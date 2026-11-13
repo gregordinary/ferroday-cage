@@ -284,12 +284,18 @@ pub enum Network {
 /// terminal, competing with the caller's own shell for it. With a PID
 /// namespace, the default, the sandbox is a process group of its own in that
 /// session, which keeps the caller's group out of reach of the signals the
-/// sandbox sends its own. Where the caller's group holds the terminal's
-/// foreground at the launch, the launch lends the sandbox's group the
+/// sandbox sends its own. An interactive run, whose standard input and
+/// standard output are both the caller's controlling terminal while the
+/// caller's group holds its foreground, lends the sandbox's group the
 /// foreground until the outcome is collected: an interrupt typed at the
-/// terminal reaches the sandbox, and `^Z` does not suspend it. Without a PID
-/// namespace the command is in the caller's own process group, and the
-/// caller's shell manages it as any job.
+/// terminal reaches the sandbox, and `^Z` does not suspend it. With output
+/// piped, redirected, or captured, the caller's job keeps the terminal, so a
+/// pipeline's far end reads it as before. The sandbox is then a background
+/// group of the terminal, orphaned once the launch stage exits, so its reads
+/// of the terminal fail, and an interrupt reaches the caller's job rather than
+/// the sandbox. Without a PID namespace
+/// the command is in the caller's own process group, and the caller's shell
+/// manages it as any job.
 ///
 /// Under `Null` or `Fd` neither sense works: the sandbox is outside the
 /// caller's session, and the session it has instead owns no terminal to run

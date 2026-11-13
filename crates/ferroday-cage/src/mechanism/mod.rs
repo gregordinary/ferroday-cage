@@ -652,15 +652,16 @@ impl LaunchPlan {
 ///
 /// A sandbox that keeps the caller's session under a PID namespace runs in a
 /// process group of its own (see
-/// [`LaunchPlan::own_process_group`]). Where the caller's standard input is its
-/// controlling terminal and the caller's own process group holds that
-/// terminal's foreground, the caller lends the foreground to the sandbox: the
-/// init takes it for the sandbox's group before the command exists. A `^C`
-/// typed at the terminal then reaches the command, as it reached the caller's
-/// job before, and the caller's group stays out of reach of what the command
-/// sends to its own. The caller's group is a background job of the terminal
-/// meanwhile, so a process in it that reads the terminal stops until its shell
-/// resumes it.
+/// [`LaunchPlan::own_process_group`]). An interactive run, whose standard input
+/// and standard output are both the caller's controlling terminal while the
+/// caller's own process group holds that terminal's foreground, has the caller
+/// lend the foreground to the sandbox: the init takes it for the sandbox's
+/// group before the command exists. A `^C` typed at the terminal then reaches
+/// the command, as it reached the caller's job before, and the caller's group
+/// stays out of reach of what the command sends to its own. The caller's group
+/// is a background job of the terminal meanwhile, so a process in it that
+/// reads the terminal stops until its shell resumes it. [`lend`](Self::lend)
+/// says why output that goes anywhere else lends nothing.
 ///
 /// This is the caller's half: the decision, made at the launch rather than at
 /// build because it is a property of the caller's process at that moment, and
@@ -689,17 +690,27 @@ pub(crate) struct Foreground {
 
 impl Foreground {
     /// Decides whether a launch of `plan` lends the caller's terminal, and
-    /// takes the terminal if it does. `terminal` is whether the launch is a
-    /// terminal launch.
+    /// takes the terminal if it does. `observe` is whether the launch captures
+    /// the output pair, and `terminal` whether it is a terminal launch.
     ///
-    /// The caller lends it when the sandbox takes a process group of its own,
-    /// its standard input is the caller's controlling terminal, and the
-    /// caller's own process group is the terminal's foreground group. A caller
-    /// in the background of its terminal, or whose standard input is no
-    /// terminal, lends nothing, and the sandbox's group is a background group
-    /// of whatever terminal it has.
-    fn lend(plan: &LaunchPlan, terminal: bool) -> Result<Option<Foreground>, Error> {
-        if !plan.own_process_group(terminal) {
+    /// The caller lends it to an interactive run alone: the sandbox takes a
+    /// process group of its own, its standard input and standard output are
+    /// both inherited and both the caller's controlling terminal, and the
+    /// caller's own process group is that terminal's foreground group.
+    ///
+    /// Output that goes anywhere else, piped, redirected, or captured, means
+    /// the caller's job is more than the sandbox: a pipeline reads what the
+    /// command writes, and a member of it may read the terminal, as a pager
+    /// does. The caller's job keeps the terminal then, and so does a caller in
+    /// the background of its terminal or whose standard input is no terminal.
+    /// The sandbox's group is a background group of whatever terminal it has,
+    /// orphaned once the launch stage exits, so its reads of the terminal fail,
+    /// and a `^C` typed at the terminal reaches the caller's job.
+    fn lend(plan: &LaunchPlan, observe: bool, terminal: bool) -> Result<Option<Foreground>, Error> {
+        if !plan.own_process_group(terminal)
+            || observe
+            || !matches!(plan.stdout, StdioPlan::Inherit)
+        {
             return Ok(None);
         }
         let stdin = rustix::stdio::stdin();
@@ -710,6 +721,9 @@ impl Foreground {
         match rustix::termios::tcgetpgrp(stdin) {
             Ok(holder) if holder == caller => {}
             _ => return Ok(None),
+        }
+        if !same_terminal(stdin, rustix::stdio::stdout()) {
+            return Ok(None);
         }
         // Close-on-exec, and above the standard streams' numbers.
         let terminal = stdin
@@ -768,6 +782,28 @@ impl Drop for Foreground {
     fn drop(&mut self) {
         self.hand_back();
     }
+}
+
+/// Whether `output` is the same terminal as `input`: two character devices of
+/// one device number.
+///
+/// Asked of standard output once standard input is known to be the caller's
+/// controlling terminal, so a yes means output goes to that terminal too. The
+/// device is compared, rather than `tcgetpgrp` asked of the output as it is of
+/// the input. A pseudoterminal's primary answers `tcgetpgrp` with its
+/// replica's foreground group, controlling terminal or not, so a caller
+/// writing into the primary of a terminal whose foreground group happened to be
+/// its own would pass that test while its output reaches nobody's terminal.
+/// The device numbers of a primary and its replica differ.
+fn same_terminal(input: BorrowedFd<'_>, output: BorrowedFd<'_>) -> bool {
+    let device = |fd| {
+        rustix::fs::fstat(fd).ok().and_then(|stat| {
+            (rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                == rustix::fs::FileType::CharacterDevice)
+                .then_some(stat.st_rdev)
+        })
+    };
+    matches!((device(input), device(output)), (Some(input), Some(output)) if input == output)
 }
 
 /// A single BPF instruction, the unit of a compiled seccomp program.
@@ -1596,7 +1632,7 @@ fn fork_launch(
     terminal: Option<&Terminal>,
 ) -> Result<ParentSide, Error> {
     refuse_directory_streams(plan, observe, terminal.is_some())?;
-    let foreground = Foreground::lend(plan, terminal.is_some())?;
+    let foreground = Foreground::lend(plan, observe, terminal.is_some())?;
 
     // Pre-fork marshaling, caller side. The pointer arrays and identity-map
     // lines are the last pieces the sandbox stages need; they are assembled

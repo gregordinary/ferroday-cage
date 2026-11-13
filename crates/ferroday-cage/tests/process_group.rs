@@ -27,7 +27,7 @@ use rustix::process::{Pid, WaitOptions};
 const ROLE: &str = "FERRODAY_CAGE_TEST_GROUP_ROLE";
 
 /// What the caller launches and how it stands: `interrupt`, `suspend`,
-/// `suspend-subreaper`, `inner-job`, or `pipe`.
+/// `suspend-subreaper`, `inner-job`, `pipeline`, or `pipe`.
 const SCENARIO: &str = "FERRODAY_CAGE_TEST_GROUP_SCENARIO";
 
 /// The command every scenario runs: it signals its own process group, which
@@ -37,9 +37,15 @@ const SCENARIO: &str = "FERRODAY_CAGE_TEST_GROUP_SCENARIO";
 /// In `inner-job` the command is a shell with job control, which runs the sleep
 /// as a job of its own: in a process group of its own, which it gives the
 /// terminal's foreground.
+///
+/// In `pipeline` the command's output is a pipe, so it says it has signalled
+/// its group on standard error, which is still the terminal.
 fn script(scenario: &str) -> &'static str {
     match scenario {
         "pipe" => "trap '' USR1 TERM; kill -USR1 0; kill -TERM 0",
+        "pipeline" => {
+            "trap '' USR1 TERM; kill -USR1 0; kill -TERM 0; echo signalled >&2; exec sleep 30"
+        }
         "inner-job" => {
             "trap '' USR1 TERM; kill -USR1 0; kill -TERM 0; set -m; echo ready; sleep 30; exit 0"
         }
@@ -68,24 +74,46 @@ fn playing(role: &str) -> Option<String> {
     std::env::var(SCENARIO).ok()
 }
 
+/// The reader at a pipeline's far end, in `pipeline`: it reads the caller's
+/// output until the caller says the sandbox is running, then reads a line typed
+/// at the terminal, says what it read, and passes the rest of the caller's
+/// output through.
+const READER: &str = "while IFS= read -r line; do [ \"$line\" = launched ] && break; done; \
+     echo sibling-reading; IFS= read -r typed </dev/tty; echo \"sibling-read=$typed\"; exec cat";
+
 /// The shell: starts the caller in a process group of its own, gives that
 /// group the terminal's foreground, and reports how the caller ended, a stop
-/// included.
+/// included. In `pipeline` the caller's output is piped to [`READER`], which
+/// the shell starts in the caller's group, as a shell starts a pipeline's
+/// members in one job.
 #[test]
 fn helper_shell() {
+    use std::os::unix::process::CommandExt as _;
+
     let Some(scenario) = playing("shell") else {
         return;
     };
-    let caller = {
-        use std::os::unix::process::CommandExt as _;
-        rerun("helper_caller", "caller", &scenario)
-            .process_group(0)
-            .spawn()
-            .expect("the caller starts")
-    };
+    let pipeline = scenario == "pipeline";
+    let mut caller = rerun("helper_caller", "caller", &scenario);
+    caller.process_group(0);
+    if pipeline {
+        caller.stdout(HostStdio::piped());
+    }
+    // Collected below through `waitpid`, which reports a stop as well as an
+    // exit, where `Child::wait` reports exits alone.
+    #[expect(clippy::zombie_processes)]
+    let mut caller = caller.spawn().expect("the caller starts");
     let pid = Pid::from_raw(i32::try_from(caller.id()).expect("a pid fits"))
         .expect("a child's pid is positive");
     println!("shell-caller-group={}", caller.id());
+    let reader = caller.stdout.take().map(|output| {
+        Command::new("/bin/sh")
+            .args(["-c", READER])
+            .stdin(output)
+            .process_group(pid.as_raw_nonzero().get())
+            .spawn()
+            .expect("the reader starts")
+    });
     // The shell's group holds the foreground, so handing it on raises nothing.
     rustix::termios::tcsetpgrp(rustix::stdio::stdin(), pid)
         .expect("the caller's group takes the foreground");
@@ -101,6 +129,9 @@ fn helper_shell() {
         let _ = rustix::process::waitpid(Some(pid), WaitOptions::empty());
         format!("stopped({:?})", status.stopping_signal())
     };
+    if let Some(mut reader) = reader {
+        let _ = reader.wait();
+    }
     println!("shell-report caller={ended}");
 }
 
@@ -140,15 +171,26 @@ fn helper_caller() {
         .expect("the sibling starts");
     // Tied to the caller, so a run that fails and ends the caller does not
     // leave the sandbox behind.
-    let status = Cage::builder()
+    let mut running = Cage::builder()
         .rootfs(rootfs)
         .command("/bin/sh")
         .args(["-c", script(&scenario)])
         .stop_with_caller(true)
         .build()
         .expect("a valid sandbox configuration")
-        .run()
+        .spawn()
         .expect("the sandbox launches");
+    // Whether the launch kept the terminal's foreground with the caller, read
+    // once the command runs; the reader of a pipeline waits for the word.
+    // One write, so the command's own output cannot land inside the line.
+    let launched = format!(
+        "caller-launched foreground={}\n",
+        terminal && in_foreground()
+    );
+    std::io::Write::write_all(&mut std::io::stderr(), launched.as_bytes())
+        .expect("the line is written");
+    println!("launched");
+    let status = running.wait().expect("the outcome is collected");
     let sibling_alive = sibling
         .try_wait()
         .expect("the sibling is waited for")
@@ -168,24 +210,39 @@ fn in_foreground() -> bool {
     rustix::termios::tcgetpgrp(rustix::stdio::stdin()) == Ok(rustix::process::getpgrp())
 }
 
-/// Runs `scenario` under a pseudoterminal: waits for the command to be ready,
-/// types each of `keys` with a pause after it, and returns everything the
-/// session wrote, its reports included, once every process in it has ended.
-fn session(scenario: &str, keys: &[&str]) -> String {
+/// One step of playing the user at a session.
+enum Step<'a> {
+    /// Wait for the session to write this.
+    Expect(&'a str),
+    /// Type this, and pause.
+    Type(&'a str),
+}
+
+/// Runs `scenario` under a pseudoterminal, taking `steps` in order, and
+/// returns everything the session wrote, its reports included, once every
+/// process in it has ended.
+fn session(scenario: &str, steps: &[Step<'_>]) -> String {
     let (primary, replica) = common::pty::pair(24, 80);
     let shell =
         common::pty::spawn_controlled(&mut rerun("helper_shell", "shell", scenario), &replica);
     drop(replica);
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = String::new();
-    let ready = common::pty::read_until(&primary, "ready", deadline, &mut seen);
-    if ready {
-        for key in keys {
-            common::pty::send(&primary, key);
-            std::thread::sleep(Duration::from_millis(300));
+    let mut ran = true;
+    for step in steps {
+        ran = match step {
+            Step::Expect(text) => common::pty::read_until(&primary, text, deadline, &mut seen),
+            Step::Type(keys) => {
+                common::pty::send(&primary, keys);
+                std::thread::sleep(Duration::from_millis(300));
+                true
+            }
+        };
+        if !ran {
+            break;
         }
     }
-    let reported = ready && common::pty::read_until(&primary, "shell-report", deadline, &mut seen);
+    let reported = ran && common::pty::read_until(&primary, "shell-report", deadline, &mut seen);
     if !reported {
         end_caller(&seen);
     }
@@ -213,10 +270,12 @@ fn end_caller(seen: &str) {
     }
 }
 
-/// Asserts the session's reports: the command ended by `^C`, the caller and
-/// its sibling survived what the command sent its group, and the caller's
-/// group holds the foreground again.
+/// Asserts the session's reports: the sandbox held the foreground while it
+/// ran, the command ended by `^C`, the caller and its sibling survived what
+/// the command sent its group, and the caller's group holds the foreground
+/// again.
 fn assert_contained(seen: &str) {
+    assert!(seen.contains("caller-launched foreground=false"), "{seen}");
     assert!(
         seen.contains("caller-report code=None signal=Some(2) sibling-alive=true foreground=true"),
         "{seen}"
@@ -232,7 +291,10 @@ fn a_command_on_the_callers_terminal_signals_only_its_own_group() {
     // The command signals its group; the caller and its sibling survive. A
     // `^C` typed at the terminal still reaches the command, whose group holds
     // the foreground, and the caller has it back once the wait returns.
-    assert_contained(&session("interrupt", &["\x03"]));
+    assert_contained(&session(
+        "interrupt",
+        &[Step::Expect("ready"), Step::Type("\x03")],
+    ));
 }
 
 #[test]
@@ -244,7 +306,14 @@ fn a_suspend_typed_at_the_terminal_leaves_the_command_running() {
     // parent is in another group of the session, and the kernel discards the
     // terminal's stop signals for it. The `^C` after the `^Z` ends a command
     // that is still running.
-    assert_contained(&session("suspend", &["\x1a", "\x03"]));
+    assert_contained(&session(
+        "suspend",
+        &[
+            Step::Expect("ready"),
+            Step::Type("\x1a"),
+            Step::Type("\x03"),
+        ],
+    ));
 }
 
 #[test]
@@ -256,7 +325,14 @@ fn a_suspend_under_a_reaper_in_the_session_is_continued() {
     // sandbox's group is not orphaned and `^Z` stops the command. The init
     // continues it, and the `^C` after it ends the command rather than
     // waiting on a stopped one.
-    assert_contained(&session("suspend-subreaper", &["\x1a", "\x03"]));
+    assert_contained(&session(
+        "suspend-subreaper",
+        &[
+            Step::Expect("ready"),
+            Step::Type("\x1a"),
+            Step::Type("\x03"),
+        ],
+    ));
 }
 
 #[test]
@@ -269,12 +345,39 @@ fn the_terminal_comes_back_from_a_job_a_shell_inside_ran() {
     // with the job's signal. The terminal is left on the job's group, which is
     // gone by the time the wait returns, and the caller takes it back from
     // there too.
-    let seen = session("inner-job", &["\x03"]);
+    let seen = session("inner-job", &[Step::Expect("ready"), Step::Type("\x03")]);
+    assert!(seen.contains("caller-launched foreground=false"), "{seen}");
     assert!(
         seen.contains("caller-report code=None signal=Some(2) sibling-alive=true foreground=true"),
         "{seen}"
     );
     assert!(seen.contains("shell-report caller=exited(0)"), "{seen}");
+}
+
+#[test]
+fn a_pipelines_far_end_keeps_the_terminal_while_the_sandbox_runs() {
+    if common::fixture_rootfs().is_none() {
+        return;
+    }
+    // The caller's output is a pipe into a reader in the caller's own job, as
+    // in `fcage -- cmd | less`. The caller lends nothing, so its job keeps the
+    // terminal: the reader's read of it succeeds while the sandbox runs, where
+    // a background read would stop it. The sandbox still has its own process
+    // group, and what the command sends its group reaches neither the caller
+    // nor the reader. The `^C` reaches the caller's job, which it ends, and
+    // the sandbox ends with the caller it is tied to.
+    let seen = session(
+        "pipeline",
+        &[
+            Step::Expect("signalled"),
+            Step::Expect("sibling-reading"),
+            Step::Type("typed-line\n"),
+            Step::Expect("sibling-read=typed-line"),
+            Step::Type("\x03"),
+        ],
+    );
+    assert!(seen.contains("caller-launched foreground=true"), "{seen}");
+    assert!(seen.contains("shell-report caller=signaled(2)"), "{seen}");
 }
 
 #[test]

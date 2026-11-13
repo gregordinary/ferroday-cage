@@ -270,12 +270,24 @@ session that shell shares.
 Under `Stdio::Inherit` the sandbox is in the caller's session. A shell inside
 it runs jobs of its own on the caller's terminal, competing with the caller's
 own shell for it. With a PID namespace, the default, the sandbox is a process
-group of its own there. The caller lends it the terminal's foreground for the
-launch. An interrupt typed at the terminal reaches the sandbox, and `^Z` does
-not suspend it. Once the launch stage has exited, no member of the sandbox's
-group has a parent in another group of the session. The kernel discards a
-terminal's stop for such a group. Where the caller's reaper is a subreaper in
-the same session, the stop reaches the command, and the init continues it.
+group of its own there.
+
+An interactive run, with standard output on that same terminal and the caller's
+group in its foreground, lends the sandbox the foreground for the launch. An
+interrupt typed at the terminal then reaches the sandbox, and `^Z` does not
+suspend it. Once the launch stage has exited, no member of the sandbox's group
+has a parent in another group of the session. The kernel discards a terminal's
+stop for such a group. Where the caller's reaper is a subreaper in the same
+session, the stop reaches the command, and the init continues it.
+
+With output piped, redirected, or captured, the caller's job keeps the
+terminal, so the far end of a pipeline reads it as before. The sandbox is a
+background group of the terminal, orphaned once the launch stage exits, so its
+reads of the terminal fail. An
+interrupt, or a `^Z`, reaches the caller's job and not the sandbox. `fcage`
+ends the sandbox with itself, and a library caller decides what an interrupt
+means for the sandboxes it launched.
+
 Without a PID namespace the command is in the caller's own process group. The
 caller's shell then manages it as it does any job.
 

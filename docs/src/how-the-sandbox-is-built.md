@@ -66,10 +66,11 @@ sequence itself.
    caller's standard input, and every terminal launch, starts a session of
    its own with `setsid`. One that inherits it stays in the caller's session
    and moves into a process group of its own with `setpgid`, so a signal the
-   sandbox sends its own group stays in the sandbox. Where the caller's group
-   held its terminal's foreground at the launch, the init then gives its own
-   group the foreground with `tcsetpgrp`, before the command exists, and the
-   caller takes it back once the outcome is collected. See [Signals and the
+   sandbox sends its own group stays in the sandbox. For an interactive run,
+   whose standard input and standard output are both the caller's controlling
+   terminal while the caller's group holds its foreground, the init then gives
+   its own group the foreground with `tcsetpgrp`, before the command exists.
+   The caller takes it back once the outcome is collected. See [Signals and the
    caller](process-model.md#signals-and-the-caller).
 8. **Hostname.** When a hostname is configured, `sethostname` sets it in the
    new UTS namespace; otherwise the sandbox keeps the host's hostname, and

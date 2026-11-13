@@ -141,14 +141,22 @@ responds to its own signals is application policy. The defined behavior:
   caller's is visible from its PID namespace. Any other standard input, and
   every terminal launch, gives the sandbox a session of its own. See
   [Stream dispositions](streaming.md#stream-dispositions).
-- **The caller lends the sandbox its terminal.** Where standard input is the
-  caller's controlling terminal and the caller's group holds its foreground, the
-  sandbox's group takes the foreground before the command runs. A `^C` typed at
-  the terminal then reaches the command, which reads the terminal as a
-  foreground job does. The caller's group is a background job meanwhile. A
-  process in it that reads the terminal stops until its shell resumes it, as
-  the pager at the far end of a pipeline does. A caller in the background of
-  its terminal lends nothing.
+- **An interactive run borrows the caller's terminal.** Its standard input and
+  standard output are both the caller's controlling terminal, and the caller's
+  group holds that terminal's foreground. The sandbox's group takes the
+  foreground before the command runs. A `^C` typed at the terminal then reaches
+  the command, which reads the terminal as a foreground job does. The caller's
+  group is a background job meanwhile, and a process in it that reads the
+  terminal stops until its shell resumes it.
+- **Any other run leaves the terminal with the caller.** With output piped,
+  redirected, or captured, the caller's job keeps the foreground, and a pager at
+  a pipeline's far end reads the terminal as before. A caller in the background
+  of its terminal lends nothing either. The sandbox is then a background group
+  of the terminal, orphaned once the launch stage exits, so its reads of it
+  fail. A `^C` reaches the caller's job rather than the sandbox: `fcage`'s
+  stop-with-caller tie ends the sandbox with `fcage`, and a library caller
+  decides for itself. A capturing launch, such as `Cage::output`, never takes
+  the terminal from its caller.
 - **The foreground comes back to the caller.** The wait that collects the
   outcome gives it back, and so does dropping the handle. A sandbox still
   running then is in the background of the terminal. A read of the terminal
