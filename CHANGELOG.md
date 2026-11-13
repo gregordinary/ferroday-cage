@@ -967,6 +967,12 @@ consumer upgrading can skip it.
   could not be stopped until every one had failed. Each index request also
   states the ceiling the layer holds an index to, so `HttpFetch` refuses one
   whose declared length is past it before reading the body.
+- The Alpine and Gentoo builders, and an Alpine `Repository`, refuse a mirror
+  URL carrying whitespace or a control character with a configuration error,
+  as the Debian layer's do. An Alpine mirror is written into the finished
+  root's `/etc/apk/repositories` one to a line, and a `file://` mirror or a
+  caller's own transport carried a newline in one through, adding a repository
+  nobody configured.
 
 ### Internal
 

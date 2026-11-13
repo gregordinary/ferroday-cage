@@ -82,7 +82,8 @@ use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
     Available, BuildLayer, Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
-    ProvisionError, ProvisionRequest, Provisioner, Stream, fetch_first, mirror_url,
+    ProvisionError, ProvisionRequest, Provisioner, Stream, compose_mirrors, fetch_first,
+    mirror_url,
 };
 use crate::failure::path_io_error;
 use crate::{ErrorChain, IdMapper, IdentityMap};
@@ -1007,7 +1008,8 @@ impl AlpineBuilder {
     ///
     /// Returns [`AlpineError::Config`] when the architecture is not one a
     /// repository can be addressed by, when the bundle holds no keys for it and
-    /// none were given, when the primary repository's release or a component is
+    /// none were given, when a mirror URL carries whitespace or a control
+    /// character, when the primary repository's release or a component is
     /// not addressable, when a [`plan`](Self::plan) does not describe
     /// something this configuration could install, or when the
     /// [`source_date_epoch`](Self::source_date_epoch) is negative.
@@ -1045,9 +1047,11 @@ impl AlpineBuilder {
             Some(keys) => keys,
             None => KeySet::alpine(&architecture)?,
         };
-        let mut mirrors = Vec::with_capacity(1 + self.fallbacks.len());
-        mirrors.push(self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()));
-        mirrors.extend(self.fallbacks);
+        let mirrors = compose_mirrors(
+            self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()),
+            self.fallbacks,
+        )
+        .map_err(|reason| AlpineError::Config { reason })?;
         let components = self.components.unwrap_or_else(|| vec!["main".to_string()]);
 
         for name in self.includes.iter().chain(&self.excludes) {
@@ -5164,6 +5168,40 @@ mod tests {
             "the Alpine events reached the run's observer"
         );
         assert!(!stopped.exists());
+    }
+
+    #[test]
+    fn a_mirror_url_the_roots_repositories_file_cannot_hold_is_refused_at_build() {
+        // A finished root lists its mirrors one to a line in
+        // `/etc/apk/repositories`, so a newline in one would add a repository
+        // nobody configured. A `file://` mirror or a transport of the caller's
+        // would otherwise carry it all the way there; the builder refuses it
+        // before anything is fetched or written.
+        let planted = "file:///srv/alpine\nhttp://planted.example/alpine";
+        for built in [
+            Alpine::builder("v3.23")
+                .architecture("x86_64")
+                .mirror(planted)
+                .build()
+                .map(drop),
+            Alpine::builder("v3.23")
+                .architecture("x86_64")
+                .mirror_fallback(planted)
+                .build()
+                .map(drop),
+            Repository::builder("v3.23")
+                .mirror("file:///srv/alpine")
+                .mirror_fallback(planted)
+                .keys(KeySet::postmarketos())
+                .build()
+                .map(drop),
+        ] {
+            let err = built.expect_err("the mirror is refused");
+            assert!(
+                matches!(&err, AlpineError::Config { reason } if reason.contains("planted.example")),
+                "{err}",
+            );
+        }
     }
 
     #[test]

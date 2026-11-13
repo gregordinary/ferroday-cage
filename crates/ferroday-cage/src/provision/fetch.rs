@@ -708,12 +708,53 @@ where
 
 /// The failure a mirror walk reports when it had nowhere to walk.
 ///
-/// Unreachable as the layers are configured, since every builder composes its
-/// mirror list with a primary in it. It is a configuration
+/// Unreachable as the layers are configured, since every mirror list is
+/// [composed](compose_mirrors) with a primary in it. It is a configuration
 /// failure rather than a missing resource, which is also what keeps it out of
 /// the failover class: there is nothing to advance to.
 pub(crate) fn no_mirror(suffix: &str) -> FetchError {
     FetchError::url(suffix, "no mirror is configured to fetch it from")
+}
+
+/// The mirror list a layer walks: `primary`, then `fallbacks` in the order they
+/// were given, each held to what a mirror URL may contain.
+///
+/// The primary is required, so the list is never empty, and a walk over it
+/// always asks a mirror. A builder supplies its archive's default where the
+/// caller named none; a repository with no default refuses a missing one
+/// before composing.
+///
+/// A URL carrying whitespace or a control character is refused. A finished
+/// root names its mirrors in its package manager's own configuration, one to a
+/// line or one to a field, as apt's sources and apk's `/etc/apk/repositories`
+/// do, so a newline in one would write a line nobody configured and a space
+/// would split one in two. No URL holds either as written, so nothing a caller
+/// can mean is refused: a path that holds one is percent-encoded, as
+/// [`file_url`](super::file_url) encodes it.
+///
+/// # Errors
+///
+/// Returns the reason a URL is refused, for the layer to wrap in its own
+/// configuration failure.
+pub(crate) fn compose_mirrors(
+    primary: String,
+    fallbacks: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut mirrors = Vec::with_capacity(1 + fallbacks.len());
+    mirrors.push(primary);
+    mirrors.extend(fallbacks);
+    if let Some(mirror) = mirrors.iter().find(|mirror| {
+        mirror
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    }) {
+        return Err(format!(
+            "the mirror URL {mirror:?} carries whitespace or a control character, which the \
+             finished root's own configuration cannot hold; percent-encode it, as file_url does \
+             for a local path"
+        ));
+    }
+    Ok(mirrors)
 }
 
 /// Joins a mirror-relative path onto a mirror's URL.
@@ -1102,6 +1143,29 @@ mod tests {
             matches!(fetch(65), Err(FetchError::Io { .. })),
             "a body past the bound is refused",
         );
+    }
+
+    #[test]
+    fn a_mirror_list_refuses_a_url_its_root_could_not_hold() {
+        assert_eq!(
+            compose_mirrors(PRIMARY.to_string(), vec![BACKSTOP.to_string()]),
+            Ok(both().to_vec()),
+        );
+        // Wherever it is in the list, a line break or a space would write a
+        // configuration line nobody asked for, or split one in two.
+        for refused in [
+            "file:///srv/mirror\nhttp://planted.example/alpine",
+            "http://mirror.example/alpine ",
+            "http://mirror.example/al pine",
+            "http://mirror.example/\u{7f}",
+            "http://mirror.example/\u{85}",
+        ] {
+            let reason = compose_mirrors(refused.to_string(), Vec::new())
+                .expect_err("a primary carrying it is refused");
+            assert!(reason.contains(&format!("{refused:?}")), "{reason}");
+            compose_mirrors(PRIMARY.to_string(), vec![refused.to_string()])
+                .expect_err("a fallback carrying it is refused");
+        }
     }
 
     #[test]

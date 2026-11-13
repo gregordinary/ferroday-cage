@@ -105,8 +105,8 @@ use super::openpgp::{Keyring, OpenPgpError};
 use super::rooted::Rooted;
 use super::{
     Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache, ProvisionError,
-    ProvisionEvent, ProvisionRequest, Provisioner, Tarball, fetch_first, mirror_url, no_mirror,
-    walk_mirrors,
+    ProvisionEvent, ProvisionRequest, Provisioner, Tarball, compose_mirrors, fetch_first,
+    mirror_url, no_mirror, walk_mirrors,
 };
 use crate::IdentityMap;
 use crate::failure::path_io_error;
@@ -2839,7 +2839,8 @@ impl GentooBuilder {
     /// # Errors
     ///
     /// Returns [`GentooError::Config`] for an architecture, a binhost or a build
-    /// id a request line or a path cannot carry, for an install list or a
+    /// id a request line or a path cannot carry, for a mirror URL carrying
+    /// whitespace or a control character, for an install list or a
     /// preference that does not parse, and for a [`plan`](Self::plan) or a
     /// [`stage3`](Self::stage3) the configuration contradicts: a plan given
     /// with an install list or a preference, or one the
@@ -2976,9 +2977,11 @@ impl GentooBuilder {
             .retaining(|fingerprint| RELEASE_CERTIFICATES.contains(&fingerprint));
         // The walk list is the primary followed by its backstops, composed
         // here so that neither method can undo the other.
-        let mut mirrors = Vec::with_capacity(1 + self.fallbacks.len());
-        mirrors.push(self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()));
-        mirrors.extend(self.fallbacks);
+        let mirrors = compose_mirrors(
+            self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()),
+            self.fallbacks,
+        )
+        .map_err(GentooError::config)?;
         Ok(Gentoo {
             architecture: self.architecture,
             variant: self.variant,

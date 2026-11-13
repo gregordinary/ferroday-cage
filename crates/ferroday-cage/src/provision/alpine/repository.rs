@@ -27,6 +27,7 @@ use std::fmt;
 
 use super::keyring::KeySet;
 use super::{AlpineError, check_coordinate};
+use crate::provision::compose_mirrors;
 use crate::provision::coordinate::Nesting;
 
 /// The file an apk repository publishes its catalogue as.
@@ -161,11 +162,6 @@ impl Repository {
     /// has none in practice, so a repository always carries keys and the check
     /// is that the set is not empty.
     fn validate(&self) -> Result<(), AlpineError> {
-        if self.mirrors.is_empty() {
-            return Err(AlpineError::Config {
-                reason: "a repository needs at least one mirror URL".to_string(),
-            });
-        }
         check_coordinate("the repository's release", &self.release, Nesting::Nested)?;
         for component in &self.components {
             check_coordinate("the repository's component", component, Nesting::Nested)?;
@@ -271,8 +267,9 @@ impl RepositoryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`AlpineError::Config`] when no mirror was set, when no keys
-    /// were, when the key set is empty, or when the release or a component is
+    /// Returns [`AlpineError::Config`] when no mirror was set, when a mirror
+    /// URL carries whitespace or a control character, when no keys were, when
+    /// the key set is empty, or when the release or a component is
     /// one the repository cannot be addressed by: an empty value, one carrying
     /// whitespace, a control character, or another character a URL path cannot
     /// carry as written (such as `%`, `?`, `#`, or one outside ASCII), or one
@@ -293,9 +290,8 @@ impl RepositoryBuilder {
                     .to_string(),
             });
         };
-        let mut mirrors = Vec::with_capacity(1 + self.fallbacks.len());
-        mirrors.push(primary);
-        mirrors.extend(self.fallbacks);
+        let mirrors = compose_mirrors(primary, self.fallbacks)
+            .map_err(|reason| AlpineError::Config { reason })?;
 
         let repository = Repository {
             mirrors,

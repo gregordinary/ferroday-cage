@@ -112,7 +112,9 @@ pub(crate) use fetch::fetch_bounded;
 #[cfg(feature = "gentoo")]
 pub(crate) use fetch::no_mirror;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-pub(crate) use fetch::{Failover, Fetched, Watch, fetch_first, mirror_url, walk_mirrors};
+pub(crate) use fetch::{
+    Failover, Fetched, Watch, compose_mirrors, fetch_first, mirror_url, walk_mirrors,
+};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub use fetch::{Fetch, FetchError, FetchJob, FetchRequest};
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]

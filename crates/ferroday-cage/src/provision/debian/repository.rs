@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use super::bootstrap::{self, PACKAGE_KEYRING_STEM, TRUST_ANCHOR_STEM};
 use super::check_coordinate;
 use super::{DebianError, EMBEDDED_KEYRING};
+use crate::provision::compose_mirrors;
 use crate::provision::coordinate::Nesting;
 use crate::provision::openpgp::Keyring;
 
@@ -238,25 +239,6 @@ impl Repository {
     /// literally would let `HTTP://` name the same plaintext transport and slip
     /// past.
     fn validate(&self) -> Result<(), DebianError> {
-        if self.mirrors.is_empty() {
-            return Err(DebianError::Config {
-                reason: "a repository needs at least one mirror URL".to_string(),
-            });
-        }
-        for mirror in &self.mirrors {
-            if mirror
-                .chars()
-                .any(|character| character.is_whitespace() || character.is_control())
-            {
-                return Err(DebianError::Config {
-                    reason: format!(
-                        "the mirror URL {mirror:?} carries whitespace or a control character, \
-                         which the finished root's apt sources cannot hold; percent-encode it, \
-                         as file_url does for a local path"
-                    ),
-                });
-            }
-        }
         check_coordinate("the repository's suite", &self.suite, Nesting::Nested)?;
         for component in &self.components {
             check_coordinate("the repository's component", component, Nesting::Nested)?;
@@ -442,9 +424,8 @@ impl RepositoryBuilder {
                 reason: "a repository needs a mirror URL; set one with mirror()".to_string(),
             });
         };
-        let mut mirrors = Vec::with_capacity(1 + self.fallbacks.len());
-        mirrors.push(primary);
-        mirrors.extend(self.fallbacks);
+        let mirrors = compose_mirrors(primary, self.fallbacks)
+            .map_err(|reason| DebianError::Config { reason })?;
 
         let components = if self.components.is_empty() {
             vec!["main".to_string()]

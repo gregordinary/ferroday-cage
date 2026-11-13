@@ -75,8 +75,8 @@ use super::layer::Staging;
 use super::rooted::Rooted;
 use super::{
     Available, BuildLayer, Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
-    ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Staged, Stream, fetch_bounded,
-    fetch_first, mirror_url, walk_mirrors,
+    ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Staged, Stream, compose_mirrors,
+    fetch_bounded, fetch_first, mirror_url, walk_mirrors,
 };
 use crate::failure::path_io_error;
 use crate::provision::digest::{Algorithm, Digest};
@@ -496,7 +496,7 @@ impl Debian {
             suite: suite.into(),
             architecture: None,
             mirror: None,
-            mirror_fallbacks: Vec::new(),
+            fallbacks: Vec::new(),
             snapshot_fallbacks: Vec::new(),
             components: Vec::new(),
             base_priority: None,
@@ -843,8 +843,8 @@ pub struct DebianBuilder {
     suite: String,
     architecture: Option<String>,
     mirror: Option<String>,
-    mirror_fallbacks: Vec<String>,
-    /// The backstops among `mirror_fallbacks` that serve a past state of the
+    fallbacks: Vec<String>,
+    /// The backstops among `fallbacks` that serve a past state of the
     /// archive.
     snapshot_fallbacks: Vec<String>,
     components: Vec<String>,
@@ -882,7 +882,7 @@ impl fmt::Debug for DebianBuilder {
             .field("suite", &self.suite)
             .field("architecture", &self.architecture)
             .field("mirror", &self.mirror)
-            .field("mirror_fallbacks", &self.mirror_fallbacks)
+            .field("fallbacks", &self.fallbacks)
             .field("snapshot_fallbacks", &self.snapshot_fallbacks)
             .field("components", &self.components)
             .field("base_priority", &self.base_priority)
@@ -954,7 +954,7 @@ impl DebianBuilder {
     /// A backstop is fetched through the same transport as the primary, so the
     /// scheme constraint of [`mirror`](Self::mirror) applies to it too.
     pub fn mirror_fallback(mut self, url: impl Into<String>) -> Self {
-        self.mirror_fallbacks.push(url.into());
+        self.fallbacks.push(url.into());
         self
     }
 
@@ -973,7 +973,7 @@ impl DebianBuilder {
     pub fn snapshot_fallback(mut self, url: impl Into<String>) -> Self {
         let url = url.into();
         self.snapshot_fallbacks.push(url.clone());
-        self.mirror_fallbacks.push(url);
+        self.fallbacks.push(url);
         self
     }
 
@@ -1591,10 +1591,11 @@ impl DebianBuilder {
         // followed by any snapshot backstops, and its trust anchor is the one
         // settled above. Repository construction rejects an unsigned http://
         // mirror, the same refusal the flattened configuration made.
-        let primary_mirror = self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string());
-        let mut mirrors = Vec::with_capacity(1 + self.mirror_fallbacks.len());
-        mirrors.push(primary_mirror);
-        mirrors.extend(self.mirror_fallbacks);
+        let mirrors = compose_mirrors(
+            self.mirror.unwrap_or_else(|| DEFAULT_MIRROR.to_string()),
+            self.fallbacks,
+        )
+        .map_err(|reason| DebianError::Config { reason })?;
         let primary = Repository::primary(
             self.suite.clone(),
             mirrors,
