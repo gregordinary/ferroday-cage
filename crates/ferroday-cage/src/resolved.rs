@@ -1483,7 +1483,7 @@ mod serde_tests {
         let inputs = Cage::builder()
             .rootfs("/tmp")
             .command("/bin/sh")
-            .seccomp(crate::SeccompPolicy::Curated)
+            .seccomp(crate::SeccompPolicy::Rules(crate::SeccompRules::curated()))
             .build()
             .expect("a valid sandbox configuration")
             .resolved_inputs();
@@ -1497,7 +1497,7 @@ mod serde_tests {
     #[cfg(feature = "hardening")]
     #[test]
     fn a_hardening_posture_records_its_grants_and_its_filter_size() {
-        use crate::{FsAccess, NetAccess, SeccompPolicy};
+        use crate::{FsAccess, NetAccess, SeccompPolicy, SeccompRules};
 
         let cage = Cage::builder()
             .rootfs("/tmp")
@@ -1508,7 +1508,7 @@ mod serde_tests {
             .bind("/proc", "/proc")
             .landlock_fs(FsAccess::READ, "/usr")
             .landlock_net(NetAccess::CONNECT, 443)
-            .seccomp(SeccompPolicy::Curated)
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
             .build()
             .expect("a valid sandbox configuration");
         let crate::ResolvedHardening::Applied {
@@ -1561,7 +1561,10 @@ mod serde_tests {
             host,
         );
         assert_eq!(
-            abi_of(Cage::builder().seccomp(crate::SeccompPolicy::Curated)),
+            abi_of(
+                Cage::builder()
+                    .seccomp(crate::SeccompPolicy::Rules(crate::SeccompRules::curated()))
+            ),
             None,
             "a posture without Landlock records no ABI",
         );

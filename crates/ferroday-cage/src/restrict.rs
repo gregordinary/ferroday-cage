@@ -607,9 +607,10 @@ impl RestrictionBuilder {
 
     /// Applies a seccomp syscall filter to the command.
     ///
-    /// See [`SeccompPolicy`] for the curated profile, caller-authored rules,
-    /// and the pre-compiled escape hatch. The filter binds the command and
-    /// its descendants.
+    /// See [`SeccompPolicy`] for rule sets, the
+    /// [curated roster](crate::SeccompRules::curated) among them, and the
+    /// pre-compiled escape hatch. The filter binds the command and its
+    /// descendants.
     pub fn seccomp(mut self, policy: SeccompPolicy) -> Self {
         self.hardening.set_seccomp(policy);
         self
@@ -805,6 +806,7 @@ fn settle_landlock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SeccompRules;
 
     /// Every field of a restriction's builder is classified against the cage
     /// builder's, and stays classified because this stops compiling otherwise.
@@ -907,13 +909,13 @@ mod tests {
     fn restricted_true() -> RestrictionBuilder {
         Restriction::builder()
             .command("/bin/true")
-            .seccomp(SeccompPolicy::Curated)
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
     }
 
     #[test]
     fn build_requires_a_command() {
         let err = Restriction::builder()
-            .seccomp(SeccompPolicy::Curated)
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
             .build()
             .unwrap_err();
         assert!(matches!(err, Error::Config(ConfigError::CommandMissing)));
@@ -923,7 +925,7 @@ mod tests {
     fn build_rejects_a_relative_command() {
         let err = Restriction::builder()
             .command("bin/true")
-            .seccomp(SeccompPolicy::Curated)
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
             .build()
             .unwrap_err();
         assert!(matches!(
@@ -938,7 +940,7 @@ mod tests {
         // cannot point at one: it says the name is never searched.
         let err = Restriction::builder()
             .command("true")
-            .seccomp(SeccompPolicy::Curated)
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
             .build()
             .unwrap_err();
         assert!(
@@ -965,7 +967,7 @@ mod tests {
         for command in [".", ".."] {
             let err = Restriction::builder()
                 .command(command)
-                .seccomp(SeccompPolicy::Curated)
+                .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
                 .build()
                 .unwrap_err();
             assert!(
@@ -1145,7 +1147,7 @@ mod tests {
         // as a path that is not absolute -- which is how a cage reads it too.
         let err = Restriction::builder()
             .command("")
-            .seccomp(SeccompPolicy::Curated)
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
             .build()
             .unwrap_err();
         assert!(

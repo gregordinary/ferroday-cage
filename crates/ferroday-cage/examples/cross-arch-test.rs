@@ -75,7 +75,7 @@ use std::process::ExitCode;
 
 use ferroday_cage::provision::debian::{Debian, DebianEvent, foreign_interpreter};
 use ferroday_cage::provision::{self, Provisioned};
-use ferroday_cage::{Cage, ConfigError, Error, ErrorChain, Network, SeccompPolicy};
+use ferroday_cage::{Cage, ConfigError, Error, ErrorChain, Network, SeccompPolicy, SeccompRules};
 
 mod common;
 
@@ -317,7 +317,7 @@ fn run(config: Config) -> ExitCode {
             Network::Isolated
         });
     if config.harden {
-        builder = builder.seccomp(SeccompPolicy::Curated);
+        builder = builder.seccomp(SeccompPolicy::Rules(SeccompRules::curated()));
     }
     builder = match &config.task {
         Task::Probe => {

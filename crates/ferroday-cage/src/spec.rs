@@ -3325,9 +3325,10 @@ impl CageBuilder {
 
     /// Applies a seccomp syscall filter to the command.
     ///
-    /// See [`SeccompPolicy`](crate::SeccompPolicy) for the curated profile,
-    /// caller-authored rules, and the pre-compiled escape hatch. The filter
-    /// binds the command and its descendants.
+    /// See [`SeccompPolicy`](crate::SeccompPolicy) for rule sets, the
+    /// [curated roster](crate::SeccompRules::curated) among them, and the
+    /// pre-compiled escape hatch. The filter binds the command and its
+    /// descendants.
     pub fn seccomp(mut self, policy: crate::hardening::SeccompPolicy) -> Self {
         self.hardening.set_seccomp(policy);
         self
@@ -7226,7 +7227,8 @@ value = 21
 "#,
         r#"
 [hardening.seccomp]
-deny = ["ptrace"]
+curated = true
+deny = ["sethostname"]
 
 [[hardening.seccomp.deny-rule]]
 syscall = "clone"
@@ -7268,7 +7270,7 @@ path = "/bin"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 92] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 93] = [
         "args",
         "base-env",
         "command",
@@ -7295,6 +7297,7 @@ path = "/bin"
         "hardening.seccomp.allow-rule[].arg[].op",
         "hardening.seccomp.allow-rule[].arg[].value",
         "hardening.seccomp.allow-rule[].syscall",
+        "hardening.seccomp.curated",
         "hardening.seccomp.deny",
         "hardening.seccomp.deny-rule",
         "hardening.seccomp.deny-rule[].arg",

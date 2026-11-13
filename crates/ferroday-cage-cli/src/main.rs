@@ -1870,7 +1870,8 @@ const FLAGS: &[Flag] = &[
         placeholder: "curated",
         help: &[
             "Apply the curated seccomp deny-list of dangerous",
-            "syscalls to the command",
+            "syscalls to the command, which --seccomp-deny,",
+            "--seccomp-deny-rule and --seccomp-errno extend",
         ],
         take: Take::One(|options, flag, value| {
             parse_seccomp(&into_string(flag, value)?, &mut options.seccomp_curated)?;
@@ -2201,12 +2202,11 @@ A profile's [hardening] table composes with the hardening flags:
 --landlock-ro, --landlock-rw, --landlock-bind, and --landlock-connect add
 grants to it, while --landlock-scope, --drop-caps, --keep-caps, and the
 seccomp flags that set a posture replace its scopes, capability posture, or
-seccomp policy. Those seccomp flags are mutually constrained: --seccomp
-curated stands alone, and an allow side (--seccomp-allow,
---seccomp-allow-rule) cannot be mixed with a deny side (--seccomp-deny,
---seccomp-deny-rule). --seccomp-errno joins whichever policy stands, the
-flags' or else the profile's, and with neither denies only what it names; a
-curated posture takes none.
+seccomp policy. Those seccomp flags are mutually constrained: an allow side
+(--seccomp-allow, --seccomp-allow-rule) cannot be mixed with a deny side
+(--seccomp-deny, --seccomp-deny-rule), and --seccomp curated is a deny side
+the deny flags extend. --seccomp-errno joins whichever policy stands, the
+flags' or else the profile's, and with neither denies only what it names.
 
 The command path is interpreted inside the sandbox (with --restrict, on the
 host) and must be absolute, unless --path-lookup resolves a name with no
@@ -2387,10 +2387,10 @@ struct Options {
     /// The seccomp flags as they were given, reconciled into
     /// [`seccomp`](Self::seccomp) once the whole command line has been read.
     ///
-    /// The curated posture and the allow and deny sides are mutually
-    /// constrained, so they are gathered rather than applied: which of them is
-    /// legal depends on what else was given, and the flag that decides can come
-    /// last. They live here rather than beside the argument loop because a
+    /// The allow and deny sides, the curated roster among the latter, are
+    /// mutually constrained, so they are gathered rather than applied: which of
+    /// them is legal depends on what else was given, and the flag that decides
+    /// can come last. They live here rather than beside the argument loop because a
     /// flag's own applier reaches exactly one value, and that value is this.
     seccomp_curated: bool,
     seccomp_allow: Vec<i64>,
@@ -2961,8 +2961,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         break;
     }
 
-    // Reconciled after the loop: the curated posture and the allow and deny
-    // sides are mutually constrained, and the flag that decides can come last.
+    // Reconciled after the loop: the allow and deny sides are mutually
+    // constrained, and the flag that decides can come last.
     options.seccomp = assemble_seccomp(
         options.seccomp_curated,
         std::mem::take(&mut options.seccomp_allow),
@@ -2970,13 +2970,6 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         std::mem::take(&mut options.seccomp_allow_rules),
         std::mem::take(&mut options.seccomp_deny_rules),
     )?;
-    // The curated posture is a whole policy and takes no errno. A profile's own
-    // posture is checked when the profile is loaded; this one is the command
-    // line's, so it is the usage error it looks like now.
-    if matches!(options.seccomp, Some(SeccompPolicy::Curated)) && !options.seccomp_errno.is_empty()
-    {
-        return Err("--seccomp curated cannot be combined with --seccomp-errno".to_string());
-    }
 
     // --kill-after is the grace period before the SIGKILL that follows a
     // --timeout; without a timeout it has nothing to hang on and would be
@@ -4619,9 +4612,9 @@ fn resolve_syscall_name(flag: &str, name: &str) -> Result<i64, String> {
 /// Reconciles the seccomp flags into a single policy, or `None` when none were
 /// given.
 ///
-/// The curated posture is a whole policy on its own, so it cannot be combined
-/// with named rules. An allow-list and a deny-list are opposite postures and
-/// cannot be combined either, the same constraint a profile enforces.
+/// The curated roster is a deny-list, which the deny flags extend. An allow-list
+/// and a deny-list are opposite postures and cannot be combined, the curated
+/// roster included, the same constraint a profile enforces.
 fn assemble_seccomp(
     curated: bool,
     allow: Vec<i64>,
@@ -4632,14 +4625,12 @@ fn assemble_seccomp(
     let allow_side = !allow.is_empty() || !allow_rules.is_empty();
     let deny_side = !deny.is_empty() || !deny_rules.is_empty();
 
-    if curated && (allow_side || deny_side) {
+    if curated && allow_side {
         return Err(
-            "--seccomp curated cannot be combined with --seccomp-allow/--seccomp-deny rules"
+            "--seccomp curated is a deny-list, which --seccomp-allow and \
+             --seccomp-allow-rule cannot extend"
                 .to_string(),
         );
-    }
-    if curated {
-        return Ok(Some(SeccompPolicy::Curated));
     }
     if allow_side && deny_side {
         return Err(
@@ -4651,6 +4642,13 @@ fn assemble_seccomp(
 
     let (bare, rules) = if allow_side {
         (SeccompRules::allowing(allow), allow_rules)
+    } else if curated {
+        let rules = deny
+            .into_iter()
+            .fold(SeccompRules::curated(), |rules, syscall| {
+                rules.rule(syscall, [])
+            });
+        (rules, deny_rules)
     } else if deny_side {
         (SeccompRules::denying(deny), deny_rules)
     } else {
@@ -4671,9 +4669,9 @@ fn assemble_seccomp(
 /// `errnos` joins whichever policy then stands: the flags', or else the
 /// profile's, `beneath`. An errno beside a profile's allow-list therefore
 /// answers its syscall without discarding the list. With neither policy, the
-/// errnos make a deny side of their own, refusing only what they name. The
-/// curated posture is a whole policy and takes none, and a policy that is not
-/// a rule set cannot be extended by one.
+/// errnos make a deny side of their own, refusing only what they name. A
+/// precompiled program, which neither the flags nor a profile spell, cannot be
+/// extended by one.
 fn compose_seccomp(
     flags: Option<SeccompPolicy>,
     errnos: Vec<(i64, u16)>,
@@ -4686,15 +4684,9 @@ fn compose_seccomp(
         (Some(SeccompPolicy::Rules(rules)), _) => rules,
         (None, Some(SeccompPolicy::Rules(rules))) => rules.clone(),
         (None, None) => SeccompRules::denying([]),
-        (Some(_), _) => {
-            return Err("--seccomp curated cannot be combined with --seccomp-errno".to_string());
-        }
-        (None, Some(_)) => {
+        _ => {
             return Err(
-                "--seccomp-errno cannot be added to the profile's seccomp policy, which is the \
-                 curated posture rather than a set of rules; add the errno to a rule set, or \
-                 replace the profile's policy with --seccomp-allow or --seccomp-deny"
-                    .to_string(),
+                "--seccomp-errno cannot be added to a precompiled seccomp program".to_string(),
             );
         }
     };
@@ -8770,11 +8762,34 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // Curated alone.
-        assert!(matches!(
-            assemble_seccomp(true, vec![], vec![], vec![], vec![]).unwrap(),
-            Some(SeccompPolicy::Curated)
-        ));
+        // Curated alone is the roster, and beside a deny side extends it.
+        let curated = |policy: Option<SeccompPolicy>| match policy {
+            Some(SeccompPolicy::Rules(rules)) => format!("{rules:?}"),
+            other => panic!("expected rules, got {other:?}"),
+        };
+        assert_eq!(
+            curated(assemble_seccomp(true, vec![], vec![], vec![], vec![]).unwrap()),
+            format!("{:?}", SeccompRules::curated()),
+        );
+        let condition = SeccompArg::eq_dword(0, 2);
+        assert_eq!(
+            curated(
+                assemble_seccomp(
+                    true,
+                    vec![],
+                    vec![sysno("acct")],
+                    vec![],
+                    vec![(sysno("socket"), vec![condition])],
+                )
+                .unwrap()
+            ),
+            format!(
+                "{:?}",
+                SeccompRules::curated()
+                    .rule(sysno("acct"), [])
+                    .rule(sysno("socket"), [condition])
+            ),
+        );
         // An allow side (bare plus a rule) yields Rules.
         assert!(matches!(
             assemble_seccomp(
@@ -8791,7 +8806,8 @@ mod tests {
 
     #[test]
     fn assemble_seccomp_rejects_contradictions() {
-        // Curated cannot be combined with named rules.
+        // The curated roster is a deny side, which an allow side cannot
+        // extend.
         assert!(
             assemble_seccomp(true, vec![sysno("read")], vec![], vec![], vec![])
                 .unwrap_err()
@@ -8871,18 +8887,18 @@ mod tests {
             "/bin/true",
         ]);
         assert_eq!(alone.seccomp_errno, [(sysno("clone3"), 38)]);
-        // Beside the curated posture it is refused, as soon as both are read.
-        assert!(
-            parse_error(&[
-                "--restrict",
-                "--seccomp",
-                "curated",
-                "--seccomp-errno",
-                "clone3=ENOSYS",
-                "/bin/true"
-            ])
-            .contains("--seccomp-errno")
-        );
+        // Beside the curated roster it joins the roster, which it extends as
+        // a deny flag would.
+        let beside = run_options(&[
+            "--restrict",
+            "--seccomp",
+            "curated",
+            "--seccomp-errno",
+            "io_uring_setup=ENOSYS",
+            "/bin/true",
+        ]);
+        assert!(matches!(beside.seccomp, Some(SeccompPolicy::Rules(_))));
+        assert_eq!(beside.seccomp_errno, [(sysno("io_uring_setup"), 38)]);
     }
 
     #[test]
@@ -8947,11 +8963,15 @@ mod tests {
             ),
             format!("{:?}", deny().errno_for(sysno("clone3"), 38)),
         );
-        // A profile's curated posture takes no errno.
-        assert!(
-            compose_seccomp(None, errno(), Some(&SeccompPolicy::Curated))
-                .unwrap_err()
-                .contains("profile's seccomp policy")
+        // A profile's curated roster is a rule set like any other, and the
+        // errnos join it.
+        let curated = SeccompPolicy::Rules(SeccompRules::curated());
+        assert_eq!(
+            rules_of(compose_seccomp(None, errno(), Some(&curated)).unwrap()),
+            format!(
+                "{:?}",
+                SeccompRules::curated().errno_for(sysno("clone3"), 38)
+            ),
         );
         // Without errnos, the flags' policy stands as it is, and with no flag
         // at all the profile's is left in place.

@@ -149,7 +149,9 @@ let status = match cage.run() {
             .command("/usr/bin/job")
             .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/usr")
             .landlock_fs(FsAccess::READ | FsAccess::WRITE, "/var/lib/job")
-            .seccomp(ferroday_cage::SeccompPolicy::Curated)
+            .seccomp(ferroday_cage::SeccompPolicy::Rules(
+                ferroday_cage::SeccompRules::curated(),
+            ))
             .build()?
             .run()?
     }

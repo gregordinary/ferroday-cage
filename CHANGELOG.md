@@ -76,6 +76,17 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking.** `SeccompPolicy::Curated` is removed. The curated roster is
+  `SeccompRules::curated()`, a deny-list a caller extends with `rule` and
+  `errno_for`, so `SeccompPolicy::Rules(SeccompRules::curated())` replaces it.
+  An errno given for a syscall the roster lists answers that syscall in place
+  of the roster's entry. A profile writes the plain roster as `seccomp =
+  "curated"`, as before, and an extended one as a `[hardening.seccomp]` table
+  with `curated = true`, which names the roster rather than listing it. `fcage
+  --seccomp curated` now combines with `--seccomp-deny`, `--seccomp-deny-rule`,
+  and `--seccomp-errno`, which extend it, and is still refused beside an allow
+  side. `--seccomp-errno` beside a profile's curated policy joins it rather than
+  being refused.
 - `host::seccomp_available` is available without the `hardening` feature.
 - A run-as identity naming another id than the single-identity map's one is
   refused with the new `ConfigError::RunAsOutsideSingleMap`, which names

@@ -2018,7 +2018,6 @@ impl core::marker::UnsafeUnpin for ferroday_cage::SeccompCompare
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::SeccompCompare
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SeccompCompare
 #[non_exhaustive] pub enum ferroday_cage::SeccompPolicy
-pub ferroday_cage::SeccompPolicy::Curated
 pub ferroday_cage::SeccompPolicy::Program(alloc::vec::Vec<ferroday_cage::SockFilter>)
 pub ferroday_cage::SeccompPolicy::Rules(ferroday_cage::SeccompRules)
 impl core::fmt::Debug for ferroday_cage::SeccompPolicy
@@ -2822,6 +2821,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SeccompArg
 pub struct ferroday_cage::SeccompRules
 impl ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::allowing<I: core::iter::traits::collect::IntoIterator<Item = i64>>(I) -> ferroday_cage::SeccompRules
+pub fn ferroday_cage::SeccompRules::curated() -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::default_action(self, ferroday_cage::SeccompAction) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::denying<I: core::iter::traits::collect::IntoIterator<Item = i64>>(I) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::errno(&str) -> core::option::Option<u16>

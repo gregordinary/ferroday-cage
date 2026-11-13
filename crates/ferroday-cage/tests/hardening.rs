@@ -464,7 +464,7 @@ fn curated_seccomp_allows_an_ordinary_command() {
         .rootfs(rootfs)
         .command("/bin/busybox")
         .args(["true"])
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid sandbox configuration")
         .run()
@@ -472,6 +472,38 @@ fn curated_seccomp_allows_an_ordinary_command() {
     assert!(
         status.success(),
         "the curated profile must not break an ordinary command"
+    );
+}
+
+#[test]
+fn a_rule_added_to_the_curated_roster_refuses_its_syscall_beside_the_roster() {
+    let Some(rootfs) = rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    // Lowering one's own priority needs no privilege, and the roster leaves
+    // `setpriority` alone, so the added rule is what refuses it. `mount` is
+    // the roster's own entry, refused either way.
+    let script = "nice -n 1 true 2>/dev/null; echo nice=$?; \
+                  mkdir -p /mnt && mount -t tmpfs none /mnt 2>/dev/null; echo mount=$?";
+    let run = |rules: SeccompRules| -> String {
+        let output = Cage::builder()
+            .rootfs(rootfs)
+            .command("/bin/busybox")
+            .args(["sh", "-c", script])
+            .seccomp(SeccompPolicy::Rules(rules))
+            .build()
+            .expect("a valid sandbox configuration")
+            .output()
+            .expect("the sandbox launches");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    assert_eq!(run(SeccompRules::curated()), "nice=0\nmount=1\n");
+    assert_eq!(
+        run(SeccompRules::curated().rule(libc::SYS_setpriority, [])),
+        "nice=1\nmount=1\n"
     );
 }
 
@@ -495,7 +527,7 @@ fn curated_seccomp_denies_a_listed_syscall() {
             .command("/bin/busybox")
             .args(["sh", "-c", script]);
         if curated {
-            builder = builder.seccomp(SeccompPolicy::Curated);
+            builder = builder.seccomp(SeccompPolicy::Rules(SeccompRules::curated()));
         }
         let output = builder
             .build()
@@ -542,7 +574,7 @@ fn curated_seccomp_denies_creating_a_namespace() {
             .command("/bin/busybox")
             .args(["sh", "-c", script]);
         if curated {
-            builder = builder.seccomp(SeccompPolicy::Curated);
+            builder = builder.seccomp(SeccompPolicy::Rules(SeccompRules::curated()));
         }
         let output = builder
             .build()

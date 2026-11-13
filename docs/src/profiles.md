@@ -322,7 +322,7 @@ ABI 6.
 
 `seccomp` is either the string `"curated"` or a table naming syscalls to
 filter — a deny-list, or an allow-list that must name every syscall the command
-needs:
+needs. A deny-list table with `curated = true` extends the curated roster:
 
 ```toml
 [hardening.seccomp]
@@ -331,6 +331,11 @@ deny = ["mount", "ptrace", "bpf"]     # these fail with EPERM, the rest allowed
 # ...or an allow-list:
 [hardening.seccomp]
 allow = ["read", "write", "execve"]   # only these allowed, the rest fail EPERM
+
+# ...or the curated roster and more:
+[hardening.seccomp]
+curated = true
+deny = ["sethostname"]
 ```
 
 A syscall may be narrowed by its arguments through an `allow-rule` or

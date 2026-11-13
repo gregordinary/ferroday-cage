@@ -156,36 +156,41 @@ drops the default scopes, and refuses scopes a restriction names itself.
 
 ## Seccomp syscall filters
 
-[`seccomp`] applies a syscall filter to the command. Three policies are
-available through [`SeccompPolicy`]:
+[`seccomp`] applies a syscall filter to the command. A [`SeccompPolicy`] is one
+of two:
 
-- `Curated` — a built-in deny-list of dangerous and rarely-legitimate syscalls,
-  answering each with `EPERM` and allowing the rest. It covers mounting,
-  creating or entering a namespace, kernel modules, the keyring, tracing,
-  time-setting, and similar. Some entries name an argument rather than a whole
-  syscall. `ioctl` is denied for the `TIOCSTI` and `TIOCLINUX` requests, which
-  write to a terminal's input queue. `clone` and `unshare` are denied when their
-  flags create a namespace, so processes and threads still start. `clone3` is
-  answered `ENOSYS`, for the reason [Argument
-  conditions](#argument-conditions) gives. A command that builds a sandbox of its
-  own, such as a browser, needs a policy of its own. The roster grows as new
-  syscalls warrant denial; it is a convenience posture, not a boundary claim.
-- `Rules` — a caller-authored [`SeccompRules`] allow-list or deny-list. An
-  allow-list names the syscalls the command may make and denies the rest, so it
-  must include every syscall the command needs. A deny-list names the syscalls
-  to refuse and allows the rest. Syscalls are named by their kernel number for
-  the host architecture, which [`SeccompRules::syscall`] reads from a name such
-  as `clone3`.
+- `Rules` — a [`SeccompRules`] allow-list or deny-list. An allow-list names the
+  syscalls the command may make and denies the rest, so it must include every
+  syscall the command needs. A deny-list names the syscalls to refuse and
+  allows the rest. Syscalls are named by their kernel number for the host
+  architecture, which [`SeccompRules::syscall`] reads from a name such as
+  `clone3`.
 - `Program` — a pre-compiled BPF program ([`SockFilter`] instructions),
   installed verbatim, for a policy produced by an external compiler.
 
+[`SeccompRules::curated`] is the built-in deny-list of dangerous and
+rarely-legitimate syscalls, answering each with `EPERM` and allowing the rest.
+It covers mounting, creating or entering a namespace, kernel modules, the
+keyring, tracing, time-setting, and similar. Some entries name an argument
+rather than a whole syscall. `ioctl` is denied for the `TIOCSTI` and
+`TIOCLINUX` requests, which write to a terminal's input queue. `clone` and
+`unshare` are denied when their flags create a namespace, so processes and
+threads still start. `clone3` is answered `ENOSYS`, for the reason [Argument
+conditions](#argument-conditions) gives. A command that builds a sandbox of its
+own, such as a browser, needs a policy of its own. The roster grows as new
+syscalls warrant denial. It is a convenience posture, not a boundary claim.
+
+The curated roster is a deny-list like any other, so a caller's rules extend
+it. An errno the caller gives for a syscall the roster lists answers that
+syscall in place of the roster's entry.
+
 ```rust,no_run
-# use ferroday_cage::{Cage, SeccompPolicy};
+# use ferroday_cage::{Cage, SeccompPolicy, SeccompRules};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
     .rootfs("/srv/rootfs/alpine")
     .command("/usr/bin/convert")
-    .seccomp(SeccompPolicy::Curated)
+    .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
     .build()?
     .run()?;
 # let _ = status;
@@ -354,12 +359,12 @@ filesystem it was given.
 process it starts inherits them:
 
 ```rust,no_run
-# use ferroday_cage::{Cage, Limit, Resource, SeccompPolicy};
+# use ferroday_cage::{Cage, Limit, Resource, SeccompPolicy, SeccompRules};
 # fn main() -> ferroday_cage::Result<()> {
 let status = Cage::builder()
     .rootfs("/srv/rootfs/alpine")
     .command("/usr/bin/analyze")
-    .seccomp(SeccompPolicy::Curated)
+    .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
     .drop_all_capabilities()
     // 64 processes, 512 MiB of address space, 64 MiB of file, 10 CPU seconds.
     .rlimit(Resource::Processes, 64, 64)
@@ -502,7 +507,8 @@ across `execve`, and none touches the sandbox init or the supervisor.
 On the command line, `--landlock-ro` and `--landlock-rw` add filesystem grants,
 `--landlock-bind` and `--landlock-connect` add network grants by port, and
 `--landlock-scope` names the scopes. `--seccomp curated` applies the curated
-profile, and `--seccomp-allow` and `--seccomp-deny` filter syscalls by name.
+roster, which the deny flags extend, and `--seccomp-allow` and `--seccomp-deny`
+filter syscalls by name.
 `--seccomp-allow-rule` and `--seccomp-deny-rule` add argument conditions in the
 profile's `arg`/`len`/`op`/`value` terms, for example `--seccomp-allow-rule
 'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno clone3=ENOSYS`

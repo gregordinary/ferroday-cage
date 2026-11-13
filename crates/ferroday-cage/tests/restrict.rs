@@ -42,7 +42,7 @@ fn a_directory_on_a_standard_stream_is_refused() {
     let directory = std::fs::File::open(&dir).expect("the scratch directory opens");
     let restriction = Restriction::builder()
         .command("/bin/true")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .stdin(Stdio::from_fd(directory.into()))
         .build()
         .expect("a stream is judged at the launch, not at build");
@@ -256,7 +256,7 @@ fn curated_seccomp_allows_an_ordinary_command() {
     }
     let status = Restriction::builder()
         .command("/bin/true")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration")
         .run()
@@ -350,7 +350,7 @@ fn no_new_privileges_is_always_set() {
     let output = Restriction::builder()
         .command("/bin/cat")
         .arg("/proc/self/status")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration")
         .output()
@@ -378,7 +378,7 @@ fn capabilities_are_dropped() {
     let output = Restriction::builder()
         .command("/bin/cat")
         .arg("/proc/self/status")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration")
         .output()
@@ -412,7 +412,7 @@ fn the_environment_is_the_base_plus_overrides() {
     let output = Restriction::builder()
         .command("/usr/bin/env")
         .env("PROBE", "value")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration")
         .output()
@@ -440,7 +440,7 @@ fn the_working_directory_applies() {
     let output = Restriction::builder()
         .command("/bin/pwd")
         .current_dir("/usr")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration")
         .output()
@@ -460,7 +460,7 @@ fn the_working_directory_defaults_to_the_root() {
     // resolves would name a different file each time.
     let output = Restriction::builder()
         .command("/bin/pwd")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration")
         .output()
@@ -477,7 +477,7 @@ fn the_handle_kills_a_running_command() {
     let restriction = Restriction::builder()
         .command("/bin/sleep")
         .arg("30")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration");
     let mut running = restriction.spawn().expect("the restriction launches");
@@ -506,7 +506,7 @@ fn the_restrictions_supervisor_outlives_the_signals_sent_to_its_group() {
     let mut running = Restriction::builder()
         .command("/bin/sh")
         .args(["-c", "sleep 1; exit 7"])
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .stdin(Stdio::Null)
         .build()
         .expect("a valid restriction configuration")
@@ -613,7 +613,7 @@ fn run_scoped(script: &str, scopes: Option<&[LandlockScope]>) -> bool {
     let builder = Restriction::builder()
         .command("/bin/sh")
         .args(["-c", script])
-        .seccomp(SeccompPolicy::Curated);
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()));
     let builder = match scopes {
         Some(scopes) => builder.landlock_scope(scopes.iter().copied()),
         None => builder,
@@ -797,7 +797,7 @@ fn the_curated_policy_denies_a_namespace_and_starts_threads_and_processes() {
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
     assert_eq!(
-        run(SeccompPolicy::Curated),
+        run(SeccompPolicy::Rules(SeccompRules::curated())),
         format!("{}\n0\n{}\nthread\nfork\n", libc::EPERM, libc::ENOSYS),
     );
     // Where the host lets an unprivileged process create a user namespace, the
@@ -819,7 +819,7 @@ fn a_missing_command_is_an_exec_setup_error() {
     }
     let result = Restriction::builder()
         .command("/ferroday-cage/no/such/binary")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .build()
         .expect("a valid restriction configuration")
         .run();
@@ -930,7 +930,7 @@ fn a_restricted_terminal_launch_is_refused_against_a_directed_stream() {
     }
     let restriction = Restriction::builder()
         .command("/bin/true")
-        .seccomp(SeccompPolicy::Curated)
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
         .stdin(Stdio::Null)
         .build()
         .expect("the restriction itself is valid");

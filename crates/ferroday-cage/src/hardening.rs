@@ -1065,8 +1065,8 @@ impl SyscallRule {
 /// `io_uring_enter` therefore permits the file opens, connects, and reads
 /// submitted through the ring, even where it denies `openat`, `connect`, or
 /// `read` directly. Do not allowlist the io_uring syscalls unless the command
-/// genuinely needs them; the [curated policy](SeccompPolicy::Curated) denies
-/// them for this reason.
+/// genuinely needs them; the [curated roster](Self::curated) denies them for
+/// this reason.
 #[derive(Debug, Clone)]
 pub struct SeccompRules {
     default_action: SeccompAction,
@@ -1075,9 +1075,56 @@ pub struct SeccompRules {
     /// The syscalls answered with an errno of their own, ahead of the listed
     /// and default actions.
     errnos: BTreeMap<i64, u16>,
+    /// Whether the rules start from the curated roster, which the program is
+    /// compiled with rather than this holding a copy of it: a profile then
+    /// records the roster by name, and a later release's additions reach it.
+    curated: bool,
 }
 
 impl SeccompRules {
+    /// The curated denylist: dangerous and rarely-legitimate syscalls fail with
+    /// `EPERM`, and everything else is allowed. A convenience posture, not a
+    /// boundary claim. Its exact roster is documented and grows only
+    /// additively.
+    ///
+    /// The roster covers mounting, creating or entering a namespace, kernel
+    /// modules, the keyring, tracing, setting the time, and similar
+    /// administrative surfaces. Some entries are conditioned on an argument
+    /// rather than naming a whole syscall. `ioctl` is denied for the `TIOCSTI`
+    /// and `TIOCLINUX` requests, which write to a terminal's input queue, and
+    /// allowed for everything else. `unshare` and `clone` are denied whenever
+    /// their flags create a namespace, and allowed otherwise, so processes and
+    /// threads start as usual. `clone3` takes its flags in memory a filter
+    /// cannot read, so it is answered `ENOSYS`, and the C library falls back to
+    /// `clone`.
+    ///
+    /// Denying namespace creation means a command that builds a sandbox of its
+    /// own, such as a browser or a container runtime, does not run under this
+    /// policy as it does elsewhere.
+    ///
+    /// The rules are a denylist like any other, so a caller extends the roster
+    /// with [`rule`](Self::rule) and [`errno_for`](Self::errno_for). An errno
+    /// given for a syscall the roster lists answers that syscall in place of
+    /// the roster's entry for it:
+    ///
+    /// ```
+    /// use ferroday_cage::{SeccompArg, SeccompPolicy, SeccompRules};
+    ///
+    /// const AF_INET: u64 = 2;
+    /// // The roster, plus IPv4 sockets refused, with io_uring answered as a
+    /// // kernel without it would answer.
+    /// let rules = SeccompRules::curated()
+    ///     .rule(libc::SYS_socket, [SeccompArg::eq_dword(0, AF_INET)])
+    ///     .errno_for(libc::SYS_io_uring_setup, libc::ENOSYS as u16);
+    /// # let _ = SeccompPolicy::Rules(rules);
+    /// ```
+    pub fn curated() -> SeccompRules {
+        SeccompRules {
+            curated: true,
+            ..SeccompRules::denying([])
+        }
+    }
+
     /// A denylist: `syscalls` fail with `EPERM`, everything else is allowed.
     pub fn denying<I: IntoIterator<Item = i64>>(syscalls: I) -> SeccompRules {
         SeccompRules {
@@ -1088,6 +1135,7 @@ impl SeccompRules {
                 .map(SyscallRule::unconditional)
                 .collect(),
             errnos: BTreeMap::new(),
+            curated: false,
         }
     }
 
@@ -1102,6 +1150,7 @@ impl SeccompRules {
                 .map(SyscallRule::unconditional)
                 .collect(),
             errnos: BTreeMap::new(),
+            curated: false,
         }
     }
 
@@ -1227,11 +1276,48 @@ impl SeccompRules {
     /// posture always restricts, since it denies every unlisted syscall; a
     /// default-allow (denylist) posture restricts only when it lists at least
     /// one syscall under a denying action, or answers one with an errno of its
-    /// own. An empty `denying([])` restricts nothing.
+    /// own. An empty `denying([])` restricts nothing, and the curated roster
+    /// always restricts, since it answers `clone3` with an errno of its own.
     fn restricts(&self) -> bool {
+        let (rules, errnos) = self.lowered();
         !self.default_action.is_permissive()
-            || (!self.rules.is_empty() && !self.listed_action.is_permissive())
-            || !self.errnos.is_empty()
+            || (!rules.is_empty() && !self.listed_action.is_permissive())
+            || !errnos.is_empty()
+    }
+
+    /// The listed rules and the errnos the program is compiled from: the
+    /// caller's own, laid over the curated roster where the rules start from
+    /// it.
+    ///
+    /// A syscall the caller answers with an errno leaves the roster, so the
+    /// caller's answer is the one it gets. The caller's own listings stay as
+    /// given, and one the caller also answers with an errno is still refused
+    /// when the program is compiled, as every rule set's is.
+    fn lowered(&self) -> (Vec<SyscallRule>, BTreeMap<i64, u16>) {
+        if !self.curated {
+            return (self.rules.clone(), self.errnos.clone());
+        }
+        let mut errnos = curated_errnos();
+        errnos.extend(&self.errnos);
+        let rules = curated_denylist()
+            .into_iter()
+            .map(SyscallRule::unconditional)
+            .chain(curated_ioctl_rules())
+            .chain(curated_namespace_rules())
+            .filter(|rule| !self.errnos.contains_key(&rule.syscall))
+            .chain(self.rules.iter().cloned())
+            .collect();
+        (rules, errnos)
+    }
+
+    /// Whether these are the curated roster with nothing added: what a profile
+    /// spells as the string `"curated"`.
+    fn is_plain_curated(&self) -> bool {
+        self.curated
+            && self.rules.is_empty()
+            && self.errnos.is_empty()
+            && self.default_action == SeccompAction::Allow
+            && self.listed_action == SeccompAction::Errno(EPERM)
     }
 }
 
@@ -1239,23 +1325,8 @@ impl SeccompRules {
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum SeccompPolicy {
-    /// A curated default-deny of dangerous and rarely-legitimate syscalls,
-    /// allowing the rest. A convenience posture, not a boundary claim; its
-    /// exact roster is documented and grows only additively.
-    ///
-    /// Some entries are conditioned on an argument rather than naming a whole
-    /// syscall. `ioctl` is denied for the `TIOCSTI` and `TIOCLINUX` requests,
-    /// which write to a terminal's input queue, and allowed for everything
-    /// else. `unshare` and `clone` are denied whenever their flags create a
-    /// namespace, and allowed otherwise, so processes and threads start as
-    /// usual. `clone3` takes its flags in memory a filter cannot read, so it
-    /// is answered `ENOSYS`, and the C library falls back to `clone`.
-    ///
-    /// Denying namespace creation means a command that builds a sandbox of
-    /// its own, such as a browser or a container runtime, does not run under
-    /// this policy as it does elsewhere.
-    Curated,
-    /// A caller-authored allow- or denylist.
+    /// An allow- or denylist, the [curated roster](SeccompRules::curated) or
+    /// one of the caller's own.
     Rules(SeccompRules),
     /// An already-compiled BPF program, installed verbatim — the escape hatch
     /// for a policy an external compiler produced.
@@ -1269,7 +1340,6 @@ impl SeccompPolicy {
     /// no-op policy does not pass the empty-restriction guard.
     pub(crate) fn restricts(&self) -> bool {
         match self {
-            SeccompPolicy::Curated => true,
             SeccompPolicy::Rules(rules) => rules.restricts(),
             // The escape hatch is opaque; a non-empty program is assumed to
             // restrict, an empty one (which the kernel would reject anyway)
@@ -1284,7 +1354,6 @@ impl SeccompPolicy {
 impl std::fmt::Debug for SeccompPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SeccompPolicy::Curated => f.write_str("Curated"),
             SeccompPolicy::Rules(rules) => f.debug_tuple("Rules").field(rules).finish(),
             SeccompPolicy::Program(program) => f
                 .debug_tuple("Program")
@@ -1306,6 +1375,9 @@ impl std::fmt::Debug for SeccompPolicy {
 /// io_uring can perform: filter the io_uring syscalls too, or leave them
 /// unlisted so the allowlist's default action denies them. See
 /// [`SeccompRules`].
+///
+/// One of the three parts of the roster [`SeccompRules::curated`] starts from,
+/// which [`SeccompRules::lowered`] puts together.
 fn curated_denylist() -> Vec<i64> {
     use syscalls::Sysno;
     // Filesystem topology, kernel modules, the keyring, tracing, time, and
@@ -1891,26 +1963,10 @@ fn grant_path_cstring(path: &Path) -> Result<CString, ConfigError> {
 /// kernel's instruction ceiling.
 fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigError> {
     let program = match policy {
-        SeccompPolicy::Curated => {
-            let rules: Vec<SyscallRule> = curated_denylist()
-                .into_iter()
-                .map(SyscallRule::unconditional)
-                .chain(curated_ioctl_rules())
-                .chain(curated_namespace_rules())
-                .collect();
-            compile_filter(
-                SeccompAction::Allow,
-                SeccompAction::Errno(EPERM),
-                &rules,
-                &curated_errnos(),
-            )?
+        SeccompPolicy::Rules(rules) => {
+            let (listed, errnos) = rules.lowered();
+            compile_filter(rules.default_action, rules.listed_action, &listed, &errnos)?
         }
-        SeccompPolicy::Rules(rules) => compile_filter(
-            rules.default_action,
-            rules.listed_action,
-            &rules.rules,
-            &rules.errnos,
-        )?,
         SeccompPolicy::Program(program) => program.clone(),
     };
     // The kernel rejects a filter longer than BPF_MAXINSNS, but only if the
@@ -2372,13 +2428,14 @@ pub(crate) mod serde_request {
     /// deliberately absent: a profile is declarative and reviewable.
     ///
     /// Written either as the string `"curated"` or as a table naming syscalls
-    /// to allow or deny. The two forms are different TOML types — a string and
-    /// a table — so the (de)serialization is written by hand rather than
-    /// derived: the derive for a mixed string-or-table shape (an untagged enum)
-    /// would silently drop the `deny_unknown_fields` strictness the rest of the
-    /// profile keeps.
+    /// to allow or deny, which `curated = true` starts from the curated roster.
+    /// The two forms are different TOML types — a string and a table — so the
+    /// (de)serialization is written by hand rather than derived: the derive for
+    /// a mixed string-or-table shape (an untagged enum) would silently drop the
+    /// `deny_unknown_fields` strictness the rest of the profile keeps.
     enum SeccompProfile {
-        /// The curated denylist. Written as the string `"curated"`.
+        /// The curated roster with nothing added. Written as the string
+        /// `"curated"`.
         Curated,
         /// An allow- or denylist, with optional per-syscall argument rules.
         Lists(SeccompLists),
@@ -2430,13 +2487,17 @@ pub(crate) mod serde_request {
     /// syscalls answered with an errno of their own in `errno`, a table of
     /// syscall names to errno names. The allow and deny sides are mutually
     /// exclusive; a table must set one side, and `errno` alone counts as the
-    /// deny side, since what it does is refuse.
+    /// deny side, since what it does is refuse. `curated = true` is a deny side
+    /// of its own, the curated roster, which the table's deny side extends.
     ///
-    /// `errno` precedes the two rule arrays so the serialized table is valid
-    /// TOML in field order, as [`HardeningProfile`] keeps its own.
+    /// `curated` and `errno` precede the two rule arrays so the serialized
+    /// table is valid TOML in field order, as [`HardeningProfile`] keeps its
+    /// own.
     #[derive(Serialize, Deserialize, Default)]
     #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
     struct SeccompLists {
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        curated: bool,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         allow: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2631,7 +2692,10 @@ pub(crate) mod serde_request {
         /// translating syscall names to numbers for the host architecture.
         fn into_policy(self) -> Result<SeccompPolicy, String> {
             let lists = match self {
-                SeccompProfile::Curated => return Ok(SeccompPolicy::Curated),
+                SeccompProfile::Curated => SeccompLists {
+                    curated: true,
+                    ..SeccompLists::default()
+                },
                 SeccompProfile::Lists(lists) => lists,
             };
             Ok(SeccompPolicy::Rules(lists.into_rules()?))
@@ -2643,7 +2707,9 @@ pub(crate) mod serde_request {
         /// denylist.
         fn from_policy(policy: &SeccompPolicy) -> Result<SeccompProfile, String> {
             match policy {
-                SeccompPolicy::Curated => Ok(SeccompProfile::Curated),
+                SeccompPolicy::Rules(rules) if rules.is_plain_curated() => {
+                    Ok(SeccompProfile::Curated)
+                }
                 SeccompPolicy::Rules(rules) => {
                     Ok(SeccompProfile::Lists(SeccompLists::from_rules(rules)?))
                 }
@@ -2660,8 +2726,13 @@ pub(crate) mod serde_request {
         /// sets both sides, or neither, is rejected.
         fn into_rules(self) -> Result<SeccompRules, String> {
             let allow_side = !self.allow.is_empty() || !self.allow_rule.is_empty();
-            let deny_side = !self.deny.is_empty() || !self.deny_rule.is_empty();
+            let deny_side = self.curated || !self.deny.is_empty() || !self.deny_rule.is_empty();
             let (mut rules, rule_profiles) = match (allow_side, deny_side) {
+                (true, true) if self.curated => {
+                    return Err("the curated roster is a deny side, which an allow side \
+                                cannot extend"
+                        .to_string());
+                }
                 (true, true) => {
                     return Err(
                         "a seccomp profile cannot set both an allow and a deny side".to_string()
@@ -2669,19 +2740,27 @@ pub(crate) mod serde_request {
                 }
                 (false, false) if self.errno.is_empty() => {
                     return Err("a seccomp table lists no syscalls; set allow, allow-rule, \
-                                deny, deny-rule, or errno"
+                                deny, deny-rule, errno, or curated"
                         .to_string());
                 }
                 (true, false) => (
                     SeccompRules::allowing(resolve_syscalls(&self.allow)?),
                     self.allow_rule,
                 ),
-                // The deny side, including a table whose only entries are
-                // errnos: what those do is refuse, and everything else runs.
-                (false, _) => (
-                    SeccompRules::denying(resolve_syscalls(&self.deny)?),
-                    self.deny_rule,
-                ),
+                // The deny side, the curated roster's or the table's own,
+                // including a table whose only entries are errnos: what those
+                // do is refuse, and everything else runs.
+                (false, _) => {
+                    let base = match self.curated {
+                        true => SeccompRules::curated(),
+                        false => SeccompRules::denying([]),
+                    };
+                    let denied = resolve_syscalls(&self.deny)?;
+                    let rules = denied
+                        .into_iter()
+                        .fold(base, |rules, syscall| rules.rule(syscall, []));
+                    (rules, self.deny_rule)
+                }
             };
             for profile in rule_profiles {
                 let syscall = resolve_syscall(&profile.syscall)?;
@@ -2717,13 +2796,15 @@ pub(crate) mod serde_request {
                 .map(|(&syscall, &errno)| Ok((name_syscall(syscall)?, name_errno(errno)?)))
                 .collect::<Result<BTreeMap<_, _>, String>>()?;
             // A table that answers syscalls with an errno and lists none reads
-            // back as a denylist, so that one shape is representable.
+            // back as a denylist, so that one shape is representable, and so
+            // does the curated roster with no listing of the caller's.
             if rules.rules.is_empty()
-                && !errno.is_empty()
+                && (!errno.is_empty() || rules.curated)
                 && rules.default_action == SeccompAction::Allow
                 && rules.listed_action == SeccompAction::Errno(EPERM)
             {
                 return Ok(SeccompLists {
+                    curated: rules.curated,
                     errno,
                     ..SeccompLists::default()
                 });
@@ -2750,17 +2831,22 @@ pub(crate) mod serde_request {
             }
             match (rules.default_action, rules.listed_action) {
                 (SeccompAction::Allow, SeccompAction::Errno(EPERM)) => Ok(SeccompLists {
+                    curated: rules.curated,
                     deny: bare,
                     deny_rule: rule_profiles,
                     errno,
                     ..SeccompLists::default()
                 }),
-                (SeccompAction::Errno(EPERM), SeccompAction::Allow) => Ok(SeccompLists {
-                    allow: bare,
-                    allow_rule: rule_profiles,
-                    errno,
-                    ..SeccompLists::default()
-                }),
+                // The curated roster is a deny side, so rules that start from it
+                // and allow what they list have no table to say so.
+                (SeccompAction::Errno(EPERM), SeccompAction::Allow) if !rules.curated => {
+                    Ok(SeccompLists {
+                        allow: bare,
+                        allow_rule: rule_profiles,
+                        errno,
+                        ..SeccompLists::default()
+                    })
+                }
                 _ => Err(
                     "a seccomp policy with custom actions cannot be represented in a profile"
                         .to_string(),
@@ -3139,7 +3225,7 @@ mod tests {
 
     #[test]
     fn curated_profile_compiles() {
-        let program = compile_seccomp(&SeccompPolicy::Curated).unwrap();
+        let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated())).unwrap();
         assert!(!program.is_empty());
     }
 
@@ -3178,7 +3264,7 @@ mod tests {
     fn a_denylist_is_prefixed_with_the_x32_guard_on_x86_64() {
         // A denylist (permissive default) is bypassable through the x32 ABI, so
         // the compiled program must begin with the guard denying that range.
-        let program = compile_seccomp(&SeccompPolicy::Curated).unwrap();
+        let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated())).unwrap();
         let guard = x32_deny_prologue();
         assert!(program.len() > guard.len());
         assert_eq!(&program[..guard.len()], &guard[..]);
@@ -3268,8 +3354,50 @@ mod tests {
     }
 
     #[test]
+    fn the_curated_roster_extended_refuses_its_own_entries_and_the_added_ones() {
+        const AF_INET: u64 = libc::AF_INET as u64;
+        let rules = SeccompRules::curated()
+            .rule(libc::SYS_socket, [SeccompArg::eq_dword(0, AF_INET)])
+            .rule(libc::SYS_sethostname, [])
+            .errno_for(libc::SYS_io_uring_setup, ENOSYS);
+        let program = compile_seccomp(&SeccompPolicy::Rules(rules)).unwrap();
+        let eperm = ret_value(SeccompAction::Errno(EPERM));
+        let enosys = ret_value(SeccompAction::Errno(ENOSYS));
+        let allow = ret_value(SeccompAction::Allow);
+        let answer = |syscall: i64, args: &[u64]| eval::run(&program, &host_call(syscall, args));
+
+        // The roster's own entries, plain, by argument, and its errno.
+        assert_eq!(answer(libc::SYS_mount, &[]), eperm);
+        assert_eq!(answer(libc::SYS_ioctl, &[0, TIOCSTI]), eperm);
+        assert_eq!(answer(libc::SYS_clone3, &[0, 88]), enosys);
+        // The caller's additions.
+        assert_eq!(answer(libc::SYS_socket, &[AF_INET]), eperm);
+        assert_eq!(answer(libc::SYS_sethostname, &[]), eperm);
+        // The caller's errno answers a syscall the roster lists, and leaves
+        // the roster's other io_uring entries as they were.
+        assert_eq!(answer(libc::SYS_io_uring_setup, &[]), enosys);
+        assert_eq!(answer(libc::SYS_io_uring_enter, &[]), eperm);
+        // What neither lists runs.
+        assert_eq!(answer(libc::SYS_socket, &[libc::AF_UNIX as u64]), allow);
+        assert_eq!(answer(libc::SYS_getpid, &[]), allow);
+    }
+
+    #[test]
+    fn a_syscall_the_caller_lists_and_answers_is_refused_over_the_roster_too() {
+        // The roster yields to the caller's errno, but the caller's own listing
+        // and errno for one syscall still contradict each other.
+        let rules = SeccompRules::curated()
+            .rule(libc::SYS_sethostname, [])
+            .errno_for(libc::SYS_sethostname, ENOSYS);
+        assert!(matches!(
+            compile_seccomp(&SeccompPolicy::Rules(rules)),
+            Err(ConfigError::SeccompInvalid { .. })
+        ));
+    }
+
+    #[test]
     fn the_curated_policy_denies_creating_a_namespace() {
-        let program = compile_seccomp(&SeccompPolicy::Curated).unwrap();
+        let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated())).unwrap();
         let eperm = ret_value(SeccompAction::Errno(EPERM));
         let allow = ret_value(SeccompAction::Allow);
         let sigchld = libc::SIGCHLD as u64;
@@ -3352,7 +3480,7 @@ mod tests {
 
     #[test]
     fn seccomp_policies_report_whether_they_restrict() {
-        assert!(SeccompPolicy::Curated.restricts());
+        assert!(SeccompPolicy::Rules(SeccompRules::curated()).restricts());
         assert!(SeccompPolicy::Rules(SeccompRules::denying([libc::SYS_ptrace])).restricts());
         // An allowlist denies every unlisted syscall, so it restricts even when
         // it lists nothing.
@@ -3377,7 +3505,7 @@ mod tests {
         assert!(empty.is_unrestricted());
         // The curated policy, which does deny, counts.
         let mut curated = Request::default();
-        curated.set_seccomp(SeccompPolicy::Curated);
+        curated.set_seccomp(SeccompPolicy::Rules(SeccompRules::curated()));
         assert!(!curated.is_unrestricted());
     }
 
@@ -3505,10 +3633,10 @@ mod tests {
     /// snapshot the change moved it out of.
     #[test]
     fn a_seccomp_policy_clones() {
-        let program =
-            compile_seccomp(&SeccompPolicy::Curated).expect("the curated policy compiles");
+        let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated()))
+            .expect("the curated policy compiles");
         for policy in [
-            SeccompPolicy::Curated,
+            SeccompPolicy::Rules(SeccompRules::curated()),
             SeccompPolicy::Rules(SeccompRules::denying([libc::SYS_ptrace])),
             SeccompPolicy::Program(program),
         ] {
@@ -4023,6 +4151,85 @@ errno = { clone3 = "enosys" }
         let written = toml::to_string(&builder).unwrap();
         assert!(written.contains("clone3 = \"ENOSYS\""), "{written}");
         assert!(!written.contains("allow"), "{written}");
+    }
+
+    /// The seccomp policy a profile's `[hardening.seccomp]` value reads as, and
+    /// the profile it writes back.
+    fn seccomp_round_trip(value: &str) -> (crate::SeccompPolicy, String) {
+        let profile =
+            format!("rootfs = \"/r\"\ncommand = \"/c\"\n[hardening]\nseccomp = {value}\n");
+        let builder: CageBuilder = toml::from_str(&profile).expect("the profile parses");
+        let written = toml::to_string(&builder).expect("the profile serializes");
+        let policy = builder.get_seccomp().expect("a policy").clone();
+        (policy, written)
+    }
+
+    #[test]
+    fn the_curated_roster_reads_and_writes_by_name() {
+        use crate::{SeccompPolicy, SeccompRules};
+
+        // The string, and the table naming the roster and nothing else, are
+        // the plain roster, which writes back as the string.
+        for value in ["\"curated\"", "{ curated = true }"] {
+            let (policy, written) = seccomp_round_trip(value);
+            let SeccompPolicy::Rules(rules) = policy else {
+                panic!("the curated roster is a rule set");
+            };
+            assert_eq!(
+                format!("{rules:?}"),
+                format!("{:?}", SeccompRules::curated())
+            );
+            assert!(written.contains("seccomp = \"curated\""), "{written}");
+        }
+
+        // An extended roster writes the table, naming the roster rather than
+        // listing it, so a later release's additions reach the profile.
+        let (policy, written) = seccomp_round_trip(
+            "{ curated = true, deny = [\"sethostname\"], errno = { io_uring_setup = \"ENOSYS\" } }",
+        );
+        assert_eq!(
+            format!("{policy:?}"),
+            format!(
+                "{:?}",
+                SeccompPolicy::Rules(
+                    SeccompRules::curated()
+                        .rule(libc::SYS_sethostname, [])
+                        .errno_for(libc::SYS_io_uring_setup, libc::ENOSYS as u16)
+                )
+            )
+        );
+        assert!(written.contains("curated = true"), "{written}");
+        assert!(written.contains("deny = [\"sethostname\"]"), "{written}");
+        assert!(
+            !written.contains("mount"),
+            "the roster was listed out: {written}"
+        );
+        let reread: CageBuilder = toml::from_str(&written).expect("it reads back");
+        assert_eq!(toml::to_string(&reread).unwrap(), written);
+    }
+
+    #[test]
+    fn the_curated_roster_is_a_deny_side_only() {
+        use crate::{SeccompAction, SeccompPolicy, SeccompRules};
+
+        let profile = "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening.seccomp]\n\
+                       curated = true\nallow = [\"read\"]\n";
+        let err = toml::from_str::<CageBuilder>(profile).unwrap_err();
+        assert!(err.to_string().contains("curated roster"), "{err}");
+
+        // Rules that start from the roster and change its actions have no
+        // table to say so, and are refused rather than written as a plain list.
+        for rules in [
+            SeccompRules::curated().listed_action(SeccompAction::KillProcess),
+            SeccompRules::curated()
+                .default_action(SeccompAction::Errno(1))
+                .listed_action(SeccompAction::Allow),
+        ] {
+            let builder = CageBuilder::default()
+                .rootfs("/r")
+                .seccomp(SeccompPolicy::Rules(rules));
+            assert!(toml::to_string(&builder).is_err());
+        }
     }
 
     #[test]
