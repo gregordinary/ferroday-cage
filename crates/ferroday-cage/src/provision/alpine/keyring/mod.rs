@@ -21,8 +21,9 @@
 //! Alpine does not sign every architecture with one key. `alpine-keys` installs
 //! three keys on x86_64, two entirely different ones on aarch64, two more on
 //! armv7, and so on: eighteen distinct keys across ten architectures, with only
-//! the two oldest serving more than one. A signature made for x86_64 does not
-//! verify on an aarch64 root under `apk`, and it does not here either.
+//! two of them serving more than one, `4a6a0840` for x86 and x86_64 and
+//! `524d27bb` for armhf and armv7. A signature made for x86_64 does not verify
+//! on an aarch64 root under `apk`, and it does not here either.
 //!
 //! [`ALPINE`] mirrors that partition rather than flattening it, and mirrors it
 //! mechanically: it is the `usr/share/apk/keys/<architecture>/` tree of the
@@ -31,9 +32,16 @@
 //! count, which is a rule a later reader can check rather than a judgement they
 //! would have to reconstruct.
 //!
-//! Alpine rotates its signing key per release and keeps the superseded ones in
-//! that package, so an architecture's set spans every release the archive still
-//! serves rather than only the current one.
+//! # One key signs many releases
+//!
+//! Alpine does not rotate its keys per release. One key per architecture signs
+//! every release over years: on x86_64, `4a6a0840` signs v3.0 through v3.14,
+//! and `6165ee59` every release since v3.15 and `edge`. `alpine-keys` keeps the
+//! superseded keys, so an architecture's set verifies every release the archive
+//! still serves rather than only the current one. It follows that a verified
+//! signature does not say which release an index belongs to. That binding is
+//! the index's own signed `DESCRIPTION`, which [`release`](super::release)
+//! checks.
 
 mod spki;
 
@@ -54,6 +62,21 @@ pub(super) struct Bundled {
     pub(super) pem: &'static str,
 }
 
+/// The prefix of every key name Alpine publishes, as a literal the macros below
+/// can join onto.
+///
+/// [`ALPINE_KEY_PREFIX`] is the same text as a value; this is the one spelling
+/// of it.
+macro_rules! alpine_key_prefix {
+    () => {
+        "alpine-devel@lists.alpinelinux.org-"
+    };
+}
+
+/// The prefix every key Alpine publishes carries in its name, followed by the
+/// hexadecimal stem that tells the keys apart.
+const ALPINE_KEY_PREFIX: &str = alpine_key_prefix!();
+
 /// One Alpine key of the bundle, named by the hexadecimal stem `alpine-keys`
 /// publishes it under.
 ///
@@ -63,14 +86,21 @@ pub(super) struct Bundled {
 macro_rules! alpine_key {
     ($stem:literal) => {
         Bundled {
-            name: concat!("alpine-devel@lists.alpinelinux.org-", $stem, ".rsa.pub"),
-            pem: include_str!(concat!(
-                "alpine-devel@lists.alpinelinux.org-",
-                $stem,
-                ".rsa.pub"
-            )),
+            name: concat!(alpine_key_prefix!(), $stem, ".rsa.pub"),
+            pem: include_str!(concat!(alpine_key_prefix!(), $stem, ".rsa.pub")),
         }
     };
+}
+
+/// Whether `name` is the name of a key Alpine publishes, bundled or not.
+///
+/// Read off the name rather than the bundle, so a key Alpine published after
+/// this crate's release and a caller added with [`KeySet::insert`] counts too.
+/// A signature names the key that made it, and verifying it against the set's
+/// key of that name is what makes the name trustworthy here: an index this
+/// answers for verified under a key held under Alpine's name.
+pub(super) fn is_alpine(name: &str) -> bool {
+    name.starts_with(ALPINE_KEY_PREFIX)
 }
 
 /// The Alpine signing keys the crate bundles, by the architecture each serves.
@@ -181,10 +211,10 @@ impl KeySet {
     ///
     /// Alpine does not sign every architecture with one key: `alpine-keys`
     /// installs three keys on x86_64, two entirely different ones on aarch64,
-    /// two more on armv7, and so on, with only the two oldest of the eighteen
-    /// serving more than one architecture. A signature made for x86_64 does not
-    /// verify on an aarch64 root under `apk`, and it does not here either, so
-    /// this is the set for one architecture rather than the whole bundle.
+    /// two more on armv7, and so on, with only two of the eighteen serving more
+    /// than one architecture. A signature made for x86_64 does not verify on an
+    /// aarch64 root under `apk`, and it does not here either, so this is the
+    /// set for one architecture rather than the whole bundle.
     ///
     /// `architecture` is the repository's, so it is always a real one —
     /// `noarch` is a property of a package rather than an archive a set can be
@@ -336,9 +366,9 @@ mod tests {
 
     #[test]
     fn the_architecture_partitions_are_all_but_disjoint() {
-        // The partition this bundle mirrors. Only the two oldest keys serve
-        // more than one architecture, so an x86_64 signature does not verify on
-        // an aarch64 root.
+        // The partition this bundle mirrors. Only two keys serve more than one
+        // architecture, x86's and x86_64's oldest and armhf's and armv7's, so
+        // an x86_64 signature does not verify on an aarch64 root.
         let x86_64 = KeySet::alpine("x86_64").expect("x86_64 is in the bundle");
         let aarch64 = KeySet::alpine("aarch64").expect("aarch64 is in the bundle");
         assert!(
@@ -366,7 +396,7 @@ mod tests {
                 "alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub",
                 "alpine-devel@lists.alpinelinux.org-524d27bb.rsa.pub",
             ],
-            "only the two oldest keys serve more than one architecture",
+            "only these two keys serve more than one architecture",
         );
     }
 
@@ -411,6 +441,19 @@ mod tests {
             .expect("a well-formed key is accepted");
         assert_eq!(set.names().count(), bundled + 1);
         assert!(set.names().any(|name| name == "mine.rsa.pub"));
+    }
+
+    #[test]
+    fn every_bundled_alpine_key_is_named_as_alpine_publishes_it() {
+        // The release binding is keyed on this: an index a key of this name
+        // verified is one Alpine's builders signed.
+        for (architecture, keys) in ALPINE {
+            for key in *keys {
+                assert!(is_alpine(key.name), "{architecture}: {}", key.name);
+            }
+        }
+        assert!(!is_alpine(POSTMARKETOS.name));
+        assert!(!is_alpine("build@example.com-64f0c0a1.rsa.pub"));
     }
 
     #[test]

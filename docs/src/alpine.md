@@ -257,11 +257,13 @@ Installed-Size: 622592
 ```
 
 An index's stanza records what an apk repository can be pinned to and no more.
-There is no `Date` and no `Valid-Until`, because the format carries neither;
-`Description` is the archive's own build string, recorded as a fact about the
-publication rather than read for meaning. `Component` is absent rather than empty
-for the componentless layout, a repository that publishes no component and one
-that publishes an unnamed one not being the same repository.
+There is no `Date` and no `Valid-Until`, because the format carries neither.
+`Description` is the archive's own build string. For an index Alpine signed, it
+is what binds the index to its release, as [What binds an index to its
+release](#what-binds-an-index-to-its-release) describes. Another publisher's is
+recorded and not read. `Component` is absent rather than empty for the componentless
+layout, a repository that publishes no component and one that publishes an
+unnamed one not being the same repository.
 
 `Size`, `Installed-Size` and `Origin` are optional. `Origin` names the source
 package a package was split from and is absent for the common case of a source
@@ -406,7 +408,10 @@ and the database is written through it.
 Authenticity comes from the archive's own signatures, not the transport, so
 packages are fetched over plain HTTP by default. Both archives this layer is
 written against serve it, and an `https://` mirror needs a transport of the
-caller's own supplied through `fetcher`.
+caller's own supplied through `fetcher`. The signatures do not cover every
+substitution a plain-HTTP path allows. [What binds an index to its
+release](#what-binds-an-index-to-its-release) says which remain, and where an
+`https://` transport is the remedy.
 
 The chain has three links, and it is worth stating plainly because two of them
 rest on SHA-1:
@@ -448,6 +453,45 @@ trust anchor, while each of its packages is signed by whichever per-builder key
 made it. `apk` installs them from the index and refuses the same file offered as
 a bare `apk add ./file.apk`, where no index vouches for it.
 
+### What binds an index to its release
+
+A signature names the key that made it, not the release it was made for. Alpine
+signs every release of an architecture with one key for years. On
+x86_64, one key signed v3.0 through v3.14, and another has signed every release
+since v3.15 and `edge`. So before an index is read, the layer holds it to the
+release it was fetched as, through the `DESCRIPTION` member its signature
+covers. Alpine's builders write `git describe` of the tree the index was built
+from there, such as `v3.23.8-18-g133b733e65d`:
+
+- An index fetched as `vX.Y` must describe a release of `X.Y`.
+- One fetched as `edge` must describe a snapshot, a pre-release, or a
+  release's `.0`. Point releases are tagged on their stable branch alone.
+- One fetched as `latest-stable` must describe some release.
+- Any other release name is refused, since Alpine publishes under no other.
+
+A mirror that answers `v3.23` with a genuine index of an older release, or of
+`edge`, fails with `AlpineError::Index`. The error names what the index describes
+itself as.
+
+The description cannot tell every substitution apart:
+
+- It names no component, so `community` served for `main` verifies. What it
+  offers is still exactly what that index names.
+- After a release, `edge` describes itself by the release's `.0` tag until the
+  development branch is next tagged, which can take months. The release's own
+  indexes describe themselves the same way until its first point release.
+- `latest-stable` binds to a stable release, not to which one.
+- postmarketOS describes an index by the time it was built, so nothing binds a
+  postmarketOS index to its release at all.
+
+An `https://` transport to a trusted mirror, supplied through `fetcher`, keeps
+these substitutions off the path. For postmarketOS it is the only protection
+there is, and the recommended configuration.
+
+The rule binds the indexes a key of Alpine's verifies and no others. A
+repository of the caller's own writes whatever its signer chose there, and is
+not held to it.
+
 ### The keyring
 
 The bundled key set is the whole trust anchor for the repository it is attached
@@ -462,9 +506,10 @@ A caller who needs a different answer sooner assembles a set with
 
 The bundle is partitioned by architecture, because Alpine is: `alpine-keys`
 installs three keys on x86_64, two entirely different ones on aarch64, two more
-on armv7, and so on — eighteen keys across ten architectures, with only the two
-oldest serving more than one. An x86_64 signature does not verify on an aarch64
-root under `apk`, and it does not here. [`KeySet::alpine`] takes the architecture
+on armv7, and so on. That is eighteen keys across ten architectures, and only two
+of them serve more than one: x86 and x86_64 share one, armhf and armv7 another.
+An x86_64 signature does not verify on an aarch64 root under `apk`, and it does
+not here. [`KeySet::alpine`] takes the architecture
 for that reason, and the bundle mirrors that package's own key tree rather than
 selecting from it.
 
@@ -512,7 +557,10 @@ held to.
 There is no equivalent of `allow_stale_release` either, because there is nothing
 to be stale against. The apk index carries no validity window and no date — its
 `DESCRIPTION` member is a build string, not a signed expiry — so a freshness rule
-would be this layer's fiction rather than the archive's policy.
+would be this layer's fiction rather than the archive's policy. The release
+binding refuses another release's index, not an older index of the same one: a
+mirror can still serve a superseded `v3.23` index, and the packages it names. An
+`https://` transport to a trusted mirror closes that too.
 
 The same reasoning is why **the index is never cached**. A cache would need a
 staleness rule the format does not express. `cache_dir` holds packages, which are
@@ -591,11 +639,12 @@ Everything in this table is a difference the archives make, not a gap:
 | Signed thing | `InRelease`, which carries the indexes' digests | The index itself; there is nothing above it |
 | Digest chain | SHA-256 throughout | SHA-1 to the control segment, SHA-256 to the file tree |
 | Trust anchor | An OpenPGP keyring, with expiry and revocation | A set of bare RSA keys, with neither, partitioned by architecture |
+| Release binding | `Suite` or `Codename` in the signed release | The signed `DESCRIPTION` of an index Alpine signed, and nothing for postmarketOS |
 | Unsigned mode | `trust_unsigned`, for a local pool | None; a private repository signs its index |
 | Freshness | `Valid-Until`, and `allow_stale_release` to relax it | None; the format expresses no validity window |
 | Package identity | A SHA-256 of the whole file, from the index | A SHA-1 of the control segment, plus `datahash` over the tree |
 | Extract-only | Files only; no configured database | Files *and* the installed database |
-| Configuration | `dpkg` runs in a cage | The install scripts run directly, in dependency order |
+| Configuration | `dpkg` runs in a sandbox | Each package's install scripts run in a sandbox, in dependency order |
 
 ## The command line
 

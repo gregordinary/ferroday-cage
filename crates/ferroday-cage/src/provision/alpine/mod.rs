@@ -48,6 +48,7 @@ mod layer;
 mod pin;
 mod pkginfo;
 mod plan;
+mod release;
 mod repository;
 mod resolve;
 mod sign;
@@ -1334,7 +1335,8 @@ fn read_index(
     )
 }
 
-/// Verifies an index container and reads the records it carries.
+/// Verifies an index container, holds it to the release it was fetched as, and
+/// reads the records it carries.
 ///
 /// `url` names where it came from, for the errors.
 fn parse_index(
@@ -1370,13 +1372,21 @@ fn parse_index(
         .ok_or_else(|| AlpineError::index(url, "its signed segment carries no APKINDEX member"))?;
     let text = std::str::from_utf8(&records.data)
         .map_err(|err| AlpineError::index(url, format!("its records are not UTF-8: {err}")))?;
-    // Whatever the repository chose to write there, kept as a fact about the
-    // publication rather than read for meaning: Alpine writes a build string and
-    // postmarketOS a timestamp, and the format defines neither.
+    // Whatever the repository chose to write there: Alpine writes `git
+    // describe` of the tree the index was built from, postmarketOS a timestamp,
+    // and the format defines neither. Alpine's is what binds the index to the
+    // release it was fetched as, since one key signs many releases; the record
+    // keeps whatever was written.
     let description = metadata
         .member("DESCRIPTION")
         .map(|member| String::from_utf8_lossy(&member.data).trim().to_string())
         .filter(|description| !description.is_empty());
+    release::check(
+        url,
+        repository.release(),
+        &metadata.signed_by,
+        description.as_deref(),
+    )?;
     Ok((
         index::parse(url, text, from)?,
         metadata.signed_by,
@@ -2511,10 +2521,15 @@ pub enum AlpineError {
         /// The digest the bytes actually have.
         actual: String,
     },
-    /// An index's records are not the ones the format defines.
+    /// An index is not one a resolution can read: its records are not the ones
+    /// the format defines, or it is not an index of the release it was fetched
+    /// as.
     ///
     /// The container held together and its signature verified; what it carries
-    /// is not a readable set of records.
+    /// is not a readable set of records, or its signed `DESCRIPTION` names
+    /// another release. Alpine signs every release of an architecture with one
+    /// key, so the description is what tells a requested release from another
+    /// one a mirror served in its place.
     #[non_exhaustive]
     Index {
         /// The URL of the index.
@@ -2998,6 +3013,81 @@ mod tests {
                 "http://mirror.invalid/alpine/v3.23/main/x86_64/APKINDEX.tar.gz",
                 "http://mirror.invalid/pmos/v26.06/x86_64/APKINDEX.tar.gz",
             ],
+        );
+    }
+
+    /// A transport serving `index` at `release`'s `main` index and nothing else.
+    fn serving(release: &str, index: &[u8]) -> Canned {
+        Canned(HashMap::from([(
+            format!("http://mirror.invalid/alpine/{release}/main/x86_64/APKINDEX.tar.gz"),
+            index.to_vec(),
+        )]))
+    }
+
+    #[test]
+    fn a_genuine_index_of_another_release_is_refused() {
+        // Alpine's v3.23 index, verified by the key that signs every release
+        // since v3.15, served where another release was asked for. Its signature
+        // verifies; its own DESCRIPTION is what says it is not that release.
+        for release in ["v3.22", "v3.24", "edge"] {
+            let mut alpine = Alpine::builder(release)
+                .architecture("x86_64")
+                .mirror("http://mirror.invalid/alpine")
+                .fetcher(serving(release, fixtures::INDEX))
+                .build()
+                .expect("the bootstrap configures");
+            let err = alpine
+                .available()
+                .expect_err("the index is not this release's");
+            let AlpineError::Index { subject, reason } = &err else {
+                panic!("{release}: expected an index refusal, got {err:?}");
+            };
+            assert!(subject.contains(&format!("/{release}/main/")), "{subject}");
+            assert!(reason.contains("v3.23.5-112-gd78b27bd62b"), "{reason}");
+            assert!(reason.contains(release), "{reason}");
+        }
+
+        // The same bytes as the release they are, and as the name the archive
+        // also publishes its newest stable release under.
+        for release in ["v3.23", "latest-stable"] {
+            let mut alpine = Alpine::builder(release)
+                .architecture("x86_64")
+                .mirror("http://mirror.invalid/alpine")
+                .fetcher(serving(release, fixtures::INDEX))
+                .build()
+                .expect("the bootstrap configures");
+            let available = alpine.available().expect("the index is this release's");
+            assert!(available.contains("busybox"), "{release}");
+        }
+    }
+
+    #[test]
+    fn a_postmarketos_index_is_not_bound_to_a_release() {
+        // postmarketOS describes an index by the time it was built, which names
+        // no release, so its v26.06 index verifies wherever it is served. This
+        // is the gap an `https://` transport closes, and the test records it.
+        let elsewhere = Repository::builder("v25.12")
+            .mirror("http://mirror.invalid/pmos")
+            .keys(KeySet::postmarketos())
+            .build()
+            .expect("the repository validates");
+        let mut fetcher = canned();
+        fetcher.0.insert(
+            "http://mirror.invalid/pmos/v25.12/x86_64/APKINDEX.tar.gz".to_string(),
+            fixtures::POSTMARKETOS_INDEX.to_vec(),
+        );
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .repository(elsewhere)
+            .fetcher(fetcher)
+            .build()
+            .expect("the bootstrap configures");
+        assert!(
+            alpine
+                .available()
+                .expect("nothing binds a postmarketOS index")
+                .contains("postmarketos-baselayout"),
         );
     }
 

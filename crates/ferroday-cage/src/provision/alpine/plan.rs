@@ -145,11 +145,12 @@ pub struct ResolvedIndex {
     /// The index's `DESCRIPTION` member, as written, when it carries one.
     ///
     /// A build string rather than a date or a validity window: Alpine writes
-    /// something of the form `v3.23.5-111-g2a2e55ba802` and postmarketOS an ISO
-    /// timestamp. It is recorded because it is the only thing an index says
-    /// about which publication it is, and it is *not* a freshness signal — it
-    /// is covered by the signature but means whatever the repository chose it
-    /// to mean.
+    /// `git describe` of the tree the index was built from, of the form
+    /// `v3.23.5-111-g2a2e55ba802`, and postmarketOS an ISO timestamp. It is the
+    /// only thing an index says about which publication it is, and it is *not*
+    /// a freshness signal. An index Alpine signed is held to describe the
+    /// release it was fetched as before it is read; what another publisher
+    /// writes here is recorded and not read.
     pub description: Option<String>,
     /// Fields this index's stanza carried that this version does not know.
     ///
