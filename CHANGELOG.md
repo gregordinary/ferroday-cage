@@ -674,6 +674,9 @@ consumer upgrading can skip it.
   `stage_layer` into it hold gigabytes. Holding a replayed plan to the root it
   lands in is bounded as a resolution is, and refused where it reaches the
   bound.
+- `fcage --gentoo-packages` without `--gentoo-binhost`, and `fcage
+  --export-rootfs` given an empty value, are usage errors and exit 2, as the
+  other modes' missing and empty values are. Each ran and failed with 125.
 
 ### Internal
 

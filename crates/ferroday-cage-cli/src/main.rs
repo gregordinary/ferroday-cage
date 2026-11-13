@@ -2479,7 +2479,7 @@ enum Invocation {
         architecture: String,
         /// The sub-architecture tree, which has no default: nothing signed
         /// enumerates them.
-        binhost: Option<String>,
+        binhost: String,
         mirror: Option<String>,
         fallbacks: Vec<String>,
     },
@@ -3010,12 +3010,7 @@ fn main() -> ExitCode {
             binhost,
             mirror,
             fallbacks,
-        }) => gentoo_packages(
-            &architecture,
-            binhost.as_deref(),
-            mirror.as_deref(),
-            &fallbacks,
-        ),
+        }) => gentoo_packages(&architecture, &binhost, mirror.as_deref(), &fallbacks),
         Ok(Invocation::GentooInstalled { root }) => gentoo_installed(&root),
         Ok(Invocation::GentooKeyring) => gentoo_keyring_horizon(),
         Ok(Invocation::Export {
@@ -3810,6 +3805,9 @@ fn parse_gentoo_keyring(args: Vec<OsString>) -> Result<Invocation, String> {
 /// architecture, the sub-architecture tree, and where to read them from. As
 /// with the other listing modes, every other flag configures a launch that does
 /// not happen here.
+///
+/// The tree has no default, so a listing without `--gentoo-binhost` is refused
+/// here, as the usage error it is, rather than by the layer once it runs.
 fn parse_gentoo_packages(args: Vec<OsString>) -> Result<Invocation, String> {
     if let Some(answer) = help_or_version(&args) {
         return Ok(answer);
@@ -3844,15 +3842,19 @@ fn parse_gentoo_packages(args: Vec<OsString>) -> Result<Invocation, String> {
             ));
         }
     }
-    match architecture {
-        Some(architecture) => Ok(Invocation::GentooPackages {
-            architecture,
-            binhost,
-            mirror,
-            fallbacks,
-        }),
-        None => Err("--gentoo-packages requires a value".to_string()),
-    }
+    let architecture =
+        architecture.ok_or_else(|| "--gentoo-packages requires a value".to_string())?;
+    let binhost = binhost.ok_or_else(|| {
+        "--gentoo-packages requires --gentoo-binhost to name the sub-architecture tree to list; \
+         nothing signed enumerates the trees, so there is no default"
+            .to_string()
+    })?;
+    Ok(Invocation::GentooPackages {
+        architecture,
+        binhost,
+        mirror,
+        fallbacks,
+    })
 }
 
 /// Parses a `--gentoo-installed` command line, excluding the program name.
@@ -3904,7 +3906,7 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
 
     while let Some(arg) = args.next() {
         if let Some(value) = mode_value("--export-rootfs", &arg, &mut args)? {
-            source = Some(PathBuf::from(value));
+            source = Some(tree_value("--export-rootfs", value)?);
         } else if let Some(value) = mode_value("--export-to", &arg, &mut args)? {
             dest = Some(PathBuf::from(value));
         } else if let Some(value) = mode_value("--identity-map", &arg, &mut args)? {
@@ -6848,7 +6850,7 @@ fn gentoo_variants(
 /// Prints what the binhost publishes: every package name and its versions.
 fn gentoo_packages(
     architecture: &str,
-    binhost: Option<&str>,
+    binhost: &str,
     mirror: Option<&str>,
     fallbacks: &[String],
 ) -> ExitCode {
@@ -6857,10 +6859,7 @@ fn gentoo_packages(
     // Configured exactly as a provisioning run configures the same layer, so a
     // command line that lists what a binhost offers and one that installs from
     // it read the same archive.
-    let mut builder = Gentoo::builder(architecture);
-    if let Some(binhost) = binhost {
-        builder = builder.binhost(binhost);
-    }
+    let mut builder = Gentoo::builder(architecture).binhost(binhost);
     if let Some(mirror) = mirror {
         builder = builder.mirror(mirror);
     }
@@ -7562,7 +7561,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(architecture, "amd64");
-                assert_eq!(binhost.as_deref(), Some("x86-64"));
+                assert_eq!(binhost, "x86-64");
             }
             _ => panic!("expected a binhost listing"),
         }
@@ -7578,6 +7577,13 @@ mod tests {
         assert!(error.contains("--gentoo-installed"), "{error}");
         // And each requires its value.
         assert!(parse_error(&["--gentoo-installed"]).contains("requires a value"));
+        // The binhost tree has no default, so a listing that names none is the
+        // usage error it is rather than a run the layer refuses.
+        let error = parse_error(&["--gentoo-packages", "amd64"]);
+        assert!(
+            error.contains("--gentoo-packages requires --gentoo-binhost"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -8806,6 +8812,12 @@ mod tests {
     #[test]
     fn export_rootfs_requires_a_source_and_a_well_formed_ceiling() {
         assert!(parse_args(&["--export-rootfs"]).is_err());
+        // An empty source is what an unset variable expands to, refused as a
+        // removal's and a listing's empty tree is, in either form.
+        for args in [["--export-rootfs", ""].as_slice(), &["--export-rootfs="]] {
+            let error = parse_error(args);
+            assert!(error.contains("an empty value"), "{args:?}: {error}");
+        }
         assert!(parse_args(&["--export-rootfs", "/roots/a", "--export-to"]).is_err());
         for bad in ["yesterday", "1.5", ""] {
             assert!(
