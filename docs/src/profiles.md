@@ -552,11 +552,12 @@ it:
   flags that set a posture replace its scopes, unix-socket restriction,
   capability posture, or seccomp policy.
   `--seccomp-errno` joins the policy that stands instead, the flags' or else the
-  profile's. The seccomp flags mirror the profile's seccomp table, so a rule reads
-  the same on a flag as in the table.
+  profile's. The seccomp flags mirror the profile's seccomp table.
   `--seccomp-allow` and `--seccomp-deny` take comma-separated syscall names.
   `--seccomp-allow-rule` and `--seccomp-deny-rule` take a syscall name with
-  `arg`/`len`/`op`/`value`/`mask` conditions, and `--seccomp-errno` takes
+  conditions in the `len`, `op`, `value` and `mask` of the table's `arg`
+  entries, and the argument's `index` written `arg=`, as in `--seccomp-allow-rule
+  'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno` takes
   `SYSCALL=ERRNO`.
 
 ```sh

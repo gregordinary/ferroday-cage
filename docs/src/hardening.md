@@ -739,8 +739,9 @@ On the command line, `--landlock-ro` and `--landlock-rw` add filesystem grants,
 roster, which the deny flags extend, and `--seccomp-allow` and `--seccomp-deny`
 filter syscalls by name.
 `--seccomp-allow-rule` and `--seccomp-deny-rule` add argument conditions in the
-profile's `arg`/`len`/`op`/`value` terms, for example `--seccomp-allow-rule
-'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno clone3=ENOSYS`
+terms of a profile's `arg` entries, `len`, `op`, `value` and `mask`, except that
+the flag names the argument `arg=` where the profile's entry names it `index`:
+`--seccomp-allow-rule 'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno clone3=ENOSYS`
 answers one syscall with an errno of its own. `--drop-caps` and `--keep-caps`
 control capabilities, and `--deny-net` selects the denied network.
 

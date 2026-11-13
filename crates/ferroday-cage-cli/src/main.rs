@@ -4821,9 +4821,9 @@ fn parse_seccomp_names(flag: &str, value: &str, target: &mut Vec<i64>) -> Result
 ///
 /// The value is a syscall name followed by comma-separated conditions, each a
 /// space-separated set of `key=value` pairs mirroring a profile's `arg` entry:
-/// `arg` (0 through 5), `len` (`dword` or `qword`), `op` (`eq`, `ne`, `ge`,
-/// `gt`, `le`, `lt`, or `masked-eq`), `value`, and `mask` (required only for
-/// `masked-eq`). Values are decimal or `0x`-prefixed hexadecimal. A rule
+/// `arg` (0 through 5, the entry's `index`), `len` (`dword` or `qword`), `op`
+/// (`eq`, `ne`, `ge`, `gt`, `le`, `lt`, or `masked-eq`), `value`, and `mask`
+/// (required only for `masked-eq`). Values are decimal or `0x`-prefixed hexadecimal. A rule
 /// without conditions lists the syscall unconditionally.
 fn parse_seccomp_rule(flag: &str, value: &str) -> Result<(i64, Vec<SeccompArg>), String> {
     let value = value.trim();
