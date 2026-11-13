@@ -2314,10 +2314,15 @@ impl CageBuilder {
     /// service manager, and needs no privilege. Each launch creates
     /// `<parent>/fcage-<unique>`, enables the controllers its
     /// [`cgroup_limit`](Self::cgroup_limit)s need in the parent's
-    /// `cgroup.subtree_control`, and writes them. The launch stage then moves
-    /// itself into the cgroup before it creates any namespace, so everything
-    /// the sandbox runs is charged there, and the sandbox's cgroup namespace is
-    /// rooted at it.
+    /// `cgroup.subtree_control`, and writes them, and creates the leaf
+    /// `<parent>/fcage-<unique>/sandbox` beneath it. The launch stage then
+    /// moves itself into the leaf before it creates any namespace, so
+    /// everything the sandbox runs is charged to the cgroup and held to its
+    /// limits, and the sandbox's cgroup namespace is rooted at the leaf, below
+    /// them. A command that mounts the cgroup filesystem in its own namespace
+    /// finds neither the limits nor the parent there, whatever the host's mount
+    /// options, unless the cgroup filesystem is bound into the sandbox
+    /// writable.
     ///
     /// The cgroup is what [`Running::kill`](crate::Running::kill) ends the
     /// whole tree through, descendants that left the command's process tree
@@ -2342,9 +2347,9 @@ impl CageBuilder {
     /// v2 hierarchy, read-only, not delegated to the caller, lacking a
     /// controller a limit needs, or holding processes, a kernel without a
     /// limit's file, and a caller that runs where the launch cannot move into
-    /// the parent's subtree from. A limit is never silently left unenforced.
-    /// [`host::cgroup_blocker`](crate::host::cgroup_blocker) gives the same
-    /// answer before a launch.
+    /// the parent's subtree from. A launch does not run without the limits it
+    /// was given. [`host::cgroup_blocker`](crate::host::cgroup_blocker) gives
+    /// the same answer before a launch.
     ///
     /// ```no_run
     /// use ferroday_cage::{Cage, CgroupLimit};

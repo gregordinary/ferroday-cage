@@ -165,6 +165,14 @@ consumer upgrading can skip it.
   able to read its keys. A policy that refuses the join alone no longer fails
   the launch. A launch that cannot install the filter fails at
   `SetupStep::ReplaceSessionKeyring`.
+- A launch with a cgroup writes its limits to `fcage-<unique>` beneath the
+  parent and runs the sandbox in a leaf beneath that, `fcage-<unique>/sandbox`,
+  which enables no controller of its own. The sandbox's cgroup namespace is
+  rooted at the leaf, so a command that mounts the cgroup filesystem in a
+  namespace of its own finds neither the limits nor the parent's
+  `cgroup.procs` there, whatever the host's mount options. The usage the handle
+  reports, its kill, and its wait for a killed tree to empty read and write
+  `fcage-<unique>`, and its removal takes the leaf and then the cgroup.
 
 ### Added
 

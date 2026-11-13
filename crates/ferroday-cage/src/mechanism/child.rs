@@ -155,8 +155,8 @@ pub(super) struct Context<'a> {
     /// the setup keeps each hidden directory's tmpfs until the profile is in
     /// place and the tmpfs is made read-only. The caller's copy stays empty.
     pub(super) hidden: &'a [Cell<Option<OwnedFd>>],
-    /// The sandbox's `cgroup.procs`, when the launch has a cgroup: the launch
-    /// stage writes itself into it before anything else.
+    /// The `cgroup.procs` of the sandbox's leaf cgroup, when the launch has a
+    /// cgroup: the launch stage writes itself into it before anything else.
     pub(super) cgroup_procs_fd: Option<BorrowedFd<'a>>,
 }
 
@@ -214,9 +214,10 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // and the fork's pidfd is the caller's alone.
     hold_closed_streams(context.null_fd).map_err(|errno| (SetupStep::SweepFds, errno, 0))?;
 
-    // The sandbox's cgroup, before any namespace: every process forked from
-    // here on is charged there, and the cgroup namespace the unshare below
-    // creates is rooted at it. `0` names the writing process.
+    // The sandbox's leaf cgroup, before any namespace: every process forked
+    // from here on is charged to the cgroup above it that holds the limits,
+    // and the cgroup namespace the unshare below creates is rooted at the
+    // leaf, below them. `0` names the writing process.
     if let Some(procs) = context.cgroup_procs_fd {
         rustix::io::write(procs, b"0").map_err(|errno| (SetupStep::JoinCgroup, errno, 0))?;
     }

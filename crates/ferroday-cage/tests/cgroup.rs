@@ -138,12 +138,15 @@ fn sandbox_cgroups(parent: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The one sandbox cgroup beneath `parent`, and the processes it holds.
+/// The leaf beneath a sandbox's cgroup that the sandbox runs in.
+const LEAF: &str = "sandbox";
+
+/// The one sandbox cgroup beneath `parent`, and the processes its leaf holds.
 fn sole_sandbox_cgroup(parent: &Path) -> (PathBuf, Vec<u32>) {
     let names = sandbox_cgroups(parent);
     assert_eq!(names.len(), 1, "one sandbox cgroup: {names:?}");
     let cgroup = parent.join(&names[0]);
-    let members = std::fs::read_to_string(cgroup.join("cgroup.procs"))
+    let members = std::fs::read_to_string(cgroup.join(LEAF).join("cgroup.procs"))
         .expect("the cgroup lists its processes")
         .lines()
         .map(|pid| pid.parse().expect("a process id"))
@@ -400,10 +403,11 @@ fn a_cgroup_still_holding_what_the_command_left_stays_beneath_the_parent() {
         !members.is_empty(),
         "the sleeper outlived the command and the handle"
     );
-    // What ends it now is the caller's own: the cgroup's kill, and then its
-    // removal once the tree has emptied.
+    // What ends it now is the caller's own: the cgroup's kill, and then the
+    // removal of its leaf and of it once the tree has emptied.
     std::fs::write(cgroup.join("cgroup.kill"), "1").expect("the tree is killed");
     assert_gone(&members);
+    remove_once_empty(&cgroup.join(LEAF), Duration::from_secs(10));
     remove_once_empty(&cgroup, Duration::from_secs(10));
 }
 
@@ -614,6 +618,182 @@ fn a_parent_that_can_hold_a_sandbox_s_cgroup_is_answered_so_and_left_as_found() 
         .output()
         .expect("the sandbox runs");
     assert!(output.status.success(), "{output:?}");
+}
+
+/// Set in the copy of this test binary that a reach test runs in a sandbox, to
+/// `cage` or `restriction`, the kind of sandbox it runs in.
+const REACH_PROBE: &str = "FERRODAY_CAGE_TEST_CGROUP_REACH";
+
+/// Where the reach probe is bound in a sandbox.
+const REACH_PROBE_PATH: &str = "/probe";
+
+/// How many threads the reach probe tries to start, twice the limit its
+/// sandbox is held to.
+const REACH_THREADS: usize = 16;
+
+/// What the reach probe reported: each step's name and its outcome, one
+/// `step outcome` line each.
+fn reach_report(output: &ferroday_cage::Output) -> std::collections::BTreeMap<String, String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("probe done"),
+        "the probe failed: {:?}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("reach "))
+        .filter_map(|line| line.split_once(' '))
+        .map(|(step, outcome)| (step.to_string(), outcome.to_string()))
+        .collect()
+}
+
+/// Asserts what a reach probe held to `PidsMax(8)` reported, and what its
+/// cgroup counted, of the threads it tried to start past the limit.
+#[track_caller]
+fn assert_held_to_the_limit(
+    output: &ferroday_cage::Output,
+    report: &std::collections::BTreeMap<String, String>,
+) {
+    let started: usize = report
+        .get("threads")
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("the probe reported no thread count: {report:?}"));
+    assert!(
+        started < REACH_THREADS,
+        "the probe started every thread past its limit: {report:?}"
+    );
+    let peak = output
+        .usage
+        .and_then(|usage| usage.cgroup_peak_processes)
+        .expect("the pids controller is offered");
+    assert!(peak <= 8, "the tree held {peak} tasks: {report:?}");
+}
+
+#[test]
+fn a_caged_command_mounting_its_cgroup_namespace_sees_no_limit_to_lift() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = common::host_userland()
+        .command(REACH_PROBE_PATH)
+        .args(["--exact", "probe_reach", "--nocapture", "--test-threads=1"])
+        .env(REACH_PROBE, "cage")
+        .resolv_conf(false)
+        .bind_ro(&exe, REACH_PROBE_PATH)
+        .cgroup_parent(parent)
+        .cgroup_limit(CgroupLimit::PidsMax(8))
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox runs");
+    let report = reach_report(&output);
+    // The cgroup namespace is rooted at the leaf, which holds no limit: the
+    // limits are written to the cgroup above it, outside the namespace,
+    // whatever the hierarchy's mount options.
+    assert_eq!(
+        report.get("own").map(String::as_str),
+        Some("/"),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.get("mount").map(String::as_str),
+        Some("ok"),
+        "{report:?}"
+    );
+    for file in ["pids.max", "memory.max"] {
+        assert_eq!(
+            report.get(file).map(String::as_str),
+            Some("absent"),
+            "{report:?}"
+        );
+    }
+    assert_held_to_the_limit(&output, &report);
+}
+
+/// Writes `max` to the limit file `file`, which the write does not create.
+fn lift(file: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(file)?
+        .write_all(b"max")
+}
+
+/// The probe the reach tests start in a sandbox: it mounts the cgroup
+/// hierarchy where it can, tries to lift the limits it finds, and then starts
+/// threads past its limit, reporting each step.
+///
+/// In a cage it creates a mount and a cgroup namespace of its own, which its
+/// user namespace owns, and mounts cgroup2 there, the hierarchy's root then
+/// being the root of the sandbox's cgroup namespace.
+#[test]
+#[expect(unsafe_code)]
+fn probe_reach() {
+    let Some(kind) = std::env::var_os(REACH_PROBE) else {
+        return;
+    };
+    let report = |step: &str, outcome: &dyn std::fmt::Display| println!("reach {step} {outcome}");
+    // The harness has begun a line of its own naming the test.
+    println!();
+    let attempt = |result: std::io::Result<()>| match result {
+        Ok(()) => "ok".to_string(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
+        Err(err) => format!("errno {}", err.raw_os_error().unwrap_or(0)),
+    };
+    let own = std::fs::read_to_string("/proc/self/cgroup").expect("the probe names its cgroup");
+    report("own", &own.trim().trim_start_matches("0::"));
+    if kind == "cage" {
+        let mount = Path::new("/tmp/cgroup");
+        std::fs::create_dir(mount).expect("the sandbox's /tmp is writable");
+        // SAFETY: `unshare_unsafe` is unsafe only because
+        // `UnshareFlags::FILES` can invalidate descriptors other threads
+        // observe, and these flags do not include it.
+        let unshared = unsafe {
+            rustix::thread::unshare_unsafe(
+                rustix::thread::UnshareFlags::NEWNS | rustix::thread::UnshareFlags::NEWCGROUP,
+            )
+        };
+        let mounted = unshared.and_then(|()| {
+            rustix::mount::mount(
+                "cgroup2",
+                mount,
+                "cgroup2",
+                rustix::mount::MountFlags::empty(),
+                None,
+            )
+        });
+        report("mount", &attempt(mounted.map_err(Into::into)));
+        for file in ["pids.max", "memory.max"] {
+            report(file, &attempt(lift(&mount.join(file))));
+        }
+    }
+    // Each thread waits until `hold` drops, the first on the channel and the
+    // rest on the lock, so all are alive at once.
+    let (hold, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Arc::new(std::sync::Mutex::new(held));
+    let mut threads = Vec::new();
+    for _ in 0..REACH_THREADS {
+        let held = std::sync::Arc::clone(&held);
+        match std::thread::Builder::new().spawn(move || {
+            let _ = held.lock().map(|held| held.recv());
+        }) {
+            Ok(thread) => threads.push(thread),
+            Err(_) => break,
+        }
+    }
+    report("threads", &threads.len());
+    drop(hold);
+    for thread in threads {
+        let _ = thread.join();
+    }
+    println!("probe done");
 }
 
 /// Set in the copy of this test binary that

@@ -1,7 +1,7 @@
 //! An out-of-band probe for joining a cgroup.
 //!
-//! The launch stage moves itself into the sandbox's cgroup by writing `0` to
-//! the cgroup's `cgroup.procs`, and whether the kernel allows that depends on
+//! The launch stage moves itself into the sandbox's leaf cgroup by writing `0`
+//! to the leaf's `cgroup.procs`, and whether the kernel allows that depends on
 //! where the writer runs as much as on the cgroup: the writer must be able to
 //! write the `cgroup.procs` of the nearest cgroup its own and the destination
 //! share, and both must lie inside its cgroup namespace. No file reports that,
@@ -34,8 +34,8 @@ const EXIT_JOINED: i32 = 0;
 const EXIT_SETUP_FAILED: i32 = 255;
 
 /// Forks a child that moves itself into the cgroup whose `cgroup.procs` is
-/// `procs`, as the launch stage does, and reports whether the kernel allowed
-/// it.
+/// `procs`, the sandbox's leaf as the launch stage joins it, and reports
+/// whether the kernel allowed it.
 ///
 /// The child exits at once, so the cgroup holds nothing once the probe returns
 /// and can be removed.

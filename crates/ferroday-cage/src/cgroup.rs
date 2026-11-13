@@ -4,18 +4,36 @@
 //! a directory of a cgroup v2 hierarchy in which it may create cgroups: a
 //! delegated subtree, such as systemd's `Delegate=yes` gives a service or a
 //! scope. Each launch then creates a cgroup of its own beneath that directory,
-//! enables the controllers its limits need, writes the limits, and opens the
-//! cgroup's `cgroup.procs`. The launch stage moves itself into the cgroup
-//! through that descriptor before it creates any namespace, so every process
-//! the sandbox runs is charged there, and the cgroup namespace the sandbox
-//! creates is rooted at it.
+//! enables the controllers its limits need, and writes the limits. Beneath it,
+//! it creates one more cgroup, [`LEAF`], and opens the leaf's `cgroup.procs`.
+//! The launch stage moves itself into the leaf through that descriptor before
+//! it creates any namespace, so every process the sandbox runs is charged
+//! there, and the cgroup namespace the sandbox creates is rooted at it.
+//!
+//! The limits sit one level above anything the sandbox can name. The kernel
+//! creates a cgroup's files owned by the process that created it, the caller,
+//! and a sandbox's processes run as the caller's own user on the host. Joined
+//! to the cgroup that holds the limits, a command could write them, or move
+//! itself out through the parent's `cgroup.procs`, wherever it can reach the
+//! cgroup's files. In the leaf it can reach neither from its cgroup namespace:
+//! the namespace's root is the leaf, which holds no limit and whose parent is
+//! outside the namespace. A restriction shares the host's cgroup namespace,
+//! where what keeps its command from the files is the confinement it runs
+//! under; see
+//! [`RestrictionBuilder::cgroup_parent`](crate::RestrictionBuilder::cgroup_parent).
+//!
+//! The leaf enables no controller for children of its own, so a process in it,
+//! or in a cgroup the sandbox creates beneath it, is charged to the limits'
+//! cgroup itself. Everything the crate reads or writes for the tree is there:
+//! the usage files, `cgroup.events`, and `cgroup.kill`, each of which covers
+//! the cgroup's descendants.
 //!
 //! The running handle reads what the whole tree used from the cgroup once the
-//! command's outcome is known, and removes the cgroup then if nothing is left
-//! in it. A kill through the handle or one of its kill handles ends the tree
-//! through `cgroup.kill`, where the kernel has one, whether or not the outcome
-//! is known yet. The handles share the cgroup, and the last of them to drop
-//! removes it, once a tree a kill ended has emptied.
+//! command's outcome is known, and removes the leaf and the cgroup then if
+//! nothing is left in them. A kill through the handle or one of its kill
+//! handles ends the tree through `cgroup.kill`, where the kernel has one,
+//! whether or not the outcome is known yet. The handles share the cgroup, and
+//! the last of them to drop removes it, once a tree a kill ended has emptied.
 
 use std::ffi::CString;
 use std::fmt;
@@ -271,12 +289,12 @@ enum Step {
     OpenParent,
     /// Enabling a controller in the parent's `cgroup.subtree_control`.
     Enable,
-    /// Creating the sandbox's cgroup beneath the parent.
+    /// Creating the sandbox's cgroup beneath the parent, or its leaf.
     Create,
-    /// Opening a file of the sandbox's cgroup to write: a limit, or its
-    /// `cgroup.procs`.
+    /// Opening a file of the sandbox's cgroup to write: a limit, its
+    /// `cgroup.kill`, or the leaf's `cgroup.procs`.
     OpenFile,
-    /// Moving the launch stage into the sandbox's cgroup.
+    /// Moving the launch stage into the sandbox's leaf.
     Join,
 }
 
@@ -306,7 +324,7 @@ fn refusal(step: Step, errno: Errno) -> Option<CgroupRefusal> {
     })
 }
 
-/// The refusal the launch stage's move into the sandbox's cgroup failed with,
+/// The refusal the launch stage's move into the sandbox's leaf failed with,
 /// where its errno stands for one.
 pub(crate) fn join_refusal(errno: Errno) -> Option<CgroupRefusal> {
     refusal(Step::Join, errno)
@@ -316,8 +334,8 @@ pub(crate) fn join_refusal(errno: Errno) -> Option<CgroupRefusal> {
 /// refused its cgroup, and why: [`host::cgroup_blocker`]'s answer.
 ///
 /// The launch's own steps, carried out: [`Cgroup::create`], then a child of
-/// this process moving itself into the cgroup as the launch stage does, and
-/// last the cgroup's removal. `None` where every step succeeded, and where one
+/// this process moving itself into the leaf as the launch stage does, and
+/// last the removal of the leaf and the cgroup. `None` where every step succeeded, and where one
 /// failed for a reason of the host's rather than a refusal, or a value the
 /// build refuses stopped the probe before it began.
 ///
@@ -598,6 +616,15 @@ const CGROUP2_SUPER_MAGIC: rustix::fs::FsWord = 0x6367_7270;
 /// offers them, whether or not a limit needs them.
 const ACCOUNTED: [&str; 2] = ["memory", "pids"];
 
+/// The name of the cgroup beneath a sandbox's own that the launch stage joins:
+/// `<parent>/fcage-<unique>/sandbox`.
+///
+/// The limits are written to `fcage-<unique>`, and every process of the
+/// sandbox runs in the leaf or beneath it, where neither the limits nor the
+/// parent's `cgroup.procs` lie within the sandbox's cgroup namespace; see the
+/// module documentation.
+const LEAF: &str = "sandbox";
+
 /// How long the drop of a cgroup whose tree a kill ended waits for the tree to
 /// empty before it removes the cgroup.
 ///
@@ -608,8 +635,8 @@ const ACCOUNTED: [&str; 2] = ["memory", "pids"];
 /// stays beneath the parent rather than hold the drop.
 const EMPTYING_BOUND: Duration = Duration::from_secs(5);
 
-/// The sandbox's cgroup, from its creation before the launch until its
-/// removal.
+/// The sandbox's cgroup and its [`LEAF`], from their creation before the
+/// launch until their removal.
 ///
 /// The running handle and each of its kill handles share it. The handle reads
 /// what the tree used once the outcome is known, and removes the cgroup then
@@ -631,9 +658,9 @@ pub(crate) struct Cgroup {
     parent_path: PathBuf,
     /// The cgroup's name beneath the parent.
     name: CString,
-    /// The cgroup's own directory.
+    /// The cgroup's own directory, which holds the limits and the leaf.
     dir: OwnedFd,
-    /// Its `cgroup.procs`, which the launch stage writes itself into.
+    /// The leaf's `cgroup.procs`, which the launch stage writes itself into.
     procs: OwnedFd,
     /// Its `cgroup.kill`, where the kernel has one (Linux 5.14).
     kill: Option<OwnedFd>,
@@ -647,7 +674,8 @@ pub(crate) struct Cgroup {
 
 impl Cgroup {
     /// Creates the sandbox's cgroup beneath the plan's parent, enables the
-    /// controllers its limits need, and writes the limits.
+    /// controllers its limits need, writes the limits, and creates the
+    /// [`LEAF`] beneath it that the launch stage joins.
     ///
     /// # Errors
     ///
@@ -794,12 +822,28 @@ impl Cgroup {
                     .map(drop)
                     .map_err(io_error("writing a limit to the sandbox's cgroup", &path))?;
             }
-            let procs = open_write(&dir, "cgroup.procs")
+            // The leaf enables no controller for children of its own, so what
+            // runs in it, or beneath it, is charged to this cgroup and held to
+            // its limits.
+            let leaf_path = path.join(LEAF);
+            rustix::fs::mkdirat(&dir, LEAF, Mode::from_raw_mode(0o755)).map_err(failed(
+                Step::Create,
+                "creating the sandbox's leaf cgroup",
+                &leaf_path,
+            ))?;
+            let leaf = rustix::fs::openat(
+                &dir,
+                LEAF,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io_error("opening the sandbox's leaf cgroup", &leaf_path))?;
+            let procs = open_write(&leaf, "cgroup.procs")
                 .and_then(kept)
                 .map_err(failed(
                     Step::OpenFile,
-                    "opening the sandbox's cgroup.procs",
-                    &path,
+                    "opening the leaf cgroup's cgroup.procs",
+                    &leaf_path,
                 ))?;
             // A kernel before Linux 5.14 has no `cgroup.kill`, and the tree is
             // then ended only as far as the supervisor's death reaches. Any
@@ -830,13 +874,15 @@ impl Cgroup {
                 removed: AtomicBool::new(false),
             }),
             Err(err) => {
+                let leaf = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())).join(LEAF);
+                let _ = rustix::fs::unlinkat(&parent, &leaf, AtFlags::REMOVEDIR);
                 let _ = rustix::fs::unlinkat(&parent, name.as_c_str(), AtFlags::REMOVEDIR);
                 Err(err)
             }
         }
     }
 
-    /// The cgroup's `cgroup.procs`, which the launch stage writes `0` to, moving
+    /// The leaf's `cgroup.procs`, which the launch stage writes `0` to, moving
     /// itself in.
     pub(crate) fn procs(&self) -> BorrowedFd<'_> {
         self.procs.as_fd()
@@ -865,9 +911,19 @@ impl Cgroup {
     /// Removes the cgroup if nothing is left in it. One that still holds a
     /// process stays, for the drop to remove.
     pub(crate) fn remove_if_empty(&self) {
-        if rustix::fs::unlinkat(&self.parent, self.name.as_c_str(), AtFlags::REMOVEDIR).is_ok() {
+        if self.remove() {
             self.removed.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Removes the leaf and then the cgroup, and says whether the cgroup went.
+    ///
+    /// The kernel removes neither while it holds a process, nor the cgroup
+    /// while the leaf is still there. A cgroup the sandbox created beneath the
+    /// leaf keeps both.
+    fn remove(&self) -> bool {
+        let _ = rustix::fs::unlinkat(&self.dir, LEAF, AtFlags::REMOVEDIR);
+        rustix::fs::unlinkat(&self.parent, self.name.as_c_str(), AtFlags::REMOVEDIR).is_ok()
     }
 
     /// Waits until no process is left in the tree, or `deadline` passes;
@@ -940,10 +996,10 @@ impl fmt::Debug for Cgroup {
 }
 
 impl Drop for Cgroup {
-    /// Removes the cgroup, which the kernel allows once no process is left in
-    /// it, waiting up to [`EMPTYING_BOUND`] for a tree a kill ended to empty.
-    /// One that still holds processes, as a sandbox without a PID namespace
-    /// can leave behind, stays beneath the parent.
+    /// Removes the leaf and the cgroup, which the kernel allows once no process
+    /// is left in them, waiting up to [`EMPTYING_BOUND`] for a tree a kill
+    /// ended to empty. One that still holds processes, as a sandbox without a
+    /// PID namespace can leave behind, stays beneath the parent.
     fn drop(&mut self) {
         if *self.removed.get_mut() {
             return;
@@ -951,7 +1007,7 @@ impl Drop for Cgroup {
         if *self.killed.get_mut() {
             self.await_empty(Instant::now().checked_add(EMPTYING_BOUND));
         }
-        let _ = rustix::fs::unlinkat(&self.parent, self.name.as_c_str(), AtFlags::REMOVEDIR);
+        self.remove();
     }
 }
 

@@ -542,9 +542,21 @@ The library creates no hierarchy and needs no privilege. The parent is a cgroup
 v2 directory the caller can create cgroups in. The scope `systemd-run --user
 --scope -p Delegate=yes` runs a command in is one. Each launch creates
 `fcage-<unique>` beneath it, enables the controllers its limits need, and
-writes them. The launch stage moves itself into the cgroup before it creates
-any namespace. Everything the sandbox runs is then charged there, and the
-sandbox's cgroup namespace is rooted at it.
+writes them. Beneath that it creates `fcage-<unique>/sandbox`, a leaf that
+enables no controller of its own. The launch stage moves itself into the leaf
+before it creates any namespace. Everything the sandbox runs is then charged
+to `fcage-<unique>` and held to its limits, and the sandbox's cgroup namespace
+is rooted at the leaf.
+
+The kernel creates a cgroup's files owned by the process that created it, the
+caller, and the sandbox's processes run as the caller's own user on the host.
+The leaf is what keeps the limits out of their reach. A sandboxed command that
+mounts the cgroup filesystem in a namespace of its own sees the leaf as the
+hierarchy's root, with no limit in it, and nothing above it: neither the
+limits nor the parent's `cgroup.procs`, through which it could move itself out
+of the tree. That holds whatever the host mounts its cgroup filesystem with. A
+bind of the host's cgroup filesystem into the sandbox, writable, puts both back
+in reach.
 
 The cgroup does three things besides the limits:
 
@@ -564,8 +576,9 @@ The cgroup does three things besides the limits:
   them, and the last of the handle and its kill handles to drop removes the
   cgroup once they have exited, waiting up to five seconds for them. Without a
   kill, a cgroup still holding them when the last handle drops stays beneath
-  the parent. The caller removes it with an `rmdir` once they have ended, by
-  themselves or through a write of `1` to its `cgroup.kill`.
+  the parent. The caller removes it once they have ended, by themselves or
+  through a write of `1` to its `cgroup.kill`: an `rmdir` of the leaf, and then
+  one of the cgroup.
 
 A cgroup with processes of its own cannot enable controllers for its children.
 A caller that runs inside the parent therefore moves itself into a leaf beside
@@ -589,7 +602,7 @@ children until then, as it does while it holds a process. A caller whose
 threads can be ending as it moves waits for the parent's `cgroup.threads` to
 list none before it launches.
 
-A limit is never left silently unenforced. A launch fails with
+A launch does not run without the limits it was given. It fails with
 `Error::CgroupRefused`, and a `CgroupRefusal` saying why, where the parent
 cannot hold the sandbox's cgroup:
 
@@ -606,7 +619,8 @@ A value the kernel would refuse is refused at build, and so is a limit with no
 parent to apply it beneath, unless the limits are not required.
 [`host::cgroup_blocker`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.cgroup_blocker.html)
 gives the same answer before a launch, by the launch's own steps: it creates a
-cgroup beneath the parent, moves a short-lived child into it, and removes it.
+cgroup and its leaf beneath the parent, moves a short-lived child into the
+leaf, and removes both.
 Inside a container, the runtime mounts the cgroup filesystem read-only by
 default, which leaves a sandbox there no parent. [Running inside a
 container](running-in-a-container.md) gives the detail.

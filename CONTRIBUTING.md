@@ -339,9 +339,9 @@ therefore replaces the crate page with that line's metadata.
   open the descriptor those signals arrive on, and a provisioning run's
   `Interrupt` blocks `SIGINT` there the same way. `fcage` has none. The only other
   `unsafe` is in test code that drives the kernel directly: `tests/keyring.rs`,
-  `tests/relay.rs`, `tests/network_filter.rs`, `tests/process.rs`, and the
-  testkit's pseudoterminal harness and its closing of a probe's standard
-  descriptors.
+  `tests/relay.rs`, `tests/network_filter.rs`, `tests/process.rs`,
+  `tests/cgroup.rs`, and the testkit's pseudoterminal harness and its closing
+  of a probe's standard descriptors.
 - **Every `unsafe` block states its invariant.** Every crate in the workspace
   denies `unsafe` by default. Each block that needs it carries a `SAFETY:`
   comment stating the invariant it relies on, which
@@ -526,7 +526,7 @@ report name a package and its version bare.
 | Can the sandboxes a provisioner runs the target's binaries in install their network filter, asked before it downloads anything? | `provision::layer::network_filter_preflight`, over `host::seccomp_available` |
 | Can this process install a seccomp filter? | `host::seccomp_available`, which installs one in a forked child through `mechanism::seccomp::installable` |
 | Can a sandbox with a PID namespace of its own mount its procfs here, and why not? | `host::procfs_blocker`, which mounts one in a forked child through `mechanism::probe_procfs_mount`, and `host::procfs_refusal` for the explanation alone |
-| Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork and the launch stage joins through `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |
+| Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork with the limits on it and a leaf beneath it, which the launch stage joins through the leaf's `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |
 | Would a launch beneath this parent be refused its cgroup, and why? | `host::cgroup_blocker`, which carries out `cgroup::Cgroup::create` and a join through `mechanism::probe_cgroup_join`, with every errno read by `cgroup::refusal` as the launch's own are |
 | Which cgroup does this process run in? | `host::own_cgroup`, over `host::MountEntry::parse` |
 | Stop a provisioning run on `SIGINT`, removing what it staged | `provision::Interrupt`, which an observer answers `ProvisionObserver::cancelled` from |

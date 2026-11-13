@@ -317,10 +317,11 @@ pub(crate) fn procfs_refusal() -> ProcfsBlocker {
 ///
 /// It answers what [`CageBuilder::cgroup_parent`] and
 /// [`CageBuilder::cgroup_limit`] meet at launch, by the launch's own steps
-/// rather than a reading of the parent's files: it creates a cgroup beneath
-/// `parent` as a launch does, enabling the controllers the limits need and
-/// writing the limits, forks a short-lived child that moves itself into it as
-/// the launch stage moves, and removes it once the child has exited. The
+/// rather than a reading of the parent's files: it creates a cgroup and its
+/// leaf beneath `parent` as a launch does, enabling the controllers the limits
+/// need and writing the limits, forks a short-lived child that moves itself
+/// into the leaf as the launch stage moves, and removes both once the child
+/// has exited. The
 /// [`CgroupRefusal`] it returns is the one the launch would fail with, as
 /// [`Error::CgroupRefused`](crate::Error::CgroupRefused). That covers a parent
 /// that does not exist, one outside a cgroup v2 hierarchy or on a read-only
