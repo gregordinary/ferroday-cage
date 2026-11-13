@@ -3695,15 +3695,8 @@ fn build_nested_plan(
                 visible_procfs(ops, false).ok_or_else(|| procfs_refusal(ops, false))?;
             // The map files as the command names them after the pivot:
             // absolute, under the profile's own procfs target.
-            let under_procfs = |leaf: &str| -> Result<CString, ConfigError> {
-                let target = procfs_target.to_bytes();
-                let mut path = Vec::with_capacity(target.len() + leaf.len() + 2);
-                path.push(b'/');
-                path.extend_from_slice(target);
-                path.push(b'/');
-                path.extend_from_slice(leaf.as_bytes());
-                CString::new(path).map_err(|err| embedded_nul(err.into_vec()))
-            };
+            let under_procfs =
+                |leaf: &str| cstring(sandbox_path(procfs_target).join(leaf).as_os_str());
             // The one extent names the sandbox's root, the writer's own id,
             // as the command is to see it: 0, or the presented identity.
             let (uid, gid) = present_as.map_or((0, 0), |presented| (presented.uid, presented.gid));
@@ -3785,14 +3778,9 @@ enum Writable {
 /// count, and the plain refusal otherwise.
 fn procfs_refusal(ops: &[MountOp], needs_fresh: bool) -> ConfigError {
     match standing_procfs(ops, needs_fresh, Writable::Ignored) {
-        Some(target) => {
-            let mut path = Vec::with_capacity(target.to_bytes().len() + 1);
-            path.push(b'/');
-            path.extend_from_slice(target.to_bytes());
-            ConfigError::NestedUsernsProcfsReadOnly {
-                target: PathBuf::from(std::ffi::OsString::from_vec(path)),
-            }
-        }
+        Some(target) => ConfigError::NestedUsernsProcfsReadOnly {
+            target: sandbox_path(target),
+        },
         None => ConfigError::NestedUsernsNeedsProcfs,
     }
 }
@@ -5115,7 +5103,7 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
                 Some(PathBuf::from(OsString::from_vec(path)))
             }
             Some((_, Arrival::Tree, _)) => None,
-            None => Some(Path::new("/").join(OsStr::from_bytes(target.as_bytes()))),
+            None => Some(sandbox_path(&target)),
         };
         // A hide follows a link at its path, as the launch's lookup does, and
         // what is not found hides nothing. Anything else found, or a lookup
@@ -5132,7 +5120,7 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
         let Some(host_path) = host_path else {
             continue;
         };
-        let named = Path::new("/").join(OsStr::from_bytes(target.as_bytes()));
+        let named = sandbox_path(&target);
         match &op.action {
             MountAction::Symlink { content, .. } => {
                 let standing = std::fs::read_link(&host_path)
@@ -5428,6 +5416,13 @@ fn sandbox_path_components(path: &Path) -> Result<Vec<&OsStr>, Error> {
 /// leading slash, its components read through [`sandbox_path_components`].
 fn sandbox_target(path: &Path) -> Result<CString, Error> {
     rel_cstring(&sandbox_path_components(path)?)
+}
+
+/// The absolute path inside the sandbox that a frozen root-relative target
+/// names, the way [`sandbox_target`] reads it back: how an error or a record
+/// names a target to a reader.
+pub(crate) fn sandbox_path(target: &CStr) -> PathBuf {
+    Path::new("/").join(OsStr::from_bytes(target.to_bytes()))
 }
 
 /// Builds the mount-target directory chain for a rootfs-relative path: one

@@ -556,6 +556,7 @@ report name a package and its version bare.
 | What does a mount op bring to rest on its target, if anything? | `mechanism::MountAction::arrival`, or `Arrival::of_raw` for a raw mount's flags |
 | Read a raw mount's flags as `mount(2)` acts on them | `mechanism::raw_mount_flags` |
 | Is this path at or under a mount target the launch froze? | `spec::covers` |
+| Freeze a sandbox path as a mount target, or name a frozen target as the sandbox path it is | `spec::sandbox_target`, and `spec::sandbox_path` back |
 | Does a launch bind the host's `resolv.conf`, or has a mount of the caller's claimed it? | `CageBuilder::get_resolv_conf` |
 | Does the network stack carry the guest's traffic to this destination? | `NetStack::forwards` |
 | Report a step over a wire, by number | `wire::wire_enum!` |

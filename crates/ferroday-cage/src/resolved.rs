@@ -23,6 +23,7 @@ use crate::cgroup::CgroupLimit;
 use crate::idmap::{IdRange, Identity};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction, RootPlan, seccomp};
+use crate::spec::sandbox_path;
 
 /// The root, environment, mounts, and posture a built sandbox will apply.
 ///
@@ -968,17 +969,17 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
             flags,
             data,
         } => ResolvedMount::Tmpfs {
-            target: absolute(target),
+            target: sandbox_path(target),
             // Widened to match `RawMount::get_flags`, which is `u64` so the
             // public surface does not depend on the kernel type's width.
             flags: u64::from(flags.bits()),
             data: lossy(data),
         },
         MountAction::Procfs { target } => ResolvedMount::Procfs {
-            target: absolute(target),
+            target: sandbox_path(target),
         },
         MountAction::Devpts { target, data } => ResolvedMount::Devpts {
-            target: absolute(target),
+            target: sandbox_path(target),
             data: lossy(data),
         },
         MountAction::Bind {
@@ -987,7 +988,7 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
             read_only,
         } => ResolvedMount::Bind {
             source: PathBuf::from(OsString::from_vec(source.as_bytes().to_vec())),
-            target: absolute(target),
+            target: sandbox_path(target),
             read_only: *read_only,
         },
         MountAction::Raw {
@@ -1001,7 +1002,7 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
             // which is what the kernel receives either way, so the projection
             // reads empty back as absent.
             source: optional(source).map(PathBuf::from),
-            target: absolute(target),
+            target: sandbox_path(target),
             fstype: optional(fstype).map(|value| value.to_string_lossy().into_owned()),
             // Widened to match `RawMount::get_flags`, which is `u64` so the
             // public surface does not depend on the kernel type's width.
@@ -1013,7 +1014,7 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
             leaf,
             content,
         } => {
-            let mut path = absolute(parent);
+            let mut path = sandbox_path(parent);
             path.push(OsString::from_vec(leaf.as_bytes().to_vec()));
             ResolvedMount::Symlink {
                 path,
@@ -1021,22 +1022,12 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
             }
         }
         MountAction::Hide { target } => ResolvedMount::Hide {
-            target: absolute(target),
+            target: sandbox_path(target),
         },
         MountAction::ReadOnly { target } => ResolvedMount::ReadOnly {
-            target: absolute(target),
+            target: sandbox_path(target),
         },
     }
-}
-
-/// Turns a rootfs-relative frozen target into the absolute path it occupies
-/// inside the sandbox, which is how a consumer reading the record thinks of
-/// it.
-fn absolute(target: &CString) -> PathBuf {
-    let mut path = Vec::with_capacity(target.as_bytes().len() + 1);
-    path.push(b'/');
-    path.extend_from_slice(target.as_bytes());
-    PathBuf::from(OsString::from_vec(path))
 }
 
 /// Reads a frozen optional field: empty means it was never set.
@@ -1085,8 +1076,8 @@ mod tests {
         // Targets are frozen relative to the rootfs, because that is what the
         // sandbox stage resolves them against; a consumer reading the record
         // wants the path as the command sees it.
-        assert_eq!(absolute(&entry("dev/pts")), PathBuf::from("/dev/pts"));
-        assert_eq!(absolute(&entry("tmp")), PathBuf::from("/tmp"));
+        assert_eq!(sandbox_path(&entry("dev/pts")), PathBuf::from("/dev/pts"));
+        assert_eq!(sandbox_path(&entry("tmp")), PathBuf::from("/tmp"));
     }
 
     #[test]
