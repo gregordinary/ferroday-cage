@@ -53,14 +53,14 @@ use super::sign;
 use crate::provision::tar;
 
 /// The uid, gid and mode a directory has when its record states none.
-const DEFAULT_DIR_ACL: Acl = Acl {
+const DEFAULT_DIR_ACL: OwnerMode = OwnerMode {
     uid: 0,
     gid: 0,
     mode: 0o755,
 };
 
 /// The uid, gid and mode a file has when its record states none.
-const DEFAULT_FILE_ACL: Acl = Acl {
+const DEFAULT_FILE_ACL: OwnerMode = OwnerMode {
     uid: 0,
     gid: 0,
     mode: 0o644,
@@ -118,7 +118,7 @@ struct DirectoryLines {
     path: Vec<u8>,
     /// The ownership and mode the directory's own entry stated, or `None` for
     /// a directory only its contents named.
-    acl: Option<Acl>,
+    acl: Option<OwnerMode>,
     files: Vec<FileLines>,
 }
 
@@ -139,15 +139,19 @@ struct FileLines {
     name: Vec<u8>,
     /// Its ownership and mode, which the `a:` line states where they are not
     /// the default.
-    acl: Acl,
+    acl: OwnerMode,
     /// The SHA-1 the package's archive states for it, which the `Z:` line
     /// carries.
     digest: Option<[u8; 20]>,
 }
 
 /// An entry's owner and mode, as the database records them.
+///
+/// What `apk` calls an entry's acl, on its `a:` and `M:` lines, and named for
+/// what it holds instead: it is no access control list, which is what
+/// `provision::xattr::Acl` is.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Acl {
+struct OwnerMode {
     uid: u32,
     gid: u32,
     mode: u32,
@@ -277,7 +281,7 @@ impl Record {
     /// description standing, which is the extraction's own rule and so
     /// describes the directory that survived.
     pub(super) fn directory(&mut self, path: &[u8], uid: u32, gid: u32, mode: u32) {
-        self.directory_at(path).acl = Some(Acl { uid, gid, mode });
+        self.directory_at(path).acl = Some(OwnerMode { uid, gid, mode });
     }
 
     /// Records a file, symbolic link or hard link the package ships, at the
@@ -300,7 +304,7 @@ impl Record {
         digest: Option<[u8; 20]>,
     ) {
         let (directory, name) = split_leaf(path);
-        let acl = Acl { uid, gid, mode };
+        let acl = OwnerMode { uid, gid, mode };
         let files = &mut self.directory_at(directory).files;
         match files.iter_mut().find(|file| file.name == name) {
             Some(file) => {
@@ -407,11 +411,11 @@ fn split_leaf(path: &[u8]) -> (&[u8], &[u8]) {
 /// The omission is not a space saving: `apk` writes the line only for a
 /// difference, and a record that stated every default would be a record `apk`
 /// did not write, which is the thing this writer is measured against.
-fn acl_line(field: u8, acl: Acl, default: Acl) -> Option<Vec<u8>> {
+fn acl_line(field: u8, acl: OwnerMode, default: OwnerMode) -> Option<Vec<u8>> {
     if acl == default {
         return None;
     }
-    let Acl { uid, gid, mode } = acl;
+    let OwnerMode { uid, gid, mode } = acl;
     Some(format!("{}:{uid}:{gid}:{mode:o}\n", field as char).into_bytes())
 }
 
