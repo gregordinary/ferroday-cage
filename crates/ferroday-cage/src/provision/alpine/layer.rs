@@ -158,7 +158,7 @@ impl Base {
             && built_for.trim() != architecture
         {
             return Err(refuse(format!(
-                "it was built for {}, and the increment is being resolved for {architecture}",
+                "it was built for {:?}, and the increment is being resolved for {architecture}",
                 built_for.trim(),
             )));
         }
@@ -301,7 +301,7 @@ impl Base {
             let (identity, patterns) = line.split_once(' ').unwrap_or((line, ""));
             let Some(&record) = records.get(identity) else {
                 return Err(self.refusal(format!(
-                    "its triggers file names {identity}, which no record in its database carries",
+                    "its triggers file names {identity:?}, which no record in its database carries",
                 )));
             };
             let at = *slot.entry(identity).or_insert_with(|| {

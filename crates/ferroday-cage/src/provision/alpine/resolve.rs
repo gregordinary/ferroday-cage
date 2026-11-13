@@ -188,6 +188,12 @@ pub(super) enum ResolveError {
 }
 
 impl fmt::Display for ResolveError {
+    /// Quotes a dependency, and a name that may be a provided one, with `{:?}`.
+    /// Both are an index's text, read as the index spells it and held to no
+    /// alphabet, so a control character in one is escaped rather than written
+    /// to the terminal the error is printed on. A package's own name and its
+    /// version are named bare: the index reader holds both to an alphabet that
+    /// has none.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         /// Renders `required_by` as a clause, or nothing for a requested name.
         fn by(required_by: &Option<String>) -> String {
@@ -208,7 +214,7 @@ impl fmt::Display for ResolveError {
                 required_by,
             } => write!(
                 f,
-                "everything that could satisfy {dependency}{} is excluded",
+                "everything that could satisfy {dependency:?}{} is excluded",
                 by(required_by),
             ),
             ResolveError::Pinned { unheld } => write!(f, "{unheld}"),
@@ -217,7 +223,7 @@ impl fmt::Display for ResolveError {
                 required_by,
                 offered,
             } if offered.is_empty() => {
-                write!(f, "no repository offers {dependency}{}", by(required_by),)
+                write!(f, "no repository offers {dependency:?}{}", by(required_by),)
             }
             ResolveError::Unsatisfied {
                 dependency,
@@ -225,7 +231,7 @@ impl fmt::Display for ResolveError {
                 offered,
             } => write!(
                 f,
-                "nothing satisfies {dependency}{}; the repositories offer {}",
+                "nothing satisfies {dependency:?}{}; the repositories offer {}",
                 by(required_by),
                 offered.join(", "),
             ),
@@ -235,7 +241,7 @@ impl fmt::Display for ResolveError {
                 required_by,
             } => write!(
                 f,
-                "{name}{} is provided at no version by {}, and none of them declares a provider \
+                "{name:?}{} is provided at no version by {}, and none of them declares a provider \
                  priority, so there is nothing to choose between them; name one of them to \
                  install",
                 by(required_by),
@@ -247,11 +253,11 @@ impl fmt::Display for ResolveError {
                 present,
             } => write!(
                 f,
-                "{declared_by} refuses {dependency}, and the closure holds {present}",
+                "{declared_by} refuses {dependency:?}, and the closure holds {present}",
             ),
             ResolveError::Contended { name, answers } => write!(
                 f,
-                "{name} is answered by {}, and a root holds one package for a name that is a \
+                "{name:?} is answered by {}, and a root holds one package for a name that is a \
                  package's own or is provided at a version; name the one to install",
                 answers.join(" and "),
             ),
@@ -263,7 +269,7 @@ impl fmt::Display for ResolveError {
                 required_by,
             } => write!(
                 f,
-                "the base layer carries {name} at {installed}, and {dependency}{} needs {offered}; \
+                "the base layer carries {name} at {installed}, and {dependency:?}{} needs {offered}; \
                  an increment installs over a base rather than upgrading it, so rebuild the base \
                  against the repositories as they stand now",
                 by(required_by),
@@ -1243,6 +1249,26 @@ mod tests {
     }
 
     #[test]
+    fn a_name_an_index_spells_reaches_a_refusal_with_its_control_characters_escaped() {
+        // A dependency's name is held to no alphabet, so the name a refusal
+        // quotes is the index's string, whoever signed it.
+        let hostile = crate::failure::hostile::TEXT;
+        let wants = format!("D:{hostile}");
+        let provides = format!("p:{hostile}");
+        for index in [
+            merged(&[("app", "1.0-r0", &wants)]),
+            merged(&[
+                ("app", "1.0-r0", &wants),
+                ("one", "1.0-r0", &provides),
+                ("two", "1.0-r0", &provides),
+            ]),
+        ] {
+            let refused = resolved(&index, &["app"], &[]).expect_err("the closure is refused");
+            crate::failure::hostile::assert_escaped(&refused.to_string());
+        }
+    }
+
+    #[test]
     fn the_closure_follows_what_a_package_requires_and_stops() {
         let index = merged(&[
             ("app", "1.0-r0", "D:lib so:libc.musl-x86_64.so.1"),
@@ -2033,7 +2059,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "lib is pinned to 1.0-r0 and app requires lib>=2.0"
+            "lib is pinned to 1.0-r0 and app requires \"lib>=2.0\""
         );
         assert!(
             matches!(AlpineError::from(err), AlpineError::Pin { unheld } if unheld.len() == 1),

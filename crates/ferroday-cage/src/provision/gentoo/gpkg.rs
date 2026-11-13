@@ -468,7 +468,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         if scan.members.contains_key(&name) {
             return Err(GentooError::container(
                 path,
-                format!("holds the member {name} twice"),
+                format!("holds the member {name:?} twice"),
             ));
         }
         let repeated = match role {
@@ -479,7 +479,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         if let Some(archive) = repeated {
             return Err(GentooError::container(
                 path,
-                format!("holds a second {archive} archive, {name}"),
+                format!("holds a second {archive} archive, {name:?}"),
             ));
         }
 
@@ -624,7 +624,7 @@ impl Manifest {
             let Ok(size) = size.parse::<u64>() else {
                 return Err(GentooError::container(
                     path,
-                    format!("states a length of {size:?} for {name}, which is not a number"),
+                    format!("states a length of {size:?} for {name:?}, which is not a number"),
                 ));
             };
             // The digests are `<algorithm> <hex>` pairs and the Manifest states
@@ -644,7 +644,7 @@ impl Manifest {
             let Some(sha512) = sha512.filter(|hex| Algorithm::Sha512.is_hex(hex)) else {
                 return Err(GentooError::container(
                     path,
-                    format!("states no usable SHA-512 for the member {name}"),
+                    format!("states no usable SHA-512 for the member {name:?}"),
                 ));
             };
             entries.insert(name.to_string(), (size, sha512));
@@ -674,21 +674,21 @@ impl Manifest {
             let Some((size, sha512)) = self.entries.get(name) else {
                 return Err(GentooError::container(
                     path,
-                    format!("holds a member {name} that its Manifest does not list"),
+                    format!("holds a member {name:?} that its Manifest does not list"),
                 ));
             };
             if seen.size != *size {
                 return Err(GentooError::container(
                     path,
                     format!(
-                        "holds a member {name} of {} bytes where its Manifest states {size}",
+                        "holds a member {name:?} of {} bytes where its Manifest states {size}",
                         seen.size,
                     ),
                 ));
             }
             if seen.sha512 != *sha512 {
                 return Err(GentooError::Digest {
-                    subject: format!("the member {name} of {}", path.display()),
+                    subject: format!("the member {name:?} of {}", path.display()),
                     expected: sha512.clone(),
                     actual: seen.sha512.clone(),
                 });
@@ -698,7 +698,7 @@ impl Manifest {
             if !scan.members.contains_key(name) {
                 return Err(GentooError::container(
                     path,
-                    format!("is missing the member {name} that its Manifest lists"),
+                    format!("is missing the member {name:?} that its Manifest lists"),
                 ));
             }
         }
@@ -1526,21 +1526,43 @@ mod tests {
     }
 
     #[test]
+    fn a_member_name_reaches_an_error_with_its_control_characters_escaped() {
+        // Nothing vouches for a member's name until the Manifest is held to the
+        // members, and that comparison is what refuses this one: the name is
+        // the mirror's string when the error names it.
+        let hostile = crate::failure::hostile::TEXT;
+        for built in [
+            Built {
+                extra: vec![(hostile, b"vouched for by nothing".to_vec())],
+                unlisted: vec![hostile],
+                ..Built::ordinary()
+            },
+            Built {
+                phantom: vec![hostile],
+                ..Built::ordinary()
+            },
+        ] {
+            let err = open("hostile", built, &planned(CPV, 1)).expect_err("the member is refused");
+            crate::failure::hostile::assert_escaped(&crate::ErrorChain::new(&err).to_string());
+        }
+    }
+
+    #[test]
     fn a_member_present_twice_is_refused_whatever_the_manifest_says() {
         // The Manifest has one line per name, so a second copy of a member is
         // one nothing vouches for separately; and a second image archive under
         // another name is one each pass could take for the image.
         for (extra, reason) in [
-            ("image.tar", "holds the member image.tar twice"),
-            ("metadata.tar", "holds the member metadata.tar twice"),
-            ("Manifest", "holds the member Manifest twice"),
+            ("image.tar", "holds the member \"image.tar\" twice"),
+            ("metadata.tar", "holds the member \"metadata.tar\" twice"),
+            ("Manifest", "holds the member \"Manifest\" twice"),
             (
                 "image.tar.zst",
-                "holds a second image archive, image.tar.zst",
+                "holds a second image archive, \"image.tar.zst\"",
             ),
             (
                 "metadata.tar.gz",
-                "holds a second metadata archive, metadata.tar.gz",
+                "holds a second metadata archive, \"metadata.tar.gz\"",
             ),
         ] {
             let built = Built {

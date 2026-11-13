@@ -186,13 +186,17 @@ impl Signature {
 
     /// Reads one `.SIGN.<algorithm>.<key>` member.
     ///
-    /// `subject` names what is being verified, for the error.
+    /// `subject` names what is being verified, for the error. The member's name
+    /// is the mirror's string until a key the repository trusts verifies the
+    /// segment, so the refusals here and in [`verify`](Self::verify) quote it
+    /// with `{:?}`, which escapes a control character rather than writing it
+    /// to the terminal the error is printed on.
     fn parse(subject: &str, member: &Member) -> Result<Signature, AlpineError> {
         let Some(rest) = member.name.strip_prefix(SIGN_PREFIX) else {
             return Err(AlpineError::signature(
                 subject,
                 format!(
-                    "its first segment holds {}, which is not a signature member",
+                    "its first segment holds {:?}, which is not a signature member",
                     member.name,
                 ),
             ));
@@ -200,7 +204,7 @@ impl Signature {
         let Some((token, key)) = rest.split_once('.') else {
             return Err(AlpineError::signature(
                 subject,
-                format!("the signature member {} names no key", member.name),
+                format!("the signature member {:?} names no key", member.name),
             ));
         };
         Ok(Signature {
@@ -232,7 +236,7 @@ impl Signature {
             return Err(AlpineError::signature(
                 subject,
                 format!(
-                    "the signature algorithm {} is not one this reader implements",
+                    "the signature algorithm {:?} is not one this reader implements",
                     self.token,
                 ),
             ));
@@ -241,7 +245,7 @@ impl Signature {
             return Err(AlpineError::signature(
                 subject,
                 format!(
-                    "it is signed by {}, which is not a key this repository trusts (held: {})",
+                    "it is signed by {:?}, which is not a key this repository trusts (held: {})",
                     self.key,
                     if keys.is_empty() {
                         "none".to_string()
@@ -398,6 +402,33 @@ mod tests {
             control_identity_hex(&metadata.compressed),
             "X11b6c50426d3c0656e9c5a567a5a59601c7f4307a",
         );
+    }
+
+    #[test]
+    fn a_signature_member_name_reaches_an_error_with_its_control_characters_escaped() {
+        // The member's name is what names the key, and it is read before any
+        // key has verified anything: it is the mirror's string, in each of the
+        // ways a segment is refused.
+        let hostile = crate::failure::hostile::TEXT;
+        let member = |name: String| Member {
+            name,
+            data: Vec::new(),
+        };
+        for name in [
+            hostile.to_string(),
+            format!("{SIGN_PREFIX}{hostile}"),
+            format!("{SIGN_PREFIX}RSA.{hostile}"),
+            format!("{SIGN_PREFIX}{hostile}.key.rsa.pub"),
+        ] {
+            let refused = Signatures::parse("the index", &[member(name.clone())])
+                .and_then(|signatures| {
+                    signatures
+                        .verify("the index", &KeySet::new(), b"payload")
+                        .map(|_| ())
+                })
+                .expect_err("nothing verifies");
+            crate::failure::hostile::assert_escaped(&refused.to_string());
+        }
     }
 
     #[test]

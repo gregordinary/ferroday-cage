@@ -834,7 +834,7 @@ fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
     checked_version(&found.version)?;
     if found.architecture != architecture && found.architecture != "all" {
         return Err(format!(
-            "its architecture {} is neither {architecture} nor all",
+            "its architecture {:?} is neither {architecture} nor all",
             found.architecture,
         ));
     }
@@ -2283,6 +2283,18 @@ mod tests {
                 false,
             )
             .expect("the named release still satisfies the pool's own check");
+    }
+
+    #[test]
+    fn an_architecture_a_package_states_reaches_the_refusal_with_its_control_characters_escaped() {
+        // The control file is the package's own text, and a package built in a
+        // sandbox wrote it there.
+        let hostile = crate::failure::hostile::TEXT;
+        let control = format!("Package: app\nVersion: 1.0\nArchitecture: {hostile}\n");
+        let Err(refused) = identity(&control, "amd64") else {
+            panic!("the architecture is refused");
+        };
+        crate::failure::hostile::assert_escaped(&refused);
     }
 
     #[test]

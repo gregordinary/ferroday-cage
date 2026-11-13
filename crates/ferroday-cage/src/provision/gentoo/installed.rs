@@ -412,7 +412,7 @@ fn entries(rooted: &Rooted, at: &Path) -> Result<Vec<(String, String)>, GentooEr
             let Ok(pf) = String::from_utf8(entry) else {
                 return Err(GentooError::database(
                     at,
-                    format!("{dir} holds an entry whose name is not UTF-8"),
+                    format!("{dir:?} holds an entry whose name is not UTF-8"),
                 ));
             };
             if pf.starts_with(MERGING_PREFIX) {
@@ -481,7 +481,7 @@ fn read_entry(
     let Some((category, package, version)) = version::split_cpv(&cpv) else {
         return Err(GentooError::database(
             at,
-            format!("{dir} does not name a package and a version"),
+            format!("{dir:?} does not name a package and a version"),
         ));
     };
     // Each file of an entry is one of a binary package's metadata files, which

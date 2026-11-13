@@ -6279,7 +6279,7 @@ impl<W: std::io::Write> Progress<W> {
                 reason,
                 ..
             } => self.line(format_args!(
-                "fcage: {required_by} requires {requirement}, and {reason}"
+                "fcage: {required_by} requires {requirement:?}, and {reason}"
             )),
             DebianEvent::Downloading {
                 package,

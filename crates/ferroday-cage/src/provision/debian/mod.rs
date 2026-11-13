@@ -3277,6 +3277,10 @@ pub enum DebianError {
         /// alone, because the observer is optional: a caller that takes no
         /// progress events, or renders them only under a verbosity flag, still
         /// has to be told which package failed.
+        ///
+        /// Each is as the list spelled it. A maintainer script writes to the
+        /// same stream, so a name here is the sandbox's text rather than one
+        /// the index vouched for, and the error's message quotes each one.
         packages: Vec<String>,
     },
     /// Packages were not left in the installed state after configuration.
@@ -3374,8 +3378,13 @@ impl fmt::Display for DebianError {
                 packages,
             } => {
                 write!(f, "the dpkg {wave} step exited with {status}")?;
-                if !packages.is_empty() {
-                    write!(f, ", processing {}", packages.join(", "))?;
+                // Each name is quoted with `{:?}`: the list is read from what
+                // the wave wrote to its stderr, which a maintainer script
+                // writes too, so a control character in it is escaped rather
+                // than handed to the terminal the error is printed on.
+                for (at, package) in packages.iter().enumerate() {
+                    let lead = if at == 0 { ", processing " } else { ", " };
+                    write!(f, "{lead}{package:?}")?;
                 }
                 Ok(())
             }
@@ -3459,7 +3468,7 @@ mod tests {
         };
         assert_eq!(
             named.to_string(),
-            "the dpkg configure step exited with exit code 1, processing systemd, udev",
+            "the dpkg configure step exited with exit code 1, processing \"systemd\", \"udev\"",
         );
         let unnamed = DebianError::Configure {
             wave: "unpack",

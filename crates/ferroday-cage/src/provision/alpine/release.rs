@@ -118,7 +118,7 @@ pub(super) fn check(
     Err(AlpineError::index(
         url,
         format!(
-            "it describes itself as {description}, which is not an index of release {release}; \
+            "it describes itself as {description:?}, which is not an index of release {release}; \
              Alpine signs every release with the same key, so the signature alone does not say \
              which release a mirror served"
         ),

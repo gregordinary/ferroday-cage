@@ -233,8 +233,8 @@ impl PlannedPackage {
                      an index record may state",
                 ),
                 _ => format!(
-                    "the plan states {length} bytes of {field} for {}, past the {max} an index \
-                     record may state",
+                    "the plan states {length} bytes of {field} for {:?}, past the {max} an \
+                     index record may state",
                     self.name,
                 ),
             });
@@ -409,7 +409,7 @@ impl Plan {
             let name = stanza
                 .get("Package")
                 .ok_or_else(|| plan_document("a stanza after the header names no package"))?;
-            let at = format!("the package {name}");
+            let at = format!("the package {name:?}");
             let package = PlannedPackage {
                 name: name.to_string(),
                 version: required(stanza.get("Version"), "Version", &at)?,

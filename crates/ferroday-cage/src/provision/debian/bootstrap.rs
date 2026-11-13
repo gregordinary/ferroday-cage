@@ -2245,6 +2245,20 @@ mod tests {
     }
 
     #[test]
+    fn a_name_a_maintainer_script_wrote_reaches_the_error_with_its_control_characters_escaped() {
+        // A script writes to the stderr the list is read from, so it can write
+        // a list of its own, and the last list wins.
+        let hostile = crate::failure::hostile::TEXT;
+        let stderr = format!("Errors were encountered while processing:\n {hostile}\n");
+        let failed = DebianError::Configure {
+            wave: "configure",
+            status: crate::ExitStatus::exited(1),
+            packages: failed_packages(stderr.as_bytes()),
+        };
+        crate::failure::hostile::assert_escaped(&failed.to_string());
+    }
+
+    #[test]
     fn a_record_path_may_carry_a_space() {
         // dpkg's fourth field runs to the end of the line, so a path with a
         // space in it is one record and not a malformed two.

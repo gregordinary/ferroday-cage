@@ -312,7 +312,7 @@ pub(super) fn parse_records(text: &str, from: usize) -> Result<Vec<Record>, Stri
         };
         if !letters.insert(key) {
             return Err(format!(
-                "the record ending at line {} carries {key}: twice",
+                "the record ending at line {} carries the field {key:?} twice",
                 number + 1
             ));
         }
@@ -349,13 +349,15 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
     let version = required('V', "version")?;
     let architecture = required('A', "architecture")?;
     let control_identity = required('C', "control identity")?;
-    let malformed = |reason: String| format!("{name}: {reason}");
-
     if !is_package_name(name) {
-        return Err(malformed(format!(
-            "{name:?} is not a name a package can be addressed by",
-        )));
+        return Err(format!(
+            "the record ending at line {line} names the package {name:?}, which is not a name \
+             a package can be addressed by",
+        ));
     }
+    // Named bare from here on: the name has passed the alphabet above, which
+    // holds no control character.
+    let malformed = |reason: String| format!("{name}: {reason}");
     if version::parse(version).is_none() {
         return Err(malformed(format!(
             "it carries {version:?}, which is not a version this format defines",
@@ -568,6 +570,27 @@ mod tests {
         }
         value.push('=');
         value
+    }
+
+    #[test]
+    fn a_record_an_index_malforms_is_refused_with_its_control_characters_escaped() {
+        // The name is refused before anything has admitted it, and a field's
+        // letter is any character a line begins with.
+        let hostile = crate::failure::hostile::TEXT;
+        for text in [
+            record(hostile, "1.0-r0", "x86_64", ""),
+            format!(
+                "{}\u{1b}:a\n\u{1b}:b\n",
+                record("app", "1.0-r0", "x86_64", "")
+            ),
+            format!(
+                "{}\u{1b}]52;c;cm0gLXJmIH4K\u{7}\n",
+                record("app", "1.0-r0", "x86_64", "")
+            ),
+        ] {
+            let refused = parse_records(&text, 0).expect_err("the record is refused");
+            crate::failure::hostile::assert_escaped(&refused);
+        }
     }
 
     /// A record, spelled the way an index spells one.

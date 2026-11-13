@@ -321,7 +321,7 @@ impl Refusals {
         }
         for taken in &self.occupied {
             parts.push(format!(
-                "{} requires {}, and {} would occupy slot {} of {}, which {} already takes {}",
+                "{} requires {}, and {} would occupy slot {:?} of {}, which {} already takes {}",
                 taken.wanted_by,
                 taken.atom,
                 taken.second,
@@ -2120,7 +2120,7 @@ USE: amd64
         assert!(
             refusals
                 .describe()
-                .contains("would occupy slot 0 of sys-libs/zlib"),
+                .contains("would occupy slot \"0\" of sys-libs/zlib"),
             "{}",
             refusals.describe(),
         );
@@ -2239,6 +2239,24 @@ USE: amd64
             ));
         }
         Index::parse(&text)
+    }
+
+    #[test]
+    fn a_slot_the_index_states_reaches_a_refusal_with_its_control_characters_escaped() {
+        // Nothing signs the index, and a slot is held to a length rather than
+        // to an alphabet, so the slot a collision names is the mirror's string.
+        let slot = crate::failure::hostile::TEXT;
+        let index = Index::parse(&format!(
+            "TIMESTAMP: 1\n\n\
+             BUILD_ID: 1\nCPV: a/b-1\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+             PATH: a/b/b-1-1.gpkg.tar\nSIZE: 1\nSLOT: {slot}\n\n\
+             BUILD_ID: 1\nCPV: a/b-2\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+             PATH: a/b/b-2-1.gpkg.tar\nSIZE: 1\nSLOT: {slot}\n\n"
+        ));
+        assert_eq!(index.records().len(), 2, "both builds are kept");
+        let (_, refusals) = run_over(&index, &Installed::default(), &["<a/b-2", ">=a/b-2"]);
+        assert_eq!(refusals.occupied.len(), 1, "{}", refusals.describe());
+        crate::failure::hostile::assert_escaped(&refusals.describe());
     }
 
     /// Resolves `atoms` against `index` over an empty root.

@@ -109,6 +109,16 @@ consumer upgrading can skip it.
   with the target's control characters escaped. A mirror, or anyone on a
   plain-HTTP path, could otherwise write terminal escape sequences into an
   operator's error output through a `Location` header.
+- The provisioners' errors quote the text an index, a package, or a sandbox
+  supplied with its control characters escaped: the member names of a Gentoo
+  binary package and of an Alpine signature segment, a Gentoo index's slot, the
+  dependencies and provided names Alpine and Debian refusals name, the versions
+  a Debian refusal offers as evidence, a `.deb`'s architecture, and the package
+  names dpkg's failure list holds. Each reached an error message as written, so
+  a mirror, a package's metadata, or a maintainer script writing its own failure
+  list could put terminal escape sequences on an operator's terminal. A refusal
+  now quotes such text, as `"lib>=2.0"` rather than `lib>=2.0`, and a Debian
+  refusal quotes its requirement in double quotes rather than backticks.
 
 ### Added
 

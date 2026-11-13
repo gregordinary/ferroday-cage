@@ -280,7 +280,7 @@ impl fmt::Display for UnheldPin {
                 required_by,
             } => write!(
                 f,
-                "{} is pinned to {} and {required_by} requires {requirement}",
+                "{} is pinned to {} and {required_by} requires {requirement:?}",
                 self.package, self.version,
             ),
         }

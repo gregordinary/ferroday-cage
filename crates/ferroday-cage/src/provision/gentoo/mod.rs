@@ -4760,7 +4760,7 @@ mod tests {
         assert!(
             ErrorChain::new(&err)
                 .to_string()
-                .contains("would occupy slot 0"),
+                .contains("would occupy slot \"0\""),
             "{err}",
         );
         assert_eq!(

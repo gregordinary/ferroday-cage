@@ -21,6 +21,14 @@
 //! reached through `source()` alone, so a renderer that walks the chain prints
 //! each layer once. [`ErrorChain`] is that renderer, for every place the crate
 //! or one of its consumers turns an error into text.
+//!
+//! A message names a string that nothing vouches for with `{:?}`: what a
+//! mirror, an unsigned index, a package's container or a sandbox's own output
+//! supplied, read before or without a signature over it. `{:?}` writes a
+//! control character as an escape, so an error printed on a terminal cannot
+//! carry an escape sequence onto it that rewrites the screen or sets the
+//! clipboard. A value an alphabet without control characters has already
+//! admitted, such as a package name an index reader checked, is named bare.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -141,6 +149,29 @@ macro_rules! path_io_error {
 }
 
 pub(crate) use path_io_error;
+
+/// What a hostile source could write into a string an error names, and the
+/// check that the error renders it inert. Every such string reaches an error
+/// through a provisioner, so the module is built where one is.
+#[cfg(all(test, any(feature = "debian", feature = "alpine", feature = "gentoo")))]
+pub(crate) mod hostile {
+    /// OSC 52, which sets the terminal's clipboard, then a screen clear.
+    pub(crate) const TEXT: &str = "\u{1b}]52;c;cm0gLXJmIH4K\u{7}\u{1b}[2J";
+
+    /// Asserts that `rendered` carries none of [`TEXT`]'s control characters,
+    /// and carries them as the escapes `{:?}` writes instead.
+    #[track_caller]
+    pub(crate) fn assert_escaped(rendered: &str) {
+        assert!(
+            !rendered.contains(['\u{1b}', '\u{7}']),
+            "a control character reached the rendering: {rendered:?}",
+        );
+        assert!(
+            rendered.contains("\\u{1b}"),
+            "the rendering does not name the string at all: {rendered:?}",
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

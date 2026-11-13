@@ -2709,7 +2709,7 @@ mod tests {
         // write it. An escape sequence carried into the operator's terminal
         // through an error chain could rewrite the screen or, as OSC 52 does,
         // set the clipboard, so a refusal renders it as `{:?}` renders it.
-        let hostile = "\u{1b}]52;c;cm0gLXJmIH4K\u{7}\u{1b}[2J";
+        let hostile = crate::failure::hostile::TEXT;
         let fetch = HttpFetch::new();
         for target in [
             format!("https://mirror.example/{hostile}"),
@@ -2720,11 +2720,7 @@ mod tests {
                 .check_redirect("http://mirror.example/x", &target)
                 .expect_err("the target is refused");
             let rendered = ErrorChain::new(&refused).to_string();
-            assert!(
-                !rendered.contains(['\u{1b}', '\u{7}']),
-                "a control character reached the error: {rendered:?}",
-            );
-            assert!(rendered.contains("\\u{1b}"), "{rendered:?}");
+            crate::failure::hostile::assert_escaped(&rendered);
             assert!(
                 rendered.starts_with("fetching http://mirror.example/x failed"),
                 "the refusal names the URL fetched: {rendered:?}",

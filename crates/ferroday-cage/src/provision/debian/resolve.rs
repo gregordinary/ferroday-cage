@@ -168,7 +168,7 @@ impl Refusal {
             }
             Refusal::ExcludedButRequired { .. } => "it is excluded".to_string(),
             Refusal::Unsatisfiable { available, .. } => match available {
-                Some(available) => format!("nothing satisfies it (available: {available})"),
+                Some(available) => format!("nothing satisfies it (available: {available:?})"),
                 None => "no configured archive offers it and no base layer supplies it".to_string(),
             },
             Refusal::Pinned { unheld, .. } => {
@@ -194,7 +194,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} requires `{}`, and {}",
+            "{} requires {:?}, and {}",
             self.required_by(),
             self.requirement(),
             self.reason(),
@@ -1446,6 +1446,32 @@ mod tests {
     }
 
     #[test]
+    fn a_relation_an_index_spells_reaches_a_refusal_with_its_control_characters_escaped() {
+        // A relation's text is the index's, held to no alphabet: a pool
+        // publishes a package's control file as the package wrote it.
+        let hostile = crate::failure::hostile::TEXT;
+        let refusal = resolve(
+            &index(&stanza("app", hostile, "")),
+            &[],
+            &["app".into()],
+            &[],
+        )
+        .into_refusal();
+        crate::failure::hostile::assert_escaped(&refusal.to_string());
+
+        // A version is held to no alphabet either, and the evidence a refusal
+        // carries names the versions the archive offers.
+        let text = format!(
+            "{}\n{}",
+            stanza("app", "lib (= 2)", ""),
+            stanza_at("lib", hostile, "", ""),
+        );
+        let refusal = resolve(&index(&text), &[], &["app".into()], &[]).into_refusal();
+        assert!(refusal.reason().contains("available"), "{refusal}");
+        crate::failure::hostile::assert_escaped(&refusal.to_string());
+    }
+
+    #[test]
     fn a_refusal_names_who_asked_and_what_the_wall_was() {
         // The three parts the progress event carries, pinned here rather than
         // only through the sentence they compose into.
@@ -1461,7 +1487,7 @@ mod tests {
         assert_eq!(
             refusal.to_string(),
             format!(
-                "{} requires `{}`, and {}",
+                "{} requires {:?}, and {}",
                 refusal.required_by(),
                 refusal.requirement(),
                 refusal.reason(),
@@ -1954,7 +1980,7 @@ mod tests {
             .to_string();
         assert_eq!(
             rendered,
-            "app requires `libfoo (>= 2.0)`, and the pin holds libfoo at 1.0",
+            "app requires \"libfoo (>= 2.0)\", and the pin holds libfoo at 1.0",
         );
         let selected = resolve(&index, &[], &["either".into()], &[]).into_packages();
         assert_eq!(names(&selected), ["either", "libbar"]);

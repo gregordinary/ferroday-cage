@@ -236,10 +236,15 @@ impl Release {
         if identifies_as(&self.suite) || identifies_as(&self.codename) {
             return Ok(());
         }
+        let stated = |field: &Option<String>| {
+            field
+                .as_deref()
+                .map_or_else(|| "absent".to_string(), |value| format!("{value:?}"))
+        };
         Err(format!(
             "the release does not identify as suite {requested} (its Suite is {}, its Codename is {})",
-            self.suite.as_deref().unwrap_or("absent"),
-            self.codename.as_deref().unwrap_or("absent"),
+            stated(&self.suite),
+            stated(&self.codename),
         ))
     }
 
@@ -272,7 +277,7 @@ impl Release {
             return Ok(());
         };
         let deadline = parse_rfc5322(valid_until)
-            .ok_or_else(|| format!("the release Valid-Until {valid_until} is unparseable"))?;
+            .ok_or_else(|| format!("the release Valid-Until {valid_until:?} is unparseable"))?;
         let now = now_epoch().ok_or_else(|| {
             "the system clock is before the Unix epoch, so release freshness cannot be \
              established"
