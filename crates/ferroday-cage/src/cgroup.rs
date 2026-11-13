@@ -693,7 +693,21 @@ impl Cgroup {
                 "opening the sandbox's cgroup.procs",
                 &path,
             ))?;
-            let kill = open_write(&dir, "cgroup.kill").ok();
+            // A kernel before Linux 5.14 has no `cgroup.kill`, and the tree is
+            // then ended only as far as the supervisor's death reaches. Any
+            // other failure to open it is one of the host's, reported rather
+            // than read as that kernel.
+            let kill = match open_write(&dir, "cgroup.kill") {
+                Ok(kill) => Some(kill),
+                Err(Errno::NOENT) => None,
+                Err(errno) => {
+                    return Err(failed(
+                        Step::OpenFile,
+                        "opening the sandbox's cgroup.kill",
+                        &path,
+                    )(errno));
+                }
+            };
             Ok((dir, procs, kill))
         })();
         match created {
