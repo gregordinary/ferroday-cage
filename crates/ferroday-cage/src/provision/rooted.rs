@@ -209,8 +209,11 @@ impl Rooted {
     /// directory of the tree rather than of the host.
     pub(crate) fn create_dir_all(&self, relative: impl AsRef<Path>) -> io::Result<()> {
         let mut made = Chain::default();
-        self.create_dirs(&components(relative.as_ref())?, &mut made)?;
-        self.settle(made)
+        let created = components(relative.as_ref())
+            .and_then(|components| self.create_dirs(&components, &mut made))
+            .map(drop)
+            .map_err(io::Error::from);
+        self.landed(made, created)
     }
 
     /// Reads the file at `relative`, refusing one that holds more than `limit`
@@ -621,10 +624,15 @@ impl Rooted {
     /// destination. Both paths resolve against the tree's root.
     pub(crate) fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
         let mut made = Chain::default();
-        let (from_parent, from_leaf) = self.parent_of(from.as_ref(), Parents::Require)?;
-        let (to_parent, to_leaf) = self.parent_of(to.as_ref(), Parents::Create(&mut made))?;
-        rustix::fs::renameat(&from_parent, &from_leaf, &to_parent, &to_leaf)?;
-        self.settle(made)
+        let renamed = self
+            .parent_of(from.as_ref(), Parents::Require)
+            .and_then(|(from_parent, from_leaf)| {
+                let (to_parent, to_leaf) =
+                    self.parent_of(to.as_ref(), Parents::Create(&mut made))?;
+                rustix::fs::renameat(&from_parent, &from_leaf, &to_parent, &to_leaf)
+            })
+            .map_err(io::Error::from);
+        self.landed(made, renamed)
     }
 
     /// Creates a symbolic link at `relative` holding `target` verbatim,
@@ -635,11 +643,15 @@ impl Rooted {
     pub(crate) fn symlink(&self, target: &str, relative: impl AsRef<Path>) -> io::Result<()> {
         let target = CString::new(target).map_err(|_| Errno::INVAL)?;
         let mut made = Chain::default();
-        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Create(&mut made))?;
-        containment::replacing(&parent, &leaf, || {
-            rustix::fs::symlinkat(&target, &parent, &leaf)
-        })?;
-        self.settle(made)
+        let linked = self
+            .parent_of(relative.as_ref(), Parents::Create(&mut made))
+            .and_then(|(parent, leaf)| {
+                containment::replacing(&parent, &leaf, || {
+                    rustix::fs::symlinkat(&target, &parent, &leaf)
+                })
+            })
+            .map_err(io::Error::from);
+        self.landed(made, linked)
     }
 
     /// Creates the file at `relative` holding `contents`, at `mode`.
@@ -651,33 +663,73 @@ impl Rooted {
     /// on the file this created and on nothing else.
     fn create(&self, relative: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         let mut made = Chain::default();
-        let (parent, leaf) = self.parent_of(relative, Parents::Create(&mut made))?;
-        let fd = containment::replacing(&parent, &leaf, || {
-            rustix::fs::openat(
-                &parent,
-                &leaf,
-                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o600),
-            )
-        })?;
-        let mut file = File::from(fd);
-        file.write_all(contents)?;
-        rustix::fs::fchmod(&file, Mode::from_raw_mode(mode))?;
-        self.settle(made)
+        let written = self
+            .parent_of(relative, Parents::Create(&mut made))
+            .map_err(io::Error::from)
+            .and_then(|(parent, leaf)| {
+                let fd = containment::replacing(&parent, &leaf, || {
+                    rustix::fs::openat(
+                        &parent,
+                        &leaf,
+                        OFlags::CREATE
+                            | OFlags::EXCL
+                            | OFlags::WRONLY
+                            | OFlags::NOFOLLOW
+                            | OFlags::CLOEXEC,
+                        Mode::from_raw_mode(0o600),
+                    )
+                })?;
+                let mut file = File::from(fd);
+                file.write_all(contents)?;
+                rustix::fs::fchmod(&file, Mode::from_raw_mode(mode))?;
+                Ok(())
+            });
+        self.landed(made, written)
     }
 
-    /// Gives each directory a write created its mode, deepest first, and then
-    /// each one it carried up from the base the ownership the base holds it at,
-    /// through the map the tree is owned through.
+    /// Settles the directories a write made, whether or not the write landed,
+    /// and answers the write's own outcome, its failure before any of the
+    /// settling's.
     ///
-    /// Called once the write has landed, as an extraction applies both once
-    /// every entry has: a mode denying the owner write or search, `0555` from a
-    /// base's directory, would refuse the calling user the write beneath it,
-    /// and so would a directory given to another id. The modes go first, while
-    /// the calling user still owns every directory and may set one.
+    /// A directory is made `0700` and owned by the calling user until it is
+    /// settled, so a write that failed beneath it and left it so would leave a
+    /// tree that differs from what it was meant to hold: a `usr/` carried up
+    /// into a kept overlay upper and left `0700` hides the base's `0755` one,
+    /// and a later run finds it there and carries nothing.
+    fn landed<T>(&self, made: Chain, outcome: io::Result<T>) -> io::Result<T> {
+        let settled = self.settle(made);
+        let value = outcome?;
+        settled?;
+        Ok(value)
+    }
+
+    /// Gives each directory a write created its mode, deepest first, and a
+    /// directory it carried up from the base the base's modification time,
+    /// and then each carried one the ownership the base holds it at, through
+    /// the map the tree is owned through.
+    ///
+    /// Called once the write is over, as an extraction applies all three once
+    /// every entry is written: a mode denying the owner write or search, `0555`
+    /// from a base's directory, would refuse the calling user the write beneath
+    /// it, and so would a directory given to another id; and a directory's
+    /// time moves as entries are made in it. The modes and times go first,
+    /// while the calling user still owns every directory and may set them.
     fn settle(&self, made: Chain) -> io::Result<()> {
-        for (dir, mode) in made.modes.iter().rev() {
-            rustix::fs::fchmod(dir, Mode::from_raw_mode(*mode))?;
+        for made in made.dirs.iter().rev() {
+            rustix::fs::fchmod(&made.dir, Mode::from_raw_mode(made.mode))?;
+            if let Some(modified) = made.modified {
+                let omit = rustix::fs::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: rustix::fs::UTIME_OMIT,
+                };
+                rustix::fs::futimens(
+                    &made.dir,
+                    &rustix::fs::Timestamps {
+                        last_access: omit,
+                        last_modification: modified,
+                    },
+                )?;
+            }
         }
         reown(&self.root, &made.owed, &self.ownership).map_err(io::Error::other)
     }
@@ -745,9 +797,15 @@ impl Rooted {
                 chain.owed.push(record);
             }
             let mode = made.copied.map_or(DIR_MODE, |below| below.st_mode & 0o7777);
-            chain
-                .modes
-                .push((rustix::io::fcntl_dupfd_cloexec(made.dir, 0)?, mode));
+            #[cfg(feature = "tarball")]
+            let modified = made.copied.map(containment::modified);
+            #[cfg(not(feature = "tarball"))]
+            let modified = None;
+            chain.dirs.push(MadeDir {
+                dir: rustix::io::fcntl_dupfd_cloexec(made.dir, 0)?,
+                mode,
+                modified,
+            });
             Ok(())
         };
         #[cfg(feature = "tarball")]
@@ -778,16 +836,25 @@ enum Parents<'o> {
     Require,
 }
 
-/// What the directories a write created are owed once the write has landed:
-/// their modes and, for one carried up from a base, its ownership. See
+/// What the directories a write created are owed once the write is over: their
+/// modes and, for one carried up from a base, its time and its ownership. See
 /// [`Rooted::settle`].
 #[derive(Default)]
 struct Chain {
-    /// Each directory made, in the order it was made, held open read-only
-    /// without following a link, with the mode it keeps.
-    modes: Vec<(OwnedFd, u32)>,
+    /// Each directory made, in the order it was made.
+    dirs: Vec<MadeDir>,
     /// The ownership the directories carried up from a base are owed.
     owed: Vec<Owed>,
+}
+
+/// One directory a write made, and what it keeps.
+struct MadeDir {
+    /// The directory, held open read-only without following a link.
+    dir: OwnedFd,
+    /// The mode it keeps.
+    mode: u32,
+    /// The base's modification time, for a directory carried up from one.
+    modified: Option<rustix::fs::Timespec>,
 }
 
 /// Splits a tree-relative path into its components.
@@ -1027,6 +1094,71 @@ mod tests {
             b"served\n"
         );
         std::fs::set_permissions(root.join("srv"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_still_gives_the_directories_it_made_their_mode() {
+        // The parents are made before the leaf, at 0700. A leaf the kernel
+        // refuses, a name past NAME_MAX here, fails the write after they are
+        // there, and they must not be left at the mode they were made with.
+        let (scratch, tree) = tree("failed-write");
+        let leaf = "x".repeat(300);
+        tree.write(format!("new/sub/{leaf}"), b"")
+            .expect_err("a name past NAME_MAX is refused");
+        let root = scratch.join("tree");
+        for dir in ["new", "new/sub"] {
+            let mode = std::fs::metadata(root.join(dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, DIR_MODE, "{dir} kept its creation mode");
+        }
+    }
+
+    #[cfg(feature = "tarball")]
+    #[test]
+    fn a_carried_directory_keeps_the_base_directorys_time() {
+        // The overlay's own copy-up keeps a directory's time, and so does an
+        // extraction's carry. The write beneath a carried directory moves its
+        // time, so it is given the base's once the write is in.
+        use std::os::unix::fs::MetadataExt;
+
+        let (scratch, upper) = tree("carried-time");
+        let base = scratch.join("base");
+        std::fs::create_dir_all(base.join("srv/www")).unwrap();
+        for dir in ["srv", "srv/www"] {
+            let stamp = rustix::fs::Timespec {
+                tv_sec: 1_000_000_000,
+                tv_nsec: 500,
+            };
+            rustix::fs::utimensat(
+                rustix::fs::CWD,
+                base.join(dir),
+                &rustix::fs::Timestamps {
+                    last_access: stamp,
+                    last_modification: stamp,
+                },
+                AtFlags::empty(),
+            )
+            .unwrap();
+        }
+        let below = Rooted::open(&base).unwrap();
+        upper
+            .over(Some(&below))
+            .unwrap()
+            .write("srv/www/index", b"served\n")
+            .expect("the write lands");
+
+        let root = scratch.join("tree");
+        for dir in ["srv", "srv/www"] {
+            let meta = std::fs::metadata(root.join(dir)).unwrap();
+            assert_eq!(
+                (meta.mtime(), meta.mtime_nsec()),
+                (1_000_000_000, 500),
+                "{dir} lost the base's time"
+            );
+        }
     }
 
     #[test]

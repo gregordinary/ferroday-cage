@@ -928,6 +928,13 @@ consumer upgrading can skip it.
   package cache and a binary package's entry, where it followed one, and a
   download into the entry, and the read back out of it, went wherever the link
   led.
+- A host-side write into a tree gives the directories it made their modes, and
+  those it carried up from a layered build's base their owner, when the write
+  itself fails. They were left at `0700` and owned by the calling user, and a
+  `usr/` left so in a kept upper hid the base's `0755` one from then on.
+- A directory a host-side write carries up from a layered build's base keeps
+  the base directory's modification time, as an extraction's carry and the
+  overlay's own copy-up keep it. It was given the time of the write.
 
 ### Internal
 
