@@ -869,9 +869,10 @@ caller reads its result back afterwards.
 The library creates the upper and its work directory with `mkdirat` against
 their parent. It adopts an existing entry only when it is a directory the
 calling user owns. A symbolic link another local user planted at the path is
-therefore refused rather than followed. That closes the create. It does not make
-a shared parent safe: the mount options name the layers as paths, and the kernel
-resolves them again at mount time.
+therefore refused rather than followed. That closes the create. Each launch then
+opens every layer without following a link, so a link put at a layer's path or
+above it since fails the launch. Neither makes a shared parent safe: a directory
+another user puts at a layer's path is the directory a launch mounts.
 
 On the command line, `--overlay-lower` and `--overlay-upper` stand in for
 `--rootfs`, and `--remove-overlay-upper` discards the upper with its work

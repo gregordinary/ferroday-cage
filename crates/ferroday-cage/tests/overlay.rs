@@ -10,7 +10,8 @@ mod common;
 
 use std::path::Path;
 
-use ferroday_cage::{Cage, ExitStatus};
+use ferroday_cage::{Cage, Error, ExitStatus, SetupStep};
+use rustix::io::Errno;
 
 /// Runs `/bin/sh -c <script>` in an overlay of `lower` with writes in `upper`.
 fn run(lower: &Path, upper: &Path, script: &str) -> ExitStatus {
@@ -340,5 +341,69 @@ fn a_bind_target_the_upper_had_deleted_stays_deleted_after_the_run() {
         std::os::unix::fs::FileTypeExt::is_char_device(&whiteout.file_type())
             && std::os::unix::fs::MetadataExt::rdev(&whiteout) == 0,
         "the deletion is recorded as a whiteout: {whiteout:?}",
+    );
+}
+
+/// Every layer the build froze is opened at every launch without following a
+/// link, so a link put in place since cannot redirect the next launch.
+///
+/// Between the build and the launch, the directory holding the upper and its
+/// work directory is moved aside and a link to another holding the same names
+/// takes its place. Followed, the sandbox would write there. The launch is
+/// refused at the overlay instead.
+#[test]
+fn a_layer_replaced_with_a_link_since_the_build_is_refused_at_launch() {
+    let Some(lower) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("overlay-frozen-layers");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let (layers, elsewhere) = (dir.join("layers"), dir.join("elsewhere"));
+    std::fs::create_dir_all(&layers).unwrap();
+    let cage = Cage::builder()
+        .overlay_rootfs(lower, layers.join("upper"))
+        .command("/bin/sh")
+        .args(["-c", "echo written > /written"])
+        .build()
+        .expect("a valid overlay cage configuration");
+
+    for name in ["upper", ".upper.work"] {
+        std::fs::create_dir_all(elsewhere.join(name)).unwrap();
+    }
+    std::fs::rename(&layers, dir.join("layers.moved")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &layers).unwrap();
+
+    let err = cage.run().expect_err("the launch is refused");
+    assert!(
+        matches!(
+            &err,
+            Error::Setup { step: SetupStep::MountOverlayRoot, source, .. }
+                if source.raw_os_error() == Some(Errno::LOOP.raw_os_error())
+        ),
+        "{err:?}"
+    );
+    assert!(!elsewhere.join("upper/written").exists());
+}
+
+/// A layer is handed to the kernel as a descriptor, so a path holding what the
+/// overlay's option syntax separates layers and options with is mounted as the
+/// directory it names.
+#[test]
+fn a_layer_path_holding_an_option_separator_mounts_the_directory_named() {
+    let Some(lower) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("overlay-separators");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let upper = dir.join(r"up\per:a,b");
+    let status = run(lower, &upper, "echo written > /written");
+    assert!(status.success(), "{status:?}");
+    assert_eq!(
+        std::fs::read_to_string(upper.join("written")).unwrap(),
+        "written\n"
     );
 }

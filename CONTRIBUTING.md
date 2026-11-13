@@ -575,7 +575,7 @@ report name a package and its version bare.
 | What does a launch refuse its sandbox where the sandbox keeps the caller's session keyring? | `mechanism::seccomp::KEYRING_FILTER`, which the launch stage installs where the kernel refuses its keyring join |
 | Does a kernel at a Landlock ABI enforce this right or this scope? | `hardening::fs_enforced`, `hardening::net_enforced`, `hardening::scope_enforced`, which `host::landlock_enforces_fs`, `host::landlock_enforces_net` and `host::landlock_enforces_scope` ask of the running kernel |
 | Can this kernel enforce a Landlock request that is a reach's only bound? | `mechanism::HardeningPlan::ensure_sandbox_enforceable` for a sandbox, `HardeningPlan::net_grant_unenforced` for a network grant a stack attaching to one would carry connections past, and `HardeningPlan::ensure_landlock_enforceable` with `hardening::ensure_scopes_enforceable` for a restriction, and `hardening::settle_resolve_unix` for the unix-socket restriction in either |
-| Compose an overlay's mount options | `mechanism::overlay_options` |
+| Mount an overlay of layers, each opened without following a link | `mechanism::overlay::mount_overlay`, which the launch and `mechanism::probe_overlay_mount` share |
 | What does a mount op bring to rest on its target, if anything? | `mechanism::MountAction::arrival`, or `Arrival::of_raw` for a raw mount's flags |
 | Read a raw mount's flags as `mount(2)` acts on them | `mechanism::raw_mount_flags` |
 | Is this path at or under a mount target the launch froze? | `spec::covers` |

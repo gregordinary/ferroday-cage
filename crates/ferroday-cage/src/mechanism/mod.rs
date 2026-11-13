@@ -121,15 +121,14 @@ pub(crate) use export::{
     ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
     StartError, kill_export, start_export,
 };
-pub(crate) use overlay::{
-    OverlayOptionsError, OverlayProbe, overlay_options, probe_overlay_mount, xattr_unsupported,
-};
+pub(crate) use overlay::{MAX_LOWERS, OverlayProbe, probe_overlay_mount, xattr_unsupported};
 pub(crate) use procfs::{ProcfsProbe, probe_procfs_mount};
 pub(crate) use remove::{RemoveFailure, delete_tree, remove_tree_mapped};
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -286,7 +285,7 @@ pub(crate) enum RootPlan {
     Overlay {
         /// The canonical rootfs the overlay is mounted over.
         base: CString,
-        /// The overlay's frozen mount options and layers.
+        /// The overlay's frozen layers.
         overlay: OverlayPlan,
     },
     /// A tmpfs of the sandbox's own, holding only what the mount profile
@@ -300,22 +299,42 @@ pub(crate) enum RootPlan {
 /// How an overlay-rooted cage's root is assembled.
 ///
 /// The base is the read-only lower and the path the overlay is mounted over
-/// both, so this carries only the preformatted mount options naming the lower,
-/// the disposable upper, and its work directory.
+/// both. Every layer is frozen as a canonical path, which the sandbox stage
+/// opens without following a link and hands to the kernel as a descriptor;
+/// see [`overlay::mount_overlay`].
 #[derive(Debug, Clone)]
 pub(crate) struct OverlayPlan {
-    /// The overlay mount options, composed at build time by
-    /// [`overlay_options`]: `lowerdir=<lowers>,upperdir=<upper>,workdir=<work>,userxattr`.
-    pub(crate) options: CString,
-    /// The resolved lower layers, first (the base the overlay mounts over)
-    /// first. Kept beside the formatted options so `resolved_inputs` can report
-    /// the stack as a structure rather than leave a caller to parse it back out
-    /// of the option string.
-    pub(crate) lower: Vec<PathBuf>,
-    /// The resolved upper layer, where the sandbox's writes land.
-    pub(crate) upper: PathBuf,
-    /// The resolved work directory the overlay requires beside the upper.
-    pub(crate) work: PathBuf,
+    /// The lower layers, the base the overlay mounts over first.
+    pub(crate) lower: Vec<CString>,
+    /// The upper layer, where the sandbox's writes land.
+    pub(crate) upper: CString,
+    /// The work directory the overlay requires beside the upper.
+    pub(crate) work: CString,
+}
+
+impl OverlayPlan {
+    /// The lower layers as paths, base first.
+    pub(crate) fn lower_paths(&self) -> Vec<PathBuf> {
+        self.lower
+            .iter()
+            .map(|lower| frozen_path(lower).to_path_buf())
+            .collect()
+    }
+
+    /// The upper layer as a path.
+    pub(crate) fn upper_path(&self) -> &Path {
+        frozen_path(&self.upper)
+    }
+
+    /// The work directory as a path.
+    pub(crate) fn work_path(&self) -> &Path {
+        frozen_path(&self.work)
+    }
+}
+
+/// The host path a layer was frozen as.
+fn frozen_path(layer: &CStr) -> &Path {
+    Path::new(OsStr::from_bytes(layer.to_bytes()))
 }
 
 /// How the command stage wires one standard stream, frozen at build time.

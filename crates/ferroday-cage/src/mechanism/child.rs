@@ -83,6 +83,7 @@ use syscalls::Sysno;
 
 use super::bounds::LINK_BUF;
 use super::frame;
+use super::overlay::{OverlayLayers, mount_overlay};
 use super::resolve;
 use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
@@ -1650,7 +1651,13 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
         RootPlan::Overlay { base, overlay } => {
             let failed = |errno| (SetupStep::MountOverlayRoot, errno, 0);
             let base = open_frozen(base, OFlags::DIRECTORY).map_err(failed)?;
-            let newroot = mount_overlay(overlay.options.as_c_str()).map_err(failed)?;
+            let layers = OverlayLayers {
+                base: base.as_fd(),
+                stacked: overlay.lower.get(1..).unwrap_or_default(),
+                upper: &overlay.upper,
+                work: &overlay.work,
+            };
+            let newroot = mount_overlay(&layers).map_err(failed)?;
             attach(newroot.as_fd(), base.as_fd()).map_err(failed)?;
             newroot
         }
@@ -2858,7 +2865,7 @@ fn clone_tree(at: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
 /// kernel refuses it instead, with `ELOOP`, and the launch fails at the mount
 /// the path was for. The mount then acts on the descriptor, so nothing
 /// resolves the path a second time.
-fn open_frozen(path: &CStr, oflags: OFlags) -> Result<OwnedFd, Errno> {
+pub(super) fn open_frozen(path: &CStr, oflags: OFlags) -> Result<OwnedFd, Errno> {
     resolve::openat2(
         fs::CWD,
         path,
@@ -2976,55 +2983,6 @@ fn nosuid_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
     }
 }
 
-/// The directory, in a tmpfs of the sandbox's own, that [`mount_overlay`]
-/// mounts an overlay on before it clones it.
-const OVERLAY_MOUNT_POINT: &CStr = c"overlay";
-
-/// Mounts an overlay with `options` and returns a descriptor of it, attached
-/// nowhere.
-///
-/// `mount(2)` is the call the overlay probe makes, with the same option string,
-/// and it mounts only onto a path. The path here is a directory in a tmpfs of
-/// the sandbox's own, attached for the moment on top of `/`, where no lookup
-/// crosses it (see [`mount_empty_root`]), so nothing outside this process can
-/// reach it or replace it. The overlay is cloned from there, the clone keeping
-/// its flags, and the tmpfs is detached again with the original in it.
-fn mount_overlay(options: &CStr) -> Result<OwnedFd, Errno> {
-    let scratch = empty_tmpfs(
-        mount::MountAttrFlags::MOUNT_ATTR_NOSUID
-            | mount::MountAttrFlags::MOUNT_ATTR_NODEV
-            | mount::MountAttrFlags::MOUNT_ATTR_NOEXEC,
-    )?;
-    fs::mkdirat(&scratch, OVERLAY_MOUNT_POINT, Mode::from_raw_mode(0o700))?;
-    attach_over_root(scratch.as_fd())?;
-    let clone = fs::openat(
-        &scratch,
-        OVERLAY_MOUNT_POINT,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .and_then(|at| {
-        mount::mount(
-            c"overlay",
-            fd_path(&at).as_cstr(),
-            c"overlay",
-            MountFlags::NOSUID,
-            options,
-        )
-    })
-    .and_then(|()| {
-        mount::open_tree(
-            &scratch,
-            OVERLAY_MOUNT_POINT,
-            mount::OpenTreeFlags::OPEN_TREE_CLONE | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC,
-        )
-    });
-    let detached = mount::unmount(fd_path(&scratch).as_cstr(), UnmountFlags::DETACH);
-    let clone = clone?;
-    detached?;
-    Ok(clone)
-}
-
 /// Mounts the tmpfs an empty root is made of, and returns a descriptor of it.
 ///
 /// The mount profile names its bind sources as host paths, which resolve by
@@ -3074,7 +3032,7 @@ fn mount_host_root() -> Result<OwnedFd, Errno> {
 
 /// Creates a tmpfs of the sandbox's own, mode `0755`, detached, carrying
 /// `attributes`, and returns a descriptor of it.
-fn empty_tmpfs(attributes: mount::MountAttrFlags) -> Result<OwnedFd, Errno> {
+pub(super) fn empty_tmpfs(attributes: mount::MountAttrFlags) -> Result<OwnedFd, Errno> {
     let context = mount::fsopen(c"tmpfs", mount::FsOpenFlags::FSOPEN_CLOEXEC)?;
     mount::fsconfig_set_string(&context, c"mode", c"0755")?;
     mount::fsconfig_create(&context)?;
@@ -3083,7 +3041,7 @@ fn empty_tmpfs(attributes: mount::MountAttrFlags) -> Result<OwnedFd, Errno> {
 
 /// Attaches the detached mount `root` names on top of `/`, as a root the
 /// sandbox pivots into.
-fn attach_over_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
+pub(super) fn attach_over_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
     mount::move_mount(
         root,
         c"",
@@ -3229,32 +3187,40 @@ fn open_in_root_with(
     resolve::openat2(root, path, oflags, mode, ResolveFlags::IN_ROOT)
 }
 
-/// A path assembled into a stack buffer, for the post-fork stages that cannot
-/// allocate one.
+/// Bytes assembled into a stack buffer of `N`, for the post-fork stages that
+/// cannot allocate: a path, as [`StackPath`], or the overlay's mount options.
 ///
-/// The buffer holds every path formatted here with room to spare: the longest
-/// is `/proc/self/fd/` and ten decimal digits. A push that would not fit is
-/// dropped rather than truncating mid-way — these processes must not panic, and
-/// a short path fails its `open` with `ENOENT` instead of naming something else.
-struct StackPath {
-    buf: [u8; 48],
+/// A push that would not fit is dropped rather than truncating mid-way — these
+/// processes must not panic, and a short path fails its `open` with `ENOENT`
+/// instead of naming something else. A caller for whom a dropped push changes
+/// what the bytes mean, rather than leaving a path that names nothing, asks
+/// [`dropped`](Self::dropped).
+pub(super) struct StackBuf<const N: usize> {
+    buf: [u8; N],
     len: usize,
+    dropped: bool,
 }
 
-impl StackPath {
-    /// An empty path.
-    fn new() -> StackPath {
-        StackPath {
-            buf: [0u8; 48],
+/// A path in a [`StackBuf`] that holds every path formatted here with room to
+/// spare: the longest is `/proc/self/fd/` and ten decimal digits.
+pub(super) type StackPath = StackBuf<48>;
+
+impl<const N: usize> StackBuf<N> {
+    /// An empty buffer.
+    pub(super) fn new() -> StackBuf<N> {
+        StackBuf {
+            buf: [0u8; N],
             len: 0,
+            dropped: false,
         }
     }
 
     /// Appends bytes, if they fit alongside the terminating NUL and hold no NUL
     /// of their own; anything else is dropped whole. Every caller appends
     /// literals and digits, which always pass.
-    fn push(&mut self, bytes: &[u8]) {
+    pub(super) fn push(&mut self, bytes: &[u8]) {
         if self.len + bytes.len() >= self.buf.len() || bytes.contains(&0) {
+            self.dropped = true;
             return;
         }
         for &byte in bytes {
@@ -3264,7 +3230,7 @@ impl StackPath {
     }
 
     /// Appends a value in decimal.
-    fn push_decimal(&mut self, mut value: u32) {
+    pub(super) fn push_decimal(&mut self, mut value: u32) {
         // The widest u32 is ten digits, emitted least-significant first and
         // reversed into the buffer.
         let mut digits = [0u8; 10];
@@ -3281,7 +3247,19 @@ impl StackPath {
         self.push(&digits[..count]);
     }
 
-    fn as_cstr(&self) -> &CStr {
+    /// Appends the `/proc/self/fd` path that names `fd`.
+    pub(super) fn push_fd_path(&mut self, fd: BorrowedFd<'_>) {
+        self.push(b"/proc/self/fd/");
+        // Descriptors are non-negative, so the cast is lossless.
+        self.push_decimal(fd.as_raw_fd() as u32);
+    }
+
+    /// Whether a push was dropped.
+    pub(super) fn dropped(&self) -> bool {
+        self.dropped
+    }
+
+    pub(super) fn as_cstr(&self) -> &CStr {
         // SAFETY: the buffer is zero-initialized, `push` never lets `len` reach
         // the final byte, and it appends no NUL, so the slice holds exactly one
         // NUL, at the end.
@@ -3292,11 +3270,9 @@ impl StackPath {
 /// Formats the `/proc/self/fd` path that names `fd`, so a descriptor
 /// resolved with `RESOLVE_IN_ROOT` can anchor a mount syscall that only
 /// accepts paths.
-fn fd_path<Fd: AsFd>(fd: &Fd) -> StackPath {
+pub(super) fn fd_path<Fd: AsFd>(fd: &Fd) -> StackPath {
     let mut path = StackPath::new();
-    path.push(b"/proc/self/fd/");
-    // Descriptors are non-negative, so the cast is lossless.
-    path.push_decimal(fd.as_fd().as_raw_fd() as u32);
+    path.push_fd_path(fd.as_fd());
     path
 }
 
@@ -3623,8 +3599,13 @@ mod tests {
         path.push(b"3\0/etc");
         path.push_decimal(7);
         assert_eq!(path.as_cstr(), c"/proc/self/fd/7");
+        assert!(path.dropped());
+        let mut path = StackPath::new();
+        path.push(b"/proc/self/fd/7");
+        assert!(!path.dropped());
         path.push(&[b'x'; 48]);
         assert_eq!(path.as_cstr(), c"/proc/self/fd/7");
+        assert!(path.dropped());
     }
 
     #[test]

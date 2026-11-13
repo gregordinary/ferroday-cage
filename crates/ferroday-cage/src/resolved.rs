@@ -791,9 +791,9 @@ fn project_root(plan: &LaunchPlan) -> ResolvedRoot {
             path: PathBuf::from(OsString::from_vec(path.as_bytes().to_vec())),
         },
         RootPlan::Overlay { overlay, .. } => ResolvedRoot::Overlay {
-            lower: overlay.lower.clone(),
-            upper: overlay.upper.clone(),
-            work: overlay.work.clone(),
+            lower: overlay.lower_paths(),
+            upper: overlay.upper_path().to_path_buf(),
+            work: overlay.work_path().to_path_buf(),
         },
         RootPlan::Empty => ResolvedRoot::Empty,
         RootPlan::HostReadOnly => ResolvedRoot::HostReadOnly,

@@ -683,32 +683,17 @@ rendered as text.
         /// The offending capability.
         capability: &'static str,
     },
-    /// An overlay-root path holds a character the overlay mount options cannot
-    /// carry: a `,`.
+    /// An overlay root stacks more lowers than a launch can hand the kernel.
     ///
-    /// The lower, upper, and work directories are passed to the kernel in one
-    /// comma-separated option string. A `\` or a `:` in a layer path is escaped
-    /// there, but a comma is not one every reader of the string honours an
-    /// escape for: a security module that takes its own options out of the same
-    /// string splits it at every comma first. Such a path is refused rather than
-    /// mounted as something else.
+    /// Before Linux 6.13 the layers reach the kernel in one option string, which
+    /// `mount(2)` passes on whole only up to a page. The bound holds on every
+    /// kernel, so a configuration builds the same wherever it runs.
     #[non_exhaustive]
-    OverlayPathInvalid {
-        /// The offending path.
-        path: PathBuf,
-    },
-    /// An overlay root's mount options are longer than the kernel passes on
-    /// whole.
-    ///
-    /// The options name every layer by its absolute path, and `mount(2)` cuts
-    /// its data at one page rather than refusing a longer string. A cut string
-    /// still mounts whenever what is left names directories that exist, which
-    /// is a different overlay from the one configured, so a stack whose paths
-    /// do not fit is refused. Fewer lowers, or shorter paths to them, fit.
-    #[non_exhaustive]
-    OverlayOptionsTooLong {
-        /// The length of the composed options, in bytes.
-        length: usize,
+    OverlayTooManyLowers {
+        /// The number of lowers, the base included.
+        count: usize,
+        /// The most lowers an overlay root may stack.
+        max: usize,
     },
     /// An overlay root names no lower layer.
     ///
@@ -724,8 +709,8 @@ rendered as text.
     OverlayUpperMissing,
     /// An overlay layer directory could not be prepared.
     ///
-    /// Every layer is canonicalized, since the mount options name the layers
-    /// absolutely; the upper and work directories are additionally created when
+    /// Every layer is canonicalized, since the launch opens the layers by
+    /// their absolute paths; the upper and work directories are additionally created when
     /// absent, while a stacked lower must already exist. This reports a host
     /// failure at either step: a path that does not resolve, a permission
     /// refusal, or a path that resolves to something other than a usable
@@ -781,7 +766,7 @@ rendered as text.
     /// from a mount the caller never issued: a lower that is, or lies beneath,
     /// the upper or the work directory; the upper and the work directory the
     /// same or nested; and two lowers the same or nested. The paths are
-    /// compared as the mount options name them, with every symbolic link above
+    /// compared as the launch opens them, with every symbolic link above
     /// a layer resolved. A directory a bind mount presents at a second path is
     /// not recognised there.
     #[non_exhaustive]
@@ -789,11 +774,11 @@ rendered as text.
         /// The layer that is, or lies beneath, the other. A lower is any of the
         /// overlay's lowers, the rootfs included.
         layer: OverlayLayer,
-        /// That layer's path, as the mount options name it.
+        /// That layer's path, as the launch opens it.
         path: PathBuf,
         /// The layer it is, or lies beneath.
         within: OverlayLayer,
-        /// That layer's path, as the mount options name it.
+        /// That layer's path, as the launch opens it.
         within_path: PathBuf,
     },
     /// An overlay-rooted cage was requested on a host that cannot establish an
@@ -940,9 +925,9 @@ rendered as text.
     /// left to the mount's `EXDEV`.
     #[non_exhaustive]
     OverlayWorkOnAnotherFilesystem {
-        /// The work directory, as the mount options name it.
+        /// The work directory, as the launch opens it.
         work: PathBuf,
-        /// The upper, as the mount options name it.
+        /// The upper, as the launch opens it.
         upper: PathBuf,
     },
 }
@@ -1174,15 +1159,9 @@ impl fmt::Display for ConfigError {
                 "keeping {capability} alongside a non-root run-as identity would let the \
                  command return to uid 0; drop the capability or run as root inside",
             ),
-            ConfigError::OverlayPathInvalid { path } => write!(
+            ConfigError::OverlayTooManyLowers { count, max } => write!(
                 f,
-                "the overlay-root path {path:?} contains a ',', which the overlay mount options \
-                 cannot carry",
-            ),
-            ConfigError::OverlayOptionsTooLong { length } => write!(
-                f,
-                "the overlay root's mount options are {length} bytes, longer than the kernel \
-                 passes on whole; stack fewer lowers, or reach them by shorter paths",
+                "the overlay root stacks {count} lowers, more than the {max} a launch can mount",
             ),
             ConfigError::OverlayLowerMissing => {
                 f.write_str("the overlay root names no lower layer to mount over")

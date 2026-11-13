@@ -195,6 +195,21 @@ consumer upgrading can skip it.
   built to be costly hash several hundred octets for each octet of its
   signatures. The library reads certificates only from the
   keyrings it embeds and the files its caller names.
+- **Breaking.** An overlay-rooted launch opens each of the overlay's layers
+  without following a link, as it opens the base, and hands the kernel the
+  descriptor rather than the path: through `fsconfig` from Linux 6.13, and as
+  the descriptor's `/proc/self/fd` path in the mount options before it. The
+  kernel previously resolved the stacked lowers, the upper and the work
+  directory again at mount, following any link. Whatever could write a
+  directory one of them ran through, such as a sandbox an earlier launch of the
+  same plan bound that directory into writable, could point a lower at any host
+  directory the caller can read, or the sandbox's writes at any the caller can
+  write. A link there now fails the launch at `SetupStep::MountOverlayRoot`
+  with `ELOOP`. A layer path may hold a `,`, and
+  `ConfigError::OverlayPathInvalid` is removed.
+  `ConfigError::OverlayOptionsTooLong` is replaced by
+  `ConfigError::OverlayTooManyLowers`, which refuses a stack of more than 160
+  lowers, the base included, whatever their paths.
 
 ### Added
 

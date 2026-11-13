@@ -11,7 +11,7 @@
 use std::ffi::CString;
 use std::fmt;
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, Mode, OFlags, XattrFlags};
@@ -899,9 +899,9 @@ fn overlay_mount_refused(scratch_dir: &Path) -> bool {
         return false;
     }
 
-    // The mount syscall names its layers as paths, so the layout below is
-    // path-based; it is safe because this base directory is fresh, private, and
-    // unpredictably named.
+    // The probe child opens its layers by path, as the launch does; that is
+    // safe because this base directory is fresh, private, and unpredictably
+    // named.
     let base = scratch_dir.join(&name);
     let outcome = overlay_mount_probe(&base);
     // The mount leaves a mode-`0` directory in its work area. Empty, it goes
@@ -911,28 +911,25 @@ fn overlay_mount_refused(scratch_dir: &Path) -> bool {
     matches!(outcome, Some(crate::mechanism::OverlayProbe::MountFailed))
 }
 
-/// Lays out the probe's lower, upper, work, and merged directories under `base`
-/// and runs the fork-based mount test, returning its outcome or `None` when the
+/// Lays out the probe's lower, upper, and work directories under `base` and
+/// runs the fork-based mount test, returning its outcome or `None` when the
 /// layout could not be prepared.
 ///
 /// `base` was just created empty and private by [`overlay_mount_refused`], so
 /// each layer directory is created outright: a name already taken is a surprise
-/// worth failing on, not something to reuse.
+/// worth failing on, not something to reuse. The child opens each layer without
+/// following a link, as the launch does, so it is named by its canonical path.
 fn overlay_mount_probe(base: &Path) -> Option<crate::mechanism::OverlayProbe> {
+    let base = std::fs::canonicalize(base).ok()?;
     let dir = |name: &str| {
         let path = base.join(name);
-        std::fs::create_dir(&path).ok().map(|()| path)
+        std::fs::create_dir(&path).ok()?;
+        CString::new(path.into_os_string().into_vec()).ok()
     };
     let lower = dir("lower")?;
     let upper = dir("upper")?;
     let work = dir("work")?;
-    let merged = dir("merged")?;
-
-    // A scratch path the option string cannot carry leaves the probe
-    // inconclusive rather than reported as a mount refusal.
-    let options = crate::mechanism::overlay_options(&[lower], &upper, &work).ok()?;
-    let merged = CString::new(merged.as_os_str().as_bytes()).ok()?;
-    Some(crate::mechanism::probe_overlay_mount(&merged, &options))
+    Some(crate::mechanism::probe_overlay_mount(&lower, &upper, &work))
 }
 
 /// Probes the host for conditions that make a uid/gid range map unavailable,

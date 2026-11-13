@@ -18,8 +18,8 @@ use crate::idmap::{self, IdMapper, Identity, IdentityMap, PresentedIdentity};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
     self, Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction,
-    MountDir, MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, PresentPlan,
-    RlimitPlan, RootPlan, RunAsPlan, StdioPlan,
+    MountDir, MountOp, NestedMap, NestedPlan, OverlayPlan, PresentPlan, RlimitPlan, RootPlan,
+    RunAsPlan, StdioPlan,
 };
 use crate::observer::{Observer, Output};
 use crate::path;
@@ -1095,9 +1095,11 @@ impl Mount {
 /// An entry already at either path is adopted only when it is a directory
 /// belonging to the calling user, and is otherwise refused with
 /// [`ConfigError::OverlayDirUnowned`], so a symbolic link another user planted
-/// there is never followed. That check closes the create; it does not make a
-/// shared parent safe, since the mount options name the layers as paths and the
-/// kernel resolves them again at mount time.
+/// there is never followed. That check closes the create. Each launch then
+/// opens every layer without following a link, so a link put at a layer's path
+/// or above it since fails the launch rather than redirecting it. Neither makes
+/// a shared parent safe: a directory another user puts at a layer's path is the
+/// directory a launch mounts.
 ///
 /// [`ConfigError::OverlayDirUnowned`]: crate::ConfigError::OverlayDirUnowned
 ///
@@ -1110,7 +1112,7 @@ impl Mount {
 /// [`ConfigError::OverlayLayersOverlap`] before it creates anything on the
 /// host. It refuses the overlaps the kernel itself refuses at mount as well.
 ///
-/// The comparison is between the paths the mount options name. Every lower is
+/// The comparison is between the paths the launch opens. Every lower is
 /// canonicalized, and the upper and the work directory are their parent's
 /// canonical path joined with their own name, a parent that does not exist yet
 /// resolved as it will be once created. A symbolic link above a layer is
@@ -1126,8 +1128,13 @@ impl Mount {
 /// one where both hold the same path. The first lower is also the directory the
 /// overlay is mounted over, and the one the sandbox pivots into.
 ///
-/// (The kernel's own `lowerdir=` option is highest-precedence-first, the reverse
-/// of this order; the mount options are emitted reversed to match.)
+/// (The kernel takes its lowers highest-precedence-first, the reverse of this
+/// order; the launch hands them over reversed to match.)
+///
+/// A stack holds at most 160 lowers, the base included; a longer one is refused
+/// with [`ConfigError::OverlayTooManyLowers`].
+///
+/// [`ConfigError::OverlayTooManyLowers`]: crate::ConfigError::OverlayTooManyLowers
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
@@ -3143,8 +3150,8 @@ impl CageBuilder {
                     // An overlay root: `canonical` is the base lower the
                     // overlay mounts over, any further lowers are resolved
                     // beside it, and the caller's upper — with its work
-                    // directory — is prepared and frozen into the mount options
-                    // here, so the sandbox stage only replays them. A host that
+                    // directory — is prepared and frozen here, so the sandbox
+                    // stage only opens what the plan names. A host that
                     // cannot establish an unprivileged overlay is refused now,
                     // before any fork. This is the one step that creates
                     // anything on the host, so it runs once every other part of
@@ -3152,9 +3159,10 @@ impl CageBuilder {
                     // any other reason leaves no layer directory behind.
                     Some(overlay) => {
                         let overlay = build_overlay_plan(canonical, overlay)?;
+                        let lower = overlay.lower_paths();
                         let layers = RootLayers::Overlay {
-                            upper: &overlay.upper,
-                            lower: &overlay.lower,
+                            upper: overlay.upper_path(),
+                            lower: &lower,
                         };
                         let placeholders = created_file_targets(&lowering.ops, &layers);
                         (RootPlan::Overlay { base, overlay }, placeholders)
@@ -4282,24 +4290,33 @@ pub(crate) fn validate_workdir(path: &Path) -> Result<Option<CString>, Error> {
 
 /// Prepares an overlay root: resolves the lowers, creates the upper and its work
 /// directory, refuses a host that cannot mount an unprivileged overlay, and
-/// freezes the mount options.
+/// freezes every layer's path.
 ///
 /// `base` is the already-canonicalized root filesystem, which is the first
 /// lower. Every further lower is resolved beside it, and the upper and work
-/// directories are resolved to the absolute paths the mount options name. The
+/// directories are resolved to the absolute paths the sandbox stage opens. The
 /// work directory, which the overlay requires empty and on the upper's
 /// filesystem, is a hidden sibling of the upper unless the caller named one.
 ///
 /// Everything that can be refused without creating a directory is checked
-/// before one is created: the lowers, the presence of an upper, whether every
-/// layer is disjoint from every other, and whether the option string can carry
-/// every layer path. The missing directories above the upper and the work
+/// before one is created: the number of lowers, the lowers themselves, the
+/// presence of an upper, and whether every layer is disjoint from every other.
+/// The missing directories above the upper and the work
 /// directory are created next, and then the host's support for an unprivileged
 /// overlay is probed in the upper's parent, through
 /// [`overlay_blocker`](crate::host::overlay_blocker). A refusal after that
 /// removes the directories this call created, so a refused build leaves the host
 /// as it found it.
 fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Error> {
+    let max = crate::mechanism::MAX_LOWERS;
+    if overlay.lower.len() > max {
+        return Err(ConfigError::OverlayTooManyLowers {
+            count: overlay.lower.len(),
+            max,
+        }
+        .into());
+    }
+
     // The base is already canonical: it is the first lower, resolved as the
     // rootfs. Resolve any further lowers the same way, so a missing or
     // non-directory layer is a typed configuration error here.
@@ -4337,18 +4354,14 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     let (upper_path, work_path) = (upper.path(), work.path());
 
     check_layers_disjoint(&lowers, &upper_path, &work_path)?;
-
-    let options =
-        crate::mechanism::overlay_options(&lowers, &upper_path, &work_path).map_err(|refusal| {
-            match refusal {
-                OverlayOptionsError::Unrepresentable(path) => {
-                    ConfigError::OverlayPathInvalid { path }
-                }
-                OverlayOptionsError::TooLong(length) => {
-                    ConfigError::OverlayOptionsTooLong { length }
-                }
-            }
-        })?;
+    let plan = OverlayPlan {
+        lower: lowers
+            .iter()
+            .map(|lower| cstring(lower.as_os_str()))
+            .collect::<Result<_, _>>()?,
+        upper: cstring(upper_path.as_os_str())?,
+        work: cstring(work_path.as_os_str())?,
+    };
 
     let mut created = CreatedDirs::default();
     for (layer, at) in [(OverlayLayer::Upper, &upper), (OverlayLayer::Work, &work)] {
@@ -4388,12 +4401,7 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     }
 
     created.keep();
-    Ok(OverlayPlan {
-        options,
-        lower: lowers,
-        upper: upper_path,
-        work: work_path,
-    })
+    Ok(plan)
 }
 
 /// The overlay work directory the library manages beside `upper`: a hidden
@@ -4431,7 +4439,7 @@ const OVERLAY_DIR_MODE: RawMode = 0o755;
 /// Where an overlay layer directory goes: its parent directory, resolved, and
 /// the layer's own name inside it.
 ///
-/// The absolute path the mount options name is composed from the parent's
+/// The absolute path the launch opens is composed from the parent's
 /// canonical path and the leaf's own name, so the leaf is never resolved as a
 /// link. [`create_layer_dir`] establishes that it is not one.
 struct LayerPath {
@@ -4526,7 +4534,7 @@ fn canonical_once_created(dir: &Path) -> std::io::Result<PathBuf> {
 /// naming the two layers rather than leaving an `ELOOP` or an `EINVAL` from a
 /// mount the caller never issued.
 ///
-/// The paths compared are the ones the mount options name: every lower
+/// The paths compared are the ones the launch opens: every lower
 /// canonicalized, and the upper and the work directory as their canonicalized
 /// parent and their own name. A symbolic link anywhere above a layer is
 /// therefore resolved before the comparison, and two spellings of one directory
@@ -10136,41 +10144,26 @@ read-only = true
         );
         assert!(!scratch.join("fresh").exists(), "nothing was created");
 
-        // A refusal inside the overlay's own preparation, after the parents of
-        // the upper were created, takes them away again. Options the kernel
-        // would cut short are refused before the layers themselves exist.
-        // Two lowers whose paths each fit a path, and together do not fit a
-        // page of options.
-        let deep = |name: &str| {
-            let mut deep = scratch.join(name);
-            while deep.as_os_str().len() < 2200 {
-                deep.push("l".repeat(200));
-            }
-            std::fs::create_dir_all(&deep).unwrap();
-            deep
-        };
-        let (first, second) = (deep("first"), deep("second"));
+        // A refusal inside the overlay's own preparation is made before the
+        // layers' parents are created: a stack deeper than a launch can mount.
+        let deep = (0..crate::mechanism::MAX_LOWERS)
+            .fold(Overlay::new().lower(&base), |overlay, _| {
+                overlay.lower(&base)
+            });
         let err = Cage::builder()
-            .overlay(
-                Overlay::new()
-                    .lower(&base)
-                    .lower(&first)
-                    .lower(&second)
-                    .upper(&upper),
-            )
+            .overlay(deep.upper(&upper))
             .command("/bin/sh")
             .build()
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::Config(ConfigError::OverlayOptionsTooLong { .. })
-            ),
-            "{err}"
-        );
+        match err {
+            Error::Config(ConfigError::OverlayTooManyLowers { count, max }) => {
+                assert_eq!((count, max), (crate::mechanism::MAX_LOWERS + 1, 160));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
         assert!(
             !scratch.join("fresh").exists(),
-            "the parents created for the upper are removed again"
+            "nothing is created for the upper"
         );
     }
 
@@ -10228,16 +10221,15 @@ read-only = true
     }
 
     #[test]
-    fn a_layer_path_the_kernel_would_unescape_mounts_the_directory_named() {
-        // Overlayfs unescapes every layer path, so `up\x` written verbatim is
-        // mounted as `upx`. The options name it escaped, which is the directory
-        // whose ownership the build checked.
-        let scratch = Scratch::new("overlay-escape");
+    fn a_layer_path_holding_an_option_separator_is_frozen_as_named() {
+        // The launch hands the kernel each layer as a descriptor, so nothing
+        // the overlay's option syntax gives a meaning to, a `\`, a `:` or a
+        // `,`, is read in a layer's path.
+        let scratch = Scratch::new("overlay-separators");
         let base = scratch.join("ba:se");
         std::fs::create_dir(&base).unwrap();
-        std::fs::create_dir(scratch.join("upx")).unwrap();
         let built = Cage::builder()
-            .overlay_rootfs(&base, scratch.join(r"up\x"))
+            .overlay_rootfs(&base, scratch.join(r"up\x,y"))
             .command("/bin/sh")
             .build();
         let cage = match built {
@@ -10253,30 +10245,11 @@ read-only = true
         let RootPlan::Overlay { overlay, .. } = &cage.plan.root else {
             panic!("an overlay-rooted cage plans an overlay root");
         };
-        let options = overlay.options.to_str().unwrap();
         let canonical = std::fs::canonicalize(&*scratch).unwrap();
-        let canonical = canonical.to_str().unwrap();
-        assert_eq!(
-            options,
-            format!(
-                r"lowerdir={canonical}/ba\:se,upperdir={canonical}/up\\x,workdir={canonical}/.up\\x.work,userxattr"
-            ),
-        );
-
-        // A comma is refused rather than escaped.
-        let err = Cage::builder()
-            .overlay_rootfs(&base, scratch.join("up,per"))
-            .command("/bin/sh")
-            .build()
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::Config(ConfigError::OverlayPathInvalid { .. })),
-            "{err}"
-        );
-        assert!(
-            !scratch.join("up,per").exists(),
-            "and nothing is created for it"
-        );
+        assert_eq!(overlay.lower_paths(), [canonical.join("ba:se")]);
+        assert_eq!(overlay.upper_path(), canonical.join(r"up\x,y"));
+        assert_eq!(overlay.work_path(), canonical.join(r".up\x,y.work"));
+        assert!(scratch.join(r"up\x,y").is_dir());
     }
 
     #[test]

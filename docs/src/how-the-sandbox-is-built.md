@@ -113,7 +113,12 @@ model](process-model.md) describes.
     since, by whatever can write a directory the path runs through, and the
     launch fails rather than mount what the link names. The root is mounted onto
     that descriptor, and the init carries on through a descriptor of the new
-    mount, so the path is not resolved again. The kernel requires bind sources
+    mount, so the path is not resolved again. An overlay's other layers, its
+    stacked lowers, its upper and its work directory, are opened the same way,
+    and the kernel is handed each descriptor rather than its path: through
+    `fsconfig` from Linux 6.13, and before it as the descriptor's
+    `/proc/self/fd` path in the mount options, which the overlay follows to the
+    directory the descriptor holds open. The kernel requires bind sources
     and targets to be attached in the caller's own mount namespace, so a
     descriptor opened before the unshare cannot anchor this step. An [empty
     root](#an-empty-root) has no path: it is a tmpfs created for the launch.

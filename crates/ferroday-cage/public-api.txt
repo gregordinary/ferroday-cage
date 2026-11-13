@@ -1762,10 +1762,9 @@ pub ferroday_cage::ConfigError::OverlayLayersOverlap::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::OverlayLayersOverlap::within: ferroday_cage::OverlayLayer
 pub ferroday_cage::ConfigError::OverlayLayersOverlap::within_path: std::path::PathBuf
 pub ferroday_cage::ConfigError::OverlayLowerMissing
-#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayOptionsTooLong
-pub ferroday_cage::ConfigError::OverlayOptionsTooLong::length: usize
-#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayPathInvalid
-pub ferroday_cage::ConfigError::OverlayPathInvalid::path: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayTooManyLowers
+pub ferroday_cage::ConfigError::OverlayTooManyLowers::count: usize
+pub ferroday_cage::ConfigError::OverlayTooManyLowers::max: usize
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayUnavailable
 pub ferroday_cage::ConfigError::OverlayUnavailable::blocker: ferroday_cage::host::OverlayBlocker
 pub ferroday_cage::ConfigError::OverlayUpperMissing
