@@ -1302,11 +1302,15 @@ the consumer extends with its own trusted calls.
 ///
 /// The whole builder is also `Debug`, and with `serde` it serializes back to
 /// the profile format, so `toml::to_string(&builder)` renders a configuration
-/// for review. Two things do not survive that, both because they are code or a
-/// resource rather than configuration: an [`id_mapper`](Self::id_mapper)
-/// delegate is simply absent from the output, and a builder holding a
-/// [`Stdio::from_fd`](crate::Stdio::from_fd) disposition fails to serialize at
-/// all, since a descriptor names nothing a profile could carry. Everything else
+/// for review. Some things do not survive that. An
+/// [`id_mapper`](Self::id_mapper) delegate is code rather than configuration,
+/// and is simply absent from the output. A builder holding anything a profile
+/// cannot spell fails to serialize at all: a
+/// [`Stdio::from_fd`](crate::Stdio::from_fd) disposition, since a descriptor
+/// names nothing a profile could carry; a value that is not UTF-8, since a
+/// profile is text; and a seccomp policy the profile's table cannot state,
+/// which is a precompiled program, a rule set whose actions are not a plain
+/// allow-list's or deny-list's, or one that names no syscall. Everything else
 /// round-trips.
 // Scalar fields precede the env table and the bind and raw-mount table
 // arrays so the serialized form is valid TOML in field order.

@@ -231,8 +231,14 @@ packages from a binary package host into it.
 //! namespaces enabled. Hosts commonly disable them; [`host`] probes for the
 //! known blocking configurations, and a denied launch is reported as
 //! [`Error::UsernsUnavailable`] with the identified cause rather than a raw
-//! `EPERM`. On such hosts the restriction fallback above remains available:
-//! it needs only Landlock or seccomp, not user namespaces.
+//! `EPERM`.
+// Gated as the section it refers to is: without `hardening` there is no
+// restriction fallback above.
+#![cfg_attr(
+    feature = "hardening",
+    doc = "On such hosts the restriction fallback above remains available: it needs \
+           only Landlock or seccomp, not user namespaces."
+)]
 //!
 //! # Status
 //!

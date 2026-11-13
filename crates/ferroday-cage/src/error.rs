@@ -256,7 +256,8 @@ impl fmt::Display for OverlayLayer {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// No root was provided: no rootfs, no overlay, and no empty root.
+    /// No root was provided: no rootfs, no overlay, no empty root, and not the
+    /// host's own root.
     RootfsMissing,
     /// More than one of a plain rootfs, an overlay root, an empty root, and the
     /// host's own root was configured, where exactly one root can be in force.
@@ -903,9 +904,14 @@ rendered as text.
     /// A restriction carrying a cgroup parent or a limit builds only where its
     /// Landlock domain keeps every write off the cgroup v2 hierarchy and its
     /// seccomp policy answers `clone3` with an errno; [`CgroupReach`] says
-    /// which of those does not hold. Limits that are not
-    /// [required](crate::RestrictionBuilder::cgroup_required) are refused the
-    /// same way.
+    /// which of those does not hold.
+    // The sentence links a feature-gated item, so its doc text is gated on the
+    // feature, as a restriction is.
+    #[cfg_attr(
+        feature = "hardening",
+        doc = "Limits that are not [required](crate::RestrictionBuilder::cgroup_required) \
+               are refused the same way."
+    )]
     #[non_exhaustive]
     RestrictionCgroupReachable {
         /// What the command could reach the cgroup through.
@@ -949,9 +955,10 @@ impl fmt::Display for ConfigError {
     // states, so a control character in one reaches a terminal as an escape.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::RootfsMissing => {
-                f.write_str("no root was provided: set a rootfs, an overlay, or an empty rootfs")
-            }
+            ConfigError::RootfsMissing => f.write_str(
+                "no root was provided: set a rootfs, an overlay, an empty rootfs, or the \
+                     host's own root",
+            ),
             ConfigError::RootContradiction => f.write_str(
                 "more than one of a rootfs, an overlay root, an empty rootfs, and the host's own \
                  root is configured, but exactly one root is in force; keep one",

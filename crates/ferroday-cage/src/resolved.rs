@@ -28,6 +28,13 @@ use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction, RootP
 ///
 /// Obtained from [`Cage::resolved_inputs`](crate::Cage::resolved_inputs).
 ///
+/// It records the conditions a command runs under, not the command line: the
+/// command, its arguments, and its working directory are not part of it. Those
+/// are what the caller states, and a launch applies them as stated, the
+/// working directory being `/` where none is set, so a consumer's provenance
+/// names them beside this record. Two builds that differ only in them produce
+/// the same record.
+///
 /// # Stability
 ///
 /// This type's *shape* follows the compatibility promise like any other public
@@ -565,9 +572,13 @@ pub struct ResolvedLandlockFs {
     /// The `LANDLOCK_ACCESS_FS_*` rights allowed beneath the path, as the
     /// kernel spells them.
     ///
-    /// This is what the grant asks for, reported before the command stage
-    /// narrows it: to the running kernel's ABI, and, where the path names
-    /// something other than a directory, to the rights that act on a file.
+    /// This is what the build kept of the grant: the rights it asks for, less
+    /// `RESOLVE_UNIX` where the unix-socket restriction does not apply, which
+    /// is where it is off, by default or by request, and where it is only the
+    /// host root's default and the kernel cannot enforce it. It is reported
+    /// before the command stage narrows it further at launch: to the running
+    /// kernel's ABI, and, where the path names something other than a
+    /// directory, to the rights that act on a file.
     // Gated for the reason `ResolvedRoot::Host`'s second sentence is: the type
     // is reported whether or not the feature is compiled in, but the type it
     // contrasts with is not.
