@@ -67,6 +67,7 @@ CI asserts the security-property suites actually ran:
 | `FERRODAY_CAGE_REQUIRE_LANDLOCK` | The kernel offers no Landlock LSM, or one that predates network rules (ABI 4, Linux 6.7) |
 | `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE` | The kernel's Landlock ABI predates scopes (ABI 6, Linux 6.12) |
 | `FERRODAY_CAGE_REQUIRE_SECCOMP` | The kernel offers no seccomp |
+| `FERRODAY_CAGE_REQUIRE_CGROUP` | The cgroup suite runs outside a delegated cgroup v2 directory of its own that can hold its sandboxes' cgroups |
 | `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` | A network suite was not opted into |
 
 A variable governs every test that needs its facility, including the host tools
@@ -90,6 +91,15 @@ To exercise the full suite locally you need three things:
 - The `tun` module loaded.
 - A subordinate id allocation for your user, from `usermod --add-subuids
   --add-subgids`.
+
+The cgroup suite, `tests/cgroup.rs`, needs a delegated cgroup with nothing else
+in it, which a terminal's own cgroup is not. Cargo's runner setting gives each
+test binary a scope of its own, while cargo itself stays outside it:
+
+```sh
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='systemd-run --user --scope --quiet -p Delegate=yes --' \
+    cargo test --workspace --all-features --test cgroup
+```
 
 ### The network suites
 

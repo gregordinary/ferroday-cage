@@ -111,6 +111,31 @@ jobs:
           # rather than an old host. A self-hosted runner on an older kernel
           # unsets this.
           FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE: '1'
+      - name: Test (cgroup limits, in a delegated cgroup)
+        # tests/cgroup.rs places its sandboxes' cgroups beneath a delegated
+        # cgroup it has to itself, which the step above, in the runner's own
+        # cgroup, is not, so there it skips. The runner image makes its user
+        # linger, so that user's systemd manager runs from boot, and
+        # `systemd-run --user --scope -p Delegate=yes` gives each test binary a
+        # scope of its own, delegated to it. Cargo's runner wraps the test
+        # binary alone, so cargo stays outside the scope. The manager is
+        # reached through XDG_RUNTIME_DIR, which a job's environment need not
+        # set. FERRODAY_CAGE_REQUIRE_CGROUP turns a scope the suite cannot use
+        # into a failure, and a manager that cannot be reached fails the
+        # preflight.
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          sudo loginctl enable-linger "$(id -un)"
+          for _ in $(seq 30); do
+            [ -S "$XDG_RUNTIME_DIR/systemd/private" ] && break
+            sleep 1
+          done
+          systemd-run --user --scope --quiet -p Delegate=yes -- cat /proc/self/cgroup
+          cargo test --workspace --all-features --test cgroup
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: systemd-run --user --scope --quiet -p Delegate=yes --
+          FERRODAY_CAGE_REQUIRE_USERNS: '1'
+          FERRODAY_CAGE_REQUIRE_CGROUP: '1'
       - name: Test (serde without hardening)
         # A profile format built without the hardening layer must refuse a
         # profile that configures hardening; only this feature combination

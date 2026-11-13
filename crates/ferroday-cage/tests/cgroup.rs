@@ -5,8 +5,8 @@
 //! the test binary runs in: run under `systemd-run --user --scope -p
 //! Delegate=yes`, that is a scope of the test's own. The first test to need it
 //! moves the whole test process into a leaf beside the sandboxes' cgroups, as
-//! a caller does. A run started anywhere else skips them, since how the run
-//! was started is the premise, not something the host lacks.
+//! a caller does. A run started anywhere else skips them, and
+//! `FERRODAY_CAGE_REQUIRE_CGROUP` turns that skip into a failure.
 
 mod common;
 
@@ -59,7 +59,7 @@ fn delegated() -> Option<&'static Path> {
     match parent {
         Ok(parent) => Some(parent.as_path()),
         Err(reason) => {
-            common::require::premise_unmet(format!(
+            common::require::CGROUP.skip(format!(
                 "{reason}; run the tests under systemd-run --user --scope -p Delegate=yes"
             ));
             None

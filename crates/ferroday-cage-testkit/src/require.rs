@@ -56,6 +56,11 @@ pub const LANDLOCK_SCOPE: Requirement = Requirement::named("FERRODAY_CAGE_REQUIR
 /// Seccomp filtering.
 pub const SECCOMP: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_SECCOMP");
 
+/// A delegated cgroup v2 directory the run has to itself and can divide, as a
+/// scope from `systemd-run --user --scope -p Delegate=yes` is, which the
+/// cgroup suite places its sandboxes' cgroups beneath.
+pub const CGROUP: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_CGROUP");
+
 /// The network suites, which run only when their own variable opts in; see
 /// [`network_suite`].
 pub const NETWORK_TEST: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_NETWORK_TEST");
