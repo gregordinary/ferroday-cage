@@ -707,11 +707,8 @@ fn dropping_capabilities_empties_every_set() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     for set in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
-        let value = text
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{set}:")))
-            .map(str::trim)
-            .unwrap_or_else(|| panic!("the status reports {set}"));
+        let value =
+            common::status_field(&text, set).unwrap_or_else(|| panic!("the status reports {set}"));
         assert_eq!(
             value, "0000000000000000",
             "a full capability drop must empty {set}",
@@ -733,11 +730,8 @@ fn keeping_a_capability_retains_only_it() {
         .expect("the sandbox launches");
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    let effective = text
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:"))
-        .map(str::trim)
-        .expect("the status reports an effective set");
+    let effective =
+        common::status_field(&text, "CapEff").expect("the status reports an effective set");
     // CAP_NET_BIND_SERVICE is bit 10, so the effective set is exactly 1 << 10.
     let bits = u64::from_str_radix(effective, 16).expect("a hex capability mask");
     assert_eq!(bits, 1 << 10, "only the kept capability remains");

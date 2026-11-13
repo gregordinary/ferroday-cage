@@ -17,8 +17,8 @@
 
 pub use ferroday_cage_testkit::fd::{is_open, readable_by, with_standard_streams_closed};
 pub use ferroday_cage_testkit::process::{
-    cpu_ticks, finish_bounded, process_exists, rerun, rerun_args, run_bounded, spawn_grouped,
-    wait_gone,
+    controlling_terminal, cpu_ticks, finish_bounded, process_exists, process_parent, process_state,
+    rerun, rerun_args, run_bounded, spawn_grouped, status_field, wait_gone,
 };
 pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;

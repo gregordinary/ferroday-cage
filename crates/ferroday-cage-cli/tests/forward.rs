@@ -263,12 +263,7 @@ impl Session {
     /// Whether `fcage` has exited. It is not reaped until the run is
     /// finished, so its process stays readable.
     fn exited(&self) -> bool {
-        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid))
-            .expect("the run's process can be read");
-        let state = stat[stat.rfind(')').expect("a stat record names its process") + 1..]
-            .split_whitespace()
-            .next();
-        state == Some("Z")
+        common::process_state(self.pid) == Some('Z')
     }
 
     /// Waits until `fcage` holds at least `wanted` sockets that are not among

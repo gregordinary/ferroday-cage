@@ -55,14 +55,8 @@ const WAIT_FOR_WINCH_QUIETLY: &str = "trap 'stty size; exit 0' WINCH; \
      echo ready; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done";
 
 /// This process's own controlling-terminal number, or `None` where it has none.
-///
-/// Field 7 of `/proc/self/stat`, read from after the closing parenthesis so a
-/// `comm` holding spaces cannot shift it. Zero means no controlling terminal.
 fn caller_tty() -> Option<String> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let (_, rest) = stat.rsplit_once(')')?;
-    let tty = rest.split_whitespace().nth(4)?;
-    (tty != "0").then(|| tty.to_string())
+    common::controlling_terminal(std::process::id()).map(|tty| tty.to_string())
 }
 
 #[test]

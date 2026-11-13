@@ -1,7 +1,7 @@
 //! Host processes a test starts or watches: whether one still exists, waiting
-//! for one to go, how much processor time one has used, running one with a
-//! bound on how long it may take, and running one test of the test binary
-//! again as a process of its own.
+//! for one to go, what its `stat` record says of it, running one with a bound
+//! on how long it may take, and running one test of the test binary again as a
+//! process of its own.
 
 use std::io::Read;
 use std::path::Path;
@@ -39,26 +39,82 @@ pub fn wait_gone(pid: u32, within: Duration) -> bool {
 /// uses next to none over a window it waits through, and one that spins uses
 /// the whole window.
 pub fn cpu_ticks(pid: u32) -> Option<u64> {
-    ticks_of(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    ticks_of(&Stat::of(&format!("/proc/{pid}/stat"))?)
 }
 
 /// The processor time the thread `tid` of this process has used, in clock
 /// ticks, as [`cpu_ticks`] reads a process's.
 pub fn thread_ticks(tid: i32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+    let stat = Stat::of(&format!("/proc/self/task/{tid}/stat"))
         .expect("a thread's statistics are readable");
     ticks_of(&stat).expect("a thread's statistics hold its times")
 }
 
-/// The user and system times a `stat` record holds, summed.
-///
-/// They are fields 14 and 15. They are counted from the state, field 3, which
-/// follows the parenthesised name: the name may hold spaces and parentheses, so
-/// the split starts after the last `)`.
-fn ticks_of(stat: &str) -> Option<u64> {
-    let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
-    let field = |at: usize| fields.get(at)?.parse::<u64>().ok();
-    Some(field(11)? + field(12)?)
+/// The user and system times a `stat` record holds, fields 14 and 15, summed.
+fn ticks_of(stat: &Stat) -> Option<u64> {
+    Some(stat.number(14)? + stat.number(15)?)
+}
+
+/// The state the process `pid` is in, the letter `ps` shows for it: `R`
+/// running, `S` sleeping, `T` stopped, `Z` exited and not yet collected, and
+/// the rest proc(5) lists. `None` once it is gone.
+pub fn process_state(pid: u32) -> Option<char> {
+    Stat::of(&format!("/proc/{pid}/stat"))?
+        .field(3)?
+        .chars()
+        .next()
+}
+
+/// The parent of the process `pid`, or `None` once it is gone.
+pub fn process_parent(pid: u32) -> Option<u32> {
+    Stat::of(&format!("/proc/{pid}/stat"))?
+        .number(4)?
+        .try_into()
+        .ok()
+}
+
+/// The device number of the process `pid`'s controlling terminal, or `None`
+/// where it has none or is gone.
+pub fn controlling_terminal(pid: u32) -> Option<u64> {
+    Stat::of(&format!("/proc/{pid}/stat"))?
+        .number(7)
+        .filter(|&tty| tty != 0)
+}
+
+/// The value of the field `name` in `status`, the text of a process's `status`
+/// record, as a command inside a sandbox reads its own and prints it: what
+/// follows `name:` on its line, trimmed.
+pub fn status_field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
+    status.lines().find_map(|line| {
+        let (field, value) = line.split_once(':')?;
+        (field == name).then_some(value.trim())
+    })
+}
+
+/// A process's or a thread's `stat` record.
+struct Stat(String);
+
+impl Stat {
+    /// The record at `path`, or `None` where it cannot be read, as once its
+    /// process is gone.
+    fn of(path: &str) -> Option<Stat> {
+        std::fs::read_to_string(path).ok().map(Stat)
+    }
+
+    /// Field `number` of the record, numbered from 1 as proc(5) numbers them.
+    ///
+    /// The second field is the process's name in parentheses, which may itself
+    /// hold spaces and parentheses, so every field after it is counted from
+    /// past the last `)`. The first two are not read.
+    fn field(&self, number: usize) -> Option<&str> {
+        let after_name = &self.0[self.0.rfind(')')? + 1..];
+        after_name.split_whitespace().nth(number.checked_sub(3)?)
+    }
+
+    /// Field `number` of the record, read as a number.
+    fn number(&self, number: usize) -> Option<u64> {
+        self.field(number)?.parse().ok()
+    }
 }
 
 /// The arguments that run one test of a test binary alone: `test` by its exact
@@ -252,6 +308,26 @@ mod tests {
             .trim()
             .parse()
             .expect("a pid")
+    }
+
+    #[test]
+    fn a_childs_stat_record_names_its_parent_and_its_end() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("the child starts");
+        assert_eq!(process_parent(child.id()), Some(std::process::id()));
+        child.kill().expect("the child is killed");
+        let pid = pid_of(&child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !exited(pid) {
+            assert!(Instant::now() < deadline, "the child outlived its kill");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Exited and not yet collected, its record is still there to read.
+        assert_eq!(process_state(child.id()), Some('Z'));
+        child.wait().expect("the child is collected");
+        assert_eq!(process_state(child.id()), None);
     }
 
     #[test]

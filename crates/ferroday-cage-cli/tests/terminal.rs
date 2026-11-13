@@ -319,7 +319,7 @@ fn a_stop_restores_the_terminal_and_a_continue_re_enters_raw_mode() {
     );
 
     session.signal(rustix::process::Signal::TSTP);
-    session.await_state(b'T');
+    session.await_state('T');
     // Restored *before* the process stopped, which is the whole discipline: the
     // shell that gets the terminal back gets it as it left it.
     pty::assert_restored(&cooked, &session.settings());
@@ -653,20 +653,18 @@ impl Session {
     /// Read from `/proc/<pid>/stat` rather than waited for with `WUNTRACED`,
     /// because this test is not the child's parent for signal purposes and a
     /// stop it consumed would be a stop the harness could not then continue
-    /// from. The field is the third, after the comm in parentheses, which is
-    /// the only field that can itself contain one.
-    fn await_state(&mut self, state: u8) {
+    /// from.
+    fn await_state(&mut self, state: char) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if process_state(self.child.id()) == Some(state) {
+            if common::process_state(self.child.id()) == Some(state) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!(
-            "the relay never reached state {}; it is in {:?}",
-            state as char,
-            process_state(self.child.id()).map(|held| held as char),
+            "the relay never reached state {state}; it is in {:?}",
+            common::process_state(self.child.id()),
         );
     }
 
@@ -712,15 +710,4 @@ impl Drop for Session {
             let _ = self.child.wait();
         }
     }
-}
-
-/// The process state `pid` is in, from `/proc/<pid>/stat`.
-///
-/// The third field, and the parse starts after the last `)` because the second
-/// is the executable name in parentheses and is the one field that can contain
-/// one.
-fn process_state(pid: u32) -> Option<u8> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = &stat[stat.rfind(')')? + 1..];
-    after_comm.split_whitespace().next()?.bytes().next()
 }

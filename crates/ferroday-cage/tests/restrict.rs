@@ -354,10 +354,7 @@ fn no_new_privileges_is_always_set() {
         .expect("the restriction launches");
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    let no_new_privs = text
-        .lines()
-        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
-        .map(str::trim)
+    let no_new_privs = common::status_field(&text, "NoNewPrivs")
         .expect("the status reports the no-new-privileges flag");
     assert_eq!(no_new_privs, "1");
 }
@@ -383,19 +380,17 @@ fn capabilities_are_dropped() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     let field = |name: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(name))
-            .map(str::trim)
+        common::status_field(&text, name)
             .unwrap_or_else(|| panic!("the status reports {name}"))
             .to_string()
     };
     assert_eq!(
-        field("CapEff:"),
+        field("CapEff"),
         "0000000000000000",
         "no effective capability"
     );
     assert_eq!(
-        field("CapPrm:"),
+        field("CapPrm"),
         "0000000000000000",
         "no permitted capability"
     );
@@ -509,12 +504,8 @@ fn the_restrictions_supervisor_outlives_the_signals_sent_to_its_group() {
         .expect("a valid restriction configuration")
         .spawn()
         .expect("the restriction launches");
-    let status = std::fs::read_to_string(format!("/proc/{}/status", running.pid()))
-        .expect("the command is alive");
-    let launch_stage = status
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))
-        .and_then(|parent| parent.trim().parse().ok())
+    let launch_stage = common::process_parent(running.pid())
+        .and_then(|parent| i32::try_from(parent).ok())
         .and_then(rustix::process::Pid::from_raw)
         .expect("the command has a parent");
     for signal in common::GROUP_SIGNALS {

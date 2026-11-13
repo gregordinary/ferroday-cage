@@ -596,7 +596,8 @@ report name a package and its version bare.
 | Run a probe with its standard descriptors closed, and put them back | `ferroday_cage_testkit::fd::with_standard_streams_closed`, and `fd::is_open` to ask of one without opening another |
 | Run a host process in a test, failing the test past a deadline | `ferroday_cage_testkit::process::run_bounded`, or `spawn_grouped` then `finish_bounded` |
 | Run one test of the test binary again, as a process of its own | `ferroday_cage_testkit::process::rerun`, or `process::rerun_args` for one a sandbox starts |
-| How much processor time has a process or a thread used? | `ferroday_cage_testkit::process::cpu_ticks`, `thread_ticks` |
+| What does a process's `stat` record say of it in a test: its processor time, its state, its parent, its controlling terminal? | `ferroday_cage_testkit::process::cpu_ticks`, `thread_ticks`, `process_state`, `process_parent`, `controlling_terminal` |
+| Read a field of the `status` record a command in a sandbox printed | `ferroday_cage_testkit::process::status_field` |
 | Encode a POSIX access control list, set or read an extended attribute, or ask whether a filesystem holds one, in a test | `ferroday_cage_testkit::xattr` |
 
 Two guards hold the table to the code, and each covers what the other cannot:

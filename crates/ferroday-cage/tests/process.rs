@@ -222,18 +222,11 @@ fn the_launch_stage_outside_the_sandbox_outlives_the_signals_sent_to_its_group()
     }
 }
 
-/// The parent of the host process `pid`, read from its procfs status.
+/// The parent of the host process `pid`.
 fn parent_of(pid: u32) -> Pid {
-    let status =
-        std::fs::read_to_string(format!("/proc/{pid}/status")).expect("the process is alive");
-    let parent = status
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))
-        .expect("a status names its parent")
-        .trim()
-        .parse()
-        .expect("a parent is a number");
-    Pid::from_raw(parent).expect("a living process has a parent")
+    let parent = common::process_parent(pid).expect("the process is alive");
+    Pid::from_raw(i32::try_from(parent).expect("a pid fits an i32"))
+        .expect("a living process has a parent")
 }
 
 #[test]
@@ -620,13 +613,7 @@ fn without_a_pid_namespace_the_launch_stage_sleeps_while_a_tracer_holds_the_exit
 
 /// Whether the host process `pid` is a zombie: exited, and not yet collected.
 fn is_zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| {
-            let (_, rest) = stat.rsplit_once(')')?;
-            rest.split_whitespace().next().map(|state| state == "Z")
-        })
-        .unwrap_or(false)
+    common::process_state(pid) == Some('Z')
 }
 
 // -- A caller's closed standard streams ---------------------------------------

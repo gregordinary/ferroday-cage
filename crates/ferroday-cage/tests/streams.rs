@@ -357,15 +357,11 @@ fn a_sandbox_that_inherits_stdin_keeps_the_callers_controlling_terminal() {
     // controlling terminal of its own, in which case there is nothing for the
     // sandbox to inherit and the assertion below would hold vacuously; skip
     // rather than pretend to have proved something.
-    let caller = std::fs::read_to_string("/proc/self/stat").expect("/proc/self/stat is readable");
-    let caller_tty = caller
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().nth(4))
-        .expect("/proc/self/stat has a tty_nr field");
-    if caller_tty == "0" {
+    let Some(caller_tty) = common::controlling_terminal(std::process::id()) else {
         common::require::premise_unmet("the test process has no controlling terminal to share");
         return;
-    }
+    };
+    let caller_tty = caller_tty.to_string();
 
     // Inheriting standard input hands the sandbox the caller's terminal, so it
     // stays in the caller's session and keeps that terminal.

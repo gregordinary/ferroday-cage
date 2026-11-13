@@ -11,7 +11,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub use ferroday_cage_testkit::process::{
-    cpu_ticks, finish_bounded, rerun, run_bounded, spawn_grouped,
+    cpu_ticks, finish_bounded, process_state, rerun, run_bounded, spawn_grouped,
 };
 pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;
