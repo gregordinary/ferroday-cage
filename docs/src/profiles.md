@@ -22,7 +22,7 @@ traits and leaves the format to the consumer.
 
 Keys are kebab-case, and each sets what a builder method sets. Most share the
 method's name. `workdir` is set by `current_dir`, and `[[mount]]` entries by
-`bind`, `bind_ro` and `raw_mount`. In `[hardening]`, `drop-caps` and
+`bind`, `bind_ro`, `raw_mount` and `symlink`. In `[hardening]`, `drop-caps` and
 `keep-caps` are set by `drop_all_capabilities` and `keep_capabilities`.
 Unknown keys are rejected — a typo in a profile is an error, not a silently
 ignored setting. Every key is optional; an omitted key keeps the library
@@ -466,7 +466,8 @@ it:
 - Scalar flags override the profile's value. Every toggle has both
   directions for this purpose — `--share-net`/`--isolate-net`,
   `--share-pid`/`--pid-ns`, `--proc`/`--no-proc`, and so on.
-- `--bind`, `--ro-bind`, and `--setenv` extend the profile's lists.
+- `--bind`, `--ro-bind`, `--raw-mount`, `--symlink`, and `--setenv` extend the
+  profile's lists.
 - A command on the command line replaces the profile's `command` and
   `args` as a unit.
 - `stop-with-caller` is the one key `fcage` defaults differently from the

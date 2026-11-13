@@ -303,7 +303,8 @@ pub enum ConfigError {
     /// A mount target is not a normal absolute path inside the rootfs.
     ///
     /// A bind or raw-mount target, and a symlink's path, must be absolute, must
-    /// not be `/` itself, and must not contain `.` or `..` components.
+    /// not be `/` itself, and must not contain a `..` component. A `.`
+    /// component names the directory it is in, and is dropped.
     #[non_exhaustive]
     MountTargetInvalid {
         /// The target path as it was given to the builder.
@@ -383,9 +384,10 @@ pub enum ConfigError {
     },
     /// A Landlock grant path is not a normal absolute path.
     ///
-    /// A grant path must be absolute and must not contain `.` or `..`
-    /// components. In a cage it is a sandbox path, resolved after the pivot;
-    /// in a restriction it is a host path.
+    /// A grant path must be absolute and must not contain a `..` component. A
+    /// `.` component names the directory it is in, and is accepted. In a cage
+    /// it is a sandbox path, resolved after the pivot; in a restriction it is a
+    /// host path.
     #[non_exhaustive]
     LandlockPathInvalid {
         /// The grant path as it was given to the builder.

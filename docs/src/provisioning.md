@@ -238,7 +238,8 @@ The map is named explicitly and must be the one the tree was built under. The
 host offset ids then round-trip to the ids the tree intends.
 
 Under the single-identity map, which is the default, the export records every
-entry as root, the identity the sandbox runs everything as.
+entry as root. That map gives its one id, the calling user who wrote the tree,
+uid 0.
 
 ```rust,no_run
 use ferroday_cage::IdentityMap;
@@ -691,9 +692,10 @@ filesystem:
   `ProvisionError::EntryRefused`, such as a path through a file or a link
   whose target is empty or holds a NUL.
 - **Ownership maps to the calling user.** Every extracted entry belongs to the
-  calling user, whom the sandbox's identity map presents as root, so
-  extracted files appear root-owned inside the sandbox. Ownership recorded
-  in the archive is ignored.
+  calling user, which the sandbox's identity map gives uid 0, so extracted
+  files appear root-owned inside the sandbox. A command with a presented
+  identity sees them as that identity's instead. Ownership recorded in the
+  archive is ignored.
 - **Permission bits apply verbatim**, setuid, setgid, and sticky bits
   included. Modification times are applied from the archive, and directory
   times are applied after their contents, so they survive extraction.

@@ -236,19 +236,26 @@ because that stack is what the root was made of. Recording only the mounts would
 leave two builds — one on a rootfs, one on an overlay over the same base —
 looking identical.
 
-`identity`, `run-as`, `no-new-privileges`, `network`, `network-filter`,
-`pid-namespace`, `hostname`, `rlimits`, and `hardening` are the posture the
-launch puts the command under, and each changes what a build produces:
+`identity`, `run-as`, `present-as`, `no-new-privileges`, `network`,
+`network-filter`, `pid-namespace`, `hostname`, `streams`, `rlimits`, and
+`hardening` are the posture the launch puts the command under, and each
+changes what a build produces:
 
 - **`identity`** — the identity map: which ids exist inside the sandbox. A
   file's recorded ownership follows from it.
-- **`run-as`** — the id the command runs as, where one is configured, in the
-  keys a profile's `[run-as]` table takes, and uid 0 where the key is absent. A Debian build's `Rules-Requires-Root`
-  handling turns on exactly this. A non-root id also leaves the command no
-  capabilities, unless the hardening keep set carries some across.
+- **`run-as`** — the run-as identity, where one is configured, in the keys a
+  profile's `[run-as]` table takes. Where the key is absent the command runs as
+  uid 0, or as the identity `present-as` names. A Debian build's
+  `Rules-Requires-Root` handling turns on exactly this. A non-root id also
+  leaves the command no capabilities, unless the hardening keep set carries
+  some across.
+- **`present-as`** — the uid and gid the single-identity map presents the
+  caller to the command as, where one is configured. `own` is recorded as the
+  ids it resolved to. The command holds no capabilities, unless the hardening
+  keep set carries some across. On the host it is still the caller.
 - **`no-new-privileges`** — whether a set-user-ID binary or a file capability
-  grants anything across `execve`. A run-as identity sets it, and so does any
-  hardening control.
+  grants anything across `execve`. A run-as identity sets it, so does a
+  presented identity, and so does any hardening control.
 - **`network`** — the namespace the sandbox creates. A stack attached to a
   pending launch is not visible here, being established after the cage is built.
 - **`network-filter`** — the syscalls [the network
@@ -262,6 +269,10 @@ launch puts the command under, and each changes what a build produces:
   it.
 - **`hostname`** — the name the command sees. Where none is configured it is the
   host's, read when the record is made, so two hosts write two records.
+- **`streams`** — where the command's three standard streams are wired:
+  inherited, `/dev/null`, or a descriptor the caller supplied. Whether a stream
+  is a terminal steers debconf's frontend, a compiler's color, and every
+  progress display.
 - **`rlimits`** — a build that adapts its parallelism to `RLIMIT_NOFILE`, or
   fails a link under `RLIMIT_AS`, produces different output.
 - **`hardening`** — the subtlest, and the one most worth recording: a seccomp

@@ -641,11 +641,13 @@ fn exec_command(
     //
     // Installed here, after the nested user namespace is entered: creating one
     // grants the CAP_SYS_ADMIN that an install without no-new-privileges
-    // requires, and a launch sets no-new-privileges only where the hardening
-    // layer asks for it. A filter survives every step below, including the
-    // identity switch and the exec. Installed before the hardening layer, so a
-    // caller's own policy stacks on top of it and, where both answer a syscall
-    // with an errno, answers with its own.
+    // requires, and nothing has set no-new-privileges yet. The hardening layer
+    // and the identity switch set it below, and only where a hardening
+    // control, a run-as identity, or a presented identity asks for it. A
+    // filter survives every step below, including the identity switch and the
+    // exec. Installed before the hardening layer, so a caller's own policy
+    // stacks on top of it and, where both answer a syscall with an errno,
+    // answers with its own.
     if seccomp::installs_network_filter(context.plan)
         && let Err(errno) = seccomp::install(seccomp::NETWORK_FILTER)
     {
@@ -899,12 +901,13 @@ fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result
 /// Set here rather than only in the hardening layer, because it is what makes
 /// the switch a boundary at all. Dropping to a non-zero uid clears the
 /// command's capabilities, but on its own it leaves the privilege-raising path
-/// through `execve` open: the rootfs bind inherits the host mount's flags
-/// rather than adding `nosuid`, and the provisioners apply a tree's permission
-/// bits verbatim, so a Debian or Alpine rootfs inside the sandbox ships
-/// set-user-ID binaries owned by in-namespace uid 0 and file capabilities to
-/// match. Without the flag, the non-root command executes them and is root
-/// inside again.
+/// through `execve` open. The provisioners apply a tree's permission bits
+/// verbatim, so a Debian or Alpine tree ships set-user-ID binaries owned by
+/// in-namespace uid 0 and file capabilities to match. The root carries `nosuid`
+/// (see `nosuid_root`), but a caller's bind or raw mount keeps its source's
+/// flags, and below Linux 5.12 so does every mount the rootfs bind carried
+/// along. Without the flag, the non-root command executes such a binary on one
+/// of them and is root inside again.
 ///
 /// It costs one `prctl`, needs no privilege, and is inherited across `execve`
 /// and by every descendant. The hardening layer sets it too, before Landlock
@@ -2428,6 +2431,12 @@ fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (S
 /// Scoped to the root. A caller's own bind keeps inheriting its source's flags:
 /// a caller who binds a host tree in order to run what is in it is entitled to
 /// a different answer than the rootfs gets.
+///
+/// Below Linux 5.12 there is no `mount_setattr`, and the fallback remounts the
+/// root mount alone: a mount the rootfs bind carried along beneath it keeps its
+/// source's flags there. No-new-privileges, which every non-root command runs
+/// with, is what still disarms a set-user-ID binary on one; see
+/// `switch_identity`.
 fn nosuid_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
     match mount_setattr(root, MOUNT_ATTR_NOSUID, true) {
         Ok(()) => Ok(()),

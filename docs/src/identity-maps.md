@@ -289,11 +289,17 @@ extent. Under such a map the command keeps the group list it inherited, and
 
 A run-as identity also sets no-new-privileges, in every build of the library
 and whatever else the sandbox requests. The cleared capability set is only half
-of the boundary: a rootfs ships set-user-ID binaries and file capabilities owned
-by in-namespace uid 0 — the provisioners apply a tree's permission bits
-verbatim, so `/usr/bin/sudo` is a working `/usr/bin/sudo` — and without the flag
-the non-root command executes them and is root inside again. The flag is
-inherited across `execve` and by every process the command starts.
+of the boundary. The provisioners apply a tree's permission bits verbatim, so a
+tree ships set-user-ID binaries and file capabilities owned by in-namespace
+uid 0. The root is mounted
+[`nosuid`](how-the-sandbox-is-built.md#the-root-is-nosuid), which disarms them
+in the root filesystem itself.
+
+A caller's own bind or raw mount keeps its source's flags, though. Below Linux
+5.12, so does every mount the root filesystem's bind carried along. Without the
+flag, the non-root command executes such a binary on one of them and is root
+inside again. The flag is inherited across `execve` and by every process the
+command starts.
 
 Capabilities interact with the switch in three ways:
 
@@ -348,10 +354,16 @@ no-new-privileges, as a run-as identity does.
 
 This is a presentation, not a boundary. On the host the command is still the
 caller. It owns every file the caller owns, a root filesystem the caller
-provisioned among them, and what it writes belongs to the caller. A command that
-must not write the root filesystem needs it mounted read-only. Keeping the
-command out of it by ownership takes a second id, which only a range map
-provides, and `run_as` to switch to it.
+provisioned among them, and what it writes belongs to the caller. A mount target
+of `/` is refused, so a plain root filesystem cannot be mounted read-only whole.
+A command that must not write it is kept from it one of these ways:
+
+- An [empty root](how-the-sandbox-is-built.md#an-empty-root) composed from
+  read-only binds.
+- A read-only bind over each part of the root filesystem it must not write.
+- A read-only [Landlock grant](hardening.md#landlock-filesystem-rules) over the
+  root filesystem.
+- A second id, which only a range map provides, and `run_as` to switch to it.
 
 Under a presented identity, the one identity `run_as` accepts is that one,
 which the command already holds. A range map refuses a presented identity at

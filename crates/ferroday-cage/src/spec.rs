@@ -1820,12 +1820,14 @@ impl CageBuilder {
     /// The launch sets no-new-privileges whenever a run-as identity is
     /// configured, in every build of the library and whatever else the sandbox
     /// requests, because the cleared capability set is only half of the
-    /// boundary. A rootfs ships set-user-ID binaries and file capabilities
-    /// owned by in-namespace uid 0 — the provisioners apply a tree's
-    /// permission bits verbatim, so `/usr/bin/sudo` is a working
-    /// `/usr/bin/sudo` — and without the flag the non-root command executes
-    /// them and is root inside again. The flag closes that path for the
-    /// command and everything it starts.
+    /// boundary. The provisioners apply a tree's permission bits verbatim, so a
+    /// tree ships set-user-ID binaries and file capabilities owned by
+    /// in-namespace uid 0. The root is mounted `nosuid`, which disarms those in
+    /// the rootfs. A [`bind`](Self::bind) or a [`raw_mount`](Self::raw_mount)
+    /// keeps its own flags, though, and below Linux 5.12 so does every mount the
+    /// rootfs bind carried along beneath the root. Without the flag the non-root
+    /// command executes such a binary there and is root inside again. The flag
+    /// closes that path for the command and everything it starts.
     ///
     /// The single-identity map holds one id, the caller, which the command
     /// sees as uid 0, or as the identity [`present_as`](Self::present_as)
@@ -1852,9 +1854,19 @@ impl CageBuilder {
     ///
     /// It is a presentation, not a boundary. On the host the command is still
     /// the caller, so it owns every file the caller owns, a rootfs the caller
-    /// provisioned among them. A command that must not write the rootfs needs
-    /// it mounted read-only, or a range [`identity_map`](Self::identity_map)
-    /// and a [`run_as`](Self::run_as) identity, which is a second id.
+    /// provisioned among them. A mount target of `/` is refused, so a plain
+    /// rootfs cannot be mounted read-only whole. A command that must not write
+    /// it is kept from it another way:
+    ///
+    /// - a root composed with [`empty_rootfs`](Self::empty_rootfs) from
+    ///   read-only binds;
+    /// - a [`bind_ro`](Self::bind_ro) of each part of the rootfs it must not
+    ///   write, at that part's own path;
+    /// - a read-only Landlock grant, `landlock_fs` with the `hardening`
+    ///   feature;
+    /// - a range [`identity_map`](Self::identity_map) and a
+    ///   [`run_as`](Self::run_as) identity, a second id the rootfs does not
+    ///   belong to.
     ///
     /// A presented identity sets no-new-privileges, as a run-as identity does.
     /// A run-as identity may name the presented identity, which the command

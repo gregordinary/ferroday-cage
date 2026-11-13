@@ -2200,7 +2200,7 @@ Usage: fcage [--rootfs DIR | --empty-rootfs | --overlay-lower DIR | --profile FI
 const CLOSING: &str = "\
 Each toggle has a counterpart to override a profile in the other direction:
 --isolate-net, --pid-ns, --proc, --dev, --tmp, --resolv-conf,
---managed-mounts, --base-env, --stop-with-caller, and --no-path-lookup.
+--managed-mounts, --base-env, --no-stop-with-caller, and --no-path-lookup.
 A profile's [hardening] table composes with the hardening flags:
 --landlock-ro, --landlock-rw, --landlock-bind, and --landlock-connect add
 grants to it, while --landlock-scope, --drop-caps, --keep-caps, and the
@@ -5702,8 +5702,9 @@ fn run_restricted(options: Options) -> ExitCode {
     if let Err(code) = withhold_from_restricted_command() {
         return code;
     }
-    // The seccomp flags have no profile beneath them here, and the curated
-    // posture beside an errno was refused when the command line was parsed.
+    // The seccomp flags have no profile beneath them here, so an errno joins
+    // the policy the flags assembled, the curated roster among them, or with
+    // none denies only what it names.
     let seccomp = match compose_seccomp(options.seccomp, options.seccomp_errno, None) {
         Ok(seccomp) => seccomp,
         Err(message) => return usage_error(format_args!("{message}")),
@@ -7616,14 +7617,25 @@ mod tests {
         );
     }
 
+    /// The flag names a stretch of the help's prose spells, in order: each
+    /// whitespace-separated token that is one once the punctuation around it
+    /// is trimmed.
+    fn prose_flag_names(prose: &str) -> Vec<&str> {
+        prose
+            .split_whitespace()
+            .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+            .filter(|name| name.starts_with("--") && name.len() > 2 && !name.ends_with('-'))
+            .collect()
+    }
+
     #[test]
     fn every_flag_the_parser_accepts_is_in_the_help() {
         // The parser's vocabulary and the help's contents are one list, so an
         // entry cannot be missing from either. What is left to check is the
         // flags the help documents in prose rather than as an entry: the
-        // counterpart toggles, each named in the closing paragraphs. A flag
-        // filed there and then forgotten in the prose is documented nowhere,
-        // and the suggester could never offer it.
+        // counterpart toggles, listed in the closing paragraphs. A flag filed
+        // there and then forgotten in the prose is documented nowhere, and the
+        // suggester could never offer it.
         let usage = usage();
         for flag in FLAGS {
             if flag.section != Section::Counterpart {
@@ -7633,14 +7645,29 @@ mod tests {
                     "the help does not list {}, which is not a prose entry",
                     flag.long,
                 );
-                continue;
             }
-            assert!(
-                usage.contains(flag.long),
-                "the parser accepts {}, which --help never names",
-                flag.long,
-            );
         }
+
+        // The list is one sentence, and it is compared name for name with the
+        // counterpart section. A substring test would pass on a counterpart
+        // that only appears inside another flag's help, as
+        // `--no-stop-with-caller` does in `--stop-with-caller`'s, and would not
+        // notice the list naming a flag that is not a counterpart at all.
+        let list = usage
+            .split_once("Each toggle has a counterpart")
+            .and_then(|(_, rest)| rest.split_once("other direction:"))
+            .and_then(|(_, rest)| rest.split_once('.'))
+            .expect("the closing prose lists the counterparts in one sentence")
+            .0;
+        let mut listed = prose_flag_names(list);
+        listed.sort_unstable();
+        let mut counterparts: Vec<&str> = FLAGS
+            .iter()
+            .filter(|flag| flag.section == Section::Counterpart)
+            .map(|flag| flag.long)
+            .collect();
+        counterparts.sort_unstable();
+        assert_eq!(listed, counterparts);
     }
 
     #[test]
@@ -7653,11 +7680,7 @@ mod tests {
             .split_once("Each toggle")
             .expect("the closing prose")
             .1;
-        for token in prose.split_whitespace() {
-            let name = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-            if !name.starts_with("--") || name.len() <= 2 || name.ends_with('-') {
-                continue;
-            }
+        for name in prose_flag_names(prose) {
             assert!(
                 FLAGS.iter().any(|flag| flag.long == name),
                 "the closing prose names {name}, which no flag is",

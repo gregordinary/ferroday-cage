@@ -135,14 +135,18 @@ inherits comes across locked.
 The nested namespace's map is the sandbox's own map reflected onto its inside
 ids: for each extent `inside outside count` of the sandbox's map, a line
 `inside inside count`. The command therefore sees exactly the ids it saw
-before, under the same names. It is established the same way the sandbox's own
-is — written in process under the single-identity map, and written by a
-delegate under a [range map](identity-maps.md), the delegate here being the
-sandbox init rather than the caller, since only a process inside the sandbox's
-namespace is root of it. It is reached through a procfs, by path, which is why a
-sandbox that mounts none is refused at build time — except where the delegate is
-outside the sandbox and reads the host's own, which [Identity
-maps](identity-maps.md) sets out.
+before, under the same names. A [presented
+identity](identity-maps.md#presenting-the-caller-as-another-identity) is the one
+departure. The single-identity map's one line then reads `UID 0 1`, so the
+command sees the caller as the presented uid rather than as 0.
+
+The map is established the same way the sandbox's own is. It is written in
+process under the single-identity map, and by a delegate under a [range
+map](identity-maps.md). The delegate here is the sandbox init rather than the
+caller, since only a process inside the sandbox's namespace is root of it. It is
+reached through a procfs, by path, which is why a sandbox that mounts none is
+refused at build time — except where the delegate is outside the sandbox and
+reads the host's own, which [Identity maps](identity-maps.md) sets out.
 
 The entry sits where it does because the kernel re-derives the whole credential
 for a new user namespace: securebits return to their defaults, the capability
@@ -219,12 +223,14 @@ accounts its packages' scripts ask for.
 `Cage::resolved_inputs` reports the filter's refusals in `network_filter`, so a
 provenance record shows which calls a command under it cannot make.
 
-The launch sets no-new-privileges only where the hardening layer asks for it, so
-the filter is installed without it. Creating the nested user namespace grants
-the capability the kernel requires in its place. A [seccomp
-policy](hardening.md#seccomp-syscall-filters) is installed after the filter.
-Where both refuse a syscall with an errno, the command sees the policy's. A host
-that cannot install the filter fails the launch at
+The filter is installed before anything sets no-new-privileges. The hardening
+layer and the identity switch set it later, and only for a hardening control, a
+run-as identity, or a presented identity. Creating the nested user namespace
+grants the capability the kernel requires in its place.
+
+A [seccomp policy](hardening.md#seccomp-syscall-filters) is installed after the
+filter. Where both refuse a syscall with an errno, the command sees the
+policy's. A host that cannot install the filter fails the launch at
 `SetupStep::InstallNetworkFilter`. [Host requirements](host-requirements.md)
 covers the hosts that cannot.
 
@@ -364,7 +370,9 @@ like every other, so the command cannot clear it.
 The scope is the root and whatever the root bind carried with it. A caller's own
 `bind` and `bind_ro` mounts keep inheriting their source's flags: a caller who
 binds a host tree in order to run what is in it is entitled to a different
-answer than the rootfs gets.
+answer than the rootfs gets. Below Linux 5.12, which lacks `mount_setattr`, only
+the root mount itself takes the flag, and a mount the root bind carried keeps
+its own. No-new-privileges, which every non-root command runs with, covers both.
 
 ### An empty root
 
