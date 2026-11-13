@@ -854,6 +854,13 @@ consumer upgrading can skip it.
   it is extracted. A package cache download batch whose staging file cannot be
   created, read back, or published now reports that failure, where it left the
   package to the per-mirror walk to fail on.
+- An Alpine index none of whose records is for the architecture it was fetched
+  for, or for `noarch`, is refused with `AlpineError::Index`. One key signs
+  several architectures' indexes, every postmarketOS architecture among them,
+  so another architecture's index verifies; its records were all dropped, and a
+  postmarketOS repository substituted this way vanished from the resolution
+  without an error. An index that holds records of the architecture keeps
+  dropping the others, as `apk` refuses to install them.
 
 ### Internal
 

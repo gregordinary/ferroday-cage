@@ -397,6 +397,39 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
     }))
 }
 
+/// Why `records`, an index fetched for `architecture`, are not an index of that
+/// architecture's, or `None` where they are.
+///
+/// A repository publishes one index per architecture, and every record in it
+/// states that architecture: a package built for every architecture is
+/// recorded with the index's rather than as [`NOARCH`]. One key signs several
+/// architectures' indexes (every postmarketOS architecture, Alpine's x86 and
+/// x86_64 through v3.14, its armhf and armv7), so another architecture's index
+/// verifies where this one's was asked for. [`Index::merge`] drops every
+/// record of it, and the index would contribute nothing: a postmarketOS
+/// overlay would vanish from the resolution without a word. So an index that
+/// carries records and none of them for `architecture` or [`NOARCH`] is
+/// refused. `apk.static` 3.0.9 reads such an index, and refuses to install any
+/// of its records, as `uninstallable`.
+///
+/// An index with no records at all is not refused: it is what a repository
+/// with nothing to offer an architecture publishes.
+pub(super) fn foreign_to(records: &[Record], architecture: &str) -> Option<String> {
+    let first = records.first()?;
+    if records
+        .iter()
+        .any(|record| record.architecture == architecture || record.architecture == NOARCH)
+    {
+        return None;
+    }
+    Some(format!(
+        "none of its {} records is for {architecture:?}, the first being for {:?}, so it is \
+         an index of another architecture",
+        records.len(),
+        first.architecture,
+    ))
+}
+
 /// The package set of one or more repositories, merged: one record per name,
 /// plus each provided name's providers.
 pub(super) struct Index {
@@ -432,8 +465,12 @@ impl Index {
     /// ordering never installs an older package than the archives offer.
     ///
     /// A record whose architecture is neither `architecture` nor [`NOARCH`] is
-    /// dropped. An index is published per architecture, so this only ever fires
-    /// for a mirror serving something other than what its path says.
+    /// dropped, which is what `apk`'s selection makes of it: `apk.static` 3.0.9
+    /// lists such a record and refuses to install it, as `uninstallable`, so a
+    /// name only such records answer is refused either way, and one another
+    /// record answers is answered by that record whatever the version. An
+    /// index made of nothing else was refused as it was read, by
+    /// [`foreign_to`].
     ///
     /// `pins` overrides the choice for the names it holds: a pinned name selects
     /// the pinned version wherever it is offered, and the pinned control segment
@@ -897,17 +934,52 @@ mod tests {
     #[test]
     fn a_record_for_another_architecture_is_dropped() {
         // An index is published per architecture, so this only fires for a
-        // mirror serving something other than what its path says.
+        // mirror serving something other than what its path says. `apk` lists
+        // the record and will not install it, and a newer version of it does
+        // not displace the record that can be installed.
         let records = parsed(&format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             record("native", "1.0-r0", "x86_64", ""),
+            record("native", "2.0-r0", "aarch64", ""),
             record("every", "1.0-r0", "noarch", ""),
             record("foreign", "1.0-r0", "aarch64", ""),
         ));
+        assert_eq!(foreign_to(&records, "x86_64"), None, "it holds x86_64's");
         let index = Index::merge([records], "x86_64", &Pins::none());
-        assert!(index.get("native").is_some());
+        assert_eq!(
+            index.get("native").map(|record| record.version.as_str()),
+            Some("1.0-r0"),
+        );
         assert!(index.get("every").is_some(), "noarch belongs to every one");
         assert!(index.get("foreign").is_none());
+    }
+
+    #[test]
+    fn an_index_of_another_architecture_alone_is_refused() {
+        // What one key signing several architectures lets a mirror serve: the
+        // index verifies, and every record of it would be dropped.
+        let foreign = parsed(&format!(
+            "{}\n{}",
+            record("one", "1.0-r0", "aarch64", ""),
+            record("two", "1.0-r0", "aarch64", ""),
+        ));
+        let reason = foreign_to(&foreign, "x86_64").expect("nothing in it is x86_64's");
+        assert!(
+            reason.contains("\"x86_64\"") && reason.contains("\"aarch64\""),
+            "{reason}",
+        );
+        // One record the architecture can install makes it that
+        // architecture's index, and so does one built for every architecture.
+        assert_eq!(foreign_to(&foreign, "aarch64"), None);
+        let every = parsed(&record("every", "1.0-r0", "noarch", ""));
+        assert_eq!(foreign_to(&every, "x86_64"), None);
+        // An index with nothing in it offers nothing to any architecture.
+        assert_eq!(foreign_to(&[], "x86_64"), None);
+        // The architecture is the index's text, and is quoted.
+        let hostile = parsed(&record("one", "1.0-r0", crate::failure::hostile::TEXT, ""));
+        crate::failure::hostile::assert_escaped(
+            &foreign_to(&hostile, "x86_64").expect("it is no x86_64 index"),
+        );
     }
 
     #[test]

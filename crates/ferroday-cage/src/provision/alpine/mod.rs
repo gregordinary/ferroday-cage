@@ -426,6 +426,7 @@ impl Alpine {
                     repository,
                     component,
                     &path,
+                    &self.architecture,
                     from,
                     observer,
                 )?;
@@ -1323,6 +1324,7 @@ fn read_index(
     repository: &Repository,
     component: Option<&str>,
     path: &str,
+    architecture: &str,
     from: usize,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(Vec<Record>, ResolvedIndex), AlpineError> {
@@ -1341,7 +1343,8 @@ fn read_index(
                 &request,
                 &mut LimitedWriter::new(&mut bytes, MAX_INDEX_FETCH),
             )?;
-            let (records, signed_by, description) = parse_index(&url, &bytes, repository, from)?;
+            let (records, signed_by, description) =
+                parse_index(&url, &bytes, repository, architecture, from)?;
             Ok((
                 records,
                 ResolvedIndex {
@@ -1366,14 +1369,15 @@ fn read_index(
     )
 }
 
-/// Verifies an index container, holds it to the release it was fetched as, and
-/// reads the records it carries.
+/// Verifies an index container, holds it to the release and the architecture
+/// it was fetched as, and reads the records it carries.
 ///
 /// `url` names where it came from, for the errors.
 fn parse_index(
     url: &str,
     bytes: &[u8],
     repository: &Repository,
+    architecture: &str,
     from: usize,
 ) -> Result<(Vec<Record>, String, Option<String>), AlpineError> {
     let mut segments = apk::Segments::new(bytes);
@@ -1418,11 +1422,11 @@ fn parse_index(
         &metadata.signed_by,
         description.as_deref(),
     )?;
-    Ok((
-        index::parse(url, text, from)?,
-        metadata.signed_by,
-        description,
-    ))
+    let records = index::parse(url, text, from)?;
+    if let Some(reason) = index::foreign_to(&records, architecture) {
+        return Err(AlpineError::index(url, reason));
+    }
+    Ok((records, metadata.signed_by, description))
 }
 
 /// An observer of an Alpine bootstrap's progress.
@@ -3275,6 +3279,34 @@ mod tests {
             .available()
             .expect_err("postmarketOS does not sign with Alpine's key");
         assert!(matches!(err, AlpineError::Signature { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_index_of_another_architecture_is_refused_where_one_was_asked_for() {
+        // x86 and x86_64 share a key through v3.14, as every postmarketOS
+        // architecture does, so another architecture's index verifies. Every
+        // record of it would be dropped, and the repository would offer
+        // nothing without saying so.
+        let mut alpine = Alpine::builder("v3.23")
+            .architecture("aarch64")
+            .mirror("http://mirror.invalid/alpine")
+            .keys(KeySet::alpine("x86_64").expect("x86_64 is in the bundle"))
+            .fetcher(Canned(HashMap::from([(
+                "http://mirror.invalid/alpine/v3.23/main/aarch64/APKINDEX.tar.gz".to_string(),
+                fixtures::INDEX.to_vec(),
+            )])))
+            .build()
+            .expect("the bootstrap configures");
+        let err = alpine
+            .available()
+            .expect_err("the index served is x86_64's");
+        assert!(
+            matches!(&err, AlpineError::Index { subject, reason }
+                if subject.ends_with("/aarch64/APKINDEX.tar.gz")
+                    && reason.contains("\"aarch64\"")
+                    && reason.contains("\"x86_64\"")),
+            "{err}",
+        );
     }
 
     #[test]
