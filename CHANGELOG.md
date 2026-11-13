@@ -753,6 +753,8 @@ consumer upgrading can skip it.
   listener `Pending::listen` makes share.
 - The network stack's tap helper's errors take their wording from the phrases
   its step enum declares.
+- The terminal baseline's end-of-file character is one
+  `terminal::BASELINE_VEOF`, which the relay's fallback reads.
 
 ## [0.5.2] - 2026-11-10
 

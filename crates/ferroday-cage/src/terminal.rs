@@ -26,6 +26,9 @@ use crate::error::Error;
 /// programs read rather than a rate anything is clocked at.
 const BASELINE_SPEED: u32 = 38400;
 
+/// The end-of-file character of the baseline: `^D`, the kernel's own.
+pub(crate) const BASELINE_VEOF: u8 = 0o004;
+
 /// A pseudoterminal to allocate for the sandbox.
 ///
 /// A terminal is a launch mode rather than builder state: it hands the caller a
@@ -449,7 +452,7 @@ fn baseline_termios(replica: &OwnedFd) -> Result<termios::Termios, Errno> {
         (SpecialCodeIndex::VQUIT, 0o034),
         (SpecialCodeIndex::VERASE, 0o177),
         (SpecialCodeIndex::VKILL, 0o025),
-        (SpecialCodeIndex::VEOF, 0o004),
+        (SpecialCodeIndex::VEOF, BASELINE_VEOF),
         (SpecialCodeIndex::VTIME, 0),
         (SpecialCodeIndex::VMIN, 1),
         (SpecialCodeIndex::VSWTC, 0),

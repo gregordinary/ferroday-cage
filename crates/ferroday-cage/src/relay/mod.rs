@@ -173,7 +173,7 @@ use crate::mechanism::frame;
 use crate::poll;
 use crate::running::Running;
 use crate::status::ExitStatus;
-use crate::terminal::Pty;
+use crate::terminal::{BASELINE_VEOF, Pty};
 use raw::RawMode;
 
 pub use escalation::Escalation;
@@ -705,7 +705,7 @@ fn write_all(output: BorrowedFd<'_>, bytes: &[u8]) -> Result<(), RelayError> {
 fn replica_veof(pty: &Pty) -> u8 {
     termios::tcgetattr(pty)
         .map(|settings| settings.special_codes[SpecialCodeIndex::VEOF])
-        .unwrap_or(0o004)
+        .unwrap_or(BASELINE_VEOF)
 }
 
 /// A relay failure: the sandbox's, or the relay's own plumbing.
