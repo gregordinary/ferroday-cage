@@ -181,9 +181,8 @@ fn a_presented_identity_owns_and_writes_as_the_caller() {
 #[test]
 fn own_presents_the_callers_host_ids() {
     let Some(rootfs) = rootfs() else { return };
-    if rustix::process::geteuid().is_root() {
-        // The build refuses a presented uid of 0, which the unit tests cover.
-        common::require::premise_unmet("the caller is root, whose own uid is never presented");
+    // The build refuses a presented uid of 0, which the unit tests cover.
+    if !common::require::not_root("the caller is root, whose own uid is never presented") {
         return;
     }
     let cage = Cage::builder()

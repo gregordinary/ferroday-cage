@@ -167,6 +167,21 @@ pub fn premise_unmet(reason: impl Display) {
     report_skip("premise", &reason);
 }
 
+/// Whether the test runs as a caller other than root, which its premise needs:
+/// root is bound by no directory's mode and refused no `chown`, so a test of
+/// what those refuse has nothing to test as root. Where the caller is root,
+/// [`premise_unmet`] reports the skip, with `why`.
+///
+/// Root is the effective uid, the one the kernel checks a permission against.
+#[track_caller]
+pub fn not_root(why: impl Display) -> bool {
+    let root = rustix::process::geteuid().is_root();
+    if root {
+        premise_unmet(why);
+    }
+    !root
+}
+
 /// The variable naming a file every skip is appended to, besides the line
 /// printed on stderr.
 ///

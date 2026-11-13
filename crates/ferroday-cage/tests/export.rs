@@ -729,11 +729,7 @@ fn refuses_plain_removal(dir: &Path) -> std::path::PathBuf {
 
 /// Skips a test that needs a permission the caller can actually be refused.
 fn unprivileged_caller() -> bool {
-    if rustix::process::geteuid().is_root() {
-        common::require::premise_unmet("root is refused nothing, so the plain removal succeeds");
-        return false;
-    }
-    true
+    common::require::not_root("root is refused nothing, so the plain removal succeeds")
 }
 
 /// A removal whose delegate fails at the map gate reports that failure

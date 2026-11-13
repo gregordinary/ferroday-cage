@@ -1411,10 +1411,9 @@ mod tests {
     fn an_entry_whose_name_holds_something_else_is_left_alone() {
         // Root is an owner an unprivileged caller cannot give, so an attempt
         // fails, and an entry left alone is one with no attempt made.
-        if rustix::process::getuid().is_root() {
-            ferroday_cage_testkit::require::premise_unmet(
-                "the test needs a caller other than root, to whom a chown to root is refused",
-            );
+        if !ferroday_cage_testkit::require::not_root(
+            "the test needs a caller other than root, to whom a chown to root is refused",
+        ) {
             return;
         }
         let dir = Scratch::new("copyin-own-replaced");
@@ -1443,10 +1442,9 @@ mod tests {
     fn an_owned_symbolic_link_is_owned_as_itself() {
         // The link is never followed: a frame naming the link acts on the
         // link, and an outside target is neither opened nor changed.
-        if rustix::process::getuid().is_root() {
-            ferroday_cage_testkit::require::premise_unmet(
-                "the test needs a caller other than root, to whom a chown to root is refused",
-            );
+        if !ferroday_cage_testkit::require::not_root(
+            "the test needs a caller other than root, to whom a chown to root is refused",
+        ) {
             return;
         }
         let dir = Scratch::new("copyin-own-link");

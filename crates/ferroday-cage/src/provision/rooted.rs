@@ -1276,10 +1276,9 @@ mod tests {
         // carried directory keeps the base's mode, 0555 here. Given that mode
         // as it is carried, the directory refuses the write the carry was for,
         // so it is given once the write has landed.
-        if rustix::process::geteuid().is_root() {
-            ferroday_cage_testkit::require::premise_unmet(
-                "the test needs a caller other than root, whom a directory's mode does not bind",
-            );
+        if !ferroday_cage_testkit::require::not_root(
+            "the test needs a caller other than root, whom a directory's mode does not bind",
+        ) {
             return;
         }
         let (scratch, upper) = tree("read-only-base");

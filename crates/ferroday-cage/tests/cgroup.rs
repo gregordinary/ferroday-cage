@@ -603,8 +603,7 @@ fn a_parent_not_delegated_to_the_caller_is_refused_alike_by_the_probe_and_the_la
         common::require::premise_unmet("the host's cgroup hierarchy has no system.slice");
         return;
     };
-    if rustix::process::geteuid().is_root() {
-        common::require::premise_unmet("root may divide any cgroup");
+    if !common::require::not_root("root may divide any cgroup") {
         return;
     }
     let parent = hierarchy.join("system.slice");

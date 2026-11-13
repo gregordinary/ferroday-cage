@@ -551,10 +551,9 @@ mod tests {
         // establish it at all, so the drop has to ask the same delegate.
         use std::os::unix::fs::PermissionsExt;
 
-        if rustix::process::geteuid().is_root() {
-            ferroday_cage_testkit::require::premise_unmet(
-                "root removes a mode-0 directory without escalating",
-            );
+        if !ferroday_cage_testkit::require::not_root(
+            "root removes a mode-0 directory without escalating",
+        ) {
             return;
         }
         let dir = Scratch::for_test("layer", "dispose-delegate");

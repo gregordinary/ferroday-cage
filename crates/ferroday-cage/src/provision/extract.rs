@@ -1719,10 +1719,9 @@ mod tests {
         // holds directories at 0555 and 0500. Given that mode as it is created,
         // such a directory refuses its owner the children still to be written;
         // given it once they are, it is laid whole.
-        if rustix::process::geteuid().is_root() {
-            ferroday_cage_testkit::require::premise_unmet(
-                "the test needs a caller other than root, whom a directory's mode does not bind",
-            );
+        if !ferroday_cage_testkit::require::not_root(
+            "the test needs a caller other than root, whom a directory's mode does not bind",
+        ) {
             return;
         }
         let base = Scratch::for_test("overlay", "read-only-source");
@@ -1759,10 +1758,9 @@ mod tests {
         // it, and the base's mode, 0555 here, is what the carried directory
         // keeps. Applied as the directory is carried, it refuses the write the
         // carry was for.
-        if rustix::process::geteuid().is_root() {
-            ferroday_cage_testkit::require::premise_unmet(
-                "the test needs a caller other than root, whom a directory's mode does not bind",
-            );
+        if !ferroday_cage_testkit::require::not_root(
+            "the test needs a caller other than root, whom a directory's mode does not bind",
+        ) {
             return;
         }
         let scratch = Scratch::for_test("overlay", "read-only-base");
@@ -2728,10 +2726,9 @@ mod layered_tests {
         // as the base holds it, a list whose owner entry is `r-x` refuses the
         // calling user the entry the carry was made for; it is the base's again
         // once the increment is written.
-        if rustix::process::geteuid().is_root() {
-            ferroday_cage_testkit::require::premise_unmet(
-                "the test needs a caller other than root, whom a directory's mode does not bind",
-            );
+        if !ferroday_cage_testkit::require::not_root(
+            "the test needs a caller other than root, whom a directory's mode does not bind",
+        ) {
             return;
         }
         let scratch = Scratch::for_test("extract-layered", "acl-owner-read-only");
