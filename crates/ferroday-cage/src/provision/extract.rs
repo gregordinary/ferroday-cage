@@ -387,13 +387,6 @@ impl Extraction {
             let path = match &self.under {
                 None => entry.path.as_slice(),
                 Some(prefix) => match strip_prefix(&entry.path, prefix) {
-                    // The wrapper's own entry. It strips to the empty path,
-                    // which the `./` arm below reads as the extraction root --
-                    // and the root is the caller's, not something the wrapper
-                    // describes, so applying its mode and modification time
-                    // there would rewrite the root every archive is unpacked
-                    // into. `under` says the wrapper lands nowhere.
-                    Some([]) => continue,
                     Some(rest) => rest,
                     // Anything outside the wrapper. The archive is read past
                     // it, so what follows is unaffected.
@@ -401,6 +394,17 @@ impl Extraction {
                 },
             };
             let components = validate_path(path, &entry.path, "path")?;
+            // The wrapper's own entry, however it is spelled: `image`,
+            // `image/`, `image/.` and `image/./` all name the directory below
+            // which the path is empty, which the `./` arm below reads as the
+            // extraction root. The root is the caller's, not something the
+            // wrapper describes, so applying its mode and modification time
+            // there would rewrite the root every archive is unpacked into.
+            // `under` says the wrapper lands nowhere, and the validated
+            // components are what say an entry is it.
+            if self.under.is_some() && components.is_empty() {
+                continue;
+            }
             // A hardlink names another entry of the same archive, so its target
             // carries the wrapper too and has to lose it the same way. One that
             // does not is naming something the archive is not laying down, and
@@ -1966,29 +1970,39 @@ mod prefix_tests {
         let root = Scratch::for_test("extract", "wrapper-root-mode");
         fs::set_permissions(&*root, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut tar = ferroday_cage_testkit::tar::Tar::new();
-        tar.dir("image/", 0o700)
-            .file("image/usr/bin/git", 0o755, b"binary\n");
-        let archive = tar.finish();
+        // Every spelling of the wrapper, the dot-component ones included,
+        // which strip to a path that is not empty until it is validated.
+        for wrapper in ["image/", "image", "image/.", "image/./"] {
+            let mut tar = ferroday_cage_testkit::tar::Tar::new();
+            tar.entry(wrapper, b'5', 0o700, 0, 0, "", b"").file(
+                "image/usr/bin/git",
+                0o755,
+                b"binary\n",
+            );
+            let archive = tar.finish();
 
-        let mut extraction = Extraction::new(&root)
-            .expect("the root opens")
-            .under(b"image");
-        extraction
-            .extract(&mut TarReader::in_memory(&archive[..]), &mut |_, _| {
-                Ok(Placement::Write)
-            })
-            .expect("the image extracts");
-        extraction
-            .finalize(&root)
-            .expect("the extraction finalizes");
+            let mut extraction = Extraction::new(&root)
+                .expect("the root opens")
+                .under(b"image");
+            extraction
+                .extract(&mut TarReader::in_memory(&archive[..]), &mut |_, _| {
+                    Ok(Placement::Write)
+                })
+                .expect("the image extracts");
+            extraction
+                .finalize(&root)
+                .expect("the extraction finalizes");
 
-        assert_eq!(
-            fs::symlink_metadata(&*root).unwrap().permissions().mode() & 0o7777,
-            0o755,
-            "the wrapper's own mode must not reach the extraction root",
-        );
-        assert!(root.join("usr/bin/git").exists(), "the image still lands");
+            assert_eq!(
+                fs::symlink_metadata(&*root).unwrap().permissions().mode() & 0o7777,
+                0o755,
+                "{wrapper}: the wrapper's own mode must not reach the extraction root",
+            );
+            assert!(
+                root.join("usr/bin/git").exists(),
+                "{wrapper}: the image lands"
+            );
+        }
     }
 
     #[test]

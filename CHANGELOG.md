@@ -815,6 +815,10 @@ consumer upgrading can skip it.
   over members, of a `.deb`'s control member, an apk's segments and a gpkg
   container, read the archive's next header from inside the member's data and
   ended the archive early, silently.
+- A Gentoo binary package's image archive no longer sets the mode and
+  modification time of the root it is merged into where it spells its wrapper
+  directory `image/.` or `image/./`. The wrapper's own entry lands nowhere
+  however it is spelled; only `image` and `image/` were recognized as it.
 
 ### Internal
 
