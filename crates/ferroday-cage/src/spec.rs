@@ -1625,7 +1625,9 @@ impl CageBuilder {
     /// and a target that disappears before the launch fails it at
     /// [`SetupStep::OpenMountTarget`](crate::SetupStep::OpenMountTarget). A
     /// symbolic link of the caller's must likewise be made inside such a
-    /// filesystem. With [`Network::Host`] the host's own `/etc/resolv.conf` is
+    /// filesystem, and `build` refuses one outside with
+    /// [`ConfigError::SymlinkInHostRoot`] unless the host's tree already holds
+    /// that link. With [`Network::Host`] the host's own `/etc/resolv.conf` is
     /// the sandbox's, so no `resolv.conf` is bound; one that links into
     /// `/run` reads through the hidden `/run`, and is reached by binding the
     /// file it links to at its own path.
@@ -4372,18 +4374,17 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     // The overlay moves files between the upper and the work directory, so the
     // kernel requires them on one filesystem. A caller that named its own work
     // directory can have put it elsewhere; comparing the two devices refuses
-    // that here, with the layer named, rather than at the mount as a bare
-    // EXDEV from a syscall the caller never issued.
+    // that here, with both named, rather than at the mount as a bare EXDEV
+    // from a syscall the caller never issued.
     let device = |layer, path: &Path| {
         rustix::fs::stat(path)
             .map(|stat| stat.st_dev)
             .map_err(|errno| overlay_errno(layer, path, errno))
     };
     if device(OverlayLayer::Upper, &upper_path)? != device(OverlayLayer::Work, &work_path)? {
-        return Err(ConfigError::OverlayDirUnusable {
-            layer: OverlayLayer::Work,
-            path: work_path,
-            source: Errno::XDEV.into(),
+        return Err(ConfigError::OverlayWorkOnAnotherFilesystem {
+            work: work_path,
+            upper: upper_path,
         }
         .into());
     }
@@ -5049,8 +5050,9 @@ impl Lowering {
 /// nothing is created and the target must exist: it is looked up on the host,
 /// through a bind's source where a bind brought the tree, and refused with
 /// [`ConfigError::MountTargetMissing`] when it is not there. A symbolic link
-/// there could only be made in the host's tree, so it is refused unless the
-/// same link already stands, which the launch leaves as it is. A tree a raw
+/// there could only be made in the host's tree, so it is refused, with
+/// [`ConfigError::SymlinkInHostRoot`], unless the same link already stands,
+/// which the launch leaves as it is. A tree a raw
 /// mount or a read-only path brought is not looked into; the launch fails at
 /// the target if it is missing.
 ///
@@ -5119,20 +5121,25 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
             continue;
         };
         let named = Path::new("/").join(OsStr::from_bytes(target.as_bytes()));
-        let missing = |source| ConfigError::MountTargetMissing {
-            target: named.clone(),
-            source,
-        };
         match &op.action {
             MountAction::Symlink { content, .. } => {
                 let standing = std::fs::read_link(&host_path)
                     .is_ok_and(|link| link.as_os_str().as_bytes() == content.as_bytes());
                 if !standing {
-                    return Err(missing(Errno::ROFS.into()).into());
+                    return Err(ConfigError::SymlinkInHostRoot {
+                        path: named,
+                        target: PathBuf::from(OsStr::from_bytes(content.as_bytes())),
+                    }
+                    .into());
                 }
             }
             _ => {
-                std::fs::metadata(&host_path).map_err(missing)?;
+                std::fs::metadata(&host_path).map_err(|source| {
+                    ConfigError::MountTargetMissing {
+                        target: named,
+                        source,
+                    }
+                })?;
             }
         }
     }
@@ -9867,10 +9874,16 @@ read-only = true
         assert!(
             matches!(
                 &refused,
-                Error::Config(ConfigError::MountTargetMissing { source, .. })
-                    if source.raw_os_error() == Some(Errno::ROFS.raw_os_error())
+                Error::Config(ConfigError::SymlinkInHostRoot { path, .. })
+                    if path == Path::new("/usr/local/bin/ferroday-cage-test-link")
             ),
             "{refused:?}"
+        );
+        assert!(
+            std::error::Error::source(&refused)
+                .and_then(std::error::Error::source)
+                .is_none(),
+            "nothing failed beneath the refusal: {refused:?}",
         );
 
         let cage = Cage::builder()
@@ -10210,11 +10223,9 @@ read-only = true
         let leftover = elsewhere.exists();
         let _ = crate::provision::remove_tree(&elsewhere, &IdentityMap::Single, None);
         match built {
-            Err(Error::Config(ConfigError::OverlayDirUnusable {
-                layer: OverlayLayer::Work,
-                source,
-                ..
-            })) => assert_eq!(source.raw_os_error(), Some(Errno::XDEV.raw_os_error())),
+            Err(Error::Config(ConfigError::OverlayWorkOnAnotherFilesystem { work, .. })) => {
+                assert_eq!(work, elsewhere.join("work"));
+            }
             Err(Error::Config(ConfigError::OverlayUnavailable { blocker })) => {
                 ferroday_cage_testkit::require::OVERLAY.skip(format!(
                     "an unprivileged overlay is unavailable here: {blocker}"

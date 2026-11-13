@@ -1753,6 +1753,9 @@ pub ferroday_cage::ConfigError::OverlayPathInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayUnavailable
 pub ferroday_cage::ConfigError::OverlayUnavailable::blocker: ferroday_cage::host::OverlayBlocker
 pub ferroday_cage::ConfigError::OverlayUpperMissing
+#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayWorkOnAnotherFilesystem
+pub ferroday_cage::ConfigError::OverlayWorkOnAnotherFilesystem::upper: std::path::PathBuf
+pub ferroday_cage::ConfigError::OverlayWorkOnAnotherFilesystem::work: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::PresentAsRoot
 pub ferroday_cage::ConfigError::PresentAsRoot::identity: ferroday_cage::PresentedIdentity
 pub ferroday_cage::ConfigError::PresentAsWithRangeMap
@@ -1799,6 +1802,9 @@ pub ferroday_cage::ConfigError::SetidCapWithNonRootIdentity::capability: &'stati
 #[non_exhaustive] pub ferroday_cage::ConfigError::StreamAttachmentConflict
 pub ferroday_cage::ConfigError::StreamAttachmentConflict::attachment: &'static str
 pub ferroday_cage::ConfigError::StreamAttachmentConflict::stream: &'static str
+#[non_exhaustive] pub ferroday_cage::ConfigError::SymlinkInHostRoot
+pub ferroday_cage::ConfigError::SymlinkInHostRoot::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::SymlinkInHostRoot::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::SymlinkTargetInvalid
 pub ferroday_cage::ConfigError::SymlinkTargetInvalid::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::SymlinkTargetInvalid::target: std::path::PathBuf

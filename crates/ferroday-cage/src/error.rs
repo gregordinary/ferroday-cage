@@ -820,20 +820,22 @@ rendered as text.
         hard: crate::limits::Limit,
     },
     /// A mount target the [host's own root](crate::CageBuilder::host_rootfs)
-    /// would need created is not there.
+    /// would need created is not there, or could not be looked up there.
     ///
     /// That root is the host's tree, read-only, and a launch creates nothing in
     /// it. A target must already exist on the host, or lie inside a filesystem
     /// the sandbox mounts itself, such as a hidden directory or the managed
-    /// `/tmp`, where it is created. A symbolic link of the caller's is made only
-    /// inside such a filesystem.
+    /// `/tmp`, where it is created. A symbolic link of the caller's is
+    /// [`SymlinkInHostRoot`](Self::SymlinkInHostRoot)'s case.
+    ///
+    /// The message says the target is not in the host's root only where the
+    /// lookup found nothing there, `ENOENT`, or found a file where a directory
+    /// above the target should be, `ENOTDIR`.
     #[non_exhaustive]
     MountTargetMissing {
         /// The target, as the mount names it inside the sandbox.
         target: PathBuf,
-        /// What looking the target up on the host answered: `ENOENT` for one
-        /// that is not there, or `EROFS` for a symbolic link that would be
-        /// made in the host's tree.
+        /// What looking the target up on the host answered.
         source: io::Error,
     },
     /// [`CageBuilder::reveal`](crate::CageBuilder::reveal) names a path the
@@ -904,6 +906,34 @@ rendered as text.
     RestrictionCgroupReachable {
         /// What the command could reach the cgroup through.
         reach: CgroupReach,
+    },
+    /// A symbolic link of the caller's would be made in the
+    /// [host's own root](crate::CageBuilder::host_rootfs), where the host's
+    /// tree does not already hold it.
+    ///
+    /// That root is the host's tree, read-only, and a launch makes nothing in
+    /// it, so a link is made only inside a filesystem the sandbox mounts
+    /// itself, such as a hidden directory or the managed `/tmp`. Where the same
+    /// link already stands on the host, the launch leaves it as it is.
+    #[non_exhaustive]
+    SymlinkInHostRoot {
+        /// The link's path inside the sandbox.
+        path: PathBuf,
+        /// What the link points at, as it was given to the builder.
+        target: PathBuf,
+    },
+    /// An overlay's work directory is on another filesystem than its upper.
+    ///
+    /// The overlay moves files between the two, so the kernel requires them on
+    /// one filesystem. The work directory a caller names is compared with the
+    /// upper once both exist, and refused here, with both named, rather than
+    /// left to the mount's `EXDEV`.
+    #[non_exhaustive]
+    OverlayWorkOnAnotherFilesystem {
+        /// The work directory, as the mount options name it.
+        work: PathBuf,
+        /// The upper, as the mount options name it.
+        upper: PathBuf,
     },
 }
 
@@ -1196,11 +1226,25 @@ impl fmt::Display for ConfigError {
                 f,
                 "the {resource} soft limit {soft} is above its hard limit {hard}",
             ),
+            // Only a lookup that found nothing at the target says it is not
+            // there; any other failure says no more than that it was not found.
+            ConfigError::MountTargetMissing { target, source }
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                write!(
+                    f,
+                    "the mount target {target:?} is not in the host's root, where a launch \
+                     creates nothing (mount over a path that exists, or beneath a filesystem the \
+                     sandbox mounts, such as a hidden directory or /tmp)",
+                )
+            }
             ConfigError::MountTargetMissing { target, .. } => write!(
                 f,
-                "the mount target {target:?} is not in the host's root, where a launch creates \
-                 nothing (mount over a path that exists, or beneath a filesystem the sandbox \
-                 mounts, such as a hidden directory or /tmp)",
+                "the mount target {target:?} could not be looked up in the host's root, where a \
+                 launch creates nothing",
             ),
             ConfigError::LandlockResolveUnixUnenforceable { abi } => match abi {
                 Some(abi) => write!(
@@ -1229,6 +1273,17 @@ impl fmt::Display for ConfigError {
                 f,
                 "the restriction's command could lift its cgroup's limits or leave its cgroup: \
                  {reach}"
+            ),
+            ConfigError::SymlinkInHostRoot { path, target } => write!(
+                f,
+                "the host's root holds no symbolic link at {path:?} to {target:?}, and a launch \
+                 makes nothing there (make the link beneath a filesystem the sandbox mounts, such \
+                 as a hidden directory or /tmp)",
+            ),
+            ConfigError::OverlayWorkOnAnotherFilesystem { work, upper } => write!(
+                f,
+                "the overlay work directory {work:?} is on another filesystem than its upper \
+                 {upper:?}; the overlay moves files between the two, so they share one",
             ),
             ConfigError::NestedUsernsProcfsReadOnly { target } => write!(
                 f,
@@ -1828,6 +1883,31 @@ mod tests {
             let message = err.to_string();
             assert_eq!(message, "the command path \"./bin/sh\" is not absolute");
         }
+    }
+
+    /// A target the host's root lacks is said to be missing from it; a lookup
+    /// that failed otherwise is not, since nothing says the target is absent.
+    #[test]
+    fn a_mount_target_is_called_missing_only_where_the_lookup_found_nothing() {
+        let missing = |errno: i32| {
+            ConfigError::MountTargetMissing {
+                target: PathBuf::from("/srv/data"),
+                source: io::Error::from_raw_os_error(errno),
+            }
+            .to_string()
+        };
+        // ENOENT and ENOTDIR.
+        for errno in [2, 20] {
+            assert!(
+                missing(errno).contains("is not in the host's root"),
+                "{}",
+                missing(errno)
+            );
+        }
+        // EACCES.
+        let denied = missing(13);
+        assert!(!denied.contains("is not in"), "{denied}");
+        assert!(denied.contains("could not be looked up"), "{denied}");
     }
 
     #[test]

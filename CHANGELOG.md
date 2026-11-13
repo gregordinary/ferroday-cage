@@ -942,6 +942,17 @@ consumer upgrading can skip it.
 - An extended attribute that was empty when its length was asked, and held a
   value by the time it was read, is read with that value by a copy into a root
   filesystem and by a layered build's carry, where it read as empty.
+- **Breaking.** A configuration error carries a `source()` only where an OS
+  error occurred. Under the host's own root, a symbolic link `build` would have
+  to make in the host's tree is refused with the new
+  `ConfigError::SymlinkInHostRoot`, naming the link, where it was
+  `ConfigError::MountTargetMissing` carrying an `EROFS` no syscall returned. An
+  overlay work directory on another filesystem than its upper is refused with
+  the new `ConfigError::OverlayWorkOnAnotherFilesystem`, naming both, where it
+  was `ConfigError::OverlayDirUnusable` carrying a made-up `EXDEV`. A consumer
+  matching either case moves to the new variant. `MountTargetMissing` now says
+  a target is not in the host's root only where the lookup found nothing there,
+  and otherwise that it could not be looked up.
 
 ### Internal
 
