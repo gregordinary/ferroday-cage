@@ -46,8 +46,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
+use ferrata::dependency::Dependency;
+
+use super::DIALECT;
 use super::apk::ScriptKind;
-use super::index::{self, Dependency};
 use super::pkginfo::PkgInfo;
 use super::sign;
 use crate::provision::tar;
@@ -183,56 +185,7 @@ impl Record {
         control_identity: String,
         control_identity_hex: String,
     ) -> Record {
-        let mut header = Vec::new();
-        let mut put = |field: &str, value: &str| {
-            header.extend_from_slice(field.as_bytes());
-            header.push(b':');
-            header.extend_from_slice(value.as_bytes());
-            header.push(b'\n');
-        };
-        put("C", &control_identity);
-        put("P", &info.name);
-        put("V", &info.version);
-        put("A", architecture);
-        put("S", &size.to_string());
-        put("I", &info.installed_size.unwrap_or(0).to_string());
-        for (field, value) in [
-            ("T", &info.description),
-            ("U", &info.url),
-            ("L", &info.license),
-            ("o", &info.origin),
-            ("m", &info.maintainer),
-        ] {
-            if let Some(value) = value {
-                put(field, value);
-            }
-        }
-        if let Some(built) = info.build_time {
-            put("t", &built.to_string());
-        }
-        if let Some(commit) = &info.commit {
-            put("c", commit);
-        }
-        if let Some(priority) = info.provider_priority {
-            put("k", &priority.to_string());
-        }
-        for (field, entries) in [
-            ("D", &info.depends),
-            ("p", &info.provides),
-            ("i", &info.install_if),
-        ] {
-            if !entries.is_empty() {
-                put(field, &entries.join(" "));
-            }
-        }
-        if !info.replaces.is_empty() {
-            let replaces: Vec<String> = info.replaces.iter().map(ToString::to_string).collect();
-            put("r", &replaces.join(" "));
-        }
-        if let Some(priority) = info.replaces_priority {
-            put("q", &priority.to_string());
-        }
-
+        let header = header(&fields(info, architecture, size, &control_identity));
         Record {
             name: info.name.clone(),
             version: info.version.clone(),
@@ -391,6 +344,83 @@ impl Record {
     }
 }
 
+/// The fields an installed record opens with, in order, each a letter and its
+/// value: the index record `.PKGINFO` describes, as [`Record::open`] sets out
+/// field by field.
+///
+/// Also what a package is ordered by where no index was read: a bootstrap from
+/// a [`Plan`](super::Plan) makes the record apk would order of these fields
+/// ([`ferrata::record::Record::from_fields`]), so the order and the database
+/// are drawn from one list.
+pub(super) fn fields(
+    info: &PkgInfo,
+    architecture: &str,
+    size: u64,
+    control_identity: &str,
+) -> Vec<(u8, Vec<u8>)> {
+    let mut fields: Vec<(u8, Vec<u8>)> = vec![
+        (b'C', control_identity.into()),
+        (b'P', info.name.clone().into_bytes()),
+        (b'V', info.version.clone().into_bytes()),
+        (b'A', architecture.into()),
+        (b'S', size.to_string().into_bytes()),
+        (
+            b'I',
+            info.installed_size.unwrap_or(0).to_string().into_bytes(),
+        ),
+    ];
+    for (field, value) in [
+        (b'T', &info.description),
+        (b'U', &info.url),
+        (b'L', &info.license),
+        (b'o', &info.origin),
+        (b'm', &info.maintainer),
+    ] {
+        if let Some(value) = value {
+            fields.push((field, value.clone().into_bytes()));
+        }
+    }
+    if let Some(built) = info.build_time {
+        fields.push((b't', built.to_string().into_bytes()));
+    }
+    if let Some(commit) = &info.commit {
+        fields.push((b'c', commit.clone().into_bytes()));
+    }
+    if let Some(priority) = info.provider_priority {
+        fields.push((b'k', priority.to_string().into_bytes()));
+    }
+    for (field, entries) in [
+        (b'D', &info.depends),
+        (b'p', &info.provides),
+        (b'i', &info.install_if),
+    ] {
+        if !entries.is_empty() {
+            fields.push((field, entries.join(" ").into_bytes()));
+        }
+    }
+    if !info.replaces.is_empty() {
+        // Each entry as the bytes apk reads back as it.
+        let replaces: Vec<Vec<u8>> = info.replaces.iter().map(Dependency::to_bytes).collect();
+        fields.push((b'r', replaces.join(&b' ')));
+    }
+    if let Some(priority) = info.replaces_priority {
+        fields.push((b'q', priority.to_string().into_bytes()));
+    }
+    fields
+}
+
+/// `fields`, rendered one to a line, as the database records them.
+fn header(fields: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut header = Vec::new();
+    for (field, value) in fields {
+        header.push(*field);
+        header.push(b':');
+        header.extend_from_slice(value);
+        header.push(b'\n');
+    }
+    header
+}
+
 /// Splits a root-relative path into the directory that holds it and the name
 /// within it, which is how the database records a file: an `R:` line under the
 /// `F:` line naming its directory.
@@ -421,78 +451,42 @@ fn acl_line(field: u8, acl: OwnerMode, default: OwnerMode) -> Option<Vec<u8>> {
 
 /// One package as a tree's database already records it, read back.
 ///
-/// What a layered build needs of a base: the record's opening fields, read
-/// through the index grammar they are written in, and the record itself so the
-/// increment's database can carry it forward without re-rendering it.
+/// What a layered build needs of a base: the record's package fields, read as
+/// apk reads them, and the record itself so the increment's database can carry
+/// it forward without re-rendering it.
 pub(super) struct Existing {
-    /// The record's header, read back as the index record it is.
-    pub(super) record: index::Record,
-    /// The whole record as the database holds it — the header, and the file
-    /// lines below it — without the blank line that ends it.
+    /// The record's package fields, read back as the record they are.
+    pub(super) record: ferrata::record::Record,
+    /// The whole record as the database holds it — its fields and the file
+    /// lines among them — through the line feed of its last line.
     pub(super) raw: Vec<u8>,
 }
 
 /// Reads a tree's `installed` database.
 ///
-/// The database is bytes rather than text: a package may ship a path that is not
-/// UTF-8, and this layer's own writer records one as it found it. So the record
-/// is carried as bytes, and only its header — the fields above the first `F:`
-/// line, which are the index fields — is required to be text.
+/// The database is bytes, as apk reads it: a package may ship a path that is
+/// not UTF-8, which this layer's own writer records as it found it, and apk
+/// holds no field to UTF-8 either. So each record is carried as the bytes it
+/// was read from, split where ferrata's reader
+/// ([`ferrata::index::read_installed`]) ends one. What this layer names of a
+/// record is held to an alphabet afterwards, by [`index::unusable`].
 ///
 /// Reports the reason a database cannot be read rather than an error, so the
 /// caller names what it was reading; a database is not an index, and a refusal
 /// that called it one would name the wrong thing.
-pub(super) fn parse(text: &[u8]) -> Result<Vec<Existing>, String> {
-    let mut existing = Vec::new();
-    let mut lines: Vec<&[u8]> = Vec::new();
-    // A record ends at a blank line, and the last one needs none.
-    for line in text.split(|byte| *byte == b'\n').chain([&b""[..]]) {
-        if !line.is_empty() {
-            lines.push(line);
-            continue;
-        }
-        if lines.is_empty() {
-            continue;
-        }
-        existing.push(one(&lines)?);
-        lines.clear();
-    }
-    Ok(existing)
-}
-
-/// Assembles one record from the lines read for it.
-fn one(lines: &[&[u8]]) -> Result<Existing, String> {
-    // Everything above the first file line is the header, and `F:` is the letter
-    // that opens one.
-    let files_at = lines
-        .iter()
-        .position(|line| line.starts_with(b"F:"))
-        .unwrap_or(lines.len());
-    let header = String::from_utf8(lines[..files_at].join(&b'\n')).map_err(|_| {
-        let name = lines
-            .iter()
-            .find_map(|line| line.strip_prefix(b"P:"))
-            .map_or_else(
-                || "a record".to_string(),
-                |name| String::from_utf8_lossy(name).into_owned(),
-            );
-        format!("the fields of {name} are not UTF-8")
-    })?;
-
-    // A base record came from no index this run configured. `NO_INDEX` is never
-    // read — a record read back seeds a resolution and never enters a plan — and
-    // it is `usize::MAX` so that a mistaken read fails the plan's index lookup
-    // rather than silently attributing the package to the first repository.
-    const NO_INDEX: usize = usize::MAX;
-    let mut records = index::parse_records(&header, NO_INDEX)?;
-    let record = match records.len() {
-        1 => records.remove(0),
-        _ => return Err("a record carries no package fields".to_string()),
-    };
-    Ok(Existing {
-        record,
-        raw: lines.join(&b'\n'),
-    })
+///
+/// [`index::unusable`]: super::index::unusable
+pub(super) fn parse(database: &[u8]) -> Result<Vec<Existing>, String> {
+    ferrata::index::read_installed(DIALECT, database)
+        .map(|located| {
+            let located = located.map_err(|err| err.to_string())?;
+            let raw = database[located.span()].to_vec();
+            Ok(Existing {
+                record: located.into_record(),
+                raw,
+            })
+        })
+        .collect()
 }
 
 /// What a base layer's database holds, carried into the one an increment writes.
@@ -735,9 +729,10 @@ impl Database {
         let mut out = Vec::new();
         for (_, raw) in order {
             out.extend_from_slice(raw);
-            // A carried record was read without the newline that ended its last
-            // line, so every record is terminated here rather than some of them
-            // being terminated already.
+            // A carried record is the base's bytes through its last line feed,
+            // and a base whose database ended without one has a last record
+            // that lacks it, so a record is terminated here where it is not
+            // already.
             if !raw.ends_with(b"\n") {
                 out.push(b'\n');
             }
@@ -863,9 +858,16 @@ fn script_name(record: &Record, kind: ScriptKind) -> String {
 }
 
 /// Whether `claimant`'s `replaces` names `other`.
+///
+/// An entry names the package by its name and admits it at its version; a `!`
+/// entry names it where the version is one the entry does not admit.
 fn replaces(claimant: &Record, other: &Record) -> bool {
+    let version = DIALECT.version(&other.version).ok();
     claimant.replaces.iter().any(|entry| {
-        entry.name == other.name && entry.accepts(Some(&other.version)) != entry.conflict
+        let admits = version
+            .as_ref()
+            .is_some_and(|version| entry.admits(version));
+        entry.name() == other.name && admits != entry.is_conflict()
     })
 }
 
@@ -1105,10 +1107,7 @@ mod tests {
         // writer above emits them in.
         let existing =
             parse(super::super::fixtures::MINIROOTFS_INSTALLED).expect("the database reads");
-        let names: Vec<&str> = existing
-            .iter()
-            .map(|one| one.record.name.as_str())
-            .collect();
+        let names: Vec<&ferrata::Name> = existing.iter().map(|one| one.record.name()).collect();
         assert_eq!(names, ["alpine-baselayout", "musl"]);
         // A record's file lines travel with it even though nothing parses them:
         // what is carried into a layered build's database is the record as the
@@ -1117,13 +1116,40 @@ mod tests {
             existing[0].raw.windows(2).any(|pair| pair == b"F:"),
             "the file lines are in the raw record",
         );
-        assert!(
-            existing[0].raw.len() > existing[0].record.name.len(),
-            "and the raw record is more than its header",
+        // Split where the reader ends a record: the two raw records are the
+        // database, but for the blank line between them.
+        let whole = super::super::fixtures::MINIROOTFS_INSTALLED;
+        assert_eq!(
+            [&existing[0].raw[..], b"\n", &existing[1].raw[..]].concat(),
+            whole.strip_suffix(b"\n").unwrap_or(whole),
         );
 
         // A record whose header is not one is refused rather than skipped.
         assert!(parse(b"P:nameless\n\n").is_err(), "no version, no record");
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_read_and_carried_byte_for_byte() {
+        // A file name is the package's bytes, and so is a description: apk
+        // holds neither to UTF-8, and the record carries them as the database
+        // holds them while its fields are still read.
+        let mut database = b"C:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nP:a\nV:1.0-r0\nA:x86_64\n\
+                             T:caf\xe9\nF:usr\nR:caf\xe9\nZ:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n"
+            .to_vec();
+        database.extend_from_slice(b"C:Q1BBBBBBBBBBBBBBBBBBBBBBBBBBB=\nP:b\nV:2.0-r0\nA:x86_64\n");
+        let existing = parse(&database).expect("the database reads");
+        let names: Vec<&ferrata::Name> = existing.iter().map(|one| one.record.name()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(existing[0].record.field(b'T'), Some(b"caf\xe9".as_slice()));
+        assert!(
+            existing[0]
+                .raw
+                .ends_with(b"R:caf\xe9\nZ:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n")
+        );
+        assert_eq!(
+            [&existing[0].raw[..], b"\n", &existing[1].raw[..]].concat(),
+            database,
+        );
     }
 
     #[test]

@@ -6484,6 +6484,19 @@ impl<W: std::io::Write> Progress<W> {
         use ferroday_cage::provision::alpine::AlpineEvent;
         match event {
             AlpineEvent::Fetching { url, .. } => self.line(format_args!("fcage: fetching {url}")),
+            // Said only where the release's own `apk` may resolve otherwise.
+            AlpineEvent::Rules {
+                apk_tools,
+                measured_against,
+                measured: false,
+                ..
+            } => self.line(format_args!(
+                "fcage: {}, and the package set follows apk-tools {measured_against}'s rules",
+                match apk_tools {
+                    Some(version) => format!("the repositories offer apk-tools {version}"),
+                    None => "no repository offers apk-tools".to_string(),
+                },
+            )),
             AlpineEvent::Resolving => self.line(format_args!("fcage: resolving the package set")),
             AlpineEvent::Downloading {
                 package,

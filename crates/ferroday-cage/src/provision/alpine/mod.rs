@@ -50,9 +50,8 @@ mod pkginfo;
 mod plan;
 mod release;
 mod repository;
-mod resolve;
+mod resolution;
 mod sign;
-mod version;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -90,9 +89,43 @@ use super::{
 };
 use crate::{IdMapper, IdentityMap};
 use bootstrap::{Declared, ScriptSubject};
-use index::{Index, Record};
+use ferrata::record::Record;
+use index::Index;
 use installed::{Carried, Claim, Database, Shape};
 use pin::Pins;
+
+/// The apk series whose rules answer every question this layer asks in apk's
+/// terms: version order, dependency syntax, reading an index, and resolution.
+///
+/// apk-tools 3.0, which Alpine ships from v3.23, for every release. A release
+/// before v3.23 ships apk-tools 2.14, and is resolved by 3.0's rules all the
+/// same, since the root is built here rather than by that release's `apk`;
+/// [`AlpineEvent::Rules`] reports, per resolution, the `apk-tools` the
+/// repositories offer beside the release these rules were measured against.
+const DIALECT: ferrata::Dialect = ferrata::Dialect::V3_0;
+
+/// The version of the `apk-tools` `index` offers, the highest where it offers
+/// several, and whether it is the release [`DIALECT`]'s rules were measured
+/// against, an Alpine rebuild of it included.
+///
+/// Asked of ferrata's [`Dialect::for_release`](ferrata::Dialect::for_release)
+/// over every record the configured repositories offer the architecture,
+/// rather than the primary's `main` alone: a postmarketOS repository carries
+/// no `apk-tools`, and a root configured with it takes Alpine's. An
+/// `apk-tools` of a series no dialect follows, such as a release's 2.14, and
+/// repositories offering none are reported rather than refused, and resolved
+/// by [`DIALECT`]'s rules as every release is.
+fn apk_tools_of(index: &Index) -> (Option<String>, bool) {
+    match ferrata::Dialect::for_release(index.records()) {
+        // A version `index::unusable` admitted, so in the grammar, which
+        // `Display` writes as its bytes.
+        Ok(selection) => (
+            Some(selection.apk_tools().to_string()),
+            selection.dialect() == DIALECT && selection.is_measured(),
+        ),
+        Err(refused) => (refused.apk_tools().map(ToString::to_string), false),
+    }
+}
 
 /// The default mirror: the Alpine content-delivery front end.
 const DEFAULT_MIRROR: &str = "http://dl-cdn.alpinelinux.org/alpine";
@@ -307,13 +340,13 @@ impl Alpine {
     /// The resolution, over a base layer where there is one.
     ///
     /// One body for the whole-root and the layered cases, so the two cannot
-    /// resolve differently: a base contributes packages the closure treats as
-    /// already answered, and nothing else about the resolution changes.
+    /// resolve differently: a base is the root the request is resolved over,
+    /// and nothing else about the resolution changes.
     fn resolve_over(
         &mut self,
         base: Option<&layer::Base>,
         observer: &mut dyn AlpineObserver,
-    ) -> Result<Plan, AlpineError> {
+    ) -> Result<Resolved, AlpineError> {
         if self.world.is_empty() {
             return Err(AlpineError::config(
                 "a resolution installs the packages named with include(), and none were \
@@ -322,36 +355,45 @@ impl Alpine {
             ));
         }
         let (records, indexes) = self.read_indexes(observer)?;
+        let index = Index::merge(records, &self.architecture);
+        let (apk_tools, measured) = apk_tools_of(&index);
+        observer.progress(AlpineEvent::Rules {
+            apk_tools: apk_tools.as_deref(),
+            measured_against: DIALECT.measured_against(),
+            measured,
+        });
         observer.progress(AlpineEvent::Resolving);
-        let merged = Index::merge(records, &self.architecture, &self.pins);
-        // Before the closure, so a pin the repositories have moved past refuses
-        // the resolution rather than quietly resolving to something else.
-        self.pins.check(&merged)?;
-        let carried = base.into_iter().flat_map(layer::Base::records);
-        let packages = resolve::resolve(&merged, &self.world, &self.excludes, carried)?;
-        Ok(Plan::project(
-            self.release(),
-            &self.architecture,
-            &packages,
-            &indexes,
-        ))
+        // Before the resolution, so a pin the repositories have moved past
+        // refuses it rather than quietly resolving to something else.
+        self.pins.check(&index)?;
+        let installs = resolution::resolve(&index, &self.world, &self.excludes, &self.pins, base)?;
+        Ok(Resolved {
+            plan: Plan::project(self.release(), &self.architecture, &installs, &indexes),
+            // Each an index's record, whose name `index::unusable` admitted as
+            // text.
+            order: installs
+                .iter()
+                .map(|(_, record)| record.name().to_string())
+                .collect(),
+        })
     }
 
     /// Resolves the increment a layered build would install over its base,
     /// downloading and unpacking nothing.
     ///
     /// The layered counterpart of [`resolve`](Self::resolve): it reads the base
-    /// layer's `lib/apk/db/installed` database, then resolves the configured
-    /// [`include`](AlpineBuilder::include)s against the merged repository index
-    /// while treating everything the base records as already answered, returning
-    /// the [`Plan`] of only the packages the base does not carry. Requires a
+    /// layer's `lib/apk/db/installed` database and `/etc/apk/world`, then
+    /// resolves the configured [`include`](AlpineBuilder::include)s over the
+    /// base as `apk add` would over that root, returning the [`Plan`] of only
+    /// the packages the increment adds. Requires a
     /// [`base_layer`](AlpineBuilder::base_layer).
     ///
-    /// The base answers at its recorded versions rather than merely by name, so
-    /// a dependency the base's version is too old for is reported rather than
-    /// quietly skipped. That is the one thing a layered resolution cannot do
-    /// about: an increment installs over a base, and a package the base already
-    /// carries cannot be replaced by a newer one without rebuilding the base.
+    /// The base answers at its recorded versions rather than merely by name.
+    /// Where `apk add` would upgrade, replace or remove a package the base
+    /// holds — a dependency the base's version is too old for, or a package the
+    /// base's world no longer reaches — the resolution is refused, naming the
+    /// package and why: an increment installs over a base, and what the base
+    /// carries cannot change without rebuilding the base.
     ///
     /// Like [`resolve`](Self::resolve) it downloads no package and runs nothing,
     /// so it needs neither a `qemu-user` binfmt handler nor an establishable
@@ -405,14 +447,12 @@ impl Alpine {
         let mut indexes = Vec::new();
         for repository in &self.repositories {
             for (component, path) in repository.indexes(&self.architecture) {
-                let from = indexes.len();
                 let (read, resolved) = read_index(
                     &mut *self.fetcher,
                     repository,
                     component,
                     &path,
                     &self.architecture,
-                    from,
                     observer,
                 )?;
                 records.push(read);
@@ -677,14 +717,14 @@ impl AlpineBuilder {
     /// # Errors
     ///
     /// A name carrying a version operator is refused at [`build`](Self::build)
-    /// with [`AlpineError::Config`]. A resolution takes the highest version each
-    /// repository offers; holding one to a version is what [`pin`](Self::pin)
-    /// is for, and reading `busybox>=1.37` as a package name would otherwise
-    /// fail as a package nothing offers.
+    /// with [`AlpineError::Config`]: holding a resolution to a version is what
+    /// [`pin`](Self::pin) is for.
     ///
     /// So is a name carrying an apk repository tag, such as `busybox@edge`. A
     /// [`Repository`] carries no tag, and every name resolves against every
-    /// configured repository.
+    /// configured repository. And so is anything else that is not a package
+    /// name as apk reads one, such as `!busybox`, which apk reads as a conflict:
+    /// [`exclude`](Self::exclude) is how a package is kept out.
     pub fn include<I, S>(mut self, packages: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -696,12 +736,13 @@ impl AlpineBuilder {
 
     /// Excludes packages from the resolved install closure.
     ///
-    /// An excluded package is never selected: it is skipped when a name is
-    /// answered, so a dependency on a name several packages provide resolves
+    /// An excluded package is never selected: its records are withheld from the
+    /// resolution, so a dependency on a name several packages provide resolves
     /// through one of the others. apk has no alternative groups, so a dependency
-    /// that only the excluded package could have satisfied fails the resolution
-    /// rather than producing a broken closure, as does excluding a package that
-    /// is also an [`include`](Self::include).
+    /// that only an excluded package could have satisfied fails the resolution,
+    /// naming the excluded packages that would have answered it, rather than
+    /// producing a broken closure. So does excluding a package that is also an
+    /// [`include`](Self::include).
     pub fn exclude<I, S>(mut self, packages: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -716,15 +757,17 @@ impl AlpineBuilder {
     ///
     /// The resolution runs as it always does — every index fetched and verified,
     /// the closure computed over what the repositories offer now — and each
-    /// package the pin names is selected at the pinned version rather than at the
-    /// highest offered. Everything else, including a package added to the closure
-    /// since and a dependency the pinned version pulls in, resolves normally.
+    /// package the pin names is offered at the pinned version, and with the
+    /// pinned control segment, alone. Everything else, including a package added
+    /// to the closure since and a dependency the pinned version pulls in,
+    /// resolves normally.
     ///
-    /// The merged index keeps one record for each name, the pinned one where
-    /// the pin names it, and every route to a package goes through it: a
-    /// dependency, a provided name, and an `install_if` condition alike. A name
-    /// a [`base_layer`](Self::base_layer) carries keeps the base's version,
-    /// since a layered build never upgrades its base.
+    /// A pin withholds records rather than requesting packages: every route to
+    /// a pinned name — a dependency, a provided name, and an `install_if`
+    /// condition alike — reaches the pinned package or nothing, and a package
+    /// the pin names that the resolution does not select stays out. A name a
+    /// [`base_layer`](Self::base_layer) carries keeps the base's version, since
+    /// a layered build never changes its base.
     ///
     /// # The trust model does not change
     ///
@@ -750,7 +793,8 @@ impl AlpineBuilder {
     /// different control segment for it. Alpine keeps one version of each
     /// package per release, so a pin outlives a publication only where the
     /// caller keeps a mirror that does. So does a dependency the pinned version
-    /// does not meet where nothing else answers it, naming the requirement.
+    /// does not meet where a version the pin withholds would, naming the
+    /// requirement.
     pub fn pin(mut self, pin: Plan) -> Self {
         self.pin = Some(pin);
         self
@@ -959,12 +1003,15 @@ impl AlpineBuilder {
         self
     }
 
-    /// Adds a repository after the primary.
+    /// Adds a repository after the primary, and after any added before it.
     ///
-    /// Order is meaning: a repository added later shadows an earlier one where
-    /// both offer a name at the same version, which is what makes postmarketOS's
-    /// repositories an overlay on Alpine's rather than a rival to them. A higher
-    /// version wins wherever it comes from.
+    /// Order is meaning, as it is in `/etc/apk/repositories`: where two
+    /// candidates rank equal, such as two builds of one version, apk installs
+    /// the one the repository configured first offers, and so does a
+    /// resolution here. A later version wins wherever it comes from. A
+    /// repository whose packages are to win a tie, as postmarketOS's are
+    /// meant to over Alpine's, is configured first: as the primary, with
+    /// Alpine's repository added after it.
     pub fn repository(mut self, repository: Repository) -> Self {
         self.repositories.push(repository);
         self
@@ -1021,14 +1068,21 @@ impl AlpineBuilder {
             if name.contains('@') {
                 return Err(AlpineError::config(format!(
                     "{name:?} names a repository tag, and the repositories configured here \
-                         carry none; a name resolves against every configured repository, the \
-                         highest version winning",
+                         carry none; a name resolves against every configured repository",
                 )));
             }
             if name.contains(['<', '>', '=', '~']) {
                 return Err(AlpineError::config(format!(
                     "{name:?} names a package and a version, and include() and exclude() \
                          name packages; hold a resolution to a version with pin() instead",
+                )));
+            }
+            // apk reads a leading `!` as a conflict, and a request is not where
+            // this layer states one: exclude() withholds a package instead.
+            let entry = DIALECT.dependency(name);
+            if !entry.is_ok_and(|entry| !entry.is_conflict() && entry.name() == name) {
+                return Err(AlpineError::config(format!(
+                    "{name:?} is not a package name, which is what include() and exclude() name",
                 )));
             }
         }
@@ -1262,7 +1316,6 @@ fn read_index(
     component: Option<&str>,
     path: &str,
     architecture: &str,
-    from: usize,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(Vec<Record>, ResolvedIndex), AlpineError> {
     let Fetched { mirror, url, body } = fetch_first(
@@ -1273,8 +1326,7 @@ fn read_index(
         observer,
         || AlpineError::Cancelled,
     )?;
-    let (records, signed_by, description) =
-        parse_index(&url, &body, repository, architecture, from)?;
+    let (records, signed_by, description) = parse_index(&url, &body, repository, architecture)?;
     Ok((
         records,
         ResolvedIndex {
@@ -1304,7 +1356,6 @@ fn parse_index(
     bytes: &[u8],
     repository: &Repository,
     architecture: &str,
-    from: usize,
 ) -> Result<(Vec<Record>, String, Option<String>), AlpineError> {
     let mut segments = apk::Segments::new(bytes);
     // An index is the trust root: nothing above it vouches for it, so its own
@@ -1331,8 +1382,6 @@ fn parse_index(
     let records = metadata
         .member("APKINDEX")
         .ok_or_else(|| AlpineError::index(url, "its signed segment carries no APKINDEX member"))?;
-    let text = std::str::from_utf8(&records.data)
-        .map_err(|err| AlpineError::index(url, format!("its records are not UTF-8: {err}")))?;
     // Whatever the repository chose to write there: Alpine writes `git
     // describe` of the tree the index was built from, postmarketOS a timestamp,
     // and the format defines neither. Alpine's is what binds the index to the
@@ -1347,7 +1396,7 @@ fn parse_index(
         &metadata.signed_by,
         description.as_deref(),
     )?;
-    let records = index::parse(url, text, from)?;
+    let records = index::parse(url, &records.data)?;
     if let Some(reason) = index::foreign_to(&records, architecture) {
         return Err(AlpineError::index(url, reason));
     }
@@ -1447,6 +1496,30 @@ pub enum AlpineEvent<'a> {
     },
     /// The dependency closure is being resolved.
     Resolving,
+    /// The `apk-tools` the configured repositories offer, beside the release
+    /// whose rules the resolution follows.
+    ///
+    /// Every release is resolved by apk-tools 3.0's rules, as measured against
+    /// `apk.static` [`measured_against`](Self::Rules::measured_against).
+    /// Reported once per resolution, once every index has been verified and
+    /// before [`Resolving`](Self::Resolving). Where `measured` is false, the
+    /// repositories offer another `apk-tools` or none, as a release before
+    /// v3.23 offers apk-tools 2.14, and that release's own `apk` may resolve a
+    /// request otherwise. Installing a [`plan`](AlpineBuilder::plan) reads no
+    /// index and reports none.
+    #[non_exhaustive]
+    Rules {
+        /// The version of the `apk-tools` package the repositories offer for
+        /// the architecture, the highest where they offer several, or `None`
+        /// where none offers it.
+        apk_tools: Option<&'a str>,
+        /// The `apk-tools` release whose rules the resolution follows, as they
+        /// were measured.
+        measured_against: &'static str,
+        /// Whether `apk_tools` is that release, an Alpine rebuild of it
+        /// included.
+        measured: bool,
+    },
     /// The closure has been resolved, carrying the plan the bootstrap will
     /// install.
     ///
@@ -1539,7 +1612,7 @@ impl Observed<'_> {
                          through Alpine::resolve_layer rather than through Alpine::resolve",
             ));
         }
-        self.alpine.resolve_over(None, self.sink)
+        Ok(self.alpine.resolve_over(None, self.sink)?.plan)
     }
 
     /// [`Alpine::available`], reporting to the attached sink.
@@ -1551,13 +1624,13 @@ impl Observed<'_> {
         // repositories offer, and a pin describes a selection from it rather
         // than a bound on what may be asked about.
         let (records, _indexes) = self.alpine.read_indexes(self.sink)?;
-        Ok(Index::merge(records, &self.alpine.architecture, &Pins::none()).into_available())
+        Ok(Index::merge(records, &self.alpine.architecture).into_available())
     }
 
     /// [`Alpine::resolve_layer`], reporting to the attached sink.
     pub fn resolve_layer(&mut self) -> Result<Plan, AlpineError> {
         let base = self.alpine.read_base_layer("resolve_layer")?;
-        self.alpine.resolve_over(Some(&base), self.sink)
+        Ok(self.alpine.resolve_over(Some(&base), self.sink)?.plan)
     }
 
     /// [`Alpine::stage_layer`], reporting to the attached sink.
@@ -1647,12 +1720,17 @@ fn install(
 ) -> Result<(), ProvisionError> {
     // A plan is the resolution: no index is fetched, which is the whole of what
     // installing from one saves. It is reported as it stands rather than
-    // re-projected, so an observer sees the same event either way.
-    let plan = match alpine.plan.clone() {
-        Some(plan) => plan,
-        None => alpine
-            .resolve_over(base, observer)
-            .map_err(ProvisionError::from)?,
+    // re-projected, so an observer sees the same event either way. A resolution
+    // also says the order apk installs its packages in; a plan is ordered once
+    // its packages are in hand.
+    let (plan, resolved_order) = match alpine.plan.clone() {
+        Some(plan) => (plan, None),
+        None => {
+            let resolved = alpine
+                .resolve_over(base, observer)
+                .map_err(ProvisionError::from)?;
+            (resolved.plan, Some(resolved.order))
+        }
     };
     observer.progress(AlpineEvent::Resolved { plan: &plan });
 
@@ -1667,9 +1745,17 @@ fn install(
     // the plan's own names are what the root wants. Written as world, they pin
     // the closure for a later `apk`: an empty file says nothing is wanted, which
     // is what `apk fix` acts on.
-    let wanted: Vec<String> = match &alpine.plan {
-        Some(plan) => plan.packages.iter().map(|p| p.name.clone()).collect(),
-        None => alpine.world.clone(),
+    let wanted: Vec<Vec<u8>> = match &alpine.plan {
+        Some(plan) => plan
+            .packages
+            .iter()
+            .map(|p| p.name.clone().into_bytes())
+            .collect(),
+        None => alpine
+            .world
+            .iter()
+            .map(|name| name.clone().into_bytes())
+            .collect(),
     };
     // Sorted as `apk` writes it, so the merged root's file is one list rather
     // than the base's followed by the increment's.
@@ -1705,12 +1791,12 @@ fn install(
         // that forced it; a plan reaches here without having been resolved
         // against this base at all, so the check is made against the plan rather
         // than only inside the resolution.
-        let carried: Vec<&str> = base.records().map(|record| record.name.as_str()).collect();
+        let carried: Vec<&ferrata::Name> = base.records().map(Record::name).collect();
         let doubled: Vec<&str> = plan
             .packages
             .iter()
             .map(|package| package.name.as_str())
-            .filter(|name| carried.contains(name))
+            .filter(|name| carried.iter().any(|carried| carried == name))
             .collect();
         if !doubled.is_empty() {
             return Err(ProvisionError::from(AlpineError::config(format!(
@@ -1742,7 +1828,10 @@ fn install(
         observer,
     )?;
 
-    let order = install_order(&acquired);
+    let order = match &resolved_order {
+        Some(names) => resolved_order_of(&acquired, names),
+        None => install_order(&acquired).map_err(ProvisionError::from)?,
+    };
     let carried = base.map(layer::Base::carried).unwrap_or_default();
     let (mut database, subjects) = lay_down(
         into,
@@ -1800,7 +1889,7 @@ fn install(
 ///
 /// The base's order is kept because `apk` reads `/etc/apk/repositories` top to
 /// bottom, and a line the base already records is not written twice.
-fn joined(carried: &[String], mine: impl IntoIterator<Item = String>) -> Vec<String> {
+fn joined<T: Clone + PartialEq>(carried: &[T], mine: impl IntoIterator<Item = T>) -> Vec<T> {
     let mut all = carried.to_vec();
     for one in mine {
         if !all.contains(&one) {
@@ -1999,47 +2088,69 @@ fn read_acquired(
     Ok((acquired, file))
 }
 
-/// The order the closure is laid down and configured in: a package after
-/// everything it needs, and a package its `install_if` brought in after the
-/// packages that condition names.
+/// A resolution: the plan it projects to, and the order apk installs its
+/// packages in.
+struct Resolved {
+    /// The packages to install, in name order, and what they were resolved
+    /// against.
+    plan: Plan,
+    /// The same packages' names, in the order apk installs them, which is the
+    /// order they are laid down and configured in.
+    order: Vec<String>,
+}
+
+/// The acquired packages' positions in the order a resolution installs them in.
 ///
-/// The second is `apk`'s order too: it adds an `install_if` package to a
-/// transaction only once everything the condition names is in it. It matters
-/// where the package's entries are owned by an account the other's
-/// pre-install creates. `dbus-daemon-launch-helper` needs nothing of `dbus`,
-/// and is owned by the `messagebus` group `dbus`'s pre-install adds.
-fn install_order(acquired: &[Acquired]) -> Vec<usize> {
-    let mut provides: HashMap<String, Vec<usize>> = HashMap::new();
-    for (at, held) in acquired.iter().enumerate() {
-        provides
-            .entry(held.package.info.name.clone())
-            .or_default()
-            .push(at);
-        for entry in &held.package.info.provides {
-            // A `p:` entry may state a version; the name is what a dependency
-            // names it by.
-            provides
-                .entry(version::name_of(entry).to_string())
-                .or_default()
-                .push(at);
-        }
-    }
-    let depends: Vec<Vec<String>> = acquired
+/// A resolution names each package once and acquires each package it names, so
+/// every name finds the one package acquired for it.
+fn resolved_order_of(acquired: &[Acquired], order: &[String]) -> Vec<usize> {
+    let at: HashMap<&str, usize> = acquired
         .iter()
-        .map(|held| {
-            let info = &held.package.info;
-            info.depends
-                .iter()
-                .chain(&info.install_if)
-                // A `!` entry states what must *not* be installed. The
-                // resolution already settled that; an install order has no edge
-                // to draw from it.
-                .filter(|entry| !entry.starts_with('!'))
-                .map(|entry| version::name_of(entry).to_string())
-                .collect()
-        })
+        .enumerate()
+        .map(|(at, held)| (held.planned.name.as_str(), at))
         .collect();
-    bootstrap::dependency_order(&depends, &provides)
+    order
+        .iter()
+        .filter_map(|name| at.get(name.as_str()).copied())
+        .collect()
+}
+
+/// The order a plan's packages are laid down and configured in, where no
+/// resolution ordered them: the order `apk add` installs them in for their
+/// names, every package a plan names being acquired, which is the world the
+/// finished root records.
+///
+/// The order is apk's ([`ferrata::resolve::order`]): every package after what
+/// it depends on, cycles broken where apk breaks them, and a package an
+/// `install_if` condition brings in after the packages the condition names.
+/// The last matters where the package's entries are owned by an account the
+/// other's pre-install creates: `dbus-daemon-launch-helper` needs nothing of
+/// `dbus`, and is owned by the `messagebus` group `dbus`'s pre-install adds.
+///
+/// A plan installs without reading an index, so each package is ordered as the
+/// record its own `.PKGINFO` describes, the one the installed database records.
+/// The original resolution's request is not recorded, so the order can differ
+/// from the one a bootstrap that resolved the same plan installs in.
+fn install_order(acquired: &[Acquired]) -> Result<Vec<usize>, AlpineError> {
+    let mut records = Vec::with_capacity(acquired.len());
+    for held in acquired {
+        let fields = installed::fields(
+            &held.package.info,
+            &held.planned.architecture,
+            held.size,
+            &held.package.control_identity,
+        );
+        let record = Record::from_fields(DIALECT, fields).map_err(|err| {
+            AlpineError::container(
+                held.path.display().to_string(),
+                format!("its fields do not read: {err}"),
+            )
+        })?;
+        records.push(record);
+    }
+    let request = resolution::request_of(acquired.iter().map(|held| held.planned.name.as_str()))
+        .map_err(AlpineError::config)?;
+    Ok(ferrata::resolve::order(&records, &request))
 }
 
 /// Lays every package's file tree into the staging tree, building the installed
@@ -2443,10 +2554,12 @@ pub enum AlpineError {
         /// What was wrong with it.
         reason: String,
     },
-    /// The closure the repositories offer is not one that can be installed.
+    /// The request is not one the repositories can answer: `apk add` would
+    /// refuse it, or, over a base layer, answer it by changing a package the
+    /// base holds.
     #[non_exhaustive]
     Resolve {
-        /// What could not be resolved, and what the repositories offer instead.
+        /// What could not be resolved, and how it came about.
         reason: String,
     },
     /// Two packages ship the same path and neither says it may take it from
@@ -2555,19 +2668,6 @@ impl AlpineError {
 }
 
 layer_error!(AlpineError, accounts);
-
-impl From<resolve::ResolveError> for AlpineError {
-    fn from(err: resolve::ResolveError) -> AlpineError {
-        match err {
-            resolve::ResolveError::Pinned { unheld } => AlpineError::Pin {
-                unheld: vec![unheld],
-            },
-            err => AlpineError::Resolve {
-                reason: err.to_string(),
-            },
-        }
-    }
-}
 
 impl fmt::Display for AlpineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -3464,13 +3564,11 @@ mod tests {
 
     #[test]
     fn an_overlay_overrides_by_version_rather_than_by_position() {
-        // How postmarketOS actually overrides an Alpine package: it republishes
-        // it at a version no Alpine release will reach -- `akms` at
-        // `99990.3.0-r1` against Alpine's `0.3.0-r0` -- rather than relying on
-        // being configured second. So the same package is selected with the
-        // repositories in either order, and the equal-version shadowing rule
-        // (proven over `Index::merge`) is not what the published archives lean
-        // on.
+        // How postmarketOS overrides most Alpine packages it republishes: at a
+        // version no Alpine release will reach -- `akms` at `99990.3.0-r1`
+        // against Alpine's `0.3.0-r0` -- rather than by its position. So the
+        // same package is selected with the repositories in either order; only
+        // a tie at equal version turns on which is configured first.
         let scratch = Scratch::new("alpine-overlay-order");
         let alpine_mirror = scratch.join("alpine");
         let overlay_mirror = scratch.join("pmos");
@@ -3876,6 +3974,7 @@ mod tests {
             ),
         ];
         let names: Vec<&str> = install_order(&acquired)
+            .expect("the packages read as records")
             .into_iter()
             .map(|at| acquired[at].package.info.name.as_str())
             .collect();
@@ -4297,12 +4396,15 @@ mod tests {
         at.to_path_buf()
     }
 
-    /// A hand-written base database holding one package at one version, for the
-    /// resolution cases a committed fixture cannot express.
+    /// A hand-written base database holding one package at one version each,
+    /// for the resolution cases a committed fixture cannot express, and a world
+    /// naming every one of them, so the root is one apk keeps as it is.
     fn base_recording(scratch: &Scratch, tag: &str, records: &[(&str, &str, &str)]) -> PathBuf {
         let base = scratch.join(tag);
         std::fs::create_dir_all(base.join("lib/apk/db")).expect("the tree is creatable");
+        std::fs::create_dir_all(base.join("etc/apk")).expect("the tree is creatable");
         let mut database = String::new();
+        let mut world = String::new();
         for (at, (name, version, fields)) in records.iter().enumerate() {
             // A distinct well-formed control identity per record, which the
             // reader checks the shape of and nothing here reads.
@@ -4310,9 +4412,11 @@ mod tests {
             database.push_str(&format!(
                 "C:{identity}\nP:{name}\nV:{version}\nA:x86_64\nS:1024\nI:2048\n{fields}\n",
             ));
+            world.push_str(&format!("{name}\n"));
         }
         std::fs::write(base.join("lib/apk/db/installed"), database)
             .expect("the database is writable");
+        std::fs::write(base.join(bootstrap::WORLD), world).expect("the world is writable");
         base
     }
 
@@ -4365,9 +4469,9 @@ mod tests {
     #[test]
     fn an_increment_that_would_replace_a_base_package_is_refused() {
         // The base answers at the version it records rather than merely by name,
-        // so a dependency its version cannot meet is reported as the upgrade it
-        // would be. `alpine-baselayout` needs its data package at exactly its own
-        // version, and this base carries an older one.
+        // so a dependency its version cannot meet is reported as the upgrade apk
+        // would make. `alpine-baselayout` needs its data package at exactly its
+        // own version, and this base carries an older one.
         let scratch = Scratch::new("alpine-upgrade");
         let mirror = published(&scratch, &[]);
         let base = base_recording(
@@ -4375,7 +4479,7 @@ mod tests {
             "base",
             &[
                 ("alpine-baselayout-data", "3.7.0-r0", ""),
-                ("busybox", "1.37.0-r30", "p:/bin/sh"),
+                ("busybox-binsh", "1.37.0-r30", "k:100\np:/bin/sh"),
             ],
         );
 
@@ -4390,7 +4494,8 @@ mod tests {
             .expect_err("the base carries an older alpine-baselayout-data");
         assert!(
             matches!(&err, AlpineError::Resolve { reason }
-                if reason.contains("3.7.0-r0") && reason.contains("alpine-baselayout-data")),
+                if reason.contains("alpine-baselayout-data at 3.7.0-r0")
+                    && reason.contains("upgrade it to 3.7.2-r0")),
             "{err}",
         );
 
@@ -4401,7 +4506,7 @@ mod tests {
             "current",
             &[
                 ("alpine-baselayout-data", "3.7.2-r0", ""),
-                ("busybox", "1.37.0-r30", "p:/bin/sh"),
+                ("busybox-binsh", "1.37.0-r30", "k:100\np:/bin/sh"),
             ],
         );
         let plan = Alpine::builder("v3.23")
@@ -4419,6 +4524,41 @@ mod tests {
             .map(|package| package.name.as_str())
             .collect();
         assert_eq!(names, ["alpine-baselayout"]);
+    }
+
+    #[test]
+    fn an_increment_that_would_remove_a_base_package_is_refused() {
+        // `apk add` over a root removes what the root's world no longer
+        // reaches, and an increment cannot remove what its base holds.
+        let scratch = Scratch::new("alpine-remove");
+        let mirror = published(&scratch, &[]);
+        let base = base_recording(
+            &scratch,
+            "base",
+            &[
+                ("busybox-binsh", "1.37.0-r30", "k:100\np:/bin/sh"),
+                ("orphan", "1.0-r0", ""),
+            ],
+        );
+        std::fs::write(base.join(bootstrap::WORLD), "busybox-binsh\n")
+            .expect("the world is writable");
+
+        let err = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .base_layer(&base)
+            .include(["alpine-baselayout-data"])
+            .build()
+            .expect("the bootstrap configures")
+            .resolve_layer()
+            .expect_err("the base's world does not reach orphan");
+        assert!(
+            matches!(&err, AlpineError::Resolve { reason }
+                if reason.contains("orphan at 1.0-r0")
+                    && reason.contains("would remove it")
+                    && reason.contains("nothing requires it")),
+            "{err}",
+        );
     }
 
     #[test]
@@ -4749,6 +4889,31 @@ mod tests {
     }
 
     #[test]
+    fn the_rules_a_resolution_follows_are_reported_beside_the_apk_tools_offered() {
+        let offering = |versions: &[&str]| {
+            let records: Vec<String> = versions
+                .iter()
+                .map(|version| index::fixture::record("apk-tools", version, "x86_64", version, ""))
+                .collect();
+            apk_tools_of(&index::fixture::merged(&records))
+        };
+        let reported = |version: &str, measured: bool| (Some(version.to_string()), measured);
+        assert_eq!(offering(&["3.0.9-r0"]), reported("3.0.9-r0", true));
+        // An Alpine rebuild of the release is that release.
+        assert_eq!(offering(&["3.0.9-r4"]), reported("3.0.9-r4", true));
+        // The highest of several.
+        assert_eq!(
+            offering(&["3.0.9-r1", "3.0.8-r0"]),
+            reported("3.0.9-r1", true)
+        );
+        // Another release of the series, and a series no dialect follows,
+        // are resolved by the same rules and reported.
+        assert_eq!(offering(&["3.0.10-r0"]), reported("3.0.10-r0", false));
+        assert_eq!(offering(&["2.14.13-r0"]), reported("2.14.13-r0", false));
+        assert_eq!(offering(&[]), (None, false));
+    }
+
+    #[test]
     fn a_bootstrap_reports_what_it_is_doing_and_can_be_stopped() {
         let scratch = Scratch::new("alpine-observed");
         let component = scratch.join("v3.23/main/x86_64");
@@ -4767,6 +4932,13 @@ mod tests {
         impl AlpineObserver for Watch {
             fn progress(&mut self, event: AlpineEvent<'_>) {
                 match event {
+                    AlpineEvent::Rules {
+                        apk_tools,
+                        measured_against,
+                        measured,
+                    } => self
+                        .seen
+                        .push(format!("rules {apk_tools:?} {measured_against} {measured}")),
                     AlpineEvent::Resolving => self.seen.push("resolving".to_string()),
                     AlpineEvent::Resolved { plan } => {
                         self.seen.push(format!("resolved {}", plan.packages.len()));
@@ -4805,6 +4977,9 @@ mod tests {
         assert_eq!(
             watch.seen,
             [
+                // The fixture index is v3.23's `main` as it stood before
+                // apk-tools 3.0.9.
+                "rules Some(\"3.0.7-r0\") 3.0.9 false",
                 "resolving",
                 "resolved 1",
                 "downloading musl",
@@ -4833,7 +5008,14 @@ mod tests {
             matches!(err, crate::provision::ProvisionError::Cancelled),
             "{err}",
         );
-        assert_eq!(watch.seen, ["resolving", "resolved 1"]);
+        assert_eq!(
+            watch.seen,
+            [
+                "rules Some(\"3.0.7-r0\") 3.0.9 false",
+                "resolving",
+                "resolved 1"
+            ]
+        );
         assert!(!watched.exists());
 
         // And from the run's own observer, which is the one a caller driving

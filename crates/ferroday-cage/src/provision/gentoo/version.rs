@@ -40,8 +40,8 @@
 //! # Why this is a third comparator
 //!
 //! The crate already has [`debian::version`](super::super::debian::version) and
-//! [`alpine::version`](super::super::alpine::version), and this is a third
-//! answer to "how do two versions compare" rather than a reuse of either. The
+//! the Alpine layer's, ferrata's `version` module, and this is a third answer
+//! to "how do two versions compare" rather than a reuse of either. The
 //! three archives genuinely disagree, and not at the edges: Debian's epoch has
 //! no counterpart here, apk's `~commit` token and its `cvs`/`svn`/`git`/`hg`
 //! suffixes are not part of this grammar, and this format's letter component is
@@ -288,13 +288,12 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
 
 /// Orders two versions, or `None` where either is not one this format defines.
 ///
-/// Partial, where [`debian::version::compare`] is total, for the reason
-/// [`alpine::version::compare`] is: a portage version is a token grammar, and
-/// a string outside it is a version the archive should not have published
-/// rather than one to be ordered low.
+/// Partial, where [`debian::version::compare`] is total, for the reason apk's
+/// reading of a version, ferrata's, refuses a string outside its grammar: a
+/// portage version is a token grammar, and a string outside it is a version
+/// the archive should not have published rather than one to be ordered low.
 ///
 /// [`debian::version::compare`]: crate::provision::debian::version::compare
-/// [`alpine::version::compare`]: crate::provision::alpine::version::compare
 pub(super) fn compare(a: &str, b: &str) -> Option<Ordering> {
     Some(parse(a)?.cmp(&parse(b)?))
 }

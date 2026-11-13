@@ -12,199 +12,38 @@
 //! p:7zip-virtual p7zip=25.01-r0 cmd:7z=25.01-r0
 //! ```
 //!
-//! There is no continuation syntax, no folded field, and no comment, so a line
-//! that is not `X:value` is a malformed index rather than something to skip. A
-//! *letter* this reader does not know is another matter: apk may define one, and
-//! an index carrying it is still the index this reader can use, so unknown
-//! letters are ignored and unknown syntax is refused.
+//! ferrata reads it ([`ferrata::index::read`]) as apk does, lenient where apk is
+//! lenient: a repeated letter replaces or adds to the one before, a letter apk
+//! does not know is a flaw of the record rather than of the index, and an entry
+//! apk cannot read leaves the record one it cannot install rather than
+//! unreadable. What apk cannot read at all, a line that is not a field or a
+//! record without a version or an identity it can decode, refuses the index
+//! here, where apk would keep the records before it: a root assembled from part
+//! of an index would be missing whatever the rest named, without saying so.
+//!
+//! An index is bytes to apk, and to ferrata: no field is held to UTF-8, and a
+//! description or a name a dependency states may hold bytes that are not. On
+//! top of apk's reading, this layer holds each record to what it does with one.
+//! The name and the version become a path segment of the URL the package is
+//! fetched from, the identity is recomputed over what a mirror serves, the
+//! architecture becomes the installed record's `A:`, and the origin is recorded
+//! in a plan, so a record whose name is not one a package can be addressed by,
+//! whose version is outside the grammar, whose identity is not a SHA-1 spelled
+//! as apk writes one, which states no architecture, or whose origin is not text
+//! refuses the index.
 
-use crate::provision::number;
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use super::AlpineError;
-use super::pin::{Fit, Pins};
-use super::sign::IDENTITY_PREFIX;
-use super::version::{self, Constraint};
+use ferrata::record::Record;
+
+use super::{AlpineError, DIALECT};
 use crate::provision::Available;
 
 /// The architecture value a package carries when it belongs to every
 /// architecture the repository serves: in an index's `A:`, a `.PKGINFO`'s
 /// `arch`, and a plan's `Architecture`.
 pub(super) const NOARCH: &str = "noarch";
-
-/// One package's record, as much of it as the reader has a use for.
-#[derive(Debug, Clone)]
-pub(super) struct Record {
-    /// `P:`, the package name, checked to be one a URL can carry.
-    pub(super) name: String,
-    /// `V:`, the version, which has been checked to parse.
-    pub(super) version: String,
-    /// `A:`, the architecture, or [`NOARCH`].
-    pub(super) architecture: String,
-    /// `C:`, the identity of the package's control segment: `Q1` and the base64
-    /// of its SHA-1. This is the link that binds a package to the index that
-    /// named it.
-    pub(super) control_identity: String,
-    /// `S:`, the size of the `.apk` on the wire, when the record states a
-    /// usable one. It bounds what a download may spend before its digest is
-    /// checked.
-    pub(super) size: Option<u64>,
-    /// `I:`, the archive's estimate of the space the package occupies once
-    /// installed, in bytes.
-    pub(super) installed_size: Option<u64>,
-    /// `o:`, the source package this one was built from, when it differs from
-    /// the name.
-    pub(super) origin: Option<String>,
-    /// `D:`, what this package needs, including what it refuses.
-    pub(super) depends: Vec<Dependency>,
-    /// `p:`, the names this package provides, each with the version it provides
-    /// them at when it states one.
-    pub(super) provides: Vec<Provided>,
-    /// `i:`, the conditions under which this package installs itself.
-    pub(super) install_if: Vec<Dependency>,
-    /// `k:`, the priority that ranks this package against another providing the
-    /// same name, and the flag that makes an unversioned `p:` entry selectable
-    /// at all.
-    ///
-    /// Only ever *greater than zero*. `apk` declines to choose between a
-    /// provider that states `k:0` and one that states no `k:` at all, exactly as
-    /// it declines between two that state none, so the two are one case and are
-    /// held as one value here rather than being told apart and then treated
-    /// alike everywhere downstream.
-    pub(super) provider_priority: Option<u32>,
-    /// Which of the caller's indexes this record was retained from, so a
-    /// package is fetched from the repository that published it.
-    pub(super) from: usize,
-}
-
-/// One entry of a `D:` or `i:` field: a name, what it accepts, and whether it
-/// is a refusal rather than a requirement.
-#[derive(Debug, Clone)]
-pub(super) struct Dependency {
-    /// The name required, which may be a real package or a provided one.
-    pub(super) name: String,
-    /// What the entry accepts, or `None` where it accepts any version.
-    pub(super) constraint: Option<Constraint>,
-    /// Whether a leading `!` made this a refusal.
-    ///
-    /// A refusal is the negation of the requirement rather than a bare "this
-    /// package must be absent": `!alsa-lib<1.2.14-r2` together with
-    /// `!alsa-lib>1.2.14-r2` is how a package says it needs exactly that
-    /// version, and both are satisfied when `alsa-lib` is present at it.
-    pub(super) conflict: bool,
-}
-
-impl Dependency {
-    /// Whether a candidate offering `version` is one this entry accepts,
-    /// leaving [`conflict`](Self::conflict) to the caller.
-    ///
-    /// `None` is a candidate that offers no version at all, which is a `p:`
-    /// entry with no `=`. Such a candidate satisfies an unconstrained entry and
-    /// no constrained one: there is no version to compare, so a mirror could
-    /// otherwise satisfy `python3>=3.12` with a package that merely says
-    /// `provides = python3`.
-    pub(super) fn accepts(&self, version: Option<&str>) -> bool {
-        match (&self.constraint, version) {
-            (None, _) => true,
-            (Some(constraint), Some(version)) => constraint.satisfied_by(version),
-            (Some(_), None) => false,
-        }
-    }
-
-    /// Parses one whitespace-separated entry of a `D:` or `i:` field.
-    ///
-    /// Also of `.PKGINFO`'s `replaces`, which is the same grammar: an entry
-    /// there may carry a version, and reading it as a bare name would widen
-    /// which packages a file may be taken from.
-    pub(super) fn parse(entry: &str) -> Result<Dependency, String> {
-        let (text, conflict) = match entry.strip_prefix('!') {
-            Some(rest) => (rest, true),
-            None => (entry, false),
-        };
-        let (name, constraint) = version::split(text)?;
-        if name.is_empty() {
-            // The entry as it was written rather than what is left after the
-            // `!`, so a bare `!` is quoted as itself and not as an empty string.
-            return Err(format!("{entry:?} names no package"));
-        }
-        Ok(Dependency {
-            name: name.to_string(),
-            constraint,
-            conflict,
-        })
-    }
-}
-
-impl fmt::Display for Dependency {
-    /// Writes the entry as an index spells it, for the refusals that quote one.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.conflict {
-            f.write_str("!")?;
-        }
-        f.write_str(&self.name)?;
-        match &self.constraint {
-            Some(constraint) => write!(f, "{constraint}"),
-            None => Ok(()),
-        }
-    }
-}
-
-/// One entry of a `p:` field: a name this package provides, and the version it
-/// provides it at.
-#[derive(Debug, Clone)]
-pub(super) struct Provided {
-    /// The name provided. It need not look like a package name — `so:` and
-    /// `cmd:` namespaces, bare paths such as `/bin/sh`, and `cmd:[` are all
-    /// published — so it is never used as anything but a key.
-    pub(super) name: String,
-    /// The version stated after an `=`, when the entry states one.
-    pub(super) version: Option<String>,
-}
-
-impl Provided {
-    /// Parses one whitespace-separated entry of a `p:` field.
-    fn parse(text: &str) -> Result<Provided, String> {
-        let (name, constraint) = version::split(text)?;
-        if name.is_empty() {
-            return Err(format!("{text:?} names nothing"));
-        }
-        let version = match constraint {
-            None => None,
-            // An entry states a version by equality and no other way. Anything
-            // else is a comparison, and a provided name that is only *greater
-            // than* something has no version for a constraint to be checked
-            // against.
-            Some(constraint) => Some(
-                constraint
-                    .exact_version()
-                    .ok_or_else(|| {
-                        format!("{text:?} provides a name at a comparison rather than a version")
-                    })?
-                    .to_string(),
-            ),
-        };
-        Ok(Provided {
-            name: name.to_string(),
-            version,
-        })
-    }
-}
-
-/// Parses one whitespace-separated list field, entry by entry.
-///
-/// One entry the format does not define refuses the whole index rather than
-/// being skipped: a dependency that cannot be read is one the closure would
-/// silently omit, and a `p:` entry that cannot be read is a name something else
-/// may be relying on.
-fn list<T>(value: Option<&str>, parse: fn(&str) -> Result<T, String>) -> Result<Vec<T>, String> {
-    value
-        .unwrap_or_default()
-        .split_ascii_whitespace()
-        .map(parse)
-        .collect()
-}
 
 /// Whether `name` is a package name that can be addressed.
 ///
@@ -228,33 +67,22 @@ pub(super) fn is_package_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
 }
 
-/// Whether `value` has the shape of a `C:` field: [`IDENTITY_PREFIX`] and the
-/// base64 of a SHA-1.
+/// Whether `value` is a well-formed `C:` field: `Q1` and the base64 of a
+/// SHA-1, spelled as apk writes it.
 ///
-/// The value is recomputed and compared when a package is fetched, and written
-/// into a plan document meanwhile, so a record carrying anything else is
-/// malformed rather than merely unfamiliar. A plan document is held to this
-/// too, in [`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable).
+/// The identity is recomputed and compared when the package is fetched, so a
+/// value that is not one is malformed rather than merely unfamiliar. A plan
+/// document is held to this too, in
+/// [`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable).
 ///
 /// The value is read as [`sign::identity_digest`] reads it, which admits only
 /// the spelling [`sign::identity`] writes: twenty bytes of base64 is
 /// twenty-seven alphabet characters and exactly one `=`, and the two bits the
-/// last character carries past the digest are zero. A value spelled any other
-/// way is one the recomputed identity can never equal, and admitting it would
-/// put the refusal in the wrong place — a fetch-time digest mismatch, worded as
-/// a mirror serving something else, for an index that was malformed before
-/// anything was fetched. `apk.static` 3.0.9 reads a spelling whose last bits
-/// are not zero as the digest it decodes to, installs the package, and records
-/// the spelling its encoder writes; no encoder writes the other, so it is
-/// refused here with the rest of what a mirror serving something else looks
-/// like.
-///
-/// The whole index is refused rather than the record dropped, which is stricter
-/// than `apk`: `apk.static` silently skips a record whose `C:` will not decode
-/// and uses the rest of the index. A mirror that serves a malformed record has
-/// served something this reader cannot account for, and a root assembled from
-/// the remainder would be missing whatever that record named, without saying
-/// so.
+/// last character carries past the digest are zero. `apk.static` 3.0.9 reads
+/// a `Q2` digest, text after the digest, and a last character whose bits past
+/// it are not zero, and records the spelling its encoder writes; no encoder
+/// writes the others, so this layer refuses them with the rest of what a
+/// mirror serving something else looks like.
 ///
 /// [`sign::identity_digest`]: super::sign::identity_digest
 /// [`sign::identity`]: super::sign::identity
@@ -262,140 +90,109 @@ pub(super) fn is_control_identity(value: &str) -> bool {
     super::sign::identity_digest(value).is_some()
 }
 
-/// Parses an `APKINDEX` into its records.
+/// A record's control identity, as a plan records it and a fetch compares it.
+///
+/// apk's own spelling of the digest the record's `C:` names, which is the one
+/// [`sign::control_identity`](super::sign::control_identity) computes over
+/// what a mirror serves. For a record [`unusable`] admits it is the `C:` field
+/// as the index wrote it.
+pub(super) fn control_identity(record: &Record) -> String {
+    record.identity().to_string()
+}
+
+/// Reads an `APKINDEX` into its records, in the order it lists them.
 ///
 /// `subject` names the index, for the errors — the URL it came from.
 ///
 /// # Errors
 ///
-/// Returns [`AlpineError::Index`] for a line that is not `X:value`, a record
-/// carrying a letter twice, a record without a name, version and architecture,
-/// or a version the format does not define. None of these occurs in a published
-/// index; all of them are what a mirror serving something else looks like, and a
-/// version that cannot be ordered is one that cannot be merged safely.
-pub(super) fn parse(subject: &str, text: &str, from: usize) -> Result<Vec<Record>, AlpineError> {
-    parse_records(text, from).map_err(|reason| AlpineError::index(subject, reason))
-}
-
-/// The body of [`parse`], reporting a reason rather than an error.
-///
-/// The split is what lets a base layer's `installed` database be read through
-/// this same grammar: an installed record opens with exactly the fields an index
-/// record carries, but a database is not an index, and a refusal that called it
-/// one would name the wrong thing.
-///
-/// A letter repeated within one record is refused through a set of the letters
-/// that record has carried. Unknown letters are admitted, and a letter is any
-/// character, so one record can carry as many letters as it has lines. A base
-/// layer's `installed` header reaches here from a tree its own scripts wrote,
-/// and a walk of the record's fields for every line would make such a header
-/// cost the square of its length.
-pub(super) fn parse_records(text: &str, from: usize) -> Result<Vec<Record>, String> {
+/// Returns [`AlpineError::Index`] for text apk cannot read on from, naming the
+/// line, and for a record this layer cannot fetch or record: a name a package
+/// cannot be addressed by, a version outside the grammar, an identity that is
+/// not a SHA-1 spelled as apk writes one, no architecture, or an origin that is
+/// not text.
+pub(super) fn parse(subject: &str, index: &[u8]) -> Result<Vec<Record>, AlpineError> {
     let mut records = Vec::new();
-    let mut fields: Vec<(char, &str)> = Vec::new();
-    let mut letters: HashSet<char> = HashSet::new();
-    for (number, line) in text.lines().enumerate() {
-        if line.is_empty() {
-            if let Some(record) = record(&fields, number, from)? {
-                records.push(record);
-            }
-            fields.clear();
-            letters.clear();
-            continue;
-        }
-        let mut characters = line.chars();
-        let (Some(key), Some(':')) = (characters.next(), characters.next()) else {
-            return Err(format!("line {} is not a field: {line:?}", number + 1));
-        };
-        if !letters.insert(key) {
-            return Err(format!(
-                "the record ending at line {} carries the field {key:?} twice",
-                number + 1
+    for located in ferrata::index::read(DIALECT, index) {
+        let located = located.map_err(|err| AlpineError::index(subject, err.to_string()))?;
+        let line = located.line();
+        let record = located.into_record();
+        if let Some(reason) = unusable(&record).or_else(|| unplannable(&record)) {
+            return Err(AlpineError::index(
+                subject,
+                format!("the record from line {line}: {reason}"),
             ));
         }
-        fields.push((key, &line[key.len_utf8() + 1..]));
-    }
-    // A final record needs no blank line after it, and an index that ends with
-    // one has nothing left in hand.
-    if let Some(record) = record(&fields, text.lines().count(), from)? {
         records.push(record);
     }
     Ok(records)
 }
 
-/// Assembles one record from the fields read for it, or `None` where there were
-/// none — the blank line between two records, or a trailing one.
+/// Why this layer cannot fetch or record the package `record` describes, or
+/// `None` where it can.
 ///
-/// `line` is where the record ended, for the errors.
-fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Record>, String> {
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    let value = |key: char| {
-        fields
-            .iter()
-            .find(|(seen, _)| *seen == key)
-            .map(|(_, value)| *value)
+/// A base layer's installed records are held to it too: they are carried into
+/// the database an increment writes and named in what it reports, and the
+/// alphabets checked here are what let a name and a version be named bare and
+/// written as the text they are. Both alphabets are ASCII, so a record this
+/// admits has a name [`to_str`](ferrata::Name::to_str) reads, and a name and a
+/// version whose `Display` is their bytes.
+pub(super) fn unusable(record: &Record) -> Option<String> {
+    // A name that is not UTF-8 is none a URL or a plan can carry, whatever
+    // apk makes of it.
+    let Some(name) = record.name().to_str().filter(|name| is_package_name(name)) else {
+        return Some(format!(
+            "it names the package {:?}, which is not a name a package can be addressed by",
+            record.name(),
+        ));
     };
-    let required = |key: char, what: &str| {
-        value(key)
-            .ok_or_else(|| format!("the record ending at line {line} names no {what} ({key}:)"))
-    };
-
-    let name = required('P', "package")?;
-    let version = required('V', "version")?;
-    let architecture = required('A', "architecture")?;
-    let control_identity = required('C', "control identity")?;
-    if !is_package_name(name) {
-        return Err(format!(
-            "the record ending at line {line} names the package {name:?}, which is not a name \
-             a package can be addressed by",
+    // Named bare from here on: the name has passed the alphabet above, which
+    // holds no control character. The version has passed none, and is quoted
+    // as ferrata writes it, each byte that is not UTF-8 escaped.
+    let version = record.version();
+    if !version.is_valid() {
+        return Some(format!(
+            "{name} carries {:?}, which is not a version this format defines",
+            version.to_string(),
         ));
     }
-    // Named bare from here on: the name has passed the alphabet above, which
-    // holds no control character.
-    let malformed = |reason: String| format!("{name}: {reason}");
-    if version::parse(version).is_none() {
-        return Err(malformed(format!(
-            "it carries {version:?}, which is not a version this format defines",
-        )));
+    let spelled = record.field(b'C').unwrap_or_default();
+    if !std::str::from_utf8(spelled).is_ok_and(is_control_identity) {
+        return Some(format!(
+            "{name}'s control identity {:?} is not a SHA-1 spelled as apk writes one, which is \
+             the digest a package is verified against",
+            String::from_utf8_lossy(spelled),
+        ));
     }
-    if !is_control_identity(control_identity) {
-        return Err(malformed(format!(
-            "its control identity {control_identity:?} is not a {IDENTITY_PREFIX} digest",
-        )));
+    if record.architecture().is_none() {
+        return Some(format!("{name} names no architecture (A:)"));
     }
+    None
+}
 
-    Ok(Some(Record {
-        name: name.to_string(),
-        version: version.to_string(),
-        architecture: architecture.to_string(),
-        control_identity: control_identity.to_string(),
-        // A record that states no size, or one that does not parse, leaves the
-        // download bounded by the fetcher's own ceiling rather than being
-        // dropped: the digest is what decides whether the bytes are the package,
-        // and a missing bound is a weaker fetch rather than a wrong one.
-        size: value('S').and_then(number::digits),
-        installed_size: value('I').and_then(number::digits),
-        // Stated by every published record, and equal to the name for most of
-        // them; kept only where it says something the name does not.
-        origin: value('o')
-            .filter(|origin| *origin != name)
-            .map(str::to_string),
-        depends: list(value('D'), Dependency::parse).map_err(malformed)?,
-        provides: list(value('p'), Provided::parse).map_err(malformed)?,
-        install_if: list(value('i'), Dependency::parse).map_err(malformed)?,
-        // A `k:` that is not a number greater than zero is no priority, which is
-        // `apk`'s own reading rather than a lenient one: `apk.static` 3.0.7
-        // refuses to choose between a provider stating `k:0`, `k:-1` or
-        // `k:abc` and one stating no `k:` at all, and picks a `k:1` provider
-        // over it. It keeps the record either way, so refusing one here would
-        // refuse an index apk itself reads.
-        provider_priority: value('k')
-            .and_then(|value| value.parse().ok())
-            .filter(|priority| *priority > 0),
-        from,
-    }))
+/// Why a plan cannot record what an index states of the package `record`
+/// describes, or `None` where it can.
+///
+/// The origin is the one field a plan carries that no alphabet holds, and a
+/// plan is text. Asked of an index's records only: a base's are carried as the
+/// bytes they are, and no plan records them.
+fn unplannable(record: &Record) -> Option<String> {
+    let origin = record.origin()?;
+    std::str::from_utf8(origin).is_err().then(|| {
+        format!(
+            "{} states the origin {:?}, which is not text a plan can record",
+            record.name(),
+            String::from_utf8_lossy(origin),
+        )
+    })
+}
+
+/// Whether `record` is a package built for `architecture`: that one, or
+/// [`NOARCH`].
+fn is_for(record: &Record, architecture: &str) -> bool {
+    record.architecture().is_some_and(|built_for| {
+        built_for == architecture.as_bytes() || built_for == NOARCH.as_bytes()
+    })
 }
 
 /// Why `records`, an index fetched for `architecture`, are not an index of that
@@ -417,169 +214,78 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
 /// with nothing to offer an architecture publishes.
 pub(super) fn foreign_to(records: &[Record], architecture: &str) -> Option<String> {
     let first = records.first()?;
-    if records
-        .iter()
-        .any(|record| record.architecture == architecture || record.architecture == NOARCH)
-    {
+    if records.iter().any(|record| is_for(record, architecture)) {
         return None;
     }
+    // Every record `parse` admits states an architecture.
     Some(format!(
         "none of its {} records is for {architecture:?}, the first being for {:?}, so it is \
          an index of another architecture",
         records.len(),
-        first.architecture,
+        String::from_utf8_lossy(first.architecture().unwrap_or_default()),
     ))
 }
 
-/// The package set of one or more repositories, merged: one record per name,
-/// plus each provided name's providers.
+/// Every configured index's records of one architecture, each index's in the
+/// order it lists them.
+///
+/// Every version an index offers is kept, since apk chooses among all of them:
+/// a dependency on `foo<2` installs `foo` 1.5 where 1.5 and 2.1 are both
+/// offered. The indexes stay apart, in the order the repositories are
+/// configured, because that order decides a tie and because a package is
+/// fetched from the index that offered it: each is one repository to the
+/// resolution, which names the one a package comes from by its position.
 pub(super) struct Index {
-    by_name: HashMap<String, Record>,
-    providers: HashMap<String, Vec<String>>,
-    /// The pin the index was merged under, which chose each pinned name's
-    /// record.
-    pins: Pins,
+    indexes: Vec<Vec<Record>>,
 }
 
 impl fmt::Debug for Index {
-    /// Reports how much was merged rather than what. A merged Alpine
-    /// `main`+`community` is around 25,000 records, which no reader of a
+    /// Reports how much was read rather than what. A merged Alpine
+    /// `main`+`community` is around 28,000 records, which no reader of a
     /// rendering can act on.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Index")
-            .field("packages", &self.by_name.len())
-            .field("virtual_names", &self.providers.len())
+            .field("indexes", &self.indexes.len())
+            .field("packages", &self.records().count())
             .finish()
     }
 }
 
 impl Index {
-    /// Merges each repository's records into one set, keeping the highest
-    /// version of each name and dropping what the architecture does not serve.
+    /// Keeps each index's records of `architecture`.
     ///
-    /// `inputs` are the repositories' record lists in the order the caller
-    /// configured them, and that order decides an exact tie: a later repository
-    /// shadows an earlier one at *equal* version. This is what makes a
-    /// repository an overlay — a postmarketOS root is Alpine's repositories plus
-    /// postmarketOS's, and a package it republishes at the same version is the
-    /// one that must win. A higher version wins wherever it comes from, so the
-    /// ordering never installs an older package than the archives offer.
-    ///
-    /// A record whose architecture is neither `architecture` nor [`NOARCH`] is
-    /// dropped, which is what `apk`'s selection makes of it: `apk.static` 3.0.9
-    /// lists such a record and refuses to install it, as `uninstallable`, so a
-    /// name only such records answer is refused either way, and one another
-    /// record answers is answered by that record whatever the version. An
-    /// index made of nothing else was refused as it was read, by
-    /// [`foreign_to`].
-    ///
-    /// `pins` overrides the choice for the names it holds: a pinned name selects
-    /// the pinned version wherever it is offered, and the pinned control segment
-    /// over another copy of that version, by [`Pins::fit`]. It keeps the highest
-    /// version where the pinned one is not offered, so [`Pins::check`] can report
-    /// what the repositories carry instead of only that the pin failed.
+    /// `inputs` are the indexes' record lists in the order the repositories
+    /// were configured, component by component. A record whose architecture is
+    /// neither `architecture` nor [`NOARCH`] is dropped, which is what `apk`'s
+    /// selection makes of it: `apk.static` 3.0.9 lists such a record and
+    /// refuses to install it, as `uninstallable`, so a name only such records
+    /// answer is refused either way, and one another record answers is answered
+    /// by that record whatever the version. An index made of nothing else was
+    /// refused as it was read, by [`foreign_to`].
     pub(super) fn merge(
         inputs: impl IntoIterator<Item = Vec<Record>>,
         architecture: &str,
-        pins: &Pins,
     ) -> Index {
-        let mut by_name: HashMap<String, Record> = HashMap::new();
-        for records in inputs {
-            for record in records {
-                if record.architecture != architecture && record.architecture != NOARCH {
-                    continue;
-                }
-                // A version that does not order never displaces one that does.
-                // Every record here parsed, so this is unreachable rather than a
-                // policy; stating it as one keeps the unreachable case from
-                // silently becoming "shadow it".
-                let not_lower = |candidate: &Record, existing: &Record| {
-                    version::compare(&candidate.version, &existing.version)
-                        .is_some_and(|order| order != Ordering::Less)
-                };
-                let keep = match by_name.get(&record.name) {
-                    None => true,
-                    // The candidate that fits the pin better wins. One that fits
-                    // it as well as an earlier one also wins, which is the
-                    // overlay rule again, and where this differs from the Debian
-                    // layer's pin: there a satisfied pin is never displaced,
-                    // because there a later repository does not shadow at equal
-                    // version. Where neither holds the pinned version, the
-                    // highest is kept as for any other name.
-                    Some(existing) if pins.names(&record.name) => {
-                        let fit = |candidate: &Record| {
-                            pins.fit(
-                                &candidate.name,
-                                &candidate.version,
-                                &candidate.control_identity,
-                            )
-                        };
-                        match fit(&record).cmp(&fit(existing)) {
-                            Ordering::Greater => true,
-                            Ordering::Less => false,
-                            Ordering::Equal => {
-                                fit(&record) != Fit::Neither || not_lower(&record, existing)
-                            }
-                        }
-                    }
-                    Some(existing) => not_lower(&record, existing),
-                };
-                if keep {
-                    by_name.insert(record.name.clone(), record);
-                }
-            }
-        }
-
-        let mut providers: HashMap<String, Vec<String>> = HashMap::new();
-        for record in by_name.values() {
-            for provided in &record.provides {
-                providers
-                    .entry(provided.name.clone())
-                    .or_default()
-                    .push(record.name.clone());
-            }
-        }
-        // The lists are built by iterating a HashMap, so their order is not
-        // reproducible; a resolution that picks among providers must be, so
-        // each is sorted into a stable one.
-        for names in providers.values_mut() {
-            names.sort();
-        }
-
-        Index {
-            by_name,
-            providers,
-            pins: pins.clone(),
-        }
+        let indexes = inputs
+            .into_iter()
+            .map(|records| {
+                records
+                    .into_iter()
+                    .filter(|record| is_for(record, architecture))
+                    .collect()
+            })
+            .collect();
+        Index { indexes }
     }
 
-    /// The pin the index was merged under, for the resolver to hold a
-    /// dependency nothing answers to.
-    pub(super) fn pins(&self) -> &Pins {
-        &self.pins
+    /// Each index's records, in the order the indexes were read.
+    pub(super) fn indexes(&self) -> &[Vec<Record>] {
+        &self.indexes
     }
 
-    /// The record for `name`, if it is a real package in this index.
-    pub(super) fn get(&self, name: &str) -> Option<&Record> {
-        self.by_name.get(name)
-    }
-
-    /// The names of the packages whose `p:` field names `name`, in a stable
-    /// order.
-    ///
-    /// A package is not a provider of itself here: it provides its own name by
-    /// being it, which the resolver accounts for separately, and only a `p:`
-    /// entry puts a name in this map.
-    pub(super) fn providers(&self, name: &str) -> &[String] {
-        self.providers.get(name).map_or(&[][..], Vec::as_slice)
-    }
-
-    /// Every record in the merged set, in no particular order.
-    ///
-    /// For the one question that is asked of the whole set rather than of a
-    /// name: which packages' `i:` conditions the selection has come to satisfy.
+    /// Every record of every index, in order.
     pub(super) fn records(&self) -> impl Iterator<Item = &Record> {
-        self.by_name.values()
+        self.indexes.iter().flatten()
     }
 
     /// Projects the index into the names it offers, consuming it.
@@ -588,7 +294,31 @@ impl Index {
     /// set and the provider map, and retaining a merged archive's worth of
     /// records to back a membership question would be the wrong trade.
     pub(super) fn into_available(self) -> Available {
-        Available::new(self.by_name.into_keys().collect(), self.providers)
+        let mut real = HashSet::new();
+        let mut providers: HashMap<String, Vec<String>> = HashMap::new();
+        for record in self.records() {
+            // A record's own name is one `unusable` admitted, so it is text.
+            real.insert(record.name().to_string());
+            for provided in record.provides() {
+                // A caller asks after a name as text, so a provided name that
+                // is not is one no caller can name.
+                let Some(provided) = provided.name().to_str() else {
+                    continue;
+                };
+                providers
+                    .entry(provided.to_string())
+                    .or_default()
+                    .push(record.name().to_string());
+            }
+        }
+        // A name offered at several versions, or by several indexes, is one
+        // provider; and a resolution's report has to be reproducible, so each
+        // list is put in one order.
+        for names in providers.values_mut() {
+            names.sort();
+            names.dedup();
+        }
+        Available::new(real, providers)
     }
 }
 
@@ -596,7 +326,6 @@ impl Index {
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::{Index, parse};
-    use crate::provision::alpine::pin::Pins;
     use crate::provision::alpine::sign::identity_for_test;
 
     /// A record offering `name` at `version` for `architecture`, its control
@@ -621,12 +350,11 @@ pub(crate) mod fixture {
         text
     }
 
-    /// An x86_64 index of `records`, read as one repository's and merged
-    /// under `pins`.
-    pub(crate) fn merged(records: &[String], pins: &Pins) -> Index {
-        let parsed = parse("the index", &records.join("\n"), 0)
+    /// An x86_64 index of `records`, read as one repository's.
+    pub(crate) fn merged(records: &[String]) -> Index {
+        let parsed = parse("the index", records.join("\n").as_bytes())
             .unwrap_or_else(|err| panic!("the index parses: {err}"));
-        Index::merge([parsed], "x86_64", pins)
+        Index::merge([parsed], "x86_64")
     }
 }
 
@@ -634,27 +362,6 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
     use crate::provision::alpine::sign::identity_for_test as identity;
-
-    #[test]
-    fn a_record_an_index_malforms_is_refused_with_its_control_characters_escaped() {
-        // The name is refused before anything has admitted it, and a field's
-        // letter is any character a line begins with.
-        let hostile = crate::failure::hostile::TEXT;
-        for text in [
-            record(hostile, "1.0-r0", "x86_64", ""),
-            format!(
-                "{}\u{1b}:a\n\u{1b}:b\n",
-                record("app", "1.0-r0", "x86_64", "")
-            ),
-            format!(
-                "{}\u{1b}]52;c;cm0gLXJmIH4K\u{7}\n",
-                record("app", "1.0-r0", "x86_64", "")
-            ),
-        ] {
-            let refused = parse_records(&text, 0).expect_err("the record is refused");
-            crate::failure::hostile::assert_escaped(&refused);
-        }
-    }
 
     /// A record, spelled the way an index spells one, providing `provides`
     /// where it is not empty.
@@ -668,21 +375,54 @@ mod tests {
 
     /// The records of `text`, or a panic naming the refusal.
     fn parsed(text: &str) -> Vec<Record> {
-        parse("the index", text, 0).unwrap_or_else(|err| panic!("the index parses: {err}"))
+        parse("the index", text.as_bytes()).unwrap_or_else(|err| panic!("the index parses: {err}"))
     }
 
-    /// The names a record provides, for the assertions that only care about
-    /// those.
-    fn provided(record: &Record) -> Vec<&str> {
-        record
-            .provides
-            .iter()
-            .map(|provided| provided.name.as_str())
-            .collect()
+    /// The refusal of `index`, or a panic naming what it read.
+    fn refused(index: &[u8]) -> AlpineError {
+        match parse("the index", index) {
+            Ok(records) => panic!("expected a refusal, read {} records", records.len()),
+            Err(err) => err,
+        }
     }
 
     #[test]
-    fn a_record_is_read_from_the_letters_that_carry_it() {
+    fn a_record_an_index_malforms_is_refused_with_its_control_characters_escaped() {
+        // The name is refused before anything has admitted it. A line that is
+        // not a field is refused by its number, and its text is not repeated.
+        let hostile = crate::failure::hostile::TEXT;
+        let refused = refused(record(hostile, "1.0-r0", "x86_64", "").as_bytes());
+        crate::failure::hostile::assert_escaped(&refused.to_string());
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_read_where_this_layer_records_nothing() {
+        // A description and a name a dependency states are bytes to apk, and an
+        // index holding such bytes is one it reads.
+        let mut index = record("a", "1.0-r0", "x86_64", "").into_bytes();
+        index.extend_from_slice(b"T:caf\xe9\nD:lib\xff\n");
+        let records = parse("the index", &index).expect("the index reads");
+        assert_eq!(records[0].field(b'T'), Some(b"caf\xe9".as_slice()));
+        assert_eq!(records[0].depends()[0].name(), b"lib\xff");
+    }
+
+    #[test]
+    fn a_name_or_an_origin_that_is_not_utf8_is_refused() {
+        // A name becomes a URL's path segment and an origin is recorded in a
+        // plan, and both are text there. The refusal writes the bytes escaped.
+        let name = format!("C:{}\nP:a", identity("a")).into_bytes();
+        let unnamed = [&name[..], b"\xff\nV:1.0-r0\nA:x86_64\n"].concat();
+        let reason = refused(&unnamed).to_string();
+        assert!(reason.contains(r#""a\xff""#), "{reason}");
+
+        let mut unrecorded = record("a", "1.0-r0", "x86_64", "").into_bytes();
+        unrecorded.extend_from_slice(b"o:caf\xe9\n");
+        let reason = refused(&unrecorded).to_string();
+        assert!(reason.contains("origin"), "{reason}");
+    }
+
+    #[test]
+    fn a_record_is_read_as_apk_reads_it() {
         let records = parsed(&format!(
             "C:{}\nP:7zip\nV:25.01-r0\nA:x86_64\nS:915485\nI:1784184\no:p7zip\nk:100\n\
              D:so:libc.musl-x86_64.so.1 !p7zip-old\np:p7zip=25.01-r0 cmd:7z\ni:docs 7zip=25.01-r0\n",
@@ -691,49 +431,20 @@ mod tests {
         let [record] = &records[..] else {
             panic!("one record: {records:?}");
         };
-        assert_eq!(record.name, "7zip");
-        assert_eq!(record.version, "25.01-r0");
-        assert_eq!(record.architecture, "x86_64");
-        assert_eq!(record.control_identity, identity("7zip"));
-        assert_eq!(record.size, Some(915_485));
-        assert_eq!(record.installed_size, Some(1_784_184));
-        assert_eq!(record.origin.as_deref(), Some("p7zip"));
-        assert_eq!(record.provider_priority, Some(100));
-        assert_eq!(record.from, 0);
-
-        assert_eq!(
-            record
-                .depends
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["so:libc.musl-x86_64.so.1", "!p7zip-old"],
+        assert_eq!(record.name(), "7zip");
+        assert_eq!(record.version().to_str(), Some("25.01-r0"));
+        assert_eq!(record.architecture(), Some(b"x86_64".as_slice()));
+        assert_eq!(control_identity(record), identity("7zip"));
+        assert_eq!(record.field(b'S'), Some(b"915485".as_slice()));
+        assert_eq!(record.origin(), Some(b"p7zip".as_slice()));
+        assert_eq!(record.priority(), 100);
+        assert_eq!(record.depends().len(), 2);
+        assert!(
+            record.depends()[1].is_conflict(),
+            "a leading ! is a refusal"
         );
-        assert!(!record.depends[0].conflict);
-        assert!(record.depends[1].conflict, "a leading ! is a refusal");
-        assert_eq!(provided(record), ["p7zip", "cmd:7z"]);
-        assert_eq!(record.provides[0].version.as_deref(), Some("25.01-r0"));
-        assert_eq!(
-            record.provides[1].version, None,
-            "an entry may provide a name at no version",
-        );
-        assert_eq!(
-            record
-                .install_if
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["docs", "7zip=25.01-r0"],
-        );
-    }
-
-    #[test]
-    fn a_source_package_equal_to_the_name_says_nothing_and_is_dropped() {
-        let text = format!(
-            "C:{}\nP:musl\nV:1.0-r0\nA:x86_64\no:musl\n",
-            identity("musl")
-        );
-        assert_eq!(parsed(&text)[0].origin, None);
+        assert_eq!(record.provides().len(), 2);
+        assert_eq!(record.install_if().len(), 2);
     }
 
     #[test]
@@ -753,7 +464,7 @@ mod tests {
             "new\tline",
         ] {
             let text = format!("C:{}\nP:{name}\nV:1.0-r0\nA:x86_64\n", identity("x"));
-            let err = parse("the index", &text, 0).expect_err("the name is not addressable");
+            let err = refused(text.as_bytes());
             assert!(matches!(err, AlpineError::Index { .. }), "{name:?}: {err}");
         }
         // And the shapes real names take are accepted.
@@ -766,68 +477,72 @@ mod tests {
             "R",
         ] {
             let text = format!("C:{}\nP:{name}\nV:1.0-r0\nA:x86_64\n", identity(name));
-            parse("the index", &text, 0)
+            parse("the index", text.as_bytes())
                 .unwrap_or_else(|err| panic!("{name} is a real Alpine name: {err}"));
         }
     }
 
     #[test]
-    fn a_control_identity_that_is_not_one_is_refused() {
+    fn an_identity_that_does_not_read_or_is_not_a_sha1_is_refused() {
         // It is recomputed and compared when the package is fetched, so a
-        // record carrying anything else is malformed rather than unfamiliar.
+        // record carrying anything else is one no package can be bound to.
         let length = identity("a").len();
-        let right_length_wrong_alphabet = format!("{}!", &identity("a")[..length - 1]);
+        let wrong_alphabet = format!("{}!", &identity("a")[..length - 1]);
         // Twenty bytes of base64 is twenty-seven alphabet characters and one
         // trailing `=`, so padding anywhere else is a value the encoder can
-        // never produce. Admitting it would move the refusal to fetch time and
-        // word it as a mirror serving the wrong bytes.
-        let padded_throughout = format!("{IDENTITY_PREFIX}{}", "=".repeat(28));
+        // never produce.
+        let padded_throughout = format!("Q1{}", "=".repeat(28));
         let padded_early = format!("{}={}", &identity("a")[..length - 2], "A");
-        // So is a last character whose bits past the digest are not zero: it
-        // decodes, under a lenient reader, to the digest a different spelling
-        // names.
+        // So is a last character whose bits past the digest are not zero, and
+        // text after the digest: apk reads both as the digest, and writes
+        // neither.
         let unpadded_bits = "Q1G2xQQm08BlbpxaVnpaWWAcf0MHp=";
+        let trailing = format!("{}x", identity("a"));
+        let sha256 = format!("Q2{}=", "A".repeat(43));
         for value in [
             "",
             "Q1",
             "Q2abc",
-            &right_length_wrong_alphabet,
+            &wrong_alphabet,
             &padded_throughout,
             &padded_early,
             unpadded_bits,
-            &format!("{}x", identity("a")),
+            &trailing,
+            &sha256,
         ] {
             let text = format!("C:{value}\nP:musl\nV:1.0-r0\nA:x86_64\n");
-            let err = parse("the index", &text, 0).expect_err("the identity is malformed");
+            let err = refused(text.as_bytes());
             assert!(matches!(err, AlpineError::Index { .. }), "{value:?}: {err}");
         }
-        // And what the encoder does produce is accepted, over inputs whose
-        // final base64 group varies.
-        for seed in ["a", "bb", "ccc", "dddd"] {
-            let text = format!("C:{}\nP:musl\nV:1.0-r0\nA:x86_64\n", identity(seed));
-            parse("the index", &text, 0)
-                .unwrap_or_else(|err| panic!("{seed}'s identity is one this crate renders: {err}"));
+        let text = format!("C:{}\nP:musl\nV:1.0-r0\nA:x86_64\n", identity("a"));
+        assert_eq!(control_identity(&parsed(&text)[0]), identity("a"));
+    }
+
+    #[test]
+    fn a_plan_s_identity_is_held_to_the_spelling_apk_writes() {
+        assert!(is_control_identity(&identity("a")));
+        for value in [
+            format!("{}x", identity("a")),
+            "Q1G2xQQm08BlbpxaVnpaWWAcf0MHp=".to_string(),
+            format!("Q2{}=", "A".repeat(43)),
+            "Q1".to_string(),
+            String::new(),
+        ] {
+            assert!(!is_control_identity(&value), "{value:?}");
         }
     }
 
     #[test]
-    fn a_dependency_entry_the_format_does_not_define_refuses_the_index() {
-        // A dependency that cannot be read is one the closure would silently
-        // omit, which is worse than refusing the index it came in.
-        for field in [
-            "D:lib>=nonesuch",
-            "D:lib><2.0",
-            "D:=1.0",
-            "i:!",
-            "p:virt>=1.0",
-            "p:=1.0",
-        ] {
+    fn a_dependency_entry_apk_cannot_read_leaves_a_record_it_cannot_install() {
+        // apk loads the record and will not install it, which is what a
+        // resolution then answers; the index is still the index apk reads.
+        for field in ["D:lib>=nonesuch", "D:=1.0"] {
             let text = format!(
                 "C:{}\nP:musl\nV:1.0-r0\nA:x86_64\n{field}\n",
                 identity("musl")
             );
-            let err = parse("the index", &text, 0).expect_err("the entry is malformed");
-            assert!(matches!(err, AlpineError::Index { .. }), "{field}: {err}");
+            let records = parsed(&text);
+            assert!(!records[0].is_installable(), "{field}");
         }
     }
 
@@ -852,13 +567,6 @@ mod tests {
     }
 
     #[test]
-    fn a_letter_this_reader_does_not_know_is_ignored() {
-        // apk may define one, and an index carrying it is still readable.
-        let text = format!("{}Z:something new\n", record("a", "1.0-r0", "x86_64", ""));
-        assert_eq!(parsed(&text)[0].name, "a");
-    }
-
-    #[test]
     fn a_line_that_is_not_a_field_is_refused() {
         // There is no continuation syntax and no comment, so this is a mirror
         // serving something other than an index rather than something to skip.
@@ -869,69 +577,39 @@ mod tests {
             "PP:two letters",
         ] {
             let text = format!("{}{line}\n", record("a", "1.0-r0", "x86_64", ""));
-            let err = parse("the index", &text, 0).expect_err("{line} is not a field");
-            assert!(matches!(err, AlpineError::Index { .. }), "{line}: {err}");
+            let err = refused(text.as_bytes());
+            assert!(
+                matches!(&err, AlpineError::Index { reason, .. } if reason.contains("line 6")),
+                "{line}: {err}",
+            );
         }
     }
 
     #[test]
     fn a_record_missing_what_identifies_it_is_refused() {
         let full = record("a", "1.0-r0", "x86_64", "");
-        for missing in ['P', 'V', 'A', 'C'] {
+        for missing in ['V', 'A', 'C'] {
             let text: String = full
                 .lines()
                 .filter(|line| !line.starts_with(missing))
                 .map(|line| format!("{line}\n"))
                 .collect();
-            let err = parse("the index", &text, 0).expect_err("the record is incomplete");
+            let err = refused(text.as_bytes());
             assert!(matches!(err, AlpineError::Index { .. }), "{err}");
         }
-    }
-
-    #[test]
-    fn a_repeated_letter_in_one_record_is_refused() {
-        // Two names in one record is a record that says two things, and which
-        // one a reader takes is exactly the ambiguity to refuse.
-        let text = format!("{}P:b\n", record("a", "1.0-r0", "x86_64", ""));
-        let err = parse("the index", &text, 0).expect_err("the record names itself twice");
-        assert!(matches!(err, AlpineError::Index { .. }), "{err}");
-    }
-
-    #[test]
-    fn a_record_of_many_distinct_letters_is_read_in_one_pass() {
-        // Unknown letters are admitted, and any character is a letter, so
-        // nothing bounds how many one record carries but its length. A base's
-        // database is a tree its own scripts wrote. The letters are told apart
-        // through a set, so this reads in a pass over the record rather than in
-        // one per line, and the record still reads as the one package it names.
-        let mut text = record("a", "1.0-r0", "x86_64", "");
-        let letters: Vec<char> = (0x4e00..0x4e00 + 0x3_0000)
-            .filter_map(char::from_u32)
-            .take(150_000)
+        // Fields with no name to end them are not a record, as apk reads them.
+        let nameless: String = full
+            .lines()
+            .filter(|line| !line.starts_with('P'))
+            .map(|line| format!("{line}\n"))
             .collect();
-        assert_eq!(letters.len(), 150_000);
-        for letter in &letters {
-            text.push_str(&format!("{letter}:x\n"));
-        }
-        let records = parsed(&text);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].name, "a");
-
-        // And the set is the record's own: the next record may carry the same
-        // letters again.
-        let twice = format!("{text}\n{text}");
-        assert_eq!(parsed(&twice).len(), 2);
-        // While a letter repeated within one record is still refused, at the
-        // end of the run of letters as at its start.
-        let repeated = format!("{text}{}:y\n", letters[letters.len() - 1]);
-        let err = parse("the index", &repeated, 0).expect_err("the last letter appears twice");
-        assert!(matches!(err, AlpineError::Index { .. }), "{err}");
+        assert!(parsed(&nameless).is_empty());
     }
 
     #[test]
     fn a_version_the_format_does_not_define_is_refused() {
         let text = record("a", "not a version", "x86_64", "");
-        let err = parse("the index", &text, 0).expect_err("the version does not parse");
+        let err = refused(text.as_bytes());
         assert!(
             matches!(&err, AlpineError::Index { reason, .. } if reason.contains("not a version")),
             "{err}",
@@ -939,33 +617,20 @@ mod tests {
     }
 
     #[test]
-    fn the_highest_version_wins_wherever_it_comes_from() {
-        let old = parsed(&record("a", "1.0-r0", "x86_64", ""));
-        let new = parsed(&record("a", "1.0-r1", "x86_64", ""));
-        let index = Index::merge([old, new], "x86_64", &Pins::none());
-        assert_eq!(index.get("a").expect("a is present").version, "1.0-r1");
-
-        let new = parsed(&record("a", "1.0-r1", "x86_64", ""));
-        let old = parsed(&record("a", "1.0-r0", "x86_64", ""));
-        let index = Index::merge([new, old], "x86_64", &Pins::none());
-        assert_eq!(
-            index.get("a").expect("a is present").version,
-            "1.0-r1",
-            "a later repository does not install an older package",
-        );
-    }
-
-    #[test]
-    fn a_later_repository_shadows_an_earlier_one_at_equal_version() {
-        // The mechanism an overlay repository needs: postmarketOS republishing
-        // an Alpine package at the same version is the one that must win.
-        let alpine = parsed(&record("a", "1.0-r0", "x86_64", "from-alpine"));
-        let overlay = parsed(&record("a", "1.0-r0", "x86_64", "from-overlay"));
-        let index = Index::merge([alpine, overlay], "x86_64", &Pins::none());
-        assert_eq!(
-            provided(index.get("a").expect("a is present")),
-            ["from-overlay"],
-        );
+    fn every_version_an_index_offers_is_kept() {
+        let first = parsed(&format!(
+            "{}\n{}",
+            record("a", "1.0-r0", "x86_64", ""),
+            record("a", "2.0-r0", "x86_64", ""),
+        ));
+        let second = parsed(&record("a", "1.0-r1", "x86_64", ""));
+        let index = Index::merge([first, second], "x86_64");
+        let versions: Vec<String> = index
+            .records()
+            .map(|record| record.version().to_string())
+            .collect();
+        assert_eq!(versions, ["1.0-r0", "2.0-r0", "1.0-r1"]);
+        assert_eq!(index.indexes().len(), 2);
     }
 
     #[test]
@@ -982,13 +647,16 @@ mod tests {
             record("foreign", "1.0-r0", "aarch64", ""),
         ));
         assert_eq!(foreign_to(&records, "x86_64"), None, "it holds x86_64's");
-        let index = Index::merge([records], "x86_64", &Pins::none());
+        let index = Index::merge([records], "x86_64");
+        let kept: Vec<String> = index
+            .records()
+            .map(|record| format!("{} {}", record.name(), record.version()))
+            .collect();
         assert_eq!(
-            index.get("native").map(|record| record.version.as_str()),
-            Some("1.0-r0"),
+            kept,
+            ["native 1.0-r0", "every 1.0-r0"],
+            "noarch belongs to every one"
         );
-        assert!(index.get("every").is_some(), "noarch belongs to every one");
-        assert!(index.get("foreign").is_none());
     }
 
     #[test]
@@ -1026,7 +694,7 @@ mod tests {
             record("musl", "1.2.5-r23", "x86_64", "so:libc.musl-x86_64.so.1"),
             record("busybox", "1.37.0-r0", "x86_64", "cmd:sh /bin/sh"),
         ));
-        let available = Index::merge([records], "x86_64", &Pins::none()).into_available();
+        let available = Index::merge([records], "x86_64").into_available();
         assert!(available.contains("musl"), "a real package");
         assert!(
             available.contains("so:libc.musl-x86_64.so.1"),
@@ -1047,14 +715,15 @@ mod tests {
     }
 
     #[test]
-    fn providers_of_one_name_are_reported_in_a_stable_order() {
+    fn providers_of_one_name_are_reported_once_in_a_stable_order() {
         let records = parsed(&format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             record("mawk", "1.0-r0", "x86_64", "cmd:awk"),
             record("gawk", "1.0-r0", "x86_64", "cmd:awk"),
             record("busybox", "1.0-r0", "x86_64", "cmd:awk"),
+            record("gawk", "1.1-r0", "x86_64", "cmd:awk"),
         ));
-        let available = Index::merge([records], "x86_64", &Pins::none()).into_available();
+        let available = Index::merge([records], "x86_64").into_available();
         assert_eq!(
             available.providers("cmd:awk").collect::<Vec<_>>(),
             ["busybox", "gawk", "mawk"],
@@ -1064,10 +733,10 @@ mod tests {
     #[test]
     fn a_rendering_reports_how_much_was_read_rather_than_what() {
         let records = parsed(&record("musl", "1.2.5-r23", "x86_64", "so:libc.musl"));
-        let index = Index::merge([records], "x86_64", &Pins::none());
+        let index = Index::merge([records], "x86_64");
         let rendering = format!("{index:?}");
         assert!(
-            rendering.contains("packages: 1") && rendering.contains("virtual_names: 1"),
+            rendering.contains("indexes: 1") && rendering.contains("packages: 1"),
             "{rendering}",
         );
         assert!(!rendering.contains("musl"), "{rendering}");

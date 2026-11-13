@@ -381,6 +381,12 @@ consumer upgrading can skip it.
 - `ProvisionError` converts from `DebianError` and `AlpineError`, as it does
   from `GentooError`: a cancellation becomes `ProvisionError::Cancelled`, and
   any other failure the layer's own error boxed as `ProvisionError::Other`.
+- `AlpineEvent::Rules`, reported once per resolution: the version of the
+  `apk-tools` the configured repositories offer, the `apk-tools` release whose
+  rules the resolution follows as they were measured (3.0.9), and whether the
+  two are one release. A release before v3.23 offers apk-tools 2.14, and is
+  resolved by 3.0's rules all the same. `fcage` prints a line where they differ
+  (`ferroday-cage-cli`).
 
 ### Changed
 
@@ -471,10 +477,45 @@ consumer upgrading can skip it.
   transport failure, so a mirror walk asks the next mirror. A server compressing
   on the fly previously produced a digest failure, which no other mirror is
   asked about.
-- **Breaking.** An Alpine dependency the pinned version of a package does not
-  meet, where nothing else answers it, fails the resolution with
-  `AlpineError::Pin` and `UnheldReason::Requirement`, naming the requirement, as
-  the Debian layer reports it. It failed with `AlpineError::Resolve`.
+- **Breaking.** An Alpine resolution is the one `apk add` makes, by apk-tools
+  3.0's rules as the `ferrata` crate measures them, which the `alpine` feature
+  now depends on. Every version a repository offers is a candidate, not only
+  the latest; a provider, an `install_if` package and a conflict are settled as
+  apk settles them; and the packages are laid down and their scripts run in the
+  order apk installs them. Of the 28,661 packages of Alpine v3.24's `main` and
+  `community`, each resolved alone, 28,660 resolve to apk.static 3.0.9's
+  packages in apk's order and one to them in another order; of v3.23's 27,577,
+  27,574 do, one in another order and two to other packages. The 22 and 17 the
+  previous resolver answered with other packages are among the exact ones. A
+  tie between two repositories, such as two builds of one version, goes to the
+  repository configured first, as apk gives it: a repository whose packages
+  are meant to win one, as postmarketOS's are, is configured as the primary,
+  with Alpine's added after it. A later repository won the tie before.
+- **Breaking.** A layered Alpine build resolves its increment over the base as
+  `apk add` would over that root, its world included, and refuses with
+  `AlpineError::Resolve` an increment that would upgrade, replace or remove a
+  package the base holds, naming the package, the change and why. A base whose
+  world does not reach every package it holds is refused for the removal.
+- **Breaking.** An Alpine pin offers each name it holds at its pinned version
+  and with its pinned bytes alone, and installs nothing the resolution does not
+  select. A dependency the pinned version does not meet, where a version the
+  pin withholds would, fails the resolution with `AlpineError::Pin` and
+  `UnheldReason::Requirement`, naming the requirement, as the Debian layer
+  reports it. It failed with `AlpineError::Resolve`. `UnheldReason::Version`
+  names the latest version the repositories offer.
+- An Alpine index, a base layer's installed database and its world are read as
+  apk reads them, as bytes: a repeated field, a field letter apk does not know,
+  a dependency entry apk cannot read, and bytes that are not UTF-8 no longer
+  refuse them, and a record apk cannot install is never selected. The
+  increment's world carries each of the base's entries as apk writes it. Text apk
+  cannot read on from, and a record whose name, version or identity this layer
+  cannot fetch by, still refuse them, as does an index record whose origin is
+  not text a plan can record. A plan's control identity is held to the
+  spelling apk writes.
+- A bootstrap from an Alpine plan installs its packages in the order `apk add`
+  installs them for the plan's names.
+- `AlpineBuilder::include` and `exclude` refuse a name that is not a package
+  name as apk reads one, such as `!busybox`, at `build`.
 - **Breaking.** A failure to read an archive's source, a file's read error or a
   streamed body's reset connection, is `ProvisionError::Io` naming the archive,
   wherever in the stream it comes. Past the stream's first bytes it was
@@ -511,10 +552,10 @@ consumer upgrading can skip it.
   module, fails with the layer's `Io` error naming the registration file, the
   read's own failure its cause. It failed with the layer's `Config` error,
   saying only that the registration could not be read.
-- An Alpine base layer whose `etc/apk/arch`, `world`, or `repositories` file is
-  not UTF-8 is refused with `AlpineError::Io` naming the file, an
-  `InvalidData` failure beneath it, as a file the layer cannot read is. It was
-  refused with `AlpineError::Config`.
+- An Alpine base layer whose `etc/apk/arch` or `repositories` file is not UTF-8
+  is refused with `AlpineError::Io` naming the file, an `InvalidData` failure
+  beneath it, as a file the layer cannot read is. It was refused with
+  `AlpineError::Config`.
 - `alpine::Observed` renders its sink in its `Debug` output as
   `<dyn AlpineObserver>`, as the Debian and Gentoo layers' `Observed` render
   theirs.
@@ -585,19 +626,7 @@ consumer upgrading can skip it.
   `AlpineError::Collision` gains `directory`, naming the package that ships the
   path as a directory.
 - An Alpine resolution no longer depends on the order `include` names packages
-  in, and `/etc/apk/world` lists them sorted. A closure no longer holds two
-  packages for a name only one may answer, a package's own name or a name
-  provided at a version, which `apk` never installs together: it is resolved
-  again keeping each in turn, and refused naming them where none holds. A
-  layered build refuses an increment whose provider contends with a package the
-  base carries.
-- An Alpine closure leaves out a package whose `install_if` condition it meets
-  where taking it, or what it requires, breaks a `!` entry in either direction,
-  as `apk` does. The closure was refused instead, so `rofi-wayland` and five
-  `rofi` plugins could not be resolved. A provider its own `install_if`
-  condition brings in now answers a name ahead of the others, whatever version
-  it offers, as in `apk`, so a `rofi` plugin, which requires `cmd:rofi`, takes
-  `rofi-x11-wayland`.
+  in, and `/etc/apk/world` lists them sorted.
 - A Gentoo plan replayed over a root refuses, before merging anything, a build
   with a runtime or post-merge dependency that neither the root nor the plan
   answers, as a resolution would have. Such a plan was installed without the

@@ -194,6 +194,10 @@ pub ferroday_cage::provision::alpine::AlpineEvent::Fetching::url: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Resolved
 pub ferroday_cage::provision::alpine::AlpineEvent::Resolved::plan: &'a ferroday_cage::provision::alpine::Plan
 pub ferroday_cage::provision::alpine::AlpineEvent::Resolving
+#[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Rules
+pub ferroday_cage::provision::alpine::AlpineEvent::Rules::apk_tools: core::option::Option<&'a str>
+pub ferroday_cage::provision::alpine::AlpineEvent::Rules::measured: bool
+pub ferroday_cage::provision::alpine::AlpineEvent::Rules::measured_against: &'static str
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineEvent::Script
 pub ferroday_cage::provision::alpine::AlpineEvent::Script::package: &'a str
 pub ferroday_cage::provision::alpine::AlpineEvent::Script::script: &'static str

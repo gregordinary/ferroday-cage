@@ -15,22 +15,27 @@
 //! describe the whole merged root, and everything the base contributed is read
 //! here and carried through byte for byte.
 //!
-//! The same read answers the resolver's question. Unlike the Debian layer's
-//! already-installed set, which is a set of names, this keeps each base
-//! package's version and the versions of the names it provides: apk dependencies
-//! routinely carry a constraint — `so:libc.musl-x86_64.so.1=1.2.5-r23` is how
-//! the archive spells a soname — and a base treated as satisfying a name at any
-//! version would produce an increment that does not close.
+//! The same read answers the resolution's question. An increment is what `apk
+//! add` would do to the base, so the base is the root it resolves over: its
+//! installed records, read as apk reads them, and its world, the entries its own
+//! root asked for. Unlike the Debian layer's already-installed set, which is a
+//! set of names, each record keeps the package's version and the versions of the
+//! names it provides: apk dependencies routinely carry a constraint —
+//! `so:libc.musl-x86_64.so.1=1.2.5-r23` is how the archive spells a soname — and
+//! a base treated as satisfying a name at any version would produce an
+//! increment that does not close.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use ferrata::dependency::Dependency;
+use ferrata::record::{Identity, Record};
+
 use super::apk::Member;
 use super::bootstrap::{ARCH, REPOSITORIES, ScriptKind, ScriptSubject, WORLD};
-use super::index::Record;
 use super::installed::{Carried, DB_DIR, Existing};
-use super::{AlpineError, apk};
+use super::{AlpineError, DIALECT, apk};
 use crate::ErrorChain;
 use crate::provision::rooted::Rooted;
 
@@ -93,8 +98,11 @@ pub(super) struct Base {
     triggers: Vec<u8>,
     /// The base's `scripts.tar`.
     scripts: Vec<u8>,
-    /// The base's `/etc/apk/world`: what its own root asked for.
-    world: Vec<String>,
+    /// The base's `/etc/apk/world`: what its own root asked for, read as apk
+    /// reads it, in the order the file states its entries.
+    entries: Vec<Dependency>,
+    /// The same entries, each as the bytes apk writes it.
+    world: Vec<Vec<u8>>,
     /// The base's `/etc/apk/repositories`, one URL per line.
     repositories: Vec<String>,
     /// Where the base sits, for the refusals.
@@ -115,7 +123,9 @@ impl Base {
     /// Returns [`AlpineError::Config`] when the base records no installed
     /// package — a directory that was never provisioned, or one provisioned as
     /// something other than an Alpine root — when its database cannot be read as
-    /// one, or when it was built for another architecture. Returns
+    /// one or holds a record this layer cannot carry, when its world holds an
+    /// entry apk does not read, or when it was built for another architecture.
+    /// Returns
     /// [`AlpineError::Io`] when a file that is there cannot be read.
     pub(super) fn read(path: &Path, architecture: &str) -> Result<Base, AlpineError> {
         let tree = Rooted::open(path).map_err(AlpineError::at("opening the base layer", path))?;
@@ -142,6 +152,14 @@ impl Base {
             }
         };
         let packages = super::installed::parse(&recorded).map_err(refuse)?;
+        if let Some(reason) = packages
+            .iter()
+            .find_map(|existing| super::index::unusable(&existing.record))
+        {
+            return Err(refuse(format!(
+                "its apk database holds a record this layer cannot carry: {reason}",
+            )));
+        }
         if packages.is_empty() {
             return Err(refuse(
                 "its apk database records no package; a base layer is a root an increment is \
@@ -162,41 +180,72 @@ impl Base {
             )));
         }
 
+        // Bytes, as apk reads the world: an entry need not be text, and none
+        // is recorded as text. A plan records packages, which `unusable` holds
+        // to an alphabet, and the increment's world carries each entry as the
+        // bytes apk writes it.
+        let world = optional_bytes(&tree, WORLD, path, MAX_STATE)?;
+        let entries: Vec<Dependency> = world
+            .split(u8::is_ascii_whitespace)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                DIALECT.dependency(entry).map_err(|err| {
+                    refuse(format!(
+                        "its world names {:?}, which is not an entry apk reads: {err}",
+                        String::from_utf8_lossy(entry),
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
         Ok(Base {
             packages,
             triggers: optional_bytes(&tree, &format!("{DB_DIR}/{TRIGGERS}"), path, MAX_STATE)?,
             scripts: read_scripts(&tree, path)?,
-            world: lines(optional_text(&tree, WORLD, path, MAX_STATE)?),
+            world: entries.iter().map(Dependency::to_bytes).collect(),
+            entries,
             repositories: lines(optional_text(&tree, REPOSITORIES, path, MAX_STATE)?),
             path: path.to_path_buf(),
         })
     }
 
-    /// The packages the base records, as the index records they are written as.
+    /// The packages the base records, in the order its database lists them.
     ///
-    /// What seeds a delta resolution: each one answers its own name at its own
-    /// version and every name it provides at the version it provides it at.
+    /// The root an increment resolves over: each one answers its own name at
+    /// its own version and every name it provides at the version it provides
+    /// it at.
     pub(super) fn records(&self) -> impl Iterator<Item = &Record> {
         self.packages.iter().map(|existing| &existing.record)
     }
 
+    /// The base's world, read as apk reads it: what an increment's request is
+    /// resolved together with.
+    pub(super) fn entries(&self) -> &[Dependency] {
+        &self.entries
+    }
+
     /// The state the increment's database carries forward, so the file it writes
     /// into the overlay upper describes the merged root.
+    ///
+    /// Each record's name is one [`index::unusable`] admitted when the base was
+    /// read, so it is text.
+    ///
+    /// [`index::unusable`]: super::index::unusable
     pub(super) fn carried(&self) -> Carried {
         Carried {
             records: self
                 .packages
                 .iter()
-                .map(|existing| (existing.record.name.clone(), existing.raw.clone()))
+                .map(|existing| (existing.record.name().to_string(), existing.raw.clone()))
                 .collect(),
             triggers: self.triggers.clone(),
             scripts: self.scripts.clone(),
         }
     }
 
-    /// What the base's own root asked for, which the increment's request is
-    /// added to.
-    pub(super) fn world(&self) -> &[String] {
+    /// What the base's own root asked for, each entry as the bytes apk writes
+    /// it, which the increment's world adds its names to.
+    pub(super) fn world(&self) -> &[Vec<u8>] {
         &self.world
     }
 
@@ -283,10 +332,12 @@ impl Base {
 
         // A record can be named by more than one line, and a hostile database
         // can carry one identity twice. A line belongs to the first record that
-        // carries its identity, so the table keeps the first.
-        let mut records: HashMap<&str, &Record> = HashMap::new();
+        // carries its identity, so the table keeps the first. apk finds a
+        // line's record by the digest, so the table is keyed by it rather than
+        // by a spelling.
+        let mut records: HashMap<Identity, &Record> = HashMap::new();
         for record in self.records() {
-            records.entry(&record.control_identity).or_insert(record);
+            records.entry(*record.identity()).or_insert(record);
         }
         // What each package watches, in the order its identity first appears,
         // and every path once.
@@ -298,7 +349,7 @@ impl Base {
             // watches: the same identity its record opens with, which is how
             // `apk` finds the record the line belongs to.
             let (identity, patterns) = line.split_once(' ').unwrap_or((line, ""));
-            let Some(&record) = records.get(identity) else {
+            let Some(&record) = Identity::read(identity).and_then(|read| records.get(&read)) else {
                 return Err(self.refusal(format!(
                     "its triggers file names {identity:?}, which no record in its database carries",
                 )));
@@ -323,7 +374,7 @@ impl Base {
 
         // Each archived trigger script by the identity its name files it under,
         // so a package's script is found without a walk of the archive.
-        let mut scripts: HashMap<String, Vec<(&str, &Member)>> = HashMap::new();
+        let mut scripts: HashMap<Identity, Vec<(&str, &Member)>> = HashMap::new();
         for member in archived {
             if let Some((filed_under, identity)) = trigger_identity(&member.name) {
                 scripts
@@ -336,13 +387,15 @@ impl Base {
         let mut subjects = Vec::with_capacity(watching.len());
         // A package whose lines name no path watches nothing, and `apk` lists it
         // among no trigger's subjects; nor does this.
+        // Each record's name and version passed `index::unusable` when the base
+        // was read, so each is the text it is written as.
         for (record, patterns) in watching
             .into_iter()
             .filter(|(_, patterns)| !patterns.is_empty())
         {
-            let filed_under = format!("{}-{}", record.name, record.version);
+            let filed_under = format!("{}-{}", record.name(), record.version());
             let script = scripts
-                .get(&record.control_identity)
+                .get(record.identity())
                 .and_then(|candidates| {
                     candidates
                         .iter()
@@ -356,13 +409,13 @@ impl Base {
                     self.refusal(format!(
                         "{} watches {:?} and its archived trigger script is not in \
                          {DB_DIR}/{SCRIPTS}",
-                        record.name,
+                        record.name(),
                         patterns.join(" "),
                     ))
                 })?;
             subjects.push(ScriptSubject {
-                name: record.name.clone(),
-                version: record.version.clone(),
+                name: record.name().to_string(),
+                version: record.version().to_string(),
                 scripts: vec![(ScriptKind::Trigger, Cow::Borrowed(script.data.as_slice()))],
                 triggers: patterns.into_iter().map(Cow::Borrowed).collect(),
                 declared: Vec::new(),
@@ -387,14 +440,18 @@ impl Base {
 /// `apk` archives a trigger script as `<package>-<version>.<identity>.trigger`,
 /// the identity being the record's control identity spelled `X1` and
 /// hexadecimal, where the record states it `Q1` and base64; this answers the
-/// identity in the record's spelling. The identity holds no `.`, so the last
-/// one before it is where the name and version end. Matched on the whole name,
-/// so a package whose name and version merely begin another's, as `a` at `1`
-/// begins `a-1.5`, is never handed that package's script.
-fn trigger_identity(member: &str) -> Option<(&str, String)> {
+/// identity itself, which compares with a record's whatever the spelling. The
+/// identity holds no `.`, so the last one before it is where the name and
+/// version end. Matched on the whole name, so a package whose name and version
+/// merely begin another's, as `a` at `1` begins `a-1.5`, is never handed that
+/// package's script.
+fn trigger_identity(member: &str) -> Option<(&str, Identity)> {
     let stem = member.strip_suffix(&format!(".{}", ScriptKind::Trigger.name()))?;
     let (filed_under, identity) = stem.rsplit_once('.')?;
-    Some((filed_under, super::sign::identity_of_hex(identity)?))
+    Some((
+        filed_under,
+        Identity::read(&super::sign::identity_of_hex(identity)?)?,
+    ))
 }
 
 /// Reads a base's archived scripts, under either name `apk` maintains, as one
@@ -549,17 +606,19 @@ mod tests {
         );
         let base = base_of(&dir);
 
-        let names: Vec<&str> = base.records().map(|record| record.name.as_str()).collect();
+        let names: Vec<&ferrata::Name> = base.records().map(Record::name).collect();
         assert_eq!(names, ["alpine-baselayout", "musl"]);
         // The version travels with the name, which is what a constrained
         // dependency on the base is answered against.
         assert!(base.records().any(|record| {
-            record.name == "musl"
-                && record.provides.iter().any(|provided| {
-                    provided.name == "so:libc.musl-x86_64.so.1" && provided.version.is_some()
+            record.name() == "musl"
+                && record.provides().iter().any(|provided| {
+                    provided.name() == "so:libc.musl-x86_64.so.1" && provided.version().is_some()
                 })
         }));
-        assert_eq!(base.world(), ["alpine-baselayout"]);
+        assert_eq!(base.world(), [b"alpine-baselayout"]);
+        let entries: Vec<String> = base.entries().iter().map(ToString::to_string).collect();
+        assert_eq!(entries, ["alpine-baselayout"]);
         assert_eq!(
             base.repositories(),
             ["http://mirror.invalid/alpine/v3.23/main"],
@@ -571,9 +630,29 @@ mod tests {
         let rejoined: Vec<u8> = carried
             .records
             .iter()
-            .flat_map(|(_, raw)| [raw.as_slice(), b"\n\n"].concat())
+            .flat_map(|(_, raw)| [raw.as_slice(), b"\n"].concat())
             .collect();
         assert_eq!(rejoined, minirootfs());
+    }
+
+    #[test]
+    fn a_world_is_read_as_bytes_and_carried_as_apk_writes_each_entry() {
+        // apk installs `w\xff` for a world naming it, and reads a world entry
+        // as any other: one that is not text is carried as the bytes it is,
+        // each entry in the spelling apk writes.
+        let dir = root(
+            "world-bytes",
+            &[
+                (&format!("{DB_DIR}/{INSTALLED}"), minirootfs()),
+                (WORLD, b"musl=>1.2 w\xff\nalpine-baselayout\n"),
+            ],
+        );
+        let base = base_of(&dir);
+        assert_eq!(
+            base.world(),
+            [&b"musl>=1.2"[..], b"w\xff", b"alpine-baselayout"],
+        );
+        assert_eq!(base.entries()[1].name(), b"w\xff");
     }
 
     #[test]
@@ -594,6 +673,41 @@ mod tests {
             Base::read(&nothing, "x86_64").err(),
             Some(AlpineError::Config { .. }),
         ));
+    }
+
+    #[test]
+    fn a_base_record_or_world_entry_apk_terms_cannot_carry_is_refused() {
+        // A base is a tree its own scripts wrote, and what its database names
+        // is reported as the base's: a name outside the alphabet is quoted,
+        // with its control characters escaped.
+        let hostile = crate::failure::hostile::TEXT;
+        let database =
+            format!("C:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nP:{hostile}\nV:1.0-r0\nA:x86_64\n\n");
+        let dir = root(
+            "hostile-record",
+            &[(&format!("{DB_DIR}/{INSTALLED}"), database.as_bytes())],
+        );
+        let Some(err) = Base::read(&dir, "x86_64").err() else {
+            panic!("the record names no package a root can carry");
+        };
+        assert!(matches!(err, AlpineError::Config { .. }), "{err}");
+        crate::failure::hostile::assert_escaped(&err.to_string());
+
+        // A world entry apk does not read, such as one carrying a tag.
+        let dir = root(
+            "tagged-world",
+            &[
+                (&format!("{DB_DIR}/{INSTALLED}"), minirootfs()),
+                (WORLD, b"alpine-baselayout musl@edge\n"),
+            ],
+        );
+        let Some(err) = Base::read(&dir, "x86_64").err() else {
+            panic!("a tagged world entry is not one this layer reads");
+        };
+        assert!(
+            matches!(&err, AlpineError::Config { reason } if reason.contains("musl@edge")),
+            "{err}",
+        );
     }
 
     #[test]

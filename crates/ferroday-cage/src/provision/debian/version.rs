@@ -9,21 +9,23 @@
 //! Comparison keeps the highest version when the same package name appears
 //! more than once across an index. [`Constraint`] builds on it to answer the
 //! resolver's question: whether a candidate version satisfies what a
-//! dependency declares. This mirrors [`alpine::version`], which holds that
-//! format's comparison and its own `Constraint` together for the same reason —
-//! a constraint is meaningless apart from the ordering it is evaluated under.
+//! dependency declares. The Alpine layer's answer, ferrata's `version` and
+//! `dependency` modules, holds that format's comparison and its matching
+//! together for the same reason — a constraint is meaningless apart from the
+//! ordering it is evaluated under.
 //!
 //! # This comparison is total, and the other two are not
 //!
 //! `compare` here answers an [`Ordering`](std::cmp::Ordering), where
-//! [`alpine::version::compare`] and [`gentoo::version::compare`] answer an
-//! `Option<Ordering>`. That is the formats speaking, not three opinions about
-//! error handling: dpkg's algorithm is defined over *every* string. It reads a
-//! version as alternating non-digit and digit runs, and any string at all is
-//! such a sequence, so there is no input it declines to order and no refusal to
-//! report. An apk or a portage version is a token grammar, and a string outside
-//! it is not a version to be ordered low — it is a version the mirror should
-//! not have published, which is what their `None` says.
+//! [`gentoo::version::compare`] answers an `Option<Ordering>` and ferrata
+//! declines to read a string outside apk's grammar as a version at all. That
+//! is the formats speaking, not three opinions about error handling: dpkg's
+//! algorithm is defined over *every* string. It reads a version as alternating
+//! non-digit and digit runs, and any string at all is such a sequence, so there
+//! is no input it declines to order and no refusal to report. An apk or a
+//! portage version is a token grammar, and a string outside it is not a version
+//! to be ordered low — it is a version the mirror should not have published,
+//! which is what the other two report.
 //!
 //! What this layer admits is narrower than what it can order. [`is_version`]
 //! holds the version an index, a plan, or a base layer's status database
@@ -31,8 +33,6 @@
 //! That is a question of what a version may be spelled with, which dpkg also
 //! asks, rather than of how two compare.
 //!
-//! [`alpine::version`]: crate::provision::alpine::version
-//! [`alpine::version::compare`]: crate::provision::alpine::version::compare
 //! [`gentoo::version::compare`]: crate::provision::gentoo::version::compare
 
 use std::cmp::Ordering;

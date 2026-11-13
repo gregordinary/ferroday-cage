@@ -422,8 +422,11 @@ The three comparators do not share a signature, and that is the formats speaking
 rather than three opinions. dpkg's algorithm is defined over every string, so
 `debian::version::compare` answers an `Ordering` and has nothing to refuse. An
 apk or a portage version is a token grammar instead. A string outside that
-grammar is one the mirror had no business publishing, which is what the other
-two report as `None`. Each module's own documentation states which it is.
+grammar is one the mirror had no business publishing, which portage's answer
+reports as `None` and apk's refuses to read as a version. apk's answer is
+ferrata's, the resolver the Alpine layer adopts, read under `alpine::DIALECT`,
+the apk series every question in apk's terms is asked of. Each module's own
+documentation states which it is.
 
 The fourth, `Refusals`, is split for a different reason. Both layers collect
 every refusal and fail once, which is the discipline, and what they collect is
@@ -474,9 +477,11 @@ report name a package and its version bare.
 | Take a lock file | `provision::lock_exclusive` |
 | Write a file beside its destination and publish it by rename | `provision::Staged`, or `provision::write_atomically` for bytes in hand |
 | Hold what an untrusted producer writes to a ceiling | `provision::LimitedWriter` |
-| How do two versions of a package format compare? | `provision::gentoo::version::compare`, `alpine::version::compare`, `debian::version::compare` |
-| Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `alpine::version::Constraint::satisfied_by`, `debian::version::Constraint::satisfied_by` |
-| What version does a `Provides`-style entry supply a name at? | `provision::alpine::version::Constraint::exact_version`, `debian::version::Constraint::exact_version` |
+| How do two versions of a package format compare? | `provision::gentoo::version::compare`, `ferrata::version::Version`'s order (read with `alpine::DIALECT.version`), `debian::version::compare` |
+| Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `ferrata::dependency::Dependency::admits` (read with `alpine::DIALECT.dependency`) and, for an Alpine package by its own name or a name it provides, `ferrata::record::Record::answers`, `debian::version::Constraint::satisfied_by` |
+| What version does a `Provides`-style entry supply a name at? | `ferrata::record::Provide::version`, `provision::debian::version::Constraint::exact_version` |
+| Which packages does an Alpine request install, and in what order does apk install them? | `provision::alpine::resolution::resolve`, over ferrata's `Resolver`, and `ferrata::resolve::order` for a set no resolution ordered |
+| Which `apk-tools` do an Alpine root's repositories offer, and is it the release the resolution's rules were measured against? | `provision::alpine::apk_tools_of`, over ferrata's `Dialect::for_release` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
 | Which targets does a Gentoo root accept a binary package built for? | `provision::gentoo::Installed::targets`, held by `gpkg::check_target` |
 | Which slot does a `slot/subslot` value name? | `provision::gentoo::installed::slot_of` |
@@ -488,7 +493,7 @@ report name a package and its version bare.
 | Which id does a root's `/etc/passwd` or `/etc/group` give a name? | `provision::accounts::ids` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag`, `atom::use_flag` |
-| What can a package's name and version contain, as an index, a plan, or a root's package database states them? | `provision::debian::index::is_package_name` and `debian::version::is_version`, `alpine::index::is_package_name` and `alpine::version::parse`, `gentoo::atom::is_package` and `gentoo::version::parse`, which `gentoo::installed` holds a database entry's `category/name` and version to |
+| What can a package's name and version contain, as an index, a plan, or a root's package database states them? | `provision::debian::index::is_package_name` and `debian::version::is_version`, `alpine::index::is_package_name` and ferrata's `Dialect::version` (read with `alpine::DIALECT`), `gentoo::atom::is_package` and `gentoo::version::parse`, which `gentoo::installed` holds a database entry's `category/name` and version to |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | Which architecture is a build for, and which of a builder's settings does a plan already decide? | `provision::settings::settle_architecture`, `settings::check_source_date_epoch`, `settings::plan_with_selection`, `settings::plan_architecture`, and `settings::named_twice` for a plan naming one package twice |
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |

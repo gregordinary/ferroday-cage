@@ -14,9 +14,10 @@
 
 use std::borrow::Cow;
 
-use super::AlpineError;
-use super::index::{NOARCH, Record};
-use super::version;
+use ferrata::record::Record;
+
+use super::index::{self, NOARCH};
+use super::{AlpineError, DIALECT};
 use crate::provision::digest::{Algorithm, Digest};
 use crate::provision::document::{self, Carried, Draft};
 use crate::provision::mirror_url;
@@ -212,14 +213,14 @@ pub struct PlannedPackage {
     /// which is what makes it the key to attribute a plan's weight to the thing
     /// that was built rather than to each of its outputs.
     pub origin: Option<String>,
-    /// Which of [`Plan::indexes`] this package's winning version came from, as
-    /// an index into that list.
+    /// Which of [`Plan::indexes`] this package came from, as an index into that
+    /// list: the first that offers the build the resolution chose.
     ///
-    /// Resolution is highest-version-wins across the merged repositories, so
-    /// with more than one configured this is the only thing that says where a
-    /// package will actually be fetched from — and an apk package is addressed
-    /// relative to its own index's directory, so it is what says that even for a
-    /// single repository with two components.
+    /// A resolution chooses among every repository's records, so with more than
+    /// one configured this is the only thing that says where a package will
+    /// actually be fetched from — and an apk package is addressed relative to
+    /// its own index's directory, so it is what says that even for a single
+    /// repository with two components.
     pub index: usize,
     /// Fields this package's stanza carried that this version does not know.
     ///
@@ -314,29 +315,26 @@ impl PlannedPackage {
     /// is what the fetched control segment's is compared against, exactly, so
     /// one of any other shape can only ever mismatch.
     ///
-    /// A package resolved from an index passed [`index::is_package_name`], the
-    /// version grammar and [`index::is_control_identity`] on the way in, so this
-    /// is the same gate for the way a plan arrives instead: a document a caller
-    /// kept and may have edited, or a [`Plan`] taken from
-    /// [`resolve`](super::Alpine::resolve) and modified, neither of which has an
-    /// index behind it.
-    ///
-    /// [`index::is_package_name`]: super::index::is_package_name
-    /// [`index::is_control_identity`]: super::index::is_control_identity
+    /// A package resolved from an index passed [`index::is_package_name`] and
+    /// the version grammar on the way in, and its identity is the one
+    /// [`index::is_control_identity`] admits, so this is the same gate for the
+    /// way a plan arrives instead: a document a caller kept and may have
+    /// edited, or a [`Plan`] taken from [`resolve`](super::Alpine::resolve) and
+    /// modified, neither of which has an index behind it.
     pub(super) fn unaddressable(&self) -> Option<String> {
-        if !super::index::is_package_name(&self.name) {
+        if !index::is_package_name(&self.name) {
             return Some(format!(
                 "the plan names {:?}, which is not a name a package can be addressed by",
                 self.name,
             ));
         }
-        if version::parse(&self.version).is_none() {
+        if DIALECT.version(&self.version).is_err() {
             return Some(format!(
                 "the plan states {} at {:?}, which is not a version this format defines",
                 self.name, self.version,
             ));
         }
-        if !super::index::is_control_identity(&self.control_identity) {
+        if !index::is_control_identity(&self.control_identity) {
             return Some(format!(
                 "the plan states {} with the control identity {:?}, which is not a {} digest",
                 self.name,
@@ -585,34 +583,70 @@ impl Plan {
 
     /// Builds a plan from a resolved package set, projecting each record onto
     /// the public shape.
+    ///
+    /// Each package comes with the index it was read from, which is this list's
+    /// ordering. The packages are put in name order, whatever order the
+    /// resolution installs them in.
     pub(super) fn project(
         release: &str,
         architecture: &str,
-        packages: &[Record],
+        packages: &[(usize, &Record)],
         indexes: &[ResolvedIndex],
     ) -> Plan {
+        let mut packages: Vec<PlannedPackage> = packages
+            .iter()
+            .map(|&(index, record)| PlannedPackage::of(record, index, architecture))
+            .collect();
+        packages.sort_by(|a, b| a.name.cmp(&b.name));
         Plan {
             release: release.to_string(),
             architecture: architecture.to_string(),
-            packages: packages
-                .iter()
-                .map(|record| {
-                    PlannedPackage {
-                        name: record.name.clone(),
-                        version: record.version.clone(),
-                        architecture: record.architecture.clone(),
-                        control_identity: record.control_identity.clone(),
-                        size: record.size,
-                        installed_size: record.installed_size,
-                        origin: record.origin.clone(),
-                        // The merge tags each retained record with the index it
-                        // was read from, which is exactly this list's ordering.
-                        index: record.from,
-                        carried: Carried::new(),
-                    }
-                })
-                .collect(),
+            packages,
             indexes: indexes.to_vec(),
+            carried: Carried::new(),
+        }
+    }
+}
+
+impl PlannedPackage {
+    /// Projects an index's record, read from the index numbered `index`, into
+    /// a plan for `architecture`.
+    ///
+    /// The index reader admitted only a record whose name is in apk's alphabet,
+    /// which states an architecture, whose version is in the grammar, whose
+    /// identity is a SHA-1 and whose origin is text, so each field here is one a
+    /// plan document can carry, and the name and the version are written as the
+    /// bytes they are. [`Index::merge`] kept only a record of `architecture` or
+    /// [`NOARCH`].
+    ///
+    /// [`Index::merge`]: super::index::Index::merge
+    fn of(record: &Record, index: usize, architecture: &str) -> PlannedPackage {
+        // A record that states no size, or one that is not a run of digits,
+        // leaves the download bounded by the fetcher's own ceiling rather than
+        // being dropped: the digest is what decides whether the bytes are the
+        // package, and a missing bound is a weaker fetch rather than a wrong
+        // one.
+        let number = |letter: u8| crate::provision::number::digits(record.field(letter)?);
+        let architecture = if record.architecture() == Some(NOARCH.as_bytes()) {
+            NOARCH
+        } else {
+            architecture
+        };
+        PlannedPackage {
+            name: record.name().to_string(),
+            version: record.version().to_string(),
+            architecture: architecture.to_string(),
+            control_identity: index::control_identity(record),
+            size: number(b'S'),
+            installed_size: number(b'I'),
+            // Stated by every published record, and equal to the name for most
+            // of them; kept only where it says something the name does not.
+            origin: record
+                .origin()
+                .filter(|origin| *origin != record.name().as_bytes())
+                .and_then(|origin| std::str::from_utf8(origin).ok())
+                .map(str::to_string),
+            index,
             carried: Carried::new(),
         }
     }
@@ -974,6 +1008,24 @@ Origin: postmarketos-base
                 assert!(reason.contains("not a number"), "{reason}");
             }
             other => panic!("expected a size refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_index_s_sizes_are_planned_only_where_each_is_a_run_of_digits() {
+        // A signed number is no size the format spells, and is planned as no
+        // bound rather than as the number it signs.
+        for (stated, planned) in [
+            ("S:2048\nI:4096", (Some(2048), Some(4096))),
+            ("S:+2048\nI:-4096", (None, None)),
+        ] {
+            let text = format!(
+                "C:{}\nP:a\nV:1.0-r0\nA:x86_64\n{stated}\n",
+                crate::provision::alpine::sign::identity_for_test("a"),
+            );
+            let records = index::parse("the index", text.as_bytes()).expect("the index reads");
+            let package = PlannedPackage::of(&records[0], 0, "x86_64");
+            assert_eq!((package.size, package.installed_size), planned, "{stated}");
         }
     }
 

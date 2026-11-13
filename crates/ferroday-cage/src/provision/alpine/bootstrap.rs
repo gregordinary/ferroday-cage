@@ -11,11 +11,12 @@
 //! This layer unpacks the whole closure and then runs every script, which is the
 //! Debian layer's shape as well.
 //!
-//! The order the scripts run in is what makes the two equivalent. It is a
-//! dependency order, not the closure's name order, because Alpine's base
-//! packages depend on each other's scripts having run: `alpine-baselayout`'s
-//! `.pre-install` calls `addgroup`, which is a `busybox` applet that exists only
-//! once `busybox`'s own `.post-install` has run `busybox --install -s`. Run in
+//! The order the scripts run in is what makes the two equivalent. It is the
+//! order `apk` installs the closure in, each package after what it depends on,
+//! not the closure's name order, because Alpine's base packages depend on each
+//! other's scripts having run: `alpine-baselayout`'s `.pre-install` calls
+//! `addgroup`, which is a `busybox` applet that exists only once `busybox`'s
+//! own `.post-install` has run `busybox --install -s`. Run in
 //! name order, that `addgroup` finds no command, the `shadow` group is never
 //! created, and the failure is silent — the script sends it to `/dev/null` and
 //! exits zero.
@@ -55,7 +56,6 @@
 //! another owner, and the database records the root that every entry is.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -120,8 +120,9 @@ const MAX_TRIGGER_MATCHES: usize = 16 * 1024;
 /// keys are written into an upper where the base's copies are already visible
 /// through the overlay.
 pub(super) struct State<'a> {
-    /// What the root asked for, one package per line in `/etc/apk/world`.
-    pub(super) world: &'a [String],
+    /// What the root asked for, one entry per line in `/etc/apk/world`, each
+    /// as the bytes apk writes it.
+    pub(super) world: &'a [Vec<u8>],
     /// The architecture the root was built for.
     pub(super) architecture: &'a str,
     /// The directories a later `apk` fetches indexes and packages from, one URL
@@ -164,14 +165,14 @@ pub(super) struct Site<'a> {
 /// Runs every package's install scripts, fires the triggers they registered,
 /// and writes the state the finished root hands back to `apk`.
 ///
-/// `order` is the dependency order the closure was laid down in, and the one the
-/// scripts run in. Between a package's pre-install and its post-install, the
-/// entries it states another owner for are [given](reown_declared) that owner,
-/// and `database` records it. `carried` is the trigger subjects of packages a layered
-/// build's base already holds, empty for a full bootstrap; they fire for the
-/// directories this wave created exactly as the closure's own do, because a
-/// trigger belongs to the installed root rather than to the transaction that ran
-/// it.
+/// `order` is the order `apk` installs the closure in, which it was laid down
+/// in, and the one the scripts run in. Between a package's pre-install and its
+/// post-install, the entries it states another owner for are
+/// [given](reown_declared) that owner, and `database` records it. `carried` is
+/// the trigger subjects of packages a layered build's base already holds, empty
+/// for a full bootstrap; they fire for the directories this wave created
+/// exactly as the closure's own do, because a trigger belongs to the installed
+/// root rather than to the transaction that ran it.
 ///
 /// Once the last trigger has run, the machine identity the scripts generated is
 /// [cleared](clear_run_state), so the finished root carries none, and with an
@@ -541,12 +542,12 @@ fn write_state(tree: &Rooted, database: &Database, state: &State<'_>) -> Result<
 
     // What the caller asked for, one per line and sorted, which is what apk
     // writes and what makes the file a function of the request.
-    let mut world: Vec<&str> = state.world.iter().map(String::as_str).collect();
+    let mut world: Vec<&[u8]> = state.world.iter().map(Vec::as_slice).collect();
     world.sort_unstable();
     world.dedup();
-    let mut text = world.join("\n");
-    text.push('\n');
-    tree.write(WORLD, text.as_bytes())
+    let mut text = world.join(&b'\n');
+    text.push(b'\n');
+    tree.write(WORLD, &text)
         .map_err(AlpineError::at("writing the world", tree.path(WORLD)))?;
 
     let mut architecture = state.architecture.to_string();
@@ -885,71 +886,6 @@ impl<'a> Set<'a> {
     }
 }
 
-/// A dependency order over the closure: a package appears after everything it
-/// needs.
-///
-/// The graph is the packages' own `depends`, and the names an `install_if`
-/// package's condition names, resolved within the closure through the names
-/// each package provides as well as its own. It has cycles — Alpine
-/// publishes mutually dependent packages — so this is a depth-first post-order
-/// that steps over a package it is already visiting rather than a sort that
-/// insists on a total order.
-///
-/// Nothing here consults a name. Two packages neither of which needs the other
-/// come out in the order they were handed in, so the same input always produces
-/// the same output and a different input may produce a different one. That is
-/// the property the callers need and the one they have: a resolution walks a
-/// `BTreeMap`, so its input is in name order, and a caller-supplied plan
-/// document's is in document order — each reproducible from what it was built
-/// from.
-pub(super) fn dependency_order(
-    depends: &[Vec<String>],
-    provides: &HashMap<String, Vec<usize>>,
-) -> Vec<usize> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum State {
-        Unvisited,
-        Visiting,
-        Done,
-    }
-
-    let mut state = vec![State::Unvisited; depends.len()];
-    let mut order = Vec::with_capacity(depends.len());
-    // An explicit stack rather than recursion: a closure is thousands of
-    // packages deep in the worst case and this runs on the caller's thread.
-    let mut stack: Vec<(usize, usize)> = Vec::new();
-    for start in 0..depends.len() {
-        if state[start] != State::Unvisited {
-            continue;
-        }
-        stack.push((start, 0));
-        state[start] = State::Visiting;
-        while let Some((at, edge)) = stack.pop() {
-            let wanted: Vec<usize> = depends[at]
-                .iter()
-                .filter_map(|name| provides.get(name))
-                .flatten()
-                .copied()
-                .filter(|to| *to != at)
-                .collect();
-            match wanted.get(edge) {
-                Some(&to) => {
-                    stack.push((at, edge + 1));
-                    if state[to] == State::Unvisited {
-                        state[to] = State::Visiting;
-                        stack.push((to, 0));
-                    }
-                }
-                None => {
-                    state[at] = State::Done;
-                    order.push(at);
-                }
-            }
-        }
-    }
-    order
-}
-
 /// The scripts `apk` knows, re-exported so this module names them without
 /// reaching through the container reader.
 pub(super) use super::apk::ScriptKind;
@@ -1157,91 +1093,6 @@ mod tests {
         );
     }
 
-    /// A closure's dependency order, by name.
-    fn order(packages: &[(&str, &[&str])]) -> Vec<String> {
-        let depends: Vec<Vec<String>> = packages
-            .iter()
-            .map(|(_, needs)| needs.iter().map(std::string::ToString::to_string).collect())
-            .collect();
-        let mut provides: HashMap<String, Vec<usize>> = HashMap::new();
-        for (at, (name, _)) in packages.iter().enumerate() {
-            provides.entry((*name).to_string()).or_default().push(at);
-        }
-        dependency_order(&depends, &provides)
-            .into_iter()
-            .map(|at| packages[at].0.to_string())
-            .collect()
-    }
-
-    #[test]
-    fn a_package_runs_after_everything_it_needs() {
-        // The case this exists for: `busybox` has to have relinked its applets
-        // before `alpine-baselayout`'s pre-install calls one of them.
-        let sorted = order(&[
-            ("alpine-baselayout", &["alpine-baselayout-data", "/bin/sh"]),
-            ("busybox", &["musl"]),
-            ("busybox-binsh", &["busybox"]),
-            ("musl", &[]),
-            ("alpine-baselayout-data", &[]),
-        ]);
-        let at = |name: &str| {
-            sorted
-                .iter()
-                .position(|package| package == name)
-                .unwrap_or_else(|| panic!("{name} is in the order: {sorted:?}"))
-        };
-        assert!(at("musl") < at("busybox"));
-        assert!(at("busybox") < at("busybox-binsh"));
-        assert_eq!(sorted.len(), 5);
-        // `/bin/sh` is provided by nothing here, so it constrains nothing; the
-        // order still holds every package exactly once.
-        assert!(at("alpine-baselayout-data") < at("alpine-baselayout"));
-    }
-
-    #[test]
-    fn a_provided_name_orders_as_the_package_that_provides_it() {
-        let packages: [(&str, &[&str]); 3] = [
-            ("alpine-baselayout", &["/bin/sh"]),
-            ("busybox-binsh", &["busybox"]),
-            ("busybox", &[]),
-        ];
-        let depends: Vec<Vec<String>> = packages
-            .iter()
-            .map(|(_, needs)| needs.iter().map(std::string::ToString::to_string).collect())
-            .collect();
-        let mut provides: HashMap<String, Vec<usize>> = HashMap::new();
-        for (at, (name, _)) in packages.iter().enumerate() {
-            provides.entry((*name).to_string()).or_default().push(at);
-        }
-        provides.entry("/bin/sh".to_string()).or_default().push(1);
-
-        let sorted: Vec<&str> = dependency_order(&depends, &provides)
-            .into_iter()
-            .map(|at| packages[at].0)
-            .collect();
-        assert_eq!(sorted, ["busybox", "busybox-binsh", "alpine-baselayout"]);
-    }
-
-    #[test]
-    fn a_cycle_is_stepped_over_rather_than_refused() {
-        // Alpine publishes mutually dependent packages, so an order that
-        // insisted on a total one would refuse closures apk installs.
-        let sorted = order(&[("a", &["b"]), ("b", &["a"]), ("c", &["a"])]);
-        assert_eq!(sorted.len(), 3);
-        assert!(sorted.contains(&"c".to_string()));
-        let at = |name: &str| sorted.iter().position(|package| package == name).unwrap();
-        assert!(at("a") < at("c"), "{sorted:?}");
-    }
-
-    #[test]
-    fn one_closure_produces_one_order() {
-        let packages: [(&str, &[&str]); 4] =
-            [("d", &["c"]), ("c", &["a", "b"]), ("b", &[]), ("a", &[])];
-        let once = order(&packages);
-        let again = order(&packages);
-        assert_eq!(once, again);
-    }
-
     /// One entry of `tree` stated owned by `uname`:`gname`, or by `uid`:`gid`
     /// where the root has no such names, as it is on disk now.
     fn stated(
@@ -1426,7 +1277,7 @@ mod tests {
         crate::provision::export_tar(&*staging, &mut archive, IdentityMap::Subordinate)
             .expect("the tree exports");
         let mut reader = crate::provision::tar::TarReader::in_memory(&archive[..]);
-        let mut owners = HashMap::new();
+        let mut owners = std::collections::HashMap::new();
         while let Some(entry) = reader.next_entry().expect("the archive reads") {
             owners.insert(entry.path.clone(), (entry.uid, entry.gid, entry.mode));
         }

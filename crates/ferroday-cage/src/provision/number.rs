@@ -50,7 +50,7 @@ pub(crate) fn digits_in(text: &str, radix: u32) -> Option<u64> {
 /// as numerically. A run of any length orders, where an integer parse would
 /// overflow, which is what a version's numeric component needs: nothing bounds
 /// its length but the mirror that wrote it.
-#[cfg(any(feature = "alpine", feature = "gentoo"))]
+#[cfg(feature = "gentoo")]
 pub(crate) fn compare_digit_runs(a: &str, b: &str) -> std::cmp::Ordering {
     let a = a.trim_start_matches('0');
     let b = b.trim_start_matches('0');
@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "alpine", feature = "gentoo"))]
+    #[cfg(feature = "gentoo")]
     fn digit_runs_order_by_value_at_any_length() {
         assert_eq!(compare_digit_runs("10", "9"), std::cmp::Ordering::Greater);
         assert_eq!(compare_digit_runs("007", "7"), std::cmp::Ordering::Equal);

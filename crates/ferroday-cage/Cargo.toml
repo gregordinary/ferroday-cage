@@ -55,6 +55,12 @@ ruzstd = { version = "0.9.1", optional = true, default-features = false, feature
 # Gentoo's digest documents.
 irongall = { version = "0.2.0", optional = true }
 sha2 = { version = "0.11", optional = true }
+# The Alpine add-on's dependency resolution (safe Rust, no dependencies): the
+# packages `apk add` installs for a request, the changes it makes to a root that
+# holds packages already, and the order it installs them in, by apk's measured
+# rules. Its version and dependency syntax answer every question the Alpine
+# layer asks in apk's terms.
+ferrata = { version = "0.1.0", optional = true }
 # The Gentoo binary-package add-on: the MD5 portage writes into its own package
 # database -- an installed package's `CONTENTS` records one per file so portage
 # can tell an edited file from a merged one, and its `BINPKGMD5` records the
@@ -91,7 +97,7 @@ debian = ["tarball", "dep:irongall", "dep:sha2"]
 # The Alpine userland provisioner: bootstrap a release/architecture rootfs from
 # an apk repository, and postmarketOS's repositories beside it. Builds on the
 # tarball extractor for the packages' data segments.
-alpine = ["tarball", "dep:irongall", "dep:sha2"]
+alpine = ["tarball", "dep:irongall", "dep:sha2", "dep:ferrata"]
 # The Gentoo userland provisioner: bootstrap a rootfs from a signed stage3
 # tarball, and install binary packages into it. It selects the Debian layer's
 # dependencies (OpenPGP for the signed pointer and digest documents, and the

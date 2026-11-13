@@ -42,17 +42,19 @@ A bootstrap runs in stages:
 1. **The signed index.** It fetches each repository's `APKINDEX.tar.gz`, verifies
    the RSA signature against the repository's keys, and parses the records. There
    is no release document above the index: the index *is* the signed thing.
-2. **The package set.** It resolves the closure over what `include` names —
-   dependencies, virtual providers, and `install_if` conditions to a fixed point
-   — against the merged records of every configured repository.
+2. **The package set.** It resolves what `include` names as `apk add` would —
+   dependencies, virtual providers, `install_if` conditions and conflicts —
+   against every record of every configured repository, and orders it as
+   `apk` installs it.
 3. **Download and verify.** It downloads each package and binds it to the index
    that named it before anything is unpacked. See [Trust](#trust).
 4. **Extraction and scripts.** It lays every package's files down in one wave and
-   runs the install scripts in a second, both in dependency order, then fires the
-   triggers whose watched directories the install changed. The scripts run inside
-   a cage rooted at the staging tree, so they need no privilege on the host. When
-   they have run, the bootstrap clears [what the run leaves
-   behind](#what-a-bootstrap-does-not-keep) and publishes the root filesystem.
+   runs the install scripts in a second, both in the order `apk` installs the
+   packages in, then fires the triggers whose watched directories the install
+   changed. The scripts run inside a cage rooted at the staging tree, so they
+   need no privilege on the host. When they have run, the bootstrap clears
+   [what the run leaves behind](#what-a-bootstrap-does-not-keep) and publishes
+   the root filesystem.
 
 The finished root carries `/lib/apk/db/installed`, `/etc/apk/world`,
 `/etc/apk/repositories`, `/etc/apk/arch` and the repositories' trusted keys, so
@@ -100,44 +102,50 @@ broken root.
 `include` names a set. The order it names packages in changes neither the
 closure nor `/etc/apk/world`, which lists them sorted, as `apk` writes it.
 
-A root holds one package for a name that is a package's own, or that a package
-provides at a version, as `apk` installs it. `icu-data-en` and `icu-data-full`
-both provide `icu-data=78.1-r0`, so a closure that needs `icu-data` and needs
-`icu-data-full` by name holds `icu-data-full` alone. The resolver answers one
-dependency at a time. Where its closure holds two such packages, it resolves
-again, keeping each in turn and setting the others aside. A closure no choice
-settles fails the resolve with `AlpineError::Resolve`, naming the packages.
+### How a package set is resolved
 
-A package whose `install_if` condition the closure meets joins it, unless it,
-or what it requires, would break a `!` entry in either direction. Then it is
-left out, as `apk` leaves it out. A provider its own condition brings in also
-answers a name ahead of the others. Both providers of `cmd:rofi` require `rofi`,
-which brings in `rofi-x11-wayland`, so a plugin that requires `cmd:rofi` takes
-it, as `apk` does.
+The resolution is the `ferrata` crate's, a resolver that answers as `apk`
+answers: its rules are apk-tools 3.0's, measured against `apk.static` rule by
+rule and over every package of Alpine's `main` and `community`. It decides
+which package answers each name and which order they are installed in, and
+this layer holds its answer to what a provisioner promises. The rules worth
+knowing when reading a plan:
 
-The resolver is not `apk`'s solver, and one difference remains. A provider
-already in the closure answers a later dependency on its name, in both. The two
-reach dependencies in different orders, though. Where a name is provided at no
-version, one can reach it with a provider already in the closure and the other
-without one. The one without takes the highest-priority provider, and holds two
-when the closure brings in the other for another reason.
+- Every version a repository offers is a candidate, not only the latest. A
+  dependency on `lib<2` installs `lib` 1.5 where 1.5 and 2.1 are both offered.
+- Of the candidates every requirement admits, `apk` installs the one providing
+  the name at a version over one providing it at none, then the later version,
+  then the higher provider priority (`k:`), then the record listed first, with
+  the repositories in the order they are configured.
+- A root holds one package for a name that is a package's own, or that a
+  package provides at a version. `icu-data-en` and `icu-data-full` both provide
+  `icu-data=78.1-r0`, so a request that needs `icu-data` and `icu-data-full`
+  by name installs `icu-data-full` alone.
+- A package whose `install_if` condition holds joins the root, unless a `!`
+  entry forbids it.
+- A name provided only at no version, by packages none of which states a
+  priority, is refused as `apk` refuses it: name the provider to install.
 
-Resolved alone against `apk` 3.0.9, 22 of the 28,660 packages in v3.24's `main`
-and `community` differ this way. So do 17 of the 27,577 in v3.23. Three names
-account for all of them:
+A request `apk` refuses fails with `AlpineError::Resolve`, quoting the
+requirement it could not meet and how that requirement came about.
 
-- `dbus:org.freedesktop.Secrets`. In 13 KDE packages in each release, among
-  them `akonadi-calendar` and `korganizer`, `apk` installs `gnome-keyring`
-  beside `kwallet`. In `neochat`, `plasmatube`, `ruqola` and `tokodon` on
-  v3.24, this resolver installs it and `apk` does not.
-- `lua`. In `acf-db-lib`, `lua-resty-lock`, `lua-resty-openidc` and
-  `pdns-backend-lua2`, this resolver installs the highest-priority interpreter
-  beside the one `apk` uses. v3.23 has no `acf-db-lib` case.
-- `java-jre-headless`. `rmlmapper` gains `openjdk25-jre-headless` beside
-  `openjdk21-jre-headless`.
+Every release is resolved by apk-tools 3.0's rules, which Alpine ships from
+v3.23. A release before v3.23 ships apk-tools 2.14, and 3.0 changed both the
+version syntax (`~` matches a prefix, a version may carry a commit hash, and
+fewer strings are versions) and a few of the solver's choices: it decides the
+names packages carry before the names they only provide, settles conflicting
+names before an `install_if` condition counts as met, weighs a conflict
+against an `install_if` package, and lets a package conflict with a name it
+provides. A root of such a release is resolved by 3.0's rules all the same,
+and the release's own `apk` may resolve the same request differently.
 
-Naming the provider `apk` installs with `include` makes the two install the same
-packages, in every one of these.
+Each resolution reports the `apk-tools` its repositories offer, beside the
+release the rules were measured against, as `AlpineEvent::Rules`, once the
+indexes are verified. `fcage` prints it where the two differ:
+
+```text
+fcage: the repositories offer apk-tools 2.14.13-r0, and the package set follows apk-tools 3.0.9's rules
+```
 
 ## Repositories
 
@@ -152,10 +160,11 @@ carrying whitespace or a control character is refused at `build`, whether it is
 the primary, a fallback, or an additional repository's. A local path that holds
 either takes a percent escape, which [`file_url`] writes.
 
-Resolution is highest-version-wins across the merged repositories. An exact tie
-resolves to the *later* repository, which is what makes an additional repository
-an overlay: a package it republishes at the version the primary already offers is
-the one that wins.
+The order the repositories are configured in is the order `/etc/apk/repositories`
+lists them in, the primary first, and it decides a tie as `apk` decides one: of
+two candidates that rank equal, such as two builds of one version, the root takes
+the one the repository configured first offers. A later version wins wherever it
+is offered.
 
 A repository here carries no tag, so apk's `name@tag` pinning has no equivalent.
 `include` and `exclude` refuse a name carrying one at `build`, rather than
@@ -177,7 +186,7 @@ let postmarketos = Repository::builder("v26.06")
     .keys(KeySet::postmarketos())
     .build()?;
 
-let mut alpine = Alpine::builder("v3.23")
+let mut alpine = Alpine::builder("v3.24")
     .repository(postmarketos)
     .include(["alpine-base", "postmarketos-baselayout"])
     .build()?;
@@ -187,9 +196,8 @@ provision::ensure("/var/lib/machines/pmos", &mut alpine)?;
 ```
 
 postmarketOS is an overlay rather than a distribution — a postmarketOS root is
-Alpine's repositories plus its own — so it is configured as an additional
-repository and never as the primary. Its release cycle is its own: `v26.06`
-against Alpine's `v3.23`.
+Alpine's repositories plus its own. Its release cycle is its own: `v26.06`
+against Alpine's `v3.24`.
 
 The examples name `mirror.nura.eco`, the host that postmarketOS's own
 `mirror.postmarketos.org` redirects every request to. The bundled HTTP client
@@ -197,13 +205,44 @@ follows a redirect to another host only where
 [`HttpFetch::cross_host_redirects`] allows it, and `fcage` has no flag for that.
 So a repository names the host that serves it.
 
-Both of its ways of overriding an Alpine package fall out of the merge rather
-than needing anything of their own. It republishes `akms` at `99990.3.0-r1`, a
-version no Alpine release will reach, so the higher version wins wherever the
+Its ways of overriding an Alpine package fall out of the resolution rather than
+needing anything of their own. It republishes `akms` at `99990.3.0-r1`, a
+version no Alpine release will reach, so the later version wins wherever the
 repository sits in the order; and `postmarketos-base` *provides*
 `alpine-base=1000-r0`, so asking for `alpine-base` with the overlay configured
 resolves postmarketOS's base system instead of Alpine's. Both are what `apk`
 does with the same two repositories configured.
+
+A package it republishes at the version Alpine publishes is a tie, and goes to
+the repository configured first. postmarketOS `v26.06` republishes eight of
+Alpine `v3.24`'s packages that way, each another build of the same version
+(`shelli` and two of its subpackages, `fbkeyboard`, `fbdebug`, `update-sysfs`,
+`beebzzr` and its documentation). Configured after Alpine's repository, as
+above, a root takes Alpine's builds of these; configured as the primary, with
+Alpine's repository added after it, it takes postmarketOS's own, as a device
+whose `/etc/apk/repositories` lists postmarketOS first does:
+
+```rust,no_run
+use ferroday_cage::provision::alpine::{Alpine, KeySet, Repository};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let alpine = Repository::builder("v3.24")
+    .mirror("http://dl-cdn.alpinelinux.org/alpine")
+    .components(["main", "community"])
+    .keys(KeySet::alpine("x86_64")?)
+    .build()?;
+
+let _pmos = Alpine::builder("v26.06")
+    .architecture("x86_64")
+    .mirror("http://mirror.nura.eco/postmarketos")
+    .components::<[&str; 0], &str>([])
+    .keys(KeySet::postmarketos())
+    .repository(alpine)
+    .include(["postmarketos-base"])
+    .build()?;
+# Ok(())
+# }
+```
 
 ### Where a package's bytes come from
 
@@ -277,14 +316,20 @@ exactly as [their Debian counterparts](debian.md#the-resolved-plan) do, includin
 what a plan refuses to compose with and the trust model a plan carries, so that
 chapter is the reference for all of it.
 
-The layers differ in how many routes lead to a version. A Debian pin holds a
-name on each of several. An Alpine resolution has one: the merged index keeps a
-single record for each name, the pinned one where the pin names it, and a
-dependency, a provided name and an `install_if` condition all reach a package
-through it. A name a base layer carries keeps the base's version, since a layered
-build never upgrades its base. A dependency the pinned version does not meet, and
-nothing else answers, fails the resolution with `AlpineError::Pin`, naming the
-requirement.
+The layers differ in how a pin holds a version. A Debian pin holds a name on
+each of several routes. An Alpine pin withholds records instead: a pinned name
+is offered to the resolution at its pinned version and with its pinned bytes
+alone, so a dependency, a provided name and an `install_if` condition all reach
+the pinned package or nothing. A pin does not install what it names, so a
+package the resolution no longer selects stays out. A name a base layer carries
+keeps the base's version, since a layered build never changes its base. A
+dependency the pinned version does not meet, where a version the pin withholds
+would, fails the resolution with `AlpineError::Pin`, naming the requirement.
+
+A bootstrap installs a plan's packages in the order `apk add` installs them for
+the plan's names, which are the world the finished root records. A bootstrap
+that resolves installs them in its resolution's order, which follows the names
+`include` gave, so the two can install one package set in different orders.
 
 One refusal is this layer's own, and it follows from where an apk package lives.
 A package is fetched from the directory of the index that named it, so the
@@ -477,11 +522,14 @@ than to the transaction, so a directory the increment creates runs the base's
 watcher for it — `busybox` relinking applets, `ca-certificates` rebuilding its
 bundle.
 
-The increment resolves against the base's installed set read at the versions it
-records, not merely at its names, because apk spells a soname
-`so:libc.musl-x86_64.so.1=1.2.5-r23`. A dependency the base's version cannot meet
-is reported as the upgrade it would be, naming both versions and the entry that
-forced it: an increment installs over a base rather than replacing part of one.
+The increment is what `apk add` would do to the base: it resolves over the base's
+installed records and its world, at the versions the base records rather than
+merely at its names, because apk spells a soname
+`so:libc.musl-x86_64.so.1=1.2.5-r23`. Where `apk add` would upgrade, replace or
+remove a package the base holds, such as a dependency the base's version cannot
+meet, the resolution fails with `AlpineError::Resolve`, naming the package, the
+change, and why: an increment installs over a base rather than changing part of
+one.
 
 A file the increment ships over one the base owns simply wins in the merged view.
 The base is read-only, and the shadow lives in the disposable upper. A collision
@@ -738,7 +786,7 @@ Everything in this table is a difference the archives make, not a gap:
 | Freshness | `Valid-Until`, and `allow_stale_release` to relax it | None; the format expresses no validity window |
 | Package identity | A SHA-256 of the whole file, from the index | A SHA-1 of the control segment, plus `datahash` over the tree |
 | Extract-only | Files and an empty database | Files *and* the installed database |
-| Configuration | `dpkg` runs in a sandbox | Each package's install scripts run in a sandbox, in dependency order |
+| Configuration | `dpkg` runs in a sandbox | Each package's install scripts run in a sandbox, in the order `apk` installs the packages in |
 
 ## The command line
 
@@ -772,7 +820,7 @@ own file name. A repository added with `--alpine-repository` must name its keys
 the same way, and naming no components selects the shallower layout:
 
 ```console
-$ fcage --rootfs ./pmos --provision-alpine v3.23 \
+$ fcage --rootfs ./pmos --provision-alpine v3.24 \
         --alpine-include alpine-base,postmarketos-baselayout \
         --alpine-repository 'release=v26.06 keys=postmarketos
                              mirror=http://mirror.nura.eco/postmarketos'

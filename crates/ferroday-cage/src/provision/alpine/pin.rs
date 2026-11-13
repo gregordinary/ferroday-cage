@@ -3,27 +3,37 @@
 //! A [`Plan`] handed to [`AlpineBuilder::pin`](super::AlpineBuilder::pin)
 //! becomes a set of constraints rather than a manifest: the resolution runs as
 //! it always does — every index fetched and verified, the closure computed over
-//! what the repositories offer now — and each package the pin names is selected
-//! at the pinned version instead of the highest. Everything the pin does not
-//! name resolves normally.
+//! what the repositories offer now — and each package the pin names is offered
+//! at the pinned version and with the pinned bytes alone. Everything the pin
+//! does not name resolves normally.
 //!
-//! The constraint is applied where the index is built, in
-//! [`Index::merge`](super::index::Index::merge), because that is the one place a
-//! version is chosen. A pinned name whose version no repository offers keeps the
-//! highest instead, so [`Pins::check`] can report what the repositories carry
-//! rather than only that something is missing; the check runs before the closure
-//! is computed, so the fallback is never resolved against.
+//! A pin withholds records rather than stating a request. A pinned name's other
+//! versions, and other builds of its pinned version, are not offered to the
+//! resolution, so every route to the name — a dependency, a provided name, an
+//! `install_if` condition — reaches the pinned package or nothing. A pin does not
+//! install what it names: a package the resolution does not select stays out,
+//! whatever the pin says of it.
+//!
+//! [`Pins::check`] runs over everything the repositories offer before anything
+//! is withheld, so a pin the repositories have moved past is reported with what
+//! they carry instead, before the resolution runs.
 
 use std::collections::HashMap;
 use std::fmt;
 
-use super::AlpineError;
-use super::index::{Dependency, Index};
+use ferrata::record::Record;
+use ferrata::resolve::{Refusal, RefusalKind};
+use ferrata::version::Version;
+
+use super::index::{self, Index};
 use super::plan::Plan;
-use super::version;
+use super::{AlpineError, DIALECT};
 
 /// The versions and identities a pin holds a resolution to, keyed by package
 /// name.
+///
+/// A plan names its packages in text, so a name an index or a dependency
+/// states in bytes that are not UTF-8 is one no pin holds.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Pins {
     by_name: HashMap<String, Pinned>,
@@ -33,13 +43,27 @@ pub(super) struct Pins {
 /// have.
 #[derive(Debug, Clone)]
 struct Pinned {
+    /// The version as the plan states it.
     version: String,
+    /// The same version read as apk reads one, or `None` for a version outside
+    /// the grammar, which a pin is refused for before it is read.
+    read: Option<Version>,
     control_identity: String,
 }
 
+impl Pinned {
+    /// Whether `version` is the one this pin holds its package to.
+    ///
+    /// Compared as apk versions rather than as strings, so a pin written with a
+    /// leading zero on the first component matches an index without one, and
+    /// the reverse.
+    fn holds(&self, version: &Version) -> bool {
+        self.read.as_ref().is_some_and(|pinned| pinned == version)
+    }
+}
+
 impl Pins {
-    /// No pin: every name resolves to the highest version offered, as an
-    /// unpinned resolution does.
+    /// No pin: every record is offered, as an unpinned resolution offers them.
     pub(super) fn none() -> Pins {
         Pins::default()
     }
@@ -49,10 +73,10 @@ impl Pins {
     /// # Errors
     ///
     /// [`AlpineError::Config`] when the plan names one package twice. A pin is
-    /// keyed by name, since the index a resolution selects from is, so two
-    /// entries for one name state two versions to hold it at and there is no
-    /// answer to which governs. A plan this library resolved cannot contain one;
-    /// a hand-written document can.
+    /// keyed by name, since a root holds one package of a name, so two entries
+    /// for one name state two versions to hold it at and there is no answer to
+    /// which governs. A plan this library resolved cannot contain one; a
+    /// hand-written document can.
     pub(super) fn of(plan: &Plan) -> Result<Pins, AlpineError> {
         if let Some((first, again)) =
             crate::provision::settings::named_twice(&plan.packages, |package| &package.name)
@@ -69,6 +93,7 @@ impl Pins {
             .map(|package| {
                 let pinned = Pinned {
                     version: package.version.clone(),
+                    read: DIALECT.version(&package.version).ok(),
                     control_identity: package.control_identity.clone(),
                 };
                 (package.name.clone(), pinned)
@@ -77,74 +102,30 @@ impl Pins {
         Ok(Pins { by_name })
     }
 
-    /// Whether this pin names `package` at all.
-    pub(super) fn names(&self, package: &str) -> bool {
-        self.by_name.contains_key(package)
+    /// The pin on `name`, if there is one.
+    fn on(&self, name: &ferrata::Name) -> Option<&Pinned> {
+        self.by_name.get(name.to_str()?)
     }
 
-    /// Whether `version` is the one this pin holds `package` to.
+    /// Whether the resolution is offered `record`: it names a package the pin
+    /// does not name, or it is the pinned version with the pinned control
+    /// segment.
     ///
-    /// Compared as apk versions rather than as strings, so a pin written with a
-    /// leading zero on the first component matches an index without one, and the
-    /// reverse. Answers `false` for a package the pin does not name.
-    pub(super) fn holds(&self, package: &str, version: &str) -> bool {
-        self.by_name
-            .get(package)
-            .and_then(|pinned| version::compare(&pinned.version, version))
-            .is_some_and(|order| order.is_eq())
-    }
-
-    /// How closely a candidate for `package` meets the pin on that name.
-    ///
-    /// What [`Index::merge`] chooses among a pinned name's candidates by. Two
-    /// repositories can offer the pinned version over different bytes, and
+    /// Two repositories can offer the pinned version over different bytes, and
     /// the one recording the pinned control segment is the package the pin
-    /// recorded, wherever it sits in the order. Answers [`Fit::Neither`] for a
-    /// package the pin does not name.
-    pub(super) fn fit(&self, package: &str, version: &str, control_identity: &str) -> Fit {
-        match self.by_name.get(package) {
-            Some(pinned) if self.holds(package, version) => {
-                if pinned.control_identity == control_identity {
-                    Fit::Exact
-                } else {
-                    Fit::Version
-                }
-            }
-            _ => Fit::Neither,
-        }
-    }
-
-    /// Holds a dependency on a package to the pin on its name.
-    ///
-    /// `None` where the pin does not name the package `dependency` names, or
-    /// holds it at a version the dependency accepts. Otherwise the refusal
-    /// names the dependency as `required_by` declares it, as
-    /// [`UnheldReason::Requirement`].
-    pub(super) fn refuse_requirement(
-        &self,
-        dependency: &Dependency,
-        required_by: &str,
-    ) -> Option<UnheldPin> {
-        let pinned = self.by_name.get(&dependency.name)?;
-        if dependency.accepts(Some(&pinned.version)) {
-            return None;
-        }
-        Some(UnheldPin {
-            package: dependency.name.clone(),
-            version: pinned.version.clone(),
-            reason: UnheldReason::Requirement {
-                requirement: dependency.to_string(),
-                required_by: required_by.to_string(),
-            },
+    /// recorded, wherever it sits in the order.
+    pub(super) fn offers(&self, record: &Record) -> bool {
+        self.on(record.name()).is_none_or(|pinned| {
+            pinned.holds(record.version())
+                && index::control_identity(record) == pinned.control_identity
         })
     }
 
-    /// Checks that the merged index can supply every pinned package at the
-    /// version and with the control segment the pin records.
+    /// Checks that the repositories offer every pinned package at the version
+    /// and with the control segment the pin records.
     ///
-    /// Run before the closure is computed, so a pin the repositories have moved
-    /// past refuses the resolution rather than quietly resolving to something
-    /// else.
+    /// Run before the resolution, so a pin the repositories have moved past
+    /// refuses it rather than quietly resolving to something else.
     ///
     /// # Errors
     ///
@@ -153,22 +134,39 @@ impl Pins {
     pub(super) fn check(&self, index: &Index) -> Result<(), AlpineError> {
         let mut unheld: Vec<UnheldPin> = Vec::new();
         for (package, pinned) in &self.by_name {
-            let reason = match index.get(package) {
-                None => Some(UnheldReason::Absent),
-                Some(offered) if !self.holds(package, &offered.version) => {
-                    Some(UnheldReason::Version {
-                        repository: offered.version.clone(),
-                    })
-                }
+            let offered: Vec<&Record> = index
+                .records()
+                .filter(|record| record.name() == package)
+                .collect();
+            let at_version: Vec<&Record> = offered
+                .iter()
+                .copied()
+                .filter(|record| pinned.holds(record.version()))
+                .collect();
+            let reason = if offered.is_empty() {
+                Some(UnheldReason::Absent)
+            } else if at_version.is_empty() {
+                // The latest, where several are offered: what a pin taken now
+                // would most likely hold.
+                let latest = offered
+                    .iter()
+                    .map(|record| record.version())
+                    .max()
+                    .map(Version::to_string)
+                    .unwrap_or_default();
+                Some(UnheldReason::Version { repository: latest })
+            } else if at_version
+                .iter()
+                .all(|record| index::control_identity(record) != pinned.control_identity)
+            {
                 // Compared exactly, unlike the Debian layer's hex digest: a
                 // control identity is base64, where case is part of the value.
-                Some(offered) if offered.control_identity != pinned.control_identity => {
-                    Some(UnheldReason::Identity {
-                        pin: pinned.control_identity.clone(),
-                        repository: offered.control_identity.clone(),
-                    })
-                }
-                Some(_) => None,
+                Some(UnheldReason::Identity {
+                    pin: pinned.control_identity.clone(),
+                    repository: index::control_identity(at_version[0]),
+                })
+            } else {
+                None
             };
             if let Some(reason) = reason {
                 unheld.push(UnheldPin {
@@ -187,18 +185,38 @@ impl Pins {
         unheld.sort_by(|a, b| a.package.cmp(&b.package));
         Err(AlpineError::Pin { unheld })
     }
-}
 
-/// How closely one candidate meets a pin, from least to most: the order is the
-/// preference [`Index::merge`] chooses by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Fit {
-    /// Another version than the pinned one.
-    Neither,
-    /// The pinned version, recording another control segment.
-    Version,
-    /// The pinned version and control segment: the package the pin recorded.
-    Exact,
+    /// The pin a refusal is about, where it is one: a requirement on a pinned
+    /// package that the pinned version does not meet, and that a version the
+    /// pin withheld would have.
+    ///
+    /// The refusal is then the pin's rather than the repositories', and it is
+    /// reported as [`UnheldReason::Requirement`], naming the requirement as the
+    /// requiring package declares it.
+    pub(super) fn unheld(&self, refusal: &Refusal, index: &Index) -> Option<UnheldPin> {
+        if refusal.kind() != RefusalKind::Unmet {
+            return None;
+        }
+        let requirement = refusal.requirement();
+        let entry = requirement.entry().filter(|entry| !entry.is_conflict())?;
+        let pinned = self.on(entry.name())?;
+        if pinned.read.as_ref().is_some_and(|read| entry.admits(read)) {
+            return None;
+        }
+        let withheld = index.records().any(|record| {
+            record.name() == entry.name() && !self.offers(record) && entry.admits(record.version())
+        });
+        // The entry's name is a pinned one, so text, and its version is in the
+        // grammar: each is written as the bytes it is.
+        withheld.then(|| UnheldPin {
+            package: entry.name().to_string(),
+            version: pinned.version.clone(),
+            reason: UnheldReason::Requirement {
+                requirement: entry.to_string(),
+                required_by: requirement.by().to_string(),
+            },
+        })
+    }
 }
 
 /// One package a [`pin`](super::AlpineBuilder::pin) could not be held to.
@@ -228,10 +246,10 @@ pub struct UnheldPin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnheldReason {
-    /// The repositories offer the package, and only at another version.
+    /// The repositories offer the package, and only at other versions.
     #[non_exhaustive]
     Version {
-        /// The version the repositories offer.
+        /// The latest version the repositories offer.
         repository: String,
     },
     /// The repositories offer no version of the package at all.
@@ -245,13 +263,14 @@ pub enum UnheldReason {
         /// The identity the repositories record.
         repository: String,
     },
-    /// A package the resolution selects requires the package at a version the
-    /// pinned one does not meet, and nothing else answers the requirement.
+    /// The resolution requires the package at a version the pinned one does
+    /// not meet, and that another version the repositories offer would.
     #[non_exhaustive]
     Requirement {
         /// The requirement as the requiring package declares it.
         requirement: String,
-        /// The package that declares it.
+        /// What declares it, as the resolution names it: a package, as
+        /// `name-version`, or the request.
         required_by: String,
     },
 }
@@ -288,29 +307,27 @@ impl fmt::Display for UnheldPin {
 }
 
 #[cfg(test)]
-impl Pins {
-    /// The pin a plan recording exactly `packages` makes, for a test that holds
-    /// records an index offers.
-    pub(super) fn holding(packages: &[super::index::Record]) -> Pins {
-        Pins::of(&Plan::project("v3.23", "x86_64", packages, &[]))
-            .expect("the packages name no package twice")
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provision::alpine::index::fixture;
+    use crate::provision::alpine::index::{self, fixture};
     use crate::provision::alpine::sign::identity_for_test as identity;
 
-    /// A merged index over `records`, each a `(name, version, identity seed)`
-    /// triple, under `pins`.
-    fn merged(records: &[(&str, &str, &str)], pins: &Pins) -> Index {
+    /// An index over `records`, each a `(name, version, identity seed)` triple.
+    fn merged(records: &[(&str, &str, &str)]) -> Index {
         let records: Vec<String> = records
             .iter()
             .map(|(name, version, seed)| fixture::record(name, version, "x86_64", seed, ""))
             .collect();
-        fixture::merged(&records, pins)
+        fixture::merged(&records)
+    }
+
+    /// What `pins` offers of `index`, as `name version` pairs.
+    fn offered(index: &Index, pins: &Pins) -> Vec<String> {
+        index
+            .records()
+            .filter(|record| pins.offers(record))
+            .map(|record| format!("{} {}", record.name(), record.version()))
+            .collect()
     }
 
     /// A plan holding exactly the given packages, as a pin is read from.
@@ -340,52 +357,31 @@ mod tests {
     }
 
     #[test]
-    fn a_pin_selects_its_version_rather_than_the_highest() {
+    fn a_pin_offers_its_version_alone() {
         // The whole of what a pin does to a resolution: the repository has
-        // published 2.0 since the pin was taken, and the pin still resolves 1.0.
+        // published 2.0 since the pin was taken, and only 1.0 is offered.
         let pins = pins(&[("p", "1.0-r0", "p")]);
-        let index = merged(&[("p", "1.0-r0", "p"), ("p", "2.0-r0", "q")], &pins);
-
-        assert_eq!(index.get("p").expect("p is in the index").version, "1.0-r0");
+        let index = merged(&[("p", "1.0-r0", "p"), ("p", "2.0-r0", "q")]);
+        assert_eq!(offered(&index, &pins), ["p 1.0-r0"]);
         pins.check(&index).expect("the pinned version is offered");
     }
 
     #[test]
-    fn the_pinned_version_wins_whichever_order_the_repositories_offer_it_in() {
-        for order in [["1.0-r0", "2.0-r0"], ["2.0-r0", "1.0-r0"]] {
-            let pins = pins(&[("p", "1.0-r0", "p")]);
-            let index = merged(&[("p", order[0], "p"), ("p", order[1], "p")], &pins);
-            assert_eq!(
-                index.get("p").expect("p is in the index").version,
-                "1.0-r0",
-                "offered in the order {order:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn an_unpinned_name_still_resolves_to_the_highest() {
+    fn an_unpinned_name_is_offered_at_every_version() {
         let pins = pins(&[("p", "1.0-r0", "p")]);
-        let index = merged(
-            &[
-                ("p", "1.0-r0", "p"),
-                ("p", "2.0-r0", "q"),
-                ("q", "1.0-r0", "q"),
-                ("q", "3.0-r0", "r"),
-            ],
-            &pins,
-        );
-        assert_eq!(index.get("p").expect("p is pinned").version, "1.0-r0");
-        assert_eq!(index.get("q").expect("q is not pinned").version, "3.0-r0");
+        let index = merged(&[
+            ("p", "1.0-r0", "p"),
+            ("p", "2.0-r0", "q"),
+            ("q", "1.0-r0", "q"),
+            ("q", "3.0-r0", "r"),
+        ]);
+        assert_eq!(offered(&index, &pins), ["p 1.0-r0", "q 1.0-r0", "q 3.0-r0"]);
     }
 
     #[test]
     fn a_version_the_repositories_have_moved_past_names_what_they_offer() {
         let pins = pins(&[("p", "1.0-r0", "p")]);
-        let index = merged(&[("p", "2.0-r0", "p")], &pins);
-
-        // The fallback keeps the highest so the failure can say what is there,
-        // and the check refuses before anything resolves against it.
+        let index = merged(&[("p", "3.0-r0", "p"), ("p", "2.0-r0", "q")]);
         match pins.check(&index) {
             Err(AlpineError::Pin { unheld }) => {
                 assert_eq!(unheld.len(), 1, "{unheld:?}");
@@ -393,8 +389,9 @@ mod tests {
                 assert_eq!(
                     unheld[0].reason,
                     UnheldReason::Version {
-                        repository: "2.0-r0".to_string(),
+                        repository: "3.0-r0".to_string(),
                     },
+                    "the latest of what is offered",
                 );
             }
             other => panic!("expected a pin refusal, got {other:?}"),
@@ -404,7 +401,7 @@ mod tests {
     #[test]
     fn a_package_the_repositories_dropped_is_reported_as_absent() {
         let pins = pins(&[("p", "1.0-r0", "p")]);
-        let index = merged(&[("q", "1.0-r0", "q")], &pins);
+        let index = merged(&[("q", "1.0-r0", "q")]);
         match pins.check(&index) {
             Err(AlpineError::Pin { unheld }) => {
                 assert_eq!(unheld[0].reason, UnheldReason::Absent);
@@ -419,7 +416,8 @@ mod tests {
         // republished the same version over different bytes. The version
         // matches, so only the identity says so.
         let pins = pins(&[("p", "1.0-r0", "p")]);
-        let index = merged(&[("p", "1.0-r0", "other")], &pins);
+        let index = merged(&[("p", "1.0-r0", "other")]);
+        assert!(offered(&index, &pins).is_empty());
         match pins.check(&index) {
             Err(AlpineError::Pin { unheld }) => {
                 assert_eq!(
@@ -435,28 +433,21 @@ mod tests {
     }
 
     #[test]
-    fn the_pinned_bytes_win_over_the_pinned_version_republished() {
+    fn the_pinned_bytes_are_offered_whichever_order_they_come_in() {
         // Two repositories offer the pinned version, one over the bytes the
         // pin recorded and one over others. The pin holds whichever order they
         // are configured in, since one of them serves exactly what it names.
         for seeds in [["p", "other"], ["other", "p"]] {
             let pins = pins(&[("p", "1.0-r0", "p")]);
-            let index = merged(
-                &[("p", "1.0-r0", seeds[0]), ("p", "1.0-r0", seeds[1])],
-                &pins,
-            );
-            assert_eq!(
-                index.get("p").expect("p is in the index").control_identity,
-                identity("p"),
-                "offered in the order {seeds:?}",
-            );
+            let index = merged(&[("p", "1.0-r0", seeds[0]), ("p", "1.0-r0", seeds[1])]);
+            let held: Vec<String> = index
+                .records()
+                .filter(|record| pins.offers(record))
+                .map(index::control_identity)
+                .collect();
+            assert_eq!(held, [identity("p")], "offered in the order {seeds:?}");
             pins.check(&index).expect("the pinned package is offered");
         }
-        // Where neither is the recorded one, the later shadows as it always
-        // does, and the refusal names what it records.
-        let pins = pins(&[("p", "1.0-r0", "p")]);
-        let index = merged(&[("p", "1.0-r0", "one"), ("p", "1.0-r0", "two")], &pins);
-        assert_eq!(index.get("p").unwrap().control_identity, identity("two"));
     }
 
     #[test]
@@ -464,8 +455,8 @@ mod tests {
         // apk version comparison, not string comparison: `01.0-r0` and `1.0-r0`
         // are the same version, and a hand-written pin may spell either.
         let pins = pins(&[("p", "01.0-r0", "p")]);
-        let index = merged(&[("p", "1.0-r0", "p")], &pins);
-        assert_eq!(index.get("p").expect("p is in the index").version, "1.0-r0");
+        let index = merged(&[("p", "1.0-r0", "p")]);
+        assert_eq!(offered(&index, &pins), ["p 1.0-r0"]);
         pins.check(&index)
             .expect("the leading zero is not a difference");
     }
@@ -479,7 +470,7 @@ mod tests {
             ("a", "1.0-r0", "a"),
             ("b", "1.0-r0", "b"),
         ]);
-        let index = merged(&[("b", "2.0-r0", "b"), ("c", "1.0-r0", "other")], &pins);
+        let index = merged(&[("b", "2.0-r0", "b"), ("c", "1.0-r0", "other")]);
         match pins.check(&index) {
             Err(AlpineError::Pin { unheld }) => {
                 let names: Vec<&str> = unheld.iter().map(|one| one.package.as_str()).collect();
@@ -504,10 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn no_pin_leaves_the_resolution_alone() {
+    fn no_pin_offers_everything() {
         let pins = Pins::none();
-        let index = merged(&[("p", "1.0-r0", "p"), ("p", "2.0-r0", "q")], &pins);
-        assert_eq!(index.get("p").expect("p is in the index").version, "2.0-r0");
+        let index = merged(&[("p", "1.0-r0", "p"), ("p", "2.0-r0", "q")]);
+        assert_eq!(offered(&index, &pins), ["p 1.0-r0", "p 2.0-r0"]);
         pins.check(&index).expect("an empty pin holds vacuously");
     }
 }

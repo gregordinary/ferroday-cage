@@ -37,8 +37,10 @@
 
 use std::collections::HashMap;
 
-use super::AlpineError;
-use super::index::{Dependency, NOARCH};
+use ferrata::dependency::Dependency;
+
+use super::index::NOARCH;
+use super::{AlpineError, DIALECT};
 use crate::provision::digest::Algorithm;
 
 /// The separator between a key and its value: one space either side, which is
@@ -153,10 +155,9 @@ impl PkgInfo {
                 ),
                 "replaces" => {
                     for entry in value.split_ascii_whitespace() {
-                        replaces.push(
-                            Dependency::parse(entry)
-                                .map_err(|reason| malformed(format!("replaces {reason}")))?,
-                        );
+                        replaces.push(DIALECT.dependency(entry).map_err(|err| {
+                            malformed(format!("replaces {entry:?}, which does not read: {err}"))
+                        })?);
                     }
                 }
                 // Everything else is single-valued. A key stated twice keeps
@@ -321,10 +322,10 @@ mod tests {
         )
         .expect("the member parses");
         assert_eq!(info.replaces.len(), 3);
-        assert_eq!(info.replaces[0].name, "b");
-        assert!(info.replaces[0].constraint.is_none());
-        assert_eq!(info.replaces[1].name, "c");
-        assert!(info.replaces[1].constraint.is_some());
+        assert_eq!(info.replaces[0].name(), "b");
+        assert_eq!(info.replaces[0].to_string(), "b");
+        assert_eq!(info.replaces[1].name(), "c");
+        assert_eq!(info.replaces[1].to_string(), "c<2.0");
         assert_eq!(info.replaces_priority, Some(1000));
     }
 
