@@ -5165,10 +5165,10 @@ mod tests {
         tar.finish()
     }
 
-    /// A `.deb` around a `data.tar`, with the `debian-binary` member that
-    /// precedes it. No control member: extraction never reads one.
+    /// A `.deb` around a `data.tar`, with the members that precede it: an empty
+    /// control member, since extraction never reads one.
     fn deb_of(data: &[u8]) -> Vec<u8> {
-        ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n"), ("data.tar", data)])
+        ferroday_cage_testkit::deb::deb(data)
     }
 
     /// Writes each `.deb` into `archives` under its digest, as the download

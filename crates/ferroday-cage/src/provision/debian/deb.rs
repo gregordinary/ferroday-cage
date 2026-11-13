@@ -66,7 +66,7 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     extraction: &mut Extraction,
     on_entry: &mut OnEntry<'_>,
 ) -> Result<(), ProvisionError> {
-    let (_, size) = seek_to_member(path, deb, "data.tar", None)?;
+    let (_, size) = seek_to_member(path, deb, Member::Data, None)?;
     // Bounded by the member's declared size, so the tar stream ends where the
     // member ends instead of running on into the container's next header.
     let member = deb.take(size);
@@ -75,19 +75,54 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     extraction.extract(&mut archive, on_entry)
 }
 
-/// Positions `deb`, which reads the `.deb` at `path`, at the data of its first
-/// member whose name begins with `member`, and returns where in the `.deb` that
-/// data begins and the size the member declares.
+/// A member of a `.deb` a caller reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Member {
+    /// `control.tar`, the package's control file and maintainer scripts.
+    Control,
+    /// `data.tar`, the files the package installs.
+    Data,
+}
+
+impl Member {
+    /// The member's name, without the compression suffix its name may carry.
+    fn stem(self) -> &'static str {
+        match self {
+            Member::Control => "control.tar",
+            Member::Data => "data.tar",
+        }
+    }
+}
+
+/// The compression suffixes a `control.tar` or `data.tar` member's name may
+/// carry: none, and the three this reader decodes.
+const SUFFIXES: [&str; 4] = ["", ".gz", ".xz", ".zst"];
+
+/// The most of the `debian-binary` member read for its format version line.
 ///
-/// The name is matched as a prefix because a `.deb`'s compressed members carry
-/// the compression as a suffix — `control.tar.xz`, `data.tar.zst` — and which
-/// one a package used is not the caller's concern.
+/// The line is `2.0` and a newline in every `.deb` there is; what follows it is
+/// a later format's business, and is not read.
+const VERSION_LINE: u64 = 64;
+
+/// Positions `deb`, which reads the `.deb` at `path`, at the data of `wanted`,
+/// and returns where in the `.deb` that data begins and the size the member
+/// declares.
+///
+/// The members are held to the order dpkg-deb holds them to, as measured
+/// against dpkg-deb 1.22: `debian-binary` first, stating format 2; then
+/// `control.tar`, then `data.tar`, each named with no suffix or with that of a
+/// compression this reader decodes. A member whose name begins with `_` is
+/// passed over between them, which the format reserves for that, and anything
+/// else where the next one belongs is refused. What follows the member wanted
+/// is never read, so members after `data.tar` are passed over as dpkg-deb
+/// passes over them. A layout dpkg-deb refuses is refused here too, so the
+/// members this reader takes from a `.deb` are the ones dpkg would. dpkg-deb
+/// also reads a `data.tar` compressed with bzip2 or lzma, which no archive this
+/// crate reads publishes and which this reader refuses by name.
 ///
 /// The `ar` container records each member's size in its header, so the members
 /// before the one wanted are seeked over rather than read, and the members after
-/// it are never touched. Seeking rather than scanning also keeps the read
-/// indifferent to member order, which a reader that stopped at the first member
-/// it streamed past would not be.
+/// it are never touched.
 ///
 /// `limit` bounds what the member may declare, for a caller that will read it
 /// into memory rather than stream it. It is checked against the declared size
@@ -100,7 +135,7 @@ pub(crate) fn extract_deb<R: Read + Seek>(
 fn seek_to_member<R: Read + Seek>(
     path: &Path,
     deb: &mut R,
-    member: &str,
+    wanted: Member,
     limit: Option<u64>,
 ) -> Result<(u64, u64), ProvisionError> {
     let io = |err: io::Error| ProvisionError::io("reading", path, err);
@@ -124,6 +159,8 @@ fn seek_to_member<R: Read + Seek>(
         ));
     }
 
+    // Which member comes next: `None` for `debian-binary`.
+    let mut next: Option<Member> = None;
     let mut offset = AR_MAGIC.len() as u64;
     while offset < length {
         // A trailing newline padding byte between the last member and the
@@ -157,13 +194,48 @@ fn seek_to_member<R: Read + Seek>(
             )
         })?;
 
-        let wanted = name.starts_with(member);
-        if let Some(limit) = limit.filter(|limit| wanted && size > *limit) {
+        let is_wanted = match next {
+            None if name == "debian-binary" => false,
+            None => {
+                return Err(refused(
+                    offset,
+                    format!(
+                        "the .deb's first member is {name:?}, where the format requires \
+                         debian-binary"
+                    ),
+                ));
+            }
+            // Reserved for members a reader passes over.
+            Some(_) if name.starts_with('_') => false,
+            Some(member) => {
+                let suffix = name.strip_prefix(member.stem()).ok_or_else(|| {
+                    refused(
+                        offset,
+                        format!(
+                            "the .deb holds {name:?} where its {} belongs",
+                            member.stem()
+                        ),
+                    )
+                })?;
+                if !SUFFIXES.contains(&suffix) {
+                    return Err(refused(
+                        offset,
+                        format!(
+                            "the .deb's member {name:?} names a compression this reader does \
+                             not decode"
+                        ),
+                    ));
+                }
+                member == wanted
+            }
+        };
+        if let Some(limit) = limit.filter(|limit| is_wanted && size > *limit) {
             return Err(refused(
                 offset,
                 format!(
-                    "the .deb's {member} member declares {size} bytes, more than the {limit} \
-                     accepted for it"
+                    "the .deb's {} member declares {size} bytes, more than the {limit} accepted \
+                     for it",
+                    wanted.stem(),
                 ),
             ));
         }
@@ -178,15 +250,61 @@ fn seek_to_member<R: Read + Seek>(
                 )
             })?;
 
-        if wanted {
+        if is_wanted {
             return Ok((data, size));
         }
+        next = match next {
+            None => {
+                check_format(path, deb, data, size)?;
+                Some(Member::Control)
+            }
+            Some(_) if name.starts_with('_') => next,
+            Some(_) => Some(Member::Data),
+        };
 
         // Members are padded to an even offset with a single newline.
         offset = end + (size & 1);
         deb.seek(SeekFrom::Start(offset)).map_err(io)?;
     }
-    Err(refused(length, format!("the .deb has no {member} member")))
+    let missing = next.map_or("debian-binary", Member::stem);
+    Err(refused(length, format!("the .deb has no {missing} member")))
+}
+
+/// Refuses a `.deb` whose `debian-binary` member, `size` bytes at `at`, does
+/// not state format 2.
+///
+/// The member's first line is the format version: digits, a dot, digits, and
+/// a newline, the major version 2 and the minor any. dpkg-deb reads a later
+/// minor version as format 2, and ignores lines after the first, so this does
+/// too; a major version other than 2 is a format it does not read.
+fn check_format<R: Read + Seek>(
+    path: &Path,
+    deb: &mut R,
+    at: u64,
+    size: u64,
+) -> Result<(), ProvisionError> {
+    let mut head = vec![0u8; size.min(VERSION_LINE) as usize];
+    deb.read_exact(&mut head)
+        .map_err(|err| ProvisionError::io("reading", path, err))?;
+    let line = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|end| &head[..end]);
+    let format_two = line.is_some_and(|line| {
+        let Some(dot) = line.iter().position(|byte| *byte == b'.') else {
+            return false;
+        };
+        let (major, minor) = (&line[..dot], &line[dot + 1..]);
+        let digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+        digits(major) && digits(minor) && major.iter().skip_while(|digit| **digit == b'0').eq(b"2")
+    });
+    if !format_two {
+        return Err(refused(
+            at,
+            "the .deb's debian-binary does not begin with a format 2 version line",
+        ));
+    }
+    Ok(())
 }
 
 /// Builds [`ProvisionError::Archive`] for a `.deb` refused for what it
@@ -224,7 +342,7 @@ pub(crate) fn read_control_from<R: Read + Seek>(
     path: &Path,
     deb: &mut R,
 ) -> Result<String, ProvisionError> {
-    let (at, size) = seek_to_member(path, deb, "control.tar", Some(CONTROL_MEMBER_LIMIT))?;
+    let (at, size) = seek_to_member(path, deb, Member::Control, Some(CONTROL_MEMBER_LIMIT))?;
     let mut member = vec![0u8; size as usize];
     deb.read_exact(&mut member)
         .map_err(|err| ProvisionError::io("reading", path, err))?;
@@ -277,7 +395,7 @@ mod tests {
 
     /// Seeks to `member`, reporting the reason rather than a typed error, and
     /// returns it with the bytes the member holds.
-    fn member_of(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
+    fn member_of(archive: &[u8], member: Member) -> Result<Vec<u8>, String> {
         let mut cursor = Cursor::new(archive);
         let (_, size) = seek_to_member(Path::new("tool.deb"), &mut cursor, member, None)
             .map_err(|err| ErrorChain::new(&err).to_string())?;
@@ -297,11 +415,8 @@ mod tests {
             ("control.tar.gz", b"odd"),
             ("data.tar.xz", b"payload!"),
         ]);
-        assert_eq!(member_of(&archive, "control.tar").unwrap(), b"odd");
-        assert_eq!(member_of(&archive, "data.tar").unwrap(), b"payload!");
-        // The name is matched as a prefix, because the compression suffix is
-        // the package's choice and not the reader's concern.
-        assert_eq!(member_of(&archive, "debian-binary").unwrap(), b"2.0\n");
+        assert_eq!(member_of(&archive, Member::Control).unwrap(), b"odd");
+        assert_eq!(member_of(&archive, Member::Data).unwrap(), b"payload!");
     }
 
     /// A `.deb` on a medium that fails every read past its first `good`
@@ -352,13 +467,17 @@ mod tests {
     #[test]
     fn a_member_the_archive_does_not_carry_is_reported_by_name() {
         let archive = ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n")]);
-        let reason = member_of(&archive, "data.tar").unwrap_err();
+        let reason = member_of(&archive, Member::Data).unwrap_err();
+        assert!(reason.contains("no control.tar member"), "{reason}");
+        let archive =
+            ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n"), ("control.tar", b"")]);
+        let reason = member_of(&archive, Member::Data).unwrap_err();
         assert!(reason.contains("no data.tar member"), "{reason}");
     }
 
     #[test]
     fn a_non_ar_input_is_rejected() {
-        let reason = member_of(b"not an ar archive at all", "data.tar").unwrap_err();
+        let reason = member_of(b"not an ar archive at all", Member::Data).unwrap_err();
         assert!(reason.contains("its magic is wrong"), "{reason}");
     }
 
@@ -367,14 +486,15 @@ mod tests {
         // The container's own end bounds every declared size, so a header
         // claiming more than the file holds is refused before anything is read
         // or allocated on its word.
-        let mut archive = AR_MAGIC.to_vec();
+        let mut archive =
+            ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n"), ("control.tar", b"")]);
         let mut header = [b' '; AR_HEADER];
         header[.."data.tar".len()].copy_from_slice(b"data.tar");
         header[48..58].copy_from_slice(b"9999999999");
         header[58] = b'`';
         header[59] = b'\n';
         archive.extend_from_slice(&header);
-        let reason = member_of(&archive, "data.tar").unwrap_err();
+        let reason = member_of(&archive, Member::Data).unwrap_err();
         assert!(reason.contains("runs past its end"), "{reason}");
     }
 
@@ -447,16 +567,113 @@ mod tests {
     }
 
     #[test]
-    fn the_control_member_is_found_after_the_payload() {
-        // Members are located by seeking on their declared sizes, so a .deb
-        // that orders its members unconventionally reads the same. A reader
-        // that streamed until it met a control member would too, but would
-        // have paid for the payload to get there.
+    fn members_out_of_the_order_dpkg_reads_them_in_are_refused() {
+        // dpkg-deb refuses a data member ahead of the control member, so a
+        // reader that found the control member wherever it was would accept a
+        // package dpkg will not install.
         let stanza = b"Package: tool\nVersion: 2.0\nArchitecture: all\n";
-        let archive = deb(stanza, 8192, true);
-        let control = read_control_from(Path::new("tool.deb"), &mut Cursor::new(&archive))
-            .expect("the control member is read");
-        assert_eq!(control, String::from_utf8_lossy(stanza));
+        let err = read_control_from(
+            Path::new("tool.deb"),
+            &mut Cursor::new(&deb(stanza, 8192, true)),
+        )
+        .expect_err("a payload ahead of the control member is refused");
+        assert!(
+            err.to_string()
+                .contains("holds \"data.tar\" where its control.tar belongs"),
+            "{err}"
+        );
+
+        let control = control_tar(stanza);
+        let refused = |members: &[(&str, &[u8])]| {
+            member_of(&ferroday_cage_testkit::deb::ar(members), Member::Data).unwrap_err()
+        };
+        // Something other than debian-binary first.
+        let reason = refused(&[
+            ("control.tar", &control),
+            ("debian-binary", b"2.0\n"),
+            ("data.tar", b"payload!"),
+        ]);
+        assert!(
+            reason.contains("first member is \"control.tar\""),
+            "{reason}"
+        );
+        // A member between the two that is not reserved for passing over.
+        let reason = refused(&[
+            ("debian-binary", b"2.0\n"),
+            ("control.tar", &control),
+            ("extra", b"x"),
+            ("data.tar", b"payload!"),
+        ]);
+        assert!(
+            reason.contains("holds \"extra\" where its data.tar belongs"),
+            "{reason}"
+        );
+        // A second control member, which dpkg-deb refuses too.
+        let reason = refused(&[
+            ("debian-binary", b"2.0\n"),
+            ("control.tar", &control),
+            ("control.tar.gz", &control),
+            ("data.tar", b"payload!"),
+        ]);
+        assert!(reason.contains("where its data.tar belongs"), "{reason}");
+        // A compression this reader does not decode.
+        let reason = refused(&[
+            ("debian-binary", b"2.0\n"),
+            ("control.tar", &control),
+            ("data.tar.bz9", b"payload!"),
+        ]);
+        assert!(reason.contains("names a compression"), "{reason}");
+    }
+
+    #[test]
+    fn members_dpkg_passes_over_are_passed_over() {
+        // A member whose name begins with `_` between the required ones, and
+        // anything after the data member, as dpkg-deb reads them.
+        let control = control_tar(b"Package: tool\n");
+        let archive = ferroday_cage_testkit::deb::ar(&[
+            ("debian-binary", b"2.0\n"),
+            ("_signature", b"x"),
+            ("control.tar", &control),
+            ("_extra", b"y"),
+            ("data.tar.gz", b"payload!"),
+            ("trailing", b"z"),
+        ]);
+        assert_eq!(member_of(&archive, Member::Data).unwrap(), b"payload!");
+        assert_eq!(member_of(&archive, Member::Control).unwrap(), control);
+    }
+
+    #[test]
+    fn debian_binary_states_format_two_as_dpkg_reads_it() {
+        // Each as dpkg-deb 1.22 answers it: a later minor version and lines
+        // after the first are format 2, and leading zeros are a number's.
+        for version in [&b"2.0\n"[..], b"2.1\nextra\n", b"02.0\n", b"2.10\n"] {
+            let archive = ferroday_cage_testkit::deb::ar(&[
+                ("debian-binary", version),
+                ("control.tar", b"odd"),
+            ]);
+            member_of(&archive, Member::Control)
+                .unwrap_or_else(|reason| panic!("{version:?}: {reason}"));
+        }
+        // Another major version, no newline, no minor, junk after the number.
+        for version in [
+            &b"3.0\n"[..],
+            b"1.0\n",
+            b"2.0",
+            b"2\n",
+            b"2.\n",
+            b"2.0x\n",
+            b" 2.0\n",
+        ] {
+            let archive = ferroday_cage_testkit::deb::ar(&[
+                ("debian-binary", version),
+                ("control.tar", b"odd"),
+            ]);
+            let reason = member_of(&archive, Member::Control).unwrap_err();
+            assert!(
+                reason.contains("format 2 version line"),
+                "{version:?}: {reason}"
+            );
+        }
     }
 
     #[test]
@@ -470,7 +687,7 @@ mod tests {
         assert!(
             ErrorChain::new(&err)
                 .to_string()
-                .contains("no control.tar member"),
+                .contains("where its control.tar belongs"),
             "{err}"
         );
     }

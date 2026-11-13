@@ -802,6 +802,12 @@ consumer upgrading can skip it.
   as an escape. Those paths include an archive entry's own name, and a refused
   entry named with a terminal escape sequence carried the sequence raw onto the
   terminal the error was printed on.
+- The Debian layer reads a `.deb` only where its members are laid out as
+  dpkg-deb requires: `debian-binary` first, stating format 2, then
+  `control.tar`, then `data.tar`, with only members whose names begin with `_`
+  between them. It found each member wherever it lay, and never read
+  `debian-binary`, so a package dpkg-deb refuses for its layout was read and
+  installed.
 
 ### Internal
 
