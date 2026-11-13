@@ -25,9 +25,12 @@
 //! ([`fixture`]), and a fixture repository's `file://` URL ([`deb`]). The
 //! features that remain gate this crate's own dependencies:
 //!
+//! - `compress`: gzip, xz and zstd encoders, for `compress`.
 //! - `hex`: SHA-256, for `hex` and the repository half of [`deb`].
 //! - `pty`: rustix's terminal calls, for `pty`.
 
+#[cfg(feature = "compress")]
+pub mod compress;
 pub mod deb;
 pub mod fd;
 pub mod fixture;

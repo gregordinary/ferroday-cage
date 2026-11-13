@@ -18,6 +18,11 @@ publish = false
 # documentation says which.
 ferroday-cage = { path = "../ferroday-cage", default-features = false }
 sha2 = { version = "0.11", optional = true }
+# The one-shot compressors, at the versions and backends the library reads
+# them with.
+flate2 = { version = "1.1", optional = true, default-features = false, features = ["rust_backend"] }
+lzma-rust2 = { version = "0.25", optional = true, default-features = false, features = ["std", "xz", "encoder"] }
+ruzstd = { version = "0.9.1", optional = true, default-features = false, features = ["std"] }
 # The process helpers wait for a child without reaping it and end a bounded run
 # by its process group, a test waits on a descriptor through `poll`, a probe
 # closes its standard descriptors and puts them back, and a test sets and reads
@@ -25,6 +30,8 @@ sha2 = { version = "0.11", optional = true }
 rustix = { version = "1.1.4", features = ["event", "fs", "process", "stdio"] }
 
 [features]
+# Documents compressed whole with gzip, xz and zstd.
+compress = ["dep:flate2", "dep:lzma-rust2", "dep:ruzstd"]
 # SHA-256 hex digests, and the Debian fixture repository whose index states
 # them.
 hex = ["dep:sha2"]

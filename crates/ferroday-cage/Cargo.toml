@@ -315,7 +315,7 @@ test = true
 # and the pseudoterminal harness. It never ships, and none of its features
 # enables one of this crate's, so a test target compiles under exactly the
 # features its command line and its `required-features` select.
-ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = ["hex", "pty"] }
+ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = ["compress", "hex", "pty"] }
 toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"

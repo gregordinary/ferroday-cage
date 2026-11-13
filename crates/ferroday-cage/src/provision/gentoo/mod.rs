@@ -2888,7 +2888,6 @@ impl GentooBuilder {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::Write;
 
     use pgp::composed::SignedSecretKey;
     use pgp::types::KeyDetails as _;
@@ -3645,9 +3644,7 @@ mod tests {
 
     /// `body` as a gzip member, which is how the archive publishes the index.
     fn gzipped(body: &str) -> Vec<u8> {
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(body.as_bytes()).expect("gzip accepts it");
-        encoder.finish().expect("the member closes")
+        ferroday_cage_testkit::compress::gzip(body.as_bytes())
     }
 
     /// The mirror-relative URL of `name` in the binhost this test reads.

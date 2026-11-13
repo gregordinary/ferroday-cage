@@ -15,6 +15,7 @@
 //! helper.
 #![allow(unused_imports, dead_code)]
 
+pub use ferroday_cage_testkit::compress;
 pub use ferroday_cage_testkit::fd::{is_open, readable_by, with_standard_streams_closed};
 pub use ferroday_cage_testkit::process::{
     controlling_terminal, cpu_ticks, finish_bounded, process_exists, process_parent, process_state,

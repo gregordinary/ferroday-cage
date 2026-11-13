@@ -777,15 +777,10 @@ mod tests {
         // writes back whichever it found — so Alpine's own published root
         // carries the compressed name and no root this layer writes does. A base
         // is read from either, and what comes out is the same script.
-        use std::io::Write as _;
 
         let (identity, _, _) = first_record();
         let body = b"#!/bin/sh\nexit 0\n";
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        encoder
-            .write_all(&first_record_archive(body))
-            .expect("the archive compresses");
-        let compressed = encoder.finish().expect("the stream closes");
+        let compressed = ferroday_cage_testkit::compress::gzip(&first_record_archive(body));
 
         let dir = root(
             "compressed-scripts",

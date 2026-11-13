@@ -3796,11 +3796,8 @@ mod tests {
         // the decompression the way the compressed length bounds the fetch: a
         // few megabytes of xz may expand into gigabytes the digest says nothing
         // about. Refused, not truncated, so no prefix of it is ever parsed.
-        use std::io::Write as _;
         let text = b"Package: p\nVersion: 1\n".repeat(64);
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&text).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = ferroday_cage_testkit::compress::gzip(&text);
         let url = "https://mirror.example/debian/dists/trixie/main/binary-amd64/Packages.gz";
 
         let err = decompress_index(url, &compressed, text.len() as u64 - 1)
@@ -4136,11 +4133,8 @@ mod tests {
         // A corrupt stream and an over-long one are different faults with
         // different remedies, so they read differently, and the decoder's own
         // refusal is the cause rather than a string folded into the reason.
-        use std::io::Write as _;
         let text = b"Package: p\nVersion: 1\n".repeat(64);
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&text).unwrap();
-        let mut corrupt = encoder.finish().unwrap();
+        let mut corrupt = ferroday_cage_testkit::compress::gzip(&text);
         // Past the ten-byte header, inside the deflate stream.
         for byte in &mut corrupt[12..20] {
             *byte ^= 0xff;
@@ -4164,11 +4158,8 @@ mod tests {
     fn a_release_that_states_the_uncompressed_length_bounds_the_index() {
         // End to end: the release lists the compressed index the mirror serves
         // and an uncompressed length shorter than what it expands to.
-        use std::io::Write as _;
         let text = b"Package: p\nVersion: 1\nArchitecture: amd64\n".repeat(16);
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&text).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = ferroday_cage_testkit::compress::gzip(&text);
         let release = format!(
             "Suite: trixie\nArchitectures: amd64\nComponents: main\nSHA256:\n {} {} \
              main/binary-amd64/Packages.gz\n {} {} main/binary-amd64/Packages\n",

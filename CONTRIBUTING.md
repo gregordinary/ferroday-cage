@@ -606,6 +606,7 @@ report name a package and its version bare.
 | Read a field of the `status` record a command in a sandbox printed | `ferroday_cage_testkit::process::status_field` |
 | Encode a POSIX access control list, set or read an extended attribute, or ask whether a filesystem holds one, in a test | `ferroday_cage_testkit::xattr` |
 | Lay an overlay whiteout into an upper by hand in a test | `ferroday_cage_testkit::overlay::whiteout` |
+| Compress a document whole with gzip, xz or zstd in a test | `ferroday_cage_testkit::compress`, or an explicit level where a test asserts the size |
 
 Two guards hold the table to the code, and each covers what the other cannot:
 

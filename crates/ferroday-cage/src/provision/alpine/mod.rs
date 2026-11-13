@@ -3809,13 +3809,7 @@ mod tests {
     /// `tree`: a signature segment no anchor holds, the control segment, and
     /// the data segment the control segment's `datahash` binds.
     fn container_of(pkginfo: &str, tree: &[u8]) -> Vec<u8> {
-        use std::io::Write as _;
-        let gzip = |tar: &[u8]| {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            encoder.write_all(tar).expect("the segment compresses");
-            encoder.finish().expect("the segment closes")
-        };
+        use ferroday_cage_testkit::compress::gzip;
         let data = gzip(tree);
         let pkginfo = format!(
             "{pkginfo}datahash = {}\n",

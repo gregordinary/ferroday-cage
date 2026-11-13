@@ -647,16 +647,13 @@ mod tests {
     /// replaced, so this has to produce something the reader accepts as a
     /// segment; what varies is only what the tar inside it holds.
     fn segment(members: &[(&str, &[u8])]) -> Vec<u8> {
-        use std::io::Write;
         let mut tar = ferroday_cage_testkit::tar::Tar::new();
         for (name, data) in members {
             tar.file(name, 0o644, data);
         }
         let tar = tar.finish();
 
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&tar).expect("writing to a vector");
-        encoder.finish().expect("the segment compresses")
+        ferroday_cage_testkit::compress::gzip(&tar)
     }
 
     /// The signature member a published container carries: its name, and the

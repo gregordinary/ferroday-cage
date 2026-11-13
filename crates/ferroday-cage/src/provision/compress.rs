@@ -910,14 +910,8 @@ mod tests {
         // silently at the first, and the tar reader tolerates a missing
         // terminator at end of input, so the result would be a rootfs missing
         // everything past the first member with no error anywhere.
-        use flate2::{Compression, write::GzEncoder};
-        use std::io::Write as _;
+        use ferroday_cage_testkit::compress::gzip;
 
-        let gzip = |bytes: &[u8]| {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-            encoder.write_all(bytes).unwrap();
-            encoder.finish().unwrap()
-        };
         let first = tar_of("first", b"one\n");
         let second = tar_of("second", b"two\n");
         let mut stream = gzip(&first);
@@ -934,16 +928,6 @@ mod tests {
         assert_eq!(decoded, expected, "both members decoded");
     }
 
-    /// `bytes` as one gzip member.
-    fn gzip_member(bytes: &[u8]) -> Vec<u8> {
-        use flate2::{Compression, write::GzEncoder};
-        use std::io::Write as _;
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(bytes).unwrap();
-        encoder.finish().unwrap()
-    }
-
     #[test]
     fn zero_padding_after_the_last_gzip_member_is_read_as_gzip_reads_it() {
         // What gzip 1.12 reads silently, measured: any run of zeros from the
@@ -952,7 +936,7 @@ mod tests {
         let first = tar_of("first", b"one\n");
         let second = tar_of("second", b"two\n");
         for zeros in [1, 4, 10_117] {
-            let mut stream = gzip_member(&first);
+            let mut stream = ferroday_cage_testkit::compress::gzip(&first);
             stream.resize(stream.len() + zeros, 0);
             assert_eq!(
                 decode_all(&stream).expect("padding is read past"),
@@ -960,8 +944,8 @@ mod tests {
                 "{zeros}"
             );
 
-            let mut stream = gzip_member(&first);
-            stream.extend_from_slice(&gzip_member(&second));
+            let mut stream = ferroday_cage_testkit::compress::gzip(&first);
+            stream.extend_from_slice(&ferroday_cage_testkit::compress::gzip(&second));
             stream.resize(stream.len() + zeros, 0);
             assert_eq!(
                 decode_all(&stream).expect("both members, then padding"),
@@ -977,7 +961,7 @@ mod tests {
         // ignored" or "unexpected end of file": zeros that a member follows,
         // zeros that anything but zeros follows, and bytes that are not zeros
         // and not a member.
-        let member = gzip_member(&tar_of("first", b"one\n"));
+        let member = ferroday_cage_testkit::compress::gzip(&tar_of("first", b"one\n"));
         let between = [&member[..], &[0u8; 16], &member].concat();
         let then_junk = [&member[..], &[0u8; 16], b"x"].concat();
         let junk = [&member[..], b"ABCD"].concat();
@@ -1513,14 +1497,7 @@ mod tests {
     fn concatenated_xz_streams_all_decode() {
         // The same shape for xz, which the module claims to handle and no test
         // pinned.
-        let xz = |bytes: &[u8]| {
-            let mut out = Vec::new();
-            let mut writer = lzma_rust2::XzWriter::new(&mut out, lzma_rust2::XzOptions::default())
-                .expect("an xz writer");
-            std::io::Write::write_all(&mut writer, bytes).unwrap();
-            writer.finish().expect("the xz stream finishes");
-            out
-        };
+        use ferroday_cage_testkit::compress::xz;
         let first = tar_of("first", b"one\n");
         let second = tar_of("second", b"two\n");
         let mut stream = xz(&first);
@@ -1552,11 +1529,6 @@ mod tests {
         writer.finish().expect("the xz stream finishes");
 
         assert_eq!(decode_all(&out).expect("the chain decodes"), payload);
-    }
-
-    /// Compresses `data` into a single zstd frame.
-    fn zstd_frame(data: &[u8]) -> Vec<u8> {
-        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
     }
 
     /// Builds a skippable frame carrying `content`.
@@ -1593,15 +1565,9 @@ mod tests {
         // Each decoder fails the read its source failed, and what arrives is
         // the source's failure, unmarked: a caller that retries a transport
         // failure has to be able to see one, and not a corrupt stream.
-        let gzip = {
-            use std::io::Write as _;
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            encoder.write_all(&[7u8; 4096]).unwrap();
-            encoder.finish().unwrap()
-        };
+        let gzip = ferroday_cage_testkit::compress::gzip(&[7u8; 4096]);
         let xz = xz_stream(Check::Crc32, &[Block::new(4096, b"payload")]);
-        let zstd = zstd_frame(&[7u8; 4096]);
+        let zstd = ferroday_cage_testkit::compress::zstd(&[7u8; 4096]);
         for (codec, stream) in [("gzip", gzip), ("xz", xz), ("zstd", zstd)] {
             // Cut short of its end, so the decoder needs a read past the cut.
             let (_, mut reader) =
@@ -1622,13 +1588,7 @@ mod tests {
         // caused; and a stream the decoder refuses carries the decoder's own
         // reason. A plain document is held to the bound as a compressed one is.
         let text = b"a document of thirty-two bytes!\n";
-        let gzip = {
-            use std::io::Write as _;
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            encoder.write_all(text).unwrap();
-            encoder.finish().unwrap()
-        };
+        let gzip = ferroday_cage_testkit::compress::gzip(text);
         for bytes in [&text[..], &gzip] {
             assert_eq!(inflate(bytes, 32).expect("at the bound"), text);
             assert!(matches!(inflate(bytes, 31), Err(Inflate::Overlong)));
@@ -1645,7 +1605,8 @@ mod tests {
 
     #[test]
     fn a_refusal_is_marked_as_the_decoders() {
-        let mut corrupt = zstd_frame(b"a frame that states its checksum");
+        let mut corrupt =
+            ferroday_cage_testkit::compress::zstd(b"a frame that states its checksum");
         *corrupt.last_mut().unwrap() ^= 0x01;
         let (_, mut reader) = decoder(&corrupt[..]).expect("the head reads");
         let err = reader.read_to_end(&mut Vec::new()).expect_err("refused");
@@ -1661,8 +1622,8 @@ mod tests {
     fn multi_frame_zstd_decodes_every_frame() {
         // Two concatenated frames, as `pzstd` emits: both must be decoded, not
         // just the first.
-        let mut stream = zstd_frame(b"first frame ");
-        stream.extend_from_slice(&zstd_frame(b"second frame"));
+        let mut stream = ferroday_cage_testkit::compress::zstd(b"first frame ");
+        stream.extend_from_slice(&ferroday_cage_testkit::compress::zstd(b"second frame"));
         assert_eq!(decode_all(&stream).unwrap(), b"first frame second frame");
     }
 
@@ -1670,7 +1631,7 @@ mod tests {
     fn a_leading_skippable_frame_is_skipped() {
         // A skippable frame ahead of the data frame, the shape `pzstd` writes.
         let mut stream = skippable_frame(b"pzstd metadata here");
-        stream.extend_from_slice(&zstd_frame(b"payload"));
+        stream.extend_from_slice(&ferroday_cage_testkit::compress::zstd(b"payload"));
         assert_eq!(decode_all(&stream).unwrap(), b"payload");
     }
 
@@ -1684,7 +1645,7 @@ mod tests {
         // source with one reusable buffer decodes them in a small fraction of
         // the bound below, which is generous so as to hold on a loaded machine.
         let mut stream = skippable_frame(b"").repeat(100_000);
-        stream.extend_from_slice(&zstd_frame(b"payload"));
+        stream.extend_from_slice(&ferroday_cage_testkit::compress::zstd(b"payload"));
         let started = std::time::Instant::now();
         assert_eq!(decode_all(&stream).unwrap(), b"payload");
         let took = started.elapsed();
@@ -1701,9 +1662,9 @@ mod tests {
         // the most chances to lose one. A small skippable frame, two data
         // frames, and a larger skippable frame between them.
         let mut stream = skippable_frame(b"xy");
-        stream.extend_from_slice(&zstd_frame(b"first frame "));
+        stream.extend_from_slice(&ferroday_cage_testkit::compress::zstd(b"first frame "));
         stream.extend_from_slice(&skippable_frame(&[7; 100]));
-        stream.extend_from_slice(&zstd_frame(b"second frame"));
+        stream.extend_from_slice(&ferroday_cage_testkit::compress::zstd(b"second frame"));
         assert_eq!(
             decode_one_byte_at_a_time(&stream).unwrap(),
             b"first frame second frame",
@@ -1720,7 +1681,7 @@ mod tests {
         // frame decodes to whatever the corruption makes of it unless the two
         // are compared here. Altering the stated checksum is the corruption
         // that leaves everything else about the frame intact.
-        let frame = zstd_frame(b"a frame that states its checksum");
+        let frame = ferroday_cage_testkit::compress::zstd(b"a frame that states its checksum");
         assert_ne!(
             frame[4] & CONTENT_CHECKSUM_FLAG,
             0,
@@ -1748,7 +1709,7 @@ mod tests {
         // A skippable frame shorter than the header peek: the pushback path must
         // return the over-read bytes so the following data frame still decodes.
         let mut stream = skippable_frame(b"xy");
-        stream.extend_from_slice(&zstd_frame(b"payload"));
+        stream.extend_from_slice(&ferroday_cage_testkit::compress::zstd(b"payload"));
         assert_eq!(decode_all(&stream).unwrap(), b"payload");
     }
 
@@ -1762,7 +1723,7 @@ mod tests {
         // A valid first frame followed by a second frame whose header declares
         // a window over the cap: the per-frame cap must reject it, not only the
         // first frame's.
-        let mut stream = zstd_frame(b"ok");
+        let mut stream = ferroday_cage_testkit::compress::zstd(b"ok");
         stream.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0x00, OVER_CAP_WINDOW]);
         let err = decode_all(&stream).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("window"), "{err}");

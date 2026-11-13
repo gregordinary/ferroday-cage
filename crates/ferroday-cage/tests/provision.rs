@@ -11,7 +11,7 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use common::Tar;
+use common::{Tar, compress};
 use ferroday_cage::provision::{
     Provision, ProvisionError, ProvisionEvent, ProvisionObserver, Provisioned, Tarball, ensure,
 };
@@ -390,25 +390,15 @@ fn a_directory_entry_replaces_a_symlink_to_a_nondirectory() {
 
 #[test]
 fn gzip_xz_zstd_and_plain_all_extract() {
-    use std::io::Write;
-
     let mut tar = archive();
     tar.dir("d", 0o755)
         .file("d/f", 0o644, b"compressed content");
     let plain = tar.finish();
 
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    gz.write_all(&plain).unwrap();
-    let gz = gz.finish().unwrap();
-
-    let mut xz =
-        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
-    xz.write_all(&plain).unwrap();
-    let xz = xz.finish().unwrap();
-
-    let zst = ruzstd::encoding::compress_to_vec(
-        plain.as_slice(),
-        ruzstd::encoding::CompressionLevel::Fastest,
+    let (gz, xz, zst) = (
+        compress::gzip(&plain),
+        compress::xz(&plain),
+        compress::zstd(&plain),
     );
 
     for (name, bytes) in [("plain", plain), ("gz", gz), ("xz", xz), ("zst", zst)] {
@@ -430,24 +420,15 @@ fn a_damaged_check_after_the_archive_ends_is_refused() {
     // damaged final block would extract as though it were sound. Damaging the
     // check itself leaves every byte the archive decodes to intact, which is
     // what makes it the case only the check can catch.
-    use std::io::Write;
 
     let mut tar = archive();
     tar.file("f", 0o644, b"the last file in the archive");
     let plain = tar.finish();
 
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    gz.write_all(&plain).unwrap();
-    let gz = gz.finish().unwrap();
-
-    let mut xz =
-        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
-    xz.write_all(&plain).unwrap();
-    let xz = xz.finish().unwrap();
-
-    let zst = ruzstd::encoding::compress_to_vec(
-        plain.as_slice(),
-        ruzstd::encoding::CompressionLevel::Fastest,
+    let (gz, xz, zst) = (
+        compress::gzip(&plain),
+        compress::xz(&plain),
+        compress::zstd(&plain),
     );
 
     // gzip's trailer is the CRC and the length, xz's footer ends with the
@@ -477,13 +458,8 @@ fn record_padding_after_the_archive_is_read_past_but_more_is_refused() {
     // so that a compressed one's closing check is compared, and what follows
     // the terminator is decompressed only to be discarded: past sixteen
     // mebibytes of it, the stream is refused rather than decompressed on.
-    use std::io::Write;
 
-    let gzip = |bytes: &[u8]| {
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gz.write_all(bytes).unwrap();
-        gz.finish().unwrap()
-    };
+    use compress::gzip;
     let mut tar = archive();
     tar.file("f", 0o644, b"content");
 
@@ -703,8 +679,6 @@ fn garbage_is_reported_as_unrecognized() {
 
 #[test]
 fn an_empty_stream_is_unrecognized_rather_than_published_as_an_empty_rootfs() {
-    use std::io::Write;
-
     // A tar reader tolerates a missing terminator, which is what lets an
     // archive whose last two blocks never arrived still extract. Applied to a
     // stream that ended before its *first* header, the same tolerance reports a
@@ -721,17 +695,7 @@ fn an_empty_stream_is_unrecognized_rather_than_published_as_an_empty_rootfs() {
     // The same holds one layer down: a well-formed compression stream whose
     // decoded payload is empty is not an archive either, and the emptiness is
     // only visible after the decoder has run.
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    gz.write_all(b"").unwrap();
-    let gz = gz.finish().unwrap();
-
-    let xz = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1))
-        .unwrap()
-        .finish()
-        .unwrap();
-
-    let zst =
-        ruzstd::encoding::compress_to_vec(&b""[..], ruzstd::encoding::CompressionLevel::Fastest);
+    let (gz, xz, zst) = (compress::gzip(b""), compress::xz(b""), compress::zstd(b""));
 
     for (name, bytes) in [("gz", gz), ("xz", xz), ("zst", zst)] {
         let err = provision_err(&format!("extract-empty-{name}"), &bytes);
@@ -744,8 +708,6 @@ fn an_empty_stream_is_unrecognized_rather_than_published_as_an_empty_rootfs() {
 
 #[test]
 fn a_corrupt_first_header_is_reported_as_what_is_wrong_with_it() {
-    use std::io::Write;
-
     // A first block carrying the ustar magic with a checksum that does not
     // match is a damaged tar archive, and the reason says so: calling it some
     // other format would send whoever reads the error looking for the wrong
@@ -764,9 +726,10 @@ fn a_corrupt_first_header_is_reported_as_what_is_wrong_with_it() {
     // A recognized compression whose payload is too short to be a tar archive
     // is not one, and the report does not claim the compression went
     // unrecognized.
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    gz.write_all(b"a short text, not an archive").unwrap();
-    let err = provision_err("extract-short-gzip-payload", &gz.finish().unwrap());
+    let err = provision_err(
+        "extract-short-gzip-payload",
+        &compress::gzip(b"a short text, not an archive"),
+    );
     assert!(
         matches!(err, ProvisionError::FormatUnrecognized { .. }),
         "{err}"
@@ -806,7 +769,7 @@ fn a_stream_that_fails_is_the_hosts_failure_wherever_it_fails() {
     // failure has to be able to tell the two apart. Where the failure comes
     // makes no difference, in the leading bytes the compression is read from
     // or in a later read, and neither does whether the stream is compressed.
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     /// Serves its bytes, then fails as a reset connection does.
     struct Resetting(std::io::Cursor<Vec<u8>>);
@@ -823,9 +786,7 @@ fn a_stream_that_fails_is_the_hosts_failure_wherever_it_fails() {
     let mut tar = archive();
     tar.file("f", 0o644, &[b'x'; 8192]);
     let plain = tar.finish();
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    gz.write_all(&plain).unwrap();
-    let gz = gz.finish().unwrap();
+    let gz = compress::gzip(&plain);
 
     let dir = common::scratch_dir("extract-failing-stream");
     for (name, bytes, cut) in [
@@ -850,13 +811,10 @@ fn a_stream_that_fails_is_the_hosts_failure_wherever_it_fails() {
 #[test]
 fn a_compressed_stream_its_decoder_refuses_carries_the_decoders_reason() {
     use std::error::Error as _;
-    use std::io::Write;
 
     let mut tar = archive();
     tar.file("f", 0o644, &[b'x'; 8192]);
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    gz.write_all(&tar.finish()).unwrap();
-    let mut gz = gz.finish().unwrap();
+    let mut gz = compress::gzip(&tar.finish());
     // The deflate data begins after the ten-byte header; a run of ones there
     // is a block the decoder refuses.
     gz[12..20].fill(0xff);
