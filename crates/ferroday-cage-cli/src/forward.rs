@@ -940,19 +940,27 @@ mod tests {
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
         let (relay, address, stop) = relay(&target);
         let thread = std::thread::spawn(move || relay.run());
-        let command = TcpStream::connect(address).expect("the command connects");
+        let mut command = TcpStream::connect(address).expect("the command connects");
         let (mut connection, _) = target.accept().expect("the relay connects to the target");
         connection
             .write_all(b"the first part of a reply")
             .expect("the target replies");
+        // The part is read before the target resets. The relay takes its
+        // connection to the target as made only once it next finds it
+        // writable, and a reset that arrives before that reads as a connect
+        // that failed: the command is reset all the same, but the part is
+        // never read from the target.
+        command
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("the read can be bounded");
+        let mut part = [0; 25];
+        command.read_exact(&mut part).expect("the part arrives");
+        assert_eq!(&part, b"the first part of a reply");
         let connection = OwnedFd::from(connection);
         reset_on_close(&connection);
         drop(connection);
 
-        assert_eq!(
-            read_to_end(command),
-            (b"the first part of a reply".to_vec(), Ending::Reset)
-        );
+        assert_eq!(read_to_end(command), (Vec::new(), Ending::Reset));
         drop(stop);
         joined_within(&thread, Duration::from_secs(5), "the relay");
     }
