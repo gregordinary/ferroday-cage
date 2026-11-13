@@ -497,6 +497,7 @@ impl Debian {
             architecture: None,
             mirror: None,
             mirror_fallbacks: Vec::new(),
+            snapshot_fallbacks: Vec::new(),
             components: Vec::new(),
             base_priority: None,
             includes: Vec::new(),
@@ -844,6 +845,9 @@ pub struct DebianBuilder {
     architecture: Option<String>,
     mirror: Option<String>,
     mirror_fallbacks: Vec<String>,
+    /// The backstops among `mirror_fallbacks` that serve a past state of the
+    /// archive.
+    snapshot_fallbacks: Vec<String>,
     components: Vec<String>,
     /// The base seed's priority floor; `None` until the caller sets one, so a
     /// plan can refuse an explicit floor without refusing the default.
@@ -880,6 +884,7 @@ impl fmt::Debug for DebianBuilder {
             .field("architecture", &self.architecture)
             .field("mirror", &self.mirror)
             .field("mirror_fallbacks", &self.mirror_fallbacks)
+            .field("snapshot_fallbacks", &self.snapshot_fallbacks)
             .field("components", &self.components)
             .field("base_priority", &self.base_priority)
             .field("includes", &self.includes)
@@ -940,18 +945,36 @@ impl DebianBuilder {
     /// a fetch reports the resource missing, fails at the transport, or is
     /// answered with an unsuccessful HTTP status.
     ///
-    /// This expresses a live primary mirror with a `snapshot.debian.org`
-    /// fallback for a version that has rotated off the live pool. The fallback
-    /// is a fetch-time concern only: the finished rootfs's `sources.list` names
-    /// the primary mirror, not the backstop. A repository whose backstop is a
-    /// snapshot normally also sets
-    /// [`allow_stale_release`](Self::allow_stale_release), the snapshot's
-    /// release being expired by design.
+    /// A backstop serves the same suite through a second URL, and its release
+    /// is held to the freshness the primary's is. One serving a past state of
+    /// the archive, such as a `snapshot.debian.org` timestamp, is added with
+    /// [`snapshot_fallback`](Self::snapshot_fallback) instead. A backstop is a
+    /// fetch-time concern only: the finished rootfs's `sources.list` names the
+    /// primary mirror, not the backstop.
     ///
     /// A backstop is fetched through the same transport as the primary, so the
     /// scheme constraint of [`mirror`](Self::mirror) applies to it too.
     pub fn mirror_fallback(mut self, url: impl Into<String>) -> Self {
         self.mirror_fallbacks.push(url.into());
+        self
+    }
+
+    /// Adds a backstop URL for the primary mirror that serves a past state of
+    /// the archive, tried in order with the
+    /// [`mirror_fallback`](Self::mirror_fallback) backstops.
+    ///
+    /// This expresses a live primary mirror with a `snapshot.debian.org`
+    /// fallback for a version that has rotated off the live pool. A snapshot's
+    /// release is past its `Valid-Until` by design, so a release this backstop
+    /// serves is accepted as [`allow_stale_release`](Self::allow_stale_release)
+    /// accepts one, the signature still verified, while a release the live
+    /// mirror serves is still held to its freshness. That keeps the live
+    /// mirror, or whatever answers in its place, from delivering an expired
+    /// release.
+    pub fn snapshot_fallback(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.snapshot_fallbacks.push(url.clone());
+        self.mirror_fallbacks.push(url);
         self
     }
 
@@ -1451,12 +1474,14 @@ impl DebianBuilder {
     /// stale but validly-signed release cannot be replayed to deliver
     /// superseded packages. (A release that omits `Valid-Until`, as the Debian
     /// stable suite does, carries no freshness bound and is accepted either
-    /// way.) Setting this relaxes the freshness check entirely while still
-    /// verifying the signature, for the legitimate case of pinning a
-    /// historical archive state — for example a `snapshot.debian.org` suite,
-    /// whose `Valid-Until` has deliberately passed. The key that made the
-    /// signature must still be in force: a state signed only by keys that
-    /// have since expired is refused. It has no effect on a
+    /// way.) Setting this relaxes the freshness check for every mirror while
+    /// still verifying the signature, for the legitimate case of pinning a
+    /// historical archive state — for example a primary mirror that is a
+    /// `snapshot.debian.org` suite, whose `Valid-Until` has deliberately
+    /// passed. A live mirror with a snapshot backstop relaxes it for the
+    /// backstop alone, with [`snapshot_fallback`](Self::snapshot_fallback). The
+    /// key that made the signature must still be in force: a state signed
+    /// only by keys that have since expired is refused. It has no effect on a
     /// [`trust_unsigned`](Self::trust_unsigned) mirror, which is never
     /// freshness-checked.
     ///
@@ -1574,6 +1599,7 @@ impl DebianBuilder {
         let primary = Repository::primary(
             self.suite.clone(),
             mirrors,
+            self.snapshot_fallbacks,
             components,
             trust,
             self.allow_stale,
@@ -1869,7 +1895,8 @@ fn bootstrap_suite(
 /// previews and the plan a bootstrap installs come from one code path and
 /// cannot drift apart. Each repository's release is verified against that
 /// repository's own keyring and bound to its own suite; freshness is enforced
-/// per repository unless it trusts unsigned or pins a historical snapshot. The
+/// on each release unless its repository trusts unsigned, waives it, or the
+/// release came from one of its snapshot backstops. The
 /// per-component indexes are tagged with their repository's index and merged,
 /// each name ranked across the union as [`Index::merge`] ranks it, so the
 /// resolved set draws each package from the repository that ships its winning
@@ -2012,7 +2039,7 @@ fn merged_index(
                 &repository.suite,
                 architecture,
                 &repository.components,
-                repository.require_fresh(),
+                repository.require_fresh(&served.mirror),
             )
             .map_err(|reason| DebianError::Release {
                 subject: served.url.clone(),
@@ -2097,9 +2124,9 @@ fn emit_resolved(
 ///
 /// The fetch walks the repository's mirror list in order, advancing past a URL
 /// that reports the release missing or fails at the transport. On the signed
-/// path the archive signature is verified against the repository's keyring;
-/// `allow_stale` relaxes the check that the signature itself is unexpired, for a
-/// deliberately pinned historical snapshot.
+/// path the archive signature is verified against the repository's keyring,
+/// and held to be unexpired where [`Repository::require_fresh`] holds the
+/// mirror that served it to freshness.
 fn fetch_release(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
@@ -2142,7 +2169,7 @@ fn fetch_release(
             // second parse of the same bytes rather than a new question; a
             // refusal is reported against the release it was to verify.
             let verified = Keyring::parse(keyring_bytes)
-                .and_then(|keyring| keyring.verify(&bytes, !repository.allow_stale))
+                .and_then(|keyring| keyring.verify(&bytes, repository.require_fresh(&mirror)))
                 .map_err(|err| DebianError::Signature {
                     subject: url.clone(),
                     reason: err.to_string(),
@@ -4660,6 +4687,63 @@ mod tests {
             matches!(&err, DebianError::Release { reason, .. }
                 if reason.contains("no index for component contrib")),
             "{err}",
+        );
+    }
+
+    #[test]
+    fn a_release_is_accepted_expired_only_from_a_snapshot_backstop() {
+        // A real release with a real expiry, long past, signed by the embedded
+        // keyring. Served by the live mirror it is refused, however the
+        // backstops are configured; served by a snapshot backstop it is
+        // accepted, and the run goes on to ask for the index, which nothing
+        // serves here. A plain backstop is held to freshness as the live
+        // mirror is.
+        const INRELEASE: &[u8] =
+            include_bytes!("../../../tests/fixtures/debian-archive/forky-InRelease");
+        const LIVE: &str = "http://live.example/debian";
+        const SNAPSHOT: &str = "http://snapshot.example/debian/20260721T000000Z";
+        let answering = |mirror: &str, snapshot: bool| {
+            let fetcher = Table {
+                bodies: [(
+                    format!("{mirror}/dists/forky/InRelease"),
+                    INRELEASE.to_vec(),
+                )]
+                .into_iter()
+                .collect(),
+                asked: std::sync::Arc::default(),
+            };
+            let builder = Debian::builder("forky")
+                .architecture("amd64")
+                .mirror(LIVE)
+                .fetcher(fetcher);
+            let builder = if snapshot {
+                builder.snapshot_fallback(SNAPSHOT)
+            } else {
+                builder.mirror_fallback(SNAPSHOT)
+            };
+            builder
+                .build()
+                .expect("the builder validates")
+                .available()
+                .expect_err("nothing serves the index")
+        };
+
+        for snapshot in [true, false] {
+            let refused = answering(LIVE, snapshot);
+            assert!(
+                matches!(&refused, DebianError::Release { reason, .. } if reason.contains("expired")),
+                "{refused:?}",
+            );
+        }
+        let held = answering(SNAPSHOT, false);
+        assert!(
+            matches!(&held, DebianError::Release { reason, .. } if reason.contains("expired")),
+            "{held:?}",
+        );
+        let accepted = answering(SNAPSHOT, true);
+        assert!(
+            matches!(&accepted, DebianError::Fetch(FetchError::NotFound { url }) if url.contains("Packages")),
+            "{accepted:?}",
         );
     }
 

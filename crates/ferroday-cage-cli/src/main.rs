@@ -577,6 +577,23 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--debian-snapshot-fallback",
+        section: Section::Provisioning,
+        placeholder: "URL",
+        help: &[
+            "A further URL serving a past state of the archive,",
+            "whose expired release is accepted (repeatable, in",
+            "order, after every --debian-mirror-fallback)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .debian_snapshot_fallback
+                .push(fetchable_mirror(flag, into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--debian-base-priority",
         section: Section::Provisioning,
         placeholder: "P",
@@ -669,8 +686,9 @@ const FLAGS: &[Flag] = &[
             "An additional archive source, merged into the same",
             "resolution. SPEC is space-separated key=value fields:",
             "'suite=S mirror=URL [mirror-fallback=URL]",
-            "[components=a,b] [keyring=PATH] [name=NAME]",
-            "[trust-unsigned] [allow-stale-release]'. Repeatable",
+            "[snapshot-fallback=URL] [components=a,b]",
+            "[keyring=PATH] [name=NAME] [trust-unsigned]",
+            "[allow-stale-release]'. Repeatable",
         ],
         take: Take::One(|options, flag, value| {
             options
@@ -2571,6 +2589,7 @@ struct Options {
     debian_cache: Option<PathBuf>,
     debian_keyring: Option<PathBuf>,
     debian_mirror_fallback: Vec<String>,
+    debian_snapshot_fallback: Vec<String>,
     debian_base_priority: Option<Priority>,
     debian_trust_unsigned: bool,
     debian_allow_stale_release: bool,
@@ -3119,6 +3138,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         debian_cache: None,
         debian_keyring: None,
         debian_mirror_fallback: Vec::new(),
+        debian_snapshot_fallback: Vec::new(),
         debian_base_priority: None,
         debian_trust_unsigned: false,
         debian_allow_stale_release: false,
@@ -4327,11 +4347,16 @@ fn fetchable_mirror(flag: &str, url: String) -> Result<String, String> {
 }
 
 /// Parses a `--debian-repository` specification:
-/// `suite=S mirror=URL [mirror-fallback=URL] [components=a,b] [keyring=PATH]
-/// [name=NAME] [trust-unsigned] [allow-stale-release]`.
+/// `suite=S mirror=URL [mirror-fallback=URL] [snapshot-fallback=URL]
+/// [components=a,b] [keyring=PATH] [name=NAME] [trust-unsigned]
+/// [allow-stale-release]`.
+///
+/// A `snapshot-fallback=` backstop is tried after every `mirror-fallback=`
+/// one, as `--debian-snapshot-fallback` is after `--debian-mirror-fallback`.
 fn parse_repository(spec: &str) -> Result<Repository, String> {
     let mut suite = None;
     let mut mirrors = MirrorSpec::default();
+    let mut snapshots: Vec<String> = Vec::new();
     let mut components: Vec<String> = Vec::new();
     let mut keyring = None;
     let mut name = None;
@@ -4342,6 +4367,9 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
             "suite" => suite = Some(value.to_string()),
             "mirror" => mirrors.primary("--debian-repository", value)?,
             "mirror-fallback" => mirrors.fallback("--debian-repository", value)?,
+            "snapshot-fallback" => {
+                snapshots.push(fetchable_mirror("--debian-repository", value.to_string())?);
+            }
             "components" => extend_comma(&mut components, value),
             "keyring" => keyring = Some(PathBuf::from(value)),
             "name" => name = Some(value.to_string()),
@@ -4350,14 +4378,21 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
             other => {
                 return Err(format!(
                     "--debian-repository: unknown field {other:?}; expected suite, mirror, \
-                     mirror-fallback, components, keyring, name, trust-unsigned, or \
-                     allow-stale-release"
+                     mirror-fallback, snapshot-fallback, components, keyring, name, \
+                     trust-unsigned, or allow-stale-release"
                 ));
             }
         }
     }
     let suite = suite.ok_or("--debian-repository requires a suite= field".to_string())?;
     let (primary, fallbacks) = mirrors.finish("--debian-repository")?;
+    if primary.is_none() && !snapshots.is_empty() {
+        return Err(
+            "--debian-repository: snapshot-fallback= names a backstop for a mirror= that was \
+             not given; a repository is fetched from its primary mirror first"
+                .to_string(),
+        );
+    }
     let mut builder = Repository::builder(suite)
         .trust_unsigned(trust_unsigned)
         .allow_stale_release(allow_stale);
@@ -4366,6 +4401,9 @@ fn parse_repository(spec: &str) -> Result<Repository, String> {
     }
     for fallback in fallbacks {
         builder = builder.mirror_fallback(fallback);
+    }
+    for snapshot in snapshots {
+        builder = builder.snapshot_fallback(snapshot);
     }
     if !components.is_empty() {
         builder = builder.components(components);
@@ -6569,6 +6607,9 @@ fn debian_provisioner(
     }
     for fallback in &options.debian_mirror_fallback {
         builder = builder.mirror_fallback(fallback.as_str());
+    }
+    for snapshot in &options.debian_snapshot_fallback {
+        builder = builder.snapshot_fallback(snapshot.as_str());
     }
     if let Some(priority) = options.debian_base_priority {
         builder = builder.base_priority(priority);
@@ -8955,6 +8996,29 @@ mod tests {
         assert!(rendered.contains("file:///srv/pool"), "{rendered}");
         assert!(rendered.contains("trust: Unsigned"), "{rendered}");
         assert!(parse_repository("mirror=file:///srv/pool").is_err());
+    }
+
+    #[test]
+    fn a_snapshot_backstop_is_tried_after_the_others_and_needs_a_primary() {
+        let repository = parse_repository(
+            "suite=trixie mirror=file:///srv/live snapshot-fallback=file:///srv/snapshot \
+             mirror-fallback=file:///srv/other trust-unsigned",
+        )
+        .unwrap();
+        let rendered = format!("{repository:?}");
+        assert!(
+            rendered.contains(
+                "mirrors: [\"file:///srv/live\", \"file:///srv/other\", \"file:///srv/snapshot\"]"
+            ),
+            "{rendered}",
+        );
+        assert!(
+            rendered.contains("snapshots: [\"file:///srv/snapshot\"]"),
+            "{rendered}"
+        );
+        let refused =
+            parse_repository("suite=trixie snapshot-fallback=file:///srv/snapshot").unwrap_err();
+        assert!(refused.contains("snapshot-fallback="), "{refused}");
     }
 
     #[test]

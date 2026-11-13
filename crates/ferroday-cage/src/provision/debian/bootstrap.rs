@@ -1342,6 +1342,7 @@ mod tests {
             components: components.iter().map(|c| c.to_string()).collect(),
             trust: Trust::Signed(keyring.to_vec()),
             allow_stale: false,
+            snapshots: Vec::new(),
             name: name.map(str::to_string),
         }
     }
@@ -1493,6 +1494,7 @@ mod tests {
             components: vec!["main".to_string()],
             trust: Trust::Archive,
             allow_stale: false,
+            snapshots: Vec::new(),
             name: None,
         }
     }
@@ -1736,6 +1738,7 @@ mod tests {
             components: vec!["main".to_string()],
             trust: Trust::Unsigned,
             allow_stale: false,
+            snapshots: Vec::new(),
             name: Some("local".to_string()),
         };
         write_repository_sources(&tree, &[primary, local]).expect("the sources are written");
@@ -1772,6 +1775,7 @@ mod tests {
             components: vec!["main".to_string()],
             trust: Trust::Unsigned,
             allow_stale: false,
+            snapshots: Vec::new(),
             name: Some("local".to_string()),
         };
         let signed_pool = signed_repo(

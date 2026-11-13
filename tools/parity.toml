@@ -417,6 +417,10 @@ name = "mirror_fallback"
 flags = ["--debian-mirror-fallback"]
 
 [[builder.setting]]
+name = "snapshot_fallback"
+flags = ["--debian-snapshot-fallback"]
+
+[[builder.setting]]
 name = "components"
 flags = ["--debian-components"]
 
@@ -822,6 +826,11 @@ why = "The `mirror=` field of the flag's specification."
 name = "mirror_fallback"
 flags = ["--debian-repository"]
 why = "The `mirror-fallback=` field, repeatable."
+
+[[builder.setting]]
+name = "snapshot_fallback"
+flags = ["--debian-repository"]
+why = "The `snapshot-fallback=` field, repeatable."
 
 [[builder.setting]]
 name = "components"

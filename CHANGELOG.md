@@ -358,6 +358,16 @@ consumer upgrading can skip it.
 - `CgroupLimit` implements `FromStr`, reading `NAME=VALUE` with a limit named
   as a profile's `[cgroup]` table names it, and refusing other text with
   `ParseCgroupLimitError`. `fcage --cgroup` reads its value through it.
+- `DebianBuilder::snapshot_fallback` and `RepositoryBuilder::snapshot_fallback`
+  add a backstop mirror that serves a past state of the archive, such as a
+  `snapshot.debian.org` timestamp, and accept the release it serves past its
+  `Valid-Until`, the signature still verified. Freshness is per mirror: the
+  live mirror's release is still held to it, where `allow_stale_release`, which
+  a live-plus-snapshot repository had to set, waives it for every mirror, so
+  that on the plain transport anything answering for the live mirror could
+  replay an expired release. `fcage` gains `--debian-snapshot-fallback` and a
+  `snapshot-fallback=` field of `--debian-repository`, each tried after every
+  plain backstop (`ferroday-cage-cli`).
 
 ### Changed
 

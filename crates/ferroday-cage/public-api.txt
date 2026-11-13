@@ -571,6 +571,7 @@ pub fn ferroday_cage::provision::debian::DebianBuilder::pin(self, ferroday_cage:
 pub fn ferroday_cage::provision::debian::DebianBuilder::plan(self, ferroday_cage::provision::debian::Plan) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder::pre_configure_overlay(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder::repository(self, ferroday_cage::provision::debian::Repository) -> Self
+pub fn ferroday_cage::provision::debian::DebianBuilder::snapshot_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder::source_date_epoch(self, i64) -> Self
 pub fn ferroday_cage::provision::debian::DebianBuilder::trust_unsigned(self, bool) -> Self
 impl core::fmt::Debug for ferroday_cage::provision::debian::DebianBuilder
@@ -700,6 +701,7 @@ pub fn ferroday_cage::provision::debian::RepositoryBuilder::keyring(self, impl c
 pub fn ferroday_cage::provision::debian::RepositoryBuilder::mirror(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferroday_cage::provision::debian::RepositoryBuilder::mirror_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferroday_cage::provision::debian::RepositoryBuilder::name(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferroday_cage::provision::debian::RepositoryBuilder::snapshot_fallback(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferroday_cage::provision::debian::RepositoryBuilder::trust_unsigned(self, bool) -> Self
 impl core::marker::Freeze for ferroday_cage::provision::debian::RepositoryBuilder
 impl core::marker::Send for ferroday_cage::provision::debian::RepositoryBuilder

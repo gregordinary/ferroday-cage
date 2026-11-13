@@ -14,7 +14,9 @@
 //! of the *same* source — a live mirror and a `snapshot.debian.org` backstop,
 //! say — tried in order when an earlier one reports a resource missing. Several
 //! repositories are several distinct sources; several URLs in one repository are
-//! one source reached several ways.
+//! one source reached several ways. Freshness is per mirror: a snapshot
+//! backstop's release is accepted past its `Valid-Until`, and a live mirror's
+//! is still held to it.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -82,8 +84,12 @@ pub struct Repository {
     pub(crate) components: Vec<String>,
     /// How the repository's authenticity is established.
     pub(crate) trust: Trust,
-    /// Whether a signed-but-expired release is accepted, repository-wide.
+    /// Whether a signed-but-expired release is accepted, from every mirror.
     pub(crate) allow_stale: bool,
+    /// The backstops among [`mirrors`](Self::mirrors) that serve a past state
+    /// of the repository, whose release is accepted signed but expired whatever
+    /// [`allow_stale`](Self::allow_stale) says.
+    pub(crate) snapshots: Vec<String>,
     /// The `sources.list.d` entry and trust-anchor file name, for an additional
     /// repository written into the finished rootfs. `None` for the primary,
     /// which owns `sources.list` and the canonical keyring path.
@@ -100,6 +106,7 @@ impl fmt::Debug for Repository {
             .field("components", &self.components)
             .field("trust", &self.trust)
             .field("allow_stale", &self.allow_stale)
+            .field("snapshots", &self.snapshots)
             .field("name", &self.name)
             .finish()
     }
@@ -117,6 +124,7 @@ impl Repository {
             suite: suite.into(),
             mirror: None,
             fallbacks: Vec::new(),
+            snapshots: Vec::new(),
             components: Vec::new(),
             keyring_path: None,
             trust_unsigned: false,
@@ -132,9 +140,13 @@ impl Repository {
     /// than a named `sources.list.d` entry, so it carries no name. Its trust
     /// anchor is settled by [`trust_anchor`], with the embedded archive keyring
     /// where the caller named none.
+    ///
+    /// `snapshots` are the backstops among `mirrors` that serve a past state
+    /// of the archive.
     pub(crate) fn primary(
         suite: String,
         mirrors: Vec<String>,
+        snapshots: Vec<String>,
         components: Vec<String>,
         trust: Trust,
         allow_stale: bool,
@@ -145,6 +157,7 @@ impl Repository {
             components,
             trust,
             allow_stale,
+            snapshots,
             name: None,
         };
         repository.validate()?;
@@ -180,10 +193,14 @@ impl Repository {
         }
     }
 
-    /// Whether freshness is enforced: signed and not stale-relaxed. An unsigned
-    /// repository is never freshness-checked.
-    pub(crate) fn require_fresh(&self) -> bool {
-        !self.trust_unsigned() && !self.allow_stale
+    /// Whether freshness is enforced on the release `mirror` served: the
+    /// repository is signed, accepts no stale release from any mirror, and
+    /// `mirror` is not one of its snapshots. An unsigned repository is never
+    /// freshness-checked.
+    pub(crate) fn require_fresh(&self, mirror: &str) -> bool {
+        !self.trust_unsigned()
+            && !self.allow_stale
+            && !self.snapshots.iter().any(|snapshot| snapshot == mirror)
     }
 
     /// Rejects a configuration the repository cannot be addressed by, or that
@@ -272,6 +289,9 @@ pub struct RepositoryBuilder {
     suite: String,
     mirror: Option<String>,
     fallbacks: Vec<String>,
+    /// The backstops among `fallbacks` that serve a past state of the
+    /// repository.
+    snapshots: Vec<String>,
     components: Vec<String>,
     keyring_path: Option<PathBuf>,
     trust_unsigned: bool,
@@ -298,17 +318,34 @@ impl RepositoryBuilder {
     /// Adds a backstop mirror URL, tried in order after the primary when a
     /// fetch reports the resource missing or fails at the transport.
     ///
-    /// This expresses a live mirror with a `snapshot.debian.org` fallback: the
-    /// same suite and the same content reached through a second URL. The
-    /// freshness posture is repository-wide, so a repository with a snapshot
-    /// backstop normally sets
-    /// [`allow_stale_release`](Self::allow_stale_release), the snapshot's
-    /// release being expired by design.
+    /// A backstop serves the same suite and the same content through a second
+    /// URL, and its release is held to the freshness the primary's is. One that
+    /// serves a past state of the repository, such as a `snapshot.debian.org`
+    /// timestamp, is added with [`snapshot_fallback`](Self::snapshot_fallback)
+    /// instead.
     ///
     /// A fallback is fetched through the same transport as the primary, so the
     /// scheme constraint of [`mirror`](Self::mirror) applies to it too.
     pub fn mirror_fallback(mut self, url: impl Into<String>) -> Self {
         self.fallbacks.push(url.into());
+        self
+    }
+
+    /// Adds a backstop mirror URL that serves a past state of the repository,
+    /// such as a `snapshot.debian.org` timestamp, tried in order with the
+    /// [`mirror_fallback`](Self::mirror_fallback) backstops.
+    ///
+    /// A snapshot's release is past its `Valid-Until` by design, so a release
+    /// this mirror serves is accepted as
+    /// [`allow_stale_release`](Self::allow_stale_release) accepts one: its
+    /// signature is still verified, and the key that made it must still be in
+    /// force. Every other mirror's release is still held to its freshness, so a
+    /// live mirror, or whatever answers in its place, cannot deliver an
+    /// expired release.
+    pub fn snapshot_fallback(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.snapshots.push(url.clone());
+        self.fallbacks.push(url);
         self
     }
 
@@ -350,12 +387,14 @@ impl RepositoryBuilder {
         self
     }
 
-    /// Accepts a signed release that is past its `Valid-Until`.
+    /// Accepts a signed release that is past its `Valid-Until`, from every
+    /// mirror.
     ///
-    /// The posture is repository-wide: it relaxes freshness for every mirror,
-    /// which a live-plus-snapshot repository wants because the snapshot's
-    /// release is expired by design. The signature is still verified, and the
-    /// key that made it must still be in force. It has no effect on a
+    /// For a repository that is itself a past state, such as one whose primary
+    /// mirror is a `snapshot.debian.org` timestamp. A live mirror with a
+    /// snapshot backstop waives freshness for the backstop alone, through
+    /// [`snapshot_fallback`](Self::snapshot_fallback). The signature is still
+    /// verified, and the key that made it must still be in force. It has no effect on a
     /// [`trust_unsigned`](Self::trust_unsigned) repository, which is never
     /// freshness-checked. The repository's source in the finished rootfs
     /// carries `check-valid-until=no`, so the root's `apt` accepts what the
@@ -436,6 +475,7 @@ impl RepositoryBuilder {
             components,
             trust,
             allow_stale: self.allow_stale,
+            snapshots: self.snapshots,
             name: self.name,
         };
         repository.validate()?;

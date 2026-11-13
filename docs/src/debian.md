@@ -315,18 +315,20 @@ use ferroday_cage::provision::debian::Debian;
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let _debian = Debian::builder("trixie")
     .mirror("http://deb.debian.org/debian")
-    .mirror_fallback("http://snapshot.debian.org/archive/debian/20250101T000000Z")
-    .allow_stale_release(true)
+    .snapshot_fallback("http://snapshot.debian.org/archive/debian/20250101T000000Z")
     .build()?;
 # Ok(())
 # }
 ```
 
-The freshness posture is repository-wide, so a repository with a snapshot
-backstop sets [`allow_stale_release`], the snapshot's release being expired by
-design. The signature is still verified. The backstop is a fetch-time concern
-only: the finished tree's `sources.list` names the live mirror, not the
-snapshot.
+A snapshot's release is expired by design, so a backstop added with
+[`snapshot_fallback`] has its release accepted past its `Valid-Until`, the
+signature still verified. Freshness is per mirror: the live mirror's release is
+still held to it, so neither the live mirror nor anything answering in its
+place can deliver an expired release. [`allow_stale_release`] waives freshness
+for every mirror of a repository, for one that is itself a past state. A
+backstop is a fetch-time concern only: the finished tree's `sources.list` names
+the live mirror, not the snapshot.
 
 Every authenticity check runs once per repository: the signature against that
 repository's keyring, the release bound to its suite, and the transport
@@ -791,8 +793,8 @@ for package in &plan.packages {
 Three details are worth stating.
 
 The **mirror** recorded is the URL that answered, not the configured list. A
-repository with a [`mirror_fallback`] snapshot backstop resolves against
-whichever URL served. Recording the list would describe a choice rather than the
+repository with a [`snapshot_fallback`] backstop resolves against whichever URL
+served. Recording the list would describe a choice rather than the
 choice made.
 
 The **release digest** is of the release file the mirror served: the
@@ -1592,10 +1594,12 @@ vulnerable packages.
 A release that omits `Valid-Until` carries no freshness bound and is accepted,
 as apt accepts it. The Debian stable suite does exactly that, so its release
 does not expire between point releases. [`allow_stale_release`] relaxes the
-freshness check entirely, the signature still being verified. It is for the
-legitimate case of pinning a historical archive state, such as a
-`snapshot.debian.org` suite. A key that signed that state must still be in
-force. A `trust_unsigned` mirror is never freshness-checked.
+freshness check for every mirror of a repository, the signature still being
+verified. It is for the legitimate case of pinning a historical archive state,
+such as a `snapshot.debian.org` suite. [`snapshot_fallback`] relaxes it for one
+backstop, so a live mirror's release is still held to it. A key that signed
+that state must still be in force. A `trust_unsigned` mirror is never
+freshness-checked.
 
 The transport is a trait. The built-in fetcher speaks plain HTTP and `file://`,
 addressing a mirror by DNS name, IPv4 literal, or bracketed IPv6 literal
@@ -1809,15 +1813,17 @@ $ fcage --rootfs ./trixie /usr/bin/dpkg --list
 ```
 
 The `--debian-arch`, `--debian-mirror`, `--debian-mirror-fallback`,
-`--debian-components`, `--debian-include`, `--debian-exclude`,
-`--debian-base-priority`, `--debian-extract-only`, `--debian-cache`,
-`--debian-keyring`, `--debian-trust-unsigned`, `--debian-allow-stale-release`,
-`--debian-pre-configure-overlay`, `--debian-identity-map`, and
-`--debian-source-date-epoch` options map onto the builder.
-`--debian-include`, `--debian-exclude`, and `--debian-components` take
-comma-separated lists, and each can be repeated. `--debian-mirror-fallback`
-can be repeated too, and its URLs are tried in order. `--debian-base-priority`
-takes `required`, `important`, `standard`, `optional`, or `extra`.
+`--debian-snapshot-fallback`, `--debian-components`, `--debian-include`,
+`--debian-exclude`, `--debian-base-priority`, `--debian-extract-only`,
+`--debian-cache`, `--debian-keyring`, `--debian-trust-unsigned`,
+`--debian-allow-stale-release`, `--debian-pre-configure-overlay`,
+`--debian-identity-map`, and `--debian-source-date-epoch` options map onto the
+builder. `--debian-include`, `--debian-exclude`, and `--debian-components` take
+comma-separated lists, and each can be repeated. `--debian-mirror-fallback` can
+be repeated too, and its URLs are tried in order. So can
+`--debian-snapshot-fallback`, whose URLs are tried after every
+`--debian-mirror-fallback` one. `--debian-base-priority` takes `required`,
+`important`, `standard`, `optional`, or `extra`.
 `--debian-identity-map` takes a map in the form `--identity-map` does.
 [Trust](#trust) takes an unsigned archive only over `file://` or `https://`,
 and `fcage` fetches nothing over `https://`, so every mirror of a run given
@@ -1842,6 +1848,7 @@ same resolution, and can be repeated. `SPEC` is space-separated fields, each
 | `suite=S` | The suite the repository publishes. Required. |
 | `mirror=URL` | Its primary mirror. Required, and given once. |
 | `mirror-fallback=URL` | A further mirror for the same repository, tried in order. Repeatable. |
+| `snapshot-fallback=URL` | A further mirror serving a past state of the repository, whose expired release is accepted, tried after every `mirror-fallback=`. Repeatable. |
 | `components=A,B` | Its components, `main` where none is named. |
 | `keyring=PATH` | The keyring its release is verified against. |
 | `name=NAME` | The stem of the files it writes into the finished tree. |
@@ -1874,6 +1881,7 @@ $ fcage --rootfs ./trixie --provision-debian trixie \
 [`Repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Repository.html
 [`repository`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.repository
 [`mirror_fallback`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.mirror_fallback
+[`snapshot_fallback`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.DebianBuilder.html#method.snapshot_fallback
 [`name`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.RepositoryBuilder.html#method.name
 [`Pool`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html
 [`Pool::mirror_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/debian/struct.Pool.html#method.mirror_url
