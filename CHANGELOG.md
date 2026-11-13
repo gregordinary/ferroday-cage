@@ -182,6 +182,17 @@ consumer upgrading can skip it.
   `CgroupReach` names the reach left open. `cgroup_required(false)` does not
   waive the rule, and `fcage --restrict` with the cgroup flags is refused the
   same way.
+- The library requires irongall 0.2.0, with which the Debian and Gentoo layers
+  verify an archive's signed documents. A signature that names intended
+  recipients in its hashed area is refused over a document, as RFC 9580 makes
+  such a signature valid only within an encrypted message sent to one of them.
+  irongall 0.1 verified it, so a signature lifted from a signed and encrypted
+  message verified as a detached signature over its content. Judging a
+  certificate hashes its primary key with each user ID or subkey once for each
+  hash algorithm, rather than once for each statement, which let a certificate
+  built to be costly hash several hundred octets for each octet of its
+  signatures. The library reads certificates only from the
+  keyrings it embeds and the files its caller names.
 
 ### Added
 
@@ -373,6 +384,9 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- Verifying a signed document holds less memory, with irongall 0.2.0: a
+  document at most 9 times its size and a keyring at most 44 times, where
+  irongall 0.1.2 held them in up to 16 and 56 times.
 - `NetStackHandle::stop` reports a pump that panicked as the new
   `NetStackError::PumpPanicked`, which says the pump panicked and the stack
   caught the panic. It reported `NetStackError::Pump`, rendered as a failure
