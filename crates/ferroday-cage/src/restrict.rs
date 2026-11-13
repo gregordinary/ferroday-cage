@@ -792,9 +792,6 @@ impl RestrictionBuilder {
         let mut hardening = self.hardening.lower(false)?;
         let abi = crate::mechanism::probe_landlock_abi();
         settle_landlock(&mut hardening, self.scopes_named, abi)?;
-        // A restriction applies the unix-socket restriction only where its
-        // caller asked for it, so it is refused where the kernel cannot.
-        crate::hardening::settle_resolve_unix(&mut hardening, true, || abi)?;
         // The grants are host paths, resolved as the host resolves them: a
         // merged-`/usr` host's `/lib` is a link, and refusing links would refuse
         // the very grants that make a host command runnable.
@@ -868,6 +865,13 @@ impl RestrictionBuilder {
 /// Holds a restriction's Landlock request to what a kernel at `abi` enforces,
 /// where `abi` is `None` when the kernel offers no Landlock LSM.
 ///
+/// The unix-socket restriction comes first. A restriction applies it only where
+/// its caller asked for it, so a kernel that cannot enforce it refuses the
+/// build, and it does so under its own error: a grant of
+/// [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX) alone is masked
+/// away below ABI 9, which the grant check below would otherwise report as a
+/// grant of another kind.
+///
 /// A restriction is confined only by what the host enforces, so a grant that
 /// falls outside the kernel's ABI, which would leave the command unconfined
 /// for that access kind, is refused rather than dropped. So is a scope the
@@ -881,6 +885,7 @@ fn settle_landlock(
     scopes_named: bool,
     abi: Option<i32>,
 ) -> Result<(), ConfigError> {
+    crate::hardening::settle_resolve_unix(hardening, true, || abi)?;
     hardening.ensure_landlock_enforceable(abi)?;
     if scopes_named {
         crate::hardening::ensure_scopes_enforceable(hardening.landlock_scoped, abi)
@@ -1167,6 +1172,26 @@ mod tests {
         ));
         assert!(settle(net(), Some(4)).is_ok());
         assert!(settle(granted(), Some(1)).is_ok());
+    }
+
+    #[test]
+    fn a_unix_socket_grant_alone_is_refused_as_the_unix_socket_restriction() {
+        let granted = || {
+            restricted_true()
+                .landlock_resolve_unix(true)
+                .landlock_fs(FsAccess::RESOLVE_UNIX, "/run")
+        };
+        for abi in [None, Some(4), Some(6), Some(8)] {
+            assert!(
+                matches!(
+                    settle(granted(), abi),
+                    Err(ConfigError::LandlockResolveUnixUnenforceable { abi: reported })
+                        if reported == abi
+                ),
+                "{abi:?}",
+            );
+        }
+        assert!(settle(granted(), Some(9)).is_ok());
     }
 
     #[test]

@@ -716,6 +716,10 @@ consumer upgrading can skip it.
   bind source runs through could replace a component with a link, and the next
   launch of the same plan bound whatever the link named. Such a launch now fails
   at that mount with `ELOOP`.
+- A restriction whose only filesystem grant is `FsAccess::RESOLVE_UNIX` is
+  refused below Landlock ABI 9 with `ConfigError::LandlockResolveUnixUnenforceable`.
+  It was refused with `ConfigError::RestrictionLandlockUnenforceable`, whose
+  message names a network grant.
 
 ### Internal
 

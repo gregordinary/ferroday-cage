@@ -407,10 +407,10 @@ pub(crate) fn ensure_scopes_enforceable(scoped: u64, abi: Option<i32>) -> Result
 /// entirely outside `abi`, so a ruleset built at `abi` would govern none of it.
 /// A zero mask means no filesystem grant was requested, so nothing is dropped.
 ///
-/// A filesystem grant keeps its ABI-1 base rights on every Landlock kernel, so
-/// in practice this is only ever true when the LSM reports an ABI of zero,
-/// which cannot occur; it exists for symmetry with the network predicate and to
-/// state the invariant explicitly.
+/// A mask holding any right of ABI 1 keeps it on every Landlock kernel. One
+/// holding only [`FsAccess::RESOLVE_UNIX`] is masked away below ABI 9, the one
+/// way this is true; a restriction settles that right first, through
+/// [`settle_resolve_unix`], so the refusal names it.
 pub(crate) fn fs_grant_masked_away(fs_handled: u64, abi: i32) -> bool {
     fs_handled != 0 && fs_handled & fs_access_for_abi(abi) == 0
 }
