@@ -737,6 +737,10 @@ consumer upgrading can skip it.
   `DebianError::Config`, as an Alpine plan naming one twice is. Both entries
   were installed, the later version's files extracted over the earlier's, into
   a root whose database registers one package of a name.
+- The Gentoo layer leaves out, and counts in `GentooEvent::Index::skipped`, a
+  binhost index record whose `SLOT` is empty or whose slot, flag lists or
+  dependency classes are folded over several lines. Such a record was resolved
+  to, and `Plan::to_document` then refused the plan recording the resolution.
 
 ### Internal
 

@@ -554,6 +554,18 @@ fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
     let build_time = build_time.and_then(|text| text.parse().ok()).unwrap_or(0);
     let rdepend = rdepend.unwrap_or_default();
     let pdepend = pdepend.unwrap_or_default();
+    // A plan states each of these on one line, and the slot as a value of its
+    // own, so a record a plan could not carry is left out here, as one with an
+    // MD5 a plan would refuse is: an empty `SLOT:` or a value folded over
+    // several lines would be resolved to and then refused by the plan that
+    // records the resolution. Portage writes every field on one line.
+    if slot.is_empty()
+        || [&slot, &use_flags, &iuse, &rdepend, &pdepend]
+            .iter()
+            .any(|field| field.contains('\n'))
+    {
+        return None;
+    }
     // Read to be checked, and the parsed form dropped: a resolution parses the
     // classes of the builds it chooses, and those alone.
     read_class(&rdepend).ok()?;
@@ -902,15 +914,31 @@ CPV: sys-libs/zlib-1.3.1
 MD5: d41d8cd98f00b204e9800998ecf8427e
 PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar
 SIZE: 1
+SLOT:
+
+BUILD_ID: 1
+CPV: sys-libs/zlib-1.3.1
+MD5: d41d8cd98f00b204e9800998ecf8427e
+PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar
+RDEPEND: dev-libs/a
+ dev-libs/b
+SIZE: 1
+
+BUILD_ID: 1
+CPV: sys-libs/zlib-1.3.1
+MD5: d41d8cd98f00b204e9800998ecf8427e
+PATH: sys-libs/zlib/zlib-1.3.1-1.gpkg.tar
+SIZE: 1
 ";
         let index = Index::parse(refused);
         // The traversal is the one that matters: nothing signs the index, so
         // its PATH is a mirror's string and it becomes a URL and a cache entry.
         // The digest matters for a second reason: a record carrying something
         // that is not one can pass no verification, and projects a plan
-        // document this crate emits and refuses to read back.
+        // document this crate emits and refuses to read back. So does an empty
+        // slot, and a value folded over two lines.
         assert_eq!(index.records().len(), 1);
-        assert_eq!(index.skipped(), 4);
+        assert_eq!(index.skipped(), 6);
         assert_eq!(index.builds("sys-libs/zlib").len(), 1);
     }
 
