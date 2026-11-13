@@ -293,36 +293,37 @@ impl<'obs> Running<'obs> {
             check_capture_composes(plan)?;
         }
         let ready = Readiness::new()?;
-        let cgroup = plan
-            .cgroup
-            .as_ref()
-            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
-            .transpose()?;
         // The progress sink borrows the observer only for the launch; the
         // borrow ends with the statement, leaving the observer to move into
         // the handle for the output pump.
-        let mut created = Vec::new();
-        let spawned = mechanism::spawn(
+        let started = start(
             plan,
-            observe,
-            None,
-            cgroup.as_ref().map(Cgroup::procs),
-            &mut |event| {
-                if let Some(observer) = observer.as_deref_mut() {
-                    observer.progress(event);
-                }
+            |procs, created| {
+                mechanism::spawn(
+                    plan,
+                    observe,
+                    None,
+                    procs,
+                    &mut |event| {
+                        if let Some(observer) = observer.as_deref_mut() {
+                            observer.progress(event);
+                        }
+                    },
+                    created,
+                )
             },
-            &mut created,
+            |launched| launched.pidfd.as_fd(),
+        )?;
+        debug_assert!(
+            started.primary.is_none(),
+            "a launch with no terminal returns none"
         );
-        let (launched, primary) = guarded(plan, &created, spawned)?;
-        debug_assert!(primary.is_none(), "a launch with no terminal returns none");
-        let placeholders = PlaceholderGuard::new(plan, &created, Some(launched.pidfd.as_fd()));
         Ok(Running::from_launched(
-            launched,
+            started.launched,
             observer,
-            placeholders,
+            started.placeholders,
             ready,
-            cgroup,
+            started.cgroup,
         ))
     }
 
@@ -351,25 +352,24 @@ impl<'obs> Running<'obs> {
     ) -> Result<(Running<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
         let ready = Readiness::new()?;
-        let cgroup = plan
-            .cgroup
-            .as_ref()
-            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
-            .transpose()?;
-        let mut created = Vec::new();
-        let spawned = mechanism::spawn(
+        let started = start(
             plan,
-            false,
-            Some(terminal),
-            cgroup.as_ref().map(Cgroup::procs),
-            &mut |_| {},
-            &mut created,
-        );
-        let (launched, primary) = guarded(plan, &created, spawned)?;
-        let placeholders = PlaceholderGuard::new(plan, &created, Some(launched.pidfd.as_fd()));
-        let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
+            |procs, created| {
+                mechanism::spawn(plan, false, Some(terminal), procs, &mut |_| {}, created)
+            },
+            |launched| launched.pidfd.as_fd(),
+        )?;
+        let primary = started
+            .primary
+            .ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
         Ok((
-            Running::from_launched(launched, None, placeholders, ready, cgroup),
+            Running::from_launched(
+                started.launched,
+                None,
+                started.placeholders,
+                ready,
+                started.cgroup,
+            ),
             Pty::new(primary),
         ))
     }
@@ -943,6 +943,51 @@ impl fmt::Debug for Running<'_> {
     }
 }
 
+/// A launch the mechanism has started, and what the caller side keeps of it
+/// beside the launch itself.
+struct Started<T> {
+    /// What the mechanism handed back: a running launch, or one held at its
+    /// gate.
+    launched: T,
+    /// The caller's end of the launch's terminal, where it has one.
+    primary: Option<OwnedFd>,
+    /// The guard for the targets the launch created in the root.
+    placeholders: PlaceholderGuard,
+    /// The sandbox's cgroup, where the launch has one.
+    cgroup: Option<Cgroup>,
+}
+
+/// The sequence every launch entry point runs once its plan composes with how
+/// it is launched: the sandbox's cgroup, created where the plan asks for one;
+/// `spawn`, handed the cgroup's `cgroup.procs` and the list the mechanism
+/// reports the targets it creates in; the removal of those targets where the
+/// launch failed; and otherwise their guard, which frees them once the process
+/// `supervisor` names has exited.
+fn start<T>(
+    plan: &LaunchPlan,
+    spawn: impl FnOnce(
+        Option<BorrowedFd<'_>>,
+        &mut Vec<CreatedTarget>,
+    ) -> Result<(T, Option<OwnedFd>), Error>,
+    supervisor: fn(&T) -> BorrowedFd<'_>,
+) -> Result<Started<T>, Error> {
+    let cgroup = plan
+        .cgroup
+        .as_ref()
+        .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
+        .transpose()?;
+    let mut created = Vec::new();
+    let spawned = spawn(cgroup.as_ref().map(Cgroup::procs), &mut created);
+    let (launched, primary) = guarded(plan, &created, spawned)?;
+    let placeholders = PlaceholderGuard::new(plan, &created, Some(supervisor(&launched)));
+    Ok(Started {
+        launched,
+        primary,
+        placeholders,
+        cgroup,
+    })
+}
+
 /// The guard for what a launch created, given its outcome.
 ///
 /// A launch that failed has ended every process of its own whose targets it
@@ -1231,32 +1276,33 @@ impl<'obs> Pending<'obs> {
         if observe {
             check_capture_composes(plan)?;
         }
-        let cgroup = plan
-            .cgroup
-            .as_ref()
-            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
-            .transpose()?;
-        let mut created = Vec::new();
-        let spawned = mechanism::spawn_pending(
+        let started = start(
             plan,
-            observe,
-            None,
-            cgroup.as_ref().map(Cgroup::procs),
-            &mut |event| {
-                if let Some(observer) = observer.as_deref_mut() {
-                    observer.progress(event);
-                }
+            |procs, created| {
+                mechanism::spawn_pending(
+                    plan,
+                    observe,
+                    None,
+                    procs,
+                    &mut |event| {
+                        if let Some(observer) = observer.as_deref_mut() {
+                            observer.progress(event);
+                        }
+                    },
+                    created,
+                )
             },
-            &mut created,
+            mechanism::PendingLaunch::supervisor,
+        )?;
+        debug_assert!(
+            started.primary.is_none(),
+            "a launch with no terminal returns none"
         );
-        let (inner, primary) = guarded(plan, &created, spawned)?;
-        debug_assert!(primary.is_none(), "a launch with no terminal returns none");
-        let placeholders = PlaceholderGuard::new(plan, &created, Some(inner.supervisor()));
         Ok(Pending {
-            inner: Some(inner),
+            inner: Some(started.launched),
             observer,
-            placeholders,
-            cgroup,
+            placeholders: started.placeholders,
+            cgroup: started.cgroup,
         })
     }
 
@@ -1272,29 +1318,22 @@ impl<'obs> Pending<'obs> {
         terminal: &Terminal,
     ) -> Result<(Pending<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
-        let cgroup = plan
-            .cgroup
-            .as_ref()
-            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
-            .transpose()?;
-        let mut created = Vec::new();
-        let spawned = mechanism::spawn_pending(
+        let started = start(
             plan,
-            false,
-            Some(terminal),
-            cgroup.as_ref().map(Cgroup::procs),
-            &mut |_| {},
-            &mut created,
-        );
-        let (inner, primary) = guarded(plan, &created, spawned)?;
-        let placeholders = PlaceholderGuard::new(plan, &created, Some(inner.supervisor()));
-        let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
+            |procs, created| {
+                mechanism::spawn_pending(plan, false, Some(terminal), procs, &mut |_| {}, created)
+            },
+            mechanism::PendingLaunch::supervisor,
+        )?;
+        let primary = started
+            .primary
+            .ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
         Ok((
             Pending {
-                inner: Some(inner),
+                inner: Some(started.launched),
                 observer: None,
-                placeholders,
-                cgroup,
+                placeholders: started.placeholders,
+                cgroup: started.cgroup,
             },
             Pty::new(primary),
         ))
