@@ -363,7 +363,7 @@ mod layered {
         open_dir,
     };
     use crate::provision::copyin::{Owed, Owner};
-    use crate::provision::xattr::{self, read_sized};
+    use crate::provision::xattr::{self, Holder};
 
     /// The extended attributes that hold a POSIX access control list: one for
     /// the directory itself, and the default its new entries inherit.
@@ -655,7 +655,8 @@ mod layered {
     /// the copy it makes.
     ///
     /// Every attribute the tree carries is copied, POSIX access control lists
-    /// and `user.` attributes among them. What the host assigns rather than the
+    /// and `user.` attributes among them, read through [`xattr::read_all`] as
+    /// every step that lays one tree into another reads them. What the host assigns rather than the
     /// tree carries is not ([`host_assigned_xattr`]): the overlay's own
     /// bookkeeping would mean something else in the upper, and a security
     /// module labels the new directory as it creates it. A `trusted.` attribute
@@ -684,26 +685,13 @@ mod layered {
             Err(Errno::ACCESS) => return Ok(()),
             Err(errno) => return Err(errno),
         };
-        let listing = read_sized(
-            || rustix::fs::flistxattr_query(&lower),
-            |buffer| rustix::fs::flistxattr(&lower, buffer),
-        )?;
         let mut carried = [false; ACLS.len()];
-        for name in listing.split(|byte| *byte == 0) {
-            if name.is_empty() || host_assigned_xattr(name) {
+        for (name, value) in xattr::read_all(Holder::Fd(lower.as_fd()))? {
+            if host_assigned_xattr(&name) {
                 continue;
             }
             let Ok(name) = CString::new(name) else {
                 continue;
-            };
-            let value = match read_sized(
-                || rustix::fs::fgetxattr_query(&lower, &name),
-                |buffer| rustix::fs::fgetxattr(&lower, &name, buffer),
-            ) {
-                Ok(value) => value,
-                // Removed since the listing: there is nothing to carry.
-                Err(Errno::NODATA) => continue,
-                Err(errno) => return Err(errno),
             };
             let acl = ACLS.iter().position(|acl| *acl == name.as_c_str());
             match rustix::fs::fsetxattr(upper, &name, &value, XattrFlags::empty()) {

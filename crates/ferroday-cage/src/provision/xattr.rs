@@ -171,7 +171,7 @@ pub(super) fn narrowed_mode(fd: BorrowedFd<'_>, mode: u32) -> Result<u32, Errno>
 /// takes a read into an empty buffer for another question about the length,
 /// and answers it rather than refusing it, so something that grew in between
 /// would read as nothing at all.
-pub(super) fn read_sized(
+fn read_sized(
     mut query: impl FnMut() -> Result<usize, Errno>,
     mut read: impl FnMut(&mut [u8]) -> Result<usize, Errno>,
 ) -> Result<Vec<u8>, Errno> {
