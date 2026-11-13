@@ -99,7 +99,7 @@ use pointer::Pointer;
 use super::cache;
 use super::compress;
 use super::coordinate::{self, Nesting};
-use super::digest::{self, Algorithm};
+use super::digest::{self, Digest};
 use super::layer::{BuildLayer, Staging};
 use super::openpgp::{Keyring, OpenPgpError};
 use super::rooted::Rooted;
@@ -421,7 +421,8 @@ pub enum GentooError {
         reason: String,
     },
     /// The tarball does not have the digest the signed document recorded for
-    /// it.
+    /// it, or a binary package's member the digest its signed `Manifest`
+    /// records.
     ///
     /// The chain held as far as the document; what a mirror served is not what
     /// the document vouched for. The bytes are not extracted. A download that
@@ -429,12 +430,12 @@ pub enum GentooError {
     /// does not match is removed and downloaded again.
     #[non_exhaustive]
     Digest {
-        /// The tarball the digest was taken over.
+        /// What the digest was taken over: the tarball, or the member.
         subject: String,
-        /// The SHA-512 the signed document recorded, as it spells it.
-        expected: String,
+        /// The SHA-512 the signed document recorded.
+        expected: Digest,
         /// The SHA-512 the bytes actually have.
-        actual: String,
+        actual: Digest,
     },
     /// The run's observer asked the bootstrap to stop.
     ///
@@ -582,8 +583,11 @@ impl fmt::Display for GentooError {
                 actual,
             } => write!(
                 f,
-                "{subject} does not have the digest the archive recorded for it: the signed \
-                 document states {expected}, the bytes are {actual}",
+                "{subject} does not have the {} digest the archive recorded for it: the signed \
+                 document states {}, the bytes are {}",
+                expected.algorithm().name(),
+                expected.hex(),
+                actual.hex(),
             ),
             GentooError::Cancelled => f.write_str("the bootstrap was cancelled"),
             GentooError::Fetch(_) => f.write_str("the Gentoo bootstrap could not fetch a resource"),
@@ -703,7 +707,7 @@ pub struct Stage3 {
     variant: String,
     path: String,
     size: u64,
-    sha512: String,
+    sha512: Digest,
     certificate: String,
 }
 
@@ -742,9 +746,9 @@ impl Stage3 {
         self.size
     }
 
-    /// The SHA-512 the signed digest document records for the tarball,
-    /// lowercase hex.
-    pub fn sha512(&self) -> &str {
+    /// The SHA-512 the signed digest document records for the tarball, which
+    /// the download is held to.
+    pub fn sha512(&self) -> &Digest {
         &self.sha512
     }
 
@@ -1603,7 +1607,7 @@ struct Resolution {
 /// What a build's digest document says about its tarball, once verified.
 struct Digested {
     /// The SHA-512 the document records for the tarball.
-    sha512: String,
+    sha512: Digest,
     /// The verifying certificate's primary-key fingerprint, uppercase hex.
     certificate: String,
     /// The document as a mirror served it, where it was fetched rather than
@@ -2128,13 +2132,13 @@ fn cached_or_fetched<T>(
 /// is the file it reads: the extractor reads it again from the start, and a
 /// path opened a second time names whatever the cache holds by then. `tarball`
 /// names it in a refusal.
-fn verify(mut file: File, tarball: &Path, expected: &str) -> Result<File, GentooError> {
-    let (actual, _) = digest::stream(Algorithm::Sha512, &mut file)
+fn verify(mut file: File, tarball: &Path, expected: &Digest) -> Result<File, GentooError> {
+    let (actual, _) = digest::stream(expected.algorithm(), &mut file)
         .map_err(GentooError::at("digesting", tarball))?;
-    if actual != expected {
+    if actual != *expected {
         return Err(GentooError::Digest {
             subject: tarball.display().to_string(),
-            expected: expected.to_string(),
+            expected: expected.clone(),
             actual,
         });
     }
@@ -3080,6 +3084,7 @@ mod tests {
     use pgp::types::KeyDetails as _;
 
     use super::*;
+    use crate::provision::digest::Algorithm;
     use crate::provision::openpgp::fixture;
     use crate::scratch::Scratch;
 
@@ -3490,7 +3495,8 @@ mod tests {
         assert_eq!(stage3.size(), 495_865_168);
         // The sidecar's digest sits first in the document, so a reader keying
         // on the algorithm alone would have taken it.
-        assert_eq!(stage3.sha512(), tarball_sha512());
+        assert_eq!(stage3.sha512().algorithm(), Algorithm::Sha512);
+        assert_eq!(stage3.sha512().hex(), tarball_sha512());
         assert_eq!(
             stage3.certificate(),
             format!("{:X}", key.to_public_key().fingerprint()),
@@ -3626,7 +3632,7 @@ mod tests {
             .resolve()
             .expect("a pin resolves without reading the pointer");
         assert_eq!(stage3.build_id(), BUILD);
-        assert_eq!(stage3.sha512(), tarball_sha512());
+        assert_eq!(stage3.sha512().hex(), tarball_sha512());
         // Nothing declared a size, so the fetch falls back to the fixed ceiling.
         assert_eq!(stage3.size(), MAX_STAGE3_BYTES);
 
@@ -3665,7 +3671,8 @@ mod tests {
             later
                 .resolve()
                 .expect("the pin resolves from the cache")
-                .sha512(),
+                .sha512()
+                .hex(),
             tarball_sha512(),
         );
         crate::provision::ensure(scratch.join("later"), &mut later)
@@ -4322,7 +4329,10 @@ mod tests {
         let err =
             crate::provision::ensure(&root, &mut gentoo).expect_err("the digest does not match");
         let reported = ErrorChain::new(&err).to_string();
-        assert!(reported.contains("does not have the digest"), "{reported}");
+        assert!(
+            reported.contains("does not have the SHA-512 digest"),
+            "{reported}"
+        );
         assert!(!root.exists(), "no root is published");
         assert!(
             !cache

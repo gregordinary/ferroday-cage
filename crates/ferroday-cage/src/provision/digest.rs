@@ -9,7 +9,8 @@
 //!
 //! Which digest is the archive's business rather than this module's, so
 //! [`Algorithm`] names it and every entry point takes one. A digest a plan
-//! records is a [`Digest`]: an algorithm and a value held to its shape.
+//! records, or a refusal names, is a [`Digest`]: an algorithm and a value held
+//! to its shape. A digest this module takes under an [`Algorithm`] is one too.
 
 use std::io::{self, Read, Write};
 
@@ -45,7 +46,7 @@ impl Algorithm {
     ///
     /// For a value small enough to hold. What a Gentoo digest document is
     /// compared against is a half-gigabyte tarball, which goes through
-    /// [`stream`] instead, so a build of that layer alone has no caller.
+    /// [`stream`] instead.
     pub(crate) fn hex_of(self, bytes: &[u8]) -> String {
         Hasher::new(self).over(bytes)
     }
@@ -84,7 +85,7 @@ impl Algorithm {
     }
 
     /// The algorithm's name as a message names it: `SHA-256`, `SHA-512`.
-    #[cfg_attr(not(feature = "debian"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Algorithm::Sha256 => "SHA-256",
@@ -107,13 +108,23 @@ impl Algorithm {
 /// SHA-256 its index offers, or the SHA-512 where it offers no SHA-256. It is
 /// also what a Debian plan records for each release it resolved against
 /// (`ResolvedArchive::release_sha256`), and an Alpine plan for each index
-/// (`ResolvedIndex::sha256`), both SHA-256 of the bytes that were verified.
+/// (`ResolvedIndex::sha256`), both SHA-256 of the bytes that were verified, and
+/// what a Gentoo stage3 must hash to (`Stage3::sha512`).
+///
+/// A refusal names one the same way: both digests of a pin the archives no
+/// longer hold (`debian::UnheldReason::Digest`), and what was recorded and what
+/// the bytes hashed to where they differ (`DebianError::Digest`,
+/// `GentooError::Digest`).
 ///
 /// Two digests a plan carries are deliberately not this. An Alpine package's
 /// `control_identity` is `Q1` and the base64 of a SHA-1 over the package's
 /// control segment: another algorithm, another encoding, and a segment rather
 /// than the file. A Gentoo package's `md5` is portage's bookkeeping digest of
-/// the container, which decides nothing about whether to trust it.
+/// the container, which decides nothing about whether to trust it. What names
+/// a control identity is text for the same reason: `alpine::UnheldReason`'s
+/// `Identity`, and `AlpineError::Digest`, which reports a control identity or,
+/// through the same fields, the data segment's SHA-256 as the package's
+/// `.PKGINFO` spells it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest {
     /// Which algorithm the value is a digest under.
@@ -147,11 +158,21 @@ impl Digest {
     }
 
     /// The digest of `bytes` under `algorithm`.
-    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
     pub(crate) fn of(algorithm: Algorithm, bytes: &[u8]) -> Digest {
+        Digest::taken(algorithm, algorithm.hex_of(bytes))
+    }
+
+    /// The digest `hex` under `algorithm`, as one of this module's hashers
+    /// wrote it.
+    ///
+    /// Not held to the shape [`new`](Self::new) holds a value to, since a
+    /// hasher writes lowercase hex of its algorithm's width and nothing else.
+    /// A value from anywhere else goes through `new`.
+    fn taken(algorithm: Algorithm, hex: String) -> Digest {
+        debug_assert!(algorithm.is_hex(&hex), "a hasher wrote {hex:?}");
         Digest {
             algorithm,
-            hex: algorithm.hex_of(bytes).into(),
+            hex: hex.into(),
         }
     }
 
@@ -218,8 +239,8 @@ impl Hasher {
     }
 }
 
-/// The lowercase hex digest of everything `reader` yields, with the number of
-/// bytes it yielded.
+/// The digest of everything `reader` yields under `algorithm`, with the number
+/// of bytes it yielded.
 ///
 /// The digest is taken in fixed-size chunks, so it costs the same memory for a
 /// kernel package as for a shell script. The size is counted from what was
@@ -229,18 +250,16 @@ impl Hasher {
 /// A layer whose downloads are digested at the sink as they arrive never reads
 /// one back, so such a build has no caller.
 #[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
-pub(crate) fn stream(algorithm: Algorithm, reader: &mut impl Read) -> io::Result<(String, u64)> {
-    let (mut digests, size) = stream_into(vec![Hasher::new(algorithm)], reader)?;
-    Ok((
-        digests
-            .pop()
-            .expect("one algorithm asked for, one digest taken"),
-        size,
-    ))
+pub(crate) fn stream(algorithm: Algorithm, reader: &mut impl Read) -> io::Result<(Digest, u64)> {
+    let (mut taken, size) = stream_into(vec![Hasher::new(algorithm)], reader)?;
+    let hex = taken
+        .pop()
+        .expect("one algorithm asked for, one digest taken");
+    Ok((Digest::taken(algorithm, hex), size))
 }
 
-/// The lowercase hex digest of everything `reader` yields under each of
-/// `algorithms`, in their order, with the number of bytes it yielded.
+/// The digest of everything `reader` yields under each of `algorithms`, in
+/// their order, with the number of bytes it yielded.
 ///
 /// [`stream`] for a file held to more than one digest at once, as a Debian
 /// package is to every digest its archive records: the bytes are read once
@@ -249,14 +268,18 @@ pub(crate) fn stream(algorithm: Algorithm, reader: &mut impl Read) -> io::Result
 pub(crate) fn stream_each(
     algorithms: &[Algorithm],
     reader: &mut impl Read,
-) -> io::Result<(Vec<String>, u64)> {
-    stream_into(
-        algorithms
-            .iter()
-            .map(|algorithm| Hasher::new(*algorithm))
-            .collect(),
-        reader,
-    )
+) -> io::Result<(Vec<Digest>, u64)> {
+    let hashers = algorithms
+        .iter()
+        .map(|algorithm| Hasher::new(*algorithm))
+        .collect();
+    let (taken, size) = stream_into(hashers, reader)?;
+    let digests = algorithms
+        .iter()
+        .zip(taken)
+        .map(|(algorithm, hex)| Digest::taken(*algorithm, hex))
+        .collect();
+    Ok((digests, size))
 }
 
 /// The one streaming loop every digest of a reader goes through: feeds each of
@@ -294,6 +317,7 @@ fn stream_into(mut hashers: Vec<Hasher>, reader: &mut impl Read) -> io::Result<(
 #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
 pub(crate) struct DigestWriter<W> {
     inner: W,
+    algorithm: Algorithm,
     hasher: Hasher,
     written: u64,
 }
@@ -304,19 +328,23 @@ impl<W: Write> DigestWriter<W> {
     pub(crate) fn new(algorithm: Algorithm, inner: W) -> DigestWriter<W> {
         DigestWriter {
             inner,
+            algorithm,
             hasher: Hasher::new(algorithm),
             written: 0,
         }
     }
 
-    /// Flushes the wrapped writer and reports the lowercase hex digest of
-    /// everything written through it, with the number of bytes that was.
+    /// Flushes the wrapped writer and reports the digest of everything written
+    /// through it, with the number of bytes that was.
     ///
     /// The count comes from what was actually written rather than from a stat,
     /// so it describes the same bytes the digest does.
-    pub(crate) fn finish(mut self) -> io::Result<(String, u64)> {
+    pub(crate) fn finish(mut self) -> io::Result<(Digest, u64)> {
         self.inner.flush()?;
-        Ok((self.hasher.finish(), self.written))
+        Ok((
+            Digest::taken(self.algorithm, self.hasher.finish()),
+            self.written,
+        ))
     }
 }
 
@@ -456,13 +484,13 @@ mod tests {
         for algorithm in [Algorithm::Sha256, Algorithm::Sha512] {
             let (digest, size) =
                 stream(algorithm, &mut Cursor::new(&bytes)).expect("the stream is digested");
-            assert_eq!(digest, algorithm.hex_of(&bytes));
+            assert_eq!(digest, Digest::of(algorithm, &bytes));
             assert_eq!(size, bytes.len() as u64);
 
             // An empty stream is the empty digest, not a failure.
             let (digest, size) =
                 stream(algorithm, &mut Cursor::new(Vec::new())).expect("empty digests");
-            assert_eq!(digest, algorithm.hex_of(b""));
+            assert_eq!(digest, Digest::of(algorithm, b""));
             assert_eq!(size, 0);
         }
     }
@@ -480,7 +508,7 @@ mod tests {
                 .write_all(&bytes)
                 .expect("the sink accepts the bytes");
             let (digest, written) = writer.finish().expect("the sink flushes");
-            assert_eq!(digest, algorithm.hex_of(&bytes));
+            assert_eq!(digest, Digest::of(algorithm, &bytes));
             assert_eq!(written, bytes.len() as u64);
             assert_eq!(received, bytes);
         }

@@ -81,7 +81,7 @@ use super::{DebianError, MAX_UNSIZED_INDEX, arch, deb, release, version};
 use crate::ErrorChain;
 use crate::provision::cache;
 use crate::provision::coordinate::Nesting;
-use crate::provision::digest::{self, Algorithm};
+use crate::provision::digest::{self, Algorithm, Digest};
 use crate::provision::document;
 use crate::provision::rooted::Rooted;
 use crate::provision::{Staged, file_url, write_atomically};
@@ -1036,10 +1036,11 @@ struct Placed {
 /// its first occurrence and reads an entry from the paragraph that carries
 /// `Filename`, so either shape would let the package decide what the index says
 /// about it.
-fn stanza_text(control: &str, rel: &str, size: u64, digest: &str) -> String {
+fn stanza_text(control: &str, rel: &str, size: u64, digest: &Digest) -> String {
     format!(
-        "{}\nFilename: {rel}\nSize: {size}\nSHA256: {digest}",
+        "{}\nFilename: {rel}\nSize: {size}\nSHA256: {}",
         control.trim_end(),
+        digest.hex(),
     )
 }
 
@@ -1088,7 +1089,7 @@ fn describe(
     deb_path: &Path,
     architecture: &str,
     expected: &Identity,
-) -> Result<(String, (String, u64)), DebianError> {
+) -> Result<(String, (Digest, u64)), DebianError> {
     let control = control_of(file, path, deb_path, architecture, expected)?;
     let digest = file
         .rewind()
@@ -1117,7 +1118,7 @@ fn describe(
 /// rewriting is how a pool file damaged out of band is repaired, the rename that
 /// publishes it replacing whatever held the name, and a genuine problem with the
 /// caller's own `.deb` surfaces when it is copied.
-fn already_published(tree: &Rooted, rel: &str, source: &mut File) -> Option<(File, String, u64)> {
+fn already_published(tree: &Rooted, rel: &str, source: &mut File) -> Option<(File, Digest, u64)> {
     let mut published = tree.reader(rel).ok()?;
     if published.metadata().ok()?.len() != source.metadata().ok()?.len() {
         return None;
@@ -1191,7 +1192,7 @@ impl OtherIndexes<'_> {
         let (digest, _) = digest::stream(Algorithm::Sha256, &mut file).map_err(reading())?;
         let Some(Recorded { index, .. }) = naming
             .iter()
-            .find(|recorded| recorded.digest.eq_ignore_ascii_case(&digest))
+            .find(|recorded| recorded.digest.eq_ignore_ascii_case(digest.hex()))
         else {
             return Ok(());
         };
@@ -1364,7 +1365,7 @@ struct Section {
     /// resolves against — as `<component>/binary-<architecture>/<file>`.
     path: String,
     size: u64,
-    digest: String,
+    digest: Digest,
 }
 
 /// Scans a suite directory for every index it holds.
@@ -1589,7 +1590,9 @@ fn build_release(claims: &Claims<'_>, sections: &[Section]) -> String {
     for section in sections {
         release.push_str(&format!(
             " {} {} {}\n",
-            section.digest, section.size, section.path,
+            section.digest.hex(),
+            section.size,
+            section.path,
         ));
     }
     release
@@ -1905,7 +1908,7 @@ mod tests {
             architecture: architecture.to_string(),
             path: format!("{component}/binary-{architecture}/{name}"),
             size: bytes.len() as u64,
-            digest: Algorithm::Sha256.hex_of(bytes),
+            digest: Digest::of(Algorithm::Sha256, bytes),
         }
     }
 

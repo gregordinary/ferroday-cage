@@ -537,11 +537,11 @@ pub(super) fn read_package<R: Read>(
             "it ends after its metadata, carrying no file tree",
         ));
     }
-    if actual != *expected {
+    if actual.hex() != expected {
         return Err(AlpineError::Digest {
             subject: subject.to_string(),
             expected: expected.clone(),
-            actual,
+            actual: actual.hex().to_string(),
         });
     }
 

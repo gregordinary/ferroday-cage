@@ -349,6 +349,12 @@ consumer upgrading can skip it.
   and `alpine::ResolvedIndex::sha256`, the last two a `String` before. A plan
   document stating a release's or an index's SHA-256 in another shape is now
   refused rather than carried. Neither layer's plan document changes.
+- **Breaking.** The digests the Debian and Gentoo layers' refusals name are a
+  `provision::digest::Digest`, each a `String` of lowercase hex before, and the
+  messages name the algorithm: `debian::UnheldReason::Digest`'s `pin` and
+  `archive`, and the `expected` and `actual` of `debian::DebianError::Digest`
+  and `gentoo::GentooError::Digest`. `gentoo::Stage3::sha512` returns a
+  `&Digest` rather than a `&str`. The Alpine layer's refusals are unchanged.
 - **Breaking.** The base environment carries `HOME=/root` only for a command
   that runs as uid 0 of its namespace. A command under `CageBuilder::present_as`,
   or a `run_as` identity naming another uid, gets `PATH` alone, and a program
@@ -577,6 +583,9 @@ consumer upgrading can skip it.
 - The relay suite reads the caller's terminal to its end once a session
   returns. It stopped reading as the session ended, so a test of all of a
   command's output failed whenever the relay ran ahead of the reader.
+- A digest the crate takes of a stream, through `digest::stream`,
+  `digest::stream_each` or a `DigestWriter`, is a `Digest`, as one of bytes in
+  hand through `Digest::of` is.
 
 ## [0.5.2] - 2026-11-10
 

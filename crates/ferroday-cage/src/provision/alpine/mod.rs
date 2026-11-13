@@ -2587,6 +2587,11 @@ pub enum AlpineError {
     /// vouched for it said it would be. Either a mirror served a package that
     /// is not the one the index named, or the package's own file tree is not
     /// the one its metadata names.
+    ///
+    /// The digests are text rather than a [`Digest`], for the first case: what
+    /// an index names a package by is its control identity, `Q1` and the
+    /// base64 of a SHA-1, which is not one. The second is the SHA-256 the
+    /// package's `.PKGINFO` states, as it spells it.
     #[non_exhaustive]
     Digest {
         /// What was being checked: a package's file name, or the identity of

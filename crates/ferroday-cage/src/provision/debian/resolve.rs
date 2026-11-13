@@ -180,8 +180,11 @@ impl Refusal {
                         "the pin holds {package} at {version}, where {release} offers {archive}"
                     ),
                     UnheldReason::Digest { pin, archive } => format!(
-                        "the pin holds {package} {version} at the digest {pin}, where that \
-                         release records {archive}"
+                        "the pin holds {package} {version} at the {} digest {}, where that \
+                         release records {}",
+                        pin.algorithm().name(),
+                        pin.hex(),
+                        archive.hex(),
                     ),
                     UnheldReason::DigestNotOffered { pin } => format!(
                         "the pin holds {package} {version} at its {} digest, where that release \

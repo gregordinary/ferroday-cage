@@ -4027,7 +4027,7 @@ fn hermetic_one_version_published_twice_over_different_bytes_is_refused() {
         .expect_err("the archive records other bytes for the pinned version")
         .to_string();
     assert!(
-        refusal.contains("base 1.0 is pinned to the digest"),
+        refusal.contains("base 1.0 is pinned to the SHA-256 digest"),
         "{refusal}"
     );
 }

@@ -129,7 +129,7 @@ impl Digests {
     /// Holds `bytes` to every recorded digest.
     pub(crate) fn check_bytes(&self, bytes: &[u8]) -> Result<(), Mismatch<'_>> {
         self.each()
-            .map(|(_, expected)| (expected, expected.algorithm().hex_of(bytes)))
+            .map(|(_, expected)| (expected, Digest::of(expected.algorithm(), bytes)))
             .try_for_each(|(expected, actual)| Mismatch::unless(expected, actual))
     }
 
@@ -173,14 +173,14 @@ impl Digests {
 pub(crate) struct Mismatch<'a> {
     /// The digest the archive recorded.
     pub(crate) expected: &'a Digest,
-    /// The digest the bytes have under the same algorithm, lowercase hex.
-    pub(crate) actual: String,
+    /// The digest the bytes have under the same algorithm.
+    pub(crate) actual: Digest,
 }
 
 impl<'a> Mismatch<'a> {
     /// `Ok` where `actual` is `expected`, and the mismatch otherwise.
-    fn unless(expected: &'a Digest, actual: String) -> Result<(), Mismatch<'a>> {
-        if actual == expected.hex() {
+    fn unless(expected: &'a Digest, actual: Digest) -> Result<(), Mismatch<'a>> {
+        if actual == *expected {
             Ok(())
         } else {
             Err(Mismatch { expected, actual })
@@ -235,14 +235,26 @@ mod tests {
         // Either one wrong refuses the bytes, as apt refuses them.
         let wrong256 = "0".repeat(64);
         let bad256 = digests(Some(&wrong256), Some(&sha512));
-        assert_eq!(
-            bad256.check_bytes(b"").unwrap_err().expected.hex(),
-            wrong256
-        );
+        let mismatch = bad256.check_bytes(b"").unwrap_err();
+        assert_eq!(mismatch.expected.hex(), wrong256);
+        assert_eq!(mismatch.actual, Digest::of(Algorithm::Sha256, b""));
         assert!(bad256.check_stream(&mut &b""[..]).unwrap().is_err());
+
+        // The mismatch names what the bytes hash to under the algorithm of the
+        // digest they failed, read in one pass or streamed.
         let bad512 = digests(Some(EMPTY_SHA256), Some(&"0".repeat(128)));
-        assert!(bad512.check_bytes(b"").is_err());
-        assert!(bad512.check_stream(&mut &b""[..]).unwrap().is_err());
+        assert_eq!(
+            bad512.check_bytes(b"").unwrap_err().actual,
+            Digest::of(Algorithm::Sha512, b"")
+        );
+        assert_eq!(
+            bad512
+                .check_stream(&mut &b""[..])
+                .unwrap()
+                .unwrap_err()
+                .actual,
+            Digest::of(Algorithm::Sha512, b"")
+        );
     }
 
     #[test]

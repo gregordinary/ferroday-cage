@@ -409,8 +409,8 @@ pub ferroday_cage::provision::debian::DebianError::Configure::wave: &'static str
 pub ferroday_cage::provision::debian::DebianError::Deb::path: std::path::PathBuf
 pub ferroday_cage::provision::debian::DebianError::Deb::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Digest
-pub ferroday_cage::provision::debian::DebianError::Digest::actual: alloc::string::String
-pub ferroday_cage::provision::debian::DebianError::Digest::expected: alloc::string::String
+pub ferroday_cage::provision::debian::DebianError::Digest::actual: ferroday_cage::provision::digest::Digest
+pub ferroday_cage::provision::debian::DebianError::Digest::expected: ferroday_cage::provision::digest::Digest
 pub ferroday_cage::provision::debian::DebianError::Digest::subject: alloc::string::String
 pub ferroday_cage::provision::debian::DebianError::Fetch(ferroday_cage::provision::FetchError)
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::Index
@@ -509,8 +509,8 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::
 #[non_exhaustive] pub enum ferroday_cage::provision::debian::UnheldReason
 pub ferroday_cage::provision::debian::UnheldReason::Absent
 #[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Digest
-pub ferroday_cage::provision::debian::UnheldReason::Digest::archive: alloc::string::String
-pub ferroday_cage::provision::debian::UnheldReason::Digest::pin: alloc::string::String
+pub ferroday_cage::provision::debian::UnheldReason::Digest::archive: ferroday_cage::provision::digest::Digest
+pub ferroday_cage::provision::debian::UnheldReason::Digest::pin: ferroday_cage::provision::digest::Digest
 #[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::DigestNotOffered
 pub ferroday_cage::provision::debian::UnheldReason::DigestNotOffered::pin: ferroday_cage::provision::digest::Digest
 #[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Release
@@ -793,8 +793,8 @@ pub ferroday_cage::provision::gentoo::GentooError::Container::subject: alloc::st
 pub ferroday_cage::provision::gentoo::GentooError::Database::reason: alloc::string::String
 pub ferroday_cage::provision::gentoo::GentooError::Database::root: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Digest
-pub ferroday_cage::provision::gentoo::GentooError::Digest::actual: alloc::string::String
-pub ferroday_cage::provision::gentoo::GentooError::Digest::expected: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Digest::actual: ferroday_cage::provision::digest::Digest
+pub ferroday_cage::provision::gentoo::GentooError::Digest::expected: ferroday_cage::provision::digest::Digest
 pub ferroday_cage::provision::gentoo::GentooError::Digest::subject: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Document
 pub ferroday_cage::provision::gentoo::GentooError::Document::reason: alloc::string::String
@@ -1043,7 +1043,7 @@ impl ferroday_cage::provision::gentoo::Stage3
 pub fn ferroday_cage::provision::gentoo::Stage3::build_id(&self) -> &str
 pub fn ferroday_cage::provision::gentoo::Stage3::certificate(&self) -> &str
 pub fn ferroday_cage::provision::gentoo::Stage3::path(&self) -> &str
-pub fn ferroday_cage::provision::gentoo::Stage3::sha512(&self) -> &str
+pub fn ferroday_cage::provision::gentoo::Stage3::sha512(&self) -> &ferroday_cage::provision::digest::Digest
 pub fn ferroday_cage::provision::gentoo::Stage3::size(&self) -> u64
 pub fn ferroday_cage::provision::gentoo::Stage3::variant(&self) -> &str
 impl core::marker::Freeze for ferroday_cage::provision::gentoo::Stage3

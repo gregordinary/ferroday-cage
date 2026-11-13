@@ -103,7 +103,7 @@ use super::{GentooError, MAX_METADATA_BYTES, atom, installed};
 use crate::ErrorChain;
 use crate::path;
 use crate::provision::compress;
-use crate::provision::digest::{self, Algorithm};
+use crate::provision::digest::{self, Algorithm, Digest};
 use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
 use crate::provision::tar::TarReader;
 
@@ -383,7 +383,7 @@ struct Scan {
 /// directory, which is what the Manifest spells.
 struct Seen {
     size: u64,
-    sha512: String,
+    sha512: Digest,
 }
 
 /// The most entries a container may hold.
@@ -501,7 +501,10 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
                 buffered = archive.read_entry(limit).map_err(|err| {
                     GentooError::container(path, ErrorChain::new(&err).to_string())
                 })?;
-                (Algorithm::Sha512.hex_of(&buffered), buffered.len() as u64)
+                (
+                    Digest::of(Algorithm::Sha512, &buffered),
+                    buffered.len() as u64,
+                )
             }
             None => {
                 let mut member = Member {
@@ -597,7 +600,7 @@ impl<R: Read> Read for Member<R> {
 /// What the container's Manifest vouches for.
 struct Manifest {
     /// Each member's stated length and SHA-512, by name.
-    entries: BTreeMap<String, (u64, String)>,
+    entries: BTreeMap<String, (u64, Digest)>,
 }
 
 impl Manifest {
@@ -631,17 +634,18 @@ impl Manifest {
             // several. SHA-512 is the one read; a pair whose algorithm this
             // layer does not know is stepped over rather than refused, since a
             // Manifest gaining an algorithm is not a Manifest this layer stops
-            // being able to read. The value is taken as written and held to
-            // the algorithm's own lowercase alphabet below, as every digest in
-            // the crate is, so a comparison with it is a plain `==`.
+            // being able to read. The value is taken as written and made a
+            // `Digest` below, which holds it to the algorithm's own lowercase
+            // alphabet as every digest in the crate is held, so a comparison
+            // with it is a plain `==`.
             let mut sha512 = None;
             let mut fields = fields.peekable();
             while let (Some(algorithm), Some(hex)) = (fields.next(), fields.next()) {
                 if algorithm == SHA512 {
-                    sha512 = Some(hex.to_string());
+                    sha512 = Some(hex);
                 }
             }
-            let Some(sha512) = sha512.filter(|hex| Algorithm::Sha512.is_hex(hex)) else {
+            let Some(sha512) = sha512.and_then(|hex| Digest::new(Algorithm::Sha512, hex)) else {
                 return Err(GentooError::container(
                     path,
                     format!("states no usable SHA-512 for the member {name:?}"),

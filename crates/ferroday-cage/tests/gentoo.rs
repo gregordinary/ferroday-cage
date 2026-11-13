@@ -14,6 +14,7 @@
 
 mod common;
 
+use ferroday_cage::provision::digest::Algorithm;
 use ferroday_cage::provision::gentoo::Gentoo;
 use ferroday_cage::provision::{self, Provisioned};
 
@@ -102,7 +103,7 @@ fn a_resolution_names_a_build_and_the_digest_it_is_held_to() {
             stage3.build_id()
         ),
     );
-    assert_eq!(stage3.sha512().len(), 128, "{}", stage3.sha512());
+    assert_eq!(stage3.sha512().algorithm(), Algorithm::Sha512);
     // The releng key is what signs the release documents, and it is the
     // identity a policy pinning this archive would pin. A rotation to another
     // certificate in the keyring is a thing to notice rather than to absorb.

@@ -24,12 +24,12 @@
 //! the chain resting on an unauthenticated file. It is never fetched.
 
 use super::GentooError;
-use crate::provision::digest::Algorithm;
+use crate::provision::digest::{Algorithm, Digest};
 
 /// The header token naming the algorithm this layer reads.
 const SHA512: &str = "SHA512";
 
-/// The SHA-512 the document records for `file`, as lowercase hex.
+/// The SHA-512 the document records for `file`.
 ///
 /// The algorithm alone does not select a line: the document records SHA-512 for
 /// the tarball *and* for its sidecar, so a reader keying on the algorithm would
@@ -38,14 +38,15 @@ const SHA512: &str = "SHA512";
 /// algorithm, so neither the order of the pairs nor the order within one is
 /// relied on.
 ///
-/// The value is held to [`Algorithm::Sha512::is_hex`](Algorithm::is_hex) before
-/// it is returned. A digest out of a document is compared against bytes and, in
-/// other layers, becomes a path segment; holding it to a shape at the boundary
-/// is what keeps every comparison in the crate a plain `==` and keeps a digest
-/// from reaching anywhere as something other than a digest.
+/// The value is made a [`Digest`], which holds it to the algorithm's lowercase
+/// hex, before it is returned. A digest out of a document is compared against
+/// bytes and, in other layers, becomes a path segment; holding it to a shape at
+/// the boundary is what keeps every comparison in the crate a plain `==` and
+/// keeps a digest from reaching anywhere as something other than a digest. A
+/// line whose digest is not one is passed over, as one naming another file is.
 ///
 /// `subject` names the document in a refusal.
-pub(super) fn sha512_of(subject: &str, body: &str, file: &str) -> Result<String, GentooError> {
+pub(super) fn sha512_of(subject: &str, body: &str, file: &str) -> Result<Digest, GentooError> {
     let mut algorithm = None;
     for line in body.lines() {
         let line = line.trim();
@@ -61,9 +62,9 @@ pub(super) fn sha512_of(subject: &str, body: &str, file: &str) -> Result<String,
         let mut fields = line.split_whitespace();
         if let (Some(digest), Some(named), None) = (fields.next(), fields.next(), fields.next())
             && named == file
-            && Algorithm::Sha512.is_hex(digest)
+            && let Some(digest) = Digest::new(Algorithm::Sha512, digest)
         {
-            return Ok(digest.to_string());
+            return Ok(digest);
         }
     }
     Err(GentooError::document(
@@ -96,11 +97,11 @@ mod tests {
         // the digest of a one-megabyte file index would fail every provision.
         assert_eq!(
             sha512_of("the digests", &body(), "s.tar.xz").unwrap(),
-            "1".repeat(128),
+            Digest::new(Algorithm::Sha512, &"1".repeat(128)).unwrap(),
         );
         assert_eq!(
             sha512_of("the digests", &body(), "s.tar.xz.CONTENTS.gz").unwrap(),
-            "2".repeat(128),
+            Digest::new(Algorithm::Sha512, &"2".repeat(128)).unwrap(),
         );
     }
 
@@ -115,7 +116,9 @@ mod tests {
             sha = "1".repeat(128),
         );
         assert_eq!(
-            sha512_of("the digests", &reordered, "s.tar.xz").unwrap(),
+            sha512_of("the digests", &reordered, "s.tar.xz")
+                .unwrap()
+                .hex(),
             "1".repeat(128),
         );
         // A document offering only BLAKE2B records nothing this layer can use.

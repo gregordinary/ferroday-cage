@@ -79,6 +79,7 @@ use super::{
     Staged, Stream, mirror_url, walk_mirrors,
 };
 use crate::failure::path_io_error;
+use crate::provision::digest::Digest;
 use crate::status::ExitStatus;
 use crate::{ErrorChain, IdMapper, IdentityMap};
 use bootstrap::{Installable, StatOverride};
@@ -2531,7 +2532,7 @@ fn verify_deb(
         .map_err(DebianError::at("reading the package", entry))?
         .map_err(|mismatch| DebianError::Digest {
             subject: subject.to_string(),
-            expected: mismatch.expected.hex().to_string(),
+            expected: mismatch.expected.clone(),
             actual: mismatch.actual,
         })
 }
@@ -2872,7 +2873,7 @@ fn verify_digest(url: &str, bytes: &[u8], digests: &Digests) -> Result<(), Debia
         .check_bytes(bytes)
         .map_err(|mismatch| DebianError::Digest {
             subject: url.to_string(),
-            expected: mismatch.expected.hex().to_string(),
+            expected: mismatch.expected.clone(),
             actual: mismatch.actual,
         })
 }
@@ -3278,16 +3279,16 @@ pub enum DebianError {
     ///
     /// The bytes are held to every digest the archive recorded, SHA-256 and
     /// SHA-512 alike, and the first that differs, SHA-256 first, is the one
-    /// named; each is as wide as its algorithm writes.
+    /// named.
     #[non_exhaustive]
     Digest {
         /// What was checked: the URL a resource was fetched from, or the path
         /// of a cached package read back to be installed.
         subject: String,
-        /// The digest the archive recorded, lowercase hex.
-        expected: String,
+        /// The digest the archive recorded.
+        expected: Digest,
         /// The digest the bytes actually have, under the same algorithm.
-        actual: String,
+        actual: Digest,
     },
     /// The bootstrap's observer asked it to stop.
     ///
@@ -3406,8 +3407,11 @@ impl fmt::Display for DebianError {
                 actual,
             } => write!(
                 f,
-                "{subject} does not have the digest the archive recorded for it: \
-                 expected {expected}, got {actual}",
+                "{subject} does not have the {} digest the archive recorded for it: \
+                 expected {}, got {}",
+                expected.algorithm().name(),
+                expected.hex(),
+                actual.hex(),
             ),
             DebianError::Cancelled => f.write_str("the bootstrap was cancelled"),
             DebianError::Configure {
@@ -4151,10 +4155,10 @@ mod tests {
         assert_eq!(asked.lock().unwrap()[1..], [by_sha512]);
 
         // Listed under both, it is asked for by the stronger, and refused if
-        // either digest differs, as apt refuses it.
-        for (stated256, stated512) in [
-            (sha256.clone(), "0".repeat(128)),
-            ("0".repeat(64), sha512.clone()),
+        // either digest differs, as apt refuses it, naming the one that does.
+        for (stated256, stated512, differs) in [
+            (sha256.clone(), "0".repeat(128), Algorithm::Sha512),
+            ("0".repeat(64), sha512.clone(), Algorithm::Sha256),
         ] {
             let (mut debian, asked) = sectioned_archive(
                 index,
@@ -4165,7 +4169,18 @@ mod tests {
                 ],
             );
             let err = debian.available().expect_err("one digest differs");
-            assert!(matches!(err, DebianError::Digest { .. }), "{err}");
+            match &err {
+                DebianError::Digest {
+                    expected, actual, ..
+                } => {
+                    assert_eq!(expected.algorithm(), differs);
+                    assert_eq!(*actual, Digest::of(differs, index));
+                    let rendered = err.to_string();
+                    let named = format!("the {} digest", differs.name());
+                    assert!(rendered.contains(&named), "{rendered}");
+                }
+                other => panic!("expected a digest refusal, got {other}"),
+            }
             assert!(
                 asked.lock().unwrap()[1].contains("/by-hash/SHA512/"),
                 "{:?}",

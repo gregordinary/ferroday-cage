@@ -232,8 +232,8 @@ fn bytes_unheld(pin: &Digest, archive: &Digests) -> Option<UnheldReason> {
     match archive.under(pin.algorithm()) {
         Some(offered) if offered == pin => None,
         Some(offered) => Some(UnheldReason::Digest {
-            pin: pin.hex().to_string(),
-            archive: offered.hex().to_string(),
+            pin: pin.clone(),
+            archive: offered.clone(),
         }),
         None => Some(UnheldReason::DigestNotOffered { pin: pin.clone() }),
     }
@@ -301,10 +301,10 @@ pub enum UnheldReason {
     /// under the pinned digest's algorithm.
     #[non_exhaustive]
     Digest {
-        /// The digest the pin records, lowercase hex.
-        pin: String,
-        /// The digest the archives record, lowercase hex.
-        archive: String,
+        /// The digest the pin records.
+        pin: Digest,
+        /// The digest the archives record, under the same algorithm.
+        archive: Digest,
     },
     /// An install list entry written `name/release` asks for the package from
     /// a release that offers it only at another version.
@@ -352,8 +352,12 @@ impl fmt::Display for UnheldPin {
             ),
             UnheldReason::Digest { pin, archive } => write!(
                 f,
-                "{} {} is pinned to the digest {pin} and the archives record {archive}",
-                self.package, self.version,
+                "{} {} is pinned to the {} digest {} and the archives record {}",
+                self.package,
+                self.version,
+                pin.algorithm().name(),
+                pin.hex(),
+                archive.hex(),
             ),
             UnheldReason::Release { release, archive } => write!(
                 f,
@@ -481,13 +485,20 @@ mod tests {
         let pins = Pins::of(&plan).unwrap();
         check(&pins, &format!("SHA256: {B}\nSHA512: {}", sha512("c"))).expect("its SHA-512");
         match check(&pins, &format!("SHA256: {A}\nSHA512: {}", sha512("d"))) {
-            Err(DebianError::Pin { unheld }) => assert_eq!(
-                unheld[0].reason,
-                UnheldReason::Digest {
-                    pin: sha512("c"),
-                    archive: sha512("d"),
-                },
-            ),
+            Err(DebianError::Pin { unheld }) => {
+                assert_eq!(
+                    unheld[0].reason,
+                    UnheldReason::Digest {
+                        pin: Digest::new(Algorithm::Sha512, &sha512("c")).unwrap(),
+                        archive: Digest::new(Algorithm::Sha512, &sha512("d")).unwrap(),
+                    },
+                );
+                let rendered = unheld[0].to_string();
+                assert!(
+                    rendered.contains(&format!("the SHA-512 digest {}", sha512("c"))),
+                    "{rendered}"
+                );
+            }
             other => panic!("expected a digest refusal, got {other:?}"),
         }
     }
@@ -588,10 +599,16 @@ mod tests {
                 assert_eq!(
                     unheld[0].reason,
                     UnheldReason::Digest {
-                        pin: A.to_string(),
-                        archive: B.to_string(),
+                        pin: Digest::new(Algorithm::Sha256, A).unwrap(),
+                        archive: Digest::new(Algorithm::Sha256, B).unwrap(),
                     },
                 );
+                let rendered = unheld[0].to_string();
+                assert!(
+                    rendered.contains(&format!("pinned to the SHA-256 digest {A}")),
+                    "{rendered}"
+                );
+                assert!(rendered.ends_with(&format!("record {B}")), "{rendered}");
             }
             other => panic!("expected a pin refusal, got {other:?}"),
         }

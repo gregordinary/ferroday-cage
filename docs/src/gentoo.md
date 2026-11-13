@@ -139,7 +139,7 @@ use ferroday_cage::provision::{self, gentoo::Gentoo};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut gentoo = Gentoo::builder("amd64").variant("amd64-openrc").build()?;
 let stage3 = gentoo.resolve()?;
-println!("{} at {}", stage3.build_id(), stage3.sha512());
+println!("{} at {}", stage3.build_id(), stage3.sha512().hex());
 
 // A second root from the same answer, with nothing re-fetched.
 let mut again = Gentoo::builder("amd64").stage3(stage3).build()?;

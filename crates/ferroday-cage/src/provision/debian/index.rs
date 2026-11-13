@@ -1772,7 +1772,7 @@ SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
         let index = ranked_under(&primary, &rebuilt, "", &pins);
         match index.in_release("tool", "trixie-backports") {
             Err(unheld) => assert!(
-                matches!(&unheld.reason, UnheldReason::Digest { archive, .. } if *archive == "f".repeat(64)),
+                matches!(&unheld.reason, UnheldReason::Digest { archive, .. } if archive.hex() == "f".repeat(64)),
                 "{unheld:?}",
             ),
             other => panic!("expected the pin refused, got {other:?}"),
