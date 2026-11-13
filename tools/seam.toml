@@ -192,9 +192,9 @@ why = "The map a staged layer records."
 
 [[layer.reach]]
 name = "ErrorChain"
-count = 2
+count = 1
 kind = "public"
-why = "As in the other two layers, for an index's and a container's reasons."
+why = "As in the other two layers, for a container's reasons."
 
 [[layer.reach]]
 name = "failure"

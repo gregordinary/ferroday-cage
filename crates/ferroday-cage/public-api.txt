@@ -805,6 +805,7 @@ pub ferroday_cage::provision::gentoo::GentooError::Document::subject: alloc::str
 pub ferroday_cage::provision::gentoo::GentooError::Fetch(ferroday_cage::provision::FetchError)
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Index
 pub ferroday_cage::provision::gentoo::GentooError::Index::reason: alloc::string::String
+pub ferroday_cage::provision::gentoo::GentooError::Index::source: core::option::Option<core::io::error::Error>
 pub ferroday_cage::provision::gentoo::GentooError::Index::subject: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooError::Io
 pub ferroday_cage::provision::gentoo::GentooError::Io::op: &'static str

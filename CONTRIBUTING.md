@@ -487,6 +487,7 @@ report name a package and its version bare.
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
 | Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
 | Which compression does a stream begin with, and what does it decode to? | `provision::compress::decoder`, or `compress::Codec::of` for a document already in memory |
+| Decompress a document held in memory, bounded, telling a stream the decoder refuses from one that decodes past the bound | `provision::compress::inflate` |
 | Fill a buffer from a reader, short only at the end of its input | `provision::compress::read_fully` |
 | Which standard stream did a provisioner's in-sandbox output come from? | `provision::Stream` |
 | Take the first mirror that serves a resource, past those that do not | `provision::walk_mirrors` |

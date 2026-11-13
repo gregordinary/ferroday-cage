@@ -403,6 +403,11 @@ mod tests {
                 all.extend([
                     Box::new(GentooError::Fetch(fetch())) as Box<dyn StdError>,
                     Box::new(GentooError::io("reading", "/srv/staging", os_error())),
+                    Box::new(GentooError::Index {
+                        subject: "http://mirror.invalid/Packages.gz".to_string(),
+                        reason: "does not decompress".to_string(),
+                        source: Some(os_error()),
+                    }),
                 ]);
             }
         }

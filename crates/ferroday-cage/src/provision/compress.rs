@@ -196,6 +196,53 @@ pub(crate) fn decoder<'r>(mut source: impl Read + 'r) -> io::Result<(Codec, Box<
     Ok((codec, decoded))
 }
 
+/// Why [`inflate`] gave back no document.
+#[cfg_attr(
+    not(any(feature = "debian", feature = "alpine", feature = "gentoo")),
+    allow(dead_code)
+)]
+#[derive(Debug)]
+pub(crate) enum Inflate {
+    /// The decoder refused the bytes, and this is its own failure.
+    Undecodable(io::Error),
+    /// The bytes decode to more than the bound, which nothing beneath them
+    /// caused.
+    Overlong,
+}
+
+/// `bytes`, decoded as their leading bytes say ([`decoder`]), or refused where
+/// they decode to more than `limit` bytes rather than cut at it.
+///
+/// For a document a layer fetched whole, such as a package index, held in
+/// memory before it is read. Nothing can fail to read a slice, so every failure
+/// is the decoder's refusal or the length, and the two are told apart: a caller
+/// reports the first with the decoder's failure as its cause and the second
+/// with no cause at all. The decoder is read one byte past the limit rather
+/// than written through a writer that refuses at it, since a writer's refusal
+/// and a decoder's arrive as the same kind of error.
+#[cfg_attr(
+    not(any(feature = "debian", feature = "alpine", feature = "gentoo")),
+    allow(dead_code)
+)]
+pub(crate) fn inflate(bytes: &[u8], limit: u64) -> Result<Vec<u8>, Inflate> {
+    let undecodable = |err: io::Error| {
+        Inflate::Undecodable(match Refusal::of(err) {
+            Ok(refusal) => refusal.into_cause(),
+            Err(err) => err,
+        })
+    };
+    let (_, decoded) = decoder(bytes).map_err(undecodable)?;
+    let mut text = Vec::new();
+    decoded
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut text)
+        .map_err(undecodable)?;
+    if text.len() as u64 > limit {
+        return Err(Inflate::Overlong);
+    }
+    Ok(text)
+}
+
 /// A decoder's refusal of the stream it was given, carried through `Read`.
 ///
 /// A decoder can report a refusal only as an `io::Error`, the type its
@@ -1364,6 +1411,34 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{codec}: {err}");
             let err = Refusal::of(err).expect_err("a source's failure is not a refusal");
             assert!(err.get_ref().is_none(), "{codec}: {err:?} is the OS's own");
+        }
+    }
+
+    #[test]
+    fn inflating_tells_a_refused_stream_from_an_overlong_one() {
+        // At the bound exactly the document is whole; one byte under it, the
+        // same bytes are refused for their length, which nothing beneath them
+        // caused; and a stream the decoder refuses carries the decoder's own
+        // reason. A plain document is held to the bound as a compressed one is.
+        let text = b"a document of thirty-two bytes!\n";
+        let gzip = {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(text).unwrap();
+            encoder.finish().unwrap()
+        };
+        for bytes in [&text[..], &gzip] {
+            assert_eq!(inflate(bytes, 32).expect("at the bound"), text);
+            assert!(matches!(inflate(bytes, 31), Err(Inflate::Overlong)));
+        }
+        let mut corrupt = gzip.clone();
+        corrupt[12..20].fill(0xff);
+        match inflate(&corrupt, 1024) {
+            Err(Inflate::Undecodable(err)) => {
+                assert!(Refusal::of(err).is_err(), "the cause is the decoder's own");
+            }
+            other => panic!("expected the decoder's refusal, got {other:?}"),
         }
     }
 

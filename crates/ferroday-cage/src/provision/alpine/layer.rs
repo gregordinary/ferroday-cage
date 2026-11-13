@@ -24,7 +24,6 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::path::{Path, PathBuf};
 
 use super::apk::Member;
@@ -415,24 +414,24 @@ fn read_scripts(tree: &Rooted, base: &Path) -> Result<Vec<u8>, AlpineError> {
     if compressed.is_empty() {
         return Ok(Vec::new());
     }
-    let mut scripts = Vec::new();
-    let at = base.join(DB_DIR).join(SCRIPTS_GZ);
-    let (_, mut reader) =
-        crate::provision::compress::decoder(compressed.as_slice()).map_err(|err| {
-            AlpineError::Config {
-                reason: format!(
-                    "the base layer at {}: its {SCRIPTS_GZ} is not readable: {}",
-                    base.display(),
-                    ErrorChain::new(&err),
-                ),
+    // In memory already, so a failure is the archive's: a stream the decoder
+    // refuses, or one that inflates past the ceiling.
+    crate::provision::compress::inflate(&compressed, MAX_SCRIPTS).map_err(|refused| {
+        let why = match refused {
+            crate::provision::compress::Inflate::Undecodable(err) => {
+                format!("is not readable: {}", ErrorChain::new(&err))
             }
-        })?;
-    io::copy(
-        &mut reader,
-        &mut crate::provision::LimitedWriter::new(&mut scripts, MAX_SCRIPTS),
-    )
-    .map_err(AlpineError::at("reading the base layer's scripts", at))?;
-    Ok(scripts)
+            crate::provision::compress::Inflate::Overlong => {
+                format!("inflates past the {MAX_SCRIPTS} bytes it may hold")
+            }
+        };
+        AlpineError::Config {
+            reason: format!(
+                "the base layer at {}: its {SCRIPTS_GZ} {why}",
+                base.display()
+            ),
+        }
+    })
 }
 
 /// Reads a file of the base that need not be there, an absent one reading as

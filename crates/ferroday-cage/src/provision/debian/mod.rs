@@ -2993,34 +2993,22 @@ const MAX_UNSIZED_INDEX: u64 = 256 * 1024 * 1024;
 /// `limit` is the uncompressed length the release states, or
 /// [`MAX_UNSIZED_INDEX`] where it states none. Every failure is the index's,
 /// named by the URL it was fetched from: the bytes are already in memory and
-/// verified, so nothing here is a host I/O operation.
-///
-/// A stream the decoder refuses and a stream that decodes past `limit` are told
-/// apart. The decoder's own failure is the cause of the first, carried as the
-/// error's source; the second has no cause beyond the length. The decoder is
-/// therefore read one byte past the limit rather than through a writer that
-/// fails at it, since a writer's refusal and a decoder's arrive as the same
-/// kind of error.
+/// verified, so nothing here is a host I/O operation. A stream the decoder
+/// refuses carries the decoder's own failure as the error's source; one that
+/// decodes past `limit` has no cause beyond the length.
 fn decompress_index(url: &str, bytes: &[u8], limit: u64) -> Result<String, DebianError> {
     let unusable = |reason: &str, source: Option<io::Error>| DebianError::Index {
         subject: url.to_string(),
         reason: reason.to_string(),
         source,
     };
-    let (_, reader) = super::compress::decoder(bytes)
-        .map_err(|err| unusable("its header cannot be read", Some(err)))?;
-    let mut text = Vec::new();
-    io::Read::read_to_end(
-        &mut io::Read::take(reader, limit.saturating_add(1)),
-        &mut text,
-    )
-    .map_err(|err| unusable("it does not decompress", Some(err)))?;
-    if text.len() as u64 > limit {
-        return Err(unusable(
+    let text = super::compress::inflate(bytes, limit).map_err(|refused| match refused {
+        super::compress::Inflate::Undecodable(err) => unusable("it does not decompress", Some(err)),
+        super::compress::Inflate::Overlong => unusable(
             &format!("it expands past the {limit} bytes it may expand to"),
             None,
-        ));
-    }
+        ),
+    })?;
     String::from_utf8(text).map_err(|_| unusable("it is not UTF-8 text", None))
 }
 

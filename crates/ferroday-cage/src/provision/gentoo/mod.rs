@@ -108,7 +108,6 @@ use super::{
     ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball, mirror_url,
     walk_mirrors,
 };
-use crate::ErrorChain;
 use crate::IdentityMap;
 use crate::failure::path_io_error;
 
@@ -358,6 +357,9 @@ pub enum GentooError {
         subject: String,
         /// What was wrong with it.
         reason: String,
+        /// The decoder's own failure, where the index is a compressed stream it
+        /// refused. `None` where nothing beneath the reason failed.
+        source: Option<io::Error>,
     },
     /// A plan document cannot be read, or cannot be written.
     ///
@@ -512,6 +514,7 @@ impl GentooError {
         GentooError::Index {
             subject: subject.into(),
             reason: reason.into(),
+            source: None,
         }
     }
 }
@@ -545,7 +548,9 @@ impl fmt::Display for GentooError {
             GentooError::Document { subject, reason } => {
                 write!(f, "{subject} verified but {reason}")
             }
-            GentooError::Index { subject, reason } => {
+            GentooError::Index {
+                subject, reason, ..
+            } => {
                 write!(f, "the index at {subject} {reason}")
             }
             GentooError::PlanDocument { reason } => {
@@ -607,6 +612,10 @@ impl std::error::Error for GentooError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             GentooError::Fetch(err) => Some(err),
+            GentooError::Index {
+                source: Some(source),
+                ..
+            } => Some(source),
             GentooError::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -1523,9 +1532,6 @@ struct Fetched {
 /// parsed out of it.
 fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooError> {
     let Fetched { url, body: served } = served;
-    let unreadable = |err: &(dyn std::error::Error + 'static)| {
-        GentooError::index(&url, format!("could not be read: {}", ErrorChain::new(err)))
-    };
     let refused = match compress::Codec::of(&served) {
         compress::Codec::Gzip | compress::Codec::Plain => None,
         compress::Codec::Xz => Some("xz"),
@@ -1540,13 +1546,17 @@ fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooEr
             ),
         ));
     }
-    let mut bytes = Vec::new();
-    {
-        let (_, mut reader) =
-            compress::decoder(served.as_slice()).map_err(|err| unreadable(&err))?;
-        io::copy(&mut reader, &mut LimitedWriter::new(&mut bytes, limit))
-            .map_err(|err| unreadable(&err))?;
-    }
+    let bytes = compress::inflate(&served, limit).map_err(|refused| match refused {
+        compress::Inflate::Undecodable(err) => GentooError::Index {
+            subject: url.clone(),
+            reason: "does not decompress".to_string(),
+            source: Some(err),
+        },
+        compress::Inflate::Overlong => GentooError::index(
+            &url,
+            format!("holds more than the {limit} bytes this layer reads of an index"),
+        ),
+    })?;
     drop(served);
     // Lossy rather than strict: the index is fifteen thousand stanzas of which
     // this layer reads a dozen fields, and one package's description holding a
@@ -3069,6 +3079,7 @@ mod tests {
     use pgp::types::KeyDetails as _;
 
     use super::*;
+    use crate::ErrorChain;
     use crate::provision::digest::Algorithm;
     use crate::provision::openpgp::fixture;
     use crate::scratch::Scratch;
@@ -3971,7 +3982,7 @@ mod tests {
             let err = read_index_body(fetched(served), ceiling - 1)
                 .expect_err("an index past the ceiling is refused");
             assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
-            assert!(err.to_string().contains("exceeded"), "{err}");
+            assert!(err.to_string().contains("holds more than"), "{err}");
         }
     }
 

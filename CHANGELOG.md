@@ -485,6 +485,11 @@ consumer upgrading can skip it.
   compressed stream its decoder refuses is still `ProvisionError::Archive`, and
   carries the decoder's own failure as its `source`, in the variant's new
   `source` field.
+- A Gentoo binary-package index the decoder refuses is reported as
+  `GentooError::Index` with the decoder's own failure as its `source`, in the
+  variant's new `source` field, as the Debian layer reports an index. The
+  failure was flattened into the reason, and an index that decompresses past
+  the bound read the same way as one that does not decompress.
 
 ### Fixed
 
