@@ -57,15 +57,16 @@ pub(crate) struct Entry {
     /// The permission bits, as stored (may include setuid/setgid/sticky).
     pub mode: u32,
     /// The owning user id, as stored. The extractor does not apply it; it
-    /// is read so a consumer can act on non-root ownership (a `.deb`'s
-    /// setgid helpers, for instance). The only such consumer today is the
-    /// Debian provisioner, so a build without that feature parses the field
-    /// but reads no further.
-    #[cfg_attr(not(feature = "debian"), allow(dead_code))]
+    /// is read so a consumer can act on non-root ownership. The Debian layer
+    /// records it for dpkg's statoverride, a `.deb`'s setgid helpers for
+    /// instance, and the Alpine layer gives an entry its owner by it where the
+    /// root has no account by the entry's [`uname`](Self::uname). A build with
+    /// neither parses the field and reads no further.
+    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
     pub uid: u32,
-    /// The owning group id, as stored. Not applied by the extractor; read
-    /// only by the Debian provisioner, as [`uid`](Self::uid) is.
-    #[cfg_attr(not(feature = "debian"), allow(dead_code))]
+    /// The owning group id, as stored. Not applied by the extractor; read by
+    /// the same two layers as [`uid`](Self::uid), for the same reasons.
+    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
     pub gid: u32,
     /// The owning user's name, as stored: the ustar header's `uname`, or a pax
     /// `uname` record. Empty where the archive states none, as a v7 header
@@ -172,18 +173,34 @@ impl PaxRecords {
 enum HeaderFlaw {
     NotATarHeader,
     Checksum,
-    Numeric,
+    /// A numeric field, named as the header names it, that does not read as a
+    /// value it may hold.
+    Field(&'static str, Numeric),
+}
+
+/// What is wrong with a numeric header field.
+#[derive(Debug, PartialEq, Eq)]
+enum Numeric {
+    /// It is neither octal digits nor the base-256 form.
+    Unreadable,
+    /// It reads, as a value the field cannot hold: a negative mode, id or
+    /// size, or one too large for the type it is read into.
+    OutOfRange,
 }
 
 impl HeaderFlaw {
-    fn describe(&self) -> &'static str {
+    fn describe(&self) -> String {
         match self {
-            HeaderFlaw::NotATarHeader => {
-                "the block is not a tar header: it carries no ustar or GNU magic \
-                 and its checksum does not match"
+            HeaderFlaw::NotATarHeader => "the block is not a tar header: it carries no ustar or \
+                                          GNU magic and its checksum does not match"
+                .to_string(),
+            HeaderFlaw::Checksum => "the header checksum does not match".to_string(),
+            HeaderFlaw::Field(field, Numeric::Unreadable) => {
+                format!("the header's {field} field is neither octal nor base-256")
             }
-            HeaderFlaw::Checksum => "the header checksum does not match",
-            HeaderFlaw::Numeric => "a numeric header field is not octal or base-256",
+            HeaderFlaw::Field(field, Numeric::OutOfRange) => {
+                format!("the header's {field} field holds a value out of its range")
+            }
         }
     }
 }
@@ -340,7 +357,7 @@ impl<R: Read> TarReader<R> {
                 Ok(entry) => entry,
                 Err(flaw) => {
                     self.not_a_tar = header_offset == 0 && flaw == HeaderFlaw::NotATarHeader;
-                    return Err(malformed(header_offset, flaw.describe()));
+                    return Err(malformed(header_offset, &flaw.describe()));
                 }
             };
             self.set_current(&entry);
@@ -776,11 +793,14 @@ fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
     // plausible-looking permission set — the setuid, setgid, and sticky bits
     // included — or into an unrelated id; refusing it keeps a malformed header
     // from silently deciding either.
-    let mode = unsigned_field(&block[100..108])?;
-    let uid = unsigned_field(&block[108..116])?;
-    let gid = unsigned_field(&block[116..124])?;
-    let size = u64::try_from(numeric_field(&block[124..136])?).map_err(|_| HeaderFlaw::Numeric)?;
-    let mtime = numeric_field(&block[136..148])?;
+    let field = |name: &'static str| move |flaw| HeaderFlaw::Field(name, flaw);
+    let mode = unsigned_field(&block[100..108]).map_err(field("mode"))?;
+    let uid = unsigned_field(&block[108..116]).map_err(field("uid"))?;
+    let gid = unsigned_field(&block[116..124]).map_err(field("gid"))?;
+    let size = numeric_field(&block[124..136])
+        .and_then(|size| u64::try_from(size).map_err(|_| Numeric::OutOfRange))
+        .map_err(field("size"))?;
+    let mtime = numeric_field(&block[136..148]).map_err(field("mtime"))?;
     let typeflag = match block[156] {
         // An old (v7-style) NUL typeflag is a regular file.
         0 => b'0',
@@ -844,7 +864,7 @@ fn field_bytes(field: &[u8]) -> &[u8] {
 
 /// Parses a numeric header field: octal ASCII, or GNU base-256 when the
 /// first byte has its high bit set.
-fn numeric_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
+fn numeric_field(field: &[u8]) -> Result<i64, Numeric> {
     if field.first().is_some_and(|b| b & 0x80 != 0) {
         return base256_field(field);
     }
@@ -856,12 +876,12 @@ fn numeric_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
                 value = value
                     .checked_mul(8)
                     .and_then(|v| v.checked_add(i64::from(byte - b'0')))
-                    .ok_or(HeaderFlaw::Numeric)?;
+                    .ok_or(Numeric::OutOfRange)?;
                 seen_digit = true;
             }
             b' ' if !seen_digit => continue,
             b' ' | 0 => break,
-            _ => return Err(HeaderFlaw::Numeric),
+            _ => return Err(Numeric::Unreadable),
         }
     }
     // An all-blank field decodes as zero, as GNU tar treats it.
@@ -874,13 +894,13 @@ fn numeric_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
 ///
 /// No capability is lost by refusing: an archive that means `0o7777`, or uid
 /// 4294967295, spells it in octal or in the positive base-256 form directly.
-fn unsigned_field(field: &[u8]) -> Result<u32, HeaderFlaw> {
-    u32::try_from(numeric_field(field)?).map_err(|_| HeaderFlaw::Numeric)
+fn unsigned_field(field: &[u8]) -> Result<u32, Numeric> {
+    u32::try_from(numeric_field(field)?).map_err(|_| Numeric::OutOfRange)
 }
 
 /// Decodes a GNU base-256 numeric field: big-endian two's complement with
 /// the top bit of the first byte as the format flag.
-fn base256_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
+fn base256_field(field: &[u8]) -> Result<i64, Numeric> {
     // The top bit of the first byte is the format marker; the remaining
     // bits begin the two's-complement value, sign-extended from bit 6.
     let mut value = i64::from(field[0] & 0x7f);
@@ -891,7 +911,7 @@ fn base256_field(field: &[u8]) -> Result<i64, HeaderFlaw> {
         value = value
             .checked_mul(256)
             .and_then(|v| v.checked_add(i64::from(*byte)))
-            .ok_or(HeaderFlaw::Numeric)?;
+            .ok_or(Numeric::OutOfRange)?;
     }
     Ok(value)
 }
@@ -1451,13 +1471,53 @@ mod tests {
         let mut block = ustar_header(b"file.txt", b"");
         block[100..108].copy_from_slice(&[0xffu8; 8]);
         checksum(&mut block);
-        assert_eq!(parse_header(&block).unwrap_err(), HeaderFlaw::Numeric);
+        let flaw = parse_header(&block).unwrap_err();
+        assert_eq!(flaw, HeaderFlaw::Field("mode", Numeric::OutOfRange));
+        // The refusal names the field and says the value is base-256 that does
+        // not fit, rather than that it is not base-256 at all.
+        assert_eq!(
+            flaw.describe(),
+            "the header's mode field holds a value out of its range"
+        );
 
         // The same header with an ordinary octal mode parses, so what is refused
         // is the sign and not the field.
         assert_eq!(
             parse_header(&ustar_header(b"file.txt", b"")).unwrap().mode,
             0o644,
+        );
+    }
+
+    #[test]
+    fn a_numeric_field_refusal_names_the_field_and_what_is_wrong_with_it() {
+        // A digit that is not octal is unreadable; a value the type it is read
+        // into cannot hold is out of range. Each names the field it is in.
+        let mut block = ustar_header(b"file.txt", b"");
+        block[108..116].copy_from_slice(b"00017x0\0");
+        checksum(&mut block);
+        assert_eq!(
+            parse_header(&block).unwrap_err().describe(),
+            "the header's uid field is neither octal nor base-256",
+        );
+
+        let mut block = ustar_header(b"file.txt", b"");
+        // Base-256, negative: no size is.
+        block[124..136].copy_from_slice(&[0xffu8; 12]);
+        checksum(&mut block);
+        assert_eq!(
+            parse_header(&block).unwrap_err(),
+            HeaderFlaw::Field("size", Numeric::OutOfRange),
+        );
+
+        let mut block = ustar_header(b"file.txt", b"");
+        // Base-256 with more significant bits than an `i64` holds.
+        block[136..148].copy_from_slice(&[
+            0x80, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ]);
+        checksum(&mut block);
+        assert_eq!(
+            parse_header(&block).unwrap_err(),
+            HeaderFlaw::Field("mtime", Numeric::OutOfRange),
         );
     }
 
