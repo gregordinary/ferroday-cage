@@ -1598,10 +1598,12 @@ fn hermetic_resolve_layer_requires_a_configured_base() {
         .include(["base"])
         .build()
         .expect("the builder validates");
-    assert!(
-        debian.resolve_layer().is_err(),
-        "a base with no dpkg status database is refused",
-    );
+    match debian.resolve_layer() {
+        Err(DebianError::Config { reason, .. }) => {
+            assert!(reason.contains("no dpkg status database"), "{reason}");
+        }
+        other => panic!("a base with no dpkg status database is refused: {other:?}"),
+    }
 }
 
 #[test]
@@ -1982,14 +1984,14 @@ fn an_archive_coordinate_the_repository_cannot_be_addressed_by_is_refused() {
         .expect("a slashed suite and component are real layouts");
 
     // An additional repository is held to the same rule, at its own build.
-    assert!(
-        Repository::builder("../../etc")
-            .mirror("file:///srv/debs")
-            .trust_unsigned(true)
-            .build()
-            .is_err(),
-        "an additional repository's suite is unchecked",
-    );
+    match Repository::builder("../../etc")
+        .mirror("file:///srv/debs")
+        .trust_unsigned(true)
+        .build()
+    {
+        Err(DebianError::Config { reason, .. }) => assert!(reason.contains("suite"), "{reason}"),
+        other => panic!("an additional repository's suite is unchecked: {other:?}"),
+    }
 }
 
 #[test]
@@ -2019,10 +2021,20 @@ fn the_unsigned_path_is_refused_without_trust_unsigned() {
         .extract_only(true)
         .build()
         .expect("the builder validates");
-    assert!(
-        provision::ensure(&rootfs, &mut debian).is_err(),
-        "an unsigned repository must not provision without trust_unsigned",
-    );
+    let err = provision::ensure(&rootfs, &mut debian)
+        .expect_err("an unsigned repository must not provision without trust_unsigned");
+    // The default path asks for the signed InRelease alone, and the refusal is
+    // that request going unanswered: not a failure further on, after the plain
+    // Release beside it had been read and trusted.
+    let ProvisionError::Other { source, .. } = &err else {
+        panic!("expected a Debian error, got {err:?}");
+    };
+    match source.downcast_ref::<DebianError>() {
+        Some(DebianError::Fetch(provision::FetchError::NotFound { url, .. })) => {
+            assert!(url.ends_with("/dists/trixie/InRelease"), "{url}");
+        }
+        _ => panic!("the refusal is the missing InRelease: {err:?}"),
+    }
     assert!(!rootfs.exists(), "a refused bootstrap publishes nothing");
 }
 
