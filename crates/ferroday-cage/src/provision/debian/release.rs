@@ -161,8 +161,8 @@ impl Release {
             hashes,
             acquire_by_hash: marked("Acquire-By-Hash"),
             priority,
-            architectures: split_ws(stanza.get("Architectures").as_deref()),
-            components: split_ws(stanza.get("Components").as_deref()),
+            architectures: document::list(stanza.get("Architectures").as_deref()),
+            components: document::list(stanza.get("Components").as_deref()),
             valid_until: stanza.get("Valid-Until").map(Cow::into_owned),
             date: stanza.get("Date").map(|value| value.trim().to_string()),
             suite: stanza.get("Suite").map(|value| value.trim().to_string()),
@@ -342,15 +342,6 @@ impl Release {
     pub(crate) fn acquire_by_hash(&self) -> bool {
         self.acquire_by_hash
     }
-}
-
-/// Splits a whitespace-separated field into owned tokens.
-fn split_ws(value: Option<&str>) -> Vec<String> {
-    value
-        .into_iter()
-        .flat_map(str::split_whitespace)
-        .map(str::to_string)
-        .collect()
 }
 
 /// Parses an RFC 5322 date (`Sat, 11 Jul 2026 09:02:23 UTC`) to a Unix

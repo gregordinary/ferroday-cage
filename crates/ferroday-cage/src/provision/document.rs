@@ -369,10 +369,15 @@ pub(crate) fn number<T: std::str::FromStr + fmt::Display>(
 
 /// Reads a space-separated list field, absent or empty giving no entries.
 ///
-/// Only the Debian layer's plan carries a list field — an archive's components,
-/// and the keys that sign it. Alpine's names one repository per stanza and
-/// Gentoo's one package per stanza, and a dependency closure is stanzas rather
-/// than a list, so a build of either alone has no caller.
+/// The separators are ASCII whitespace. The format's own syntax is ASCII, so a
+/// character outside it, a non-breaking space among them, is part of an entry
+/// rather than the end of one.
+///
+/// Only the Debian layer reads a list field: its plan's archive components and
+/// signing keys, and a release's architectures and components. Alpine's plan
+/// names one repository per stanza and Gentoo's one package per stanza, and a
+/// dependency closure is stanzas rather than a list, so a build of either
+/// alone has no caller.
 #[cfg_attr(not(feature = "debian"), allow(dead_code))]
 pub(crate) fn list(value: Option<&str>) -> Vec<String> {
     value
