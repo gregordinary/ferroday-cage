@@ -67,6 +67,11 @@ const SIGN_PREFIX: &str = ".SIGN.";
 /// checksums both carry it.
 pub(super) const IDENTITY_PREFIX: &str = "Q1";
 
+/// The SHA-1 a control identity names, whichever of its two spellings it was
+/// read from: [`identity_digest`] reads the `Q1` one and [`identity_of_hex`] the
+/// `X1` one. A fixed width, so a digest of another length is not a value of it.
+pub(super) type IdentityDigest = [u8; size_of::<<Sha1 as HashFunction>::Output>()];
+
 /// The tag the same digest carries when it is spelled in hexadecimal, which is
 /// how the installed database's script archive names a package.
 const IDENTITY_HEX_PREFIX: &str = "X1";
@@ -100,9 +105,10 @@ pub(super) fn identity(digest: &[u8]) -> String {
 /// the one spelling [`identity`] writes. A lenient reader decodes `...IHJ=` as
 /// it decodes `...IHI=`, and a value compared as text would then be refused as
 /// a mismatch long after it was admitted.
-pub(super) fn identity_digest(spelled: &str) -> Option<Vec<u8>> {
-    let digest = base64::decode(spelled.strip_prefix(IDENTITY_PREFIX)?)?;
-    (digest.len() == size_of::<<Sha1 as HashFunction>::Output>()).then_some(digest)
+pub(super) fn identity_digest(spelled: &str) -> Option<IdentityDigest> {
+    base64::decode(spelled.strip_prefix(IDENTITY_PREFIX)?)?
+        .try_into()
+        .ok()
 }
 
 /// A well-formed control identity, distinct per `seed`, for a test that needs
@@ -134,8 +140,7 @@ pub(super) fn control_identity_hex(payload: &[u8]) -> String {
 /// is how `apk` itself finds the record an archived script belongs to.
 pub(super) fn identity_of_hex(spelled: &str) -> Option<String> {
     let hex = spelled.strip_prefix(IDENTITY_HEX_PREFIX)?.as_bytes();
-    const SHA1_LEN: usize = size_of::<<Sha1 as HashFunction>::Output>();
-    let digest: [u8; SHA1_LEN] = crate::provision::digest::unhex(hex)?;
+    let digest: IdentityDigest = crate::provision::digest::unhex(hex)?;
     Some(identity(&digest))
 }
 
