@@ -497,6 +497,9 @@ consumer upgrading can skip it.
   named a member or a package as though it were the path. `Pool::publish`
   reports a `.deb` it cannot read as `DebianError::Io`, the OS error its cause,
   where it was `DebianError::Deb` with the error flattened into the reason.
+- **Breaking.** A Gentoo binary package whose container cannot be read is
+  reported as `GentooError::Io`, the OS error its cause, as the layer documents.
+  It was `GentooError::Container` with the error flattened into the reason.
 
 ### Fixed
 

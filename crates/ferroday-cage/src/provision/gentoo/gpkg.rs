@@ -102,10 +102,10 @@ use super::plan::PlannedPackage;
 use super::{GentooError, MAX_METADATA_BYTES, atom, installed};
 use crate::ErrorChain;
 use crate::path;
-use crate::provision::compress;
 use crate::provision::digest::{self, Algorithm, Digest};
 use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
 use crate::provision::tar::{self, TarReader};
+use crate::provision::{ProvisionError, compress};
 
 /// The member every container must carry, and the marker that says which format
 /// it is.
@@ -323,10 +323,7 @@ impl Package {
         let mut file = &self.container;
         io::Seek::rewind(&mut file).map_err(GentooError::at("rewinding the container", path))?;
         let mut archive = TarReader::new(io::BufReader::new(file), path);
-        while let Some(entry) = archive
-            .next_entry()
-            .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?
-        {
+        while let Some(entry) = archive.next_entry().map_err(|err| unreadable(path, err))? {
             let is_image = entry.typeflag != b'5'
                 && split_member(&entry.path)
                     .and_then(|(_, name)| std::str::from_utf8(name).ok())
@@ -340,10 +337,8 @@ impl Package {
             };
             // As in the first pass, a failure under the member is the tar
             // reader's, and says the container is cut short or unreadable.
-            let (_, inner) = compress::decoder(member).map_err(|err| {
-                let err = tar::read_failure(path, 0, err);
-                GentooError::container(path, ErrorChain::new(&err).to_string())
-            })?;
+            let (_, inner) = compress::decoder(member)
+                .map_err(|err| unreadable(path, tar::read_failure(path, 0, err)))?;
             return Ok(TarReader::new(inner, path));
         }
         Err(GentooError::container(
@@ -413,10 +408,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
     };
     let mut prefix: Option<Vec<u8>> = None;
     let mut entries = 0usize;
-    while let Some(entry) = archive
-        .next_entry()
-        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?
-    {
+    while let Some(entry) = archive.next_entry().map_err(|err| unreadable(path, err))? {
         entries += 1;
         if entries > MAX_ENTRIES {
             return Err(GentooError::container(
@@ -498,9 +490,9 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             // held, and never cut at the ceiling: a member that fits is read
             // whole and one past it is refused as what it is.
             Some(limit) => {
-                buffered = archive.read_entry(limit).map_err(|err| {
-                    GentooError::container(path, ErrorChain::new(&err).to_string())
-                })?;
+                buffered = archive
+                    .read_entry(limit)
+                    .map_err(|err| unreadable(path, err))?;
                 (
                     Digest::of(Algorithm::Sha512, &buffered),
                     buffered.len() as u64,
@@ -514,9 +506,8 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
                 // What fails here is the tar reader under the member, which
                 // reports a container cut short or unreadable the way the
                 // entry headers above report one.
-                let digested = digest::stream(Algorithm::Sha512, &mut member).map_err(|err| {
-                    GentooError::container(path, ErrorChain::new(&err).to_string())
-                })?;
+                let digested = digest::stream(Algorithm::Sha512, &mut member)
+                    .map_err(|err| unreadable(path, tar::read_failure(path, 0, err)))?;
                 archive = member.archive;
                 digested
             }
@@ -554,6 +545,24 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         ));
     }
     Ok(scan)
+}
+
+/// A failure reading the container at `path`, as this layer reports it.
+///
+/// A read of the file that failed is the host's, [`GentooError::Io`], the OS's
+/// failure its cause, which is what [`Package::read`] promises for a container
+/// it could not read. Anything else is the container's,
+/// [`GentooError::Container`]: one cut short, or holding an archive or a
+/// compression the reader refuses.
+fn unreadable(path: &Path, err: ProvisionError) -> GentooError {
+    match err {
+        ProvisionError::Io {
+            op,
+            path: read,
+            source,
+        } => GentooError::io(op, read, source),
+        other => GentooError::container(path, ErrorChain::new(&other).to_string()),
+    }
 }
 
 /// Splits a member path into its directory prefix and the name below it.
@@ -719,23 +728,20 @@ impl Manifest {
 fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, GentooError> {
     let mut files = BTreeMap::new();
     let (_, inner) = compress::decoder(scan.metadata.as_slice())
-        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
+        .map_err(|err| unreadable(path, tar::read_failure(path, 0, err)))?;
     let mut inner = TarReader::new(inner, path);
     // What the entries may hold between them, which is what each is read
     // under: the metadata is one budget, however the archive divides it. An
     // entry the layer does not keep is read under it too, since decompressing
     // it costs what decompressing a kept one does.
     let mut left = MAX_METADATA_BYTES;
-    while let Some(entry) = inner
-        .next_entry()
-        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?
-    {
+    while let Some(entry) = inner.next_entry().map_err(|err| unreadable(path, err))? {
         if entry.typeflag == b'5' {
             continue;
         }
         let bytes = inner
             .read_entry(left)
-            .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
+            .map_err(|err| unreadable(path, err))?;
         left -= bytes.len() as u64;
         // Anything that is not a plain file directly under `metadata/` is not a
         // metadata file, and the layer writes out only what it recognizes.
@@ -1275,6 +1281,37 @@ mod tests {
     /// The targets of a root the fixture containers were built for.
     fn root_targets() -> BTreeSet<String> {
         BTreeSet::from([CHOST.to_string()])
+    }
+
+    #[test]
+    fn a_failed_read_is_the_hosts_and_a_refusal_the_containers() {
+        // What `Package::read` promises: a container that could not be read is
+        // `Io`, its OS error the cause, however it reached the layer -- from
+        // the tar reader directly, or carried through a member's data -- and
+        // one the reader refuses is the container's.
+        let path = Path::new("/var/cache/binpkgs/zlib-1.3.1-1.gpkg.tar");
+        let eio = || ProvisionError::io("reading", path, io::Error::from_raw_os_error(5));
+        let carried = tar::read_failure(path, 0, tar::into_io(eio()));
+        for err in [eio(), carried] {
+            match unreadable(path, err) {
+                GentooError::Io {
+                    path: read, source, ..
+                } => {
+                    assert_eq!(read, path);
+                    assert_eq!(source.raw_os_error(), Some(5));
+                }
+                other => panic!("expected the host's failure, got {other:?}"),
+            }
+        }
+        let cut = ProvisionError::Archive {
+            offset: 9216,
+            reason: "the archive ends inside an entry's data".to_string(),
+            source: None,
+        };
+        assert!(
+            matches!(unreadable(path, cut), GentooError::Container { .. }),
+            "a container cut short is the container's",
+        );
     }
 
     /// Opens `built` and reports what happened, as the plan entry `wanted`
