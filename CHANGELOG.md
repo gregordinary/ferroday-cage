@@ -596,6 +596,8 @@ consumer upgrading can skip it.
 - The test of a reaped child's processor time measures the child's work in
   processor time, as its own `/proc` record states it, rather than in wall
   time, which a preempted or throttled child is charged less than.
+- Every test skip is also appended to the file `FERRODAY_CAGE_SKIP_LOG` names,
+  one line each, and CI lists the skips its test steps logged.
 
 ## [0.5.2] - 2026-11-10
 

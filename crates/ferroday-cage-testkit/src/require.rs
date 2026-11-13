@@ -14,12 +14,18 @@
 //! remembered to check it. [`Requirement`] names a facility and its variable;
 //! [`premise_unmet`] is the one skip no variable governs.
 //!
+//! A skip line on stderr is captured with the rest of a passing test's output,
+//! so a green summary does not say how many of its passes were skips. Naming a
+//! file in [`SKIP_LOG`] appends every skip to it as well, one line each, for a
+//! run to be audited after it ends.
+//!
 //! The probes themselves stay with the tests where they need a library feature
 //! (`host::landlock_abi` and the `host::landlock_enforces_*` questions are the
 //! hardening layer's), and their results are handed in. The probes a
 //! featureless library answers are here.
 
 use std::fmt::Display;
+use std::io::Write;
 use std::path::Path;
 
 /// A host facility some tests need, and the variable that asserts they ran.
@@ -92,7 +98,7 @@ impl Requirement {
     #[track_caller]
     pub fn skip(self, reason: impl Display) {
         self.insist(&reason);
-        eprintln!("skipping: {reason}");
+        report_skip(self.variable, &reason);
     }
 
     /// Fails the test when the variable demands that it run, and otherwise
@@ -140,8 +146,67 @@ impl Requirement {
 /// on the runner that has them, and one that needs a caller other than root, or
 /// a caller with a controlling terminal, depends on how the run was started.
 /// None of those is a host that failed to provide something.
+#[track_caller]
 pub fn premise_unmet(reason: impl Display) {
+    report_skip("premise", &reason);
+}
+
+/// The variable naming a file every skip is appended to, besides the line
+/// printed on stderr.
+///
+/// Each skip is one line of four tab-separated fields: the source location
+/// that called for the skip, the running test's name, the variable that
+/// governs it (or `premise` for [`premise_unmet`]'s), and the reason. The test
+/// binaries a run starts all append to the one file, so it is removed before a
+/// run whose skips it is to hold alone:
+///
+/// ```sh
+/// rm -f target/skips.log
+/// FERRODAY_CAGE_SKIP_LOG=$PWD/target/skips.log cargo test --workspace --all-features
+/// cut -f3 target/skips.log | sort | uniq -c
+/// ```
+///
+/// A log that cannot be written fails the skipping test, since a run asked
+/// for an account of its skips and would otherwise come back with a partial
+/// one.
+pub const SKIP_LOG: &str = "FERRODAY_CAGE_SKIP_LOG";
+
+/// Reports a skip governed by `governed_by`: on stderr, and in the file
+/// [`SKIP_LOG`] names, where one is named.
+///
+/// # Panics
+///
+/// When the skip log is named and cannot be appended to.
+#[track_caller]
+fn report_skip(governed_by: &str, reason: &dyn Display) {
     eprintln!("skipping: {reason}");
+    let Some(log) = std::env::var_os(SKIP_LOG) else {
+        return;
+    };
+    let caller = std::panic::Location::caller();
+    let thread = std::thread::current();
+    // A reason can carry an error's own text, which keeps the line one line
+    // only once its separators are spaces.
+    let reason = reason.to_string().replace(['\t', '\n', '\r'], " ");
+    let line = format!(
+        "{}:{}\t{}\t{governed_by}\t{reason}\n",
+        caller.file(),
+        caller.line(),
+        thread.name().unwrap_or("unnamed"),
+    );
+    // One write to a file opened for appending, so the lines of tests skipping
+    // at once on their own threads, or in other binaries, do not interleave.
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .unwrap_or_else(|err| {
+            panic!(
+                "the skip log {} cannot be appended to: {err}",
+                Path::new(&log).display()
+            )
+        });
 }
 
 /// Whether the host can create unprivileged user namespaces; the skip reports

@@ -84,6 +84,19 @@ printing a skip of its own. `require::USERNS.skip(reason)` and its siblings
 report a facility's skip, and `require::premise_unmet(reason)` reports a skip no
 variable governs.
 
+A skipped test still counts as passed, and its skip line is captured with the
+rest of a passing test's output, so a green summary does not say how much of it
+ran. `FERRODAY_CAGE_SKIP_LOG` names a file every skip is also appended to, one
+line each: the location that called for it, the test, the variable that governs
+it (`premise` where none does), and the reason. Every test binary of a run
+appends to the same file, so remove it first:
+
+```sh
+rm -f target/skips.log
+FERRODAY_CAGE_SKIP_LOG=$PWD/target/skips.log cargo test --workspace --all-features
+cut -f3 target/skips.log | sort | uniq -c
+```
+
 To exercise the full suite locally you need three things:
 
 - Unprivileged user namespaces enabled. On Ubuntu 23.10 and later, that is

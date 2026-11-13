@@ -99,6 +99,7 @@ jobs:
         # assume the capable runner provisioned above.
         run: cargo test --workspace --all-features
         env:
+          FERRODAY_CAGE_SKIP_LOG: ${{ runner.temp }}/skips.log
           FERRODAY_CAGE_REQUIRE_USERNS: '1'
           FERRODAY_CAGE_REQUIRE_SUBID: '1'
           FERRODAY_CAGE_REQUIRE_TUN: '1'
@@ -134,8 +135,23 @@ jobs:
           cargo test --workspace --all-features --test cgroup
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: systemd-run --user --scope --quiet -p Delegate=yes --
+          FERRODAY_CAGE_SKIP_LOG: ${{ runner.temp }}/skips.log
           FERRODAY_CAGE_REQUIRE_USERNS: '1'
           FERRODAY_CAGE_REQUIRE_CGROUP: '1'
+      - name: Skipped tests
+        # The REQUIRE variables leave the skips whose premise is how the run
+        # was started, and the network suites nothing opted into. A skip still
+        # counts as a pass, so the steps above log each one, and this lists
+        # them by the variable that governs it, or `premise`.
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/skips.log"
+          if [ -f "$log" ]; then
+            cut -f3 "$log" | sort | uniq -c
+            cut -f2- "$log" | sort
+          else
+            echo "No test skipped."
+          fi
       - name: Test (serde without hardening)
         # A profile format built without the hardening layer must refuse a
         # profile that configures hardening; only this feature combination
