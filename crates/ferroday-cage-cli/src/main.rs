@@ -6761,9 +6761,14 @@ fn gentoo_provisioner(
     architecture: &str,
     options: &Options,
 ) -> Result<ferroday_cage::provision::gentoo::Gentoo, ExitCode> {
-    use ferroday_cage::provision::gentoo::{Gentoo, Plan};
+    use ferroday_cage::provision::gentoo::Plan;
 
-    let mut builder = Gentoo::builder(architecture);
+    let mut builder = gentoo_archive(
+        architecture,
+        options.gentoo_mirror.as_deref(),
+        &options.gentoo_mirror_fallback,
+        options.gentoo_max_pointer_age,
+    );
     if let Some(variant) = &options.gentoo_variant {
         builder = builder.variant(variant);
     }
@@ -6782,20 +6787,37 @@ fn gentoo_provisioner(
     if let Some(build_id) = &options.gentoo_build_id {
         builder = builder.build_id(build_id);
     }
-    if let Some(mirror) = &options.gentoo_mirror {
-        builder = builder.mirror(mirror);
-    }
-    for fallback in &options.gentoo_mirror_fallback {
-        builder = builder.mirror_fallback(fallback);
-    }
     if let Some(cache) = &options.gentoo_cache {
         builder = builder.cache_dir(cache);
     }
-    if let Some(age) = options.gentoo_max_pointer_age {
-        builder = builder.max_pointer_age(age.map(days));
-    }
 
     builder.build().map_err(fail)
+}
+
+/// A Gentoo layer for `architecture`, reading the archive the flags name: the
+/// primary `mirror` where one was given, the `fallbacks` behind it in order,
+/// and the pointer age a listing or a bootstrap accepts.
+///
+/// A provisioning run and both listings start here, so a command line that
+/// lists what an archive offers and one that installs from it read the same
+/// archive, configured the same way.
+fn gentoo_archive(
+    architecture: &str,
+    mirror: Option<&str>,
+    fallbacks: &[String],
+    max_pointer_age: Option<Option<u64>>,
+) -> ferroday_cage::provision::gentoo::GentooBuilder {
+    let mut builder = ferroday_cage::provision::gentoo::Gentoo::builder(architecture);
+    if let Some(mirror) = mirror {
+        builder = builder.mirror(mirror);
+    }
+    for fallback in fallbacks {
+        builder = builder.mirror_fallback(fallback);
+    }
+    if let Some(age) = max_pointer_age {
+        builder = builder.max_pointer_age(age.map(days));
+    }
+    builder
 }
 
 /// A count of days as a duration.
@@ -6811,21 +6833,7 @@ fn gentoo_variants(
     fallbacks: &[String],
     max_pointer_age: Option<Option<u64>>,
 ) -> ExitCode {
-    use ferroday_cage::provision::gentoo::Gentoo;
-
-    // Configured exactly as a provisioning run configures the same layer, so a
-    // command line that lists an architecture's variants and one that installs
-    // one of them read the same archive.
-    let mut builder = Gentoo::builder(architecture);
-    if let Some(mirror) = mirror {
-        builder = builder.mirror(mirror);
-    }
-    for fallback in fallbacks {
-        builder = builder.mirror_fallback(fallback);
-    }
-    if let Some(age) = max_pointer_age {
-        builder = builder.max_pointer_age(age.map(days));
-    }
+    let builder = gentoo_archive(architecture, mirror, fallbacks, max_pointer_age);
     let mut gentoo = match builder.build() {
         Ok(gentoo) => gentoo,
         Err(error) => return fail(error),
@@ -6854,18 +6862,7 @@ fn gentoo_packages(
     mirror: Option<&str>,
     fallbacks: &[String],
 ) -> ExitCode {
-    use ferroday_cage::provision::gentoo::Gentoo;
-
-    // Configured exactly as a provisioning run configures the same layer, so a
-    // command line that lists what a binhost offers and one that installs from
-    // it read the same archive.
-    let mut builder = Gentoo::builder(architecture).binhost(binhost);
-    if let Some(mirror) = mirror {
-        builder = builder.mirror(mirror);
-    }
-    for fallback in fallbacks {
-        builder = builder.mirror_fallback(fallback);
-    }
+    let builder = gentoo_archive(architecture, mirror, fallbacks, None).binhost(binhost);
     let mut gentoo = match builder.build() {
         Ok(gentoo) => gentoo,
         Err(error) => return fail(error),
