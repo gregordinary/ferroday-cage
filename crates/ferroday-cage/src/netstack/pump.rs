@@ -338,7 +338,7 @@ impl Engine {
                     .poll(self.now(), &mut self.device, &mut self.sockets);
             }
 
-            self.reap();
+            self.reap(std::time::Instant::now());
         }
     }
 
@@ -626,13 +626,27 @@ impl Engine {
         progress
     }
 
-    /// Enforces establish and idle deadlines and removes finished flows
+    /// Enforces the flows' deadlines as of `now`, then removes finished flows
     /// with their sockets.
-    fn reap(&mut self) {
-        let now = std::time::Instant::now();
+    ///
+    /// A flow a deadline aborts still has its reset to send. smoltcp emits it
+    /// on the socket's next dispatch, and removing the socket first would
+    /// discard it. The guest would then never learn of the abort. Its side of
+    /// an outbound connection is established before the host's is, since its
+    /// handshake completes against the stack's own listener, so it would wait on
+    /// a connection that no longer exists for as long as it cares to wait. The
+    /// interface is therefore polled between the aborts and the removal. Every
+    /// other abort happens while the flows are serviced, and the interface poll
+    /// that follows each servicing round sends its reset.
+    fn reap(&mut self, now: std::time::Instant) {
+        let mut aborted = false;
         for flow in &mut self.flows {
             let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
-            flow.enforce_deadline(socket, now);
+            aborted |= flow.enforce_deadline(socket, now);
+        }
+        if aborted {
+            self.iface
+                .poll(self.now(), &mut self.device, &mut self.sockets);
         }
         let mut index = 0;
         while index < self.flows.len() {
@@ -1105,9 +1119,9 @@ mod tests {
     use rustix::net::{AddressFamily, SocketType};
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
-        EthernetFrame, EthernetProtocol, EthernetRepr, Icmpv6Message, Icmpv6Packet, Icmpv6Repr,
-        IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, NdiscRepr, TcpControl, TcpPacket,
-        TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+        ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, EthernetRepr,
+        Icmpv6Message, Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet,
+        Ipv6Repr, NdiscRepr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
     };
     use std::net::{Ipv6Addr as StdIpv6Addr, SocketAddr as StdSocketAddr, TcpListener, UdpSocket};
 
@@ -1181,21 +1195,40 @@ mod tests {
         ipv4(src, dst, IpProtocol::Udp, &udp)
     }
 
-    /// A connection-opening segment in an IPv4 frame.
-    fn syn_v4(src: Ipv4Addr, dst: Ipv4Addr, port: u16) -> Vec<u8> {
+    /// The port the guest's connections leave from.
+    const GUEST_PORT: u16 = 41_000;
+
+    /// The sequence number the guest's connection-opening segment carries.
+    const GUEST_ISN: u32 = 7;
+
+    /// The window the guest advertises: small, so a transfer toward it stops
+    /// well short of the stack's transmit buffer.
+    const GUEST_WINDOW: u16 = 4096;
+
+    /// A TCP segment from [`GUEST_PORT`] on `src` to `port` on `dst`, in an
+    /// IPv4 frame.
+    fn segment_v4(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        port: u16,
+        control: TcpControl,
+        seq: u32,
+        ack: Option<u32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let repr = TcpRepr {
-            src_port: 41_000,
+            src_port: GUEST_PORT,
             dst_port: port,
-            control: TcpControl::Syn,
-            seq_number: TcpSeqNumber(7),
-            ack_number: None,
-            window_len: 4096,
+            control,
+            seq_number: TcpSeqNumber(i32::from_ne_bytes(seq.to_ne_bytes())),
+            ack_number: ack.map(|ack| TcpSeqNumber(i32::from_ne_bytes(ack.to_ne_bytes()))),
+            window_len: GUEST_WINDOW,
             window_scale: None,
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
             timestamp: None,
-            payload: &[],
+            payload,
         };
         let mut segment = vec![0u8; repr.buffer_len()];
         repr.emit(
@@ -1205,6 +1238,11 @@ mod tests {
             &ChecksumCapabilities::default(),
         );
         ipv4(src, dst, IpProtocol::Tcp, &segment)
+    }
+
+    /// A connection-opening segment in an IPv4 frame.
+    fn syn_v4(src: Ipv4Addr, dst: Ipv4Addr, port: u16) -> Vec<u8> {
+        segment_v4(src, dst, port, TcpControl::Syn, GUEST_ISN, None, &[])
     }
 
     /// A UDP datagram in an IPv6 frame, behind a hop-by-hop options header
@@ -1689,6 +1727,221 @@ mod tests {
         assert!(
             used < IDLE_TICKS,
             "the pump spun: {used} ticks in one second"
+        );
+    }
+
+    /// One TCP segment the stack sent the guest, as much of it as the tests
+    /// read.
+    #[derive(Debug)]
+    struct Sent {
+        syn: bool,
+        rst: bool,
+        seq: u32,
+        payload: usize,
+    }
+
+    /// The TCP segments the stack has written to the guest's end of the pair
+    /// since the last call, in order. Every other frame, an ARP reply say, is
+    /// passed over.
+    fn sent_to_guest(guest: &OwnedFd) -> Vec<Sent> {
+        let mut sent = Vec::new();
+        let mut frame = [0u8; 2048];
+        loop {
+            let read = match rustix::io::read(guest, &mut frame) {
+                Ok(read) => read,
+                Err(Errno::AGAIN) => return sent,
+                Err(errno) => panic!("the guest's end failed: {errno}"),
+            };
+            let Ok(ethernet) = EthernetFrame::new_checked(&frame[..read]) else {
+                continue;
+            };
+            if ethernet.ethertype() != EthernetProtocol::Ipv4 {
+                continue;
+            }
+            let Ok(ip) = Ipv4Packet::new_checked(ethernet.payload()) else {
+                continue;
+            };
+            if ip.next_header() != IpProtocol::Tcp {
+                continue;
+            }
+            let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
+                continue;
+            };
+            sent.push(Sent {
+                syn: tcp.syn(),
+                rst: tcp.rst(),
+                seq: u32::from_ne_bytes(tcp.seq_number().0.to_ne_bytes()),
+                payload: tcp.payload().len(),
+            });
+        }
+    }
+
+    /// An ARP request from the guest for the gateway's hardware address, which
+    /// is how the stack learns the guest's own: a guest resolves its gateway
+    /// before it sends anything through it.
+    fn resolve_gateway() -> Vec<u8> {
+        let repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: EthernetAddress(GUEST_MAC),
+            source_protocol_addr: GUEST,
+            target_hardware_addr: EthernetAddress([0; 6]),
+            target_protocol_addr: GATEWAY,
+        };
+        let mut packet = vec![0u8; repr.buffer_len()];
+        repr.emit(&mut ArpPacket::new_unchecked(&mut packet));
+        ethernet(EthernetProtocol::Arp, &packet)
+    }
+
+    /// Hands `frame` to the engine as ingestion does: classified first, so a
+    /// connection attempt gets its flow, then delivered.
+    fn guest_sends(engine: &mut Engine, frame: &[u8]) {
+        assert!(
+            engine.consider(classify(frame)),
+            "the stack withheld the guest's frame"
+        );
+        deliver(engine, frame);
+    }
+
+    /// Opens a connection from the guest to the gateway's `port`, which the
+    /// plan maps onto host loopback, and completes the guest's side of it.
+    ///
+    /// The guest's handshake completes against the stack's own listener at
+    /// once, while the host connect runs in parallel. Nothing reports that
+    /// connect's conclusion to the flow until the test does, so the flow is
+    /// left established on the guest's side alone.
+    fn guest_connects(engine: &mut Engine, guest: &OwnedFd, port: u16) {
+        guest_sends(engine, &resolve_gateway());
+        guest_sends(engine, &syn_v4(GUEST, GATEWAY, port));
+        let sent = sent_to_guest(guest);
+        let syn_ack = sent
+            .iter()
+            .find(|segment| segment.syn)
+            .unwrap_or_else(|| panic!("the stack never answered the guest's SYN: {sent:?}"));
+        let next = syn_ack.seq.wrapping_add(1);
+        guest_sends(
+            engine,
+            &segment_v4(
+                GUEST,
+                GATEWAY,
+                port,
+                TcpControl::None,
+                GUEST_ISN + 1,
+                Some(next),
+                &[],
+            ),
+        );
+        assert_eq!(
+            engine
+                .sockets
+                .get::<tcp_socket::Socket>(engine.flows[0].handle)
+                .state(),
+            tcp_socket::State::Established,
+            "the guest's side of the connection is established",
+        );
+    }
+
+    /// A flow the establish deadline aborts resets the guest, whose side of the
+    /// connection is already established and would otherwise wait on it for as
+    /// long as it cares to.
+    #[test]
+    fn a_flow_the_establish_deadline_aborts_resets_the_guest() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, mapping(port), Vec::new());
+        guest_connects(&mut engine, &guest, port);
+        let now = std::time::Instant::now();
+        let flow = &engine.flows[0];
+        assert!(
+            flow.deadline_in(engine.sockets.get(flow.handle), now)
+                .is_some_and(|left| left > Duration::ZERO),
+            "the flow waits on its host connect, under the establish deadline",
+        );
+
+        engine.reap(now + tcp::ESTABLISH_DEADLINE);
+        assert!(engine.flows.is_empty(), "the deadline reclaimed the flow");
+        let sent = sent_to_guest(&guest);
+        assert!(
+            sent.iter().any(|segment| segment.rst),
+            "the guest was never told the connection is gone: {sent:?}",
+        );
+    }
+
+    /// A flow the hangup deadline reclaims, a guest that never reads behind a
+    /// host that has finished sending, resets the guest the same way.
+    #[test]
+    fn a_flow_the_hangup_deadline_reclaims_resets_the_guest() {
+        use std::io::Write as _;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, mapping(port), Vec::new());
+        guest_connects(&mut engine, &guest, port);
+
+        // The host connect concludes, as a poll reports it.
+        let (mut peer, _) = listener.accept().expect("the stack's connect arrives");
+        engine.flows[0].events = PollFlags::OUT;
+        engine.service();
+
+        // The host sends half as much again as the guest's transmit buffer
+        // holds and hangs up, so the tail and its end of stream stay queued
+        // behind a buffer the guest never drains. Written on a thread of its
+        // own, since the kernel buffers only so much while the stack is not
+        // reading.
+        let writer = std::thread::spawn(move || {
+            peer.write_all(&vec![b'x'; tcp::BUFFER_SIZE * 3 / 2])
+                .expect("the host writes");
+            peer.shutdown(std::net::Shutdown::Write)
+                .expect("the host hangs up");
+            peer
+        });
+        let patience = std::time::Instant::now() + Duration::from_secs(10);
+        while !writer.is_finished() {
+            assert!(
+                std::time::Instant::now() < patience,
+                "the host never finished writing"
+            );
+            engine.flows[0].events = PollFlags::IN;
+            engine.service();
+            engine
+                .iface
+                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _peer = writer.join().expect("the writer completes");
+
+        // The hangup is reported, the guest is sent what its window takes, and
+        // the flow can move nothing more.
+        engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
+        engine.service();
+        engine
+            .iface
+            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.flows[0].events = PollFlags::empty();
+        engine.service();
+        let now = std::time::Instant::now();
+        let flow = &engine.flows[0];
+        assert!(
+            flow.deadline_in(engine.sockets.get(flow.handle), now)
+                .is_some_and(|left| left > Duration::ZERO),
+            "the flow is stalled, under the hangup deadline",
+        );
+        let delivered: usize = sent_to_guest(&guest)
+            .iter()
+            .map(|segment| segment.payload)
+            .sum();
+        assert!(
+            delivered > 0 && delivered <= usize::from(GUEST_WINDOW),
+            "the guest's window, and no more, was filled: {delivered} bytes",
+        );
+
+        engine.reap(now + tcp::HANGUP_DEADLINE);
+        assert!(engine.flows.is_empty(), "the deadline reclaimed the flow");
+        let sent = sent_to_guest(&guest);
+        assert!(
+            sent.iter().any(|segment| segment.rst),
+            "the guest was never told the connection is gone: {sent:?}",
         );
     }
 }

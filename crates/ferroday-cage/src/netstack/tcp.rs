@@ -462,9 +462,11 @@ impl TcpFlow {
 
     /// Aborts the flow if it has run out of time: the establish deadline before
     /// both sides are up, the hangup deadline for a stall that never resolves.
-    pub(super) fn enforce_deadline(&mut self, socket: &mut tcp::Socket, now: Instant) {
+    /// Returns whether it did, since the guest's reset then waits on the
+    /// socket's next dispatch.
+    pub(super) fn enforce_deadline(&mut self, socket: &mut tcp::Socket, now: Instant) -> bool {
         if self.dead {
-            return;
+            return false;
         }
         let expired = if self.established(socket) {
             self.stalled_since
@@ -476,6 +478,7 @@ impl TcpFlow {
             socket.abort();
             self.dead = true;
         }
+        expired
     }
 
     /// Records whether the pass that just ran left the flow stalled, which is
