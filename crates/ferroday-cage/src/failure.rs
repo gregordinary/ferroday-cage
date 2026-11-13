@@ -157,9 +157,11 @@ macro_rules! path_io_error {
 pub(crate) use path_io_error;
 
 /// What a hostile source could write into a string an error names, and the
-/// check that the error renders it inert. Every such string reaches an error
-/// through a provisioner, so the module is built where one is.
-#[cfg(all(test, any(feature = "debian", feature = "alpine", feature = "gentoo")))]
+/// check that the error renders it inert. Such a string reaches an error
+/// through a provisioner, an archive's entry names through the tarball one that
+/// every userland layer builds on, or through the network stack, which names an
+/// interface the kernel refused, so the module is built where either is.
+#[cfg(all(test, any(feature = "tarball", feature = "netstack")))]
 pub(crate) mod hostile {
     /// OSC 52, which sets the terminal's clipboard, then a screen clear.
     pub(crate) const TEXT: &str = "\u{1b}]52;c;cm0gLXJmIH4K\u{7}\u{1b}[2J";
@@ -415,7 +417,7 @@ mod tests {
             ProvisionError::other(ProvisionError::io("opening", "/srv/rootfs.tar", os_error()));
         assert_eq!(
             ErrorChain::new(&error).to_string(),
-            "provisioning failed: provisioning failed while opening /srv/rootfs.tar: \
+            "provisioning failed: provisioning failed while opening \"/srv/rootfs.tar\": \
              Permission denied (os error 13)",
         );
         assert_eq!(

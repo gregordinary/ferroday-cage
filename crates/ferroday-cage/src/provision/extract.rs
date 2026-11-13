@@ -2046,6 +2046,48 @@ mod mode_tests {
     }
 }
 
+// What a refusal says about an entry whose name is the archive's own text.
+#[cfg(test)]
+mod naming_tests {
+    use super::{Placement, TarReader, extract_archive};
+    use crate::ErrorChain;
+    use crate::failure::hostile;
+    use crate::scratch::Scratch;
+    use ferroday_cage_testkit::tar::Tar;
+
+    #[test]
+    fn a_refused_entry_is_named_with_its_control_characters_escaped() {
+        // An entry's name is whatever the archive spells, and a `Tarball` is
+        // documented for archives nothing vouches for. Each refusal that names
+        // the entry is printed through the same chain a caller prints, so a
+        // name carrying a terminal escape reaches it as the escape's spelling.
+        let escaping = format!("{}/../escape", hostile::TEXT);
+        let mut traversal = Tar::new();
+        traversal.file(&escaping, 0o644, b"x");
+        let mut sparse = Tar::new();
+        sparse.entry(hostile::TEXT, b'S', 0o644, 0, 0, "", b"");
+        let below = format!("{}/beneath", hostile::TEXT);
+        let mut under_a_file = Tar::new();
+        under_a_file
+            .file(hostile::TEXT, 0o644, b"a file")
+            .file(&below, 0o644, b"x");
+        for (case, archive) in [
+            ("a traversal", traversal),
+            ("an unsupported type", sparse),
+            ("a component that is a file", under_a_file),
+        ] {
+            let root = Scratch::for_test("extract", "hostile-name");
+            let err = extract_archive(
+                &mut TarReader::new(&archive.finish()[..]),
+                &root,
+                &mut |_, _| Ok(Placement::Write),
+            )
+            .expect_err(case);
+            hostile::assert_escaped(&ErrorChain::new(&err).to_string());
+        }
+    }
+}
+
 // The access control lists an archive records, which the extractor applies
 // rather than leaving the mode to stand for them.
 #[cfg(test)]

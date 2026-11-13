@@ -770,6 +770,11 @@ consumer upgrading can skip it.
   binhost index record whose `SLOT` is empty or whose slot, flag lists or
   dependency classes are folded over several lines. Such a record was resolved
   to, and `Plan::to_document` then refused the plan recording the resolution.
+- `ProvisionError` quotes the path in its `Io`, `EntryUnsafe`, `EntryRefused`,
+  `EntryUnsupported` and `SourceChanged` messages, writing a control character
+  as an escape. Those paths include an archive entry's own name, and a refused
+  entry named with a terminal escape sequence carried the sequence raw onto the
+  terminal the error was printed on.
 
 ### Internal
 

@@ -685,24 +685,28 @@ impl fmt::Display for ProvisionError {
                 "cannot publish a rootfs at {}: the path has no final component or is not a directory",
                 path.display(),
             ),
+            // A path in this variant, and in the entry variants below, may be
+            // an archive's own spelling of an entry, or a name a sandbox wrote
+            // into a tree, so it is quoted: `{:?}` escapes a control character
+            // rather than handing it to the terminal the error is printed on.
+            // A path the caller configured reads the same way, which keeps one
+            // rule per variant rather than one per site that builds it.
             ProvisionError::Io { op, path, .. } => {
-                write!(f, "provisioning failed while {op} {}", path.display())
+                write!(f, "provisioning failed while {op} {path:?}")
             }
             ProvisionError::Archive { offset, reason } => {
                 write!(f, "malformed archive at offset {offset}: {reason}")
             }
             ProvisionError::EntryUnsafe { path, reason } => write!(
                 f,
-                "the archive entry {} reaches outside the extraction root: {reason}",
-                path.display(),
+                "the archive entry {path:?} reaches outside the extraction root: {reason}",
             ),
             ProvisionError::EntryRefused { path, reason } => {
-                write!(f, "the entry {} was refused: {reason}", path.display())
+                write!(f, "the entry {path:?} was refused: {reason}")
             }
             ProvisionError::EntryUnsupported { path, kind } => write!(
                 f,
-                "the archive entry {} has unsupported type {:?}",
-                path.display(),
+                "the archive entry {path:?} has unsupported type {:?}",
                 char::from(*kind),
             ),
             ProvisionError::FormatUnrecognized { path } => write!(
@@ -737,9 +741,8 @@ impl fmt::Display for ProvisionError {
             ),
             ProvisionError::SourceChanged { path, recorded } => write!(
                 f,
-                "{} changed while it was being read: {recorded} bytes were recorded for it, \
+                "{path:?} changed while it was being read: {recorded} bytes were recorded for it, \
                  which is no longer what it holds",
-                path.display(),
             ),
             #[cfg(feature = "tarball")]
             ProvisionError::ExportUnprivileged { path, reason } => write!(
