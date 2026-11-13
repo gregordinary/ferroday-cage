@@ -37,7 +37,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::host::UsernsBlocker;
+use crate::host::{ProcfsBlocker, UsernsBlocker};
 use crate::spec::is_command_name;
 use crate::wire::wire_enum;
 
@@ -866,6 +866,19 @@ rendered as text.
         /// The grant, as `access on path`.
         grant: String,
     },
+    /// The only procfs the sandbox mounts that could serve its nested user
+    /// namespace is read-only.
+    ///
+    /// The [`NestedUsernsNeedsProcfs`](Self::NestedUsernsNeedsProcfs) refusal,
+    /// where read-only is the one reason the procfs at `target` does not count:
+    /// the identity map of the nested user namespace is written through it.
+    /// A procfs bound read-only, a fresh one mounted read-only, and one a later
+    /// remount makes read-only are each such a procfs.
+    #[non_exhaustive]
+    NestedUsernsProcfsReadOnly {
+        /// Where the read-only procfs is mounted inside the sandbox.
+        target: PathBuf,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -1199,6 +1212,13 @@ impl fmt::Display for ConfigError {
                  host's own root hides /home, /root, /run, /var/run, and /var/tmp)",
                 path.display()
             ),
+            ConfigError::NestedUsernsProcfsReadOnly { target } => write!(
+                f,
+                "the procfs at {} is read-only, and the nested user namespace that locks the \
+                 sandbox's mount flags writes its identity map through it; mount it writable, \
+                 or leave the managed profile's own procfs in place",
+                target.display(),
+            ),
         }
     }
 }
@@ -1428,6 +1448,23 @@ pub enum Error {
         /// makes the listener ended without saying why.
         source: Option<io::Error>,
     },
+    /// The kernel refused the fresh procfs a sandbox with a PID namespace of
+    /// its own mounts, as it does inside a container whose runtime masks
+    /// entries of the container's procfs.
+    ///
+    /// The kernel mounts a procfs for a user namespace only where an existing
+    /// procfs is fully visible, and [`ProcfsBlocker`] says what the mount table
+    /// shows about why none is, and what to do. The same check is available
+    /// before a launch as [`host::procfs_blocker`](crate::host::procfs_blocker).
+    /// Reported in place of [`Setup`](Self::Setup) for a
+    /// [`MountProc`](SetupStep::MountProc) step that failed with `EPERM`.
+    #[non_exhaustive]
+    ProcfsRefused {
+        /// What the mount table shows, and the remedies.
+        blocker: ProcfsBlocker,
+        /// The error the kernel returned for the mount, `EPERM`.
+        source: io::Error,
+    },
 }
 
 /// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
@@ -1588,6 +1625,11 @@ impl fmt::Display for Error {
                 f,
                 "could not listen at {address} on the sandbox's loopback while {op}"
             ),
+            Error::ProcfsRefused { blocker, .. } => write!(
+                f,
+                "sandbox setup failed while mounting a fresh procfs for the sandbox's PID \
+                 namespace ({blocker})"
+            ),
         }
     }
 }
@@ -1616,7 +1658,8 @@ impl std::error::Error for Error {
             | Error::Signal { source }
             | Error::KillHandle { source }
             | Error::Terminal { source }
-            | Error::TerminalsExhausted { source } => Some(source),
+            | Error::TerminalsExhausted { source }
+            | Error::ProcfsRefused { source, .. } => Some(source),
             Error::Listen { source, .. } => source
                 .as_ref()
                 .map(|source| source as &(dyn std::error::Error + 'static)),

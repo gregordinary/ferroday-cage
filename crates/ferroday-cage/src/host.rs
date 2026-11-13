@@ -139,6 +139,222 @@ pub fn seccomp_available() -> bool {
     crate::mechanism::seccomp::installable()
 }
 
+/// Why a sandbox with a PID namespace of its own cannot mount the fresh procfs
+/// that namespace needs.
+///
+/// The kernel lets a process inside a user namespace mount a procfs only where
+/// its mount namespace already holds one that is fully visible: a procfs
+/// mounted at its own root, with no mount lying on any of its entries except
+/// the permanently empty directories the kernel keeps for mounting on, such as
+/// `/proc/sys/fs/binfmt_misc`. A container runtime masks entries of the
+/// container's procfs by mounting over them, `/proc/kcore` and `/proc/sys`
+/// among them, and a sandbox's user namespace locks those mounts in place, so
+/// inside a container started with the runtime's defaults no procfs qualifies,
+/// whatever the sandbox does. The mount fails with `EPERM`, which a launch
+/// reports as [`Error::ProcfsRefused`](crate::Error::ProcfsRefused).
+///
+/// Two remedies exist, in the order to consider them. The first is unmasking
+/// the runtime's procfs: Docker's `--security-opt systempaths=unconfined`, or
+/// Kubernetes' `procMount: Unmasked`, which needs `hostUsers: false`. The
+/// second is sharing the caller's PID namespace, with
+/// [`CageBuilder::pid_namespace(false)`](crate::CageBuilder::pid_namespace). The managed
+/// profile then binds the existing procfs, masks included, and needs no fresh
+/// one; the command can then see and signal the processes of the caller's PID
+/// namespace that run as the same user, which the `hardening` feature's
+/// `LandlockScope::Signal` refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProcfsBlocker {
+    /// Mounts lie on entries of every procfs the mount namespace holds.
+    #[non_exhaustive]
+    Covered {
+        /// Where each such mount is mounted, in the order the mount table
+        /// lists them.
+        mounts: Vec<PathBuf>,
+    },
+    /// The kernel refused the mount, and no mount lies on the procfs.
+    ///
+    /// The rule weighs the existing procfs's own flags as well: a procfs
+    /// mounted read-only, or with access-time settings other than the default,
+    /// does not count. A security module's policy or a seccomp filter can
+    /// refuse the mount too.
+    Refused,
+}
+
+impl fmt::Display for ProcfsBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProcfsBlocker::Covered { mounts } => {
+                f.write_str(
+                    "the kernel mounts a fresh procfs only where an existing one is fully \
+                     visible, and mounts cover entries of the one this process runs under, as a \
+                     container runtime's masks do: ",
+                )?;
+                for (at, mount) in mounts.iter().enumerate() {
+                    let lead = if at == 0 { "" } else { ", " };
+                    write!(f, "{lead}{}", mount.display())?;
+                }
+                f.write_str(
+                    "; unmask the procfs, with Docker's --security-opt systempaths=unconfined or \
+                     Kubernetes' procMount: Unmasked, or share the caller's PID namespace with \
+                     pid_namespace(false)",
+                )
+            }
+            ProcfsBlocker::Refused => f.write_str(
+                "the kernel refused a fresh procfs although no mount covers the existing one; \
+                 its read-only or access-time flags, a security module's policy, or a seccomp \
+                 filter can refuse it, and sharing the caller's PID namespace with \
+                 pid_namespace(false) needs no fresh procfs",
+            ),
+        }
+    }
+}
+
+/// Probes whether a sandbox with a PID namespace of its own can mount the
+/// fresh procfs it needs, returning why not where it cannot.
+///
+/// The probe forks a short-lived child that creates a user, a mount and a PID
+/// namespace and mounts a procfs inside them, as a launch does, so it answers
+/// what a launch would meet, including the conditions no file reports. It then
+/// reads this process's mount table to say why: [`ProcfsBlocker::Covered`]
+/// names the mounts lying on the procfs.
+///
+/// `None` means the procfs mounted, or that the probe could not create the
+/// namespaces to try it in. The second leaves the diagnosis to
+/// [`userns_blocker`], the boundary that owns it, as [`overlay_blocker`] does.
+/// The probe changes nothing in the calling process, and its mount goes away
+/// with the child's namespaces.
+pub fn procfs_blocker() -> Option<ProcfsBlocker> {
+    match crate::mechanism::probe_procfs_mount() {
+        crate::mechanism::ProcfsProbe::Refused => Some(procfs_refusal()),
+        crate::mechanism::ProcfsProbe::Mounted | crate::mechanism::ProcfsProbe::Inconclusive => {
+            None
+        }
+    }
+}
+
+/// Why the kernel refused a fresh procfs, read from this process's mount table:
+/// the mounts covering every procfs it holds, or [`ProcfsBlocker::Refused`]
+/// where the table shows a procfs nothing covers or cannot be read.
+///
+/// Asked once a refusal is known, by the probe and by a launch whose procfs
+/// mount failed. The mount table is the one the sandbox's mount namespace was
+/// copied from.
+pub(crate) fn procfs_refusal() -> ProcfsBlocker {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .ok()
+        .and_then(|table| procfs_covers(&table))
+        .map_or(ProcfsBlocker::Refused, |mounts| ProcfsBlocker::Covered {
+            mounts,
+        })
+}
+
+/// The procfs entries the kernel keeps as permanently empty directories for
+/// other filesystems to mount on, relative to the procfs's root. A mount on
+/// one leaves the procfs fully visible.
+const PROCFS_MOUNT_POINTS: [&str; 2] = ["sys/fs/binfmt_misc", "fs/nfsd"];
+
+/// The mounts lying on entries of every procfs in `mountinfo`, a
+/// `/proc/self/mountinfo` table, or `None` where the table holds no procfs, or
+/// holds one no mount covers.
+///
+/// A procfs counts where it is mounted at its own root, which a bind of one of
+/// its subdirectories is not. What covers it is every mount whose parent it is,
+/// except one on a [permanently empty directory](PROCFS_MOUNT_POINTS). A mount
+/// stacked on such a mount covers that mount and not the procfs.
+fn procfs_covers(mountinfo: &str) -> Option<Vec<PathBuf>> {
+    let mounts: Vec<MountEntry> = mountinfo.lines().filter_map(MountEntry::parse).collect();
+    let mut covering = Vec::new();
+    let mut found = false;
+    for procfs in mounts
+        .iter()
+        .filter(|entry| entry.fstype == "proc" && entry.root == Path::new("/"))
+    {
+        found = true;
+        let covers: Vec<&PathBuf> = mounts
+            .iter()
+            .filter(|entry| entry.parent == procfs.id && entry.id != procfs.id)
+            .filter(|entry| {
+                entry
+                    .mount_point
+                    .strip_prefix(&procfs.mount_point)
+                    .is_ok_and(|beneath| {
+                        !PROCFS_MOUNT_POINTS
+                            .iter()
+                            .any(|empty| beneath == Path::new(empty))
+                    })
+            })
+            .map(|entry| &entry.mount_point)
+            .collect();
+        if covers.is_empty() {
+            return None;
+        }
+        covering.extend(covers.into_iter().cloned());
+    }
+    found.then_some(covering)
+}
+
+/// One line of a `/proc/self/mountinfo` table, as far as the procfs scan reads
+/// it.
+struct MountEntry {
+    /// The mount's id.
+    id: u64,
+    /// The id of the mount it is mounted on.
+    parent: u64,
+    /// The directory of its filesystem that the mount presents.
+    root: PathBuf,
+    /// Where it is mounted.
+    mount_point: PathBuf,
+    /// Its filesystem type.
+    fstype: String,
+}
+
+impl MountEntry {
+    /// Reads one line, or `None` where it is not one the kernel writes.
+    ///
+    /// The fields are space-separated, with optional fields before a lone `-`
+    /// and the filesystem type after it. A path is written with a space, a tab,
+    /// a newline and a backslash as three-digit octal escapes.
+    fn parse(line: &str) -> Option<MountEntry> {
+        let mut fields = line.split(' ');
+        let id = fields.next()?.parse().ok()?;
+        let parent = fields.next()?.parse().ok()?;
+        let _device = fields.next()?;
+        let root = unescape_mount_path(fields.next()?)?;
+        let mount_point = unescape_mount_path(fields.next()?)?;
+        let fstype = fields.skip_while(|field| *field != "-").nth(1)?.to_string();
+        Some(MountEntry {
+            id,
+            parent,
+            root,
+            mount_point,
+            fstype,
+        })
+    }
+}
+
+/// A mount table path with its octal escapes decoded, or `None` where an
+/// escape is malformed.
+fn unescape_mount_path(field: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let bytes = field.as_bytes();
+    let mut path = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            let digits = bytes.get(at + 1..at + 4)?;
+            let text = std::str::from_utf8(digits).ok()?;
+            path.push(u8::from_str_radix(text, 8).ok()?);
+            at += 4;
+        } else {
+            path.push(bytes[at]);
+            at += 1;
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(path)))
+}
+
 /// Reads a sysctl file and parses its leading integer value.
 ///
 /// Returns `None` when the file does not exist, cannot be read, or does not
@@ -783,6 +999,94 @@ mod tests {
         // The result is host-dependent; the probe itself must always be safe
         // to call.
         let _ = userns_blocker();
+        let _ = procfs_blocker();
+    }
+
+    /// The procfs and its masks as a container runtime with its defaults lays
+    /// them out: subdirectories bound read-only onto themselves, files covered
+    /// with a bind of `/dev/null`, and a directory with an empty tmpfs.
+    const CONTAINER_MOUNTINFO: &str = "\
+600 599 0:45 / / rw,relatime master:1 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w
+601 600 0:48 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+602 600 0:49 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+640 601 0:48 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+643 601 0:48 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+645 601 0:53 / /proc/acpi ro,relatime - tmpfs tmpfs ro
+646 601 0:49 /null /proc/kcore rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+647 601 0:49 /null /proc/key\\040list rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+";
+
+    /// A host's procfs, with systemd's `binfmt_misc` automount and the
+    /// filesystem it mounts on top.
+    const HOST_MOUNTINFO: &str = "\
+28 1 259:2 / / rw,relatime shared:1 - ext4 /dev/root rw
+22 28 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw
+41 22 0:36 / /proc/sys/fs/binfmt_misc rw,relatime shared:13 - autofs systemd-1 rw,fd=32
+826 41 0:68 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:383 - binfmt_misc binfmt_misc rw
+";
+
+    #[test]
+    fn a_runtimes_masks_cover_its_procfs() {
+        assert_eq!(
+            procfs_covers(CONTAINER_MOUNTINFO),
+            Some(
+                [
+                    "/proc/bus",
+                    "/proc/sys",
+                    "/proc/acpi",
+                    "/proc/kcore",
+                    "/proc/key list",
+                ]
+                .map(PathBuf::from)
+                .to_vec()
+            ),
+            "every mount on the procfs is named, a bound subdirectory included, \
+             and a path's octal escape is decoded",
+        );
+    }
+
+    #[test]
+    fn a_mount_on_a_permanently_empty_directory_covers_nothing() {
+        // The automount sits on a directory the kernel keeps empty for it, and
+        // the filesystem on top of that is the automount's child, not the
+        // procfs's.
+        assert_eq!(procfs_covers(HOST_MOUNTINFO), None);
+    }
+
+    #[test]
+    fn one_procfs_nothing_covers_leaves_the_rule_met() {
+        // The kernel accepts a new procfs where any one already mounted is
+        // fully visible, so a masked one beside a clear one explains nothing.
+        let both = format!(
+            "{CONTAINER_MOUNTINFO}700 600 0:48 / /host-proc rw,nosuid,nodev,noexec,relatime - \
+             proc proc rw\n"
+        );
+        assert_eq!(procfs_covers(&both), None);
+        // A bind of a procfs subdirectory is no procfs root of its own.
+        let bound = "\
+1 0 0:1 / / rw - tmpfs tmpfs rw
+2 1 0:48 /sys /proc rw,nosuid - proc proc rw
+";
+        assert_eq!(
+            procfs_covers(bound),
+            None,
+            "no procfs is mounted at its root"
+        );
+        assert_eq!(procfs_covers(""), None);
+    }
+
+    #[test]
+    fn a_covered_procfs_names_its_mounts_and_the_remedies() {
+        let blocker = ProcfsBlocker::Covered {
+            mounts: vec![PathBuf::from("/proc/kcore"), PathBuf::from("/proc/acpi")],
+        };
+        let rendered = blocker.to_string();
+        assert!(
+            rendered.contains(": /proc/kcore, /proc/acpi;"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("systempaths=unconfined"), "{rendered}");
+        assert!(rendered.contains("pid_namespace(false)"), "{rendered}");
     }
 
     /// A `security.capability` attribute of the second revision: the magic

@@ -98,6 +98,7 @@ pub(crate) mod frame;
 mod harden;
 pub(crate) mod netns;
 mod overlay;
+mod procfs;
 mod remove;
 pub(crate) mod resolve;
 pub(crate) mod seccomp;
@@ -119,6 +120,7 @@ pub(crate) use export::{
 pub(crate) use overlay::{
     OverlayOptionsError, OverlayProbe, overlay_options, probe_overlay_mount, xattr_unsupported,
 };
+pub(crate) use procfs::{ProcfsProbe, probe_procfs_mount};
 pub(crate) use remove::{RemoveFailure, delete_tree, remove_tree_mapped};
 
 use std::ffi::{CStr, CString};
@@ -2516,6 +2518,16 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     // touched.
     if step == SetupStep::ReplaceSessionKeyring && errno == Errno::DQUOT.raw_os_error() {
         return Error::KeyQuotaExhausted {
+            source: std::io::Error::from_raw_os_error(errno),
+        };
+    }
+    // A procfs for the sandbox's PID namespace is refused `EPERM` where no
+    // procfs already mounted is fully visible, as inside a container whose
+    // runtime masks its entries. The mount table says which mounts are in the
+    // way, and the error names the remedies.
+    if step == SetupStep::MountProc && errno == Errno::PERM.raw_os_error() {
+        return Error::ProcfsRefused {
+            blocker: host::procfs_refusal(),
             source: std::io::Error::from_raw_os_error(errno),
         };
     }

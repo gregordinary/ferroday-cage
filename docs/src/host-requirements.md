@@ -73,6 +73,44 @@ A host that cannot be unblocked is not entirely without options: with the
 confines a command with Landlock and seccomp alone, which need no user
 namespace.
 
+## A fresh procfs
+
+A sandbox with a PID namespace of its own, the default, mounts a procfs for
+that namespace. The kernel lets a process inside a user namespace mount one
+only where its mount namespace already holds a procfs that is fully visible.
+That means a procfs mounted at its own root, with no mount on any of its entries
+except the permanently empty directories the kernel keeps for mounting on, such
+as `/proc/sys/fs/binfmt_misc`. A host's own `/proc` qualifies. The procfs of a
+container started with its runtime's defaults does not: the runtime masks
+entries such as `/proc/kcore` and `/proc/sys` by mounting over them. Inside such
+a container every launch with a PID namespace of its own fails, whatever the
+sandbox does.
+
+The launch reports this as `Error::ProcfsRefused`, which names the mounts lying
+on the procfs and the remedies, rather than a bare `EPERM`:
+
+1. **Unmask the runtime's procfs.** Docker's `--security-opt
+   systempaths=unconfined` does, and so does Kubernetes' `procMount: Unmasked`,
+   which needs `hostUsers: false`.
+2. **Share the caller's PID namespace**, with
+   [`CageBuilder::pid_namespace(false)`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.pid_namespace)
+   or `fcage --share-pid`. The managed profile then binds the existing `/proc`,
+   masks included, and needs no fresh one. The command can then see the
+   processes of the caller's PID namespace, and signal those that run as the
+   same user. The `hardening` feature's `LandlockScope::Signal` refuses the
+   signals, and any Landlock domain refuses `ptrace` of a process outside it.
+
+A third arrangement is accepted and not recommended: binding the existing
+`/proc` under a PID namespace of the sandbox's own. That procfs presents the
+caller's PID namespace, so the command's view of itself is incoherent: its own
+pid and the pids under `/proc` belong to different namespaces.
+
+[`host::procfs_blocker`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.procfs_blocker.html)
+answers the same question before a launch. It forks a short-lived child that
+mounts a procfs in namespaces of its own, as a launch does. A mount table cannot
+answer it alone, since the rule also weighs the existing procfs's read-only and
+access-time flags. It then reads the mount table to name the mounts in the way.
+
 ## Where the rootfs lives
 
 The rootfs must sit under a directory the calling user controls — not a

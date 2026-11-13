@@ -221,6 +221,17 @@ consumer upgrading can skip it.
   of a release that offers it only at another version, and
   `UnheldReason::Requirement`, in the Debian and the Alpine layers alike, for a
   pinned package at a version a selected package's dependency rules out.
+- `Error::ProcfsRefused`, reported in place of `Error::Setup` when the kernel
+  refuses the fresh procfs a sandbox with a PID namespace of its own mounts, as
+  it does inside a container started with its runtime's defaults. Its
+  `host::ProcfsBlocker` names the mounts lying on the procfs and the remedies:
+  unmasking the runtime's procfs, or `pid_namespace(false)`.
+  `host::procfs_blocker` answers the same question before a launch, by mounting
+  a procfs in a short-lived child's namespaces.
+- `ConfigError::NestedUsernsProcfsReadOnly`, reported in place of
+  `ConfigError::NestedUsernsNeedsProcfs` where the only procfs that could serve
+  the nested user namespace's identity map is read-only, naming where it is
+  mounted.
 
 ### Changed
 

@@ -2568,7 +2568,7 @@ fn execute_op(
                 c"proc",
                 fd_path(&target).as_cstr(),
                 c"proc",
-                MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+                super::procfs::FRESH_PROCFS_FLAGS,
                 c"",
             )
             .map_err(|errno| (SetupStep::MountProc, errno))

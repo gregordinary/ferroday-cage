@@ -1957,6 +1957,13 @@ impl CageBuilder {
     /// capture's endpoint: a descendant holding the command's streams keeps
     /// an unbounded wait blocked after the command exits; see
     /// [`Running::wait`](crate::Running::wait).
+    ///
+    /// A PID namespace of the sandbox's own needs a fresh procfs, which the
+    /// kernel refuses inside a container whose runtime masks entries of the
+    /// container's procfs. A launch there fails with
+    /// [`Error::ProcfsRefused`](crate::Error::ProcfsRefused), and sharing the
+    /// caller's PID namespace is one of its remedies; see
+    /// [`host::procfs_blocker`](crate::host::procfs_blocker).
     pub fn pid_namespace(mut self, isolate: bool) -> Self {
         self.pid_namespace = isolate;
         self
@@ -3475,7 +3482,7 @@ fn build_nested_plan(
         // `self`, which every instance resolves for its reader.
         IdentityPlan::Single => {
             let procfs_target =
-                visible_procfs(ops, false).ok_or(ConfigError::NestedUsernsNeedsProcfs)?;
+                visible_procfs(ops, false).ok_or_else(|| procfs_refusal(ops, false))?;
             // The map files as the command names them after the pivot:
             // absolute, under the profile's own procfs target.
             let under_procfs = |leaf: &str| -> Result<CString, ConfigError> {
@@ -3516,7 +3523,7 @@ fn build_nested_plan(
             let procfs_target = if pid_namespace {
                 Some(
                     visible_procfs(ops, true)
-                        .ok_or(ConfigError::NestedUsernsNeedsProcfs)?
+                        .ok_or_else(|| procfs_refusal(ops, true))?
                         .to_owned(),
                 )
             } else {
@@ -3548,13 +3555,47 @@ fn build_nested_plan(
 /// [`MountAction::arrival`]. A remount can still make a procfs unusable, by
 /// leaving it read-only, and one that does drops it as a cover would.
 fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
+    standing_procfs(ops, needs_fresh, Writable::Required)
+}
+
+/// Whether a procfs search holds candidates to being writable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Writable {
+    /// A read-only procfs is no candidate: the search the nested map rests on.
+    Required,
+    /// A read-only procfs is a candidate too: the search that tells a profile
+    /// whose only procfs is read-only from one that has none.
+    Ignored,
+}
+
+/// The refusal for a profile whose nested map finds no procfs to be written
+/// through: the read-only one where read-only is the only reason one does not
+/// count, and the plain refusal otherwise.
+fn procfs_refusal(ops: &[MountOp], needs_fresh: bool) -> ConfigError {
+    match standing_procfs(ops, needs_fresh, Writable::Ignored) {
+        Some(target) => {
+            let mut path = Vec::with_capacity(target.to_bytes().len() + 1);
+            path.push(b'/');
+            path.extend_from_slice(target.to_bytes());
+            ConfigError::NestedUsernsProcfsReadOnly {
+                target: PathBuf::from(std::ffi::OsString::from_vec(path)),
+            }
+        }
+        None => ConfigError::NestedUsernsNeedsProcfs,
+    }
+}
+
+/// The search behind [`visible_procfs`] and [`procfs_refusal`]: the last
+/// procfs candidate no later mount comes to rest on, with `writable` deciding
+/// whether a read-only one counts.
+fn standing_procfs(ops: &[MountOp], needs_fresh: bool, writable: Writable) -> Option<&CStr> {
     // Walked backwards, because what is wanted is the *last* one still visible:
     // a candidate qualifies when nothing after it comes to rest on top of it.
     // Carrying only the most recent candidate forward instead would report no
     // procfs at all for a profile that mounted two and covered the second,
     // though the first is still standing.
     for (at, op) in ops.iter().enumerate().rev() {
-        let Some(target) = procfs_op_target(op, needs_fresh) else {
+        let Some(target) = procfs_op_target(op, needs_fresh, writable) else {
             continue;
         };
         let later = &ops[at + 1..];
@@ -3562,7 +3603,8 @@ fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
             .iter()
             .filter_map(|later| later.action.arrival())
             .any(|(over, _)| covers(over, target));
-        if !covered && !remounted_read_only(later, target) {
+        let read_only = writable == Writable::Required && remounted_read_only(later, target);
+        if !covered && !read_only {
             return Some(target);
         }
     }
@@ -3619,14 +3661,25 @@ fn remounted_read_only(later: &[MountOp], target: &CStr) -> bool {
 /// source mounted read-only. A bound tree must also be a procfs's root, since
 /// the map files are named from there. A bind of `/proc/sys` or `/proc/1`
 /// carries the procfs magic number and holds no `self` to name them under.
-fn procfs_op_target(op: &MountOp, needs_fresh: bool) -> Option<&CStr> {
+/// [`Writable::Ignored`] admits a procfs that arrives read-only, and nothing
+/// else.
+fn procfs_op_target(op: &MountOp, needs_fresh: bool, writable: Writable) -> Option<&CStr> {
+    let admits = |procfs_writable: bool| procfs_writable || writable == Writable::Ignored;
     match (&op.action, op.action.arrival()?) {
         (MountAction::Procfs { target }, _) => Some(target),
-        (MountAction::Bind { read_only, .. }, _) if *read_only => None,
-        (MountAction::Bind { source, target, .. }, _)
-        | (MountAction::Raw { source, target, .. }, (_, Arrival::Tree)) => {
-            (!needs_fresh && is_writable_procfs_root(source)).then_some(target.as_c_str())
-        }
+        (
+            MountAction::Bind {
+                source,
+                target,
+                read_only,
+            },
+            _,
+        ) => (!needs_fresh
+            && procfs_root_writable(source).is_some_and(|w| admits(w && !read_only)))
+        .then_some(target.as_c_str()),
+        (MountAction::Raw { source, target, .. }, (_, Arrival::Tree)) => (!needs_fresh
+            && procfs_root_writable(source).is_some_and(admits))
+        .then_some(target.as_c_str()),
         (
             MountAction::Raw {
                 target,
@@ -3637,7 +3690,7 @@ fn procfs_op_target(op: &MountOp, needs_fresh: bool) -> Option<&CStr> {
             (_, Arrival::Fresh),
         ) => {
             let read_only = mechanism::raw_mount_flags(*flags) & MountFlags::RDONLY.bits() != 0;
-            (fstype.as_bytes() == b"proc" && !read_only).then_some(target.as_c_str())
+            (fstype.as_bytes() == b"proc" && admits(!read_only)).then_some(target.as_c_str())
         }
         _ => None,
     }
@@ -3647,9 +3700,10 @@ fn procfs_op_target(op: &MountOp, needs_fresh: bool) -> Option<&CStr> {
 /// procfs instance gives its root and nothing else in it.
 const PROC_ROOT_INO: u64 = 1;
 
-/// Whether the bind source is the root of a procfs mounted writable, by the
-/// filesystem's own magic number rather than by its path: the managed profile
-/// binds `/proc`, and a caller is free to bind a procfs mounted anywhere else.
+/// Whether the bind source is the root of a procfs, and then whether it is
+/// mounted writable, by the filesystem's own magic number rather than by its
+/// path: the managed profile binds `/proc`, and a caller is free to bind a
+/// procfs mounted anywhere else.
 ///
 /// A bind takes its source mount's flags, and `mount(2)` ignores `MS_RDONLY` on
 /// the bind itself, so a source mounted read-only arrives read-only whatever the
@@ -3658,17 +3712,16 @@ const PROC_ROOT_INO: u64 = 1;
 ///
 /// A source that cannot be interrogated is not one, which is the safe answer:
 /// the build then refuses rather than composing paths into a filesystem that
-/// holds no map files.
-fn is_writable_procfs_root(source: &CStr) -> bool {
-    let Ok(source) = rustix::fs::open(source, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) else {
-        return false;
-    };
+/// holds no map files. Where its mount flags cannot be read it is read-only,
+/// for the same reason.
+fn procfs_root_writable(source: &CStr) -> Option<bool> {
+    let source = rustix::fs::open(source, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).ok()?;
     let procfs =
         rustix::fs::fstatfs(&source).is_ok_and(|stat| stat.f_type == rustix::fs::PROC_SUPER_MAGIC);
     let root = rustix::fs::fstat(&source).is_ok_and(|stat| stat.st_ino == PROC_ROOT_INO);
     let writable = rustix::fs::fstatvfs(&source)
         .is_ok_and(|stat| !stat.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY));
-    procfs && root && writable
+    (procfs && root).then_some(writable)
 }
 
 /// Whether a mount at `mount` hides an entry at `covered`: the same path, or a
@@ -6431,7 +6484,8 @@ mod tests {
 
     /// The nested map is written through the procfs, so one that is standing
     /// but cannot take the write is refused at build, as an absent one is,
-    /// rather than failing the launch with `EROFS` or `ENOENT`.
+    /// rather than failing the launch with `EROFS` or `ENOENT`. Where read-only
+    /// is the one reason it does not count, the refusal says so.
     #[test]
     fn a_procfs_the_nested_map_cannot_be_written_through_is_refused() {
         const MS_RDONLY: u64 = 1;
@@ -6444,21 +6498,39 @@ mod tests {
                 "{what}: {err}",
             );
         };
+        let read_only = |builder: CageBuilder, what: &str| {
+            let err = builder.build().unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::Config(ConfigError::NestedUsernsProcfsReadOnly { target })
+                        if target == Path::new("/proc")
+                ),
+                "{what}: {err}",
+            );
+        };
         let opted_out = || sh_in("/tmp").managed_mounts(false);
 
-        refused(opted_out().bind_ro("/proc", "/proc"), "a read-only bind");
-        refused(
+        read_only(opted_out().bind_ro("/proc", "/proc"), "a read-only bind");
+        read_only(
             sh_in("/tmp")
                 .mount_proc(false)
                 .raw_mount(RawMount::new("/proc").fstype("proc").flags(MS_RDONLY)),
             "a read-only raw procfs",
         );
         for remount in [MS_REMOUNT | MS_RDONLY, MS_REMOUNT | MS_BIND | MS_RDONLY] {
-            refused(
+            read_only(
                 sh_in("/tmp").raw_mount(RawMount::new("/proc").flags(remount)),
                 "a read-only remount",
             );
         }
+        // A read-only procfs a later mount covers is gone, not read-only.
+        refused(
+            opted_out()
+                .bind_ro("/proc", "/proc")
+                .raw_mount(RawMount::new("/proc").fstype("tmpfs")),
+            "a covered read-only bind",
+        );
         // Not the root of a procfs, though each carries its magic number: the
         // map files are named under `self`, which neither holds.
         refused(
@@ -6521,7 +6593,10 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(
-            matches!(err, Error::Config(ConfigError::NestedUsernsNeedsProcfs)),
+            matches!(
+                err,
+                Error::Config(ConfigError::NestedUsernsProcfsReadOnly { .. })
+            ),
             "{err}",
         );
     }

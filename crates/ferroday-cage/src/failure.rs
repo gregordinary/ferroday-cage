@@ -288,6 +288,12 @@ mod tests {
                 op: "binding the listening socket",
                 source: Some(os_error()),
             }),
+            Box::new(Error::ProcfsRefused {
+                blocker: crate::host::ProcfsBlocker::Covered {
+                    mounts: vec![PathBuf::from("/proc/kcore")],
+                },
+                source: os_error(),
+            }),
             Box::new(ProvisionError::io("opening", "/srv/rootfs.tar", os_error())),
             Box::new(ProvisionError::other(ProvisionError::io(
                 "opening",
