@@ -1508,26 +1508,6 @@ mod tests {
         }
     }
 
-    /// Makes an overlay whiteout at `path`, or answers `false` on a kernel that
-    /// refuses an unprivileged one (they are allowed from Linux 5.8).
-    fn whiteout(path: &Path) -> bool {
-        match rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            FileType::CharacterDevice,
-            Mode::empty(),
-            0,
-        ) {
-            Ok(()) => true,
-            Err(Errno::PERM) => {
-                ferroday_cage_testkit::require::OVERLAY
-                    .skip("this kernel refuses an unprivileged whiteout");
-                false
-            }
-            Err(errno) => panic!("making a whiteout: {errno}"),
-        }
-    }
-
     #[test]
     fn a_read_past_its_ceiling_is_refused_naming_the_path_and_the_ceiling() {
         // A script makes a file enormous for nothing: the length is a number in
@@ -1573,7 +1553,7 @@ mod tests {
         for absent in ["etc/absent", "absent/shadow", "etc/shadow/below"] {
             assert_eq!(tree.read_if_present(absent, 64).unwrap(), None, "{absent}");
         }
-        if whiteout(&scratch.join("tree/etc/gone")) {
+        if ferroday_cage_testkit::overlay::whiteout(&scratch.join("tree/etc/gone")) {
             assert_eq!(tree.read_if_present("etc/gone", 64).unwrap(), None);
         }
         // Something that is there and is not a file is not a missing file.
@@ -1624,7 +1604,7 @@ mod tests {
         )
         .unwrap();
         tree.truncate_if("etc/pipe", |_| true).unwrap();
-        if whiteout(&root.join("etc/gone")) {
+        if ferroday_cage_testkit::overlay::whiteout(&root.join("etc/gone")) {
             tree.truncate_if("etc/gone", |_| true).unwrap();
             assert!(std::fs::symlink_metadata(root.join("etc/gone")).is_ok());
         }
@@ -1670,7 +1650,7 @@ mod tests {
         tree.remove_if("log/dpkg.log", |stat| !Rooted::is_whiteout(stat))
             .unwrap();
         assert!(std::fs::symlink_metadata(root.join("log/dpkg.log")).is_err());
-        if whiteout(&root.join("log/alternatives.log")) {
+        if ferroday_cage_testkit::overlay::whiteout(&root.join("log/alternatives.log")) {
             tree.remove_if("log/alternatives.log", |stat| !Rooted::is_whiteout(stat))
                 .unwrap();
             assert!(std::fs::symlink_metadata(root.join("log/alternatives.log")).is_ok());

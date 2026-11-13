@@ -1970,21 +1970,10 @@ mod tests {
         for path in RUN_RECORDS.into_iter().chain([DBUS_MACHINE_ID, MACHINE_ID]) {
             let at = staging.join(path);
             fs::create_dir_all(at.parent().unwrap()).unwrap();
-            match rustix::fs::mknodat(
-                rustix::fs::CWD,
-                &at,
-                rustix::fs::FileType::CharacterDevice,
-                rustix::fs::Mode::empty(),
-                0,
-            ) {
-                Ok(()) => whiteouts.push(at),
-                Err(rustix::io::Errno::PERM) => {
-                    ferroday_cage_testkit::require::OVERLAY
-                        .skip("this kernel refuses an unprivileged whiteout");
-                    return;
-                }
-                Err(errno) => panic!("making a whiteout: {errno}"),
+            if !ferroday_cage_testkit::overlay::whiteout(&at) {
+                return;
             }
+            whiteouts.push(at);
         }
 
         clear_run_state(&tree).expect("the run state is cleared");

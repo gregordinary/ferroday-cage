@@ -33,6 +33,7 @@ pub mod fd;
 pub mod fixture;
 #[cfg(feature = "hex")]
 pub mod hex;
+pub mod overlay;
 pub mod process;
 #[cfg(feature = "pty")]
 pub mod pty;

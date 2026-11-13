@@ -1378,17 +1378,7 @@ mod tests {
         // made.
         let util = upper.join(DB_DIR).join("sys-apps/util-linux-2.41.2");
         std::fs::create_dir_all(&util).unwrap();
-        if let Err(errno) = rustix::fs::mknodat(
-            rustix::fs::CWD,
-            util.join(USE_FILE),
-            rustix::fs::FileType::CharacterDevice,
-            rustix::fs::Mode::empty(),
-            0,
-        ) {
-            ferroday_cage_testkit::require::OVERLAY.skip(format!(
-                "the whiteout case: a whiteout cannot be made here ({errno})"
-            ));
-        } else {
+        if ferroday_cage_testkit::overlay::whiteout(&util.join(USE_FILE)) {
             let view = merged(&lower, &upper).expect("the merged view is read");
             let util_read = view
                 .under("sys-apps/util-linux")

@@ -405,19 +405,13 @@ mod tests {
         assert_eq!(groups.get(&b"messagebus"[..]), Some(&101));
     }
 
-    /// Records an overlay whiteout at `relative` in `tree`, as an overlay
-    /// upper does for a name a script removed from the merged root, or reports
-    /// why the host refused to.
-    fn whiteout(staging: &Path, relative: &str) -> Result<(), rustix::io::Errno> {
-        let parent = staging.join(relative).parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&parent).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            staging.join(relative),
-            rustix::fs::FileType::CharacterDevice,
-            rustix::fs::Mode::from_raw_mode(0),
-            0,
-        )
+    /// Records an overlay whiteout at `relative` in `staging`, as an overlay
+    /// upper does for a name a script removed from the merged root, or
+    /// answers `false` where the host refuses one.
+    fn whiteout(staging: &Path, relative: &str) -> bool {
+        let path = staging.join(relative);
+        std::fs::create_dir_all(crate::path::parent_of(&path)).unwrap();
+        ferroday_cage_testkit::overlay::whiteout(&path)
     }
 
     #[test]
@@ -429,12 +423,7 @@ mod tests {
             .unwrap();
         let (upper_dir, upper) = rooted_tree("whiteout-upper");
         for path in SHADOW {
-            if let Err(errno) = whiteout(&upper_dir, path) {
-                // Linux 5.8 is the first to let an unprivileged caller record
-                // one.
-                ferroday_cage_testkit::require::OVERLAY.skip(format!(
-                    "the host refused an unprivileged whiteout: {errno}"
-                ));
+            if !whiteout(&upper_dir, path) {
                 return;
             }
         }
@@ -472,10 +461,7 @@ mod tests {
         let [shadow, _] = SHADOW;
 
         let (whited_dir, whited) = rooted_tree("hidden-etc-whiteout");
-        if let Err(errno) = whiteout(&whited_dir, "etc") {
-            ferroday_cage_testkit::require::OVERLAY.skip(format!(
-                "the host refused an unprivileged whiteout: {errno}"
-            ));
+        if !whiteout(&whited_dir, "etc") {
             return;
         }
         let (opaque_dir, opaque) = rooted_tree("hidden-etc-opaque");

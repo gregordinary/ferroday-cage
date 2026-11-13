@@ -7914,17 +7914,6 @@ mod tests {
         assert!(shipped.plan.managed_placeholders.is_empty());
     }
 
-    /// Creates an overlay whiteout at `path`, or says why the host cannot.
-    fn whiteout(path: &Path) -> Result<(), Errno> {
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            FileType::CharacterDevice,
-            Mode::empty(),
-            0,
-        )
-    }
-
     /// Marks the directory at `path` opaque, as an unprivileged overlay does,
     /// or says why the filesystem cannot. The attribute is the overlay's own,
     /// which `Rooted::is_opaque` reads.
@@ -7969,23 +7958,23 @@ mod tests {
         // A whiteout in the upper hides the base's entry. Creating the target
         // replaces it, which the removal has to undo, so it is told apart.
         reset();
-        if let Err(errno) = whiteout(&upper.join("etc/x")) {
-            ferroday_cage_testkit::require::OVERLAY
-                .skip(format!("this host cannot create a whiteout: {errno}"));
+        if !ferroday_cage_testkit::overlay::whiteout(&upper.join("etc/x")) {
             return;
         }
         assert_eq!(presence(), Presence::WhitedOut);
 
         // One in a lower hides it too, and stays where it is.
         reset();
-        whiteout(&middle.join("etc/x")).unwrap();
+        assert!(ferroday_cage_testkit::overlay::whiteout(
+            &middle.join("etc/x")
+        ));
         assert_eq!(presence(), Presence::Absent);
 
         // A whiteout, or a file, where a directory above the target would have
         // to be hides everything beneath it.
         reset();
         std::fs::remove_dir(upper.join("etc")).unwrap();
-        whiteout(&upper.join("etc")).unwrap();
+        assert!(ferroday_cage_testkit::overlay::whiteout(&upper.join("etc")));
         assert_eq!(presence(), Presence::Absent);
         reset();
         std::fs::remove_dir(middle.join("etc")).unwrap();
@@ -7996,7 +7985,9 @@ mod tests {
         // the layers below it hold.
         reset();
         std::fs::write(upper.join("etc/x"), b"").unwrap();
-        whiteout(&middle.join("etc/x")).unwrap();
+        assert!(ferroday_cage_testkit::overlay::whiteout(
+            &middle.join("etc/x")
+        ));
         assert_eq!(presence(), Presence::Present);
 
         // A directory above the target marked opaque hides what the layers
@@ -8341,9 +8332,7 @@ mod tests {
         std::fs::create_dir_all(upper.join("etc")).unwrap();
         std::fs::create_dir_all(base.join("etc")).unwrap();
         std::fs::write(base.join("etc/shipped"), b"shipped").unwrap();
-        if let Err(errno) = whiteout(&upper.join("etc/shipped")) {
-            ferroday_cage_testkit::require::OVERLAY
-                .skip(format!("this host cannot create a whiteout: {errno}"));
+        if !ferroday_cage_testkit::overlay::whiteout(&upper.join("etc/shipped")) {
             return;
         }
         let mut lowering = Lowering::default();

@@ -2474,26 +2474,6 @@ mod layered_tests {
         )
     }
 
-    /// Makes an overlay whiteout at `path`, or answers `false` where the
-    /// kernel refuses an unprivileged one.
-    fn whiteout(path: &Path) -> bool {
-        match rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::FileType::CharacterDevice,
-            rustix::fs::Mode::empty(),
-            0,
-        ) {
-            Ok(()) => true,
-            Err(rustix::io::Errno::PERM) => {
-                ferroday_cage_testkit::require::OVERLAY
-                    .skip("this kernel refuses an unprivileged whiteout");
-                false
-            }
-            Err(errno) => panic!("making a whiteout: {errno}"),
-        }
-    }
-
     /// The opaque marker on `dir`, if any.
     fn opaque(dir: &Path) -> bool {
         let opened = fs::File::open(dir).unwrap();
@@ -2521,7 +2501,7 @@ mod layered_tests {
         // A whiteout in the upper is a deletion the merged view shows: the
         // directory a later entry needs there starts empty, so it is marked
         // opaque rather than merged with the base's again.
-        if !whiteout(&upper.join("usr/share/doc")) {
+        if !ferroday_cage_testkit::overlay::whiteout(&upper.join("usr/share/doc")) {
             return;
         }
         // An opaque directory hides the base beneath it, links included.
@@ -2533,7 +2513,7 @@ mod layered_tests {
         )
         .unwrap();
         // A whiteout in the base is nothing at all.
-        if !whiteout(&base.join("srv")) {
+        if !ferroday_cage_testkit::overlay::whiteout(&base.join("srv")) {
             return;
         }
 
