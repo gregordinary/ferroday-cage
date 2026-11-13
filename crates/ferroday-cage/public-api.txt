@@ -470,6 +470,12 @@ impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian:
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::CommandOutput
 pub ferroday_cage::provision::debian::DebianEvent::CommandOutput::bytes: &'a [u8]
 pub ferroday_cage::provision::debian::DebianEvent::CommandOutput::stream: ferroday_cage::provision::Stream
+#[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Conflict
+pub ferroday_cage::provision::debian::DebianEvent::Conflict::against: &'a str
+pub ferroday_cage::provision::debian::DebianEvent::Conflict::against_in_base: bool
+pub ferroday_cage::provision::debian::DebianEvent::Conflict::relation: &'a str
+pub ferroday_cage::provision::debian::DebianEvent::Conflict::stated_by: &'a str
+pub ferroday_cage::provision::debian::DebianEvent::Conflict::stated_in_base: bool
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianEvent::Downloading
 pub ferroday_cage::provision::debian::DebianEvent::Downloading::index: usize
 pub ferroday_cage::provision::debian::DebianEvent::Downloading::package: &'a str

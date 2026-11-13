@@ -46,6 +46,12 @@ pub(crate) struct Package {
     /// The virtual package names this package provides, each with the version
     /// it is provided at when the stanza declares one.
     pub provides: Vec<Provided>,
+    /// What the package cannot be installed beside: its `Conflicts`, then its
+    /// `Breaks`, each entry naming this bootstrap's architecture, or any.
+    pub clashes: Vec<Clash>,
+    /// Whether the stanza declares `Multi-Arch: allowed`, the one value that
+    /// lets a relation qualified `:any` name the package.
+    pub multi_arch_allowed: bool,
     pub essential: bool,
     pub priority: Option<String>,
     /// The archive's `Installed-Size:` in kibibytes, when the stanza carries
@@ -102,6 +108,66 @@ pub(crate) struct Provided {
     pub name: String,
     /// The version it is provided at, or `None` for a bare `Provides`.
     pub version: Option<String>,
+}
+
+/// One entry of a package's `Conflicts` or `Breaks`: a name, and the versions
+/// of it, that the stating package cannot be installed beside.
+///
+/// The two fields differ in how dpkg orders an unpack around them, and in
+/// nothing a resolution asks: apt keeps a package out of a resolution beside
+/// what it `Breaks` exactly as beside what it `Conflicts` with, so both are
+/// held here as one shape and the [`ClashField`] says which one stated it.
+///
+/// An entry names a real package or a virtual one, and answers as a dependency
+/// on the same name would: a version the constraint accepts, or a `Provides`
+/// at one, and an unversioned entry every provider. A package never clashes
+/// with itself, which is what lets the idiom `Conflicts: mta`, `Provides: mta`,
+/// `Replaces: mta` keep every other provider of `mta` out and leave the package
+/// stating it alone.
+#[derive(Debug, Clone)]
+pub(crate) struct Clash {
+    /// Which field states it.
+    pub field: ClashField,
+    /// The name, and the versions of it, the entry names.
+    pub atom: DepAtom,
+    /// Whether the entry is qualified `:any`, which apt answers with a package
+    /// `Multi-Arch: allowed` alone.
+    pub any: bool,
+}
+
+/// The field a [`Clash`] is stated in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClashField {
+    /// `Conflicts`: the two packages are never unpacked together.
+    Conflicts,
+    /// `Breaks`: the stating package is not configured beside the other.
+    Breaks,
+}
+
+impl ClashField {
+    /// The field's name as a control file spells it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ClashField::Conflicts => "Conflicts",
+            ClashField::Breaks => "Breaks",
+        }
+    }
+}
+
+impl fmt::Display for Clash {
+    /// Writes the entry as its field states it, `Breaks: libfoo (<< 2)`, with
+    /// the architecture qualifier left out except for `:any`, the one that
+    /// still decides what it names.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.field.as_str(), self.atom.name)?;
+        if self.any {
+            f.write_str(":any")?;
+        }
+        match &self.atom.constraint {
+            Some(constraint) => write!(f, " ({constraint})"),
+            None => Ok(()),
+        }
+    }
 }
 
 roster_enum! {
@@ -203,7 +269,11 @@ impl Package {
     /// Builds a package from a `Packages` stanza, or `None` when a required
     /// field is missing or malformed: among them a name [`is_package_name`]
     /// does not admit, and a version [`version::is_version`] does not.
-    fn from_stanza(stanza: &Stanza<'_>) -> Option<Package> {
+    ///
+    /// `native` is the architecture the bootstrap installs, which an
+    /// architecture qualifier on a `Conflicts` or `Breaks` entry is read
+    /// against.
+    fn from_stanza(stanza: &Stanza<'_>, native: &str) -> Option<Package> {
         let [
             name,
             version,
@@ -217,6 +287,9 @@ impl Package {
             depends,
             pre_depends,
             provides,
+            conflicts,
+            breaks,
+            multi_arch,
             essential,
             priority,
         ] = stanza.get_each([
@@ -232,6 +305,9 @@ impl Package {
             "Depends",
             "Pre-Depends",
             "Provides",
+            "Conflicts",
+            "Breaks",
+            "Multi-Arch",
             "Essential",
             "Priority",
         ]);
@@ -282,6 +358,8 @@ impl Package {
                 .map(parse_relations)
                 .unwrap_or_default(),
             provides: provides.as_deref().map(parse_provides).unwrap_or_default(),
+            clashes: parse_clashes(conflicts.as_deref(), breaks.as_deref(), native),
+            multi_arch_allowed: multi_arch.is_some_and(|value| is_multi_arch_allowed(&value)),
             essential: essential.is_some_and(|value| value.eq_ignore_ascii_case("yes")),
             priority: priority.map(Cow::into_owned),
             installed_size,
@@ -413,6 +491,9 @@ pub(crate) struct Source<'a> {
 pub(crate) struct Index {
     by_name: HashMap<String, Vec<Package>>,
     providers: HashMap<String, Vec<String>>,
+    /// The real packages one of whose versions states a [`Clash`] on each
+    /// name, in name order.
+    clashing: HashMap<String, Vec<String>>,
     /// The suite and the rank of each repository, by origin.
     releases: HashMap<usize, (String, ReleasePriority)>,
     /// The pin the index was merged under.
@@ -467,7 +548,7 @@ impl Index {
         for source in sources {
             releases.insert(source.origin, (source.suite.to_string(), source.priority));
             for stanza in document::parse(source.text) {
-                let Some(mut package) = Package::from_stanza(&stanza) else {
+                let Some(mut package) = Package::from_stanza(&stanza, architecture) else {
                     skipped += 1;
                     continue;
                 };
@@ -534,10 +615,26 @@ impl Index {
             names.sort();
             names.dedup();
         }
+        // The same for what states a clash on each name, which the resolver
+        // asks about a candidate before it selects one.
+        let mut clashing: HashMap<String, Vec<String>> = HashMap::new();
+        for package in by_name.values().flatten() {
+            for clash in &package.clashes {
+                clashing
+                    .entry(clash.atom.name.clone())
+                    .or_default()
+                    .push(package.name.clone());
+            }
+        }
+        for names in clashing.values_mut() {
+            names.sort();
+            names.dedup();
+        }
 
         Index {
             by_name,
             providers,
+            clashing,
             releases,
             pins: pins.clone(),
             skipped,
@@ -570,6 +667,12 @@ impl Index {
     /// The real packages whose versions provide the virtual package `name`.
     pub(crate) fn providers(&self, name: &str) -> &[String] {
         self.providers.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// The real packages whose versions state a `Conflicts` or `Breaks` entry
+    /// naming `name`, in name order.
+    pub(crate) fn clashing(&self, name: &str) -> &[String] {
+        self.clashing.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// The suite the repository at `origin` publishes, as configured.
@@ -813,6 +916,68 @@ pub(crate) fn parse_provides(value: &str) -> Vec<Provided> {
                 .map(str::to_string),
         })
         .collect()
+}
+
+/// Parses a package's `Conflicts` and `Breaks` values into what it cannot be
+/// installed beside, as an index states them or a status database records
+/// them, for a bootstrap installing the `native` architecture.
+///
+/// An entry's architecture qualifier is read as apt 2.8 reads it in a
+/// resolution of one architecture: `:native` and the native architecture's own
+/// name name what an unqualified entry names, `:any` names only a package
+/// `Multi-Arch: allowed` ([`Clash::any`]), and any other architecture, `:all`
+/// included, names no package such a resolution holds, so the entry is left
+/// out. Neither field admits alternatives, and dpkg refuses a `|` in either; an
+/// entry written with one is read as each of its alternatives, which is the
+/// reading that keeps every package it names out.
+pub(super) fn parse_clashes(
+    conflicts: Option<&str>,
+    breaks: Option<&str>,
+    native: &str,
+) -> Vec<Clash> {
+    let fields = [
+        (ClashField::Conflicts, conflicts),
+        (ClashField::Breaks, breaks),
+    ];
+    let mut clashes = Vec::new();
+    for (field, value) in fields {
+        let Some(value) = value else {
+            continue;
+        };
+        for text in value.split([',', '|']) {
+            let Some(atom) = parse_atom(text) else {
+                continue;
+            };
+            let any = match qualifier(text) {
+                None | Some("native") => false,
+                Some("any") => true,
+                Some(arch) if arch == native => false,
+                Some(_) => continue,
+            };
+            clashes.push(Clash { field, atom, any });
+        }
+    }
+    clashes
+}
+
+/// The architecture qualifier of one relation entry, `arm64` in
+/// `libc6:arm64 (>= 2.36)`, where it carries one.
+fn qualifier(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let after = text
+        .find(|c: char| c.is_whitespace() || matches!(c, '(' | ':' | '[' | '<'))
+        .filter(|&at| text[at..].starts_with(':'))?;
+    let rest = &text[after + 1..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, '(' | '[' | '<'))
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Whether a `Multi-Arch` value is `allowed`, which lets a relation qualified
+/// `:any` name the package.
+pub(super) fn is_multi_arch_allowed(value: &str) -> bool {
+    value.trim() == "allowed"
 }
 
 /// Parses a `Source:` field into the source package's name, or `None` when it
@@ -1356,6 +1521,62 @@ Version: 1.0
         assert_eq!(provided[0].version, None);
         assert_eq!(provided[1].version.as_deref(), Some("1.0"));
         assert_eq!(provided[2].version, None);
+    }
+
+    #[test]
+    fn conflicts_and_breaks_read_their_qualifiers_as_apt_does() {
+        // Measured against apt 2.8.4 resolving for amd64 alone: the native
+        // architecture and `:native` name what an unqualified entry does,
+        // `:any` only a `Multi-Arch: allowed` package, and any other
+        // architecture, `all` included, nothing.
+        let clashes = parse_clashes(
+            Some("plain, old (<< 2), here:amd64, self:native, there:i386, indep:all"),
+            Some("ma:any (>= 1.0), alt1 | alt2"),
+            "amd64",
+        );
+        let read: Vec<String> = clashes.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            read,
+            [
+                "Conflicts: plain",
+                "Conflicts: old (<< 2)",
+                "Conflicts: here",
+                "Conflicts: self",
+                "Breaks: ma:any (>= 1.0)",
+                "Breaks: alt1",
+                "Breaks: alt2",
+            ],
+        );
+        assert!(clashes[4].any && !clashes[0].any);
+        assert!(parse_clashes(None, None, "amd64").is_empty());
+    }
+
+    #[test]
+    fn a_stanza_records_what_it_clashes_with_and_its_multi_arch() {
+        let text = format!(
+            "{}{}",
+            fixture::stanza(
+                "postfix",
+                "3.10",
+                &fixture::digest_of("postfix"),
+                "Conflicts: mail-transport-agent\nBreaks: libfoo1 (<< 2)\n\
+                 Provides: mail-transport-agent\nMulti-Arch: foreign",
+            ),
+            fixture::stanza(
+                "perl",
+                "5.40",
+                &fixture::digest_of("perl"),
+                "Multi-Arch: allowed"
+            ),
+        );
+        let index = Index::parse(&text, "amd64");
+        let postfix = index.get("postfix").unwrap();
+        assert_eq!(postfix.clashes.len(), 2);
+        assert!(!postfix.multi_arch_allowed);
+        assert!(index.get("perl").unwrap().multi_arch_allowed);
+        assert_eq!(index.clashing("mail-transport-agent"), ["postfix"]);
+        assert_eq!(index.clashing("libfoo1"), ["postfix"]);
+        assert!(index.clashing("perl").is_empty());
     }
 
     #[test]

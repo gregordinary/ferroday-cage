@@ -431,8 +431,8 @@ documentation states which it is.
 The fourth, `Refusals`, is split for a different reason. Both layers collect
 every refusal and fail once, which is the discipline, and what they collect is
 not the same set. A portage resolution refuses in three shapes: an atom nothing
-answers, a blocker, and two builds contending for one slot. The last two have no
-Debian meaning, so a shared type would carry collections that are always empty
+answers, a blocker, and two builds contending for one slot. The last has no
+Debian meaning, so a shared type would carry a collection that is always empty
 on one side. Alpine reports one refusal at a time and has no such type yet. When
 it grows one, it is this row it extends.
 

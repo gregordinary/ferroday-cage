@@ -17,7 +17,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use super::DebianError;
-use super::index::{Dependency, Provided, is_package_name, parse_provides, parse_relations};
+use super::index::{
+    Clash, Dependency, Provided, is_multi_arch_allowed, is_package_name, parse_clashes,
+    parse_provides, parse_relations,
+};
 use crate::provision::document;
 
 /// What a base layer supplies, and what its packages need, as the resolver has
@@ -47,12 +50,19 @@ use crate::provision::document;
 /// later: `libc6 (>= 2.43)` is not answered by "the base has a libc6", and
 /// treating it as though it were is what lets an aged base pass a resolve and
 /// fail the compile.
+///
+/// *What can this package not be installed beside, and which packages state
+/// that of this name?* is asked of real packages too: a layer removes nothing
+/// from its base, so a package the base keeps is never one a candidate may
+/// clash with.
 #[derive(Debug, Default)]
 pub(super) struct InstalledSet {
     supplies: HashMap<String, Vec<Supply>>,
     /// Every installed package this layer can name, in name order, so a check
     /// over all of them meets them in an order nothing else decides.
     packages: BTreeMap<String, Installed>,
+    /// The installed packages stating a [`Clash`] on each name, in name order.
+    clashing: HashMap<String, Vec<String>>,
 }
 
 /// One way a base layer supplies a name: as the package of that name, or as a
@@ -68,11 +78,17 @@ pub(super) struct Supply {
 
 /// One installed package of a base layer.
 #[derive(Debug, Default)]
-struct Installed {
+pub(super) struct Installed {
     /// The version, where the status database states one.
-    version: Option<String>,
+    pub(super) version: Option<String>,
     /// Its `Pre-Depends`, then its `Depends`.
-    relations: Vec<Dependency>,
+    pub(super) relations: Vec<Dependency>,
+    /// The names it provides, each at the version it states.
+    pub(super) provides: Vec<Provided>,
+    /// What it cannot be installed beside: its `Conflicts`, then its `Breaks`.
+    pub(super) clashes: Vec<Clash>,
+    /// Whether it declares `Multi-Arch: allowed`.
+    pub(super) multi_arch_allowed: bool,
 }
 
 impl InstalledSet {
@@ -109,6 +125,26 @@ impl InstalledSet {
     /// Records that the installed package `provider` supplies `provided`.
     pub(super) fn provide(&mut self, provider: &str, provided: &Provided) {
         self.supply(&provided.name, provider, provided.version.as_deref());
+        if let Some(installed) = self.packages.get_mut(provider) {
+            installed.provides.push(provided.clone());
+        }
+    }
+
+    /// Records what the real package `name`, recorded by
+    /// [`install`](Self::install), cannot be installed beside, and whether it
+    /// declares `Multi-Arch: allowed`.
+    pub(super) fn clash(&mut self, name: &str, clashes: Vec<Clash>, multi_arch_allowed: bool) {
+        let Some(installed) = self.packages.get_mut(name) else {
+            return;
+        };
+        for clash in &clashes {
+            let staters = self.clashing.entry(clash.atom.name.clone()).or_default();
+            if let Err(at) = staters.binary_search_by(|stater| stater.as_str().cmp(name)) {
+                staters.insert(at, name.to_string());
+            }
+        }
+        installed.clashes.extend(clashes);
+        installed.multi_arch_allowed |= multi_arch_allowed;
     }
 
     /// Records that the installed package `provider` supplies `name` at
@@ -141,12 +177,24 @@ impl InstalledSet {
             .and_then(|installed| installed.version.as_deref())
     }
 
-    /// Every real package [`install`](Self::install) recorded, with its
-    /// `Pre-Depends` and `Depends`, in name order.
-    pub(super) fn packages(&self) -> impl Iterator<Item = (&str, &[Dependency])> {
+    /// Every real package [`install`](Self::install) recorded, in name order,
+    /// so a check over all of them meets them in an order nothing else
+    /// decides.
+    pub(super) fn members(&self) -> impl Iterator<Item = (&str, &Installed)> {
         self.packages
             .iter()
-            .map(|(name, installed)| (name.as_str(), installed.relations.as_slice()))
+            .map(|(name, installed)| (name.as_str(), installed))
+    }
+
+    /// The real package `name`, where [`install`](Self::install) recorded it.
+    pub(super) fn package(&self, name: &str) -> Option<&Installed> {
+        self.packages.get(name)
+    }
+
+    /// The installed packages stating a `Conflicts` or `Breaks` entry naming
+    /// `name`, in name order.
+    pub(super) fn clashing(&self, name: &str) -> &[String] {
+        self.clashing.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// Whether the base supplies nothing at all.
@@ -156,8 +204,10 @@ impl InstalledSet {
 }
 
 /// Reads a base layer's already-installed set: every configured package, with
-/// its dependencies, and the virtual packages those packages provide, each with
-/// the version it supplies and the package supplying it.
+/// its dependencies and what it cannot be installed beside, and the virtual
+/// packages those packages provide, each with the version it supplies and the
+/// package supplying it. The base's `architecture` is what an architecture
+/// qualifier on a `Conflicts` or `Breaks` entry is read against.
 ///
 /// The set seeds a delta resolution, so the increment [`Debian::stage_layer`]
 /// resolves closes only over packages the base does not carry, except where it
@@ -180,7 +230,10 @@ impl InstalledSet {
 /// whose contents decide what the increment resolves against.
 ///
 /// [`Debian::stage_layer`]: super::Debian::stage_layer
-pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianError> {
+pub(super) fn read_installed_set(
+    base: &Path,
+    architecture: &str,
+) -> Result<InstalledSet, DebianError> {
     let text = match super::bootstrap::read_base_status(base) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -201,13 +254,26 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
 
     let mut installed = InstalledSet::default();
     for stanza in document::parse(&text) {
-        let [name, status, version, provides, pre_depends, depends] = stanza.get_each([
+        let [
+            name,
+            status,
+            version,
+            provides,
+            pre_depends,
+            depends,
+            conflicts,
+            breaks,
+            multi_arch,
+        ] = stanza.get_each([
             "Package",
             "Status",
             "Version",
             "Provides",
             "Pre-Depends",
             "Depends",
+            "Conflicts",
+            "Breaks",
+            "Multi-Arch",
         ]);
         let (Some(name), Some(status)) = (name, status) else {
             continue;
@@ -229,12 +295,18 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
                 .flat_map(|value| parse_relations(&value))
                 .collect();
             installed.install(&name, version, relations);
+            installed.clash(
+                &name,
+                parse_clashes(conflicts.as_deref(), breaks.as_deref(), architecture),
+                multi_arch.is_some_and(|value| is_multi_arch_allowed(&value)),
+            );
         } else {
             // A name policy does not admit still supplies itself, so nothing
             // installs it again. It is no package this layer names, though: no
             // index this layer reads offers it, so no increment replaces it,
             // and a refusal names a package bare, so its own dependencies are
-            // left out of the merged root's check.
+            // left out of the merged root's check, and so are the packages it
+            // states it cannot be installed beside.
             installed.supply(&name, &name, version);
         }
         // A package's provided virtuals satisfy dependencies named against them,
@@ -276,9 +348,10 @@ mod tests {
 
     /// Each installed package's relations, rendered by name, for an assertion.
     fn relations(set: &InstalledSet) -> Vec<(&str, Vec<Vec<&str>>)> {
-        set.packages()
-            .map(|(name, relations)| {
-                let groups = relations
+        set.members()
+            .map(|(name, installed)| {
+                let groups = installed
+                    .relations
                     .iter()
                     .map(|group| group.iter().map(|atom| atom.name.as_str()).collect())
                     .collect();
@@ -299,7 +372,7 @@ mod tests {
              Package: mawk\nStatus: install ok installed\nProvides: awk\nVersion: 1.3\n\n\
              Package: half\nStatus: install ok unpacked\nVersion: 1.0\n",
         );
-        let set = read_installed_set(&dir).expect("the status database reads");
+        let set = read_installed_set(&dir, "amd64").expect("the status database reads");
         assert_eq!(supplies(&set, "libc6"), [("libc6", Some("2.41"))]);
         assert_eq!(supplies(&set, "mawk"), [("mawk", Some("1.3"))]);
         // The virtual is present, and bare: `Provides: awk` names no version,
@@ -324,7 +397,7 @@ mod tests {
             &dir,
             &format!("Package: libfoo1\nStatus: install ok installed\nVersion: {hostile}\n"),
         );
-        let set = read_installed_set(&dir).expect("the status database reads");
+        let set = read_installed_set(&dir, "amd64").expect("the status database reads");
         assert_eq!(supplies(&set, "libfoo1"), [("libfoo1", None)]);
         assert_eq!(set.installed("libfoo1"), None);
     }
@@ -337,7 +410,7 @@ mod tests {
             "Package: libfoo1\nStatus: install ok installed\nVersion: 1.4-2\n\
              Provides: libfoo (= 1.4)\n",
         );
-        let set = read_installed_set(&dir).expect("the status database reads");
+        let set = read_installed_set(&dir, "amd64").expect("the status database reads");
         assert_eq!(supplies(&set, "libfoo1"), [("libfoo1", Some("1.4-2"))]);
         assert_eq!(supplies(&set, "libfoo"), [("libfoo1", Some("1.4"))]);
         assert_eq!(set.installed("libfoo"), None);
@@ -357,7 +430,7 @@ mod tests {
              Package: libc6\nStatus: install ok installed\nVersion: 2.41-10\n\n\
              Package: half\nStatus: install ok unpacked\nVersion: 1.0\nDepends: libc6\n",
         );
-        let set = read_installed_set(&dir).expect("the status database reads");
+        let set = read_installed_set(&dir, "amd64").expect("the status database reads");
         assert_eq!(
             relations(&set),
             [
@@ -368,9 +441,38 @@ mod tests {
                 ("libc6", vec![]),
             ],
         );
-        let (_, libc_bin) = set.packages().next().unwrap();
-        let constraint = libc_bin[2][0].constraint.as_ref().unwrap();
+        let (_, libc_bin) = set.members().next().unwrap();
+        let constraint = libc_bin.relations[2][0].constraint.as_ref().unwrap();
         assert_eq!(constraint.to_string(), "<< 2.42");
+    }
+
+    #[test]
+    fn a_configured_package_records_what_it_clashes_with() {
+        // Read with the index's own grammar, the qualifiers against the base's
+        // architecture, beside the names it provides and its `Multi-Arch`.
+        let dir = Scratch::for_test("layer", "clashes");
+        base_with_status(
+            &dir,
+            "Package: postfix\nStatus: install ok installed\nVersion: 3.10\n\
+             Provides: mail-transport-agent\nConflicts: mail-transport-agent, \
+             exim4:arm64\nBreaks: libfoo1 (<< 2)\nMulti-Arch: allowed\n\n\
+             Package: half\nStatus: install ok unpacked\nVersion: 1.0\n\
+             Conflicts: postfix\n",
+        );
+        let set = read_installed_set(&dir, "amd64").expect("the status database reads");
+        let postfix = set.package("postfix").expect("postfix is installed");
+        let clashes: Vec<String> = postfix.clashes.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            clashes,
+            ["Conflicts: mail-transport-agent", "Breaks: libfoo1 (<< 2)"],
+        );
+        assert!(postfix.multi_arch_allowed);
+        assert_eq!(postfix.provides[0].name, "mail-transport-agent");
+        assert_eq!(set.clashing("mail-transport-agent"), ["postfix"]);
+        assert!(
+            set.clashing("postfix").is_empty(),
+            "a package not configured states nothing the base holds",
+        );
     }
 
     #[test]
@@ -387,11 +489,11 @@ mod tests {
                  Depends: libc6 (= 9)\nProvides: awk\n"
             ),
         );
-        let set = read_installed_set(&dir).expect("the status database reads");
+        let set = read_installed_set(&dir, "amd64").expect("the status database reads");
         assert_eq!(supplies(&set, hostile), [(hostile, Some("1.0"))]);
         assert_eq!(supplies(&set, "awk"), [(hostile, None)]);
         assert_eq!(set.installed(hostile), None);
-        assert_eq!(set.packages().count(), 0);
+        assert_eq!(set.members().count(), 0);
     }
 
     #[test]
@@ -399,7 +501,7 @@ mod tests {
         // A base with no status database is not a configured bootstrap.
         let missing = Scratch::for_test("layer", "no-status");
         assert!(matches!(
-            read_installed_set(&missing),
+            read_installed_set(&missing, "amd64"),
             Err(DebianError::Config { .. }),
         ));
 
@@ -408,7 +510,7 @@ mod tests {
         let empty = Scratch::for_test("layer", "empty-status");
         base_with_status(&empty, "");
         assert!(matches!(
-            read_installed_set(&empty),
+            read_installed_set(&empty, "amd64"),
             Err(DebianError::Config { .. }),
         ));
     }

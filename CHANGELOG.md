@@ -420,6 +420,17 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking.** The Debian resolver reads `Conflicts` and `Breaks`, and holds a
+  resolution to them as apt 2.8 does. A dependency's alternative, or a provider
+  of a virtual name, that clashes with a package the resolution already holds,
+  whichever of the two states it, is passed over for the next one. A root
+  holding two packages that clash is refused, each pair reported as the new
+  `DebianEvent::Conflict` and named in `DebianError::Resolve`. A layered build
+  passes over an alternative that clashes with a package its base keeps,
+  upgrades the base package where an upgrade apt would take ends the clash,
+  and otherwise refuses, as it refuses a base whose own packages clash. A
+  resolution that succeeded can therefore choose another alternative, or be
+  refused. `fcage` prints each conflict (`ferroday-cage-cli`).
 - The network stack resets a connection past a published port's budget of 128
   on the host side, as it resets one the guest refuses. It closed the
   connection, so the peer read an empty reply where it had been refused.

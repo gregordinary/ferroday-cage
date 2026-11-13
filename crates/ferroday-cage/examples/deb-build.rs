@@ -392,6 +392,12 @@ fn print_progress(event: DebianEvent<'_>) {
             reason,
             ..
         } => eprintln!("deb-build: {required_by} requires {requirement}, and {reason}"),
+        DebianEvent::Conflict {
+            relation,
+            stated_by,
+            against,
+            ..
+        } => eprintln!("deb-build: {stated_by} states {relation}, against {against}"),
         DebianEvent::Downloading {
             package,
             index,

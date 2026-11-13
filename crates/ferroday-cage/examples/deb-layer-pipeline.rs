@@ -416,6 +416,12 @@ fn print_progress(event: DebianEvent<'_>) {
             reason,
             ..
         } => eprintln!("deb-layer-pipeline: {required_by} requires {requirement}, and {reason}"),
+        DebianEvent::Conflict {
+            relation,
+            stated_by,
+            against,
+            ..
+        } => eprintln!("deb-layer-pipeline: {stated_by} states {relation}, against {against}"),
         DebianEvent::Downloading {
             package,
             index,

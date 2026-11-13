@@ -511,9 +511,10 @@ impl Debian {
     /// package.
     ///
     /// A resolution that cannot be satisfied reports every refusal it met as a
-    /// [`DebianEvent::Unsatisfiable`] and then fails once with all of them
-    /// named, so an install list with four mistakes in it is corrected in one
-    /// pass rather than four. Where the [`pin`](DebianBuilder::pin) is among
+    /// [`DebianEvent::Unsatisfiable`], and every pair of packages in the root
+    /// that conflict as a [`DebianEvent::Conflict`], and then fails once with
+    /// all of them named, so an install list with four mistakes in it is
+    /// corrected in one pass rather than four. Where the [`pin`](DebianBuilder::pin) is among
     /// what it refused, the failure is [`DebianError::Pin`], naming every
     /// package the pin could not be held to.
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
@@ -573,7 +574,9 @@ impl Debian {
     /// whose dependency an upgrade breaks is upgraded with it where apt would
     /// upgrade it. What is still unmet is refused, reported as a
     /// [`DebianEvent::Unsatisfiable`] like any other refusal, since a layer
-    /// removes nothing from its base.
+    /// removes nothing from its base. A conflict with a package the base keeps
+    /// is avoided where a choice avoids it, or an upgrade apt would take, and
+    /// otherwise refused as a [`DebianEvent::Conflict`].
     ///
     /// Like [`resolve`](Self::resolve) it downloads no package and runs nothing,
     /// so it needs neither a `qemu-user` binfmt handler nor an establishable
@@ -607,7 +610,7 @@ impl Debian {
         // Reading the base's set is what refuses a base that is not a
         // configured bootstrap, so it runs whether or not a plan makes the
         // resolution below unnecessary.
-        let assume_installed = layer::read_installed_set(&base)?;
+        let assume_installed = layer::read_installed_set(&base, &self.architecture)?;
 
         let suite = self.suite.clone();
         let (config, fetcher) = self.split();
@@ -696,7 +699,8 @@ impl Debian {
 
         // The base's configured set seeds the resolver, and reading it refuses a
         // base that is not a configured bootstrap.
-        let assume_installed = layer::read_installed_set(&base).map_err(ProvisionError::from)?;
+        let assume_installed =
+            layer::read_installed_set(&base, &self.architecture).map_err(ProvisionError::from)?;
 
         // Create the upper and refuse a host that cannot establish an
         // unprivileged overlay on its filesystem, before any download. The
@@ -1846,6 +1850,15 @@ fn report_refusals(
             reason: &refusal.reason(),
         });
     }
+    for conflict in refusals.conflicts() {
+        observer.progress(DebianEvent::Conflict {
+            relation: &conflict.relation,
+            stated_by: &conflict.stated_by,
+            stated_in_base: conflict.stated_in_base,
+            against: &conflict.against,
+            against_in_base: conflict.against_in_base,
+        });
+    }
     let unheld = refusals.unheld();
     if !unheld.is_empty() {
         return Err(DebianError::Pin { unheld });
@@ -2987,6 +3000,28 @@ pub enum DebianEvent<'a> {
         /// package left out this way is one a resolution cannot select. A live
         /// archive reports zero.
         skipped: usize,
+    },
+    /// Two packages of the root a resolution produces cannot be installed
+    /// together: one states a `Conflicts` or `Breaks` entry naming the other.
+    ///
+    /// Each party is one the resolution selects, or, in a layered build, one
+    /// the base keeps, which a layer does not remove. Reported for every such
+    /// pair, alongside every [`Unsatisfiable`](Self::Unsatisfiable), before
+    /// the run fails, and the failure carries the same set as one sentence.
+    #[non_exhaustive]
+    Conflict {
+        /// The entry, as its field states it: `Conflicts: mail-transport-agent`
+        /// or `Breaks: libfoo1 (<< 2.0)`.
+        relation: &'a str,
+        /// The package stating it, as `name version`.
+        stated_by: &'a str,
+        /// Whether the package stating it is one a layered build's base keeps,
+        /// rather than one the resolution selects.
+        stated_in_base: bool,
+        /// The package it names, as `name version`.
+        against: &'a str,
+        /// Whether the package it names is one a layered build's base keeps.
+        against_in_base: bool,
     },
 }
 
@@ -4661,9 +4696,9 @@ mod tests {
     #[test]
     fn two_packages_shipping_one_owned_path_derive_one_statoverride_record() {
         // dpkg treats two records for one path as an unrecoverable fatal error,
-        // and a closure reaches that honestly: the resolver reads no Conflicts,
-        // so two packages that a real archive expects never to be unpacked
-        // together can both be selected, and tar permits one data.tar to list a
+        // and a closure reaches that honestly: a package that `Replaces` files
+        // of another without conflicting with it ships a path the other ships
+        // too, and both are selected, and tar permits one data.tar to list a
         // path twice besides. Both shapes are here, and both have to collapse.
         let dir = Scratch::new("statoverride-duplicate");
         let archives = dir.join("archives");

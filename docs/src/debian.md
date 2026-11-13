@@ -47,7 +47,7 @@ A bootstrap runs in stages:
    path would leave the mirror. It then resolves the install set: the base
    system (every essential and required package the primary repository marks,
    plus `apt`) together with the packages named by `include`, closed over their
-   dependencies.
+   dependencies, no two of which conflict.
 3. **Download and extract.** It downloads each package, verifies every digest
    its stanza records, and extracts its files into a staging tree with the same
    kernel-enforced containment the tarball provisioner uses. The merged-usr
@@ -235,6 +235,35 @@ satisfies contributes nothing to the selection, so the rest of the closure is
 unaffected by it. Two packages needing one absent name produce two refusals
 rather than one. That is the fact rather than noise, since both have to
 change.
+
+### Conflicts and Breaks
+
+The install set holds no two packages one of which `Conflicts` with or `Breaks`
+the other, as apt holds a resolution to. An entry names a package as a
+dependency on the same name would: by name at a version its constraint accepts,
+or by a `Provides`, so an unversioned `Conflicts: mail-transport-agent` names
+every provider of it. A package never conflicts with itself, which is what the
+idiom `Conflicts`, `Provides` and `Replaces` of one virtual name relies on to
+keep out every other provider. An architecture qualifier is read as apt reads
+it for one architecture. The bootstrap's own architecture and `:native` name
+what an unqualified entry names, and `:any` names only a package that is
+`Multi-Arch: allowed`. Any other architecture names nothing the install set
+holds.
+
+A choice is where a conflict is avoided. A dependency group takes its first
+alternative that conflicts with nothing selected so far: the package the
+alternative names, then each of its providers, then the next alternative. A
+group such as `default-mta | mail-transport-agent` beside a selected `postfix`
+therefore never draws in a second mail transport agent. Where every alternative
+conflicts, the first is taken and the conflict refused.
+
+The walk does not go back on a choice. A package selected later can conflict
+with one chosen before it was there to avoid, and the resolution then refuses
+rather than choosing again. apt does the same.
+
+Each conflict is reported as a `DebianEvent::Conflict` naming the entry, the
+package stating it, and the package it names, and the failure names all of
+them alongside every unsatisfiable dependency.
 
 ## Repositories
 
@@ -1412,7 +1441,17 @@ takes with it every name that version supplied, its own and the ones it
 it carries: of each package the increment installs, and of each package the base
 keeps. A package the base keeps whose dependency an upgrade breaks is upgraded
 too, where the archives offer a version apt would take. A layer removes nothing
-from its base, so a dependency that is still unmet refuses the resolution. The
+from its base, so a dependency that is still unmet refuses the resolution.
+
+[Conflicts](#conflicts-and-breaks) are held to the same root. A package the base
+keeps stands as apt treats one it may not remove, an essential one. A
+dependency's alternative that conflicts with it is passed over for the next,
+unless the base package has an upgrade apt would take that conflicts with
+nothing. apt takes the upgrade in that position, and so does the resolution. A
+conflict nothing avoids, such as an install list entry that `Breaks` a base
+package nothing upgrades, refuses the resolution where apt would remove the
+base package. So does a base whose own packages already conflict, as apt acts
+on no broken system. The
 refusal names the package whose dependency it is, the dependency as declared,
 what the root holds for it, and the upgrade that took the old version away. A
 dependency is held to the finished root, so it is refused whether the resolution
@@ -1686,8 +1725,8 @@ a tree a range map, where the ids are real and nothing is substituted.
 
 The overrides are recorded one per path. dpkg treats two records for one path as
 an unrecoverable fatal error, and an install set reaches that honestly. Two
-selected packages can ship one path, since the resolver reads `Depends` and
-`Provides` and never `Conflicts`.
+selected packages can ship one path, as a package that `Replaces` files of
+another without conflicting with it does.
 
 Where that happens the last record wins, which is the extraction's own rule: a
 later entry supersedes an earlier one. The record therefore describes the file

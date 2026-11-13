@@ -6453,6 +6453,26 @@ impl<W: std::io::Write> Progress<W> {
             } => self.line(format_args!(
                 "fcage: {required_by} requires {requirement:?}, and {reason}"
             )),
+            DebianEvent::Conflict {
+                relation,
+                stated_by,
+                stated_in_base,
+                against,
+                against_in_base,
+                ..
+            } => self.line(format_args!(
+                "fcage: {stated_by}{} states {relation:?}, and {}",
+                if *stated_in_base {
+                    ", which the base layer keeps,"
+                } else {
+                    ""
+                },
+                if *against_in_base {
+                    format!("the base layer keeps {against}")
+                } else {
+                    format!("the resolution selects {against} too")
+                },
+            )),
             DebianEvent::Downloading {
                 package,
                 index,

@@ -213,8 +213,8 @@ pub(crate) struct Installable {
 /// duplicate, and so does every dpkg invocation the bootstrap makes after the
 /// file is written, with a message that says nothing about which package
 /// produced it. A closure reaches a duplicate honestly — two selected packages
-/// shipping one path, since the resolver reads `Depends` and `Provides` and
-/// never `Conflicts` or `Replaces`; a `data.tar` listing a path twice, which tar
+/// shipping one path, as a package that `Replaces` another's files without
+/// conflicting with it does; a `data.tar` listing a path twice, which tar
 /// permits; or an increment re-shipping a path its base already overrode — so
 /// the duplicate is collapsed here rather than handed to dpkg.
 ///

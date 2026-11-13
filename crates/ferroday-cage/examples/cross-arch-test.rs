@@ -483,6 +483,12 @@ fn print_progress(event: DebianEvent<'_>) {
             reason,
             ..
         } => eprintln!("cross-arch-test: {required_by} requires {requirement}, and {reason}"),
+        DebianEvent::Conflict {
+            relation,
+            stated_by,
+            against,
+            ..
+        } => eprintln!("cross-arch-test: {stated_by} states {relation}, against {against}"),
         DebianEvent::Downloading {
             package,
             index,

@@ -4,7 +4,7 @@
 //! following `debootstrap`'s discipline: the first satisfiable alternative of
 //! an `a | b` group, virtual packages satisfied by preferring an
 //! already-selected provider. The result is the set of real packages to
-//! download and install.
+//! download and install, none of which `Conflicts` with or `Breaks` another.
 //!
 //! Version constraints are **enforced**, not assumed. A full bootstrap draws
 //! from one coherent suite, where a constraint is satisfied almost by
@@ -53,12 +53,44 @@
 //! [`Refusal::Pinned`] rather than resolving around it: an entry naming a
 //! release that does not offer the pinned version, or a dependency the pinned
 //! version does not meet.
+//!
+//! # Conflicts and Breaks
+//!
+//! The root a resolution produces holds no two packages one of which
+//! `Conflicts` with or `Breaks` the other, as apt holds a resolution to. The
+//! two fields keep packages apart alike: they differ in how dpkg orders an
+//! unpack, and apt 2.8 resolves around a `Breaks` exactly as around a
+//! `Conflicts`. A [`Clash`] says what each entry names.
+//!
+//! A choice is where a clash is avoided, as apt avoids one. A dependency group
+//! takes its first alternative that clashes with nothing the root holds as the
+//! walk meets the group: the real package an alternative names, then each of
+//! its providers in turn, then the next alternative. A clash in either
+//! direction passes a candidate over, whichever of the two states it. Only
+//! where every alternative clashes is the first that answers the group taken,
+//! and the clash it brings refused.
+//!
+//! The walk does not go back on a choice. A package selected later can clash
+//! with one chosen earlier, before the later one was there to avoid, and the
+//! resolution then refuses the clash rather than choosing again. apt 2.8 does
+//! the same: `apt-get install a z`, where `a` depends on `b | c`, `b`
+//! conflicts with `x`, and `z` depends on `x`, takes `b` for `a` and then fails
+//! on `z`'s `x`.
+//!
+//! A layered resolution removes nothing from its base, so a package the base
+//! keeps stands as apt treats one it may not remove, an essential one. A
+//! candidate that clashes with it is passed over, unless the base package has
+//! an upgrade apt would take that clashes with nothing. apt upgrades a package
+//! in that position, and so does the resolution. Where nothing avoids the
+//! clash, the resolution refuses it where apt would remove the base package.
+//! A base that already holds two packages that clash is refused too, as apt
+//! refuses to act on a broken system.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use super::index::{DepAtom, Dependency, Index, Package};
-use super::layer::{InstalledSet, Supply};
+use super::index::{Clash, DepAtom, Dependency, Index, Package, Provided};
+use super::layer::{Installed, InstalledSet, Supply};
 use super::pin::{UnheldPin, UnheldReason};
 use super::version::Constraint;
 
@@ -193,6 +225,52 @@ impl fmt::Display for Replacement {
     }
 }
 
+/// Two packages of the root a resolution produces that cannot be installed
+/// together: one states a `Conflicts` or `Breaks` entry naming the other.
+///
+/// Each party is named bare, as `name version`: the name is held to policy's
+/// alphabet as the index or the base's status database is read, and so is the
+/// version, which a base package states nothing of where its database states
+/// none that alphabet admits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Conflict {
+    /// The entry, as its field states it: `Breaks: libfoo (<< 2)`.
+    pub(crate) relation: String,
+    /// The package stating it.
+    pub(crate) stated_by: String,
+    /// Whether the package stating it is one a layered build's base keeps,
+    /// rather than one the resolution selects.
+    pub(crate) stated_in_base: bool,
+    /// The package it names.
+    pub(crate) against: String,
+    /// Whether the package it names is one a layered build's base keeps.
+    pub(crate) against_in_base: bool,
+}
+
+impl fmt::Display for Conflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let which = if self.stated_in_base {
+            ", which the base layer keeps,"
+        } else {
+            ""
+        };
+        write!(
+            f,
+            "{}{which} states {:?}, and ",
+            self.stated_by, self.relation
+        )?;
+        match (self.against_in_base, self.stated_in_base) {
+            (true, false) => write!(
+                f,
+                "the base layer keeps {}, which a layer does not remove",
+                self.against,
+            ),
+            (true, true) => write!(f, "the base layer keeps {} too", self.against),
+            (false, _) => write!(f, "the resolution selects {} too", self.against),
+        }
+    }
+}
+
 impl Refusal {
     /// What could not be supplied: the dependency group as the archive, or a
     /// base layer's status database, declares it, or the package name where
@@ -297,19 +375,21 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Everything one resolution refused, in the order it met them.
+/// Everything one resolution refused: every dependency in the order it met
+/// them, then every [`Conflict`] in the root it produced.
 ///
 /// Debian's own rather than Gentoo's `Refusals`, which is the same idea under
 /// the same name in the same position. The two are deliberately separate: a
 /// portage resolution refuses in three shapes — an atom nothing answers, a
-/// blocker, and two builds contending for one slot — and the last two are
-/// portage concepts with no Debian meaning, so a shared type would carry two
-/// collections that are always empty here. What the layers share is the
-/// discipline, not the vocabulary, and `CONTRIBUTING.md`'s shared-vocabulary
-/// table records the split.
+/// blocker, and two builds contending for one slot — and the last is a portage
+/// concept with no Debian meaning, so a shared type would carry a collection
+/// that is always empty here. What the layers share is the discipline, not the
+/// vocabulary, and `CONTRIBUTING.md`'s shared-vocabulary table records the
+/// split.
 #[derive(Debug, Default)]
 pub(crate) struct Refusals {
     refused: Vec<Refusal>,
+    conflicts: Vec<Conflict>,
 }
 
 impl Refusals {
@@ -320,12 +400,18 @@ impl Refusals {
 
     /// Whether the resolution can be acted on.
     pub(crate) fn is_empty(&self) -> bool {
-        self.refused.is_empty()
+        self.refused.is_empty() && self.conflicts.is_empty()
     }
 
-    /// Every refusal, in the order the resolution met them.
+    /// Every dependency refused, in the order the resolution met them.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Refusal> {
         self.refused.iter()
+    }
+
+    /// Every conflict the root holds, the selected packages' first, each
+    /// party's in name order.
+    pub(crate) fn conflicts(&self) -> impl Iterator<Item = &Conflict> {
+        self.conflicts.iter()
     }
 
     /// Every package the pin could not be held to, in name order, and in the
@@ -352,6 +438,7 @@ impl Refusals {
         self.refused
             .iter()
             .map(Refusal::to_string)
+            .chain(self.conflicts.iter().map(Conflict::to_string))
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -368,8 +455,9 @@ impl Refusals {
 /// as a dependency alternative so a later alternative satisfies the group
 /// instead. A hard dependency an exclusion leaves unsatisfiable refuses the
 /// resolution rather than shipping a broken closure, and a package that is both
-/// included and excluded is a contradiction that refuses likewise. The returned
-/// packages are sorted by name.
+/// included and excluded is a contradiction that refuses likewise, as does a
+/// closure holding two packages that clash. The returned packages are sorted by
+/// name.
 pub(crate) fn resolve(
     index: &Index,
     base: &[String],
@@ -647,11 +735,17 @@ impl Closure<'_> {
     ///
     /// Returns whether the pass selected anything, which leaves the walk to
     /// close over it and the check to run again. A pass that selected nothing
-    /// is the last, and refuses what the base keeps that is still broken. Only
-    /// that pass refuses it, since an earlier pass's selection can answer a
-    /// group of the base's that a later one leaves broken. The groups of
-    /// selected packages are refused as they are met, as the walk refuses
+    /// is the last, and refuses what the base keeps that is still broken, and
+    /// every clash the root holds. Only that pass refuses them, since an
+    /// earlier pass's selection can answer a group of the base's that a later
+    /// one leaves broken, and upgrade a base package out of a clash. The groups
+    /// of selected packages are refused as they are met, as the walk refuses
     /// them: nothing selected later answers a group no candidate answers.
+    ///
+    /// A package the base keeps that clashes with a selected one is upgraded
+    /// where the upgrade [`Candidates::upgrade`] offers clashes with nothing,
+    /// as apt upgrades a package a candidate's `Breaks` or `Conflicts` names
+    /// before it would remove it.
     fn settle(&mut self) -> bool {
         for (at, name) in self.answered.clone().iter().enumerate() {
             self.resolve(THE_INSTALL_LIST, at, &vec![unversioned(name)]);
@@ -668,19 +762,19 @@ impl Closure<'_> {
 
         let installed = self.candidates.installed;
         let mut broken = Vec::new();
-        for (name, groups) in installed.packages() {
+        for (name, package) in installed.members() {
             if self.selected.contains_key(name) {
                 continue;
             }
-            for group in groups {
+            for group in &package.relations {
                 if group
                     .iter()
                     .any(|atom| merged_satisfies(&self.candidates, &self.selected, atom))
                 {
                     continue;
                 }
-                if let Some(upgrade) = self.upgrade(name) {
-                    add(&mut self.selected, &mut self.queue, &upgrade);
+                if let Some(upgrade) = self.candidates.upgrade(name, &self.excluded) {
+                    add(&mut self.selected, &mut self.queue, upgrade);
                     break;
                 }
                 broken.push(Refusal::Broken {
@@ -694,24 +788,31 @@ impl Closure<'_> {
         if !self.queue.is_empty() {
             return true;
         }
+        for (name, package) in installed.members() {
+            if self.selected.contains_key(name) {
+                continue;
+            }
+            let kept = Member::kept(name, package);
+            let clashes_with_selection = clashes(&self.candidates, &self.selected, kept)
+                .iter()
+                .any(|clash| !clash.stated_by.in_base || !clash.against.in_base);
+            if !clashes_with_selection {
+                continue;
+            }
+            if let Some(upgrade) = self.candidates.upgrade(name, &self.excluded)
+                && fits(&self.candidates, &self.excluded, &self.selected, upgrade)
+            {
+                add(&mut self.selected, &mut self.queue, upgrade);
+            }
+        }
+        if !self.queue.is_empty() {
+            return true;
+        }
         for refusal in broken {
             self.refusals.push(refusal);
         }
+        self.refusals.conflicts = root_conflicts(&self.candidates, &self.selected);
         false
-    }
-
-    /// The version a package the base keeps is upgraded to where the merged
-    /// set breaks one of its dependencies: the one [`Candidates::of`] offers,
-    /// as apt upgrades an installed package an upgrade breaks.
-    ///
-    /// `None` for a package the caller excluded, and for one whose installed
-    /// version the status database does not state, which is no version to
-    /// upgrade from.
-    fn upgrade(&self, name: &str) -> Option<Package> {
-        if self.excluded.contains(name) || self.candidates.installed.installed(name).is_none() {
-            return None;
-        }
-        self.candidates.of(name).cloned()
     }
 }
 
@@ -772,6 +873,21 @@ impl<'a> Candidates<'a> {
     /// Whether an install list entry switched `name` to a release's version.
     fn is_targeted(&self, name: &str) -> bool {
         self.targeted.contains_key(name)
+    }
+
+    /// The version a package the base keeps is upgraded to where the merged
+    /// set breaks one of its dependencies or clashes with it: the one
+    /// [`of`](Self::of) offers, as apt upgrades an installed package an
+    /// upgrade breaks.
+    ///
+    /// `None` for a package the caller excluded, and for one whose installed
+    /// version the status database does not state, which is no version to
+    /// upgrade from.
+    fn upgrade(&self, name: &str, excluded: &HashSet<&str>) -> Option<&Package> {
+        if excluded.contains(name) || self.installed.installed(name).is_none() {
+            return None;
+        }
+        self.of(name)
     }
 
     /// Switches `package`'s name to that version, then each versioned
@@ -905,6 +1021,13 @@ impl<'a> Candidates<'a> {
 /// first such alternative, since without the pin a version that does meet it
 /// may be there to take. An exclusion is reported ahead of a pin: it removes
 /// the name whatever version would have answered.
+///
+/// An answer that clashes with the root as it stands is passed over for the
+/// next one that does not ([`fits`]): the real package an alternative names,
+/// then each of its providers, then the next alternative, as apt 2.8 passes
+/// one over. Where every answer clashes, the first is taken all the same, and
+/// the merged set's check refuses the clash it brings, naming both packages
+/// and the entry, which says more than refusing the group would.
 fn resolve_group(
     candidates: &Candidates<'_>,
     group: &Dependency,
@@ -932,6 +1055,8 @@ fn resolve_group(
     // unsatisfied solely by exclusion can be reported against it.
     let mut blocked: Option<String> = None;
     let mut pinned: Option<UnheldPin> = None;
+    // The first answer, where every answer clashes.
+    let mut clashing: Option<&Package> = None;
     for atom in group {
         if excluded.contains(atom.name.as_str()) {
             // The real package is excluded. One name can be both a real
@@ -948,8 +1073,11 @@ fn resolve_group(
             // continues — a provider may still supply the name at a version
             // that is, and a later alternative may too.
             if meets(atom.constraint.as_ref(), &package.version) {
-                add(selected, queue, package);
-                return None;
+                if fits(candidates, excluded, selected, package) {
+                    add(selected, queue, package);
+                    return None;
+                }
+                clashing.get_or_insert(package);
             }
         }
         if pinned.is_none() && !excluded.contains(atom.name.as_str()) {
@@ -960,12 +1088,15 @@ fn resolve_group(
                 required_by,
             );
         }
-        if let Some(provider) = first_available_provider(candidates, atom, excluded) {
+        for provider in available_providers(candidates, atom, excluded) {
             let package = candidates
-                .of(&provider)
+                .of(provider)
                 .expect("a provider is a real package");
-            add(selected, queue, package);
-            return None;
+            if fits(candidates, excluded, selected, package) {
+                add(selected, queue, package);
+                return None;
+            }
+            clashing.get_or_insert(package);
         }
         // A virtual whose every provider is excluded: record the first, so an
         // all-excluded alternative group is reported rather than silently
@@ -977,6 +1108,10 @@ fn resolve_group(
         {
             blocked.get_or_insert_with(|| provider.clone());
         }
+    }
+    if let Some(package) = clashing {
+        add(selected, queue, package);
+        return None;
     }
     match (blocked, pinned) {
         (Some(package), _) => Some(Refusal::ExcludedButRequired {
@@ -1233,17 +1368,291 @@ fn first_available_provider(
     atom: &DepAtom,
     excluded: &HashSet<&str>,
 ) -> Option<String> {
+    available_providers(candidates, atom, excluded)
+        .next()
+        .cloned()
+}
+
+/// Every provider of `atom`'s virtual name that is not excluded and whose
+/// version supplies it at a version the constraint accepts, in name order.
+fn available_providers<'c>(
+    candidates: &'c Candidates<'_>,
+    atom: &'c DepAtom,
+    excluded: &'c HashSet<&str>,
+) -> impl Iterator<Item = &'c String> {
     candidates
         .index
         .providers(&atom.name)
         .iter()
-        .find(|provider| {
+        .filter(move |provider| {
             !excluded.contains(provider.as_str())
                 && candidates
                     .of(provider)
                     .is_some_and(|package| provides_satisfies(package, atom))
         })
-        .cloned()
+}
+
+/// One package of the root a resolution produces, as a [`Clash`] asks about
+/// it: one the resolution selects, or one a layered build's base keeps.
+#[derive(Debug, Clone, Copy)]
+struct Member<'r> {
+    name: &'r str,
+    /// The version, which a base package's status database may not state.
+    version: Option<&'r str>,
+    provides: &'r [Provided],
+    clashes: &'r [Clash],
+    multi_arch_allowed: bool,
+    /// Whether the base keeps it, rather than the resolution selecting it.
+    in_base: bool,
+}
+
+impl<'r> Member<'r> {
+    /// A package the resolution selects.
+    fn selected(package: &'r Package) -> Member<'r> {
+        Member {
+            name: &package.name,
+            version: Some(&package.version),
+            provides: &package.provides,
+            clashes: &package.clashes,
+            multi_arch_allowed: package.multi_arch_allowed,
+            in_base: false,
+        }
+    }
+
+    /// The package `name` the base keeps.
+    fn kept(name: &'r str, package: &'r Installed) -> Member<'r> {
+        Member {
+            name,
+            version: package.version.as_deref(),
+            provides: &package.provides,
+            clashes: &package.clashes,
+            multi_arch_allowed: package.multi_arch_allowed,
+            in_base: true,
+        }
+    }
+
+    /// Whether `clash`, stated by another package, names this one: by its
+    /// own name or by a name it provides, at a version the entry's constraint
+    /// accepts, as a dependency on the same name would be answered.
+    fn named_by(&self, clash: &Clash) -> bool {
+        let atom = &clash.atom;
+        let constraint = atom.constraint.as_ref();
+        (!clash.any || self.multi_arch_allowed)
+            && ((self.name == atom.name && answers(self.version, constraint))
+                || self.provides.iter().any(|provided| {
+                    provided.name == atom.name && answers(provided.version.as_deref(), constraint)
+                }))
+    }
+
+    /// The package as a refusal names it, `name version`.
+    fn describe(&self) -> String {
+        match self.version {
+            Some(version) => format!("{} {version}", self.name),
+            None => self.name.to_string(),
+        }
+    }
+}
+
+/// One clash between two members of the root: who states it, the entry, and
+/// what it names.
+struct Clashing<'r> {
+    stated_by: Member<'r>,
+    clash: &'r Clash,
+    against: Member<'r>,
+}
+
+impl Clashing<'_> {
+    /// The clash as a refusal reports it.
+    fn conflict(&self) -> Conflict {
+        Conflict {
+            relation: self.clash.to_string(),
+            stated_by: self.stated_by.describe(),
+            stated_in_base: self.stated_by.in_base,
+            against: self.against.describe(),
+            against_in_base: self.against.in_base,
+        }
+    }
+}
+
+/// The members of the root that supply `name`, as a clash on it could name
+/// them: the selected package of that name and each selected provider of it,
+/// then each package the base keeps supplying it. A package is listed once
+/// however many ways it supplies the name.
+fn supplying<'r>(
+    candidates: &'r Candidates<'_>,
+    selected: &'r BTreeMap<String, Package>,
+    name: &str,
+) -> Vec<Member<'r>> {
+    let mut members: Vec<Member<'r>> = Vec::new();
+    let real = selected.get(name).into_iter();
+    let providers = candidates
+        .index
+        .providers(name)
+        .iter()
+        .filter_map(|provider| selected.get(provider));
+    for package in real.chain(providers) {
+        if !members.iter().any(|member| member.name == package.name) {
+            members.push(Member::selected(package));
+        }
+    }
+    let installed = candidates.installed;
+    for supply in kept(installed, selected, name) {
+        if members.iter().any(|member| member.name == supply.provider) {
+            continue;
+        }
+        if let Some(package) = installed.package(&supply.provider) {
+            members.push(Member::kept(&supply.provider, package));
+        }
+    }
+    members
+}
+
+/// The members of the root stating a clash on `name`: the selected ones, then
+/// those the base keeps.
+fn stating<'r>(
+    candidates: &'r Candidates<'_>,
+    selected: &'r BTreeMap<String, Package>,
+    name: &str,
+) -> Vec<Member<'r>> {
+    let installed = candidates.installed;
+    let chosen = candidates
+        .index
+        .clashing(name)
+        .iter()
+        .filter_map(|stater| selected.get(stater))
+        .map(Member::selected);
+    let base = installed
+        .clashing(name)
+        .iter()
+        .filter(|stater| !selected.contains_key(stater.as_str()))
+        .filter_map(|stater| {
+            installed
+                .package(stater)
+                .map(|package| Member::kept(stater, package))
+        });
+    chosen.chain(base).collect()
+}
+
+/// Every clash `member` states against the rest of the root.
+///
+/// A member never clashes with a package of its own name, which is itself or
+/// the base package it replaces.
+fn stated<'r>(
+    candidates: &'r Candidates<'_>,
+    selected: &'r BTreeMap<String, Package>,
+    member: Member<'r>,
+) -> Vec<Clashing<'r>> {
+    let mut found = Vec::new();
+    for clash in member.clashes {
+        for against in supplying(candidates, selected, &clash.atom.name) {
+            if against.name != member.name && against.named_by(clash) {
+                found.push(Clashing {
+                    stated_by: member,
+                    clash,
+                    against,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Every clash between `member` and the rest of the root, in either direction:
+/// those it states, then those stated against it.
+fn clashes<'r>(
+    candidates: &'r Candidates<'_>,
+    selected: &'r BTreeMap<String, Package>,
+    member: Member<'r>,
+) -> Vec<Clashing<'r>> {
+    let mut found = stated(candidates, selected, member);
+    let mut names: Vec<&str> = vec![member.name];
+    names.extend(
+        member
+            .provides
+            .iter()
+            .map(|provided| provided.name.as_str()),
+    );
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        for stated_by in stating(candidates, selected, name) {
+            if stated_by.name == member.name {
+                continue;
+            }
+            for clash in stated_by.clashes {
+                if clash.atom.name == name && member.named_by(clash) {
+                    found.push(Clashing {
+                        stated_by,
+                        clash,
+                        against: member,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether `package` can join the root as it stands without a clash nothing
+/// resolves.
+///
+/// A clash with a selected package is never resolved: the walk does not go
+/// back on what it chose. One with a package the base keeps is resolved where
+/// that package's upgrade ([`Candidates::upgrade`]) clashes with `package` in
+/// neither direction, since the merged set's check then takes the upgrade, as
+/// apt upgrades a package before it would remove it.
+fn fits(
+    candidates: &Candidates<'_>,
+    excluded: &HashSet<&str>,
+    selected: &BTreeMap<String, Package>,
+    package: &Package,
+) -> bool {
+    let member = Member::selected(package);
+    clashes(candidates, selected, member).iter().all(|clash| {
+        let base = if clash.stated_by.in_base {
+            clash.stated_by
+        } else {
+            clash.against
+        };
+        base.in_base
+            && candidates
+                .upgrade(base.name, excluded)
+                .is_some_and(|upgrade| !clash_between(Member::selected(upgrade), member))
+    })
+}
+
+/// Whether either of two packages states a clash naming the other.
+fn clash_between(one: Member<'_>, other: Member<'_>) -> bool {
+    one.name != other.name
+        && (one.clashes.iter().any(|clash| other.named_by(clash))
+            || other.clashes.iter().any(|clash| one.named_by(clash)))
+}
+
+/// Every clash the root holds, as the refusals report them: each stated by a
+/// selected package, then each stated by a package the base keeps, every
+/// party in name order.
+fn root_conflicts(
+    candidates: &Candidates<'_>,
+    selected: &BTreeMap<String, Package>,
+) -> Vec<Conflict> {
+    let installed = candidates.installed;
+    let chosen = selected.values().map(Member::selected);
+    let base = installed
+        .members()
+        .filter(|(name, _)| !selected.contains_key(*name))
+        .map(|(name, package)| Member::kept(name, package));
+    let mut conflicts = Vec::new();
+    for member in chosen.chain(base) {
+        for clashing in stated(candidates, selected, member) {
+            // A field naming one package twice, or a package supplying the
+            // name twice, is one conflict to report.
+            let conflict = clashing.conflict();
+            if !conflicts.contains(&conflict) {
+                conflicts.push(conflict);
+            }
+        }
+    }
+    conflicts
 }
 
 /// Adds a package to the selection and the work queue if new.
@@ -1273,6 +1682,8 @@ mod tests {
         fn expecting(self, what: &str) -> Vec<Package>;
         /// The one refusal a test about a single failure pins.
         fn into_refusal(self) -> Refusal;
+        /// Every conflict, asserting the resolution refused no dependency.
+        fn into_conflicts(self) -> Vec<Conflict>;
     }
 
     impl Resolution for (Vec<Package>, Refusals) {
@@ -1292,16 +1703,34 @@ mod tests {
 
         fn into_refusal(self) -> Refusal {
             let (packages, refusals) = self;
-            let mut refused: Vec<Refusal> = refusals.refused;
-            match refused.len() {
-                1 => refused.remove(0),
-                0 => panic!("expected a refusal, resolved {:?}", names(&packages)),
-                _ => panic!(
-                    "expected exactly one refusal, got {}: {}",
-                    refused.len(),
-                    Refusals { refused }.describe(),
+            let Refusals {
+                mut refused,
+                conflicts,
+            } = refusals;
+            match (refused.len(), conflicts.len()) {
+                (1, 0) => refused.remove(0),
+                (0, 0) => panic!("expected a refusal, resolved {:?}", names(&packages)),
+                (count, _) => panic!(
+                    "expected exactly one refusal, got {count} and {} conflicts: {}",
+                    conflicts.len(),
+                    Refusals { refused, conflicts }.describe(),
                 ),
             }
+        }
+
+        fn into_conflicts(self) -> Vec<Conflict> {
+            let (packages, refusals) = self;
+            assert!(
+                refusals.refused.is_empty(),
+                "expected only conflicts, and it refused: {}",
+                refusals.describe(),
+            );
+            assert!(
+                !refusals.conflicts.is_empty(),
+                "expected a conflict, resolved {:?}",
+                names(&packages),
+            );
+            refusals.conflicts
         }
     }
 
@@ -1364,26 +1793,364 @@ mod tests {
         assert_eq!(names(&selected), ["base", "mawk"]);
     }
 
+    /// Resolves `includes` with nothing seeded besides, as `apt-get install`
+    /// with them on its command line on a system with nothing installed.
+    fn install(index: &Index, includes: &[&str]) -> (Vec<Package>, Refusals) {
+        let includes: Vec<String> = includes.iter().map(|name| name.to_string()).collect();
+        resolve(index, &[], &includes, &[])
+    }
+
+    /// Each conflict a refused resolution reports, as one sentence each.
+    fn conflicts(resolution: (Vec<Package>, Refusals)) -> Vec<String> {
+        resolution
+            .into_conflicts()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    // The conflict tests pin what apt 2.8.4 answers for the same index: each
+    // was measured with `apt-get --simulate install`, against a flat `file:`
+    // repository holding these stanzas and a status database holding the
+    // base, before it was written here.
+
     #[test]
-    fn two_packages_a_real_archive_conflicts_both_enter_the_closure() {
-        // The resolver reads Depends, Pre-Depends, and Provides, and no other
-        // relation: a coherent suite is internally consistent, and dpkg runs
-        // with --force-depends. So Conflicts and Replaces are not consulted, and
-        // a closure can legitimately hold two packages a real archive expects
-        // never to be unpacked together.
-        //
-        // Pinned because it is what makes a duplicate statoverride reachable
-        // without anything malformed — two selected packages shipping one path.
-        // The collapsing is the accumulator's job, not the resolver's, and it
-        // has to stay that way while this rule holds.
+    fn an_alternative_that_clashes_with_the_selection_is_passed_over() {
+        // apt takes cc for aa's `bb | cc` whichever of bb and xx states the
+        // clash, and whether it is a Conflicts or a Breaks.
+        for (b, x) in [
+            ("Conflicts: xx", ""),
+            ("", "Conflicts: bb"),
+            ("Breaks: xx", ""),
+            ("", "Breaks: bb"),
+        ] {
+            let text = format!(
+                "{}{}{}{}",
+                stanza("aa", "bb | cc", ""),
+                stanza("bb", "", b),
+                stanza("cc", "", ""),
+                stanza("xx", "", x),
+            );
+            let selected = install(&index(&text), &["xx", "aa"]).into_packages();
+            assert_eq!(names(&selected), ["aa", "cc", "xx"], "{b:?} {x:?}");
+        }
+    }
+
+    #[test]
+    fn a_provider_that_clashes_is_passed_over_for_the_next() {
+        // p1 is the provider the resolver takes first, and it conflicts with
+        // xx, so p2 answers. Where every provider clashes, the next
+        // alternative does.
+        let text = format!(
+            "{}{}{}{}{}",
+            stanza("aa", "vv", ""),
+            stanza("p1", "", "Provides: vv\nConflicts: xx"),
+            stanza("p2", "", "Provides: vv"),
+            stanza("xx", "", ""),
+            stanza("dd", "ww | cc", ""),
+        );
+        let text = format!(
+            "{text}{}{}",
+            stanza("qq", "", "Provides: ww\nBreaks: xx"),
+            stanza("cc", "", ""),
+        );
+        let index = index(&text);
+        assert_eq!(
+            names(&install(&index, &["xx", "aa"]).into_packages()),
+            ["aa", "p2", "xx"],
+        );
+        assert_eq!(
+            names(&install(&index, &["aa"]).into_packages()),
+            ["aa", "p1"],
+            "a clash with nothing selected is no reason to pass p1 over",
+        );
+        assert_eq!(
+            names(&install(&index, &["xx", "dd"]).into_packages()),
+            ["cc", "dd", "xx"],
+        );
+    }
+
+    #[test]
+    fn a_versioned_breaks_names_only_the_versions_it_states() {
+        // bb breaks the xx before 2, so xx 2 stands beside it and xx 1 does
+        // not.
+        for (version, expected) in [("2", ["aa", "bb", "xx"]), ("1", ["aa", "cc", "xx"])] {
+            let text = format!(
+                "{}{}{}{}",
+                stanza("aa", "bb | cc", ""),
+                stanza("bb", "", "Breaks: xx (<< 2)"),
+                stanza("cc", "", ""),
+                stanza_at("xx", version, "", ""),
+            );
+            let selected = install(&index(&text), &["xx", "aa"]).into_packages();
+            assert_eq!(names(&selected), expected, "xx {version}");
+        }
+    }
+
+    #[test]
+    fn a_package_conflicting_with_a_name_it_provides_keeps_out_only_the_others() {
+        // The idiom every mail transport agent states: it conflicts with,
+        // provides, and replaces `mail-transport-agent`, so no two are
+        // installed, and each stands beside its own provide.
+        let mta = "Provides: mta\nConflicts: mta\nReplaces: mta";
         let text = format!(
             "{}{}{}",
-            stanza("base", "left, right", ""),
-            stanza("left", "", "Conflicts: right\nReplaces: right"),
-            stanza("right", "", "Conflicts: left\nReplaces: left"),
+            stanza("aa", "mta", ""),
+            stanza("exim", "", mta),
+            stanza("postfix", "", mta),
         );
-        let selected = resolve(&index(&text), &["base".into()], &[], &[]).into_packages();
-        assert_eq!(names(&selected), ["base", "left", "right"]);
+        let index = index(&text);
+        assert_eq!(
+            names(&install(&index, &["postfix", "aa"]).into_packages()),
+            ["aa", "postfix"],
+        );
+        assert_eq!(
+            conflicts(install(&index, &["postfix", "exim"])),
+            [
+                "exim 1.0 states \"Conflicts: mta\", and the resolution selects postfix 1.0 too",
+                "postfix 1.0 states \"Conflicts: mta\", and the resolution selects exim 1.0 too",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_clash_on_a_virtual_name_names_each_provider_its_constraint_accepts() {
+        // An unversioned entry names every provider. A versioned one names a
+        // provider only at a version it states that the constraint accepts,
+        // as a versioned dependency is answered only by one.
+        let text = format!(
+            "{}{}{}{}{}",
+            stanza("bb", "", "Conflicts: vv"),
+            stanza("versioned", "", "Conflicts: vv (<< 2)"),
+            stanza("bare", "", "Provides: vv"),
+            stanza("old", "", "Provides: vv (= 1)"),
+            stanza("new", "", "Provides: vv (= 3)"),
+        );
+        let index = index(&text);
+        assert_eq!(
+            conflicts(install(&index, &["bb", "bare"])),
+            ["bb 1.0 states \"Conflicts: vv\", and the resolution selects bare 1.0 too"],
+        );
+        for provider in ["bare", "new"] {
+            install(&index, &["versioned", provider]).expecting(provider);
+        }
+        assert_eq!(
+            conflicts(install(&index, &["versioned", "old"])),
+            [
+                "versioned 1.0 states \"Conflicts: vv (<< 2)\", and the resolution selects \
+                 old 1.0 too"
+            ],
+        );
+    }
+
+    #[test]
+    fn an_architecture_qualifier_names_what_apt_names() {
+        // In a resolution of one architecture, `:native` and the native
+        // architecture name what an unqualified entry names, another
+        // architecture names nothing, `all` included, and `:any` names only a
+        // package `Multi-Arch: allowed`.
+        let text = format!(
+            "{}{}{}{}{}{}{}",
+            stanza("xx", "", ""),
+            stanza("allowed", "", "Multi-Arch: allowed"),
+            stanza("native", "", "Conflicts: xx:amd64"),
+            stanza("named", "", "Conflicts: xx:native"),
+            stanza("foreign", "", "Conflicts: xx:i386"),
+            stanza("indep", "", "Conflicts: xx:all"),
+            stanza("any", "", "Breaks: xx:any, allowed:any"),
+        );
+        let index = index(&text);
+        for stater in ["native", "named"] {
+            assert_eq!(
+                conflicts(install(&index, &[stater, "xx"])),
+                [format!(
+                    "{stater} 1.0 states \"Conflicts: xx\", and the resolution selects xx 1.0 too"
+                )],
+            );
+        }
+        for stater in ["foreign", "indep", "any"] {
+            install(&index, &[stater, "xx"]).expecting(stater);
+        }
+        assert_eq!(
+            conflicts(install(&index, &["any", "allowed"])),
+            [
+                "any 1.0 states \"Breaks: allowed:any\", and the resolution selects allowed \
+                 1.0 too"
+            ],
+        );
+    }
+
+    #[test]
+    fn a_clash_no_choice_avoids_is_refused_naming_both_packages() {
+        // aa needs both, and bb conflicts with cc. apt fails, naming aa's
+        // dependency on cc; the refusal names the entry that is in the way.
+        let text = format!(
+            "{}{}{}",
+            stanza("aa", "bb, cc", ""),
+            stanza("bb", "", "Conflicts: cc"),
+            stanza("cc", "", ""),
+        );
+        let resolution = install(&index(&text), &["aa"]);
+        assert_eq!(
+            conflicts(resolution),
+            ["bb 1.0 states \"Conflicts: cc\", and the resolution selects cc 1.0 too"],
+        );
+    }
+
+    #[test]
+    fn a_choice_a_later_selection_clashes_with_is_refused_rather_than_made_again() {
+        // aa's `bb | cc` is met before anything selects xx, so bb is taken,
+        // and zz's xx then clashes with it. apt 2.8 takes bb and fails on xx the same
+        // way; it does not go back on the choice either. Met the other way
+        // round, xx is there to avoid.
+        let text = format!(
+            "{}{}{}{}{}",
+            stanza("aa", "bb | cc", ""),
+            stanza("bb", "", "Conflicts: xx"),
+            stanza("cc", "", ""),
+            stanza("xx", "", ""),
+            stanza("zz", "xx", ""),
+        );
+        let index = index(&text);
+        assert_eq!(
+            conflicts(install(&index, &["aa", "zz"])),
+            ["bb 1.0 states \"Conflicts: xx\", and the resolution selects xx 1.0 too"],
+        );
+        assert_eq!(
+            names(&install(&index, &["zz", "aa"]).into_packages()),
+            ["aa", "cc", "xx", "zz"],
+        );
+    }
+
+    /// Builds an assume-installed set from `(name, version, fields)`, each
+    /// package stating the `Conflicts` and `Breaks` lines `fields` holds.
+    fn base_clashing(entries: &[(&str, &str, &str)]) -> InstalledSet {
+        let mut set = InstalledSet::default();
+        for (name, version, fields) in entries {
+            set.install(name, Some(version), Vec::new());
+            let field = |prefix: &str| {
+                fields
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(str::to_string)
+            };
+            let (conflicts, breaks) = (field("Conflicts: "), field("Breaks: "));
+            set.clash(
+                name,
+                super::super::index::parse_clashes(
+                    conflicts.as_deref(),
+                    breaks.as_deref(),
+                    "amd64",
+                ),
+                false,
+            );
+        }
+        set
+    }
+
+    #[test]
+    fn an_alternative_clashing_with_what_the_base_keeps_is_passed_over() {
+        // apt removes an installed package a candidate breaks, where nothing
+        // upgrades it, and takes the next alternative only where it may not
+        // remove the package, as for an essential one. A layer removes
+        // nothing, so cc answers, whichever of bb and xx states the clash.
+        for (b, x) in [("Breaks: xx", ""), ("", "Conflicts: bb")] {
+            let text = format!(
+                "{}{}{}{}",
+                stanza("aa", "bb | cc", ""),
+                stanza("bb", "", b),
+                stanza("cc", "", ""),
+                stanza("xx", "", ""),
+            );
+            let base = base_clashing(&[("xx", "1.0", x)]);
+            let selected = resolve_seeded(&index(&text), &[], &["aa".into()], &[], &base)
+                .expecting("cc answers aa");
+            assert_eq!(names(&selected), ["aa", "cc"], "{b:?} {x:?}");
+        }
+    }
+
+    #[test]
+    fn a_base_package_a_candidate_clashes_with_is_upgraded_where_the_upgrade_does_not() {
+        // The archive's xx 2.0 neither breaks bb nor is broken by it, so apt
+        // takes bb and upgrades xx, whichever of the two states the clash, and
+        // so does the layer.
+        for (b, x) in [("Breaks: xx (<< 2.0)", ""), ("", "Breaks: bb")] {
+            let text = format!(
+                "{}{}{}{}",
+                stanza("aa", "bb | cc", ""),
+                stanza("bb", "", b),
+                stanza("cc", "", ""),
+                stanza_at("xx", "2.0", "", ""),
+            );
+            let base = base_clashing(&[("xx", "1.0", x)]);
+            let selected = resolve_seeded(&index(&text), &[], &["aa".into()], &[], &base)
+                .expecting("xx is upgraded");
+            assert_eq!(
+                chosen(&selected),
+                [
+                    ("aa".into(), "1.0".into(), 0),
+                    ("bb".into(), "1.0".into(), 0),
+                    ("xx".into(), "2.0".into(), 0),
+                ],
+                "{b:?} {x:?}",
+            );
+        }
+        // Where bb breaks xx 2.0 as well, the upgrade is no way out: apt would
+        // remove xx, and the layer takes cc instead.
+        let text = format!(
+            "{}{}{}{}",
+            stanza("aa", "bb | cc", ""),
+            stanza("bb", "", "Breaks: xx (<< 3)"),
+            stanza("cc", "", ""),
+            stanza_at("xx", "2.0", "", ""),
+        );
+        let base = base_clashing(&[("xx", "1.0", "")]);
+        let selected = resolve_seeded(&index(&text), &[], &["aa".into()], &[], &base)
+            .expecting("cc answers aa");
+        assert_eq!(names(&selected), ["aa", "cc"]);
+    }
+
+    #[test]
+    fn an_increment_clashing_with_a_base_package_nothing_upgrades_is_refused() {
+        // bb is asked for by name, so nothing else answers, and nothing
+        // upgrades xx. apt removes xx; a layer removes nothing from its base.
+        let text = format!("{}{}", stanza("bb", "", "Breaks: xx"), stanza("xx", "", ""));
+        let base = base_clashing(&[("xx", "1.0", "")]);
+        let resolution = resolve_seeded(&index(&text), &[], &["bb".into()], &[], &base);
+        assert_eq!(
+            conflicts(resolution),
+            [
+                "bb 1.0 states \"Breaks: xx\", and the base layer keeps xx 1.0, which a layer \
+                 does not remove"
+            ],
+        );
+        // The same where the base package states it.
+        let text = format!("{}{}", stanza("bb", "", ""), stanza("xx", "", ""));
+        let base = base_clashing(&[("xx", "1.0", "Conflicts: bb")]);
+        let resolution = resolve_seeded(&index(&text), &[], &["bb".into()], &[], &base);
+        let refused = resolution.into_conflicts();
+        assert_eq!(
+            refused[0].to_string(),
+            "xx 1.0, which the base layer keeps, states \"Conflicts: bb\", and the resolution \
+             selects bb 1.0 too",
+        );
+        assert!(refused[0].stated_in_base && !refused[0].against_in_base);
+    }
+
+    #[test]
+    fn a_base_already_holding_a_clash_is_refused() {
+        // apt acts on no system whose installed packages clash until it is
+        // fixed, and a layer cannot fix its base.
+        let text = stanza("zz", "", "");
+        let base = base_clashing(&[("xx", "1.0", "Conflicts: yy"), ("yy", "1.0", "")]);
+        let resolution = resolve_seeded(&index(&text), &[], &["zz".into()], &[], &base);
+        assert_eq!(
+            conflicts(resolution),
+            [
+                "xx 1.0, which the base layer keeps, states \"Conflicts: yy\", and the base \
+                 layer keeps yy 1.0 too"
+            ],
+        );
     }
 
     #[test]

@@ -428,6 +428,8 @@ mod tests {
                 depends: Vec::new(),
                 pre_depends: Vec::new(),
                 provides: Vec::new(),
+                clashes: Vec::new(),
+                multi_arch_allowed: false,
                 essential: false,
                 priority: None,
                 installed_size: None,
