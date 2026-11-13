@@ -509,6 +509,7 @@ report name a package and its version bare.
 | Fork a helper child and signal or reap it whatever else in the caller reaps | `mechanism::sys::fork_with_pidfd`, which hands back a `mechanism::Forked` |
 | Keep a descriptor the launch creates off the standard streams' numbers | `mechanism::above_stdio` in the caller, and in the sandbox's processes the launch stage's `child::hold_closed_streams`, which holds each number the caller left closed before any stage creates a descriptor |
 | Do work in a sandbox's network namespace and get one descriptor back | `mechanism::netns::in_network_namespace`, after `netns::Namespaces::of` |
+| Open a socket in the family of the address it connects to or binds | `mechanism::netns::socket_for` |
 | Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |

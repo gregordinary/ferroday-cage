@@ -286,16 +286,12 @@ pub(crate) fn listen(
         join_net: ListenStep::JoinNet.wire(),
         send: ListenStep::Send.wire(),
     };
-    let family = match address {
-        SocketAddr::V4(_) => AddressFamily::INET,
-        SocketAddr::V6(_) => AddressFamily::INET6,
-    };
     // SAFETY: `make_listener` makes three raw syscalls over the address copied
     // into it and returns; it allocates nothing, takes no lock and cannot panic,
     // and it uses no descriptor of the caller's.
     let made = unsafe {
         in_network_namespace(namespaces, &steps, move || {
-            make_listener(family, &address).map_err(|(step, errno)| (step.wire(), errno))
+            make_listener(&address).map_err(|(step, errno)| (step.wire(), errno))
         })
     };
     made.map_err(|failure| match failure {
@@ -310,15 +306,29 @@ pub(crate) fn listen(
 
 /// Creates, binds, and listens on a TCP socket, in whatever network namespace
 /// the calling process is in.
-fn make_listener(
-    family: AddressFamily,
-    address: &SocketAddr,
-) -> Result<OwnedFd, (ListenStep, Errno)> {
-    let socket = rustix::net::socket_with(family, SocketType::STREAM, SocketFlags::CLOEXEC, None)
+fn make_listener(address: &SocketAddr) -> Result<OwnedFd, (ListenStep, Errno)> {
+    let socket = socket_for(address, SocketType::STREAM, SocketFlags::CLOEXEC)
         .map_err(|errno| (ListenStep::Socket, errno))?;
     rustix::net::bind(&socket, address).map_err(|errno| (ListenStep::Bind, errno))?;
     rustix::net::listen(&socket, BACKLOG).map_err(|errno| (ListenStep::Listen, errno))?;
     Ok(socket)
+}
+
+/// Opens a socket of `kind` in the address family of `address`, which is the
+/// family a socket that connects to it or binds it takes.
+///
+/// One system call over values in hand, allocating nothing, so a forked helper
+/// may make it as freely as the caller.
+pub(crate) fn socket_for(
+    address: &SocketAddr,
+    kind: SocketType,
+    flags: SocketFlags,
+) -> Result<OwnedFd, Errno> {
+    let family = match address {
+        SocketAddr::V4(_) => AddressFamily::INET,
+        SocketAddr::V6(_) => AddressFamily::INET6,
+    };
+    rustix::net::socket_with(family, kind, flags, None)
 }
 
 #[cfg(test)]

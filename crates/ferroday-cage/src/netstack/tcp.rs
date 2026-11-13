@@ -60,10 +60,12 @@ use std::os::fd::OwnedFd;
 
 use rustix::event::PollFlags;
 use rustix::io::Errno;
-use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType, sockopt};
+use rustix::net::{RecvFlags, SendFlags, SocketFlags, SocketType, sockopt};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpEndpoint;
+
+use crate::mechanism::netns::socket_for;
 
 /// The most TCP connections of the guest's own opening served at once. A
 /// connection attempt past the cap is answered with a reset.
@@ -235,15 +237,10 @@ impl TcpFlow {
         target: SocketAddr,
         now: Instant,
     ) -> Result<TcpFlow, Errno> {
-        let family = match target {
-            SocketAddr::V4(_) => AddressFamily::INET,
-            SocketAddr::V6(_) => AddressFamily::INET6,
-        };
-        let host = rustix::net::socket_with(
-            family,
+        let host = socket_for(
+            &target,
             SocketType::STREAM,
             SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-            None,
         )?;
         let connected = match rustix::net::connect(&host, &target) {
             Ok(()) => true,
@@ -739,6 +736,7 @@ fn tune_keep_alive(host: &OwnedFd) {
 
 #[cfg(test)]
 mod tests {
+    use rustix::net::AddressFamily;
     use smoltcp::iface::SocketSet;
     use smoltcp::wire::IpAddress;
 

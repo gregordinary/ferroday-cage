@@ -40,13 +40,14 @@ use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
-use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType};
+use rustix::net::{RecvFlags, SendFlags, SocketFlags, SocketType};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use super::Plan;
 use super::pump::host_target;
+use crate::mechanism::netns::socket_for;
 
 /// The most guest UDP flows tracked at once. A datagram that would open a
 /// flow past the cap is dropped.
@@ -468,15 +469,10 @@ fn forward_out(
 
 /// Opens a connected, nonblocking host UDP socket to `target`.
 fn connect_host(target: SocketAddr) -> Result<OwnedFd, Errno> {
-    let family = match target {
-        SocketAddr::V4(_) => AddressFamily::INET,
-        SocketAddr::V6(_) => AddressFamily::INET6,
-    };
-    let host = rustix::net::socket_with(
-        family,
+    let host = socket_for(
+        &target,
         SocketType::DGRAM,
         SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-        None,
     )?;
     rustix::net::connect(&host, &target)?;
     Ok(host)
@@ -484,6 +480,8 @@ fn connect_host(target: SocketAddr) -> Result<OwnedFd, Errno> {
 
 #[cfg(test)]
 mod tests {
+    use rustix::net::AddressFamily;
+
     use super::*;
 
     /// A connected socket pair standing in for a flow's host side: the first
