@@ -12,7 +12,7 @@
 //! the mechanism both formats share: reading the files from a tree that may be
 //! an overlay's upper, and rewriting the days a run wrote.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
@@ -98,6 +98,10 @@ impl Accounts {
 /// scripts run: the file in the tree, or where the tree holds none, the one
 /// beneath it in a layered build. No file is no accounts, and neither is a
 /// whiteout, which removes the base's file from the merged root.
+///
+/// The first line naming an account is the one that counts, as `getspnam(3)`
+/// reads the file and as [`ids`] reads the other two. A later line naming the
+/// same account is one nothing on the root reads.
 pub(super) fn account_dates(tree: &Rooted, beneath: Option<&Rooted>) -> Result<Dates, Failure> {
     let [shadow, _] = SHADOW;
     let held = match (Accounts::read(tree, shadow)?, beneath) {
@@ -107,15 +111,17 @@ pub(super) fn account_dates(tree: &Rooted, beneath: Option<&Rooted>) -> Result<D
     let Accounts::Held(contents) = held else {
         return Ok(Dates::new());
     };
-    Ok(contents
-        .split(|&byte| byte == b'\n')
-        .filter_map(|line| {
-            let mut fields = line.split(|&byte| byte == b':');
-            let name = fields.next()?;
-            let _password = fields.next()?;
-            Some((name.to_vec(), fields.next()?.to_vec()))
-        })
-        .collect())
+    let mut dates = Dates::new();
+    for line in contents.split(|&byte| byte == b'\n') {
+        let mut fields = line.split(|&byte| byte == b':');
+        let (Some(name), Some(_password), Some(day)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        dates.entry(name.to_vec()).or_insert_with(|| day.to_vec());
+    }
+    Ok(dates)
 }
 
 /// The id each name in the accounts file at `path` is given, as the root sees
@@ -211,8 +217,10 @@ pub(super) fn redate(
 /// replaced by `day`, or `None` where there is none to replace.
 ///
 /// Only the third field of a line is touched. A line with fewer fields is not
-/// an account, and one already holding `day` has nothing to replace. Every
-/// other byte, line endings included, is kept as it stands.
+/// an account, and neither is a later line naming an account an earlier line
+/// names, which [`account_dates`] and `getspnam(3)` read past. One already
+/// holding `day` has nothing to replace. Every other byte, line endings
+/// included, is kept as it stands.
 fn redated(
     contents: &[u8],
     found: &Dates,
@@ -220,11 +228,13 @@ fn redated(
     rewrites: &impl Fn(&[u8]) -> bool,
 ) -> Option<Vec<u8>> {
     let mut changed = false;
+    let mut named = HashSet::new();
     let lines: Vec<Vec<u8>> = contents
         .split(|&byte| byte == b'\n')
         .map(|line| {
             let mut fields: Vec<&[u8]> = line.split(|&byte| byte == b':').collect();
             let written = fields.len() >= 3
+                && named.insert(fields[0])
                 && rewrites(fields[2])
                 && fields[2] != day
                 && found.get(fields[0]).map(Vec::as_slice) != Some(fields[2]);
@@ -284,6 +294,27 @@ mod tests {
         assert_eq!(redated(&dated, &before, b"19675", &any_written), None);
         // Nor is a field the rule declines.
         assert_eq!(redated(after, &before, b"19675", &|_: &[u8]| false), None);
+    }
+
+    #[test]
+    fn an_account_named_twice_is_the_first_line_naming_it() {
+        // `getspnam` reads the first line naming an account and never the
+        // second. The day recorded is the first line's, so the run's untouched
+        // account is not taken for one it dated, and the second line is not an
+        // account to date.
+        let (_staging, tree) = rooted_tree("shadow-twice");
+        let shipped = b"root:*:17000:0:::::\nroot:*:18000:0:::::\n";
+        tree.write_mode("etc/shadow", shipped, 0o640).unwrap();
+        let before = account_dates(&tree, None).expect("the accounts read");
+        assert_eq!(before, found(&[("root", "17000")]));
+        assert_eq!(redated(shipped, &before, b"19675", &any_written), None);
+
+        // A run that changed the first line is dated there, and only there.
+        let after = b"root:*:20722:0:::::\nroot:*:18000:0:::::\n";
+        assert_eq!(
+            redated(after, &before, b"19675", &any_written).as_deref(),
+            Some(&b"root:*:19675:0:::::\nroot:*:18000:0:::::\n"[..]),
+        );
     }
 
     #[test]
