@@ -4305,17 +4305,13 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     let mut lowers = vec![base.to_path_buf()];
     for lower in overlay.lower.iter().skip(1) {
         let resolved = std::fs::canonicalize(lower)
-            .map_err(|err| overlay_io(OverlayLayer::Lower, lower, err))?;
+            .map_err(|err| overlay_unusable(OverlayLayer::Lower, lower, err))?;
         rustix::fs::open(
             &resolved,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|errno| ConfigError::OverlayDirUnusable {
-            layer: OverlayLayer::Lower,
-            path: lower.clone(),
-            source: errno.into(),
-        })?;
+        .map_err(|errno| overlay_unusable(OverlayLayer::Lower, lower, errno))?;
         lowers.push(resolved);
     }
 
@@ -4357,7 +4353,7 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     for (layer, at) in [(OverlayLayer::Upper, &upper), (OverlayLayer::Work, &work)] {
         created
             .create_all(&at.parent)
-            .map_err(|err| overlay_io(layer, &at.parent, err))?;
+            .map_err(|err| overlay_unusable(layer, &at.parent, err))?;
     }
 
     // Refuse a host that cannot establish an unprivileged overlay whose upper
@@ -4380,7 +4376,7 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
     let device = |layer, path: &Path| {
         rustix::fs::stat(path)
             .map(|stat| stat.st_dev)
-            .map_err(|errno| overlay_errno(layer, path, errno))
+            .map_err(|errno| overlay_unusable(layer, path, errno))
     };
     if device(OverlayLayer::Upper, &upper_path)? != device(OverlayLayer::Work, &work_path)? {
         return Err(ConfigError::OverlayWorkOnAnotherFilesystem {
@@ -4473,7 +4469,8 @@ fn layer_path(layer: OverlayLayer, path: &Path) -> Result<LayerPath, Error> {
     };
     let parent = crate::path::parent_of(path);
     Ok(LayerPath {
-        parent: canonical_once_created(parent).map_err(|err| overlay_io(layer, parent, err))?,
+        parent: canonical_once_created(parent)
+            .map_err(|err| overlay_unusable(layer, parent, err))?,
         name: name.to_os_string(),
     })
 }
@@ -4591,7 +4588,7 @@ fn create_layer_dir(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| overlay_errno(layer, &at.parent, errno))?;
+    .map_err(|errno| overlay_unusable(layer, &at.parent, errno))?;
 
     match rustix::fs::mkdirat(&dirfd, &at.name, Mode::from_raw_mode(OVERLAY_DIR_MODE)) {
         // The mode is set again, because `mkdir` narrows it by the process
@@ -4611,19 +4608,19 @@ fn create_layer_dir(
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(|errno| overlay_errno(layer, &path, errno))?;
+            .map_err(|errno| overlay_unusable(layer, &path, errno))?;
             rustix::fs::fchmod(&made, Mode::from_raw_mode(OVERLAY_DIR_MODE))
-                .map_err(|errno| overlay_errno(layer, &path, errno))?;
+                .map_err(|errno| overlay_unusable(layer, &path, errno))?;
         }
         Err(Errno::EXIST) => {
             let stat = rustix::fs::statat(&dirfd, &at.name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|errno| overlay_errno(layer, &path, errno))?;
+                .map_err(|errno| overlay_unusable(layer, &path, errno))?;
             let is_dir = FileType::from_raw_mode(stat.st_mode) == FileType::Directory;
             if !is_dir || stat.st_uid != rustix::process::geteuid().as_raw() {
                 return Err(ConfigError::OverlayDirUnowned { layer, path }.into());
             }
         }
-        Err(errno) => return Err(overlay_errno(layer, &path, errno)),
+        Err(errno) => return Err(overlay_unusable(layer, &path, errno)),
     }
     Ok(())
 }
@@ -4678,24 +4675,15 @@ impl Drop for CreatedDirs {
     }
 }
 
-/// Builds the configuration error for a host I/O failure preparing an overlay
-/// layer directory, naming which of the two the failure was.
-fn overlay_io(layer: OverlayLayer, path: &Path, err: std::io::Error) -> Error {
+/// The configuration error for a host failure preparing an overlay layer
+/// directory, naming which layer it was. The cause is a standard library
+/// failure or a raw syscall's [`Errno`], each as the [`std::io::Error`] the
+/// error carries.
+fn overlay_unusable(layer: OverlayLayer, path: &Path, source: impl Into<std::io::Error>) -> Error {
     ConfigError::OverlayDirUnusable {
         layer,
         path: path.to_path_buf(),
-        source: err,
-    }
-    .into()
-}
-
-/// [`overlay_io`] for the raw-syscall paths, which report an [`Errno`] rather
-/// than an [`std::io::Error`].
-fn overlay_errno(layer: OverlayLayer, path: &Path, errno: Errno) -> Error {
-    ConfigError::OverlayDirUnusable {
-        layer,
-        path: path.to_path_buf(),
-        source: errno.into(),
+        source: source.into(),
     }
     .into()
 }
@@ -10042,7 +10030,7 @@ read-only = true
         let at = layer_path(layer, path)?;
         created
             .create_all(&at.parent)
-            .map_err(|err| overlay_io(layer, &at.parent, err))?;
+            .map_err(|err| overlay_unusable(layer, &at.parent, err))?;
         create_layer_dir(layer, &at, &mut created)?;
         created.keep();
         Ok(at.path())
