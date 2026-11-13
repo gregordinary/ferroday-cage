@@ -22,7 +22,7 @@
 //!
 //! - A forward holds at most [`MAX_CONNECTIONS`] connections at once, counting
 //!   those whose connection to the target is still being made. A connection
-//!   accepted past that is closed at once. The first one is reported on
+//!   accepted past that is reset at once. The first one is reported on
 //!   standard error, naming the bound, and the rest are not, so a command that
 //!   keeps connecting does not flood standard error.
 //! - A connection to the target not made within [`ESTABLISH_DEADLINE`] is
@@ -59,9 +59,14 @@
 //! for a flow. A unix socket has no reset to send, so a unix target reads an
 //! end of stream all the same.
 //!
-//! A connection past the budget is closed rather than reset, as the network
-//! stack closes one past a published port's budget: it never reached a target,
-//! and the command reads its end before any byte.
+//! A connection past the budget is reset as well, as the network stack resets
+//! one past a published port's budget. The listener cannot turn away a
+//! connection the kernel has already completed, and one left in its queue is
+//! established as far as the command knows, which then waits on it with nothing
+//! to say why. A reset is the nearest an accepted connection comes to the
+//! refusal a closed port answers: the command's first read fails with
+//! `ECONNRESET`, where a plain close would read as an empty reply. The
+//! listener is always TCP, so the reset always reaches the command.
 
 use std::fmt;
 use std::io;
@@ -83,7 +88,7 @@ use crate::{Failure, output};
 
 /// The most connections one forward holds at once, counting those whose
 /// connection to the target is still being made. A connection accepted past it
-/// is closed at once.
+/// is reset at once.
 ///
 /// The figure is the network stack's budget for the connections through its
 /// published ports, which answer the same question from the other side. That
@@ -280,7 +285,7 @@ struct Relay {
     /// Whether an accept has failed since the last one succeeded. Only the
     /// first failure of a run of them is reported.
     accept_failing: bool,
-    /// Whether a connection past the budget has been closed. Only the first is
+    /// Whether a connection past the budget has been reset. Only the first is
     /// reported.
     refused: bool,
     /// Whether a connection to the target has failed since the last one was
@@ -465,7 +470,7 @@ impl Relay {
     }
 
     /// Accepts the connections waiting on the listener, each starting a
-    /// connection to the target, or closed at once past the budget.
+    /// connection to the target, or reset at once past the budget.
     fn accept(&mut self, now: Instant) {
         for _ in 0..ACCEPT_BATCH {
             let inbound = match rustix::net::accept_with(
@@ -487,11 +492,12 @@ impl Relay {
             };
             self.accept_failing = false;
             if self.connecting.len() + self.carried.len() >= MAX_CONNECTIONS {
-                // Dropping it closes it, which is how the command learns.
+                // Dropping it resets it, which is how the command learns.
+                reset_on_close(&inbound);
                 if !std::mem::replace(&mut self.refused, true) {
                     self.report(format_args!(
-                        "closed a connection past the budget of {MAX_CONNECTIONS} open at \
-                         once; any further one is closed without a report"
+                        "reset a connection past the budget of {MAX_CONNECTIONS} open at \
+                         once; any further one is reset without a report"
                     ));
                 }
                 continue;
@@ -966,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_past_the_budget_is_closed_at_once() {
+    fn a_connection_past_the_budget_is_reset_at_once() {
         // Nothing here polls, so a connect to the target that the kernel has
         // made is still one the relay is making: the budget counts both.
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
@@ -991,7 +997,7 @@ mod tests {
             MAX_CONNECTIONS
         );
         assert!(relay.refused);
-        assert_eq!(read_to_end(past), (Vec::new(), Ending::Closed));
+        assert_eq!(read_to_end(past), (Vec::new(), Ending::Reset));
         drop(held);
     }
 

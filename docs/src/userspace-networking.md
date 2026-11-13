@@ -103,7 +103,8 @@ reply. Its bounds are the network stack's for a published port:
 
 - A forward holds at most 128 connections at once, counting those whose
   connection to the target is still being made. A connection past that is
-  closed at once. The first is reported on standard error, and later ones are
+  reset at once, so the command's first read fails rather than reading an
+  empty reply. The first is reported on standard error, and later ones are
   not.
 - A connection the target refuses, or does not take within 30 seconds, has
   the command's connection reset. The first such failure is reported on
@@ -358,9 +359,10 @@ guest's address of the listener's family. A guest with nothing listening on the
 port refuses it, and the stack resets the host side. Once both ends are up, a
 published connection is forwarded like any other flow, with the same
 half-closes and the same deadlines. It counts against a budget of its own, 128
-published connections at once. The stack closes a connection past that on the
-host side. A peer holding published connections open cannot crowd out the
-guest's own connections, nor the guest's crowd out the published ones.
+published connections at once. The stack resets a connection past that on the
+host side, so its peer's first read fails rather than reading an empty reply.
+A peer holding published connections open cannot crowd out the guest's own
+connections, nor the guest's crowd out the published ones.
 
 The host address decides who can connect. `127.0.0.1` admits the host's own
 processes, and every local user's process is among them. `0.0.0.0` or `::`

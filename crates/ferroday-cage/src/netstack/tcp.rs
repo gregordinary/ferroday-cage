@@ -72,7 +72,7 @@ use crate::mechanism::netns::socket_for;
 pub(super) const MAX_FLOWS: usize = 128;
 
 /// The most connections through the published ports served at once. A
-/// connection accepted past the cap is closed at once.
+/// connection accepted past the cap is reset at once.
 ///
 /// A budget of its own rather than a share of [`MAX_FLOWS`]. Anyone who can
 /// reach a published port's host address, which for a wildcard address is the
@@ -707,9 +707,19 @@ impl Drop for TcpFlow {
     /// the close a reset instead.
     fn drop(&mut self) {
         if let Some(host) = self.host.take() {
-            let _ = sockopt::set_socket_linger(&host, Some(Duration::ZERO));
+            reset_on_close(&host);
         }
     }
+}
+
+/// Makes the close of a host socket a reset rather than an end of stream, by a
+/// zero linger.
+///
+/// Best-effort: the option's value is a constant the kernel accepts on every
+/// socket, so the one way it fails is a descriptor that is not a socket, which
+/// no host side is.
+pub(super) fn reset_on_close(host: &OwnedFd) {
+    let _ = sockopt::set_socket_linger(host, Some(Duration::ZERO));
 }
 
 /// Enables keep-alive on a flow's host socket, tuned to the cadence of the

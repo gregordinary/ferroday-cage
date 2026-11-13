@@ -653,7 +653,7 @@ fn a_unix_target_whose_queue_was_full_takes_the_connection_once_it_has_room() {
 }
 
 #[test]
-fn a_forward_holds_its_budget_on_one_thread_and_closes_what_is_past_it() {
+fn a_forward_holds_its_budget_on_one_thread_and_resets_what_is_past_it() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
@@ -666,7 +666,7 @@ fn a_forward_holds_its_budget_on_one_thread_and_closes_what_is_past_it() {
 
     // One connection past the budget, each held open: `nc` sends its end at
     // once and then waits for the connection's, which the target never sends.
-    // The one the forward closes is the one whose `nc` ends, and it records
+    // The one the forward resets is the one whose `nc` ends, and it records
     // its number.
     let script = format!(
         "echo ready; read go; i=0; \
@@ -730,7 +730,7 @@ fn a_forward_holds_its_budget_on_one_thread_and_closes_what_is_past_it() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "1",
-        "one connection is closed past the budget"
+        "one connection is reset past the budget"
     );
     assert_eq!(
         stderr.matches("past the budget of 128").count(),

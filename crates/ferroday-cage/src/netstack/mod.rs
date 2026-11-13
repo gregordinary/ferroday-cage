@@ -669,7 +669,7 @@ impl NetStackBuilder {
     ///
     /// At most 128 published connections are carried at once, a budget apart
     /// from the guest's own connections, so neither kind can crowd out the
-    /// other. A connection past it is closed on the host side as well.
+    /// other. A connection past it is reset on the host side as well.
     ///
     /// `host` is the caller's to choose, and it decides who else can connect.
     /// `127.0.0.1` admits the host's own processes, every local user's

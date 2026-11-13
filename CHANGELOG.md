@@ -235,7 +235,7 @@ consumer upgrading can skip it.
   `PORT` and carries each connection the command makes there to `TARGET` on the
   host, a unix socket's absolute path or an `ADDRESS:PORT`. A forward is one
   thread however many connections the command makes, and holds at most 128 at
-  once; a connection past that is closed at once, and the first such is
+  once; a connection past that is reset at once, and the first such is
   reported. A connection the target refuses, or does not take within 30
   seconds, is reset, and the first of a run of such failures is reported, until
   a connection to the target is made again. A connection that ends any other
@@ -417,6 +417,9 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- The network stack resets a connection past a published port's budget of 128
+  on the host side, as it resets one the guest refuses. It closed the
+  connection, so the peer read an empty reply where it had been refused.
 - Verifying a signed document holds less memory, with irongall 0.2.0: a
   document at most 9 times its size and a keyring at most 44 times, where
   irongall 0.1.2 held them in up to 16 and 56 times.

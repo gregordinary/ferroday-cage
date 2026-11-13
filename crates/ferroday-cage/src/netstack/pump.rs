@@ -49,7 +49,7 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use rustix::net::SocketFlags;
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp as tcp_socket;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
@@ -586,9 +586,14 @@ impl Engine {
     /// flow toward the guest.
     ///
     /// A connection past [`MAX_PUBLISHED_FLOWS`](tcp::MAX_PUBLISHED_FLOWS), or
-    /// one no local port is free for, is accepted and closed at once, which is
-    /// how the host side learns it was refused. A connection the peer abandoned before it was
-    /// accepted is passed over.
+    /// one no local port is free for, is accepted and reset at once, which is
+    /// how the host side learns it was refused. A listener cannot refuse a
+    /// connection the kernel has already completed, and one left in its queue
+    /// is established as far as its peer knows, which then waits on it with
+    /// nothing to say why. A reset is the nearest an accepted connection comes
+    /// to a closed port's refusal: the peer's first read fails with
+    /// `ECONNRESET`, where a plain close would read as an empty reply. A
+    /// connection the peer abandoned before it was accepted is passed over.
     fn accept(&mut self, index: usize) {
         for _ in 0..ACCEPT_BATCH {
             let accepted = match rustix::net::accept_with(
@@ -604,19 +609,10 @@ impl Engine {
                     return;
                 }
             };
-            if self.held(true) >= tcp::MAX_PUBLISHED_FLOWS {
-                continue;
-            }
-            let (guest, local_addr) = (self.inbound[index].guest, self.inbound[index].local);
-            let Some(port) = self.free_local_port(guest, local_addr) else {
+            let Some((handle, guest, local)) = self.guest_side(index) else {
+                tcp::reset_on_close(&accepted);
                 continue;
             };
-            let local = IpEndpoint::new(local_addr, port);
-            let mut socket = tcp::guest_facing_socket();
-            if socket.connect(self.iface.context(), guest, local).is_err() {
-                continue;
-            }
-            let handle = self.sockets.add(socket);
             self.flows.push(TcpFlow::accepted(
                 handle,
                 guest,
@@ -625,6 +621,22 @@ impl Engine {
                 std::time::Instant::now(),
             ));
         }
+    }
+
+    /// Starts the guest-facing side of a connection accepted on published port
+    /// `index`: a socket connecting to the guest's port from a free local port
+    /// of the gateway's. Answers the socket's handle and its two ends, or
+    /// `None` where the connection is past the published budget or no flow can
+    /// be made for it.
+    fn guest_side(&mut self, index: usize) -> Option<(SocketHandle, IpEndpoint, IpEndpoint)> {
+        if self.held(true) >= tcp::MAX_PUBLISHED_FLOWS {
+            return None;
+        }
+        let (guest, local_addr) = (self.inbound[index].guest, self.inbound[index].local);
+        let local = IpEndpoint::new(local_addr, self.free_local_port(guest, local_addr)?);
+        let mut socket = tcp::guest_facing_socket();
+        socket.connect(self.iface.context(), guest, local).ok()?;
+        Some((self.sockets.add(socket), guest, local))
     }
 
     /// How many flows of one kind are held: those through the published ports,
@@ -1171,7 +1183,6 @@ mod tests {
     // there is testable without a tap device or a sandbox.
 
     use rustix::net::{AddressFamily, SocketType};
-    use smoltcp::iface::SocketHandle;
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, EthernetRepr,
@@ -1767,22 +1778,32 @@ mod tests {
             peers.push(peer);
         }
 
-        // One more published connection is accepted and closed at once.
+        // One more published connection is accepted and reset at once.
         let mut late = std::net::TcpStream::connect(address).expect("the listener accepts");
         late.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("the timeout is settable");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while engine.flows.len() == tcp::MAX_PUBLISHED_FLOWS && std::time::Instant::now() < deadline
+        let mut ending = None;
+        while ending.is_none()
+            && engine.flows.len() == tcp::MAX_PUBLISHED_FLOWS
+            && std::time::Instant::now() < deadline
         {
             engine.accept(0);
             let mut byte = [0u8; 1];
             use std::io::Read as _;
             match late.read(&mut byte) {
-                Ok(0) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Ok(0) => ending = Some("an end of stream"),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    ending = Some("a reset");
+                }
                 _ => {}
             }
         }
+        assert_eq!(
+            ending,
+            Some("a reset"),
+            "a published connection past the budget was not refused with a reset",
+        );
         assert_eq!(
             engine.flows.len(),
             tcp::MAX_PUBLISHED_FLOWS,
