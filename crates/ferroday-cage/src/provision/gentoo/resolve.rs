@@ -1188,6 +1188,9 @@ pub(super) struct Arriving {
     /// Which build of its version it is, so a refusal names it as a
     /// resolution's refusal would.
     pub build_id: u64,
+    /// What it requires of the root it lands in: its runtime and post-merge
+    /// dependencies, but for the blockers [`package`](Self::package) carries.
+    pub requires: Vec<Dependency>,
 }
 
 impl Candidate for Arriving {
@@ -1239,13 +1242,19 @@ pub(super) fn missing(installed: &Installed, planned: &[PlannedPackage]) -> Vec<
 /// Holds the builds a replayed plan names to the root they are about to be
 /// merged into, with the checks a resolution holds its own choices to.
 ///
-/// A plan carries no slot, no USE and no dependencies, so `arriving` describes
-/// each build from its verified metadata: the files a merge writes out as its
-/// database entry. Each is refused where something in the root or earlier in
-/// the plan holds its slot, and the blockers each states, and those the root
-/// states, are held to the rest. Without this a plan resolved against one stage3
-/// and replayed over a newer one registers its version beside the newer
-/// version of the same package in one slot, and reports success.
+/// `arriving` describes each build from its verified metadata, the files a
+/// merge writes out as its database entry, which the plan's own record of the
+/// build was held to as the container was read. Each is refused where
+/// something in the root or earlier in the plan holds its slot. The blockers
+/// each states, and those the root states, are held to the rest. And each
+/// dependency it requires must be answered by the root or by a build the plan
+/// installs, as a resolution requires of every build it chooses, an any-of
+/// group by one of its alternatives whole.
+///
+/// Without this a plan resolved against one stage3 and replayed over a newer
+/// one registers its version beside the newer version of the same package in
+/// one slot, or installs a package without a dependency the older root
+/// supplied and the newer one does not, and reports success.
 pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals {
     let mut refusals = Refusals::default();
     let mut admitted = Builds::default();
@@ -1289,7 +1298,62 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
         &mut compared,
         &mut refusals,
     );
+    requirements(installed, &admitted, &mut compared, &mut refusals);
     refusals
+}
+
+/// Records every dependency of `admitted` that neither the root nor another of
+/// `admitted` answers.
+///
+/// What answers is the root and the whole of what the plan installs, whatever
+/// order it merges in: a resolution's closure is a set, and its order breaks
+/// the cycles the archive's runtime graph has. An any-of group is answered by
+/// any one of its alternatives, every atom of it that names something to
+/// install answered, as [`Resolution::any_of`] reads one.
+fn requirements(
+    installed: &Installed,
+    admitted: &Builds<Arriving>,
+    compared: &mut Comparisons,
+    refusals: &mut Refusals,
+) {
+    let mut answered = |atom: &Atom| {
+        installed
+            .under(atom.name())
+            .any(|package| compared.charge(atom.reads(package)) && atom.matches(package))
+            || admitted
+                .under(atom.name())
+                .any(|(_, build)| compared.charge(atom.reads(build)) && atom.matches(build))
+    };
+    for build in &admitted.all {
+        let wanted_by: Rc<str> = Rc::from(build.cpv());
+        for dependency in &build.requires {
+            let (met, atom) = match dependency {
+                // A blocker binds through `conflicts`, and answers nothing.
+                Dependency::One(atom) if atom.blocker().is_some() => continue,
+                Dependency::One(atom) => (answered(atom), atom.to_string()),
+                Dependency::AnyOf(alternatives) => (
+                    alternatives.iter().any(|together| {
+                        together
+                            .iter()
+                            .filter(|atom| atom.blocker().is_none())
+                            .all(&mut answered)
+                    }),
+                    written(alternatives),
+                ),
+            };
+            if met {
+                continue;
+            }
+            if !refusals.has_room() {
+                return;
+            }
+            refusals.unsatisfied.push(Unsatisfied {
+                atom,
+                wanted_by: Rc::clone(&wanted_by),
+                reason: "in the root or in the plan answers it".to_string(),
+            });
+        }
+    }
 }
 
 /// What `index` offers for `atom`: the build to install, or how far the build
@@ -2734,14 +2798,15 @@ USE: amd64 compat
             .iter()
             .map(|(name, text)| (*name, text.as_bytes()))
             .collect();
+        let (package, requires) =
+            InstalledPackage::from_metadata(&format!("{category}/{package}"), version, |name| {
+                files.get(name).copied()
+            })
+            .expect("fixture metadata");
         Arriving {
-            package: InstalledPackage::from_metadata(
-                &format!("{category}/{package}"),
-                version,
-                |name| files.get(name).copied(),
-            )
-            .expect("fixture metadata"),
+            package,
             build_id,
+            requires,
         }
     }
 
@@ -2832,6 +2897,77 @@ USE: amd64 compat
             vec![arriving("sys-libs/zlib-1.3.2", 1, &[("SLOT", "0/1\n")])],
         );
         assert!(refusals.is_empty(), "{}", refusals.describe());
+    }
+
+    #[test]
+    fn a_replayed_plan_is_held_to_what_its_builds_require_of_the_root() {
+        // A plan resolved against a stage3 that shipped `dev-libs/foo`,
+        // replayed over one that does not. A resolution would have refused
+        // the tool for the missing dependency, so the replay does too, naming
+        // it, and only it: zlib is in the newer root, `a/y` answers the group
+        // by being in the plan itself, and the post-merge dependency is the
+        // plan's own first entry, whatever order the two merge in.
+        let root = root(&["sys-libs/zlib-1.3.3"]);
+        let plan = || {
+            vec![
+                arriving("app-misc/later-1.0", 1, &[("SLOT", "0\n")]),
+                arriving(
+                    "app-misc/tool-1.0",
+                    2,
+                    &[
+                        ("SLOT", "0\n"),
+                        (
+                            "RDEPEND",
+                            ">=sys-libs/zlib-1.3 dev-libs/foo || ( a/x a/y ) !a/z\n",
+                        ),
+                        ("PDEPEND", "app-misc/later\n"),
+                    ],
+                ),
+                arriving("a/y-1", 3, &[("SLOT", "0\n")]),
+            ]
+        };
+        let refusals = admit(&root, plan());
+        assert_eq!(refusals.unsatisfied.len(), 1, "{}", refusals.describe());
+        let missing = &refusals.unsatisfied[0];
+        assert_eq!(missing.atom, "dev-libs/foo");
+        assert_eq!(&*missing.wanted_by, "app-misc/tool-1.0");
+        assert!(
+            refusals
+                .describe()
+                .contains("app-misc/tool-1.0 requires dev-libs/foo, and no build in the root or in the plan answers it"),
+            "{}",
+            refusals.describe(),
+        );
+        assert!(refusals.conflicts.is_empty() && refusals.occupied.is_empty());
+
+        // The root that still has it admits the same plan, and so does a plan
+        // that brings it along.
+        let older = Installed::of(
+            [("sys-libs/zlib", "1.3.3"), ("dev-libs/foo", "2")]
+                .map(|(name, version)| {
+                    (
+                        name.to_string(),
+                        version.to_string(),
+                        "0".to_string(),
+                        String::new(),
+                    )
+                })
+                .to_vec(),
+        );
+        let refusals = admit(&older, plan());
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        let mut bringing = plan();
+        bringing.push(arriving("dev-libs/foo-2", 4, &[("SLOT", "0\n")]));
+        let refusals = admit(&root, bringing);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+
+        // A group none of whose alternatives is there is refused as written.
+        let mut without = plan();
+        without.pop();
+        without.push(arriving("dev-libs/foo-2", 4, &[("SLOT", "0\n")]));
+        let refusals = admit(&root, without);
+        assert_eq!(refusals.unsatisfied.len(), 1, "{}", refusals.describe());
+        assert_eq!(refusals.unsatisfied[0].atom, "a/x or a/y");
     }
 
     #[test]

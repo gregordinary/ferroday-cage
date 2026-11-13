@@ -423,13 +423,16 @@ the root it installs into:
 - A package the root already has at the version the plan names is skipped, as a
   resolution would skip it.
 - The rest are verified before anything is merged. Each one's own signed
-  metadata then supplies the slot and blockers the plan does not record.
+  metadata, which its plan entry is held to, is what the checks below read.
 - A package whose slot the root or an earlier entry already holds is refused, as
-  is a blocker either side states against the other. Nothing is merged.
+  is a blocker either side states against the other. So is a package with a
+  dependency that neither the root nor the plan answers. Nothing is merged.
 
 A plan resolved against a stage3 with no `dev-libs/foo`, replayed over one that
 ships `foo-1.1`, therefore refuses rather than registering `foo-1.0` beside it.
-Resolve the plan again against the newer root.
+One resolved against a stage3 that supplied a dependency, replayed over one that
+no longer does, refuses rather than installing without it. Resolve the plan
+again against the newer root.
 
 The stanza order *is* the install order, which is where this format departs from
 the other two layers' plans. That order is a resolution's own output, a

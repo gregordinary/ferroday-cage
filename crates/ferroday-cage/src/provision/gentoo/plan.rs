@@ -97,7 +97,8 @@ const PACKAGE_FIELDS: &[&str] = &[
 /// and taken back by [`GentooBuilder::plan`](super::GentooBuilder::plan), which
 /// installs what it names and resolves nothing. A replay is held to the root it
 /// installs into: a package that root already has at the planned version is
-/// skipped, and one whose slot it already holds is refused.
+/// skipped, and one whose slot it already holds, or whose dependencies neither
+/// it nor the plan answers, is refused.
 ///
 /// Every package is index-resolved: it names a container the archive published,
 /// with the size that bounds its download, the container's MD5, and what the

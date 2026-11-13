@@ -1920,7 +1920,7 @@ impl Gentoo {
                     targets.insert(package.chost().to_string());
                 }
                 let files: BTreeMap<&str, &[u8]> = package.metadata_files().collect();
-                let described =
+                let (described, requires) =
                     InstalledPackage::from_metadata(&planned.name, &planned.version, |name| {
                         files.get(name).copied()
                     })
@@ -1931,6 +1931,7 @@ impl Gentoo {
                 arriving.push(resolve::Arriving {
                     package: described,
                     build_id: planned.build_id,
+                    requires,
                 });
             }
             let refusals = resolve::admit(&installed, arriving);
@@ -2677,9 +2678,10 @@ impl GentooBuilder {
     /// the root already has at the version the plan names is skipped, as a
     /// resolution would skip it. The rest are verified before anything is
     /// merged, and their own metadata is held to the root with the checks a
-    /// resolution applies: a build whose slot the root or an earlier entry
-    /// already holds, or a blocker either side states against the other, refuses
-    /// the run with [`GentooError::Resolve`] and merges nothing.
+    /// resolution applies. A build whose slot the root or an earlier entry
+    /// already holds, a blocker either side states against the other, or a
+    /// dependency neither the root nor the plan answers refuses the run with
+    /// [`GentooError::Resolve`] and merges nothing.
     ///
     /// # Errors
     ///
@@ -4274,10 +4276,21 @@ mod tests {
     }
 
     /// A fresh, empty root under `scratch`.
-    fn empty_root(scratch: &Scratch, name: &str) -> PathBuf {
+    /// A root holding what the fixture package requires of one, as a stage3
+    /// holds it, and nothing else.
+    fn supplied_root(scratch: &Scratch, name: &str) -> PathBuf {
         let root = scratch.join(name);
         std::fs::create_dir_all(&root).expect("the root is created");
+        supply(&root);
         root
+    }
+
+    /// Registers in `root` what the fixture package's `RDEPEND` asks for:
+    /// glibc, and xz-utils for its any-of group. Neither states a target, so
+    /// a root holding only these states none.
+    fn supply(root: &Path) {
+        registered(root, "sys-libs", "glibc-2.43", "2.2", &[]);
+        registered(root, "app-arch", "xz-utils-5.8.1", "0", &[]);
     }
 
     #[test]
@@ -4299,11 +4312,11 @@ mod tests {
             },
         );
 
-        let first = empty_root(&scratch, "x86-64");
+        let first = supplied_root(&scratch, "x86-64");
         installing(&key, "x86-64", ordinary, &cache)
             .install_wave(&first, None, &mut Silent)
             .expect("the first binhost's build installs");
-        let second = empty_root(&scratch, "x86-64-v3");
+        let second = supplied_root(&scratch, "x86-64-v3");
         installing(&key, "x86-64-v3", other, &cache)
             .install_wave(&second, None, &mut Silent)
             .expect("the second binhost's build installs");
@@ -4327,7 +4340,7 @@ mod tests {
     /// A root under `scratch` whose database holds one package, built for
     /// `chost`.
     fn root_built_for(scratch: &Scratch, name: &str, chost: &str) -> PathBuf {
-        let root = empty_root(scratch, name);
+        let root = supplied_root(scratch, name);
         let entry = root.join(DB_DIR).join("sys-apps/baselayout-2.17");
         std::fs::create_dir_all(&entry).expect("the entry is created");
         std::fs::write(entry.join("SLOT"), "0\n").expect("written");
@@ -4409,7 +4422,7 @@ mod tests {
         gentoo.plan = Some(plan);
         gentoo.cache_dir = Some(scratch.join("cache"));
 
-        let root = empty_root(&scratch, "root");
+        let root = supplied_root(&scratch, "root");
         let err = gentoo
             .install_wave(&root, None, &mut Silent)
             .expect_err("a second target in one root is refused");
@@ -4447,7 +4460,7 @@ mod tests {
         std::fs::create_dir_all(entry.parent().expect("a parent")).unwrap();
         std::fs::write(&entry, b"a container cut short").unwrap();
 
-        let root = empty_root(&scratch, "root");
+        let root = supplied_root(&scratch, "root");
         gentoo
             .install_wave(&root, None, &mut Silent)
             .expect("the planted entry is replaced from the archive");
@@ -4471,7 +4484,7 @@ mod tests {
             std::fs::write(root.join("var/cache/edb/counter"), value.to_string()).unwrap();
         };
 
-        let full = empty_root(&scratch, "full");
+        let full = supplied_root(&scratch, "full");
         counter_at(&full, u64::MAX);
         let err = installing(&key, BINHOST, built.clone(), &scratch.join("cache"))
             .install_wave(&full, None, &mut Silent)
@@ -4486,7 +4499,7 @@ mod tests {
         );
 
         // One ordinal left is one merge, stamped with the last value there is.
-        let last = empty_root(&scratch, "last");
+        let last = supplied_root(&scratch, "last");
         counter_at(&last, u64::MAX - 1);
         installing(&key, BINHOST, built, &scratch.join("cache"))
             .install_wave(&last, None, &mut Silent)
@@ -4516,7 +4529,7 @@ mod tests {
         // slot, which a resolution refuses.
         let scratch = Scratch::for_test("gentoo", "replay-occupied");
         let key = fixture::signing_key("releng <releng@test.invalid>");
-        let root = empty_root(&scratch, "root");
+        let root = supplied_root(&scratch, "root");
         registered(&root, "sys-libs", "zlib-1.3.3", "0/1", &[]);
 
         let mut occupied = Vec::new();
@@ -4558,7 +4571,7 @@ mod tests {
 
         // A blocker the root states against what the plan names refuses it
         // the same way.
-        let root = empty_root(&scratch, "blocking");
+        let root = supplied_root(&scratch, "blocking");
         registered(
             &root,
             "sys-apps",
@@ -4587,12 +4600,53 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_replayed_over_a_root_without_what_it_requires_is_refused_before_anything_merges() {
+        // The plan was resolved against a stage3 that had glibc, and is
+        // replayed over a root that has only xz-utils. A resolution would not
+        // have chosen zlib without its runtime dependency, and the replay
+        // refuses it the same way, naming what is missing.
+        let scratch = Scratch::for_test("gentoo", "replay-unmet");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let root = scratch.join("root");
+        registered(&root, "app-arch", "xz-utils-5.8.1", "0", &[]);
+
+        let mut unmet = Vec::new();
+        let err = installing(
+            &key,
+            BINHOST,
+            container(&key, gpkg::fixture::Built::ordinary()),
+            &scratch.join("cache"),
+        )
+        .install_wave(&root, None, &mut |event: GentooEvent<'_>| {
+            if let GentooEvent::Unsatisfiable {
+                atom, wanted_by, ..
+            } = event
+            {
+                unmet.push(format!("{wanted_by} {atom}"));
+            }
+        })
+        .expect_err("glibc is missing");
+        assert!(
+            ErrorChain::new(&err)
+                .to_string()
+                .contains("no build in the root or in the plan answers it"),
+            "{err}",
+        );
+        assert_eq!(unmet, ["sys-libs/zlib-1.3.2 >=sys-libs/glibc-2.40"]);
+        assert!(
+            !root.join("usr/lib/libz.so.1.3.2").exists(),
+            "nothing merged"
+        );
+        assert!(!root.join("var/db/pkg/sys-libs/zlib-1.3.2").exists());
+    }
+
+    #[test]
     fn a_plan_replayed_over_a_root_that_has_its_package_installs_nothing() {
         // What the root has at the version the plan names is done, as an atom
         // the root answers is done: nothing is fetched or merged.
         let scratch = Scratch::for_test("gentoo", "replay-installed");
         let key = fixture::signing_key("releng <releng@test.invalid>");
-        let root = empty_root(&scratch, "root");
+        let root = supplied_root(&scratch, "root");
         registered(&root, "sys-libs", "zlib-1.3.2", "0/1", &[]);
         let mut gentoo = provisioner(&key, Box::new(Unreachable));
         // No container is read, so the digest the plan records is never asked.
@@ -4616,7 +4670,7 @@ mod tests {
         // of the file and every entry's own.
         let scratch = Scratch::for_test("gentoo", "counter-entries");
         let key = fixture::signing_key("releng <releng@test.invalid>");
-        let root = empty_root(&scratch, "root");
+        let root = supplied_root(&scratch, "root");
         std::fs::create_dir_all(root.join("var/cache/edb")).unwrap();
         std::fs::write(root.join("var/cache/edb/counter"), "5").unwrap();
         registered(&root, "app-misc", "other-1.0", "0", &[("COUNTER", "391")]);
@@ -4647,7 +4701,7 @@ mod tests {
         // upper the caller already had may hold an earlier increment.
         let scratch = Scratch::for_test("gentoo", "failed-increment");
         let key = fixture::signing_key("releng <releng@test.invalid>");
-        let base = empty_root(&scratch, "base");
+        let base = supplied_root(&scratch, "base");
         registered(&base, "sys-libs", "zlib-1.3.3", "0/1", &[]);
         let staging = |upper: &Path| {
             let mut gentoo = installing(
@@ -4690,6 +4744,7 @@ mod tests {
         std::os::unix::fs::symlink("usr/bin", base.join("sbin")).expect("a link");
         std::fs::write(base.join("usr/lib64/ld-linux-x86-64.so.2"), b"loader").expect("written");
         std::fs::write(base.join("var/cache/edb/counter"), b"391").expect("written");
+        supply(&base);
 
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let container = scratch.join("zlib.gpkg.tar");
@@ -4754,7 +4809,7 @@ mod tests {
             "the increment's package is in the merged view",
         );
         // The base was only read.
-        assert!(!base.join("var/db/pkg").exists());
+        assert!(!base.join("var/db/pkg/sys-libs/zlib-1.3.2").exists());
         assert!(!base.join("usr/lib64/libz.so.1").exists());
         drop(layer);
     }

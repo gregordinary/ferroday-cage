@@ -496,7 +496,9 @@ fn read_entry(
             .map(|bytes| bytes.as_deref().map(field_text))
             .map_err(|err| GentooError::io("reading a package database entry", at, err))
     };
-    read_package(
+    // What an installed package requires is the state the root arrived in,
+    // and not this layer's to hold it to.
+    let (package, _) = read_package(
         format!("{category}/{package}"),
         version,
         field,
@@ -513,12 +515,16 @@ fn read_entry(
                 },
             )
         },
-    )
+    )?;
+    Ok(package)
 }
 
 impl InstalledPackage {
     /// The package a binary package's own metadata describes: what the root's
     /// database will say of `name` at `version` once the package is merged.
+    /// And what it requires of the root it lands in: every dependency of its
+    /// runtime and post-merge classes but its blockers, which the package
+    /// carries.
     ///
     /// The merge writes a container's metadata files out as the entry
     /// verbatim, so the entry [`installed`] would read back afterwards is these
@@ -538,7 +544,7 @@ impl InstalledPackage {
         name: &str,
         version: &str,
         file: impl Fn(&str) -> Option<&'f [u8]>,
-    ) -> Result<InstalledPackage, String> {
+    ) -> Result<(InstalledPackage, Vec<Dependency>), String> {
         let field =
             |name: &str| -> Result<Option<String>, String> { Ok(file(name).map(field_text)) };
         read_package(
@@ -580,7 +586,8 @@ enum Unreadable {
 
 /// Reads the package `name` at `version` out of its metadata files, each asked
 /// of `field` by name, reporting files that do not describe one through
-/// `refuse`.
+/// `refuse`. Beside the package, the dependencies it requires: those of its
+/// runtime classes that are not the blockers it keeps.
 ///
 /// The one reading of a package's files, whether they sit in a root's database
 /// or in a binary package not yet merged: the merge writes the second out as the
@@ -590,7 +597,7 @@ fn read_package<E>(
     version: &str,
     field: impl Fn(&str) -> Result<Option<String>, E>,
     refuse: impl Fn(Unreadable) -> E,
-) -> Result<InstalledPackage, E> {
+) -> Result<(InstalledPackage, Vec<Dependency>), E> {
     // A missing `SLOT` is what tells an entry directory from something else
     // that happens to be shaped like one: portage writes the file for every
     // package it merges, and so does this layer.
@@ -601,20 +608,19 @@ fn read_package<E>(
     // absence is no blockers. One that does not parse is a gap in what the
     // root forbids, and resolving past it could install what it blocks.
     let mut blockers = Vec::new();
+    let mut requires = Vec::new();
     for file in RUNTIME_DEPENDENCY_FILES {
         let class = field(file)?.unwrap_or_default();
         let parsed = atom::parse_class(&class)
             .map_err(|reason| refuse(Unreadable::Dependencies { file, reason }))?;
-        blockers.extend(
-            parsed
-                .into_iter()
-                .filter_map(|dependency| match dependency {
-                    Dependency::One(atom) if atom.blocker().is_some() => Some(atom),
-                    _ => None,
-                }),
-        );
+        for dependency in parsed {
+            match dependency {
+                Dependency::One(atom) if atom.blocker().is_some() => blockers.push(atom),
+                requirement => requires.push(requirement),
+            }
+        }
     }
-    Ok(InstalledPackage {
+    let package = InstalledPackage {
         name,
         version: version.to_string(),
         slot,
@@ -629,7 +635,8 @@ fn read_package<E>(
         blockers,
         counter: field(COUNTER_FILE)?.and_then(|text| text.parse().ok()),
         chost: field(CHOST_FILE)?.filter(|chost| !chost.is_empty()),
-    })
+    };
+    Ok((package, requires))
 }
 
 /// What a base root and an increment staged over it hold together.
@@ -1030,8 +1037,17 @@ mod tests {
                 .find(|(held, _)| *held == name)
                 .map(|(_, b)| *b)
         };
-        let from_metadata = InstalledPackage::from_metadata("sys-libs/zlib", "1.3.2", lookup)
-            .expect("the metadata describes a package");
+        let (from_metadata, requires) =
+            InstalledPackage::from_metadata("sys-libs/zlib", "1.3.2", lookup)
+                .expect("the metadata describes a package");
+        // The blocker is the package's; what it requires of the root is the
+        // rest.
+        assert_eq!(
+            requires,
+            [Dependency::One(
+                atom::parse(">=sys-libs/glibc-2.40").expect("an atom")
+            )],
+        );
 
         let dir = Scratch::for_test("gentoo-installed", "from-metadata");
         let entry = dir.join(DB_DIR).join("sys-libs/zlib-1.3.2");
