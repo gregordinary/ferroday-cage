@@ -164,8 +164,8 @@ consumer upgrading can skip it.
   identity map has no id for.
 - `UnheldReason::Release`, for a pinned Debian package an `include` entry asks
   of a release that offers it only at another version, and
-  `UnheldReason::Requirement`, for a pinned package at a version a selected
-  package's dependency rules out.
+  `UnheldReason::Requirement`, in the Debian and the Alpine layers alike, for a
+  pinned package at a version a selected package's dependency rules out.
 
 ### Changed
 
@@ -212,6 +212,10 @@ consumer upgrading can skip it.
   transport failure, so a mirror walk asks the next mirror. A server compressing
   on the fly previously produced a digest failure, which no other mirror is
   asked about.
+- **Breaking.** An Alpine dependency the pinned version of a package does not
+  meet, where nothing else answers it, fails the resolution with
+  `AlpineError::Pin` and `UnheldReason::Requirement`, naming the requirement, as
+  the Debian layer reports it. It failed with `AlpineError::Resolve`.
 
 ### Fixed
 
@@ -236,6 +240,15 @@ consumer upgrading can skip it.
   holding it, before the publish returns. A crash could leave a pool's
   `Packages` short, and the next publish, which merges into it, then dropped
   every package published before.
+- **Breaking.** `Pool::publish` refuses, with `DebianError::Deb`, to replace a
+  pool file with other bytes, by a same-version republish or an epoch-only
+  upgrade, where another index names the bytes the file holds. A pool path is
+  shared by every suite publishing a package into one component, and by every
+  architecture's index for an `Architecture: all` package. The replacement
+  updated only the index the publish wrote, and the others went on naming a
+  digest the file no longer had, so a bootstrap from them failed its digest
+  check. A refused publish changes nothing: every `.deb` is staged and checked
+  before any lands.
 - An Alpine bootstrap refuses two packages that ship one path as a directory
   and as an entry that is not one, whichever is unpacked first and whatever
   their `replaces` say, as `apk` does. The later one previously replaced the
@@ -250,6 +263,13 @@ consumer upgrading can skip it.
   again keeping each in turn, and refused naming them where none holds. A
   layered build refuses an increment whose provider contends with a package the
   base carries.
+- An Alpine closure leaves out a package whose `install_if` condition it meets
+  where taking it, or what it requires, breaks a `!` entry in either direction,
+  as `apk` does. The closure was refused instead, so `rofi-wayland` and five
+  `rofi` plugins could not be resolved. A provider its own `install_if`
+  condition brings in now answers a name ahead of the others, whatever version
+  it offers, as in `apk`, so a `rofi` plugin, which requires `cmd:rofi`, takes
+  `rofi-x11-wayland`.
 - A Gentoo plan replayed over a root refuses, before merging anything, a build
   with a runtime or post-merge dependency that neither the root nor the plan
   answers, as a resolution would have. Such a plan was installed without the
@@ -332,6 +352,10 @@ consumer upgrading can skip it.
   as an `http://` one is.
 - A bootstrap given a `source_date_epoch` reads an account `/etc/shadow` names
   twice by its first line, as `getspnam` does.
+- The `hardening` feature builds for x86, where the curated roster named
+  `kexec_file_load`, which i386 lacks. The build refuses a `Rules` policy there
+  with `ConfigError::SeccompUnsupportedArch`, as on every 32-bit target, and the
+  layer's Landlock rules and capability drops apply.
 - `fcage --help` names `--no-stop-with-caller` among the counterpart toggles,
   where it named `--stop-with-caller`.
 
@@ -347,6 +371,11 @@ consumer upgrading can skip it.
   the root's reader uses.
 - The relay and the supervisor open their signal descriptors through one
   `mechanism::sys::signalfd`.
+- CI runs clippy over every target for x86, 32-bit arm, aarch64, and riscv64,
+  the architectures beside the runner's that the library builds for.
+- The relay suite reads the caller's terminal to its end once a session
+  returns. It stopped reading as the session ended, so a test of all of a
+  command's output failed whenever the relay ran ahead of the reader.
 
 ## [0.5.2] - 2026-11-10
 
