@@ -257,9 +257,12 @@ group such as `default-mta | mail-transport-agent` beside a selected `postfix`
 therefore never draws in a second mail transport agent. Where every alternative
 conflicts, the first is taken and the conflict refused.
 
-The walk does not go back on a choice. A package selected later can conflict
-with one chosen before it was there to avoid, and the resolution then refuses
-rather than choosing again. apt does the same.
+A package selected later can conflict with one chosen before it was there to
+avoid. Where the later package states the conflict, and the earlier one was
+drawn in by a dependency rather than named in `include` or kept by a base
+layer, the earlier one is dropped, with what only it needed, and the
+dependencies it answered are answered again, as apt unmarks it. Otherwise the
+resolution refuses rather than choosing again, as apt does.
 
 Each conflict is reported as a `DebianEvent::Conflict` naming the entry, the
 package stating it, and the package it names, and the failure names all of

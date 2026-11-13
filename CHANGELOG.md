@@ -434,7 +434,10 @@ consumer upgrading can skip it.
   of a virtual name, that clashes with a package the resolution already holds,
   whichever of the two states it, is passed over for the next one. A root
   holding two packages that clash is refused, each pair reported as the new
-  `DebianEvent::Conflict` and named in `DebianError::Resolve`. A layered build
+  `DebianEvent::Conflict` and named in `DebianError::Resolve`. A package a
+  dependency selected that a package selected later clashes with is
+  unselected, with what only it needed, and the groups it answered are
+  answered again, as apt unmarks it. A layered build
   passes over an alternative that clashes with a package its base keeps,
   upgrades the base package where an upgrade apt would take ends the clash,
   and otherwise refuses, as it refuses a base whose own packages clash. A

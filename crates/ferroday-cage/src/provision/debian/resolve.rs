@@ -70,12 +70,15 @@
 //! where every alternative clashes is the first that answers the group taken,
 //! and the clash it brings refused.
 //!
-//! The walk does not go back on a choice. A package selected later can clash
-//! with one chosen earlier, before the later one was there to avoid, and the
-//! resolution then refuses the clash rather than choosing again. apt 2.8 does
-//! the same: `apt-get install a z`, where `a` depends on `b | c`, `b`
-//! conflicts with `x`, and `z` depends on `x`, takes `b` for `a` and then fails
-//! on `z`'s `x`.
+//! A package selected later can clash with one chosen earlier, before the
+//! later one was there to avoid. Where the later one states the clash, and the
+//! earlier one was selected for a dependency rather than named by the install
+//! list or kept by the base, the earlier one is unselected, as apt 2.8 unmarks
+//! it, and every group it answered is answered again
+//! ([`Closure::unselect_named`]). Otherwise the walk does not go back on the
+//! choice, and the clash is refused. apt does the same: `apt-get install a z`,
+//! where `a` depends on `b | c`, `b` conflicts with `x`, and `z` depends on
+//! `x`, takes `b` for `a` and then fails on `z`'s `x`.
 //!
 //! A layered resolution removes nothing from its base, so a package the base
 //! keeps stands as apt treats one it may not remove, an essential one. A
@@ -616,6 +619,8 @@ pub(crate) fn resolve_seeded(
         refusals,
         refused: HashSet::new(),
         answered,
+        seeds: HashSet::new(),
+        unselected: HashSet::new(),
     };
 
     // Seed the whole base set before closing over anything, so a virtual
@@ -664,12 +669,14 @@ pub(crate) fn resolve_seeded(
         }
     }
 
+    closure.seeds = closure.selected.keys().cloned().collect();
     loop {
         closure.walk();
         if !closure.settle() {
             break;
         }
     }
+    closure.sweep();
     (closure.selected.into_values().collect(), closure.refusals)
 }
 
@@ -698,6 +705,14 @@ struct Closure<'a> {
     /// The install list's entries the base answered rather than the
     /// increment, by name.
     answered: Vec<String>,
+    /// What was selected before the walk began: the base seed and the install
+    /// list's entries, which nothing unselects.
+    seeds: HashSet<String>,
+    /// Every package a later selection unselected ([`unselect_named`]), which
+    /// is unselected once at most and, selected again, unselects nothing.
+    ///
+    /// [`unselect_named`]: Self::unselect_named
+    unselected: HashSet<String>,
 }
 
 impl Closure<'_> {
@@ -718,6 +733,7 @@ impl Closure<'_> {
         if self.refused.contains(&key) {
             return;
         }
+        let waiting = self.queue.len();
         if let Some(refusal) = resolve_group(
             &self.candidates,
             group,
@@ -729,8 +745,95 @@ impl Closure<'_> {
             self.refused.insert(key);
             self.refusals.push(refusal);
         }
+        // A group selects one package at most, which `add` queued last.
+        if self.queue.len() > waiting
+            && let Some(chosen) = self.queue.back().cloned()
+        {
+            self.unselect_named(&chosen);
+        }
     }
 
+    /// Unselects each package `chosen` states a clash against that a
+    /// dependency selected, as apt 2.8 unmarks a package it marked for a
+    /// dependency where a package it marks later conflicts with or breaks it.
+    ///
+    /// Only a package [`resolve_group`] had to take though it clashes reaches
+    /// here with a clash: any other is one that fits. Where `aa` depends on
+    /// `mm` and on `xx`, `mm` on `bb | cc`, and `xx` conflicts with `bb`, apt
+    /// takes `bb` for `mm`, unmarks it when it marks `xx`, and answers `mm`
+    /// with `cc` instead; the merged set's check here answers again every group
+    /// the unselected package answered. A clash stated against `chosen` rather
+    /// than by it unselects nothing, and fails in apt as it is refused here,
+    /// and so does one against a seed, a package the base keeps, or a package
+    /// unselected once already. A package selected again after it was
+    /// unselected unselects nothing, which is what ends two packages that
+    /// conflict with each other taking turns.
+    fn unselect_named(&mut self, chosen: &str) {
+        if self.unselected.contains(chosen) {
+            return;
+        }
+        let Some(package) = self.selected.get(chosen) else {
+            return;
+        };
+        let named: Vec<String> =
+            stated(&self.candidates, &self.selected, Member::selected(package))
+                .iter()
+                .filter(|clash| !clash.against.in_base)
+                .map(|clash| clash.against.name.to_string())
+                .filter(|name| !self.seeds.contains(name) && !self.unselected.contains(name))
+                .collect();
+        for name in named {
+            self.selected.remove(&name);
+            self.queue.retain(|queued| *queued != name);
+            self.unselected.insert(name);
+        }
+    }
+
+    /// Drops what only an unselected package needed, as apt drops what it
+    /// marked for a package it later unmarked, and the refusals of groups no
+    /// package the root holds declares any more.
+    ///
+    /// A package stays where the seeds reach it: through any group of a
+    /// package already reached, by any alternative the selection answers it
+    /// with, by name or by `Provides`. A base package the increment replaces is
+    /// reached as a seed is, and so is what answers an install list entry the
+    /// base answered. Nothing is dropped unless something was unselected: every
+    /// other selection was made for a group of a package already reached.
+    fn sweep(&mut self) {
+        if self.unselected.is_empty() {
+            return;
+        }
+        let installed = self.candidates.installed;
+        let index = self.candidates.index;
+        let mut reached: HashSet<String> = HashSet::new();
+        let mut pending: Vec<String> = Vec::new();
+        let answered: Vec<Dependency> = self
+            .answered
+            .iter()
+            .map(|name| vec![unversioned(name)])
+            .collect();
+        let roots = self.selected.keys().filter(|name| {
+            self.seeds.contains(name.as_str()) || installed.installed(name).is_some()
+        });
+        pending.extend(roots.cloned());
+        for group in &answered {
+            pending.extend(group_answers(index, &self.selected, group));
+        }
+        while let Some(name) = pending.pop() {
+            if !reached.insert(name.clone()) {
+                continue;
+            }
+            for group in relations(&self.selected[&name]) {
+                pending.extend(group_answers(index, &self.selected, &group));
+            }
+        }
+        self.selected.retain(|name, _| reached.contains(name));
+        let selected = &self.selected;
+        self.refusals.refused.retain(|refusal| {
+            let by = refusal.required_by();
+            by == THE_INSTALL_LIST || selected.contains_key(by) || installed.installed(by).is_some()
+        });
+    }
     /// One pass of the merged set's check, as [`resolve_seeded`] describes it.
     ///
     /// Returns whether the pass selected anything, which leaves the walk to
@@ -1231,19 +1334,42 @@ fn replacements(
     replaced.into_values().collect()
 }
 
+/// The selected packages answering any alternative of `group`, by name or by
+/// `Provides`.
+fn group_answers(
+    index: &Index,
+    selected: &BTreeMap<String, Package>,
+    group: &Dependency,
+) -> Vec<String> {
+    group
+        .iter()
+        .flat_map(|atom| selected_answers(index, selected, atom))
+        .map(|package| package.name.clone())
+        .collect()
+}
+
+/// The selected packages answering `atom`: the one of its name, at a version
+/// the constraint accepts, then each whose `Provides` answers it.
+fn selected_answers<'s>(
+    index: &'s Index,
+    selected: &'s BTreeMap<String, Package>,
+    atom: &'s DepAtom,
+) -> impl Iterator<Item = &'s Package> {
+    let real = selected
+        .get(&atom.name)
+        .filter(|package| meets(atom.constraint.as_ref(), &package.version));
+    let providers = index
+        .providers(&atom.name)
+        .iter()
+        .filter_map(|provider| selected.get(provider))
+        .filter(|package| provides_satisfies(package, atom));
+    real.into_iter().chain(providers)
+}
+
 /// Whether the already-selected packages satisfy `atom`, by real name or by a
 /// selected package's `Provides`.
 fn selected_satisfies(index: &Index, selected: &BTreeMap<String, Package>, atom: &DepAtom) -> bool {
-    if let Some(package) = selected.get(&atom.name)
-        && meets(atom.constraint.as_ref(), &package.version)
-    {
-        return true;
-    }
-    index.providers(&atom.name).iter().any(|provider| {
-        selected
-            .get(provider)
-            .is_some_and(|package| provides_satisfies(package, atom))
-    })
+    selected_answers(index, selected, atom).next().is_some()
 }
 
 /// Whether `package`'s `Provides` supplies `atom`'s name at a version the
@@ -2019,6 +2145,45 @@ mod tests {
         assert_eq!(
             names(&install(&index, &["zz", "aa"]).into_packages()),
             ["aa", "cc", "xx", "zz"],
+        );
+    }
+
+    #[test]
+    fn a_package_a_later_selection_clashes_with_is_unselected_where_apt_unmarks_it() {
+        // bb answers mm's `bb | cc` before anything selects xx, which ww needs
+        // and nothing else answers, and xx conflicts with bb. apt unmarks bb
+        // and what it marked for bb, and answers mm with cc; so does the
+        // resolution, for a Breaks as for a Conflicts.
+        let packages = |relation: &str, mm: &str| {
+            index(&format!(
+                "{}{}{}{}{}{}{}",
+                stanza("aa", "mm, ww", ""),
+                stanza("mm", mm, ""),
+                stanza("bb", "dd", ""),
+                stanza("dd", "", ""),
+                stanza("cc", "", ""),
+                stanza("ww", "xx", ""),
+                stanza("xx", "", &format!("{relation}: bb")),
+            ))
+        };
+        for relation in ["Conflicts", "Breaks"] {
+            let selected = install(&packages(relation, "bb | cc"), &["aa"]).into_packages();
+            assert_eq!(
+                names(&selected),
+                ["aa", "cc", "mm", "ww", "xx"],
+                "{relation}"
+            );
+        }
+        // A package the install list names is not unselected, and nor is one
+        // nothing else answers: apt fails on both.
+        let expected = ["xx 1.0 states \"Conflicts: bb\", and the resolution selects bb 1.0 too"];
+        assert_eq!(
+            conflicts(install(&packages("Conflicts", "bb | cc"), &["aa", "bb"])),
+            expected,
+        );
+        assert_eq!(
+            conflicts(install(&packages("Conflicts", "bb"), &["aa"])),
+            expected,
         );
     }
 
