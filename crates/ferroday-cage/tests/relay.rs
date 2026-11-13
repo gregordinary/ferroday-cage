@@ -22,6 +22,11 @@
 //! raises one, but a suite that depended on that would be depending on a
 //! subtlety rather than on the documented rule.
 //!
+//! The lock queues every session behind the ones before it, so a test bounds
+//! how long its session ran by [`Session::ran`], the session's own clock. A
+//! clock started before [`relayed`] counts the wait for the lock as well, and
+//! the test that takes the lock last waits out nearly the whole suite.
+//!
 //! Every test launches a real sandbox, so it skips explicitly, on stderr, where
 //! the host cannot create unprivileged user namespaces;
 //! `FERRODAY_CAGE_REQUIRE_USERNS` turns each skip into a failure. The
@@ -58,6 +63,16 @@ const RELAY_BUF: usize = 8192;
 /// How long a driver waits for something the session is about to print.
 const PROMPTLY: Duration = Duration::from_secs(5);
 
+/// How long a session that the relay ends at a deadline or at a signal from
+/// outside may run before the test calls it waiting for the command instead.
+///
+/// Each of those commands sleeps for a minute or never stops, while the relay
+/// ends its session within a few seconds of the deadline or the signal. Twenty
+/// seconds sits well short of the first and leaves a loaded host room for the
+/// second. It is compared with [`Session::ran`], which leaves out the session
+/// lock and the launch.
+const WELL_BEFORE_THE_COMMAND_ENDS: Duration = Duration::from_secs(20);
+
 /// Takes the session lock, ignoring a poisoning left by a failed test: the lock
 /// orders the sessions and guards no state a panic could have left inconsistent.
 fn serially() -> std::sync::MutexGuard<'static, ()> {
@@ -91,7 +106,9 @@ struct Session {
     /// Everything the user's end read.
     seen: String,
     /// How long the session ran: from just before its escalation was built to
-    /// the relay's return. Neither the session lock nor the launch is in it.
+    /// the relay's return. Neither the session lock nor the launch is in it,
+    /// which is what makes it the clock a test bounds a session by; see the
+    /// module documentation.
     ran: Duration,
 }
 
@@ -629,7 +646,6 @@ fn an_expired_deadline_reports_no_status() {
         return;
     };
     let cage = shell(rootfs, "echo ready; sleep 60");
-    let started = Instant::now();
     let session = relayed(
         Wiring::Terminal { raw: false },
         (24, 80),
@@ -644,8 +660,9 @@ fn an_expired_deadline_reports_no_status() {
         session.outcome,
     );
     assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the deadline did not end the session promptly",
+        session.ran < WELL_BEFORE_THE_COMMAND_ENDS,
+        "the deadline did not end the session promptly: {:?}",
+        session.ran,
     );
 }
 
@@ -664,7 +681,6 @@ fn an_expired_deadline_reports_no_status_against_a_command_that_never_stops_prin
     };
     // Three writers, so the relay is refilled while it drains.
     let cage = shell(rootfs, "yes flooding & yes flooding & yes flooding");
-    let started = Instant::now();
     let session = relayed(
         Wiring::Terminal { raw: false },
         (24, 80),
@@ -679,8 +695,9 @@ fn an_expired_deadline_reports_no_status_against_a_command_that_never_stops_prin
         session.outcome,
     );
     assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the deadline did not end the session promptly",
+        session.ran < WELL_BEFORE_THE_COMMAND_ENDS,
+        "the deadline did not end the session promptly: {:?}",
+        session.ran,
     );
     assert!(
         !session.seen.is_empty(),
@@ -703,7 +720,6 @@ fn a_deadline_stops_a_command_that_closed_its_terminal() {
         return;
     };
     let cage = shell(rootfs, CLOSES_ITS_TERMINAL);
-    let started = Instant::now();
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -718,8 +734,9 @@ fn a_deadline_stops_a_command_that_closed_its_terminal() {
         session.outcome,
     );
     assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the deadline did not stop the command once its terminal closed",
+        session.ran < WELL_BEFORE_THE_COMMAND_ENDS,
+        "the deadline did not stop the command once its terminal closed: {:?}",
+        session.ran,
     );
     session.assert_restored();
 }
@@ -735,7 +752,6 @@ fn a_termination_request_reaches_a_command_that_closed_its_terminal() {
         return;
     };
     let cage = shell(rootfs, CLOSES_ITS_TERMINAL);
-    let started = Instant::now();
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -755,8 +771,9 @@ fn a_termination_request_reaches_a_command_that_closed_its_terminal() {
         session.outcome,
     );
     assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the request did not reach the command once its terminal closed",
+        session.ran < WELL_BEFORE_THE_COMMAND_ENDS,
+        "the request did not reach the command once its terminal closed: {:?}",
+        session.ran,
     );
     session.assert_restored();
 }
@@ -778,7 +795,6 @@ fn an_interrupt_before_the_terminal_closed_counts_toward_the_kill() {
         rootfs,
         "trap '' TERM; echo ready; read line; exec 0<&- 1>&- 2>&-; exec sleep 60",
     );
-    let started = Instant::now();
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -802,7 +818,11 @@ fn an_interrupt_before_the_terminal_closed_counts_toward_the_kill() {
         "only the kill ends a command that ignores the request: {:?}",
         session.outcome,
     );
-    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(
+        session.ran < WELL_BEFORE_THE_COMMAND_ENDS,
+        "the second interrupt did not kill the command once its terminal closed: {:?}",
+        session.ran,
+    );
 }
 
 // -- The other launch paths ---------------------------------------------------
@@ -861,7 +881,6 @@ fn a_deadline_stops_a_restricted_command_that_closed_its_terminal() {
     let Some(restriction) = restricted_shell(CLOSES_ITS_TERMINAL) else {
         return;
     };
-    let started = Instant::now();
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -876,8 +895,9 @@ fn a_deadline_stops_a_restricted_command_that_closed_its_terminal() {
         session.outcome,
     );
     assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the deadline did not stop the command once its terminal closed",
+        session.ran < WELL_BEFORE_THE_COMMAND_ENDS,
+        "the deadline did not stop the command once its terminal closed: {:?}",
+        session.ran,
     );
     session.assert_restored();
 }
