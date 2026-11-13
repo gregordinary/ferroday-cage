@@ -315,6 +315,8 @@ let status = Cage::builder()
 
 The drop narrows the bounding, ambient, permitted, effective, and inheritable
 sets, so a dropped capability cannot be regained across the command's `execve`.
+It drops every capability the running kernel defines, including any added to
+the kernel after this library was built.
 
 A capability posture composes with a non-root [run-as
 identity](identity-maps.md#running-as-a-non-root-identity). Without a keep

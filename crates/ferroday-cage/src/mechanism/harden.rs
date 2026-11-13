@@ -158,10 +158,12 @@ fn drop_capabilities(keep: CapabilitySet) -> Result<(), Errno> {
         .effective
         .contains(CapabilitySet::SETPCAP);
     if hold_setpcap {
-        // Drop every known capability the caller did not keep from the bounding
-        // set. A capability the running kernel does not define answers EINVAL,
+        // Drop every capability the caller did not keep from the bounding set:
+        // every position the kernel's sets hold, not only the capabilities this
+        // build names, so one a later kernel adds is dropped as well. A
+        // position past the running kernel's last capability answers EINVAL,
         // which is not a failure.
-        for capability in CapabilitySet::all().iter() {
+        for capability in every_capability_position() {
             if !keep.contains(capability) {
                 match rustix::thread::remove_capability_from_bounding_set(capability) {
                     Ok(()) | Err(Errno::INVAL) => {}
@@ -190,6 +192,18 @@ fn drop_capabilities(keep: CapabilitySet) -> Result<(), Errno> {
         rustix::thread::configure_capability_in_ambient_set(capability, true)?;
     }
     Ok(())
+}
+
+/// Every position a capability can occupy in the kernel's 64-bit capability
+/// sets, each as a set holding that one capability.
+///
+/// Every capability any kernel can define sits in one of these positions,
+/// since the `capget` and `capset` ABI carries the sets as 64 bits, so a
+/// capability newer than this build is among them. `CapabilitySet::all()`
+/// covers the same bits but iterates the ones rustix does not name as a single
+/// set, which no one-capability call accepts.
+fn every_capability_position() -> impl Iterator<Item = CapabilitySet> {
+    (0..u64::BITS).map(|position| CapabilitySet::from_bits_retain(1 << position))
 }
 
 /// `LANDLOCK_CREATE_RULESET_VERSION`: query the supported ABI version.
@@ -441,4 +455,32 @@ fn restrict_self(ruleset: BorrowedFd<'_>) -> Result<(), Errno> {
     unsafe { syscalls::syscall!(Sysno::landlock_restrict_self, ruleset.as_raw_fd(), 0usize) }
         .map(|_| ())
         .map_err(errno)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bounding_drop_reaches_every_position_the_sets_hold() {
+        let positions: Vec<CapabilitySet> = every_capability_position().collect();
+        assert_eq!(positions.len(), 64);
+        assert!(
+            positions.iter().all(|one| one.bits().count_ones() == 1),
+            "each position is one capability: {positions:?}"
+        );
+        let union = positions
+            .iter()
+            .fold(CapabilitySet::empty(), |all, one| all | *one);
+        assert_eq!(union.bits(), u64::MAX, "every position, each once");
+        // The named iteration reaches the positions past the last capability
+        // rustix names only as one set, which a bounding-set drop refuses with
+        // EINVAL, the answer a capability the kernel lacks also gets.
+        assert!(
+            CapabilitySet::all()
+                .iter()
+                .any(|item| item.bits().count_ones() > 1),
+            "the named iteration yields each position alone"
+        );
+    }
 }
