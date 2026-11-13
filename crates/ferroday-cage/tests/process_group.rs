@@ -36,7 +36,10 @@ const SCENARIO: &str = "FERRODAY_CAGE_TEST_GROUP_SCENARIO";
 ///
 /// In `inner-job` the command is a shell with job control, which runs the sleep
 /// as a job of its own: in a process group of its own, which it gives the
-/// terminal's foreground.
+/// terminal's foreground. The job says it is ready itself. The shell hands a
+/// job the foreground in the job's own process before running it, so the word
+/// comes after the hand-over, where one from the shell would come before it
+/// and a `^C` typed in between would reach the shell rather than the job.
 ///
 /// In `pipeline` the command's output is a pipe, so it says it has signalled
 /// its group on standard error, which is still the terminal.
@@ -47,7 +50,8 @@ fn script(scenario: &str) -> &'static str {
             "trap '' USR1 TERM; kill -USR1 0; kill -TERM 0; echo signalled >&2; exec sleep 30"
         }
         "inner-job" => {
-            "trap '' USR1 TERM; kill -USR1 0; kill -TERM 0; set -m; echo ready; sleep 30; exit 0"
+            "trap '' USR1 TERM; kill -USR1 0; kill -TERM 0; set -m; \
+             sh -c 'echo ready; exec sleep 30'; exit 0"
         }
         _ => "trap '' USR1 TERM; kill -USR1 0; kill -TERM 0; echo ready; exec sleep 30",
     }
@@ -211,6 +215,14 @@ fn in_foreground() -> bool {
 }
 
 /// One step of playing the user at a session.
+///
+/// A terminal without `NOFLSH` set flushes its output when it reads an
+/// interrupt or a suspend, so output the session writes between the key being
+/// typed and the terminal reading it is discarded. A line the caller writes as
+/// the user types `^C` can therefore vanish, and a step that types one comes
+/// after an `Expect` of every line already on its way: the command's `ready`,
+/// and the caller's `caller-launched`, which it writes once the launch
+/// returns, before or after the command's.
 enum Step<'a> {
     /// Wait for the session to write this.
     Expect(&'a str),
@@ -293,7 +305,11 @@ fn a_command_on_the_callers_terminal_signals_only_its_own_group() {
     // the foreground, and the caller has it back once the wait returns.
     assert_contained(&session(
         "interrupt",
-        &[Step::Expect("ready"), Step::Type("\x03")],
+        &[
+            Step::Expect("ready"),
+            Step::Expect("caller-launched"),
+            Step::Type("\x03"),
+        ],
     ));
 }
 
@@ -310,6 +326,7 @@ fn a_suspend_typed_at_the_terminal_leaves_the_command_running() {
         "suspend",
         &[
             Step::Expect("ready"),
+            Step::Expect("caller-launched"),
             Step::Type("\x1a"),
             Step::Type("\x03"),
         ],
@@ -329,6 +346,7 @@ fn a_suspend_under_a_reaper_in_the_session_is_continued() {
         "suspend-subreaper",
         &[
             Step::Expect("ready"),
+            Step::Expect("caller-launched"),
             Step::Type("\x1a"),
             Step::Type("\x03"),
         ],
@@ -345,7 +363,14 @@ fn the_terminal_comes_back_from_a_job_a_shell_inside_ran() {
     // with the job's signal. The terminal is left on the job's group, which is
     // gone by the time the wait returns, and the caller takes it back from
     // there too.
-    let seen = session("inner-job", &[Step::Expect("ready"), Step::Type("\x03")]);
+    let seen = session(
+        "inner-job",
+        &[
+            Step::Expect("ready"),
+            Step::Expect("caller-launched"),
+            Step::Type("\x03"),
+        ],
+    );
     assert!(seen.contains("caller-launched foreground=false"), "{seen}");
     assert!(
         seen.contains("caller-report code=None signal=Some(2) sibling-alive=true foreground=true"),
