@@ -994,6 +994,10 @@ consumer upgrading can skip it.
   tools wrote were taken for the base's and left undated under
   `source_date_epoch`, and an Alpine package's owner was named by the base's
   ids rather than the root's.
+- `Pool::publish` removes the staging `.deb` a publish killed outright left
+  beside a pool file, from each directory it publishes into, as the package
+  cache removes a killed run's staging downloads. Such a file was left in the
+  pool for good.
 
 ### Internal
 

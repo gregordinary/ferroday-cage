@@ -974,6 +974,11 @@ fn index_deb(
     let dest = pool_dir.join(&rel);
     if let Some(parent) = dest.parent() {
         mkdir_all(parent)?;
+        // A publish killed outright leaves the `.deb` it was staging beside
+        // the name it was to take, and the next publish into the directory is
+        // the one that can tell it is nobody's, as the package cache's next run
+        // can of a download.
+        Staged::sweep(parent);
     }
 
     // Republishing a `.deb` the pool already holds is the common incremental
@@ -2213,6 +2218,42 @@ mod tests {
             .component("main/debian-installer")
             .publish::<&Path>([])
             .expect("a slashed component publishes");
+    }
+
+    #[test]
+    fn a_publish_sweeps_the_staging_files_a_killed_one_left() {
+        // A staging `.deb` whose holder is gone is removed by the next publish
+        // into its directory; one being written is not, which `Staged::sweep`
+        // decides by its lock.
+        let dir = Scratch::for_test("pool", "staging-sweep");
+        let package_dir = dir.join("pool/main/t/tool");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        let orphan = package_dir.join(".tool_0.9_amd64.deb.0123456789abcdef.partial");
+        std::fs::write(&orphan, b"half a package").unwrap();
+        let (held, _file) = Staged::beside(&package_dir.join("tool_0.8_amd64.deb")).unwrap();
+
+        let deb = dir.join("tool.deb");
+        std::fs::write(
+            &deb,
+            ferroday_cage_testkit::deb::deb_with_control(
+                "Package: tool\nVersion: 1.0\nArchitecture: amd64\n",
+                &ferroday_cage_testkit::tar::Tar::new().finish(),
+            ),
+        )
+        .unwrap();
+        Pool::at(&dir)
+            .suite("local")
+            .architecture("amd64")
+            .date(1_700_000_000)
+            .publish([&deb])
+            .expect("the package is published");
+
+        assert!(!orphan.exists(), "the leftover was kept");
+        assert!(
+            held.path().exists(),
+            "a staging file being written was swept"
+        );
+        assert!(package_dir.join("tool_1.0_amd64.deb").is_file());
     }
 
     #[test]
