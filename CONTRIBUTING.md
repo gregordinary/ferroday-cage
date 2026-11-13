@@ -532,6 +532,7 @@ report name a package and its version bare.
 | Which cgroup limit does `NAME=VALUE` spell? | `CgroupLimit`'s `FromStr`, whose names are the keys of a profile's `[cgroup]` table |
 | Read this process's mount table | `host::MountEntry::parse`, one line of the kernel's `mountinfo` at a time |
 | Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |
+| Can this caller write a range map directly, without a delegate? | `idmap::direct_write_refusal`, over `idmap::effective_capabilities`, which `DirectMapper` asks of a request and `host::range_map_blocker` of no extent at all |
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |
 | What does the single-identity map write? | `idmap::single_identity_lines` |
 | Validate the command a sandbox or a restriction executes | `spec::validate_command` |

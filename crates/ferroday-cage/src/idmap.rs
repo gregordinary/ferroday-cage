@@ -1008,10 +1008,7 @@ impl IdMapper for DirectMapper {
             IdentityMap::Ranges { uid, gid } => (uid.clone(), gid.clone()),
         };
 
-        let effective = rustix::thread::capabilities(None)
-            .map(|sets| sets.effective)
-            .unwrap_or_else(|_| rustix::thread::CapabilitySet::empty());
-        if let Some(reason) = direct_write_refusal(&uid, effective) {
+        if let Some(reason) = direct_write_refusal(&uid, effective_capabilities()) {
             return Err(IdMapError::unsatisfiable(reason));
         }
 
@@ -1062,8 +1059,25 @@ impl IdMapper for DirectMapper {
     }
 }
 
+/// The calling thread's effective capability set, or the empty set where it
+/// cannot be read.
+///
+/// The effective set is the one the direct tier asks about: the map files need
+/// the capabilities effective, and a write does not raise them from the
+/// permitted set.
+pub(crate) fn effective_capabilities() -> rustix::thread::CapabilitySet {
+    rustix::thread::capabilities(None)
+        .map(|sets| sets.effective)
+        .unwrap_or_else(|_| rustix::thread::CapabilitySet::empty())
+}
+
 /// Why a caller holding `effective` cannot write a map with these uid extents
 /// directly, or `None` when it can.
+///
+/// The one answer to whether a caller writes a range map directly:
+/// [`DirectMapper`] asks it of a request, and
+/// [`range_map_blocker`](crate::host::range_map_blocker) asks it of no extent
+/// at all, which leaves the capabilities every direct write needs.
 ///
 /// The map files need `CAP_SETUID` and `CAP_SETGID` over the parent namespace.
 /// Since Linux 5.12 a `uid_map` naming the parent's uid 0 among its outside ids
@@ -1071,7 +1085,7 @@ impl IdMapper for DirectMapper {
 /// could hand the new namespace file capabilities the parent honours. The rule
 /// is about the outside id alone, so `0 1 1` needs no `CAP_SETFCAP` and `5 0 1`
 /// does.
-fn direct_write_refusal(
+pub(crate) fn direct_write_refusal(
     uid: &[IdRange],
     effective: rustix::thread::CapabilitySet,
 ) -> Option<String> {
@@ -2313,8 +2327,7 @@ mod tests {
             // A caller holding CAP_SETUID and CAP_SETGID writes maps directly,
             // and the flag is no obstacle to that; this test process holds
             // neither unless it runs as root.
-            let effective = rustix::thread::capabilities(None).unwrap().effective;
-            if !effective.contains(rustix::thread::CapabilitySet::SETUID) {
+            if !effective_capabilities().contains(rustix::thread::CapabilitySet::SETUID) {
                 assert_eq!(
                     crate::host::range_map_blocker(),
                     Some(crate::host::RangeMapBlocker::NoNewPrivileges),
@@ -2344,10 +2357,7 @@ mod tests {
             let expected = expected.to_str().expect("the expectation is text");
             let blocker = crate::host::helper_blocker().expect("the helpers cannot work here");
             assert!(blocker.to_string().contains(expected), "{blocker}");
-            let effective = rustix::thread::capabilities(None)
-                .map(|sets| sets.effective)
-                .unwrap_or(rustix::thread::CapabilitySet::empty());
-            if !effective.contains(rustix::thread::CapabilitySet::SETUID) {
+            if !effective_capabilities().contains(rustix::thread::CapabilitySet::SETUID) {
                 assert_eq!(crate::host::range_map_blocker(), Some(blocker.clone()));
             }
 

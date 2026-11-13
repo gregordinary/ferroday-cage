@@ -7039,10 +7039,7 @@ mod tests {
         // Without a configured delegate, the bundled chain must refuse: the
         // direct mapper requires capabilities an unprivileged test run does
         // not hold. Skip silently when the test itself runs privileged.
-        let effective = rustix::thread::capabilities(None)
-            .map(|sets| sets.effective)
-            .unwrap_or(rustix::thread::CapabilitySet::empty());
-        if effective.contains(rustix::thread::CapabilitySet::SETUID) {
+        if crate::idmap::effective_capabilities().contains(rustix::thread::CapabilitySet::SETUID) {
             return;
         }
         let extent = crate::IdRange {

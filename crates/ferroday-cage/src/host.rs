@@ -932,20 +932,11 @@ fn overlay_mount_probe(base: &Path) -> Option<crate::mechanism::OverlayProbe> {
 /// The probe is best-effort and read-only; `None` is an absence of known
 /// blockers, not a guarantee.
 pub fn range_map_blocker() -> Option<RangeMapBlocker> {
-    // A caller holding CAP_SETUID and CAP_SETGID in its effective set writes
-    // maps directly; nothing else matters. The effective set is the right
-    // question here because the direct tier requires the capabilities
-    // effective and does not raise them from permitted (see `DirectMapper`).
-    if let Ok(sets) = rustix::thread::capabilities(None)
-        && sets
-            .effective
-            .contains(rustix::thread::CapabilitySet::SETUID)
-        && sets
-            .effective
-            .contains(rustix::thread::CapabilitySet::SETGID)
-    {
-        return None;
-    }
+    // A caller that can write a map directly needs nothing else, and has no
+    // blocker: no refusal of a direct write is `None` here too. The map's
+    // outside ids are the request's, which the probe does not know, so it asks
+    // about none of them.
+    crate::idmap::direct_write_refusal(&[], crate::idmap::effective_capabilities())?;
 
     #[cfg(not(feature = "subid"))]
     {
