@@ -658,6 +658,11 @@ and its `alpine` feature ferrata 0.1.0.
 
 ### Fixed
 
+- A wait on a sandbox that a `KillHandle` killed from another thread reports
+  termination by `SIGKILL`. Where the wait saw the supervisor's death before
+  the kill was recorded, which the handle did only after sending it, it
+  reported `Error::SupervisorLost` instead. The kill and its record are now one
+  step that the wait reads past.
 - `fcage --profile` and `--restricted-profile` write a profile's parse error
   with every control character in the line it quotes escaped. A raw escape
   sequence in a profile reached the terminal as written

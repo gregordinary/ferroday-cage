@@ -6,8 +6,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, epoll};
@@ -132,9 +131,9 @@ pub struct Running<'obs> {
     outcome: Option<ExitStatus>,
     /// What the command used, once its status record has arrived carrying it.
     usage: Option<ResourceUsage>,
-    /// Whether a kill was requested through this handle or a [`KillHandle`];
+    /// Whether a kill was delivered through this handle or a [`KillHandle`];
     /// decides how a status pipe that closes without a record is read.
-    kill_sent: Arc<AtomicBool>,
+    kill_sent: Arc<KillRecord>,
     /// A pidfd of the launch stage, for the handle to reap once the status
     /// arrives (no PID namespace); the in-namespace init is not the caller's
     /// child process. A pidfd rather than a raw pid so the reap cannot alias a
@@ -399,7 +398,7 @@ impl<'obs> Running<'obs> {
             record_len: 0,
             outcome: None,
             usage: None,
-            kill_sent: Arc::new(AtomicBool::new(false)),
+            kill_sent: Arc::new(KillRecord::default()),
             reap: launched.reap,
             supervisor_exited: false,
             buf,
@@ -613,18 +612,13 @@ impl<'obs> Running<'obs> {
     /// kill, [`wait`](Self::wait) still pumps the output produced before
     /// the kill and then reports the outcome.
     ///
-    /// The killed outcome is reported as `signaled(SIGKILL)` only once the
-    /// signal is known delivered; the flag that carries that fact is set after
-    /// the signal so a failed signal cannot fabricate a killed outcome. When a
-    /// [`KillHandle`] on another thread issues the kill while this thread is
-    /// waiting, that ordering leaves a narrow window in which the waiter can
-    /// observe the supervisor's death before the flag is set and report
-    /// [`Error::SupervisorLost`] instead of `signaled(SIGKILL)`. The kill still
-    /// took effect; only the reported form differs, and only for a
-    /// cross-thread kill racing the wait. A same-thread kill (this method
-    /// before a subsequent [`wait`](Self::wait)) is not affected.
-    ///
-    /// [`Error::SupervisorLost`]: crate::Error::SupervisorLost
+    /// The killed outcome is reported as `signaled(SIGKILL)` once the signal
+    /// is delivered, and a signal that failed reports nothing, so it cannot
+    /// make a supervisor that died some other way read as killed. A
+    /// [`KillHandle`] killing from another thread while this handle waits is
+    /// reported the same way: the wait reads whether a kill was delivered only
+    /// once any kill in flight has been recorded, so it cannot see the death
+    /// the kill caused and take it for a lost supervisor.
     pub fn kill(&mut self) -> Result<(), Error> {
         send_kill(&self.pidfd, &self.kill_sent, self.cgroup.as_deref())
     }
@@ -670,7 +664,7 @@ impl<'obs> Running<'obs> {
     /// outcome is a lost supervisor, reported as one without waiting on a
     /// process that need never exit.
     fn awaiting_supervisor(&self) -> bool {
-        !self.supervisor_exited && (self.outcome.is_some() || self.kill_sent.load(Ordering::SeqCst))
+        !self.supervisor_exited && (self.outcome.is_some() || self.kill_sent.delivered())
     }
 
     /// The fused outcome once every channel has settled.
@@ -710,18 +704,15 @@ impl<'obs> Running<'obs> {
         if let Some(outcome) = self.outcome {
             return Ok(outcome);
         }
-        if self.kill_sent.load(Ordering::SeqCst) {
+        if self.kill_sent.delivered() {
             let outcome = ExitStatus::signaled(Signal::KILL.as_raw());
             self.outcome = Some(outcome);
             return Ok(outcome);
         }
-        // The supervisor is gone with no status record and no kill flag set.
-        // Unprovoked, that is a lost supervisor. The one benign case is a
-        // cross-thread kill whose flag store has not yet landed when this
-        // waiter observes the death: `send_kill` sets the flag after the signal
-        // so a failed signal cannot fabricate a killed outcome, which leaves
-        // that narrow window. The kill still took effect; only the reported
-        // error differs. See `Running::kill`.
+        // The supervisor is gone with no status record and no kill delivered:
+        // a lost supervisor. A kill another thread had in flight when this one
+        // saw the death has been recorded by now, since `delivered` waits it
+        // out.
         Err(Error::SupervisorLost)
     }
 
@@ -1201,7 +1192,7 @@ fn remove_placeholder(root: &Rooted, placeholder: &Placeholder) {
 pub struct KillHandle {
     pidfd: OwnedFd,
     control: OwnedFd,
-    kill_sent: Arc<AtomicBool>,
+    kill_sent: Arc<KillRecord>,
     /// The sandbox's cgroup, shared with the [`Running`] and every other kill
     /// handle of it.
     cgroup: Option<Arc<Cgroup>>,
@@ -1215,8 +1206,7 @@ impl KillHandle {
     }
 
     /// Kills the sandbox: SIGKILL to the supervisor. See [`Running::kill`],
-    /// including the note on the cross-thread kill racing a wait, which is
-    /// exactly the case this handle serves.
+    /// including how a wait on another thread reports it.
     pub fn kill(&self) -> Result<(), Error> {
         send_kill(&self.pidfd, &self.kill_sent, self.cgroup.as_deref())
     }
@@ -1624,14 +1614,51 @@ fn send_terminate(control: &OwnedFd) -> Result<(), Error> {
 /// command's process tree, whether the outcome is known yet or not.
 fn send_kill(
     pidfd: &OwnedFd,
-    kill_sent: &AtomicBool,
+    kill_sent: &KillRecord,
     cgroup: Option<&Cgroup>,
 ) -> Result<(), Error> {
-    match process::pidfd_send_signal(pidfd, Signal::KILL) {
-        Ok(()) | Err(Errno::SRCH) => kill_sent.store(true, Ordering::SeqCst),
-        Err(errno) => return Err(signal_error(errno)),
-    }
+    kill_sent.send(pidfd).map_err(signal_error)?;
     cgroup.map_or(Ok(()), Cgroup::kill).map_err(signal_error)
+}
+
+/// Whether a SIGKILL this library sent the supervisor was delivered, shared by
+/// a [`Running`] and every [`KillHandle`] of it.
+///
+/// The signal and its record are one step: [`send`](Self::send) holds the lock
+/// from before the signal until the delivery is recorded, and
+/// [`delivered`](Self::delivered) reads through the same lock. A waiter that
+/// has seen the supervisor die therefore waits out a kill another thread has
+/// in flight, and is never told that no kill was sent about a death that kill
+/// caused. A signal that failed records nothing, so it cannot make a
+/// supervisor that died some other way read as killed.
+#[derive(Debug, Default)]
+struct KillRecord(Mutex<bool>);
+
+impl KillRecord {
+    /// Sends SIGKILL through `pidfd` and records it delivered. A process that
+    /// has already exited (`ESRCH`) counts as killed, since there is nothing
+    /// left for the signal to end.
+    fn send(&self, pidfd: &OwnedFd) -> Result<(), Errno> {
+        let mut delivered = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match process::pidfd_send_signal(pidfd, Signal::KILL) {
+            Ok(()) | Err(Errno::SRCH) => {
+                *delivered = true;
+                Ok(())
+            }
+            Err(errno) => Err(errno),
+        }
+    }
+
+    /// Whether a kill was delivered, once any kill in flight is recorded.
+    fn delivered(&self) -> bool {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 fn signal_error(errno: Errno) -> Error {
