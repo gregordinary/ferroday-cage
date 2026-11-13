@@ -58,6 +58,11 @@ macro_rules! letter_set_text {
         $(#[$error_meta:meta])*
         $error:ident
     ) => {
+        impl $set {
+            /// Each modeled right on its own, in the order of its letter.
+            pub(crate) const EACH: &'static [$set] = &[$( $set::$flag ),+];
+        }
+
         impl fmt::Display for $set {
             #[doc = concat!("Writes the rights as the letters ", $expected, ", in that order; the empty set writes nothing.")]
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -308,7 +313,7 @@ pub(crate) fn fs_access_for_abi(abi: i32) -> u64 {
 /// narrowed away. A restriction the library turns on by default is narrowed
 /// instead; see [`settle_resolve_unix`].
 pub(crate) fn ensure_resolve_unix_enforceable(abi: Option<i32>) -> Result<(), ConfigError> {
-    if abi.is_some_and(|abi| fs_access_for_abi(abi) & fs_access::RESOLVE_UNIX != 0) {
+    if fs_enforced(FsAccess::RESOLVE_UNIX, abi) {
         Ok(())
     } else {
         Err(ConfigError::LandlockResolveUnixUnenforceable { abi })
@@ -332,7 +337,7 @@ pub(crate) fn settle_resolve_unix(
     if named {
         return ensure_resolve_unix_enforceable(abi);
     }
-    if abi.is_none_or(|abi| fs_access_for_abi(abi) & fs_access::RESOLVE_UNIX == 0) {
+    if !fs_enforced(FsAccess::RESOLVE_UNIX, abi) {
         // A rule left allowing nothing is kept, and skipped where the ruleset
         // is built: a rule is named in a setup error by its position.
         plan.landlock_handled &= !fs_access::RESOLVE_UNIX;
@@ -386,10 +391,9 @@ pub(crate) fn scope_for_abi(abi: i32) -> u64 {
 /// callers pick which scopes they pass; a scope a namespace also bounds, or a
 /// restriction's default, is masked by [`scope_for_abi`] rather than refused.
 pub(crate) fn ensure_scopes_enforceable(scoped: u64, abi: Option<i32>) -> Result<(), ConfigError> {
-    let enforced = abi.map_or(0, scope_for_abi);
     match LandlockScope::ALL
         .iter()
-        .find(|scope| scoped & !enforced & scope.to_landlock() != 0)
+        .find(|scope| scoped & scope.to_landlock() != 0 && !scope_enforced(**scope, abi))
     {
         Some(scope) => Err(ConfigError::LandlockScopeUnenforceable {
             scope: scope.as_str(),
@@ -427,6 +431,44 @@ pub(crate) fn fs_grant_masked_away(fs_handled: u64, abi: i32) -> bool {
 /// cage, whose only network boundary is Landlock).
 pub(crate) fn net_grant_masked_away(net_handled: u64, abi: i32) -> bool {
     net_handled != 0 && net_handled & net_access_for_abi(abi) == 0
+}
+
+/// Whether a kernel at `abi` enforces every right in `access`, where `abi` is
+/// `None` when the kernel offers no Landlock LSM.
+///
+/// A right is enforced where the ABI keeps a kernel right it stands for, so a
+/// grant of it is not [masked away](fs_grant_masked_away): the base rights from
+/// ABI 1, and [`FsAccess::RESOLVE_UNIX`] from ABI 9. An empty set is enforced
+/// wherever Landlock is. Answers [`host::landlock_enforces_fs`] and the
+/// library's own refusals alike.
+///
+/// [`host::landlock_enforces_fs`]: crate::host::landlock_enforces_fs
+pub(crate) fn fs_enforced(access: FsAccess, abi: Option<i32>) -> bool {
+    abi.is_some_and(|abi| {
+        FsAccess::EACH
+            .iter()
+            .filter(|right| access.contains(**right))
+            .all(|right| !fs_grant_masked_away(right.to_landlock(), abi))
+    })
+}
+
+/// Whether a kernel at `abi` enforces every right in `access`, where `abi` is
+/// `None` when the kernel offers no Landlock LSM: from ABI 4, which
+/// [`net_access_for_abi`] states. An empty set is enforced wherever Landlock
+/// is.
+pub(crate) fn net_enforced(access: NetAccess, abi: Option<i32>) -> bool {
+    abi.is_some_and(|abi| {
+        NetAccess::EACH
+            .iter()
+            .filter(|right| access.contains(**right))
+            .all(|right| !net_grant_masked_away(right.to_landlock(), abi))
+    })
+}
+
+/// Whether a kernel at `abi` enforces `scope`, where `abi` is `None` when the
+/// kernel offers no Landlock LSM: from ABI 6, which [`scope_for_abi`] states.
+pub(crate) fn scope_enforced(scope: LandlockScope, abi: Option<i32>) -> bool {
+    abi.is_some_and(|abi| scope.to_landlock() & scope_for_abi(abi) != 0)
 }
 
 /// A set of filesystem access rights, granted on a path by
@@ -4040,6 +4082,34 @@ mod tests {
             plan.landlock_labels,
             ["rx on /usr", "rw on /dev/null", "c on tcp:443"],
         );
+    }
+
+    #[test]
+    fn a_right_is_enforced_from_the_abi_that_brought_it() {
+        let base = FsAccess::READ | FsAccess::WRITE | FsAccess::EXECUTE;
+        assert!(fs_enforced(base, Some(1)), "the base rights are ABI 1's");
+        assert!(
+            !fs_enforced(base, None),
+            "nothing is enforced without Landlock"
+        );
+        assert!(!fs_enforced(FsAccess::RESOLVE_UNIX, Some(8)));
+        assert!(fs_enforced(FsAccess::RESOLVE_UNIX, Some(9)));
+        assert!(
+            !fs_enforced(base | FsAccess::RESOLVE_UNIX, Some(8)),
+            "every right in the set"
+        );
+        assert!(fs_enforced(FsAccess::empty(), Some(1)));
+        assert!(!fs_enforced(FsAccess::empty(), None));
+
+        assert!(!net_enforced(NetAccess::CONNECT, Some(3)));
+        assert!(net_enforced(NetAccess::all(), Some(4)));
+        assert!(!net_enforced(NetAccess::BIND, None));
+
+        for scope in LandlockScope::ALL.iter().copied() {
+            assert!(!scope_enforced(scope, Some(5)), "{scope}");
+            assert!(scope_enforced(scope, Some(6)), "{scope}");
+            assert!(!scope_enforced(scope, None), "{scope}");
+        }
     }
 
     #[test]

@@ -425,9 +425,9 @@ fn listening_sockets(
 /// skip where it does not. No variable governs it: CI's kernels predate it.
 #[cfg(feature = "hardening")]
 fn landlock_resolve_unix() -> bool {
-    let abi = ferroday_cage::host::landlock_abi();
-    let present = abi.is_some_and(|abi| abi >= 9);
+    let present = ferroday_cage::host::landlock_enforces_fs(ferroday_cage::FsAccess::RESOLVE_UNIX);
     if !present {
+        let abi = ferroday_cage::host::landlock_abi();
         common::require::premise_unmet(format_args!(
             "the unix-socket restriction needs Landlock ABI 9, and the kernel offers {abi:?}"
         ));

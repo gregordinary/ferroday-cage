@@ -511,3 +511,21 @@ so a name a flag takes would be one a profile refuses."""
 path = "crates/ferroday-cage/src/hardening.rs"
 count = 1
 why = "The answer."
+
+[[idiom]]
+name = "a Landlock ABI compared with a number"
+pattern = '\babi *(?:>=|<=|>|<|==) *\d'
+answer = """\
+`hardening::fs_enforced`, `net_enforced` and `scope_enforced`, which \
+`host::landlock_enforces_fs`, `landlock_enforces_net` and \
+`landlock_enforces_scope` ask of the running kernel. Which ABI brought each \
+right is stated once, in the masks those read, so a caller asking whether a \
+right is enforced cannot disagree with the build that refuses it."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/hardening.rs"
+count = 6
+why = """\
+The answer's own table: `fs_access_for_abi`, `net_access_for_abi` and \
+`scope_for_abi`, one comparison for each ABI that brought a right or a \
+scope."""

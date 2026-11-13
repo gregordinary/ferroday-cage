@@ -197,8 +197,9 @@ one with a network grant the same way. A seccomp-only restriction runs on
 either, without the default scopes a kernel below ABI 6 cannot enforce. One
 that names its scopes is refused there instead, with
 [`ConfigError::LandlockScopeUnenforceable`]. [`host::landlock_abi`] reports the
-kernel's Landlock ABI, and [`host::seccomp_available`] whether this process can
-install a seccomp filter.
+kernel's Landlock ABI, [`host::landlock_enforces_scope`] and its siblings whether
+the kernel enforces a scope or a right, and [`host::seccomp_available`] whether
+this process can install a seccomp filter.
 
 ## On the command line
 
@@ -238,4 +239,5 @@ consumes.
 [`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html
 [`Error::UsernsUnavailable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Error.html
 [`host::landlock_abi`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_abi.html
+[`host::landlock_enforces_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_enforces_scope.html
 [`host::seccomp_available`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.seccomp_available.html

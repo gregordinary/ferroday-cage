@@ -3906,8 +3906,9 @@ impl CageBuilder {
     ///
     /// Network rights require Landlock ABI 4. On an older kernel that offers
     /// Landlock they are narrowed away best-effort, exactly as an unsupported
-    /// filesystem right is; [`host::landlock_abi`](crate::host::landlock_abi)
-    /// reports whether the running kernel reaches ABI 4.
+    /// filesystem right is;
+    /// [`host::landlock_enforces_net`](crate::host::landlock_enforces_net)
+    /// reports whether the running kernel enforces them.
     ///
     /// # Where the downgrade is refused, and where it is silent
     ///
@@ -3921,8 +3922,8 @@ impl CageBuilder {
     /// request made: with every network right masked away and no filesystem
     /// grant to carry, no ruleset is built at all, and the command runs with the
     /// namespace as its sole network confinement. Check
-    /// [`host::landlock_abi`](crate::host::landlock_abi) before the build where
-    /// that matters.
+    /// [`host::landlock_enforces_net`](crate::host::landlock_enforces_net)
+    /// before the build where that matters.
     ///
     /// A network stack attached to such a sandbox gives its namespace outbound
     /// TCP, after which the grant is the only bound on the ports the command
@@ -3968,6 +3969,9 @@ impl CageBuilder {
     ///   kernel refuses the build with
     ///   [`ConfigError::LandlockScopeUnenforceable`](crate::ConfigError::LandlockScopeUnenforceable),
     ///   rather than run the command with that reach open.
+    ///
+    /// [`host::landlock_enforces_scope`](crate::host::landlock_enforces_scope)
+    /// reports whether the running kernel enforces a scope.
     ///
     /// A scope is not a grant: it enrolls no path and no port, so the
     /// filesystem and the network stay as open as the grants leave them.
@@ -4021,9 +4025,12 @@ impl CageBuilder {
     /// The right needs Landlock ABI 9. A restriction asked for here is refused
     /// at build on an older kernel, or one without the Landlock LSM, with
     /// [`ConfigError::LandlockResolveUnixUnenforceable`](crate::ConfigError::LandlockResolveUnixUnenforceable),
-    /// since it is the only bound on the sockets a mount does not hide. The
-    /// host root's default is dropped on such a kernel instead, and
-    /// [`resolved_inputs`](Cage::resolved_inputs) reports whether it applies.
+    /// since it is the only bound on the sockets a mount does not hide.
+    /// [`host::landlock_enforces_fs`](crate::host::landlock_enforces_fs) with
+    /// [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX) reports whether
+    /// the running kernel enforces it. The host root's default is dropped on
+    /// such a kernel instead, and [`resolved_inputs`](Cage::resolved_inputs)
+    /// reports whether it applies.
     pub fn landlock_resolve_unix(mut self, restrict: bool) -> Self {
         self.hardening.set_resolve_unix(restrict);
         self

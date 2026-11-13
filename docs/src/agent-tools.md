@@ -123,8 +123,8 @@ in view, such as one in the working tree, accepts the command's connection.
 [`landlock_resolve_unix`] refuses those connections, except to a socket the
 command or a process it started created. It needs Landlock ABI 9, and a kernel
 below it refuses the build that asks for it. The example therefore asks for it
-where [`host::landlock_abi`] reports 9 or later, and says on standard error where
-the kernel cannot enforce it.
+where [`host::landlock_enforces_fs`] reports that the kernel enforces
+`FsAccess::RESOLVE_UNIX`, and says on standard error where it cannot.
 
 The sandbox's own PID and network namespaces keep its signals and its abstract
 sockets from the host's processes. No [Landlock
@@ -362,7 +362,7 @@ remain the caller's to decide:
 [`present_as`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.present_as
 [`SeccompRules::curated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.curated
 [`landlock_resolve_unix`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.landlock_resolve_unix
-[`host::landlock_abi`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_abi.html
+[`host::landlock_enforces_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_enforces_fs.html
 [`Pending::listen`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html#method.listen
 [`Running::try_wait`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.try_wait
 [`Escalation`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/relay/struct.Escalation.html

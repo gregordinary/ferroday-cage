@@ -250,7 +250,7 @@ fn a_scope_no_namespace_bounds_builds_only_where_the_kernel_enforces_it() {
     // kernel with scopes both sandboxes build; on one without, the scope that
     // is the only bound on its reach refuses the build rather than vanish.
     let abi = ferroday_cage::host::landlock_abi();
-    let enforced = abi.is_some_and(|abi| abi >= 6);
+    let enforced = ferroday_cage::host::landlock_enforces_scope(LandlockScope::Signal);
     let base = || {
         Cage::builder()
             .rootfs(common::scratch_dir("unbounded-scope"))

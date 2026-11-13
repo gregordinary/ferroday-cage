@@ -106,8 +106,8 @@ Network rights arrive in Landlock ABI 4. On an older kernel that still offers
 Landlock they are narrowed away best-effort, the same downgrade an unsupported
 filesystem right receives; a network-only request on such a kernel becomes a
 no-op rather than an error, and no ruleset is built at all. Check
-[`host::landlock_abi`] for a version of 4 or more when a command must not run
-unless its network restriction can be enforced.
+[`host::landlock_enforces_net`] when a command must not run unless its network
+restriction can be enforced.
 
 The downgrade is refused rather than taken wherever the grant is the only bound
 on the command's network reach. A host-network cage and the restriction
@@ -159,7 +159,8 @@ away best-effort. Where nothing else bounds the reach, the scope is the
 boundary. That is `Signal` under [`pid_namespace(false)`], and
 `AbstractUnixSocket` under [`Network::Host`]. There a kernel below ABI 6, or one
 without Landlock, refuses the build with
-[`ConfigError::LandlockScopeUnenforceable`].
+[`ConfigError::LandlockScopeUnenforceable`]. [`host::landlock_enforces_scope`]
+reports whether the running kernel enforces a scope.
 
 ## Landlock and unix sockets
 
@@ -201,7 +202,9 @@ covers them.
 The right needs Landlock ABI 9. Asked for on an older kernel, or on one without
 Landlock, the build is refused with
 [`ConfigError::LandlockResolveUnixUnenforceable`], since nothing else bounds the
-sockets the mounts leave in view. The host root's default is dropped on such a
+sockets the mounts leave in view. [`host::landlock_enforces_fs`] reports whether
+the running kernel enforces a right, `FsAccess::RESOLVE_UNIX` among them, so a
+caller can ask for the restriction only where it applies. The host root's default is dropped on such a
 kernel instead, and the [resolved inputs](embedding.md#recording-what-a-build-ran-under)
 report whether it applies. On the command line, `--landlock-resolve-unix` turns
 it on, `--no-landlock-resolve-unix` off, and `--landlock-unix PATH` grants the
@@ -719,4 +722,7 @@ with no sandbox around it.
 [`FsAccess::RESOLVE_UNIX`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.FsAccess.html#associatedconstant.RESOLVE_UNIX
 [`ConfigError::LandlockResolveUnixUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html#variant.LandlockResolveUnixUnenforceable
 [`host::landlock_abi`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_abi.html
+[`host::landlock_enforces_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_enforces_fs.html
+[`host::landlock_enforces_net`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_enforces_net.html
+[`host::landlock_enforces_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_enforces_scope.html
 [`host::seccomp_available`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.seccomp_available.html

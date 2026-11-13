@@ -112,18 +112,26 @@ pub fn landlock() -> bool {
     require::landlock(ferroday_cage::host::landlock_abi())
 }
 
-/// Whether the kernel's Landlock ABI grants network rights.
+/// Whether the kernel's Landlock enforces network rights.
 #[cfg(feature = "hardening")]
 #[track_caller]
 pub fn landlock_net() -> bool {
-    require::landlock_net(ferroday_cage::host::landlock_abi())
+    require::landlock_net(
+        ferroday_cage::host::landlock_abi(),
+        ferroday_cage::host::landlock_enforces_net(ferroday_cage::NetAccess::all()),
+    )
 }
 
-/// Whether the kernel's Landlock ABI has scopes.
+/// Whether the kernel's Landlock enforces scopes.
 #[cfg(feature = "hardening")]
 #[track_caller]
 pub fn landlock_scope() -> bool {
-    require::landlock_scope(ferroday_cage::host::landlock_abi())
+    require::landlock_scope(
+        ferroday_cage::host::landlock_abi(),
+        ferroday_cage::LandlockScope::ALL
+            .iter()
+            .all(|scope| ferroday_cage::host::landlock_enforces_scope(*scope)),
+    )
 }
 
 /// Builders for hermetic Debian fixtures: tar streams, `.deb` archives, and a

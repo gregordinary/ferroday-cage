@@ -625,9 +625,10 @@ impl RestrictionBuilder {
     /// [`ConfigError::LandlockScopeUnenforceable`](crate::ConfigError::LandlockScopeUnenforceable).
     /// The default scopes, left unnamed, are dropped on such a kernel instead,
     /// which leaves those reaches open so that a seccomp-only restriction still
-    /// runs there. [`host::landlock_abi`](crate::host::landlock_abi) reports the
-    /// running ABI. Naming no scope at all, an empty list, turns them off on
-    /// every kernel.
+    /// runs there.
+    /// [`host::landlock_enforces_scope`](crate::host::landlock_enforces_scope)
+    /// reports whether the running kernel enforces a scope. Naming no scope at
+    /// all, an empty list, turns them off on every kernel.
     ///
     /// Unlike a grant, a scope alone does not count as confinement: a
     /// restriction with no grant and no seccomp policy is still refused as
@@ -1064,15 +1065,16 @@ mod tests {
                 .command("/bin/true")
                 .landlock_net(NetAccess::CONNECT, 443)
         };
-        match crate::mechanism::probe_landlock_abi() {
-            Some(abi) if abi >= 4 => {
+        let abi = crate::mechanism::probe_landlock_abi();
+        match crate::hardening::net_enforced(NetAccess::CONNECT, abi) {
+            true => {
                 let restriction = builder().build().expect("a network grant is a restriction");
                 let hardening = &restriction.plan.hardening;
                 assert_eq!(hardening.landlock_net.len(), 1);
                 assert_ne!(hardening.landlock_net_handled, 0);
                 assert!(hardening.landlock.is_empty());
             }
-            _ => {
+            false => {
                 // Below ABI 4, or with no Landlock LSM, the grant cannot apply,
                 // so the build is refused rather than silently dropping it.
                 assert!(matches!(
@@ -1152,15 +1154,16 @@ mod tests {
         let built = restricted_true()
             .landlock_scope([LandlockScope::Signal])
             .build();
-        match crate::mechanism::probe_landlock_abi() {
-            Some(abi) if abi >= 6 => {
+        let abi = crate::mechanism::probe_landlock_abi();
+        match crate::hardening::scope_enforced(LandlockScope::Signal, abi) {
+            true => {
                 let restriction = built.expect("a kernel with scopes enforces a named one");
                 assert_eq!(
                     restriction.plan.hardening.landlock_scoped,
                     crate::hardening::scope::SIGNAL,
                 );
             }
-            abi => assert!(matches!(
+            false => assert!(matches!(
                 built,
                 Err(Error::Config(ConfigError::LandlockScopeUnenforceable { abi: reported, .. }))
                     if reported == abi

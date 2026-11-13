@@ -15,8 +15,9 @@
 //! [`premise_unmet`] is the one skip no variable governs.
 //!
 //! The probes themselves stay with the tests where they need a library feature
-//! (`host::landlock_abi` is the hardening layer's), and their results are
-//! handed in. The probes a featureless library answers are here.
+//! (`host::landlock_abi` and the `host::landlock_enforces_*` questions are the
+//! hardening layer's), and their results are handed in. The probes a
+//! featureless library answers are here.
 
 use std::fmt::Display;
 use std::path::Path;
@@ -192,37 +193,36 @@ pub fn landlock(abi: Option<i32>) -> bool {
     LANDLOCK.holds(abi.is_some(), "the kernel offers no Landlock support")
 }
 
-/// Whether the kernel's Landlock ABI grants network rights (ABI 4), given what
-/// `host::landlock_abi` reported.
+/// Whether the kernel's Landlock enforces network rights, given what
+/// `host::landlock_abi` reported and what `host::landlock_enforces_net`
+/// answered.
 #[track_caller]
-pub fn landlock_net(abi: Option<i32>) -> bool {
+pub fn landlock_net(abi: Option<i32>, enforced: bool) -> bool {
     match abi {
         None => landlock(abi),
         Some(abi) => LANDLOCK.holds(
-            abi >= 4,
-            format!("Landlock ABI {abi} predates network rights (needs 4)"),
+            enforced,
+            format!("Landlock ABI {abi} predates network rights"),
         ),
     }
 }
 
-/// Whether the kernel's Landlock ABI has scopes (ABI 6), given what
-/// `host::landlock_abi` reported.
+/// Whether the kernel's Landlock enforces scopes, given what
+/// `host::landlock_abi` reported and what `host::landlock_enforces_scope`
+/// answered.
 ///
 /// A kernel with no Landlock at all is missing Landlock before it is missing
 /// scopes, so its skip is [`landlock`]'s, which [`LANDLOCK`] turns into a
 /// failure as it does for every Landlock test. [`LANDLOCK_SCOPE`] still demands
 /// the test there too, since scopes are among what that kernel lacks.
 #[track_caller]
-pub fn landlock_scope(abi: Option<i32>) -> bool {
+pub fn landlock_scope(abi: Option<i32>, enforced: bool) -> bool {
     match abi {
         None => {
             LANDLOCK_SCOPE.insist("the kernel offers no Landlock support");
             landlock(abi)
         }
-        Some(abi) => LANDLOCK_SCOPE.holds(
-            abi >= 6,
-            format!("Landlock ABI {abi} predates scopes (needs 6)"),
-        ),
+        Some(abi) => LANDLOCK_SCOPE.holds(enforced, format!("Landlock ABI {abi} predates scopes")),
     }
 }
 

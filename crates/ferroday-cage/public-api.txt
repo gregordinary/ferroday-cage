@@ -61,6 +61,9 @@ impl core::marker::UnsafeUnpin for ferroday_cage::host::UsernsBlocker
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::host::UsernsBlocker
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::host::UsernsBlocker
 pub fn ferroday_cage::host::landlock_abi() -> core::option::Option<i32>
+pub fn ferroday_cage::host::landlock_enforces_fs(ferroday_cage::FsAccess) -> bool
+pub fn ferroday_cage::host::landlock_enforces_net(ferroday_cage::NetAccess) -> bool
+pub fn ferroday_cage::host::landlock_enforces_scope(ferroday_cage::LandlockScope) -> bool
 pub fn ferroday_cage::host::overlay_blocker(impl core::convert::AsRef<std::path::Path>) -> core::option::Option<ferroday_cage::host::OverlayBlocker>
 pub fn ferroday_cage::host::procfs_blocker() -> core::option::Option<ferroday_cage::host::ProcfsBlocker>
 pub fn ferroday_cage::host::range_map_blocker() -> core::option::Option<ferroday_cage::host::RangeMapBlocker>

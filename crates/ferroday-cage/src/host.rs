@@ -117,6 +117,68 @@ pub fn landlock_abi() -> Option<i32> {
     crate::mechanism::probe_landlock_abi()
 }
 
+/// Whether the running kernel's Landlock enforces every right in `access`.
+///
+/// A right is enforced where the kernel governs it, so a grant of it is applied
+/// rather than narrowed away: [`FsAccess::READ`], [`FsAccess::WRITE`] and
+/// [`FsAccess::EXECUTE`] on every kernel that offers Landlock (ABI 1), and
+/// [`FsAccess::RESOLVE_UNIX`] from Landlock ABI 9. Two parts of a right arrive
+/// after the right itself and are not weighed here: truncation, part of
+/// `WRITE`, is governed from ABI 3, and device `ioctl` from ABI 5. `false`
+/// without Landlock.
+///
+/// A build asks the same question of a right nothing else bounds, and refuses
+/// one this answers `false` for, such as
+/// [`landlock_resolve_unix`](crate::CageBuilder::landlock_resolve_unix) on a
+/// kernel below ABI 9. A caller asks it first to choose a posture the kernel
+/// enforces:
+///
+/// ```no_run
+/// use ferroday_cage::{Cage, FsAccess, host};
+///
+/// # fn main() -> ferroday_cage::Result<()> {
+/// let cage = Cage::builder()
+///     .host_rootfs()
+///     .landlock_resolve_unix(host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX))
+///     .command("/usr/bin/make")
+///     .build()?;
+/// # let _ = cage;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`FsAccess::READ`]: crate::FsAccess::READ
+/// [`FsAccess::WRITE`]: crate::FsAccess::WRITE
+/// [`FsAccess::EXECUTE`]: crate::FsAccess::EXECUTE
+/// [`FsAccess::RESOLVE_UNIX`]: crate::FsAccess::RESOLVE_UNIX
+#[cfg(feature = "hardening")]
+pub fn landlock_enforces_fs(access: crate::FsAccess) -> bool {
+    crate::hardening::fs_enforced(access, landlock_abi())
+}
+
+/// Whether the running kernel's Landlock enforces every right in `access`:
+/// from Landlock ABI 4 (Linux 6.7), and `false` without Landlock.
+///
+/// Below it a network grant is narrowed away where a network namespace bounds
+/// the command, and refused where the grant is the only bound, as under
+/// [`Network::Host`](crate::Network::Host); see
+/// [`CageBuilder::landlock_net`](crate::CageBuilder::landlock_net).
+#[cfg(feature = "hardening")]
+pub fn landlock_enforces_net(access: crate::NetAccess) -> bool {
+    crate::hardening::net_enforced(access, landlock_abi())
+}
+
+/// Whether the running kernel's Landlock enforces `scope`: from Landlock ABI 6
+/// (Linux 6.12), and `false` without Landlock.
+///
+/// Below it a scope is narrowed away where a namespace also bounds its reach,
+/// and refused where nothing else does; see
+/// [`CageBuilder::landlock_scope`](crate::CageBuilder::landlock_scope).
+#[cfg(feature = "hardening")]
+pub fn landlock_enforces_scope(scope: crate::LandlockScope) -> bool {
+    crate::hardening::scope_enforced(scope, landlock_abi())
+}
+
 /// Whether this process can install a seccomp filter.
 ///
 /// `false` on a kernel built without `CONFIG_SECCOMP_FILTER`, and where a

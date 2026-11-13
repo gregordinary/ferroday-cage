@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 
 use ferroday_cage::relay::Escalation;
 use ferroday_cage::{
-    Cage, CageBuilder, CgroupLimit, Error, ErrorChain, ExitStatus, Network, PresentedIdentity,
-    Resource, ResourceUsage, Running, SeccompPolicy, SeccompRules, Stdio, host,
+    Cage, CageBuilder, CgroupLimit, Error, ErrorChain, ExitStatus, FsAccess, Network,
+    PresentedIdentity, Resource, ResourceUsage, Running, SeccompPolicy, SeccompRules, Stdio, host,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -361,7 +361,9 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
             Limits::PerProcess
         }
     };
-    let resolve_unix = resolve_unix_enforceable();
+    // Asked for on a kernel that cannot enforce it, the unix-socket restriction
+    // is refused at build, so the example asks for it only where it holds.
+    let resolve_unix = host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX);
     if !resolve_unix {
         eprintln!(
             "agent-tools: this kernel's Landlock cannot refuse connections to pathname unix \
@@ -552,13 +554,6 @@ fn delegated_cgroup() -> Result<PathBuf, String> {
     std::fs::write(leaf.join("cgroup.procs"), "0")
         .map_err(|err| format!("cannot move into {}: {err}", leaf.display()))?;
     Ok(cgroup)
-}
-
-/// Whether the kernel enforces Landlock's unix-socket restriction, which
-/// arrives in Landlock ABI 9. Asked for on an older kernel, it is refused at
-/// build, so the example asks only where it holds.
-fn resolve_unix_enforceable() -> bool {
-    host::landlock_abi().is_some_and(|abi| abi >= 9)
 }
 
 /// Answers the command's connections on `listener` until its outcome is known,
@@ -810,10 +805,15 @@ mod tests {
             ] {
                 let mut config = parse_run(&["git", "status"]);
                 config.empty_root = empty_root;
-                let built = posture(&config, &tree, &limits, resolve_unix_enforceable())
-                    .command("git")
-                    .arg("status")
-                    .build();
+                let built = posture(
+                    &config,
+                    &tree,
+                    &limits,
+                    host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
+                )
+                .command("git")
+                .arg("status")
+                .build();
                 if let Err(error) = built {
                     panic!(
                         "empty root {empty_root}, {limits:?}: {}",
@@ -865,7 +865,7 @@ mod tests {
             &parse_run(&["git"]),
             &tree,
             &Limits::PerProcess,
-            resolve_unix_enforceable(),
+            host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
         )
         .command("git");
         // Two settings the resolved inputs do not record.

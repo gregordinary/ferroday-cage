@@ -196,6 +196,10 @@ consumer upgrading can skip it.
   `resolve-unix = false`, and `fcage` gains `--landlock-resolve-unix`,
   `--no-landlock-resolve-unix`, and `--landlock-unix`. `FsAccess::all()` now
   includes the new right.
+- `host::landlock_enforces_fs`, `host::landlock_enforces_net` and
+  `host::landlock_enforces_scope` answer whether the running kernel's Landlock
+  enforces a right or a scope, from the same table of which Landlock ABI brought
+  each one that a build refuses an unenforceable request by.
 - `CageBuilder::present_as` presents the caller to the command as another
   identity under the single-identity map. The command sees the caller as the
   given uid and gid rather than as root, or, with `PresentedIdentity::Own`, as
