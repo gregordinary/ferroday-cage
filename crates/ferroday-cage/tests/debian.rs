@@ -1046,6 +1046,66 @@ fn hermetic_republishing_changed_bytes_replaces_the_file_and_its_digest() {
     assert_eq!(digest, common::deb_repo::sha256_hex(&second));
 }
 
+#[test]
+fn hermetic_a_version_sharing_a_pool_path_never_replaces_the_file_the_index_names() {
+    // The archive layout drops the epoch, so `1:1.0-1` and `1.0-1` are stored
+    // at one path. The index keeps the higher, and the file at that path must
+    // be the one its digest names, whichever publish brings each version and
+    // in whichever order.
+    let dir = common::scratch_dir("debian-pool-epoch");
+    let build = |version: &str, contents: &[u8]| {
+        let bytes = deb_with_control(
+            &format!(
+                "Package: tool\nVersion: {version}\nArchitecture: amd64\nDescription: a tool\n"
+            ),
+            &Tar::new()
+                .dir("./usr", 0o755)
+                .file("./usr/bin/tool", 0o755, contents)
+                .finish(),
+        );
+        let path = dir.join(format!("tool-{}.deb", version.replace(':', "-epoch-")));
+        std::fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    };
+    let (epoch, epoch_bytes) = build("1:1.0-1", b"with an epoch\n");
+    let (plain, plain_bytes) = build("1.0-1", b"without one\n");
+    assert_ne!(epoch_bytes, plain_bytes);
+
+    let held = |pool: &Path| {
+        let (filename, size, digest) = published_fields(pool, "tool");
+        assert_eq!(filename, "pool/main/t/tool/tool_1.0-1_amd64.deb");
+        let file = std::fs::read(pool.join(&filename)).unwrap();
+        assert_eq!(
+            (size, digest),
+            (file.len() as u64, common::deb_repo::sha256_hex(&file)),
+            "the index describes a file other than the one the pool holds",
+        );
+        file
+    };
+
+    // The higher version first, then the lower in a later publish: the lower
+    // is neither indexed nor written.
+    let pool = dir.join("later");
+    trixie_pool(&pool).publish([&epoch]).unwrap();
+    trixie_pool(&pool).publish([&plain]).unwrap();
+    assert_eq!(held(&pool), epoch_bytes);
+
+    // Both in one publish, in either order.
+    for (order, name) in [([&epoch, &plain], "falling"), ([&plain, &epoch], "rising")] {
+        let pool = dir.join(name);
+        trixie_pool(&pool).publish(order).unwrap();
+        assert_eq!(held(&pool), epoch_bytes, "published {name}");
+    }
+
+    // The lower version first, then the higher: the higher replaces the file
+    // and the index follows it.
+    let pool = dir.join("upgraded");
+    trixie_pool(&pool).publish([&plain]).unwrap();
+    assert_eq!(held(&pool), plain_bytes);
+    trixie_pool(&pool).publish([&epoch]).unwrap();
+    assert_eq!(held(&pool), epoch_bytes);
+}
+
 /// Makes a named pipe at `path`.
 fn make_fifo(path: &Path) {
     use rustix::fs::{CWD, FileType, Mode, mknodat};

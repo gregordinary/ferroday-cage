@@ -338,7 +338,11 @@ impl Pool {
     /// applies within one repository — so the pool a caller
     /// writes and the set the resolver later draws from it cannot disagree. A
     /// `.deb` republished at the same version replaces its own entry, so
-    /// re-running the call over a superset of a prior run is well-defined.
+    /// re-running the call over a superset of a prior run is well-defined. A
+    /// `.deb` below the version the index keeps for its name is neither indexed
+    /// nor copied into the pool. A version differing from the kept one only by
+    /// an epoch is stored at the same path, and copying it would replace the
+    /// file the kept entry describes.
     ///
     /// Publishing no `.deb`s to a fresh pool writes a valid, empty repository:
     /// an empty `Packages` and a `Release` that still declares the architecture
@@ -356,10 +360,11 @@ impl Pool {
     /// documentation describes how each half is guarded.
     ///
     /// The exception is republishing a package at a version the pool already
-    /// holds with *different* bytes: the archive layout stores both at one
-    /// path, so a reader partway through resolving the older bytes fails its
-    /// digest check. In a build pipeline that means two components produced the
-    /// same package version.
+    /// holds with *different* bytes, or at a higher one differing from it only
+    /// by an epoch: the archive layout stores both at one path, so a reader
+    /// partway through resolving the older bytes fails its digest check. In a
+    /// build pipeline that means two components produced the same package
+    /// version.
     ///
     /// Each path in `debs` is opened as a file in a tree that is not fully
     /// trusted, because that is where a pipeline takes them from: the output
@@ -560,10 +565,15 @@ fn write_pool<P: AsRef<Path>>(
         }
     }
 
-    // Add each freshly-built .deb: copy it into the pool and index it.
+    // Add each freshly-built .deb: copy it into the pool and index it, unless
+    // the index keeps a higher version of its name.
     for deb_path in debs {
-        let entry = index_deb(&tree, pool_dir, component, architecture, deb_path.as_ref())?;
-        insert_highest(&mut by_name, entry);
+        let deb_path = deb_path.as_ref();
+        if let Some(entry) =
+            index_deb(&tree, pool_dir, component, architecture, deb_path, &by_name)?
+        {
+            insert_highest(&mut by_name, entry);
+        }
     }
 
     // The index is the retained stanzas in name order, deb822 paragraphs
@@ -889,13 +899,22 @@ fn checked_version(version: &str) -> Result<(), String> {
 /// same bytes without holding them. A caller that rewrites its `.deb` while it
 /// is being published is refused rather than indexed under a digest for content
 /// that is not there.
+///
+/// Whether the `.deb` is written at all is decided before anything is.
+/// `retained` is the index as it stands, and a `.deb` below the version it
+/// keeps for the name answers `None`, written nowhere: the index keeps the
+/// higher version, so nothing would name the file. Writing it would not be
+/// harmless either. A version and one differing from it only by an epoch share
+/// a [`pool_path`], so the lower one's bytes would replace the file whose
+/// digest the kept entry records.
 fn index_deb(
     tree: &Rooted,
     pool_dir: &Path,
     component: &str,
     architecture: &str,
     deb_path: &Path,
-) -> Result<Entry, DebianError> {
+    retained: &BTreeMap<String, Entry>,
+) -> Result<Option<Entry>, DebianError> {
     let bad = |reason: String| DebianError::Deb {
         path: deb_path.to_path_buf(),
         reason,
@@ -911,6 +930,11 @@ fn index_deb(
     let control = deb::read_control_from(&mut source)
         .map_err(|err| bad(ErrorChain::new(&err).to_string()))?;
     let offered = identity(&control, architecture).map_err(bad)?;
+    if retained.get(&offered.name).is_some_and(|kept| {
+        version::compare(&offered.version, &kept.version) == std::cmp::Ordering::Less
+    }) {
+        return Ok(None);
+    }
     let rel = pool_path(
         component,
         &offered.name,
@@ -932,11 +956,11 @@ fn index_deb(
         // read from the file the index will name, through the descriptor the
         // comparison read, and the digest already taken from it stands.
         let control = control_of(&mut published, &dest, deb_path, architecture, &offered)?;
-        return Ok(Entry {
+        return Ok(Some(Entry {
             name: offered.name,
             version: offered.version,
             text: stanza_text(&control, &rel, size, &digest),
-        });
+        }));
     }
 
     // Stage beside the destination, describe what was staged, then rename: the
@@ -949,11 +973,11 @@ fn index_deb(
         .publish()
         .map_err(DebianError::at("publishing a .deb into the pool", &dest))?;
 
-    Ok(Entry {
+    Ok(Some(Entry {
         name: offered.name,
         version: offered.version,
         text: stanza_text(&control, &rel, size, &digest),
-    })
+    }))
 }
 
 /// The `Packages` stanza for a pool file: its control stanza verbatim, with the
@@ -1099,6 +1123,10 @@ fn stage(dest: &Path, source: &mut File) -> Result<(Staged, File), DebianError> 
 /// same-version re-insertion replaces the prior entry, so republishing a `.deb`
 /// refreshes its stanza; this matches the resolver, which keeps the highest
 /// version of a name within one repository.
+///
+/// A published `.deb` reaches here only where [`index_deb`] wrote it, which it
+/// does only where this keeps it, so the file the kept entry names is the file
+/// the pool holds.
 fn insert_highest(by_name: &mut BTreeMap<String, Entry>, entry: Entry) {
     match by_name.get(&entry.name) {
         Some(existing)
@@ -1132,8 +1160,12 @@ fn pool_path(component: &str, name: &str, version: &str, architecture: &str) -> 
 /// colon instead, as apt's local cache does, would be laid out unlike every
 /// archive a client has seen, and would rest on each of them treating the
 /// `Filename` field as a literal string. Following the convention asks nothing
-/// of the client. A pool holds one version per package, so dropping the epoch
-/// cannot collide.
+/// of the client.
+///
+/// Two versions differing only by an epoch therefore share a path. An index
+/// keeps one version per package, and [`index_deb`] writes a `.deb` only where
+/// its version is the one kept, so the file at a shared path is the one the
+/// index names.
 fn filename_version(version: &str) -> &str {
     match version.split_once(':') {
         Some((epoch, rest)) if !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) => {

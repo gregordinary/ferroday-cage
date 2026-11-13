@@ -408,6 +408,11 @@ updated in place, and the index keeps the highest version of each package name,
 which is the same rule resolution applies. Republishing over a superset of a
 prior run is therefore well-defined.
 
+A `.deb` below the version the index keeps for its name is neither indexed nor
+copied. The pool path drops the epoch, as the archive's does, so `1:1.0-1` and
+`1.0-1` share one file name. Copying the lower version would replace the file
+the index describes.
+
 Publishing an empty set writes a valid, empty repository. The `Release` still
 declares the architecture and component, so the pool can be created before the
 first `.deb` exists and referenced from the start. It then resolves against an
@@ -688,10 +693,13 @@ A bootstrap that has read a `Release` therefore keeps resolving the indexes that
 
 One case falls outside this. Republishing a package at a version the pool
 already holds, with *different* bytes, writes to the path the older bytes
-occupy. The archive layout stores both there. A reader partway through
-resolving the older bytes fails its digest check. In a build pipeline that means
-two components produced the same package version. Republishing *identical* bytes
-is the ordinary incremental case and rewrites nothing.
+occupy. So does publishing a higher version that differs from the held one only
+by its epoch. The archive layout stores both there. A reader partway through
+resolving the older bytes fails its digest check.
+
+In a build pipeline that means two components produced the same package version.
+Republishing *identical* bytes is the ordinary incremental case and rewrites
+nothing.
 
 ## The resolved plan
 
