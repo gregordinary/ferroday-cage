@@ -258,7 +258,9 @@ Two further gates matter when the public API moves:
   layers sit on a seam they could one day be crates of their own on, and this
   keeps that decision cheap. A new reach past the seam is recorded in
   `tools/seam.toml` with what it would cost. It also refuses a userland naming
-  another outright, since the three formats are deliberately not shared. The
+  another outright, since the three formats are deliberately not shared, and a
+  userland importing `provision` or the crate root with a glob, through which
+  either kind of reach would go unseen. The
   [stability
   chapter](https://gregordinary.github.io/ferroday-cage/stability.html) records
   the decision itself and what would settle it.

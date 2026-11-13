@@ -24,9 +24,12 @@ A reach is counted however it is spelled: `crate::host`, a `super::` chain that
 climbs out of `provision`, or one name of a grouped `use crate::{...}`. Every
 path is resolved against the module its file defines before it is judged.
 
-It also refuses one thing outright: a userland naming another. The three formats
-are deliberately not shared, and a layer reading another layer's module is how
-that stops being true.
+It also refuses two things outright. One is a userland naming another: the three
+formats are deliberately not shared, and a layer reading another layer's module
+is how that stops being true. The other is a userland importing every name of
+`provision` or of the crate root at once, with a glob: each brings names into
+scope that the code then uses bare, a sibling userland's module among them for
+`provision`, and a bare name is one neither count can see.
 
 Usage:
 
@@ -81,7 +84,7 @@ def use_paths(tree: str) -> list[list[str]]:
     `crate::{IdentityMap, provision::{self, Fetch}}` names three paths:
     `crate::IdentityMap`, `crate::provision`, and `crate::provision::Fetch`.
     An alias is dropped, since the path is what is reached; a glob keeps its
-    prefix.
+    prefix and ends in `*`.
     """
     tokens = TOKEN.findall(tree)
 
@@ -99,7 +102,7 @@ def use_paths(tree: str) -> list[list[str]]:
                         at += 1
                 return paths, at + 1
             if token == "*":
-                return [segments], at + 1
+                return [segments + ["*"]], at + 1
             if token != "self":
                 segments.append(token)
             at += 1
@@ -136,21 +139,41 @@ def absolute(segments: list[str], module: list[str]) -> list[str] | None:
 def paths_in(path: Path) -> list[list[str]]:
     """Every crate-rooted path a source file names, from the crate root.
 
-    A `use` declaration contributes each path its tree names, and every other
-    `crate::`, `super::`, or `self::` path in the code contributes itself.
-    Resolving `super::` against the file's own module is what makes a reach
-    written as `super::super::host` count the same as one written as
-    `crate::host`.
+    A `use` declaration contributes each path its tree names, a glob its
+    prefix, and every other `crate::`, `super::`, or `self::` path in the code
+    contributes itself. Resolving `super::` against the file's own module is
+    what makes a reach written as `super::super::host` count the same as one
+    written as `crate::host`.
     """
     module = module_of(path)
     body = code(path)
     found = []
     for declaration in USE.finditer(body):
-        found += use_paths(declaration.group(1))
+        found += [
+            segments[:-1] if segments[-1:] == ["*"] else segments
+            for segments in use_paths(declaration.group(1))
+        ]
     rest = USE.sub(lambda match: "\n" * match.group(0).count("\n"), body)
     found += [match.group(0).split("::") for match in ROOTED.finditer(rest)]
     resolved = (absolute(segments, module) for segments in found)
     return [segments for segments in resolved if segments]
+
+
+def hidden_globs(layer: str) -> list[str]:
+    """Where `layer`'s code imports every name of `provision` or of the crate
+    root with a glob."""
+    found = []
+    for path in sorted((LAYERS / layer).rglob("*.rs")):
+        module = module_of(path)
+        for declaration in USE.finditer(code(path)):
+            for segments in use_paths(declaration.group(1)):
+                if segments[-1:] != ["*"]:
+                    continue
+                prefix = absolute(segments[:-1], module)
+                if prefix in ([], ["provision"]):
+                    named = "::".join(["crate", *prefix])
+                    found.append(f"{path.relative_to(REPO)} imports {named}::*")
+    return found
 
 
 def reaches(layer: str) -> dict[str, int]:
@@ -219,6 +242,17 @@ def main() -> int:
                 "\n".join(
                     [f"{name}: a userland names another, which is never right."]
                     + [f"    {line}" for line in crossed]
+                )
+            )
+        globbed = hidden_globs(name)
+        if globbed:
+            failures.append(
+                "\n".join(
+                    [
+                        f"{name}: a userland imports provision or the crate whole, "
+                        "which hides what it names from this check."
+                    ]
+                    + [f"    {line}" for line in globbed]
                 )
             )
 
