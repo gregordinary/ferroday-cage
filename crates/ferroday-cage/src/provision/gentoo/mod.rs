@@ -36,8 +36,8 @@
 //! ```
 //!
 //! The release certificates are the part of Gentoo's vendored service-key
-//! bundle that Gentoo's own tooling trusts for these documents
-//! ([`RELEASE_CERTIFICATES`]).
+//! bundle that Gentoo's own tooling trusts for these documents: the ones
+//! `sec-keys/openpgp-keys-gentoo-release` installs.
 //!
 //! The subkey that signs a package's `Manifest` is the one that signs the
 //! pointer and the digest documents, so the binary-package half adds no trust
