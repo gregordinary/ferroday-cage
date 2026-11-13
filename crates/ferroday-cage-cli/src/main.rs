@@ -61,6 +61,7 @@ use ferroday_cage::{
     Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, Network, Overlay,
     PresentedIdentity, RawMount, Resource, RestrictedProfile, Restriction, RestrictionBuilder,
     Running, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
+    Symlink,
 };
 use serde::Deserialize as _;
 
@@ -333,6 +334,20 @@ const FLAGS: &[Flag] = &[
         take: Take::One(|options, _flag, value| {
             options.rootfs = Some(PathBuf::from(value));
             Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--empty-rootfs",
+        section: Section::Provisioning,
+        help: &[
+            "Root the sandbox on an empty filesystem of its own,",
+            "composed with --ro-bind, --bind and --symlink and made",
+            "read-only once they are in place. Nothing is written",
+            "on the host. Alternative to --rootfs",
+        ],
+        take: Take::Bare(|options| {
+            options.empty_rootfs = true;
         }),
         ..Flag::DEFAULTS
     },
@@ -1320,6 +1335,24 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--symlink",
+        section: Section::Profiles,
+        placeholder: "TARGET PATH",
+        help: &[
+            "Create a symbolic link at PATH inside the sandbox,",
+            "pointing at TARGET, in its place among the mounts",
+        ],
+        needs: "a target and a path",
+        take: Take::Two(|options, _flag, target, path| {
+            options.mounts.push(Mount::Symlink(Symlink::new(
+                PathBuf::from(target),
+                PathBuf::from(path),
+            )));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--raw-mount",
         section: Section::Profiles,
         placeholder: "SPEC",
@@ -2144,7 +2177,7 @@ const FLAGS: &[Flag] = &[
 const SYNOPSIS: &str = "\
 Run a command inside an unprivileged Linux sandbox.
 
-Usage: fcage [--rootfs DIR | --overlay-lower DIR | --profile FILE | --restricted-profile FILE | --restrict] [OPTIONS] [--] [COMMAND [ARGS...]]
+Usage: fcage [--rootfs DIR | --empty-rootfs | --overlay-lower DIR | --profile FILE | --restricted-profile FILE | --restrict] [OPTIONS] [--] [COMMAND [ARGS...]]
        fcage --remove-rootfs DIR [--identity-map M] [--keep-lock]
        fcage --remove-overlay-upper DIR [--identity-map M]
        fcage --export-rootfs DIR [--export-to FILE] [--identity-map M] [--clamp-mtime EPOCH]
@@ -2265,6 +2298,8 @@ struct Options {
     /// (`--restricted-profile`) rather than fully trusted (`--profile`).
     profile_restricted: bool,
     rootfs: Option<PathBuf>,
+    /// `--empty-rootfs`.
+    empty_rootfs: bool,
     provision_tar: Option<PathBuf>,
     provision_debian: Option<String>,
     debian_arch: Option<String>,
@@ -2794,6 +2829,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         profile: None,
         profile_restricted: false,
         rootfs: None,
+        empty_rootfs: false,
         provision_tar: None,
         provision_debian: None,
         debian_arch: None,
@@ -2962,6 +2998,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         // that configures one is a contradiction, named explicitly.
         let conflicts = [
             (options.rootfs.is_some(), "--rootfs"),
+            (options.empty_rootfs, "--empty-rootfs"),
             (
                 options.profile.is_some(),
                 "--profile or --restricted-profile",
@@ -2998,6 +3035,13 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
                     .iter()
                     .any(|mount| matches!(mount, Mount::Raw(_))),
                 "--raw-mount",
+            ),
+            (
+                options
+                    .mounts
+                    .iter()
+                    .any(|mount| matches!(mount, Mount::Symlink(_))),
+                "--symlink",
             ),
             (
                 !options.overlay_lowers.is_empty()
@@ -3048,8 +3092,9 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         return Err("the --netstack-* options require --netstack".to_string());
     }
 
-    // An overlay root and a plain rootfs are alternatives; the last builder
-    // call would silently win, so name the contradiction here instead.
+    // A plain rootfs, an overlay root, and an empty root are alternatives; the
+    // last builder call would silently win, so name the contradiction here
+    // instead.
     let overlay_given = !options.overlay_lowers.is_empty()
         || options.overlay_upper.is_some()
         || options.overlay_work.is_some();
@@ -3064,9 +3109,22 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             return Err("--rootfs and the --overlay-* options are alternatives".to_string());
         }
     }
-    if options.rootfs.is_none() && options.profile.is_none() && !overlay_given {
+    if options.empty_rootfs {
+        if options.rootfs.is_some() {
+            return Err("--rootfs and --empty-rootfs are alternatives".to_string());
+        }
+        if overlay_given {
+            return Err("--empty-rootfs and the --overlay-* options are alternatives".to_string());
+        }
+    }
+    if options.rootfs.is_none()
+        && options.profile.is_none()
+        && !overlay_given
+        && !options.empty_rootfs
+    {
         return Err(
-            "--rootfs, --overlay-lower, --profile, --restricted-profile, or --restrict is required"
+            "--rootfs, --empty-rootfs, --overlay-lower, --profile, --restricted-profile, \
+                    or --restrict is required"
                 .to_string(),
         );
     }
@@ -5085,6 +5143,9 @@ impl Launch {
 
         if let Some(rootfs) = options.rootfs {
             builder = builder.rootfs(rootfs);
+        }
+        if options.empty_rootfs {
+            builder = builder.empty_rootfs();
         }
         // An overlay root, when the run named one. Parse-time validation has
         // already established that a lower and an upper are both present and
@@ -8462,6 +8523,75 @@ mod tests {
         assert_eq!(parse_priority("required").unwrap(), Priority::Required);
         assert_eq!(parse_priority("optional").unwrap(), Priority::Optional);
         assert!(parse_priority("urgent").is_err());
+    }
+
+    #[test]
+    fn an_empty_root_is_composed_by_the_mount_flags_and_stands_alone() {
+        let options = run_options(&[
+            "--empty-rootfs",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/bin",
+            "/bin",
+            "/bin/true",
+        ]);
+        assert!(options.empty_rootfs);
+        // The link takes its place in the one mount sequence, after the bind.
+        let [Mount::Bind(_), Mount::Symlink(link)] = &options.mounts[..] else {
+            panic!("a bind then a link: {:?}", options.mounts);
+        };
+        assert_eq!(link.get_target(), Path::new("usr/bin"));
+        assert_eq!(link.get_path(), Path::new("/bin"));
+
+        for args in [
+            ["--empty-rootfs", "--rootfs", "/r", "/bin/true"].as_slice(),
+            [
+                "--empty-rootfs",
+                "--overlay-lower",
+                "/l",
+                "--overlay-upper",
+                "/u",
+                "/bin/true",
+            ]
+            .as_slice(),
+        ] {
+            let error = parse_error(args);
+            assert!(error.contains("are alternatives"), "{args:?}: {error}");
+        }
+        for (args, flag) in [
+            (
+                [
+                    "--restrict",
+                    "--empty-rootfs",
+                    "--landlock-ro",
+                    "/usr",
+                    "/bin/true",
+                ]
+                .as_slice(),
+                "--empty-rootfs",
+            ),
+            (
+                [
+                    "--restrict",
+                    "--symlink",
+                    "a",
+                    "/b",
+                    "--landlock-ro",
+                    "/usr",
+                    "/bin/true",
+                ]
+                .as_slice(),
+                "--symlink",
+            ),
+        ] {
+            let error = parse_error(args);
+            assert!(
+                error.contains(flag) && error.contains("--restrict"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

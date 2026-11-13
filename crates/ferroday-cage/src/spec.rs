@@ -18,7 +18,7 @@ use crate::limits::{Limit, Resource};
 use crate::mechanism::{
     self, Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction,
     MountDir, MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, PresentPlan,
-    RlimitPlan, RunAsPlan, StdioPlan,
+    RlimitPlan, RootPlan, RunAsPlan, StdioPlan,
 };
 use crate::observer::{Observer, Output};
 use crate::path;
@@ -77,6 +77,8 @@ const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
 ///
 /// A mount over a directory above the target claims it too when what arrives
 /// there is a tree that already stood elsewhere: a bind, or a raw bind or move.
+/// So does a [`Mount::Symlink`] at a directory above it, which sends the
+/// target's path wherever the link points.
 /// The managed bind's target would otherwise be created inside that tree, which
 /// is the caller's host directory: an empty file left there for good, or a
 /// launch that fails where the bind is read-only. A fresh filesystem mounted
@@ -90,7 +92,9 @@ const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
 /// nothing, since no sandbox is built with it.
 fn claims_resolv_conf(mount: &Mount) -> bool {
     let arrival = match mount {
-        Mount::Bind(_) => Some(Arrival::Tree),
+        // A link at the target or above it decides what the path names, as a
+        // tree mounted there would.
+        Mount::Bind(_) | Mount::Symlink(_) => Some(Arrival::Tree),
         Mount::Raw(raw) => u32::try_from(raw.flags)
             .ok()
             .and_then(|flags| Arrival::of_raw(MountFlags::from_bits_retain(flags))),
@@ -804,17 +808,72 @@ impl Bind {
     }
 }
 
-/// One mount a consumer adds to a sandbox: a bind, or a raw mount.
+/// One symbolic link a sandbox creates: a link at a path inside, pointing at a
+/// target.
+///
+/// Added with [`CageBuilder::symlink`], or as a `[[mount]]` table with
+/// `kind = "symlink"` in a profile, and read back through
+/// [`CageBuilder::get_mounts`]. It takes its place in the mount sequence, so a
+/// link is made after the mounts declared before it and before those declared
+/// after. That is what lays out the links of a root composed from binds, such
+/// as `/bin` pointing at `usr/bin` beside a bind of the host's `/usr`.
+///
+/// The link is made in whatever holds its path at that point: an
+/// [empty root](CageBuilder::empty_rootfs), a tmpfs mounted earlier, or a
+/// plain rootfs on the host, where it stays after the sandbox exits. A path
+/// that already holds a link with the same target is left as it is, so a
+/// sandbox over a persistent rootfs launches again. Anything else at the path
+/// fails the launch.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case", deny_unknown_fields)
+)]
+pub struct Symlink {
+    target: PathBuf,
+    path: PathBuf,
+}
+
+impl Symlink {
+    /// Returns a link at `path`, an absolute path inside the sandbox, pointing
+    /// at `target`.
+    ///
+    /// The target is written into the link as given, in the order `ln -s`
+    /// takes them. A relative target resolves from the link's directory, and
+    /// an absolute one inside the sandbox, as every link the command follows
+    /// does. [`CageBuilder::symlink`] is the ordinary way to add one.
+    pub fn new(target: impl AsRef<Path>, path: impl AsRef<Path>) -> Symlink {
+        Symlink {
+            target: target.as_ref().to_path_buf(),
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    /// The path the link points at, as written.
+    pub fn get_target(&self) -> &Path {
+        &self.target
+    }
+
+    /// The link's own path inside the sandbox.
+    pub fn get_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// One mount a consumer adds to a sandbox: a bind, a raw mount, or a symbolic
+/// link.
 ///
 /// The sandbox applies these in the order they are declared, after the
-/// managed mount profile. Holding both kinds in one sequence is what makes
+/// managed mount profile. Holding every kind in one sequence is what makes
 /// that order expressible: a raw tmpfs and the binds that populate it can be
 /// interleaved, which a bind-then-raw arrangement cannot express.
 ///
-/// Added with [`CageBuilder::bind`], [`CageBuilder::bind_ro`], and
-/// [`CageBuilder::raw_mount`], whole with [`CageBuilder::mount`] and
-/// [`CageBuilder::mounts`], or as a `[[mount]]` table in a profile, and read
-/// back through [`CageBuilder::get_mounts`].
+/// Added with [`CageBuilder::bind`], [`CageBuilder::bind_ro`],
+/// [`CageBuilder::raw_mount`], and [`CageBuilder::symlink`], whole with
+/// [`CageBuilder::mount`] and [`CageBuilder::mounts`], or as a `[[mount]]`
+/// table in a profile, and read back through [`CageBuilder::get_mounts`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -827,14 +886,22 @@ pub enum Mount {
     Bind(Bind),
     /// A raw mount, passed to the kernel verbatim.
     Raw(RawMount),
+    /// A symbolic link, created in the sandbox's filesystem.
+    Symlink(Symlink),
 }
 
 impl Mount {
     /// The path inside the sandbox the mount is established at.
+    ///
+    /// For a [`Symlink`](Self::Symlink) this is the link itself, not the path
+    /// it points at, as [`ResolvedMount::get_target`] reports it.
+    ///
+    /// [`ResolvedMount::get_target`]: crate::ResolvedMount::get_target
     pub fn get_target(&self) -> &Path {
         match self {
             Mount::Bind(bind) => bind.get_target(),
             Mount::Raw(raw) => raw.get_target(),
+            Mount::Symlink(symlink) => symlink.get_path(),
         }
     }
 }
@@ -1076,6 +1143,8 @@ impl Overlay {
 )]
 pub struct CageBuilder {
     rootfs: Option<PathBuf>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
+    empty_rootfs: bool,
     command: Option<PathBuf>,
     #[cfg_attr(
         feature = "serde",
@@ -1224,6 +1293,7 @@ impl Default for CageBuilder {
     fn default() -> Self {
         CageBuilder {
             rootfs: None,
+            empty_rootfs: false,
             command: None,
             args: Vec::new(),
             network: Network::default(),
@@ -1262,9 +1332,11 @@ impl CageBuilder {
     ///
     /// The path is resolved and opened by [`build`](Self::build); it must
     /// exist, be a directory, and not be the host root. Setting a plain rootfs
-    /// supersedes an [`overlay_rootfs`](Self::overlay_rootfs) call, and the
-    /// reverse; the last call wins. A consumer overriding an untrusted profile's
-    /// rootfs therefore clears any overlay it configured along with it.
+    /// supersedes an [`overlay_rootfs`](Self::overlay_rootfs) or an
+    /// [`empty_rootfs`](Self::empty_rootfs) call, and either of those
+    /// supersedes it; the last call wins. A consumer overriding an untrusted
+    /// profile's rootfs therefore clears any other root it configured along
+    /// with it.
     ///
     /// The rootfs must live under a directory the calling user controls, not a
     /// world-writable one. The launch resolves the path a second time inside the
@@ -1276,6 +1348,48 @@ impl CageBuilder {
     pub fn rootfs(mut self, path: impl AsRef<Path>) -> Self {
         self.rootfs = Some(path.as_ref().to_path_buf());
         self.overlay = None;
+        self.empty_rootfs = false;
+        self
+    }
+
+    /// Roots the sandbox on an empty filesystem of its own, which the mount
+    /// profile populates.
+    ///
+    /// The root is a tmpfs the sandbox mounts inside its own mount namespace,
+    /// so no directory on the host is needed for it and nothing is written
+    /// there. It holds only what the launch makes in it: the managed `/proc`,
+    /// `/dev` and `/tmp`, the targets of the caller's mounts, and the caller's
+    /// [`symlink`](Self::symlink)s. Once those are in place the root itself is
+    /// made read-only, so the command writes only where a mount lets it: a
+    /// writable bind, the managed `/tmp`, or a tmpfs added with
+    /// [`raw_mount`](Self::raw_mount).
+    ///
+    /// A command typically runs from the host's own userland, bound in
+    /// read-only, with the links a merged `/usr` layout expects:
+    ///
+    /// ```no_run
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// let cage = ferroday_cage::Cage::builder()
+    ///     .empty_rootfs()
+    ///     .bind_ro("/usr", "/usr")
+    ///     .symlink("usr/bin", "/bin")
+    ///     .symlink("usr/lib", "/lib")
+    ///     .symlink("usr/lib64", "/lib64")
+    ///     .bind("/srv/work", "/work")
+    ///     .command("/bin/sh")
+    ///     .build()?;
+    /// # let _ = cage;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Setting an empty root supersedes a plain [`rootfs`](Self::rootfs) or an
+    /// [`overlay`](Self::overlay), and either of those supersedes it; the last
+    /// call wins.
+    pub fn empty_rootfs(mut self) -> Self {
+        self.rootfs = None;
+        self.overlay = None;
+        self.empty_rootfs = true;
         self
     }
 
@@ -1309,7 +1423,8 @@ impl CageBuilder {
     /// missing. The upper's filesystem must record `user.*` extended attributes,
     /// so an on-disk filesystem (ext4, xfs, btrfs) works on Linux 5.11 and later,
     /// while a tmpfs upper needs Linux 6.6. Setting an overlay root supersedes a
-    /// plain [`rootfs`](Self::rootfs), and the reverse; the last call wins.
+    /// plain [`rootfs`](Self::rootfs) or an [`empty_rootfs`](Self::empty_rootfs),
+    /// and the reverse; the last call wins.
     ///
     /// The shorthand for [`overlay`](Self::overlay), carrying the one lower and
     /// one upper an overlay always needs. Reach for the value form to stack
@@ -1325,8 +1440,9 @@ impl CageBuilder {
     /// caller-named work directory is expressible, and further axes arrive as
     /// methods on [`Overlay`].
     ///
-    /// Setting an overlay root supersedes a plain [`rootfs`](Self::rootfs), and
-    /// the reverse; the last call wins.
+    /// Setting an overlay root supersedes a plain [`rootfs`](Self::rootfs) or an
+    /// [`empty_rootfs`](Self::empty_rootfs), and the reverse; the last call
+    /// wins.
     ///
     /// This is an unprivileged overlay mounted from inside the sandbox's user
     /// namespace, which the host must support: [`build`](Self::build) refuses a
@@ -1337,6 +1453,7 @@ impl CageBuilder {
     /// [Where the upper lives](Overlay#where-the-upper-lives).
     pub fn overlay(mut self, overlay: Overlay) -> Self {
         self.rootfs = None;
+        self.empty_rootfs = false;
         self.overlay = Some(overlay);
         self
     }
@@ -1752,19 +1869,30 @@ impl CageBuilder {
         self
     }
 
-    /// Adds a mount of either kind, applied in declaration order with the rest.
+    /// Creates a symbolic link at `path` inside the sandbox, pointing at
+    /// `target`, in its place in the mount sequence.
+    ///
+    /// The arguments come in the order `ln -s` takes them. See [`Symlink`] for
+    /// where the link is made and what an entry already at its path does.
+    pub fn symlink(mut self, target: impl AsRef<Path>, path: impl AsRef<Path>) -> Self {
+        self.mounts.push(Mount::Symlink(Symlink::new(target, path)));
+        self
+    }
+
+    /// Adds a mount of any kind, applied in declaration order with the rest.
     ///
     /// The counterpart of [`get_mounts`](Self::get_mounts), for a caller that
     /// holds a [`Mount`] rather than its parts: one read back from another
     /// builder, or one assembled with [`Bind::new`]. A [`Mount::Bind`] is the
     /// [`bind`](Self::bind) or [`bind_ro`](Self::bind_ro) its read-only flag
-    /// names, and a [`Mount::Raw`] is a [`raw_mount`](Self::raw_mount).
+    /// names, a [`Mount::Raw`] is a [`raw_mount`](Self::raw_mount), and a
+    /// [`Mount::Symlink`] is a [`symlink`](Self::symlink).
     pub fn mount(mut self, mount: Mount) -> Self {
         self.mounts.push(mount);
         self
     }
 
-    /// Adds mounts of either kind, in iteration order, after those already
+    /// Adds mounts of any kind, in iteration order, after those already
     /// configured.
     ///
     /// Repeated [`mount`](Self::mount) calls, so a sequence read back through
@@ -1972,10 +2100,16 @@ impl CageBuilder {
     /// The configured rootfs, when a plain one is set.
     ///
     /// `None` for an overlay-rooted cage, whose base is the first lower of
-    /// [`get_overlay`](Self::get_overlay), and for a builder with no root at
+    /// [`get_overlay`](Self::get_overlay), for an
+    /// [empty root](Self::get_empty_rootfs), and for a builder with no root at
     /// all — which [`build`](Self::build) rejects.
     pub fn get_rootfs(&self) -> Option<&Path> {
         self.rootfs.as_deref()
+    }
+
+    /// Whether the sandbox is rooted on an [empty root](Self::empty_rootfs).
+    pub fn get_empty_rootfs(&self) -> bool {
+        self.empty_rootfs
     }
 
     /// The configured overlay root, when one is set.
@@ -2013,7 +2147,7 @@ impl CageBuilder {
     ///
     /// This is the whole picture. [`get_binds`](Self::get_binds) and
     /// [`get_raw_mounts`](Self::get_raw_mounts) narrow it to one kind, at the
-    /// cost of the relative order between the two.
+    /// cost of the relative order between the kinds.
     pub fn get_mounts(&self) -> &[Mount] {
         &self.mounts
     }
@@ -2022,7 +2156,7 @@ impl CageBuilder {
     pub fn get_binds(&self) -> impl Iterator<Item = &Bind> {
         self.mounts.iter().filter_map(|mount| match mount {
             Mount::Bind(bind) => Some(bind),
-            Mount::Raw(_) => None,
+            Mount::Raw(_) | Mount::Symlink(_) => None,
         })
     }
 
@@ -2030,7 +2164,7 @@ impl CageBuilder {
     pub fn get_raw_mounts(&self) -> impl Iterator<Item = &RawMount> {
         self.mounts.iter().filter_map(|mount| match mount {
             Mount::Raw(raw) => Some(raw),
-            Mount::Bind(_) => None,
+            Mount::Bind(_) | Mount::Symlink(_) => None,
         })
     }
 
@@ -2043,9 +2177,10 @@ impl CageBuilder {
     /// [`resolv_conf`](Self::resolv_conf) setting, with the managed-mount
     /// master switch folded in, and with the caller's own claim on the target.
     ///
-    /// A mount of the caller's at `/etc/resolv.conf`, or a host tree bound or
-    /// moved over a directory above it, replaces the bind, so this answers
-    /// `false` for a sandbox carrying one. The library acts on this only under
+    /// A mount or a symlink of the caller's at `/etc/resolv.conf`, a host tree
+    /// bound or moved over a directory above it, or a symlink at such a
+    /// directory, replaces the bind, so this answers `false` for a sandbox
+    /// carrying one. The library acts on this only under
     /// [`Network::Host`]. A caller that composes resolver configuration of its
     /// own, as `fcage` does for a native-stack run, reads it to honor the same
     /// opt-outs and to yield to the same mounts.
@@ -2194,19 +2329,30 @@ impl CageBuilder {
         let resolv_conf = self.get_resolv_conf();
         let base_env = self.base_env.unwrap_or(true);
 
-        // Exactly one root is in force: a plain rootfs, or an overlay whose
-        // first lower is the base the overlay mounts over. The builder's
-        // setters keep the two exclusive, but a deserialized profile can carry
-        // both keys; taking either one would silently discard the other's
-        // configuration, so a profile that names both is refused.
+        // Exactly one root is in force: a plain rootfs, an overlay whose first
+        // lower is the base the overlay mounts over, or an empty root, which
+        // has no host path at all. The builder's setters keep them exclusive,
+        // but a deserialized profile can carry several keys; taking one would
+        // silently discard the others' configuration, so a profile that names
+        // two is refused.
+        let named = [
+            self.rootfs.is_some(),
+            self.overlay.is_some(),
+            self.empty_rootfs,
+        ];
+        if named.into_iter().filter(|&named| named).count() > 1 {
+            return Err(ConfigError::RootContradiction.into());
+        }
         let rootfs = match (&self.rootfs, &self.overlay) {
-            (Some(_), Some(_)) => return Err(ConfigError::RootContradiction.into()),
-            (Some(rootfs), None) => rootfs.clone(),
-            (None, Some(overlay)) => overlay
-                .lower
-                .first()
-                .ok_or(ConfigError::OverlayLowerMissing)?
-                .clone(),
+            (Some(rootfs), _) => Some(rootfs.clone()),
+            (None, Some(overlay)) => Some(
+                overlay
+                    .lower
+                    .first()
+                    .ok_or(ConfigError::OverlayLowerMissing)?
+                    .clone(),
+            ),
+            (None, None) if self.empty_rootfs => None,
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
         let command = validate_command(self.command, Some(self.path_lookup))?;
@@ -2251,30 +2397,7 @@ impl CageBuilder {
             .transpose()?
             .flatten();
 
-        // Resolve the rootfs to a canonical directory and prove it can be
-        // opened as one, so a missing or unusable rootfs is a typed
-        // configuration error here, before any fork. The launch itself
-        // resolves the canonical path again inside the new mount namespace,
-        // where descriptors opened here could not anchor the mounts.
-        let canonical = std::fs::canonicalize(&rootfs).map_err(|err| {
-            Error::from(ConfigError::RootfsUnusable {
-                path: rootfs.clone(),
-                source: err,
-            })
-        })?;
-        if canonical.parent().is_none() {
-            return Err(ConfigError::RootfsIsHostRoot.into());
-        }
-        rustix::fs::open(
-            &canonical,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| ConfigError::RootfsUnusable {
-            path: rootfs.clone(),
-            source: errno.into(),
-        })?;
-        let rootfs_path = cstring(canonical.as_os_str())?;
+        let canonical = rootfs.as_deref().map(canonical_rootfs).transpose()?;
 
         let mut unshare = UnshareFlags::NEWUSER
             | UnshareFlags::NEWNS
@@ -2320,6 +2443,7 @@ impl CageBuilder {
             match mount {
                 Mount::Bind(bind) => lowering.push_bind(bind)?,
                 Mount::Raw(raw) => lowering.push_raw(raw)?,
+                Mount::Symlink(symlink) => lowering.push_symlink(symlink)?,
             }
         }
         // The managed `resolv.conf` bind, which `resolv_conf` above already
@@ -2421,37 +2545,48 @@ impl CageBuilder {
             hardening
         };
 
-        // An overlay root: `canonical` is the base lower the overlay mounts
-        // over, any further lowers are resolved beside it, and the caller's
-        // upper — with its work directory — is prepared and frozen into the
-        // mount options here, so the sandbox stage only replays them. A host
-        // that cannot establish an unprivileged overlay is refused now, before
-        // any fork. This is the one step that creates anything on the host, so
-        // it runs once every other part of the configuration has been accepted:
-        // a build refused for any other reason leaves no layer directory behind.
-        let overlay = self
-            .overlay
-            .as_ref()
-            .map(|overlay| build_overlay_plan(&canonical, overlay))
-            .transpose()?;
-
-        // Every mount target the launch has to create as an empty file, as the
-        // host path it comes to rest at. A file the sandbox creates only to
-        // mount over is not part of the root, so the caller side takes it away
-        // once the sandbox is gone. Writes land in the root filesystem itself
-        // for a plain root and in the upper for an overlay root, whose pivoted
-        // root is the merged view. Both are canonical paths, so a root the
-        // caller named relatively does not leave a path that re-resolves
-        // against whatever directory the process happens to be in when the
-        // handle drops.
-        let root = match &overlay {
-            Some(plan) => RootLayers::Overlay {
-                upper: &plan.upper,
-                lower: &plan.lower,
-            },
-            None => RootLayers::Plain(&canonical),
+        // The root, with every mount target the launch has to create in it as
+        // an empty file, as the host path it comes to rest at. A file the
+        // sandbox creates only to mount over is not part of the root, so the
+        // caller side takes it away once the sandbox is gone. Writes land in
+        // the root filesystem itself for a plain root and in the upper for an
+        // overlay root, whose pivoted root is the merged view. Both are
+        // canonical paths, so a root the caller named relatively does not leave
+        // a path that re-resolves against whatever directory the process
+        // happens to be in when the handle drops. An empty root is the
+        // sandbox's own: what the launch creates in it goes with it, and none
+        // of it has a host path.
+        let (root, managed_placeholders) = match &canonical {
+            None => (RootPlan::Empty, ManagedPlaceholders::default()),
+            Some(canonical) => {
+                let base = cstring(canonical.as_os_str())?;
+                match &self.overlay {
+                    None => (
+                        RootPlan::Bind(base),
+                        created_file_targets(&lowering.ops, &RootLayers::Plain(canonical)),
+                    ),
+                    // An overlay root: `canonical` is the base lower the
+                    // overlay mounts over, any further lowers are resolved
+                    // beside it, and the caller's upper — with its work
+                    // directory — is prepared and frozen into the mount options
+                    // here, so the sandbox stage only replays them. A host that
+                    // cannot establish an unprivileged overlay is refused now,
+                    // before any fork. This is the one step that creates
+                    // anything on the host, so it runs once every other part of
+                    // the configuration has been accepted: a build refused for
+                    // any other reason leaves no layer directory behind.
+                    Some(overlay) => {
+                        let overlay = build_overlay_plan(canonical, overlay)?;
+                        let layers = RootLayers::Overlay {
+                            upper: &overlay.upper,
+                            lower: &overlay.lower,
+                        };
+                        let placeholders = created_file_targets(&lowering.ops, &layers);
+                        (RootPlan::Overlay { base, overlay }, placeholders)
+                    }
+                }
+            }
         };
-        let managed_placeholders = created_file_targets(&lowering.ops, &root);
 
         Ok(Cage {
             plan: LaunchPlan {
@@ -2464,8 +2599,7 @@ impl CageBuilder {
                 program_search,
                 args,
                 env,
-                rootfs_path,
-                overlay,
+                root,
                 unshare,
                 pid_namespace: self.pid_namespace,
                 // Lower each disposition into the plan's own form; the descriptor
@@ -2645,6 +2779,9 @@ impl CageBuilder {
             // Bounded by the calling user's own authority, and allowed. See
             // this type's documentation for what a profile still governs.
             rootfs: _,
+            // A tmpfs of the sandbox's own maps nothing of the host in; what
+            // the profile could then put in it, it could not bind there.
+            empty_rootfs: _,
             command: _,
             args: _,
             hostname: _,
@@ -2688,7 +2825,9 @@ impl CageBuilder {
         } = self;
 
         // Reported by kind rather than as one "a mount" refusal, so the message
-        // names the operation the profile actually asked for.
+        // names the operation the profile actually asked for. A symlink is
+        // allowed: it maps nothing in, and what it makes on a plain rootfs the
+        // command could make there itself.
         if mounts.iter().any(|mount| matches!(mount, Mount::Bind(_))) {
             return Err(ConfigError::ProfileOperationForbidden {
                 operation: "a bind mount",
@@ -3884,6 +4023,44 @@ impl Lowering {
         Ok(())
     }
 
+    /// A caller's symbolic link, made in whatever holds its parent directory
+    /// once the ops before it have run.
+    fn push_symlink(&mut self, symlink: &Symlink) -> Result<(), Error> {
+        let components = sandbox_path_components(&symlink.path)?;
+        let (leaf, parents) = components
+            .split_last()
+            .expect("a mount target names at least one component");
+        // The kernel refuses an empty target, and one that does not fit a path
+        // with its terminator, so either is refused here with its name. The
+        // launch reads an existing link back into a buffer of this size, which
+        // a target filling it could not be told apart from a longer one in.
+        let target = symlink.target.as_os_str();
+        if target.is_empty() || target.len() >= mechanism::bounds::LINK_BUF {
+            return Err(ConfigError::SymlinkTargetInvalid {
+                path: symlink.path.clone(),
+                target: symlink.target.clone(),
+            }
+            .into());
+        }
+        self.push(
+            MountOp {
+                dirs: dir_chain(parents, DIR_MODE)?,
+                create_file: None,
+                action: MountAction::Symlink {
+                    parent: rel_cstring(parents)?,
+                    leaf: cstring(leaf)?,
+                    content: cstring(target)?,
+                },
+            },
+            format!(
+                "symlink at {} to {}",
+                symlink.path.display(),
+                symlink.target.display()
+            ),
+        );
+        Ok(())
+    }
+
     /// The host's `resolv.conf`, bound read-only over the rootfs's own.
     ///
     /// Resolving the host's `resolv.conf` can fail — it is commonly a symlink
@@ -4121,6 +4298,30 @@ fn merged_presence(layers: &[Option<Rooted>], relative: &Path) -> Presence {
 /// The bare root is refused on top of what [`path::absolute_components`]
 /// refuses: a mount target names something *inside* the rootfs, and the rootfs
 /// itself is what the target would be established over.
+/// Resolves a configured rootfs to the canonical directory a launch roots on,
+/// and proves it can be opened as one, so a missing or unusable rootfs is a
+/// typed configuration error at build rather than a launch failure.
+///
+/// The launch resolves the canonical path again inside the new mount
+/// namespace, where a descriptor opened here could not anchor the mounts.
+fn canonical_rootfs(rootfs: &Path) -> Result<PathBuf, Error> {
+    let unusable = |source: std::io::Error| ConfigError::RootfsUnusable {
+        path: rootfs.to_path_buf(),
+        source,
+    };
+    let canonical = std::fs::canonicalize(rootfs).map_err(unusable)?;
+    if canonical.parent().is_none() {
+        return Err(ConfigError::RootfsIsHostRoot.into());
+    }
+    rustix::fs::open(
+        &canonical,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| unusable(errno.into()))?;
+    Ok(canonical)
+}
+
 fn sandbox_path_components(path: &Path) -> Result<Vec<&OsStr>, Error> {
     let invalid = || {
         Error::from(ConfigError::MountTargetInvalid {
@@ -4851,6 +5052,78 @@ mod tests {
     }
 
     #[test]
+    fn the_last_root_call_wins_among_all_three() {
+        let empty = Cage::builder()
+            .rootfs("/srv/rootfs")
+            .overlay_rootfs("/srv/base", "/tmp/upper")
+            .empty_rootfs();
+        assert!(empty.get_empty_rootfs());
+        assert!(empty.get_rootfs().is_none() && empty.get_overlay().is_none());
+
+        let plain = empty.clone().rootfs("/srv/rootfs");
+        assert!(!plain.get_empty_rootfs());
+        let overlaid = empty.overlay_rootfs("/srv/base", "/tmp/upper");
+        assert!(!overlaid.get_empty_rootfs());
+    }
+
+    #[test]
+    fn an_empty_root_plans_no_placeholders() {
+        // A file bind's target is created in the root, which for an empty
+        // root is the sandbox's own and leaves nothing on the host to remove.
+        let source = Scratch::new("empty-root-placeholders");
+        std::fs::write(source.join("file"), b"").unwrap();
+        let cage = Cage::builder()
+            .empty_rootfs()
+            .bind_ro(source.join("file"), "/etc/file")
+            .command("/bin/sh")
+            .build()
+            .expect("a valid sandbox configuration");
+        assert!(matches!(cage.plan.root, RootPlan::Empty));
+        assert!(cage.plan.managed_placeholders.is_empty());
+        assert!(cage.plan.ops.iter().any(|op| op.create_file.is_some()));
+    }
+
+    #[test]
+    fn a_symlink_is_validated_at_build() {
+        let build = |target: &OsStr, path: &str| {
+            Cage::builder()
+                .empty_rootfs()
+                .symlink(target, path)
+                .command("/bin/sh")
+                .build()
+        };
+        let long = OsString::from("a".repeat(mechanism::bounds::LINK_BUF));
+        for target in [OsStr::new(""), long.as_os_str()] {
+            let err = build(target, "/bin").unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::SymlinkTargetInvalid { .. })),
+                "{err}"
+            );
+        }
+        for path in ["/", "bin", "/usr/../bin"] {
+            let err = build(OsStr::new("usr/bin"), path).unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::MountTargetInvalid { .. })),
+                "{path}: {err}"
+            );
+        }
+        // The longest target a link can hold is accepted.
+        let longest = OsString::from("a".repeat(mechanism::bounds::LINK_BUF - 1));
+        build(&longest, "/bin").expect("a target one short of the buffer fits");
+    }
+
+    #[test]
+    fn a_symlink_at_or_above_resolv_conf_claims_it() {
+        let host = Cage::builder().rootfs("/tmp").network(Network::Host);
+        assert!(host.get_resolv_conf());
+        for path in ["/etc/resolv.conf", "/etc"] {
+            let linked = host.clone().symlink("/run/resolver", path);
+            assert!(!linked.get_resolv_conf(), "{path}");
+        }
+        assert!(host.symlink("/run/x", "/etc/hosts").get_resolv_conf());
+    }
+
+    #[test]
     fn a_built_cage_clones_its_frozen_plan() {
         let cage = sh_in("/tmp").arg("-c").arg("true").build().unwrap();
         let clone = cage.clone();
@@ -4858,7 +5131,10 @@ mod tests {
         // and arguments; the original is untouched and both remain usable.
         assert_eq!(clone.plan.program, cage.plan.program);
         assert_eq!(clone.plan.args, cage.plan.args);
-        assert_eq!(clone.plan.rootfs_path, cage.plan.rootfs_path);
+        assert!(matches!(
+            (&clone.plan.root, &cage.plan.root),
+            (RootPlan::Bind(cloned), RootPlan::Bind(original)) if cloned == original
+        ));
     }
 
     #[test]
@@ -6930,7 +7206,7 @@ access = "c"
     /// than the curated policy, once per side, since a table allows or denies
     /// and never both.
     #[cfg(feature = "hardening")]
-    const OTHER_FORM_PROFILES: [&str; 2] = [
+    const OTHER_FORM_PROFILES: [&str; 3] = [
         r#"
 [hardening]
 drop-caps = true
@@ -6960,6 +7236,14 @@ len = "qword"
 op = "eq"
 value = 268435456
 "#,
+        r#"
+empty-rootfs = true
+
+[[mount]]
+kind = "symlink"
+target = "usr/bin"
+path = "/bin"
+"#,
     ];
 
     /// Every value `network` can take, as a profile spells it.
@@ -6984,10 +7268,11 @@ value = 268435456
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 90] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 92] = [
         "args",
         "base-env",
         "command",
+        "empty-rootfs",
         "env",
         "env.PATH",
         "hardening",
@@ -7040,6 +7325,7 @@ value = 268435456
         "mount[].flags",
         "mount[].fstype",
         "mount[].kind",
+        "mount[].path",
         "mount[].read-only",
         "mount[].source",
         "mount[].target",
@@ -7669,6 +7955,60 @@ read-only = true
     }
 
     #[test]
+    fn a_profile_naming_an_empty_root_beside_another_root_is_refused() {
+        for other in [
+            "rootfs = \"/srv/alpine\"\n",
+            "[overlay]\nlower = [\"/srv/base\"]\n",
+        ] {
+            let profile = format!("empty-rootfs = true\ncommand = \"/bin/sh\"\n{other}");
+            let builder: CageBuilder = toml::from_str(&profile).expect("the profile parses");
+            let err = builder.build().unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::RootContradiction)),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restricted_profile_accepts_an_empty_root_and_its_links() {
+        // Neither maps anything of the host in.
+        let profile = "empty-rootfs = true\ncommand = \"/bin/sh\"\n\n\
+                       [[mount]]\nkind = \"symlink\"\ntarget = \"usr/bin\"\npath = \"/bin\"\n";
+        let builder = toml::from_str::<RestrictedProfile>(profile)
+            .expect("the restricted policy admits both")
+            .into_builder();
+        assert!(builder.get_empty_rootfs());
+        let inputs = builder.build().expect("a valid sandbox").resolved_inputs();
+        assert!(matches!(inputs.root, crate::ResolvedRoot::Empty));
+        assert!(inputs.mounts.iter().any(|mount| matches!(
+            mount,
+            crate::ResolvedMount::Symlink { path, target }
+                if path == Path::new("/bin") && target == Path::new("usr/bin")
+        )));
+    }
+
+    #[test]
+    fn an_empty_root_and_its_links_round_trip() {
+        let builder = Cage::builder()
+            .empty_rootfs()
+            .symlink("usr/lib", "/lib")
+            .command("/bin/sh");
+        let rendered = toml::to_string(&builder).expect("the builder serializes");
+        assert!(rendered.starts_with("empty-rootfs = true\n"), "{rendered}");
+        let reparsed: CageBuilder = toml::from_str(&rendered).expect("the profile parses back");
+        assert!(reparsed.get_empty_rootfs());
+        let [Mount::Symlink(symlink)] = reparsed.get_mounts() else {
+            panic!("one symlink: {:?}", reparsed.get_mounts());
+        };
+        assert_eq!(symlink.get_target(), Path::new("usr/lib"));
+        assert_eq!(symlink.get_path(), Path::new("/lib"));
+        // A plain root renders no empty-rootfs key at all.
+        let plain = toml::to_string(&Cage::builder().rootfs("/srv")).unwrap();
+        assert!(!plain.contains("empty-rootfs"), "{plain}");
+    }
+
+    #[test]
     fn an_overlay_without_a_lower_names_what_is_missing() {
         // "no rootfs was provided" reads as an oversight to an author who
         // provided an overlay table and forgot its base layer.
@@ -7937,14 +8277,10 @@ read-only = true
             }
             Err(err) => panic!("unexpected error: {err}"),
         };
-        let options = cage
-            .plan
-            .overlay
-            .as_ref()
-            .unwrap()
-            .options
-            .to_str()
-            .unwrap();
+        let RootPlan::Overlay { overlay, .. } = &cage.plan.root else {
+            panic!("an overlay-rooted cage plans an overlay root");
+        };
+        let options = overlay.options.to_str().unwrap();
         let canonical = std::fs::canonicalize(&*scratch).unwrap();
         let canonical = canonical.to_str().unwrap();
         assert_eq!(

@@ -1405,3 +1405,94 @@ fn a_launch_that_fails_after_the_mounts_leaves_no_placeholder_behind() {
         "a failed launch left its bind target behind",
     );
 }
+
+/// Binds the fixture's userland read-only into whatever root `builder` names.
+fn fixture_userland(
+    builder: ferroday_cage::CageBuilder,
+    rootfs: &Path,
+) -> ferroday_cage::CageBuilder {
+    ["bin", "lib", "usr"]
+        .into_iter()
+        .fold(builder, |builder, dir| {
+            builder.bind_ro(rootfs.join(dir), format!("/{dir}"))
+        })
+}
+
+#[test]
+fn an_empty_root_holds_only_what_the_profile_makes_and_is_read_only() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let work = common::scratch_dir("empty-root-work");
+    // The root's own mount, from the sandbox's mount table: its filesystem type
+    // and its first option, which is `ro` or `rw`.
+    let root_mount = r"sed -n 's|^[^ ]* [^ ]* [^ ]* / / \([^ ,]*\).* - \([^ ]*\) .*|\2 \1|p' /proc/self/mountinfo";
+    let script = format!(
+        "ls /; readlink /sbin; /sbin/busybox true && echo through-the-link; \
+         mkdir /made 2>/dev/null || echo root-read-only; \
+         touch /tmp/made && echo tmp-writable; echo out > /work/out; \
+         test -s /etc/alpine-release && echo file-bound; {root_mount}"
+    );
+    // A file bind's target is created in the root and held open for the
+    // launch's lock, which must not keep the root from turning read-only.
+    let cage = fixture_userland(Cage::builder().empty_rootfs(), rootfs)
+        .symlink("bin", "/sbin")
+        .bind(&work, "/work")
+        .bind_ro(rootfs.join("etc/alpine-release"), "/etc/alpine-release")
+        .command("/bin/sh")
+        .args(["-c", &script])
+        .build()
+        .expect("a valid sandbox configuration");
+    assert!(matches!(
+        cage.resolved_inputs().root,
+        ferroday_cage::ResolvedRoot::Empty
+    ));
+
+    let output = cage.output().expect("the sandbox runs");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "bin\ndev\netc\nlib\nproc\nsbin\ntmp\nusr\nwork\n\
+         bin\nthrough-the-link\nroot-read-only\ntmp-writable\nfile-bound\ntmpfs ro\n",
+    );
+    assert_eq!(std::fs::read(work.join("out")).unwrap(), b"out\n");
+}
+
+#[test]
+fn a_symlink_already_standing_is_kept_and_anything_else_is_refused() {
+    let Some(rootfs) = common::scratch_rootfs("symlink-relaunch") else {
+        return;
+    };
+    let launch = |target: &str| {
+        Cage::builder()
+            .rootfs(&rootfs)
+            .symlink(target, "/opt/linked")
+            .command("/bin/sh")
+            .args(["-c", "readlink /opt/linked"])
+            .build()
+            .expect("a valid sandbox configuration")
+            .output()
+    };
+    // A plain root keeps the link, and a second launch finds it standing.
+    for _ in 0..2 {
+        let output = launch("../bin").expect("the sandbox runs");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"../bin\n");
+    }
+    assert_eq!(
+        std::fs::read_link(rootfs.join("opt/linked")).unwrap(),
+        Path::new("../bin"),
+    );
+
+    let err = launch("../sbin").expect_err("a link to elsewhere holds the path");
+    assert!(
+        matches!(
+            err,
+            Error::Setup {
+                step: SetupStep::CreateSymlink,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}

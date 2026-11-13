@@ -2,9 +2,9 @@
 //! own carries, which refuses the routes out that a network namespace does not
 //! cover: vsock, io_uring, and on x86 the socket creation `socketcall` hides.
 //!
-//! The probe is this test binary, run again inside a sandbox whose root is the
-//! host's own userland, bound read-only, so the calls under test are made
-//! directly rather than through a tool that might not make them. A probe run
+//! The probe is this test binary, run again inside a sandbox on an empty root
+//! holding the host's own userland, bound read-only, so the calls under test
+//! are made directly rather than through a tool that might not make them. A probe run
 //! prints one line per route. Each test compares a sandbox under
 //! [`Network::Host`], which carries no filter, with the postures that do, so a
 //! refusal the host's kernel would have made anyway is told apart from one the
@@ -15,9 +15,9 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use ferroday_cage::{Cage, Network};
+use ferroday_cage::{Cage, CageBuilder, Network};
 
 /// Set inside the sandbox to make a probe test probe rather than return.
 const PROBE: &str = "FERRODAY_CAGE_TEST_NETWORK_FILTER_PROBE";
@@ -179,13 +179,11 @@ fn probe_compat() {
     println!("probe done");
 }
 
-/// A root holding nothing of its own, in the scratch directory `name`: the
-/// host's userland is bound into it read-only, and the merged-`/usr` links are
-/// recreated as the host has them, so this test binary runs inside as it runs
-/// outside.
-fn host_userland(name: &str) -> (PathBuf, Vec<&'static str>) {
-    let root = common::scratch_dir(name);
-    let mut binds = vec!["/usr"];
+/// An empty root holding the host's userland: bound in read-only, with the
+/// merged-`/usr` links made as the host has them, so this test binary runs
+/// inside as it runs outside.
+fn host_userland() -> CageBuilder {
+    let mut builder = Cage::builder().empty_rootfs().bind_ro("/usr", "/usr");
     for top in ["/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"] {
         let path = Path::new(top);
         let Ok(meta) = path.symlink_metadata() else {
@@ -193,30 +191,24 @@ fn host_userland(name: &str) -> (PathBuf, Vec<&'static str>) {
         };
         if meta.file_type().is_symlink() {
             let target = std::fs::read_link(path).expect("a readable host link");
-            std::os::unix::fs::symlink(target, root.join(&top[1..])).expect("the link is made");
+            builder = builder.symlink(target, top);
         } else if meta.is_dir() {
-            binds.push(top);
+            builder = builder.bind_ro(top, top);
         }
     }
-    (root, binds)
+    builder
 }
 
 /// Runs the probe test `test` in a sandbox under `network`.
 fn probe(network: Network, test: &str) -> Report {
-    let (root, binds) = host_userland(&format!("network-filter-{test}-{network:?}"));
     let exe = std::env::current_exe().expect("the test binary has a path");
-    let mut builder = Cage::builder()
-        .rootfs(&root)
+    let output = host_userland()
         .command(PROBE_PATH)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(PROBE, "1")
         .network(network)
         .resolv_conf(false)
-        .bind_ro(&exe, PROBE_PATH);
-    for bind in binds {
-        builder = builder.bind_ro(bind, bind);
-    }
-    let output = builder
+        .bind_ro(&exe, PROBE_PATH)
         .build()
         .expect("a valid sandbox configuration")
         .output()

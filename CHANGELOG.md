@@ -58,6 +58,21 @@ consumer upgrading can skip it.
   exit, so it covers every process collected by then, which under a PID
   namespace includes the orphans the init collected. A kill under a PID
   namespace reports no usage.
+- `CageBuilder::empty_rootfs` roots a sandbox on an empty tmpfs of its own, for
+  a sandbox composed from binds that needs no root directory on the host. The
+  launch writes nothing on the host, and the root itself becomes read-only once
+  the mount profile is in place, while each mount in it keeps its own flags.
+  `fcage --empty-rootfs` and the profile key `empty-rootfs` reach it,
+  `ResolvedRoot::Empty` reports it, and a launch that fails to mount or seal it
+  reports `SetupStep::MountEmptyRoot` or `SetupStep::ReadOnlyEmptyRoot`. A
+  profile naming it beside another root is refused with
+  `ConfigError::RootContradiction`.
+- `CageBuilder::symlink` and `Mount::Symlink` make a symbolic link in its place
+  in the mount sequence, such as `/bin` pointing at `usr/bin` beside a bind of
+  the host's `/usr`. A link already standing with the same target is kept, so a
+  launch over a plain rootfs repeats. `fcage --symlink TARGET PATH` and a
+  `[[mount]]` entry with `kind = "symlink"` reach it, and a target that is empty
+  or too long for a path is refused with `ConfigError::SymlinkTargetInvalid`.
 
 ### Changed
 

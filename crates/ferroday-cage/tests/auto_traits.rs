@@ -33,6 +33,7 @@ const _: () = assert_send_sync::<ferroday_cage::Overlay>();
 const _: () = assert_send_sync::<ferroday_cage::Bind>();
 const _: () = assert_send_sync::<ferroday_cage::Mount>();
 const _: () = assert_send_sync::<ferroday_cage::RawMount>();
+const _: () = assert_send_sync::<ferroday_cage::Symlink>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedInputs>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedRoot>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedMount>();

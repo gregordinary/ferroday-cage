@@ -135,7 +135,7 @@
 //! [`Error::UsernsUnavailable`]: crate::Error::UsernsUnavailable
 
 use std::collections::BTreeMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use rustix::thread::UnshareFlags;
@@ -144,7 +144,7 @@ use crate::error::{ConfigError, Error};
 use crate::hardening::{FsAccess, LandlockScope, NetAccess, Request, SeccompPolicy};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
-    Confinement, HardeningPlan, IdentityPlan, LaunchPlan, ManagedPlaceholders, StdioPlan,
+    Confinement, HardeningPlan, IdentityPlan, LaunchPlan, ManagedPlaceholders, RootPlan, StdioPlan,
 };
 use crate::observer::{Observer, Output};
 use crate::running::Running;
@@ -746,8 +746,7 @@ impl RestrictionBuilder {
                 // No root is swapped and no namespace is created: the
                 // container fields stay empty and the launch runs the
                 // outside-supervised process shape.
-                rootfs_path: CString::default(),
-                overlay: None,
+                root: RootPlan::Host,
                 unshare: UnshareFlags::empty(),
                 pid_namespace: false,
                 stdin: StdioPlan::of(&self.stdin),
@@ -1209,7 +1208,7 @@ mod tests {
         assert!(!plan.configure_loopback);
         assert!(plan.hostname.is_none());
         assert!(plan.ops.is_empty() && plan.op_labels.is_empty());
-        assert!(plan.rootfs_path.is_empty());
+        assert!(matches!(plan.root, RootPlan::Host));
         assert!(matches!(plan.stdin, StdioPlan::Null));
         assert!(plan.stop_with_caller);
         assert_eq!(plan.workdir.as_deref(), Some(c"/tmp"));

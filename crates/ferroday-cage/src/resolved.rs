@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use crate::Network;
 use crate::idmap::{IdRange, Identity};
 use crate::limits::{Limit, Resource};
-use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction};
+use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction, RootPlan};
 
 /// The root, environment, mounts, and posture a built sandbox will apply.
 ///
@@ -225,6 +225,10 @@ pub enum ResolvedRoot {
         /// The work directory the overlay requires beside the upper.
         work: PathBuf,
     },
+    /// An empty root: a tmpfs of the sandbox's own, holding only what the
+    /// mount profile creates in it, and read-only once the profile is in
+    /// place. See [`CageBuilder::empty_rootfs`](crate::CageBuilder::empty_rootfs).
+    Empty,
 }
 
 /// The identity map a built sandbox's user namespace carries.
@@ -536,9 +540,10 @@ pub enum ResolvedMount {
     },
     /// A symlink created inside the rootfs.
     ///
-    /// Not a mount in the kernel's sense, but part of what the managed profile
-    /// establishes — the five `/dev` symlinks arrive this way — and so part of
-    /// the filesystem the command sees.
+    /// Not a mount in the kernel's sense, but part of what the mount profile
+    /// establishes — the five `/dev` symlinks arrive this way, as does each
+    /// [`Symlink`](crate::Symlink) of the caller's — and so part of the
+    /// filesystem the command sees.
     #[non_exhaustive]
     Symlink {
         /// The link's own path inside the sandbox.
@@ -604,23 +609,21 @@ impl ResolvedInputs {
 
 /// Projects the sandbox's root filesystem.
 ///
-/// The overlay is reported from the plan's own overlay rather than from `ops`
+/// The root is reported from the plan's own root rather than from `ops`
 /// because it is not in them: the setup establishes it before the profile's
-/// mounts, over the rootfs the plan names, which is the base lower.
+/// mounts, which land in it.
 fn project_root(plan: &LaunchPlan) -> ResolvedRoot {
-    match plan.confinement {
-        Confinement::Container => match &plan.overlay {
-            Some(overlay) => ResolvedRoot::Overlay {
-                lower: overlay.lower.clone(),
-                upper: overlay.upper.clone(),
-                work: overlay.work.clone(),
-            },
-            None => ResolvedRoot::Plain {
-                path: PathBuf::from(OsString::from_vec(plan.rootfs_path.as_bytes().to_vec())),
-            },
+    match &plan.root {
+        RootPlan::Host => ResolvedRoot::Host,
+        RootPlan::Bind(path) => ResolvedRoot::Plain {
+            path: PathBuf::from(OsString::from_vec(path.as_bytes().to_vec())),
         },
-        #[cfg(feature = "hardening")]
-        Confinement::Restriction => ResolvedRoot::Host,
+        RootPlan::Overlay { overlay, .. } => ResolvedRoot::Overlay {
+            lower: overlay.lower.clone(),
+            upper: overlay.upper.clone(),
+            work: overlay.work.clone(),
+        },
+        RootPlan::Empty => ResolvedRoot::Empty,
     }
 }
 
@@ -1075,7 +1078,11 @@ mod serde_tests {
             identity: ResolvedIdentity::Caller,
             ..everything.clone()
         };
-        vec![everything, overlaid, restricted]
+        let empty = ResolvedInputs {
+            root: ResolvedRoot::Empty,
+            ..everything.clone()
+        };
+        vec![everything, overlaid, restricted, empty]
     }
 
     /// Which variant of each of the record's enums a record holds.
@@ -1089,6 +1096,7 @@ mod serde_tests {
             ResolvedRoot::Host => "root host",
             ResolvedRoot::Plain { .. } => "root plain",
             ResolvedRoot::Overlay { .. } => "root overlay",
+            ResolvedRoot::Empty => "root empty",
         };
         let identity = match record.identity {
             ResolvedIdentity::Caller => "identity caller",
@@ -1140,6 +1148,7 @@ mod serde_tests {
                 "mount raw",
                 "mount symlink",
                 "mount tmpfs",
+                "root empty",
                 "root host",
                 "root overlay",
                 "root plain",

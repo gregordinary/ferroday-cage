@@ -183,6 +183,11 @@ wire_enum! {
         /// own carries, which refuses the routes out that the namespace does
         /// not cover. See [`Network::Isolated`](crate::Network::Isolated).
         InstallNetworkFilter = 58 => "installing the network namespace's seccomp filter",
+        /// Mount the tmpfs an empty root is made of, on top of the sandbox's
+        /// inherited root. See [`CageBuilder::empty_rootfs`](crate::CageBuilder::empty_rootfs).
+        MountEmptyRoot = 59 => "mounting the empty root",
+        /// Make an empty root read-only once the mount profile is in place.
+        ReadOnlyEmptyRoot = 60 => "making the empty root read-only",
     }
 }
 
@@ -221,18 +226,19 @@ impl fmt::Display for OverlayLayer {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// No rootfs was provided.
+    /// No root was provided: no rootfs, no overlay, and no empty root.
     RootfsMissing,
-    /// A plain rootfs and an overlay root were both configured, where exactly
-    /// one root can be in force.
+    /// More than one of a plain rootfs, an overlay root, and an empty root was
+    /// configured, where exactly one root can be in force.
     ///
-    /// The builder's setters keep the two exclusive — [`rootfs`] clears an
-    /// overlay and [`overlay`] clears a rootfs — so this arises from a profile
-    /// that carries both keys. Honoring either one silently would discard the
-    /// other's configuration.
+    /// The builder's setters keep them exclusive — each of [`rootfs`],
+    /// [`overlay`], and [`empty_rootfs`] clears the other two — so this arises
+    /// from a profile that carries more than one of their keys. Honoring one
+    /// silently would discard the others' configuration.
     ///
     /// [`rootfs`]: crate::CageBuilder::rootfs
     /// [`overlay`]: crate::CageBuilder::overlay
+    /// [`empty_rootfs`]: crate::CageBuilder::empty_rootfs
     RootContradiction,
     /// The rootfs path could not be resolved and opened as a directory.
     #[non_exhaustive]
@@ -294,12 +300,20 @@ pub enum ConfigError {
     },
     /// A mount target is not a normal absolute path inside the rootfs.
     ///
-    /// A bind or raw-mount target must be absolute, must not be `/` itself,
-    /// and must not contain `.` or `..` components.
+    /// A bind or raw-mount target, and a symlink's path, must be absolute, must
+    /// not be `/` itself, and must not contain `.` or `..` components.
     #[non_exhaustive]
     MountTargetInvalid {
         /// The target path as it was given to the builder.
         path: PathBuf,
+    },
+    /// A symbolic link's target is empty, or too long for a path.
+    #[non_exhaustive]
+    SymlinkTargetInvalid {
+        /// The link's path inside the sandbox, as it was given to the builder.
+        path: PathBuf,
+        /// The target as it was given to the builder.
+        target: PathBuf,
     },
     /// A raw mount's flags do not fit the kernel's mount-flags word.
     #[non_exhaustive]
@@ -735,10 +749,12 @@ rendered as text.
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::RootfsMissing => f.write_str("no rootfs was provided"),
+            ConfigError::RootfsMissing => {
+                f.write_str("no root was provided: set a rootfs, an overlay, or an empty rootfs")
+            }
             ConfigError::RootContradiction => f.write_str(
-                "a rootfs and an overlay root are both configured, but exactly one root is \
-                 in force; drop one of the two",
+                "more than one of a rootfs, an overlay root, and an empty rootfs is configured, \
+                 but exactly one root is in force; keep one",
             ),
             ConfigError::RootfsUnusable { path, .. } => {
                 write!(f, "cannot use {} as the rootfs", path.display())
@@ -788,6 +804,12 @@ impl fmt::Display for ConfigError {
                 f,
                 "the mount target {} is not a normal absolute path inside the rootfs",
                 path.display(),
+            ),
+            ConfigError::SymlinkTargetInvalid { path, target } => write!(
+                f,
+                "the symlink at {} has an empty target, or one too long for a path: {}",
+                path.display(),
+                target.display(),
             ),
             ConfigError::MountFlagsInvalid { target, flags } => write!(
                 f,

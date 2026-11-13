@@ -103,6 +103,27 @@ the way the layers were built. `upper` is where the sandbox's writes land, and
 discarding it reverts them. Note that a `RestrictedProfile` refuses an overlay
 root outright, for the reason [below](#untrusted-profiles).
 
+`empty-rootfs = true` roots the sandbox on an [empty
+root](how-the-sandbox-is-built.md#an-empty-root) instead, which the `[[mount]]`
+entries compose. It is the third alternative, refused beside either of the
+others:
+
+```toml
+empty-rootfs = true
+command = "/bin/sh"
+
+[[mount]]
+kind = "bind"
+source = "/usr"
+target = "/usr"
+read-only = true
+
+[[mount]]
+kind = "symlink"
+target = "usr/bin"   # what the link points at, as `ln -s` writes it
+path = "/bin"        # the link itself, inside the sandbox
+```
+
 `[env]` is a table of environment variables, added on top of the
 deterministic base (`PATH` and `HOME`) — or the whole environment, where
 `base-env = false`.
@@ -130,8 +151,10 @@ profile. The `kind` selects which fields the entry carries:
   not model: the target is validated and confined to the rootfs like every
   mount target, and the `source`, `fstype`, `flags` — the kernel's raw `MS_*`
   bits — and `data` string go to the kernel verbatim.
+- `kind = "symlink"` makes a symbolic link at `path`, pointing at `target`. The
+  link is not a mount, but it takes its place in the same order.
 
-Both kinds share one array so that their relative order is expressible. It
+Every kind shares one array so that their relative order is expressible. It
 matters whenever a mount covers a path an earlier one established: declaring a
 `raw` tmpfs on a directory and then the binds that populate it builds a
 directory whose contents the sandbox owns outright, and the reverse order

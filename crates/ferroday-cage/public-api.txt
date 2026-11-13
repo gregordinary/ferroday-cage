@@ -1621,6 +1621,9 @@ pub ferroday_cage::ConfigError::SetidCapWithNonRootIdentity::capability: &'stati
 #[non_exhaustive] pub ferroday_cage::ConfigError::StreamAttachmentConflict
 pub ferroday_cage::ConfigError::StreamAttachmentConflict::attachment: &'static str
 pub ferroday_cage::ConfigError::StreamAttachmentConflict::stream: &'static str
+#[non_exhaustive] pub ferroday_cage::ConfigError::SymlinkTargetInvalid
+pub ferroday_cage::ConfigError::SymlinkTargetInvalid::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::SymlinkTargetInvalid::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::WorkdirNotAbsolute
 pub ferroday_cage::ConfigError::WorkdirNotAbsolute::path: std::path::PathBuf
 impl core::convert::From<ferroday_cage::ConfigError> for ferroday_cage::Error
@@ -1748,6 +1751,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::LandlockScope
 #[non_exhaustive] pub enum ferroday_cage::Mount
 pub ferroday_cage::Mount::Bind(ferroday_cage::Bind)
 pub ferroday_cage::Mount::Raw(ferroday_cage::RawMount)
+pub ferroday_cage::Mount::Symlink(ferroday_cage::Symlink)
 impl ferroday_cage::Mount
 pub fn ferroday_cage::Mount::get_target(&self) -> &std::path::Path
 impl core::marker::Freeze for ferroday_cage::Mount
@@ -1926,6 +1930,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedMount
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedMount
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedMount
 #[non_exhaustive] pub enum ferroday_cage::ResolvedRoot
+pub ferroday_cage::ResolvedRoot::Empty
 pub ferroday_cage::ResolvedRoot::Host
 #[non_exhaustive] pub ferroday_cage::ResolvedRoot::Overlay
 pub ferroday_cage::ResolvedRoot::Overlay::lower: alloc::vec::Vec<std::path::PathBuf>
@@ -2050,6 +2055,7 @@ pub ferroday_cage::SetupStep::LandlockAddRule = 34
 pub ferroday_cage::SetupStep::LandlockCreateRuleset = 33
 pub ferroday_cage::SetupStep::LandlockRestrictSelf = 35
 pub ferroday_cage::SetupStep::MountDevpts = 13
+pub ferroday_cage::SetupStep::MountEmptyRoot = 59
 pub ferroday_cage::SetupStep::MountOverlayRoot = 43
 pub ferroday_cage::SetupStep::MountProc = 25
 pub ferroday_cage::SetupStep::MountRaw = 26
@@ -2065,6 +2071,7 @@ pub ferroday_cage::SetupStep::OpenMountTarget = 11
 pub ferroday_cage::SetupStep::OpenSandboxProcfs = 52
 pub ferroday_cage::SetupStep::PivotRoot = 17
 pub ferroday_cage::SetupStep::PrivatizeMounts = 7
+pub ferroday_cage::SetupStep::ReadOnlyEmptyRoot = 60
 pub ferroday_cage::SetupStep::RemountReadOnly = 15
 pub ferroday_cage::SetupStep::ReplaceSessionKeyring = 55
 pub ferroday_cage::SetupStep::ResetSignals = 22
@@ -2155,6 +2162,7 @@ pub fn ferroday_cage::CageBuilder::build(self) -> core::result::Result<ferroday_
 pub fn ferroday_cage::CageBuilder::clear_args(self) -> Self
 pub fn ferroday_cage::CageBuilder::command(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::current_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::CageBuilder::empty_rootfs(self) -> Self
 pub fn ferroday_cage::CageBuilder::env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn ferroday_cage::CageBuilder::envs<I, K, V>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = (K, V)>, K: core::convert::AsRef<std::ffi::os_str::OsStr>, V: core::convert::AsRef<std::ffi::os_str::OsStr>
 pub fn ferroday_cage::CageBuilder::get_args(&self) -> &[std::ffi::os_str::OsString]
@@ -2162,6 +2170,7 @@ pub fn ferroday_cage::CageBuilder::get_base_env(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_binds(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferroday_cage::Bind>
 pub fn ferroday_cage::CageBuilder::get_command(&self) -> core::option::Option<&std::path::Path>
 pub fn ferroday_cage::CageBuilder::get_current_dir(&self) -> core::option::Option<&std::path::Path>
+pub fn ferroday_cage::CageBuilder::get_empty_rootfs(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_envs(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&std::ffi::os_str::OsStr, &std::ffi::os_str::OsStr)>
 pub fn ferroday_cage::CageBuilder::get_hostname(&self) -> core::option::Option<&std::ffi::os_str::OsStr>
 pub fn ferroday_cage::CageBuilder::get_identity_map(&self) -> &ferroday_cage::IdentityMap
@@ -2208,6 +2217,7 @@ pub fn ferroday_cage::CageBuilder::stderr(self, ferroday_cage::Stdio) -> Self
 pub fn ferroday_cage::CageBuilder::stdin(self, ferroday_cage::Stdio) -> Self
 pub fn ferroday_cage::CageBuilder::stdout(self, ferroday_cage::Stdio) -> Self
 pub fn ferroday_cage::CageBuilder::stop_with_caller(self, bool) -> Self
+pub fn ferroday_cage::CageBuilder::symlink(self, impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> Self
 impl ferroday_cage::CageBuilder
 pub fn ferroday_cage::CageBuilder::drop_all_capabilities(self) -> Self
 pub fn ferroday_cage::CageBuilder::get_keep_capabilities(&self) -> core::option::Option<&[ferroday_cage::Capability]>
@@ -2851,6 +2861,18 @@ impl core::marker::Unpin for ferroday_cage::SubidMapper
 impl core::marker::UnsafeUnpin for ferroday_cage::SubidMapper
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::SubidMapper
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SubidMapper
+#[non_exhaustive] pub struct ferroday_cage::Symlink
+impl ferroday_cage::Symlink
+pub fn ferroday_cage::Symlink::get_path(&self) -> &std::path::Path
+pub fn ferroday_cage::Symlink::get_target(&self) -> &std::path::Path
+pub fn ferroday_cage::Symlink::new(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::Symlink
+impl core::marker::Freeze for ferroday_cage::Symlink
+impl core::marker::Send for ferroday_cage::Symlink
+impl core::marker::Sync for ferroday_cage::Symlink
+impl core::marker::Unpin for ferroday_cage::Symlink
+impl core::marker::UnsafeUnpin for ferroday_cage::Symlink
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Symlink
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Symlink
 #[non_exhaustive] pub struct ferroday_cage::Terminal
 impl ferroday_cage::Terminal
 pub fn ferroday_cage::Terminal::get_size(&self) -> (u16, u16)

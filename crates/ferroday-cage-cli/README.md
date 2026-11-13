@@ -90,6 +90,16 @@ TCP/IP stack for IPv4 and IPv6 with no helper binary, outbound and to any port
 `--netstack-publish` opens on the host. `--share-net` gives the command the host's network
 instead.
 
+A sandbox composed from host binds needs no root directory. `--empty-rootfs` roots it on an
+empty filesystem of its own, which the mount flags populate and which becomes read-only once
+they are in place:
+
+```sh
+fcage --empty-rootfs --ro-bind /usr /usr \
+    --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+    --bind ./work /work -- /bin/sh
+```
+
 Other flags cover mounts and overlays, uid/gid range maps, resource limits, a pseudoterminal
 of the sandbox's own (`--terminal`), timeouts, and the environment. `fcage --help` lists
 them all, grouped.

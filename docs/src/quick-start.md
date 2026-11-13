@@ -166,6 +166,8 @@ interface.
 
 ## Going further
 
+- Compose the root from the host's own files, with no root directory at all:
+  [An empty root](how-the-sandbox-is-built.md#an-empty-root).
 - Stream the command's output to your own code: [Streaming
   output](streaming.md).
 - Wait with deadlines, stop gracefully, kill outright, and tie the

@@ -29,4 +29,8 @@ pub(crate) const DATA_BUF: usize = 65536;
 
 /// The symbolic-link target and hardlink anchor buffer; either is at most
 /// `PATH_MAX`.
+///
+/// A sandbox's own symlink op shares it: the build refuses a target that does
+/// not fit, and the launch reads a link already at the op's path back into a
+/// buffer of this size to compare it.
 pub(crate) const LINK_BUF: usize = 4096;

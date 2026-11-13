@@ -77,13 +77,14 @@ use rustix::process::{self, PidfdFlags, WaitOptions, WaitStatus};
 use rustix::thread;
 use syscalls::Sysno;
 
+use super::bounds::LINK_BUF;
 use super::frame;
 use super::resolve;
 use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
-    IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdioPlan,
-    encode_status,
+    IdentityPlan, LaunchPlan, MountAction, MountOp, RootPlan, STATUS_EXITED, STATUS_SIGNALED,
+    StdioPlan, encode_status,
 };
 use crate::error::SetupStep;
 
@@ -1443,45 +1444,45 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     // attached in the caller's namespace, so a descriptor opened before
     // `unshare` cannot anchor this step. The overlay mounts as root inside the
     // now-established identity map, so its copy-up ownership resolves against
-    // that map.
-    // The root carries `nosuid` either way; see `nosuid_root`. An overlay takes
-    // it at its own mount, where the flag applies directly and no fallback is
-    // needed; a bind inherits its source's flags instead and has the attribute
-    // added below, once there is a descriptor for the mount to add it to.
-    let bound_root = plan.overlay.is_none();
-    match &plan.overlay {
-        None => {
-            mount::mount_bind_recursive(&plan.rootfs_path, &plan.rootfs_path)
+    // that map. An empty root has no path; see `mount_empty_root`.
+    //
+    // Each root carries `nosuid`; see `nosuid_root`. An overlay and an empty
+    // root take it at their own mount, where the flag applies directly and no
+    // fallback is needed; a bind inherits its source's flags instead and has
+    // the attribute added once there is a descriptor for the mount to add it
+    // to, before the profile's own mounts, so the recursion covers the root
+    // bind and whatever it carried along and nothing the caller went on to
+    // mount: a caller's bind keeps its source's flags.
+    //
+    // The descriptor anchors both the mount-target resolution below and the
+    // pivot. Opening a path root anew lands on top of the mount stack, the new
+    // mount.
+    let newroot = match &plan.root {
+        RootPlan::Bind(rootfs) => {
+            mount::mount_bind_recursive(rootfs, rootfs)
                 .map_err(|errno| (SetupStep::BindRootfs, errno, 0))?;
+            let newroot = open_root(rootfs)?;
+            nosuid_root(newroot.as_fd()).map_err(|errno| (SetupStep::NosuidRootfs, errno, 0))?;
+            newroot
         }
-        Some(overlay) => {
+        RootPlan::Overlay { base, overlay } => {
             mount::mount(
                 c"overlay",
-                plan.rootfs_path.as_c_str(),
+                base.as_c_str(),
                 c"overlay",
                 MountFlags::NOSUID,
                 overlay.options.as_c_str(),
             )
             .map_err(|errno| (SetupStep::MountOverlayRoot, errno, 0))?;
+            open_root(base)?
         }
-    }
-
-    // Open the root mount just created. Opening the path anew lands on top
-    // of the mount stack — the new mount — and the descriptor anchors both
-    // the mount-target resolution below and the pivot.
-    let newroot = rustix::fs::open(
-        &plan.rootfs_path,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| (SetupStep::EnterRootfs, errno, 0))?;
-
-    // Before the profile's own mounts, so the recursion covers the root bind
-    // and whatever it carried along and nothing the caller went on to mount:
-    // a caller's bind keeps its source's flags.
-    if bound_root {
-        nosuid_root(newroot.as_fd()).map_err(|errno| (SetupStep::NosuidRootfs, errno, 0))?;
-    }
+        RootPlan::Empty => {
+            mount_empty_root().map_err(|errno| (SetupStep::MountEmptyRoot, errno, 0))?
+        }
+        // A sandbox's plan always names a root to pivot into, and a
+        // restriction's never reaches this stage.
+        RootPlan::Host => return Err((SetupStep::EnterRootfs, Errno::INVAL, 0)),
+    };
 
     // The mount profile: host bind sources are still resolvable (the host
     // tree is mounted until the pivot), and every target resolves inside
@@ -1502,6 +1503,12 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
         ),
         None => None,
     };
+
+    // Last of all, once nothing more is made in it.
+    if matches!(plan.root, RootPlan::Empty) {
+        read_only_root(newroot.as_fd())
+            .map_err(|errno| (SetupStep::ReadOnlyEmptyRoot, errno, 0))?;
+    }
 
     process::fchdir(&newroot).map_err(|errno| (SetupStep::EnterRootfs, errno, 0))?;
 
@@ -2094,6 +2101,12 @@ const FILE_TARGET_MODE: fs::RawMode = 0o644;
 /// the process umask. Only a file this call just created is chmod-ed, so a mode
 /// the root ships is never rewritten.
 ///
+/// The file is opened for reading, though it is created: nothing is written to
+/// it, and the descriptor [`hold_file_target`] keeps open for its lock must not
+/// count as a writer, which would refuse an
+/// [empty root](crate::CageBuilder::empty_rootfs)'s read-only remount with
+/// `EBUSY`.
+///
 /// [`LaunchPlan::managed_placeholders`]: super::LaunchPlan::managed_placeholders
 fn create_mount_file(
     root: BorrowedFd<'_>,
@@ -2103,7 +2116,7 @@ fn create_mount_file(
     match open_in_root_with(
         root,
         path,
-        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+        OFlags::CREATE | OFlags::EXCL | OFlags::RDONLY | OFlags::CLOEXEC,
         mode,
     ) {
         Ok(file) => {
@@ -2315,11 +2328,37 @@ fn execute_op(
             leaf,
             content,
         } => {
-            let parent = open_in_root(root, parent, OFlags::PATH | OFlags::DIRECTORY)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-            fs::symlinkat(content.as_c_str(), &parent, leaf.as_c_str())
-                .map_err(|errno| (SetupStep::CreateSymlink, errno))
+            // A link at the root's top level has no parent to resolve: it is
+            // made in the root itself.
+            let parent = match parent.is_empty() {
+                true => None,
+                false => Some(
+                    open_in_root(root, parent, OFlags::PATH | OFlags::DIRECTORY)
+                        .map_err(|errno| (SetupStep::OpenMountTarget, errno))?,
+                ),
+            };
+            let dir = parent.as_ref().map_or(root, AsFd::as_fd);
+            match fs::symlinkat(content.as_c_str(), dir, leaf.as_c_str()) {
+                Ok(()) => Ok(()),
+                // The link this op makes, made by an earlier launch over the
+                // same persistent root.
+                Err(Errno::EXIST) if links_to(dir, leaf, content) => Ok(()),
+                Err(errno) => Err((SetupStep::CreateSymlink, errno)),
+            }
         }
+    }
+}
+
+/// Whether the entry `leaf` names in `dir` is a symbolic link to `content`.
+///
+/// Read into a buffer on the stack, since this runs after the fork. The build
+/// refused a `content` that does not fit it, so a target that fills it is a
+/// longer one, truncated, and not `content`.
+fn links_to(dir: BorrowedFd<'_>, leaf: &CStr, content: &CStr) -> bool {
+    let mut target = [0u8; LINK_BUF];
+    match fs::readlinkat_raw(dir, leaf, &mut target[..]) {
+        Ok(len) => len < target.len() && &target[..len] == content.to_bytes(),
+        Err(_) => false,
     }
 }
 
@@ -2353,7 +2392,7 @@ fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (S
     )
     .map_err(|errno| (SetupStep::BindMount, errno))?;
     let remount_after = read_only
-        && match mount_setattr_recursive(tree.as_fd(), MOUNT_ATTR_RDONLY) {
+        && match mount_setattr(tree.as_fd(), MOUNT_ATTR_RDONLY, true) {
             Ok(()) => false,
             Err(Errno::NOSYS) => true,
             Err(errno) => return Err((SetupStep::RemountReadOnly, errno)),
@@ -2390,9 +2429,62 @@ fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (S
 /// a caller who binds a host tree in order to run what is in it is entitled to
 /// a different answer than the rootfs gets.
 fn nosuid_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
-    match mount_setattr_recursive(root, MOUNT_ATTR_NOSUID) {
+    match mount_setattr(root, MOUNT_ATTR_NOSUID, true) {
         Ok(()) => Ok(()),
         Err(Errno::NOSYS) => remount_top(root, MountFlags::NOSUID),
+        Err(errno) => Err(errno),
+    }
+}
+
+/// Opens the root mount a path root was just mounted at.
+fn open_root(path: &CStr) -> Result<OwnedFd, Failure> {
+    rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| (SetupStep::EnterRootfs, errno, 0))
+}
+
+/// Mounts the tmpfs an empty root is made of, and returns a descriptor of it.
+///
+/// The mount profile names its bind sources as host paths, which resolve by
+/// path until the pivot, so the root cannot be mounted over a host directory:
+/// a source beneath that directory would be hidden. The tmpfs is created
+/// detached instead, and attached on top of `/` itself. A path lookup starts at
+/// the process's root, the mount beneath, and does not cross a mount stacked on
+/// its starting point, so every host path resolves as it did before. The
+/// descriptor is what reaches the new root, for the mount targets and the
+/// pivot.
+///
+/// `nosuid` and `nodev` from the start: nothing in it is executable or a
+/// device, and a mount the profile makes beneath it carries its own flags.
+fn mount_empty_root() -> Result<OwnedFd, Errno> {
+    let context = mount::fsopen(c"tmpfs", mount::FsOpenFlags::FSOPEN_CLOEXEC)?;
+    mount::fsconfig_set_string(&context, c"mode", c"0755")?;
+    mount::fsconfig_create(&context)?;
+    let root = mount::fsmount(
+        &context,
+        mount::FsMountFlags::FSMOUNT_CLOEXEC,
+        mount::MountAttrFlags::MOUNT_ATTR_NOSUID | mount::MountAttrFlags::MOUNT_ATTR_NODEV,
+    )?;
+    mount::move_mount(
+        &root,
+        c"",
+        fs::CWD,
+        c"/",
+        mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )?;
+    Ok(root)
+}
+
+/// Makes the root mount `root` names read-only, and only it: every mount the
+/// profile made beneath it keeps its own flags, so a writable bind and the
+/// managed `/tmp` stay writable.
+fn read_only_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
+    match mount_setattr(root, MOUNT_ATTR_RDONLY, false) {
+        Ok(()) => Ok(()),
+        Err(Errno::NOSYS) => remount_top(root, MountFlags::RDONLY),
         Err(errno) => Err(errno),
     }
 }
@@ -2420,8 +2512,8 @@ struct MountAttr {
 // The layout must match the kernel's, or the attribute would be misread.
 const _: () = assert!(size_of::<MountAttr>() == 32);
 
-/// Sets `attr_set` on the mount `target` names, and on every mount beneath it,
-/// through `mount_setattr`.
+/// Sets `attr_set` on the mount `target` names, and with `recursive` on every
+/// mount beneath it, through `mount_setattr`.
 ///
 /// Only ever used to *add* a restriction, which is what makes the recursion
 /// safe to apply without locked-flag handling: the call never clears a flag the
@@ -2429,16 +2521,17 @@ const _: () = assert!(size_of::<MountAttr>() == 32);
 ///
 /// Returns `Errno::NOSYS` on a kernel that predates `mount_setattr` (before
 /// 5.12), which each caller answers with a top-level remount.
-fn mount_setattr_recursive(target: BorrowedFd<'_>, attr_set: u64) -> Result<(), Errno> {
+fn mount_setattr(target: BorrowedFd<'_>, attr_set: u64, recursive: bool) -> Result<(), Errno> {
     let attr = MountAttr {
         attr_set,
         attr_clr: 0,
         propagation: 0,
         userns_fd: 0,
     };
-    // SAFETY: `target` is a descriptor naming a mount, the root's bind or a
-    // detached tree; with AT_EMPTY_PATH and an empty path the call operates on
-    // that mount, and with AT_RECURSIVE on its submounts. The attr pointer and
+    let scope = if recursive { AT_RECURSIVE } else { 0 };
+    // SAFETY: `target` is a descriptor naming a mount: the root, or a detached
+    // tree. With AT_EMPTY_PATH and an empty path the call operates on that
+    // mount, and with AT_RECURSIVE on its submounts too. The attr pointer and
     // its size describe a valid `struct mount_attr` for the duration of the
     // call.
     unsafe {
@@ -2446,7 +2539,7 @@ fn mount_setattr_recursive(target: BorrowedFd<'_>, attr_set: u64) -> Result<(), 
             Sysno::mount_setattr,
             target.as_raw_fd(),
             c"".as_ptr(),
-            AT_RECURSIVE | AT_EMPTY_PATH,
+            scope | AT_EMPTY_PATH,
             &attr as *const MountAttr,
             size_of::<MountAttr>()
         )

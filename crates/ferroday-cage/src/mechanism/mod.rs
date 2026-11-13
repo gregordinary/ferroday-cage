@@ -259,13 +259,42 @@ pub(crate) struct NestedPlan {
     pub(crate) gid_lines: Vec<u8>,
 }
 
+/// The root a launch pivots into, as the build froze it.
+#[derive(Debug, Clone)]
+pub(crate) enum RootPlan {
+    /// No root swap: a restriction's command runs against the host's own
+    /// filesystem, and the sandbox stage that would use a root never runs.
+    ///
+    /// Only a restriction builds it, and restrictions come with the
+    /// `hardening` feature; the readers of a plan match it in every build.
+    #[cfg_attr(not(feature = "hardening"), expect(dead_code))]
+    Host,
+    /// The canonical rootfs, bound onto itself.
+    ///
+    /// The sandbox stage resolves the path anew inside its own mount
+    /// namespace: a descriptor opened before `unshare` still references the
+    /// original namespace's mounts, and `mount` refuses bind sources and
+    /// targets that are not attached in the caller's namespace.
+    Bind(CString),
+    /// An overlay mounted over the canonical rootfs, which is its read-only
+    /// base lower, so writes land in a disposable upper. The path is resolved
+    /// anew as [`Bind`](Self::Bind)'s is.
+    Overlay {
+        /// The canonical rootfs the overlay is mounted over.
+        base: CString,
+        /// The overlay's frozen mount options and layers.
+        overlay: OverlayPlan,
+    },
+    /// A tmpfs of the sandbox's own, holding only what the mount profile
+    /// creates in it and made read-only once the profile is in place.
+    Empty,
+}
+
 /// How an overlay-rooted cage's root is assembled.
 ///
-/// The base is the read-only lower and [`rootfs_path`](LaunchPlan::rootfs_path)
-/// both — the overlay is mounted over the base's own directory — so this
-/// carries only the preformatted mount options naming the lower, the disposable
-/// upper, and its work directory. Present only when the caller requested an
-/// overlay root; a plain cage binds its rootfs onto itself instead.
+/// The base is the read-only lower and the path the overlay is mounted over
+/// both, so this carries only the preformatted mount options naming the lower,
+/// the disposable upper, and its work directory.
 #[derive(Debug, Clone)]
 pub(crate) struct OverlayPlan {
     /// The overlay mount options, composed at build time by
@@ -528,19 +557,8 @@ pub(crate) struct LaunchPlan {
     pub(crate) args: Vec<CString>,
     /// The command's complete environment, as frozen `NAME=value` entries.
     pub(crate) env: Vec<CString>,
-    /// The canonicalized rootfs path, validated at build time; empty and
-    /// unused in a restriction, which swaps no root.
-    ///
-    /// The sandbox stage resolves this path anew inside its own mount
-    /// namespace: a descriptor opened before `unshare` still references the
-    /// original namespace's mounts, and `mount` refuses bind sources and
-    /// targets that are not attached in the caller's namespace.
-    pub(crate) rootfs_path: CString,
-    /// When set, root the cage on an overlay of the rootfs rather than the
-    /// rootfs directly: [`rootfs_path`](Self::rootfs_path) is the read-only
-    /// lower, and the sandbox stage mounts the overlay over it before the pivot
-    /// so writes land in a disposable upper. `None` for a plain rootfs.
-    pub(crate) overlay: Option<OverlayPlan>,
+    /// The root the sandbox stage pivots into, validated at build time.
+    pub(crate) root: RootPlan,
     /// The namespaces the launch stage unshares into.
     pub(crate) unshare: UnshareFlags,
     /// Whether the sandbox gets its own PID namespace, and with it the

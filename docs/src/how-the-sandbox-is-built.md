@@ -71,13 +71,14 @@ sequence itself.
 9. **Privatize propagation.** Mount propagation for the inherited tree is
    made recursively private, so nothing done here propagates back to the
    host, and because `pivot_root` refuses to operate under shared mounts.
-10. **Bind the rootfs.** The rootfs is bind-mounted onto itself, recursively.
-    `pivot_root` requires the new root to be a mount point; the self-bind
-    makes it one without imposing any staging directory. The canonical path
-    validated at build time is resolved here, inside the new namespace — the
-    kernel requires bind sources and targets to be mounts attached in the
-    caller's own mount namespace, so a descriptor opened before the unshare
-    cannot anchor this step.
+10. **Mount the root.** `pivot_root` requires the new root to be a mount
+    point. A plain root filesystem is bind-mounted onto itself, recursively,
+    which makes it one without a staging directory. An overlay root is mounted
+    over its base. The canonical path validated at build time is resolved here,
+    inside the new namespace. The kernel requires bind sources and targets to be
+    attached in the caller's own mount namespace, so a descriptor opened before
+    the unshare cannot anchor this step. An [empty root](#an-empty-root) has no
+    path: it is a tmpfs created for the launch.
 11. **The mount profile.** The init executes the frozen mount operations in
     order: the fresh `/proc`, the minimal `/dev`, the `/tmp` tmpfs, the
     caller's own mounts, and the `resolv.conf` bind, as configured. Bind
@@ -96,7 +97,8 @@ sequence itself.
     submounts of the source keep their own flags. The restriction becomes a
     boundary at step 13, where the command enters a nested user namespace and
     the kernel locks it — see [A read-only bind is a
-    boundary](#a-read-only-bind-is-a-boundary).
+    boundary](#a-read-only-bind-is-a-boundary). An empty root is made read-only
+    once the profile is in place.
 12. **Pivot.** The init enters the new mount and calls
     `pivot_root(".", ".")`, stacking the old root on the same mount point,
     then lazily detaches the old root and changes directory to the new `/`.
@@ -298,21 +300,27 @@ can be disabled:
 
 The caller's own mounts apply after the managed profile, in configuration
 order, with one exception: the `resolv.conf` bind is applied last of all.
-Binds and raw mounts (see [Profiles](profiles.md) for the escape hatch) share
-one sequence rather than being applied kind by kind, so a mount that
-covers a path an earlier one established can be ordered deliberately: a raw
-tmpfs followed by the binds that populate it yields a directory the sandbox
-owns outright, which is how the managed `/dev` is itself assembled.
+Binds, raw mounts (see [Profiles](profiles.md) for the escape hatch), and
+symbolic links share one sequence rather than being applied kind by kind. A
+mount that covers a path an earlier one established can then be ordered
+deliberately. A raw tmpfs followed by the binds that populate it yields a
+directory the sandbox owns outright. The managed `/dev` is assembled that way.
+
+A link is made where the sequence reaches it, in whatever holds its path then.
+On a plain root filesystem it stays on the host after the sandbox exits. A path
+already holding a link with the same target is left as it is, so the next
+launch over that root succeeds. Anything else at the path fails the launch.
 
 Last, the host's `resolv.conf` — resolved to its real file — is bound
 read-only onto `/etc/resolv.conf` when the host network is shared. Unless the
 caller mounted that target themselves: a mount of their own there replaces this
 one rather than sitting under it, so applying it last does not take back the
 rule that among the caller's mounts the order is theirs. Every kind of mount
-counts, a raw mount as much as a bind. A bind of the caller's over a directory
-above the target, such as `/etc`, counts too. That directory is the caller's
-own, and the target would otherwise be created in it. A tmpfs there is the
-sandbox's own, and the bind lands in it.
+counts, a raw mount as much as a bind, and so does a link of the caller's at
+the target. A bind or a link of the caller's at a directory above the target,
+such as `/etc`, counts too. That directory is the caller's own, or where the
+link sends it, and the target would otherwise be created there. A tmpfs there
+is the sandbox's own, and the bind lands in it.
 
 ### A read-only bind is a boundary
 
@@ -348,6 +356,24 @@ The scope is the root and whatever the root bind carried with it. A caller's own
 `bind` and `bind_ro` mounts keep inheriting their source's flags: a caller who
 binds a host tree in order to run what is in it is entitled to a different
 answer than the rootfs gets.
+
+### An empty root
+
+[`empty_rootfs`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.empty_rootfs)
+roots the sandbox on a tmpfs of its own rather than a host directory. It suits a
+sandbox composed entirely from binds: the host's `/usr` read-only, a working
+tree read-write, and the links a merged `/usr` layout expects. The launch writes
+nothing on the host, and what it creates in the root goes with the sandbox.
+
+The tmpfs is created detached and attached on top of the inherited root.
+Mounted over a host directory instead, it would hide any bind source beneath
+that directory. A lookup by absolute path does not cross a mount stacked on its
+starting root, so every source still resolves on the host until the pivot.
+
+Once the profile is in place, the root mount itself is made read-only, and only
+it. The mounts the profile made keep their own flags. A writable bind and the
+managed `/tmp` stay writable, and the command can write nowhere else. A place to
+write elsewhere is a mount of its own: a bind, or a tmpfs added as a raw mount.
 
 ## What a launch leaves in the root
 
