@@ -319,7 +319,7 @@ impl Drop for RawMode<'_> {
 /// that is no terminal, and no `SIGTTOU` or `SIGTTIN` would ever apply, so
 /// there is no foreground to defer to. The same reading covers a controlling
 /// terminal whose foreground group has gone, which the kernel lets anyone in
-/// the session write.
+/// the session read and write.
 pub(super) fn in_foreground(fd: BorrowedFd<'_>) -> bool {
     match termios::tcgetpgrp(fd) {
         Ok(foreground) => foreground == rustix::process::getpgrp(),
