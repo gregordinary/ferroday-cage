@@ -95,7 +95,11 @@ pub(super) fn apply_pre_switch(plan: &HardeningPlan) -> Result<(), Failure> {
     // set-user-ID file cannot regain privilege across the exec.
     rustix::thread::set_no_new_privs(true).map_err(|errno| (SetupStep::SetNoNewPrivs, errno, 0))?;
 
-    if !plan.landlock.is_empty() || !plan.landlock_net.is_empty() || plan.landlock_scoped != 0 {
+    if !plan.landlock.is_empty()
+        || !plan.landlock_net.is_empty()
+        || plan.landlock_scoped != 0
+        || plan.landlock_handled != 0
+    {
         apply_landlock(plan)?;
     }
 
@@ -283,11 +287,13 @@ fn apply_landlock(plan: &HardeningPlan) -> Result<(), Failure> {
     // fork: a restriction's grants and the scopes it names
     // (`ensure_landlock_enforceable`, `ensure_scopes_enforceable`), and a
     // sandbox's network grant or scope with no namespace behind it
-    // (`ensure_sandbox_enforceable`). At the pending seam: a network grant an
-    // attaching network stack would carry connections past
+    // (`ensure_sandbox_enforceable`), and a unix-socket restriction a caller
+    // asked for (`settle_resolve_unix`). At the pending seam: a network grant
+    // an attaching network stack would carry connections past
     // (`NetStack::attach`). What reaches here is a request some namespace also
-    // bounds, or a restriction's default scopes, which its build already masked
-    // to this kernel; that is why the drop is tolerated.
+    // bounds, or a default — a restriction's scopes, the host root's
+    // unix-socket restriction — which the build already masked to this kernel;
+    // that is why the drop is tolerated.
     // `CageBuilder::landlock_net` and `CageBuilder::landlock_scope` state it
     // for callers.
     if handled_fs == 0 && handled_net == 0 && scoped == 0 {

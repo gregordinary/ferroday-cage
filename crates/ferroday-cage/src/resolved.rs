@@ -451,6 +451,14 @@ pub enum ResolvedHardening {
         landlock_fs: Vec<ResolvedLandlockFs>,
         /// The Landlock network grants, in the order they were declared.
         landlock_net: Vec<ResolvedLandlockNet>,
+        /// Whether the ruleset handles `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`: the
+        /// unix-socket restriction, which refuses a connection to a pathname
+        /// socket created outside the command's domain except beneath a path
+        /// granted it.
+        ///
+        /// What the build kept: the default the host's own root applies is
+        /// dropped at build on a kernel below Landlock ABI 9.
+        landlock_resolve_unix: bool,
         /// The `LANDLOCK_SCOPE_*` flags the ruleset scopes, as the kernel spells
         /// them; zero when none applies.
         ///
@@ -824,6 +832,9 @@ fn project_hardening(plan: &LaunchPlan) -> ResolvedHardening {
                     access: rule.access,
                 })
                 .collect(),
+            landlock_resolve_unix: plan.hardening.landlock_handled
+                & crate::hardening::fs_access::RESOLVE_UNIX
+                != 0,
             landlock_scope: plan.hardening.landlock_scoped,
             seccomp_instructions: plan.hardening.seccomp.as_ref().map(Vec::len),
             keep_capabilities: plan.hardening.keep_caps,
@@ -835,10 +846,13 @@ fn project_hardening(plan: &LaunchPlan) -> ResolvedHardening {
 }
 
 /// Whether a hardening plan asks anything of Landlock: a grant of either kind,
-/// or a scope.
+/// a scope, or the unix-socket restriction.
 #[cfg(feature = "hardening")]
 fn requests_landlock(plan: &crate::mechanism::HardeningPlan) -> bool {
-    !plan.landlock.is_empty() || !plan.landlock_net.is_empty() || plan.landlock_scoped != 0
+    !plan.landlock.is_empty()
+        || !plan.landlock_net.is_empty()
+        || plan.landlock_scoped != 0
+        || plan.landlock_handled != 0
 }
 
 /// Splits a frozen `NAME=value` entry back into its pair.
@@ -1015,7 +1029,7 @@ mod serde_tests {
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 63] = [
+    const EXPECTED_RECORD_KEYS: [&str; 64] = [
         "env",
         "env.SOURCE_DATE_EPOCH",
         "hardening",
@@ -1028,6 +1042,7 @@ mod serde_tests {
         "hardening.landlock-net",
         "hardening.landlock-net[].access",
         "hardening.landlock-net[].port",
+        "hardening.landlock-resolve-unix",
         "hardening.landlock-scope",
         "hardening.seccomp-instructions",
         "hostname",
@@ -1176,6 +1191,7 @@ mod serde_tests {
                     port: 443,
                     access: 2,
                 }],
+                landlock_resolve_unix: true,
                 landlock_scope: 3,
                 seccomp_instructions: Some(4),
                 keep_capabilities: Some(5),
@@ -1344,7 +1360,7 @@ mod serde_tests {
         // than on the configuration, which is the whole point of the field
         // being present either way.
         #[cfg(feature = "hardening")]
-        let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\nlandlock-scope = 0\n";
+        let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\nlandlock-resolve-unix = false\nlandlock-scope = 0\n";
         #[cfg(not(feature = "hardening"))]
         let hardening = "[hardening]\nkind = \"unavailable\"\n";
         // The isolated network's filter, which refuses `socketcall`'s socket

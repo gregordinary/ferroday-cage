@@ -1595,6 +1595,10 @@ impl CageBuilder {
     /// `/run` reads through the hidden `/run`, and is reached by binding the
     /// file it links to at its own path.
     ///
+    /// With the `hardening` feature the command also runs under Landlock's
+    /// unix-socket restriction by default, which refuses a connection to a
+    /// socket the hides left in view; see `landlock_resolve_unix`.
+    ///
     /// The clone and its read-only marking need `mount_setattr`, Linux 5.12;
     /// an older kernel fails the launch at
     /// [`SetupStep::MountHostRoot`](crate::SetupStep::MountHostRoot) rather
@@ -2844,7 +2848,10 @@ impl CageBuilder {
         // stage only replays frozen data.
         #[cfg(feature = "hardening")]
         let hardening = {
-            let mut hardening = self.hardening.lower()?;
+            // The host's own root restricts unix sockets unless the caller
+            // says otherwise: it leaves the host's sockets connectable through
+            // the read-only tree wherever no hide covers them.
+            let mut hardening = self.hardening.lower(self.host_rootfs)?;
             // Whether the command switches from root inside to a non-root id.
             // A presented identity is never root inside, and a run-as identity
             // under one is the identity the command already holds, so there is
@@ -2887,6 +2894,14 @@ impl CageBuilder {
             hardening.ensure_sandbox_enforceable(
                 matches!(self.network, Network::Host),
                 !self.pid_namespace,
+                crate::mechanism::probe_landlock_abi,
+            )?;
+            // The unix-socket restriction is refused where the caller asked
+            // for it and the kernel cannot enforce it, and dropped where it is
+            // the host root's default.
+            crate::hardening::settle_resolve_unix(
+                &mut hardening,
+                self.hardening.resolve_unix() == Some(true),
                 crate::mechanism::probe_landlock_abi,
             )?;
             hardening
@@ -3777,6 +3792,53 @@ impl CageBuilder {
         self
     }
 
+    /// Refuses the command a connection to a pathname unix socket created
+    /// outside its Landlock domain, except beneath a path granted
+    /// [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX) (default:
+    /// on under the [host's own root](Self::host_rootfs), off otherwise).
+    ///
+    /// A read-only mount does not stop a `connect`, and a hidden path covers
+    /// only the places it names, so a socket anywhere else in the command's
+    /// view accepts its connection: inside a bound working tree, or an agent's
+    /// socket at an unexpected path. This is Landlock's
+    /// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` right, which governs `connect`, and
+    /// `sendmsg` with an explicit address, to such a socket, and answers
+    /// `EACCES`. A socket the command or a process it started created stays
+    /// reachable, as an abstract socket does under
+    /// [`LandlockScope::AbstractUnixSocket`](crate::LandlockScope::AbstractUnixSocket).
+    ///
+    /// ```no_run
+    /// use ferroday_cage::{Cage, FsAccess};
+    ///
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// let cage = Cage::builder()
+    ///     .rootfs("/srv/rootfs/alpine")
+    ///     .bind("/run/egress", "/run/egress")
+    ///     .landlock_resolve_unix(true)
+    ///     .landlock_fs(FsAccess::RESOLVE_UNIX, "/run/egress")
+    ///     .command("/usr/bin/agent")
+    ///     .build()?;
+    /// # let _ = cage;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// It enrolls no other right, so a grant of `RESOLVE_UNIX` alone opens one
+    /// socket directory without closing the rest of the filesystem. A grant of
+    /// it where the restriction is off allows nothing, and is refused at build
+    /// with [`ConfigError::ResolveUnixUnhandled`](crate::ConfigError::ResolveUnixUnhandled).
+    ///
+    /// The right needs Landlock ABI 9. A restriction asked for here is refused
+    /// at build on an older kernel, or one without the Landlock LSM, with
+    /// [`ConfigError::LandlockResolveUnixUnenforceable`](crate::ConfigError::LandlockResolveUnixUnenforceable),
+    /// since it is the only bound on the sockets a mount does not hide. The
+    /// host root's default is dropped on such a kernel instead, and
+    /// [`resolved_inputs`](Cage::resolved_inputs) reports whether it applies.
+    pub fn landlock_resolve_unix(mut self, restrict: bool) -> Self {
+        self.hardening.set_resolve_unix(restrict);
+        self
+    }
+
     /// Applies a seccomp syscall filter to the command.
     ///
     /// See [`SeccompPolicy`](crate::SeccompPolicy) for rule sets, the
@@ -3829,6 +3891,15 @@ impl CageBuilder {
     /// default.
     pub fn get_landlock_scope(&self) -> impl Iterator<Item = crate::hardening::LandlockScope> {
         self.hardening.scopes()
+    }
+
+    /// Whether the command is held to the unix-socket restriction: the
+    /// [`landlock_resolve_unix`](Self::landlock_resolve_unix) setting, or the
+    /// root's default where it is unset. What a kernel too old for the
+    /// default does with it is [`resolved_inputs`](Cage::resolved_inputs)'s to
+    /// report.
+    pub fn get_landlock_resolve_unix(&self) -> bool {
+        self.hardening.resolve_unix().unwrap_or(self.host_rootfs)
     }
 
     /// The seccomp policy applied to the command, or `None` for no filter.
@@ -8212,6 +8283,7 @@ data = "mode=0777"
 seccomp = "curated"
 keep-caps = ["net-bind-service"]
 landlock-scope = ["signal"]
+resolve-unix = true
 
 [[hardening.landlock-fs]]
 path = "/usr"
@@ -8303,7 +8375,7 @@ target = "/work/.git/hooks"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 95] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 96] = [
         "args",
         "base-env",
         "command",
@@ -8320,6 +8392,7 @@ target = "/work/.git/hooks"
         "hardening.landlock-net[].access",
         "hardening.landlock-net[].port",
         "hardening.landlock-scope",
+        "hardening.resolve-unix",
         "hardening.seccomp",
         "hardening.seccomp.allow",
         "hardening.seccomp.allow-rule",
@@ -9065,6 +9138,12 @@ read-only = true
             (
                 "rootfs = \"/srv/rootfs\"\nreveal = [\"/run\"]\ncommand = \"/bin/sh\"\n",
                 "a path the host's root hides taken back (reveal)",
+            ),
+            #[cfg(feature = "hardening")]
+            (
+                "rootfs = \"/srv/rootfs\"\ncommand = \"/bin/sh\"\n\
+                 [hardening]\nresolve-unix = false\n",
+                "the unix-socket restriction turned off (resolve-unix = false)",
             ),
         ] {
             let builder: CageBuilder = toml::from_str(profile).expect("a trusted load accepts it");

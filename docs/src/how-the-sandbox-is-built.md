@@ -448,7 +448,11 @@ so the host's `/run` is shown only with both taken back.
 Two parts of the host stay in view, and are disclosed rather than hidden. `/sys`
 is the host's sysfs, read-only: it describes the host's devices and kernel
 settings, and bubblewrap-based tools leave it in place too. A socket anywhere
-outside the hidden paths stays connectable through the read-only tree.
+outside the hidden paths stays in view through the read-only tree. With the
+`hardening` feature, Landlock's [unix-socket
+restriction](hardening.md#landlock-and-unix-sockets) is on by default for this
+root and refuses a connection to it. On a kernel below Landlock ABI 9 the
+default is dropped, and such a socket stays connectable.
 
 Nothing is created on the host. A mount target outside every filesystem the
 sandbox mounts must already exist, and `build` refuses one missing from the

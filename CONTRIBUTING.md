@@ -496,7 +496,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Write a classic-BPF seccomp program by hand, or install one | `mechanism::seccomp`: its `bpf` opcodes and offsets, its audit architectures, and `seccomp::install` |
 | Run a seccomp program over a syscall in a unit test | `mechanism::seccomp::eval` |
 | Does a launch install the network filter, and what does the filter refuse? | `mechanism::seccomp::installs_network_filter` and `seccomp::NETWORK_FILTER_REFUSALS`, which the launch and the provenance record both read |
-| Can this kernel enforce a Landlock request that is a reach's only bound? | `mechanism::HardeningPlan::ensure_sandbox_enforceable` for a sandbox, `HardeningPlan::net_grant_unenforced` for a network grant a stack attaching to one would carry connections past, and `HardeningPlan::ensure_landlock_enforceable` with `hardening::ensure_scopes_enforceable` for a restriction |
+| Can this kernel enforce a Landlock request that is a reach's only bound? | `mechanism::HardeningPlan::ensure_sandbox_enforceable` for a sandbox, `HardeningPlan::net_grant_unenforced` for a network grant a stack attaching to one would carry connections past, and `HardeningPlan::ensure_landlock_enforceable` with `hardening::ensure_scopes_enforceable` for a restriction, and `hardening::settle_resolve_unix` for the unix-socket restriction in either |
 | Compose an overlay's mount options | `mechanism::overlay_options` |
 | What does a mount op bring to rest on its target, if anything? | `mechanism::MountAction::arrival`, or `Arrival::of_raw` for a raw mount's flags |
 | Read a raw mount's flags as `mount(2)` acts on them | `mechanism::raw_mount_flags` |

@@ -1588,6 +1588,8 @@ pub ferroday_cage::ConfigError::IdentityMapUnavailable::source: core::option::Op
 pub ferroday_cage::ConfigError::LandlockGrantEmpty::grant: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockPathInvalid
 pub ferroday_cage::ConfigError::LandlockPathInvalid::path: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ConfigError::LandlockResolveUnixUnenforceable
+pub ferroday_cage::ConfigError::LandlockResolveUnixUnenforceable::abi: core::option::Option<i32>
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockScopeUnenforceable
 pub ferroday_cage::ConfigError::LandlockScopeUnenforceable::abi: core::option::Option<i32>
 pub ferroday_cage::ConfigError::LandlockScopeUnenforceable::scope: &'static str
@@ -1630,6 +1632,8 @@ pub ferroday_cage::ConfigError::PresentAsRoot::identity: ferroday_cage::Presente
 pub ferroday_cage::ConfigError::PresentAsWithRangeMap
 #[non_exhaustive] pub ferroday_cage::ConfigError::ProfileOperationForbidden
 pub ferroday_cage::ConfigError::ProfileOperationForbidden::operation: &'static str
+#[non_exhaustive] pub ferroday_cage::ConfigError::ResolveUnixUnhandled
+pub ferroday_cage::ConfigError::ResolveUnixUnhandled::grant: alloc::string::String
 pub ferroday_cage::ConfigError::RestrictionEmpty
 #[non_exhaustive] pub ferroday_cage::ConfigError::RestrictionLandlockUnenforceable
 pub ferroday_cage::ConfigError::RestrictionLandlockUnenforceable::abi: core::option::Option<i32>
@@ -1944,6 +1948,7 @@ pub ferroday_cage::ResolvedHardening::Applied::keep_capabilities: core::option::
 pub ferroday_cage::ResolvedHardening::Applied::landlock_abi: core::option::Option<i32>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_fs: alloc::vec::Vec<ferroday_cage::ResolvedLandlockFs>
 pub ferroday_cage::ResolvedHardening::Applied::landlock_net: alloc::vec::Vec<ferroday_cage::ResolvedLandlockNet>
+pub ferroday_cage::ResolvedHardening::Applied::landlock_resolve_unix: bool
 pub ferroday_cage::ResolvedHardening::Applied::landlock_scope: u64
 pub ferroday_cage::ResolvedHardening::Applied::seccomp_instructions: core::option::Option<usize>
 pub ferroday_cage::ResolvedHardening::Unavailable
@@ -2309,11 +2314,13 @@ pub fn ferroday_cage::CageBuilder::drop_all_capabilities(self) -> Self
 pub fn ferroday_cage::CageBuilder::get_keep_capabilities(&self) -> core::option::Option<&[ferroday_cage::Capability]>
 pub fn ferroday_cage::CageBuilder::get_landlock_fs(&self) -> impl core::iter::traits::iterator::Iterator<Item = (ferroday_cage::FsAccess, &std::path::Path)>
 pub fn ferroday_cage::CageBuilder::get_landlock_net(&self) -> impl core::iter::traits::iterator::Iterator<Item = (ferroday_cage::NetAccess, u16)>
+pub fn ferroday_cage::CageBuilder::get_landlock_resolve_unix(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_landlock_scope(&self) -> impl core::iter::traits::iterator::Iterator<Item = ferroday_cage::LandlockScope>
 pub fn ferroday_cage::CageBuilder::get_seccomp(&self) -> core::option::Option<&ferroday_cage::SeccompPolicy>
 pub fn ferroday_cage::CageBuilder::keep_capabilities<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::Capability>
 pub fn ferroday_cage::CageBuilder::landlock_fs(self, ferroday_cage::FsAccess, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::landlock_net(self, ferroday_cage::NetAccess, u16) -> Self
+pub fn ferroday_cage::CageBuilder::landlock_resolve_unix(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::landlock_scope<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>
 pub fn ferroday_cage::CageBuilder::seccomp(self, ferroday_cage::SeccompPolicy) -> Self
 impl core::convert::TryFrom<ferroday_cage::CageBuilder> for ferroday_cage::RestrictedProfile
@@ -2374,6 +2381,7 @@ pub struct ferroday_cage::FsAccess(_)
 impl ferroday_cage::FsAccess
 pub const ferroday_cage::FsAccess::EXECUTE: ferroday_cage::FsAccess
 pub const ferroday_cage::FsAccess::READ: ferroday_cage::FsAccess
+pub const ferroday_cage::FsAccess::RESOLVE_UNIX: ferroday_cage::FsAccess
 pub const ferroday_cage::FsAccess::WRITE: ferroday_cage::FsAccess
 pub const fn ferroday_cage::FsAccess::all() -> ferroday_cage::FsAccess
 pub const fn ferroday_cage::FsAccess::contains(self, ferroday_cage::FsAccess) -> bool
@@ -2890,6 +2898,7 @@ pub fn ferroday_cage::RestrictionBuilder::get_stdout(&self) -> &ferroday_cage::S
 pub fn ferroday_cage::RestrictionBuilder::get_stop_with_caller(&self) -> bool
 pub fn ferroday_cage::RestrictionBuilder::landlock_fs(self, ferroday_cage::FsAccess, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::landlock_net(self, ferroday_cage::NetAccess, u16) -> Self
+pub fn ferroday_cage::RestrictionBuilder::landlock_resolve_unix(self, bool) -> Self
 pub fn ferroday_cage::RestrictionBuilder::landlock_scope<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>>(self, I) -> Self
 pub fn ferroday_cage::RestrictionBuilder::rlimit(self, ferroday_cage::limits::Resource, impl core::convert::Into<ferroday_cage::limits::Limit>, impl core::convert::Into<ferroday_cage::limits::Limit>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::seccomp(self, ferroday_cage::SeccompPolicy) -> Self

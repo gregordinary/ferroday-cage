@@ -143,6 +143,20 @@ consumer upgrading can skip it.
   the profile kinds `hide` and `read-only`, `ResolvedMount::Hide` and
   `ResolvedMount::ReadOnly`, and `fcage --hide` and `--read-only`, and fail a
   launch at the new `SetupStep::HidePath` or `SetupStep::ReadOnlyPath`.
+- `CageBuilder::landlock_resolve_unix` and `RestrictionBuilder::landlock_resolve_unix`
+  refuse the command a connection to a pathname unix socket created outside its
+  Landlock domain, except beneath a path granted the new `FsAccess::RESOLVE_UNIX`
+  (access letter `u`). It is Landlock ABI 9's `RESOLVE_UNIX` right. Off by
+  default, and on by default under the host's own root; asked for on a kernel
+  below ABI 9 it is refused with the new
+  `ConfigError::LandlockResolveUnixUnenforceable`, while the host root's default
+  is dropped there. A grant of `RESOLVE_UNIX` alone where the restriction is off
+  is refused with the new `ConfigError::ResolveUnixUnhandled`.
+  `ResolvedHardening::Applied` reports it as `landlock_resolve_unix`, the
+  profile key is `resolve-unix` in `[hardening]`, a `RestrictedProfile` refuses
+  `resolve-unix = false`, and `fcage` gains `--landlock-resolve-unix`,
+  `--no-landlock-resolve-unix`, and `--landlock-unix`. `FsAccess::all()` now
+  includes the new right.
 - `CageBuilder::present_as` presents the caller to the command as another
   identity under the single-identity map. The command sees the caller as the
   given uid and gid rather than as root, or, with `PresentedIdentity::Own`, as

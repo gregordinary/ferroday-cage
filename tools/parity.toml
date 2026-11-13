@@ -213,6 +213,10 @@ name = "landlock_scope"
 flags = ["--landlock-scope"]
 
 [[builder.setting]]
+name = "landlock_resolve_unix"
+flags = ["--landlock-resolve-unix", "--no-landlock-resolve-unix"]
+
+[[builder.setting]]
 name = "drop_all_capabilities"
 flags = ["--drop-caps"]
 
@@ -304,6 +308,10 @@ flags = ["--landlock-bind", "--landlock-connect"]
 [[builder.setting]]
 name = "landlock_scope"
 flags = ["--landlock-scope"]
+
+[[builder.setting]]
+name = "landlock_resolve_unix"
+flags = ["--landlock-resolve-unix", "--no-landlock-resolve-unix"]
 
 [[builder.setting]]
 name = "stdin"

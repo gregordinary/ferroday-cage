@@ -92,6 +92,12 @@ isolation, some host-reaching surfaces remain:
 - **Abstract sockets.** It shares the host's network namespace, so it can reach
   the session bus and the X server through their abstract sockets. A Landlock
   network grant governs TCP alone, and seccomp cannot read a socket's address.
+- **Pathname sockets.** It can connect to any unix socket at a path it can name:
+  the session bus's under `/run/user`, an SSH agent's, a container runtime's. A
+  Landlock filesystem grant governs files, not a `connect`. From Landlock ABI 9,
+  [`landlock_resolve_unix`] confines it to the sockets the command created and
+  those beneath a path granted `FsAccess::RESOLVE_UNIX`, and a restriction that
+  asks for it is refused on an older kernel.
 - **Other processes' memory and environment.** Without a Landlock domain, it can
   `ptrace` the calling user's other processes and read their
   `/proc/<pid>/environ`.
@@ -209,7 +215,9 @@ $ fcage --restrict \
 ```
 
 `--landlock-scope` replaces the default scopes, and an empty list turns them
-off. Scopes named this way are refused on a kernel that cannot enforce them. Alongside the grant flags, `--setenv`, `--no-base-env`, `--chdir`,
+off. Scopes named this way are refused on a kernel that cannot enforce them.
+`--landlock-resolve-unix` and `--landlock-unix PATH` restrict pathname sockets
+as they do for a sandbox. Alongside the grant flags, `--setenv`, `--no-base-env`, `--chdir`,
 `--stdin`, `--rlimit`, `--timeout`, `--kill-after`, and `--stop-with-caller`
 behave as they do for a sandbox. [`rlimit`] matters more here than in a cage: without
 namespaces, a resource limit is the only thing bounding what the command
@@ -221,6 +229,7 @@ consumes.
 [`ConfigError::RestrictionLandlockUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
 [`ConfigError::LandlockScopeUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
 [`landlock_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_scope
+[`landlock_resolve_unix`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_resolve_unix
 [`seccomp`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.seccomp
 [`current_dir`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.current_dir
 [`stdin`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.stdin

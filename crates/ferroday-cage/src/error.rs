@@ -841,6 +841,31 @@ rendered as text.
         /// The path as it was given.
         path: PathBuf,
     },
+    /// The unix-socket restriction was asked for on a kernel that cannot
+    /// enforce it: one below Landlock ABI 9, or one without the Landlock LSM.
+    ///
+    /// The restriction is the only bound on the pathname sockets a sandbox's
+    /// mounts do not hide, so a request for it is refused rather than dropped.
+    /// Where the library applies it by default, under the
+    /// [host's own root](crate::CageBuilder::host_rootfs), such a kernel runs
+    /// without it instead.
+    #[non_exhaustive]
+    LandlockResolveUnixUnenforceable {
+        /// The kernel's supported Landlock ABI, or `None` when the LSM is
+        /// absent.
+        abi: Option<i32>,
+    },
+    /// A Landlock grant allows only connecting to unix sockets, where no
+    /// unix-socket restriction applies to allow them past.
+    ///
+    /// Without the restriction a pathname socket is reachable wherever the
+    /// command can name it, so the grant would allow nothing, and turning the
+    /// restriction on is what the grant reads as meaning.
+    #[non_exhaustive]
+    ResolveUnixUnhandled {
+        /// The grant, as `access on path`.
+        grant: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -1152,6 +1177,21 @@ impl fmt::Display for ConfigError {
                  nothing (mount over a path that exists, or beneath a filesystem the sandbox \
                  mounts, such as a hidden directory or /tmp)",
                 target.display()
+            ),
+            ConfigError::LandlockResolveUnixUnenforceable { abi } => match abi {
+                Some(abi) => write!(
+                    f,
+                    "the unix-socket restriction needs Landlock ABI 9, and the kernel supports \
+                     ABI {abi}"
+                ),
+                None => f.write_str(
+                    "the unix-socket restriction needs Landlock, which the kernel does not offer",
+                ),
+            },
+            ConfigError::ResolveUnixUnhandled { grant } => write!(
+                f,
+                "the Landlock grant {grant} allows only connecting to unix sockets, which nothing \
+                 restricts unless the unix-socket restriction is on"
             ),
             ConfigError::RevealUnhidden { path } => write!(
                 f,

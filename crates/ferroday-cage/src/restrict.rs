@@ -39,6 +39,13 @@
 //!   network namespace, which a restriction shares, so the session bus and the
 //!   X server are reachable through theirs. A Landlock network grant governs TCP
 //!   alone, and a seccomp filter cannot read the address a connect names.
+//! - **Pathname sockets.** A unix socket at a path the command can name accepts
+//!   its connection: the session bus's under `/run/user`, an SSH agent's, a
+//!   container runtime's. A Landlock filesystem grant governs files, not a
+//!   `connect`, before ABI 9. From ABI 9,
+//!   [`landlock_resolve_unix`](RestrictionBuilder::landlock_resolve_unix)
+//!   confines it to the sockets the command created and those beneath a path
+//!   granted [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX).
 //! - **Same-user `/proc` and `ptrace`.** A command with no Landlock domain can
 //!   `ptrace` the calling user's other processes, where the host's Yama policy
 //!   permits it, and read their `/proc/<pid>/{environ,mem,maps}`. Any Landlock
@@ -610,6 +617,24 @@ impl RestrictionBuilder {
         self
     }
 
+    /// Refuses the command a connection to a pathname unix socket created
+    /// outside its Landlock domain, except beneath a path granted
+    /// [`FsAccess::RESOLVE_UNIX`] (default: off).
+    ///
+    /// A restriction runs on the host, so every socket the calling user can
+    /// name is otherwise reachable: the session bus's, an agent's, a container
+    /// runtime's. See
+    /// [`CageBuilder::landlock_resolve_unix`](crate::CageBuilder::landlock_resolve_unix)
+    /// for what the right governs. It needs Landlock ABI 9, and a restriction
+    /// has nothing else behind it, so it is refused at build on an older
+    /// kernel, or one without the Landlock LSM, as
+    /// [`ConfigError::LandlockResolveUnixUnenforceable`](crate::ConfigError::LandlockResolveUnixUnenforceable).
+    /// Like a scope, it does not count as confinement on its own.
+    pub fn landlock_resolve_unix(mut self, restrict: bool) -> Self {
+        self.hardening.set_resolve_unix(restrict);
+        self
+    }
+
     /// Applies a seccomp syscall filter to the command.
     ///
     /// See [`SeccompPolicy`] for rule sets, the
@@ -709,12 +734,12 @@ impl RestrictionBuilder {
         if self.hardening.is_unrestricted() {
             return Err(ConfigError::RestrictionEmpty.into());
         }
-        let mut hardening = self.hardening.lower()?;
-        settle_landlock(
-            &mut hardening,
-            self.scopes_named,
-            crate::mechanism::probe_landlock_abi(),
-        )?;
+        let mut hardening = self.hardening.lower(false)?;
+        let abi = crate::mechanism::probe_landlock_abi();
+        settle_landlock(&mut hardening, self.scopes_named, abi)?;
+        // A restriction applies the unix-socket restriction only where its
+        // caller asked for it, so it is refused where the kernel cannot.
+        crate::hardening::settle_resolve_unix(&mut hardening, true, || abi)?;
         // The grants are host paths, resolved as the host resolves them: a
         // merged-`/usr` host's `/lib` is a link, and refusing links would refuse
         // the very grants that make a host command runnable.
@@ -1026,7 +1051,7 @@ mod tests {
     /// Settles `builder`'s Landlock request against a kernel that reported
     /// `abi`, returning the scopes it kept.
     fn settle(builder: RestrictionBuilder, abi: Option<i32>) -> Result<u64, ConfigError> {
-        let mut hardening = builder.hardening.lower().expect("a valid request");
+        let mut hardening = builder.hardening.lower(false).expect("a valid request");
         settle_landlock(&mut hardening, builder.scopes_named, abi)?;
         Ok(hardening.landlock_scoped)
     }

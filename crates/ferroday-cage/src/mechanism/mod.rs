@@ -874,9 +874,11 @@ pub(crate) struct HardeningPlan {
     /// Landlock filesystem grants; an empty list means the ruleset governs no
     /// filesystem access.
     pub(crate) landlock: Vec<LandlockRule>,
-    /// The `handled_access_fs` mask the ruleset governs — the full modeled
-    /// set, masked to the kernel ABI in the child. Zero when no filesystem
-    /// grant applies.
+    /// The `handled_access_fs` mask the ruleset governs, masked to the kernel
+    /// ABI in the child: the ABI 5 set where a grant names a file right, and
+    /// `RESOLVE_UNIX` where the unix-socket restriction applies. Zero when
+    /// neither does. A ruleset is built when it is non-zero, grants or none,
+    /// since the unix-socket restriction needs a domain as a scope does.
     pub(crate) landlock_handled: u64,
     /// Landlock network grants; an empty list means the ruleset governs no
     /// network access. A ruleset is built when either grant list is non-empty.
@@ -928,6 +930,7 @@ impl HardeningPlan {
         self.landlock.is_empty()
             && self.landlock_net.is_empty()
             && self.landlock_scoped == 0
+            && self.landlock_handled == 0
             && self.seccomp.is_none()
             && self.keep_caps.is_none()
             && !self.set_securebits

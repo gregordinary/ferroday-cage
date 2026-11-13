@@ -1897,8 +1897,9 @@ const FLAGS: &[Flag] = &[
             "denies all filesystem access not granted)",
         ],
         take: Take::One(|options, _flag, value| {
-            let path = value;
-            options.landlock.push((PathBuf::from(path), false));
+            options
+                .landlock
+                .push((PathBuf::from(value), FsAccess::READ | FsAccess::EXECUTE));
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -1912,8 +1913,41 @@ const FLAGS: &[Flag] = &[
             "(repeatable)",
         ],
         take: Take::One(|options, _flag, value| {
-            let path = value;
-            options.landlock.push((PathBuf::from(path), true));
+            options.landlock.push((
+                PathBuf::from(value),
+                FsAccess::READ | FsAccess::WRITE | FsAccess::EXECUTE,
+            ));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--landlock-resolve-unix",
+        section: Section::Hardening,
+        help: &[
+            "Refuse the command a connection to a pathname unix",
+            "socket it did not create, except beneath a",
+            "--landlock-unix path. On by default with",
+            "--host-rootfs. Needs Landlock ABI 9",
+        ],
+        take: Take::Bare(|options| {
+            options.landlock_resolve_unix = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--landlock-unix",
+        section: Section::Hardening,
+        placeholder: "PATH",
+        help: &[
+            "Allow the command to connect to the unix sockets",
+            "beneath PATH past --landlock-resolve-unix",
+            "(repeatable)",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options
+                .landlock
+                .push((PathBuf::from(value), FsAccess::RESOLVE_UNIX));
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -2103,6 +2137,19 @@ const FLAGS: &[Flag] = &[
         help: &["Share the host PID namespace (default: isolated)"],
         take: Take::Bare(|options| {
             options.pid_namespace = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-landlock-resolve-unix",
+        section: Section::Off,
+        help: &[
+            "Leave the command's connections to pathname unix",
+            "sockets unrestricted, as --host-rootfs otherwise does",
+            "not",
+        ],
+        take: Take::Bare(|options| {
+            options.landlock_resolve_unix = Some(false);
         }),
         ..Flag::DEFAULTS
     },
@@ -2487,9 +2534,12 @@ struct Options {
     managed_mounts: Option<bool>,
     base_env: Option<bool>,
     stop_with_caller: Option<bool>,
-    landlock: Vec<(PathBuf, bool)>,
+    /// The `--landlock-ro`, `--landlock-rw`, and `--landlock-unix` grants, in
+    /// the order given.
+    landlock: Vec<(PathBuf, FsAccess)>,
     landlock_net: Vec<(u16, NetAccess)>,
     landlock_scope: Option<Vec<LandlockScope>>,
+    landlock_resolve_unix: Option<bool>,
     seccomp: Option<SeccompPolicy>,
     /// The seccomp flags as they were given, reconciled into
     /// [`seccomp`](Self::seccomp) once the whole command line has been read.
@@ -3021,6 +3071,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         landlock: Vec::new(),
         landlock_net: Vec::new(),
         landlock_scope: None,
+        landlock_resolve_unix: None,
         seccomp: None,
         seccomp_curated: false,
         seccomp_allow: Vec::new(),
@@ -3189,7 +3240,10 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         // A restriction with nothing to enforce would run a plain host process
         // while appearing to sandbox it. The library rejects that too, but as a
         // launch error; catching it here makes it the usage error it is.
-        if options.landlock.is_empty()
+        if options
+            .landlock
+            .iter()
+            .all(|(_, access)| *access == FsAccess::RESOLVE_UNIX)
             && options.landlock_net.is_empty()
             && options.seccomp.is_none()
             && options.seccomp_errno.is_empty()
@@ -5394,14 +5448,17 @@ impl Launch {
         {
             builder = builder.stop_with_caller(tie);
         }
-        for (path, writable) in options.landlock {
-            builder = builder.landlock_fs(landlock_access(writable), path);
+        for (path, access) in options.landlock {
+            builder = builder.landlock_fs(access, path);
         }
         for (port, access) in options.landlock_net {
             builder = builder.landlock_net(access, port);
         }
         if let Some(scopes) = options.landlock_scope {
             builder = builder.landlock_scope(scopes);
+        }
+        if let Some(restrict) = options.landlock_resolve_unix {
+            builder = builder.landlock_resolve_unix(restrict);
         }
         if let Some(policy) = seccomp {
             builder = builder.seccomp(policy);
@@ -5937,14 +5994,17 @@ fn run_restricted(options: Options) -> ExitCode {
     if let Some(tie) = stop_with_caller_default(options.stop_with_caller, false) {
         builder = builder.stop_with_caller(tie);
     }
-    for (path, writable) in options.landlock {
-        builder = builder.landlock_fs(landlock_access(writable), path);
+    for (path, access) in options.landlock {
+        builder = builder.landlock_fs(access, path);
     }
     for (port, access) in options.landlock_net {
         builder = builder.landlock_net(access, port);
     }
     if let Some(scopes) = options.landlock_scope {
         builder = builder.landlock_scope(scopes);
+    }
+    if let Some(restrict) = options.landlock_resolve_unix {
+        builder = builder.landlock_resolve_unix(restrict);
     }
     if let Some(policy) = seccomp {
         builder = builder.seccomp(policy);
@@ -6020,14 +6080,6 @@ fn withhold_from_restricted_command() -> Result<(), ExitCode> {
 }
 
 /// The Landlock access set a --landlock-ro or --landlock-rw grant confers.
-fn landlock_access(writable: bool) -> FsAccess {
-    if writable {
-        FsAccess::READ | FsAccess::WRITE | FsAccess::EXECUTE
-    } else {
-        FsAccess::READ | FsAccess::EXECUTE
-    }
-}
-
 /// Waits a launch out under the optional deadline, escalating as
 /// [`Escalation`] says. `Ok(None)` means the deadline fired.
 ///
@@ -8840,6 +8892,31 @@ mod tests {
                 "{args:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn the_unix_socket_restriction_and_its_grants_reach_both_builders() {
+        let options = run_options(&[
+            "--host-rootfs",
+            "--no-landlock-resolve-unix",
+            "--landlock-unix",
+            "/run/egress",
+            "/bin/true",
+        ]);
+        assert_eq!(options.landlock_resolve_unix, Some(false));
+        assert_eq!(
+            options.landlock,
+            [(PathBuf::from("/run/egress"), FsAccess::RESOLVE_UNIX)]
+        );
+        // A socket grant alone does not count as a restriction's confinement.
+        let error = parse_error(&[
+            "--restrict",
+            "--landlock-resolve-unix",
+            "--landlock-unix",
+            "/run/egress",
+            "/bin/true",
+        ]);
+        assert!(error.contains("requires at least one grant"), "{error}");
     }
 
     #[test]

@@ -322,3 +322,162 @@ fn a_read_only_path_refuses_writes_inside_a_writable_bind() {
         "{result:?}"
     );
 }
+
+/// Set inside the sandbox to make [`probe_unix_connect`] connect rather than
+/// return: the socket paths to connect to, joined as a `PATH` is.
+#[cfg(feature = "hardening")]
+const PROBE: &str = "FERRODAY_CAGE_TEST_UNIX_SOCKET_PROBE";
+
+/// Where the test binary is bound inside the sandbox: inside the managed
+/// `/tmp`, where the host's own root lets a target be made.
+#[cfg(feature = "hardening")]
+const PROBE_PATH: &str = "/tmp/probe";
+
+/// Inside the sandbox: connects to each socket the outer test named, then to
+/// one this process created itself, and prints what each connection met.
+#[cfg(feature = "hardening")]
+#[test]
+fn probe_unix_connect() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let Some(paths) = std::env::var_os(PROBE) else {
+        return;
+    };
+    println!();
+    let outcome = |path: &Path| match UnixStream::connect(path) {
+        Ok(_) => "ok".to_string(),
+        Err(err) => format!("errno {}", err.raw_os_error().unwrap_or(0)),
+    };
+    for path in std::env::split_paths(&paths) {
+        println!("connect {} {}", path.display(), outcome(&path));
+    }
+    let own = Path::new("/tmp/own.sock");
+    let _listener = UnixListener::bind(own).expect("the probe's own socket binds");
+    println!("connect own {}", outcome(own));
+    println!("probe done");
+}
+
+/// Runs [`probe_unix_connect`] in `builder`'s sandbox, which binds `sockets`
+/// at `/tmp/s`, and returns each connection's outcome, by the path inside the
+/// sandbox, or `own` for the probe's own socket.
+#[cfg(feature = "hardening")]
+fn probe_connections(
+    builder: CageBuilder,
+    sockets: &Path,
+) -> std::collections::BTreeMap<String, String> {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = builder
+        .bind(sockets, "/tmp/s")
+        .bind_ro(&exe, PROBE_PATH)
+        .command(PROBE_PATH)
+        .args([
+            "--exact",
+            "probe_unix_connect",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE, "/tmp/s/granted/sock:/tmp/s/other/sock")
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox launches");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("probe done"),
+        "the probe did not report:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("connect "))
+        .map(|line| {
+            let (path, outcome) = line.split_once(' ').expect("a path and an outcome");
+            (path.to_string(), outcome.to_string())
+        })
+        .collect()
+}
+
+/// A scratch directory holding a listening socket in `granted/` and another in
+/// `other/`, made through this process's descriptor for the directory so the
+/// sockets' paths fit a socket address however deep the fixture cache sits.
+#[cfg(feature = "hardening")]
+fn listening_sockets(
+    name: &str,
+) -> (
+    std::path::PathBuf,
+    std::fs::File,
+    [std::os::unix::net::UnixListener; 2],
+) {
+    use std::os::fd::AsRawFd as _;
+
+    let dir = common::scratch_dir(name);
+    let handle = std::fs::File::open(&dir).expect("the scratch directory opens");
+    let listen = |sub: &str| {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        let short = format!("/proc/self/fd/{}/{sub}/sock", handle.as_raw_fd());
+        std::os::unix::net::UnixListener::bind(short).expect("the socket binds")
+    };
+    let listeners = [listen("granted"), listen("other")];
+    (dir, handle, listeners)
+}
+
+/// Whether the kernel's Landlock ABI has the unix-socket right, reporting the
+/// skip where it does not. No variable governs it: CI's kernels predate it.
+#[cfg(feature = "hardening")]
+fn landlock_resolve_unix() -> bool {
+    let abi = ferroday_cage::host::landlock_abi();
+    let present = abi.is_some_and(|abi| abi >= 9);
+    if !present {
+        common::require::premise_unmet(format_args!(
+            "the unix-socket restriction needs Landlock ABI 9, and the kernel offers {abi:?}"
+        ));
+    }
+    present
+}
+
+#[cfg(feature = "hardening")]
+#[test]
+fn the_unix_socket_restriction_refuses_a_host_socket_and_admits_a_granted_one() {
+    use ferroday_cage::FsAccess;
+
+    if !common::require::userns() || !landlock_resolve_unix() {
+        return;
+    }
+    let (dir, _handle, _listeners) = listening_sockets("host-root-unix-sockets");
+    // On by default under the host's own root, asked for on an empty root.
+    for builder in [
+        Cage::builder().host_rootfs(),
+        common::host_userland().landlock_resolve_unix(true),
+    ] {
+        let seen = probe_connections(
+            builder.landlock_fs(FsAccess::RESOLVE_UNIX, "/tmp/s/granted"),
+            &dir,
+        );
+        assert_eq!(seen["/tmp/s/granted/sock"], "ok", "{seen:?}");
+        assert_eq!(seen["/tmp/s/other/sock"], "errno 13", "{seen:?}");
+        assert_eq!(seen["own"], "ok", "{seen:?}");
+    }
+    // Turned off, every socket in view answers.
+    let seen = probe_connections(
+        Cage::builder().host_rootfs().landlock_resolve_unix(false),
+        &dir,
+    );
+    assert_eq!(seen["/tmp/s/other/sock"], "ok", "{seen:?}");
+    let report = Cage::builder()
+        .host_rootfs()
+        .command("/bin/true")
+        .build()
+        .expect("a valid sandbox configuration")
+        .resolved_inputs()
+        .hardening;
+    assert!(
+        matches!(
+            report,
+            ferroday_cage::ResolvedHardening::Applied {
+                landlock_resolve_unix: true,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+}

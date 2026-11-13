@@ -161,6 +161,52 @@ boundary. That is `Signal` under [`pid_namespace(false)`], and
 without Landlock, refuses the build with
 [`ConfigError::LandlockScopeUnenforceable`].
 
+## Landlock and unix sockets
+
+A read-only mount refuses writing files, not connecting to a socket, and a
+hidden path covers only the places it names. A pathname socket anywhere else in
+the command's view accepts its connection: one inside a bound working tree, or
+an agent's socket at a path nothing hid. [`landlock_resolve_unix`] refuses
+those connections, except to a socket the command or a process it started
+created, and beneath a path granted [`FsAccess::RESOLVE_UNIX`]:
+
+```rust,no_run
+# use ferroday_cage::{Cage, FsAccess};
+# fn main() -> ferroday_cage::Result<()> {
+let status = Cage::builder()
+    .rootfs("/srv/rootfs/alpine")
+    .bind("/run/egress", "/run/egress")
+    .landlock_resolve_unix(true)
+    .landlock_fs(FsAccess::RESOLVE_UNIX, "/run/egress")
+    .command("/usr/bin/agent")
+    .build()?
+    .run()?;
+# let _ = status;
+# Ok(())
+# }
+```
+
+This is Landlock's `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` right. It governs
+`connect`, and `sendmsg` with an explicit address, to a pathname socket, and a
+refusal answers `EACCES`. A grant of the right alone enrolls no other filesystem
+right, so it opens a socket directory without closing the rest of the
+filesystem. In a profile the grant's access letter is `u`, and the setting is
+`resolve-unix` in the `[hardening]` table.
+
+The restriction is off by default, so a sandbox's existing grants behave as
+they did. The [host's own root](how-the-sandbox-is-built.md#the-hosts-own-root)
+turns it on, since that root leaves the host's sockets in view wherever no hide
+covers them.
+
+The right needs Landlock ABI 9. Asked for on an older kernel, or on one without
+Landlock, the build is refused with
+[`ConfigError::LandlockResolveUnixUnenforceable`], since nothing else bounds the
+sockets the mounts leave in view. The host root's default is dropped on such a
+kernel instead, and the [resolved inputs](embedding.md#recording-what-a-build-ran-under)
+report whether it applies. On the command line, `--landlock-resolve-unix` turns
+it on, `--no-landlock-resolve-unix` off, and `--landlock-unix PATH` grants the
+right beneath a path.
+
 The [restriction fallback](restriction-fallback.md), which has neither
 namespace, applies both scopes by default. A kernel that cannot enforce them
 drops the default scopes, and refuses scopes a restriction names itself.
@@ -575,5 +621,8 @@ with no sandbox around it.
 [`LandlockScope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.LandlockScope.html
 [`SeccompRules::errno_for`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.errno_for
 [`ConfigError::LandlockScopeUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
+[`landlock_resolve_unix`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.landlock_resolve_unix
+[`FsAccess::RESOLVE_UNIX`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.FsAccess.html#associatedconstant.RESOLVE_UNIX
+[`ConfigError::LandlockResolveUnixUnenforceable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html#variant.LandlockResolveUnixUnenforceable
 [`host::landlock_abi`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_abi.html
 [`host::seccomp_available`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.seccomp_available.html

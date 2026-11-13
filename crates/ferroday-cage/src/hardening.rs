@@ -203,9 +203,14 @@ pub(crate) mod fs_access {
     pub(crate) const REFER: u64 = 1 << 13;
     pub(crate) const TRUNCATE: u64 = 1 << 14;
     pub(crate) const IOCTL_DEV: u64 = 1 << 15;
+    pub(crate) const RESOLVE_UNIX: u64 = 1 << 16;
 
-    /// Every filesystem right this crate models — the ABI 5 set. The command
+    /// Every filesystem right a grant handles — the ABI 5 set. The command
     /// stage masks this down to the running kernel's supported ABI.
+    ///
+    /// [`RESOLVE_UNIX`] is not here. It restricts connections rather than
+    /// files, and is handled only where the unix-socket restriction is on, so
+    /// a grant made without it leaves sockets as they were.
     pub(crate) const ALL: u64 = EXECUTE
         | WRITE_FILE
         | READ_FILE
@@ -229,7 +234,8 @@ pub(crate) mod fs_access {
     /// A rule whose target is not a directory may allow these and nothing else.
     /// The kernel refuses the rule with `EINVAL` otherwise, so the command stage
     /// narrows a grant on a file or a device node to this set before adding it.
-    pub(crate) const FILE: u64 = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
+    pub(crate) const FILE: u64 =
+        EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV | RESOLVE_UNIX;
 }
 
 /// Kernel `LANDLOCK_SCOPE_*` flags: the IPC reaches a ruleset can confine to
@@ -286,7 +292,55 @@ pub(crate) fn fs_access_for_abi(abi: i32) -> u64 {
     if abi >= 5 {
         mask |= IOCTL_DEV;
     }
+    // ABIs 6 to 8 add scopes and logging flags, and no filesystem right.
+    if abi >= 9 {
+        mask |= RESOLVE_UNIX;
+    }
     mask
+}
+
+/// Refuses the unix-socket restriction on a kernel that cannot enforce it: one
+/// below Landlock ABI 9, or one without the Landlock LSM (`None`).
+///
+/// For a restriction a caller asked for. It is the only bound on the
+/// pathname sockets a mount does not hide, so it follows the scopes'
+/// precedent rather than a filesystem right's, and is refused rather than
+/// narrowed away. A restriction the library turns on by default is narrowed
+/// instead; see [`settle_resolve_unix`].
+pub(crate) fn ensure_resolve_unix_enforceable(abi: Option<i32>) -> Result<(), ConfigError> {
+    if abi.is_some_and(|abi| fs_access_for_abi(abi) & fs_access::RESOLVE_UNIX != 0) {
+        Ok(())
+    } else {
+        Err(ConfigError::LandlockResolveUnixUnenforceable { abi })
+    }
+}
+
+/// Holds a plan's unix-socket restriction to what the kernel at `landlock_abi`
+/// enforces: refused below ABI 9 where `named`, the caller having asked for it,
+/// and otherwise dropped there, the default it is then being a default a
+/// kernel too old for it does without. `landlock_abi` is asked only where the
+/// plan holds the restriction.
+pub(crate) fn settle_resolve_unix(
+    plan: &mut HardeningPlan,
+    named: bool,
+    landlock_abi: impl FnOnce() -> Option<i32>,
+) -> Result<(), ConfigError> {
+    if plan.landlock_handled & fs_access::RESOLVE_UNIX == 0 {
+        return Ok(());
+    }
+    let abi = landlock_abi();
+    if named {
+        return ensure_resolve_unix_enforceable(abi);
+    }
+    if abi.is_none_or(|abi| fs_access_for_abi(abi) & fs_access::RESOLVE_UNIX == 0) {
+        // A rule left allowing nothing is kept, and skipped where the ruleset
+        // is built: a rule is named in a setup error by its position.
+        plan.landlock_handled &= !fs_access::RESOLVE_UNIX;
+        for rule in &mut plan.landlock {
+            rule.access &= !fs_access::RESOLVE_UNIX;
+        }
+    }
+    Ok(())
 }
 
 /// Masks a network access set down to the rights a Landlock ABI version
@@ -378,9 +432,10 @@ pub(crate) fn net_grant_masked_away(net_handled: u64, abi: i32) -> bool {
 /// A set of filesystem access rights, granted on a path by
 /// [`CageBuilder::landlock_fs`].
 ///
-/// The three primitives — [`READ`](Self::READ), [`WRITE`](Self::WRITE), and
-/// [`EXECUTE`](Self::EXECUTE) — combine with `|`, mask with `&`, and
-/// complement with `!` (within the modeled rights):
+/// The four primitives — [`READ`](Self::READ), [`WRITE`](Self::WRITE),
+/// [`EXECUTE`](Self::EXECUTE), and [`RESOLVE_UNIX`](Self::RESOLVE_UNIX) —
+/// combine with `|`, mask with `&`, and complement with `!` (within the
+/// modeled rights):
 ///
 /// ```
 /// use ferroday_cage::FsAccess;
@@ -388,7 +443,10 @@ pub(crate) fn net_grant_masked_away(net_handled: u64, abi: i32) -> bool {
 /// let read_execute = FsAccess::READ | FsAccess::EXECUTE;
 /// assert!(read_execute.contains(FsAccess::READ));
 /// assert_eq!(read_execute & FsAccess::WRITE, FsAccess::empty());
-/// assert_eq!(!FsAccess::WRITE, FsAccess::READ | FsAccess::EXECUTE);
+/// assert_eq!(
+///     !FsAccess::WRITE,
+///     FsAccess::READ | FsAccess::EXECUTE | FsAccess::RESOLVE_UNIX
+/// );
 /// ```
 ///
 /// [`CageBuilder::landlock_fs`]: crate::CageBuilder::landlock_fs
@@ -402,17 +460,29 @@ impl FsAccess {
     pub const WRITE: FsAccess = FsAccess(0b010);
     /// Execute files beneath the path.
     pub const EXECUTE: FsAccess = FsAccess(0b100);
+    /// Connect to a pathname unix socket beneath the path, or send a datagram
+    /// to one, where the unix-socket restriction applies
+    /// (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, Landlock ABI 9).
+    ///
+    /// The restriction is
+    /// [`CageBuilder::landlock_resolve_unix`](crate::CageBuilder::landlock_resolve_unix):
+    /// it refuses the command a connection to a socket created outside its
+    /// Landlock domain, except beneath a path granted this right. Without the
+    /// restriction this right grants nothing, since nothing is refused. A grant
+    /// of it alone enrolls no other filesystem right, so it opens one socket
+    /// directory without closing the rest of the filesystem.
+    pub const RESOLVE_UNIX: FsAccess = FsAccess(0b1000);
 
     /// The bits every modeled right occupies, for masking a complement.
-    const MASK: u8 = 0b111;
+    const MASK: u8 = 0b1111;
 
     /// The empty access set — no rights. Equivalent to [`FsAccess::default`].
     pub const fn empty() -> FsAccess {
         FsAccess(0)
     }
 
-    /// Every modeled right: [`READ`](Self::READ), [`WRITE`](Self::WRITE), and
-    /// [`EXECUTE`](Self::EXECUTE).
+    /// Every modeled right: [`READ`](Self::READ), [`WRITE`](Self::WRITE),
+    /// [`EXECUTE`](Self::EXECUTE), and [`RESOLVE_UNIX`](Self::RESOLVE_UNIX).
     pub const fn all() -> FsAccess {
         FsAccess(FsAccess::MASK)
     }
@@ -467,6 +537,9 @@ impl FsAccess {
         if self.contains(FsAccess::READ) || self.contains(FsAccess::WRITE) {
             bits |= IOCTL_DEV;
         }
+        if self.contains(FsAccess::RESOLVE_UNIX) {
+            bits |= RESOLVE_UNIX;
+        }
         bits
     }
 }
@@ -474,14 +547,15 @@ impl FsAccess {
 bitflag_ops!(FsAccess);
 
 letter_set_text! {
-    FsAccess, "r, w, and x",
+    FsAccess, "r, w, x, and u",
     'r' => READ,
     'w' => WRITE,
     'x' => EXECUTE,
+    'u' => RESOLVE_UNIX,
     /// The error from parsing an [`FsAccess`] from an invalid access string.
     ///
-    /// Produced when the string holds a character other than `r`, `w`, or `x`,
-    /// or repeats one of them.
+    /// Produced when the string holds a character other than `r`, `w`, `x`,
+    /// or `u`, or repeats one of them.
     ParseFsAccessError
 }
 
@@ -1747,6 +1821,9 @@ pub(crate) struct Request {
     landlock_net: Vec<NetGrant>,
     /// The `LANDLOCK_SCOPE_*` flags requested, joined.
     scope: u64,
+    /// The unix-socket restriction as the caller set it; `None` leaves it to
+    /// the root's default.
+    resolve_unix: Option<bool>,
     seccomp: Option<SeccompPolicy>,
     capabilities: CapabilityPosture,
 }
@@ -1770,6 +1847,17 @@ impl Request {
         self.scope = LandlockScope::bits_of(scopes);
     }
 
+    /// Sets the unix-socket restriction.
+    pub(crate) fn set_resolve_unix(&mut self, restrict: bool) {
+        self.resolve_unix = Some(restrict);
+    }
+
+    /// The unix-socket restriction as the caller set it, `None` where it was
+    /// left to the root's default.
+    pub(crate) fn resolve_unix(&self) -> Option<bool> {
+        self.resolve_unix
+    }
+
     /// Sets the seccomp policy.
     pub(crate) fn set_seccomp(&mut self, policy: SeccompPolicy) {
         self.seccomp = Some(policy);
@@ -1783,9 +1871,14 @@ impl Request {
     /// posture does not count — the restriction fallback, the check's consumer,
     /// cannot express one — and neither do the Landlock scopes, which a
     /// restriction requests by default and which leave the filesystem and the
-    /// network as open as they found them.
+    /// network as open as they found them, nor a grant of
+    /// [`FsAccess::RESOLVE_UNIX`] alone, which opens sockets and closes no
+    /// file.
     pub(crate) fn is_unrestricted(&self) -> bool {
-        self.landlock.is_empty()
+        // An empty grant counts, so that it reaches the refusal of its own.
+        self.landlock
+            .iter()
+            .all(|grant| grant.access == FsAccess::RESOLVE_UNIX)
             && self.landlock_net.is_empty()
             && self
                 .seccomp
@@ -1804,6 +1897,7 @@ impl Request {
         self.landlock.is_empty()
             && self.landlock_net.is_empty()
             && self.scope == 0
+            && self.resolve_unix.is_none()
             && self.seccomp.is_none()
             && matches!(self.capabilities, CapabilityPosture::Keep)
     }
@@ -1872,11 +1966,15 @@ impl Request {
     ///   to a non-root identity, so it would hand a consumer's
     ///   [`run_as`](crate::CageBuilder::run_as) command the capabilities that
     ///   switch exists to clear.
+    /// - **Refused: the unix-socket restriction turned off**, `resolve-unix =
+    ///   false`. It would take the restriction away from a root that applies
+    ///   it by default, should the consumer root the sandbox there.
     /// - **Allowed: everything else**, because each part only removes. A seccomp
     ///   policy refuses syscalls, a full capability drop (`drop-caps`) takes
-    ///   every capability away, and a Landlock scope denies a reach outside the
-    ///   sandbox. Any of them also sets no-new-privileges. A consumer's own call
-    ///   for any of them replaces the profile's rather than adding to it.
+    ///   every capability away, and a Landlock scope and the unix-socket
+    ///   restriction turned on deny a reach outside the sandbox. Any of them
+    ///   also sets no-new-privileges. A consumer's own call for any of them
+    ///   replaces the profile's rather than adding to it.
     ///
     /// Destructured without `..`, so a field added to the request fails to
     /// compile here until it is classified, as the builder's own fields are in
@@ -1889,11 +1987,15 @@ impl Request {
             landlock,
             landlock_net,
             scope: _,
+            resolve_unix,
             seccomp: _,
             capabilities,
         } = self;
         if !landlock.is_empty() {
             return Some("a Landlock filesystem grant (landlock-fs)");
+        }
+        if *resolve_unix == Some(false) {
+            return Some("the unix-socket restriction turned off (resolve-unix = false)");
         }
         if !landlock_net.is_empty() {
             return Some("a Landlock network grant (landlock-net)");
@@ -1909,7 +2011,25 @@ impl Request {
     /// Lowers the request into the frozen plan, compiling the seccomp policy
     /// and validating the Landlock grant paths. Called from the builders'
     /// `build`, where allocation and failure are free.
-    pub(crate) fn lower(&self) -> Result<HardeningPlan, ConfigError> {
+    ///
+    /// `resolve_unix_default` is the unix-socket restriction the root applies
+    /// where the caller left it unset. The handled filesystem rights are the
+    /// ABI 5 set where a grant names a right other than
+    /// [`FsAccess::RESOLVE_UNIX`], and `RESOLVE_UNIX` where the restriction
+    /// applies; a grant's `RESOLVE_UNIX` is dropped where it does not, and a
+    /// grant of nothing else is then refused, since it would grant nothing.
+    pub(crate) fn lower(&self, resolve_unix_default: bool) -> Result<HardeningPlan, ConfigError> {
+        let resolve_unix = self.resolve_unix.unwrap_or(resolve_unix_default);
+        let files_handled = self
+            .landlock
+            .iter()
+            .any(|grant| !(grant.access & !FsAccess::RESOLVE_UNIX).is_empty());
+        let landlock_handled = if files_handled { fs_access::ALL } else { 0 }
+            | if resolve_unix {
+                fs_access::RESOLVE_UNIX
+            } else {
+                0
+            };
         // An empty access set is a trap rather than a no-op: enrolling any
         // grant denies everything ungranted, while the kernel skips a rule that
         // permits nothing. A grant of `FsAccess::empty()` therefore denies the
@@ -1933,10 +2053,16 @@ impl Request {
                         grant: subject.to_string(),
                     });
                 }
+                let access = grant.access.to_landlock() & landlock_handled;
+                if access == 0 {
+                    return Err(ConfigError::ResolveUnixUnhandled {
+                        grant: subject.to_string(),
+                    });
+                }
                 landlock_labels.push(format!("{} on {subject}", grant.access));
                 Ok(LandlockRule {
                     path: grant_path_cstring(&grant.path)?,
-                    access: grant.access.to_landlock(),
+                    access,
                 })
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
@@ -1975,11 +2101,7 @@ impl Request {
 
         Ok(HardeningPlan {
             landlock,
-            landlock_handled: if self.landlock.is_empty() {
-                0
-            } else {
-                fs_access::ALL
-            },
+            landlock_handled,
             landlock_net,
             landlock_net_handled: if self.landlock_net.is_empty() {
                 0
@@ -2451,6 +2573,9 @@ pub(crate) mod serde_request {
         /// The Landlock scopes, by name.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         landlock_scope: Vec<String>,
+        /// The unix-socket restriction, where the profile sets it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolve_unix: Option<bool>,
         /// The seccomp policy, when one is configured.
         #[serde(skip_serializing_if = "Option::is_none")]
         seccomp: Option<SeccompProfile>,
@@ -2689,6 +2814,7 @@ pub(crate) mod serde_request {
                 landlock,
                 landlock_net,
                 scope,
+                resolve_unix: self.resolve_unix,
                 seccomp,
                 capabilities,
             })
@@ -2736,6 +2862,7 @@ pub(crate) mod serde_request {
                 drop_caps,
                 keep_caps,
                 landlock_scope,
+                resolve_unix: request.resolve_unix,
                 seccomp,
                 landlock_fs,
                 landlock_net,
@@ -3048,7 +3175,7 @@ mod tests {
         assert_eq!(FsAccess::default(), FsAccess::empty());
         assert_eq!(
             FsAccess::all(),
-            FsAccess::READ | FsAccess::WRITE | FsAccess::EXECUTE
+            FsAccess::READ | FsAccess::WRITE | FsAccess::EXECUTE | FsAccess::RESOLVE_UNIX
         );
 
         let mut set = FsAccess::READ;
@@ -3062,7 +3189,10 @@ mod tests {
         assert_eq!(set, FsAccess::READ);
 
         // Complement stays within the modeled rights.
-        assert_eq!(!FsAccess::WRITE, FsAccess::READ | FsAccess::EXECUTE);
+        assert_eq!(
+            !FsAccess::WRITE,
+            FsAccess::READ | FsAccess::EXECUTE | FsAccess::RESOLVE_UNIX
+        );
         assert_eq!(!FsAccess::all(), FsAccess::empty());
         assert_eq!(!FsAccess::empty(), FsAccess::all());
     }
@@ -3083,34 +3213,112 @@ mod tests {
         assert_eq!(FsAccess::empty().to_string(), "");
         assert_eq!(FsAccess::READ.to_string(), "r");
         assert_eq!((FsAccess::READ | FsAccess::EXECUTE).to_string(), "rx");
-        assert_eq!(FsAccess::all().to_string(), "rwx");
+        assert_eq!(FsAccess::all().to_string(), "rwxu");
+        assert_eq!(FsAccess::RESOLVE_UNIX.to_string(), "u");
         // Display and FromStr round-trip across every subset.
-        for access in [
-            FsAccess::empty(),
-            FsAccess::READ,
-            FsAccess::WRITE,
-            FsAccess::EXECUTE,
-            FsAccess::READ | FsAccess::WRITE,
-            FsAccess::READ | FsAccess::EXECUTE,
-            FsAccess::WRITE | FsAccess::EXECUTE,
-            FsAccess::all(),
-        ] {
+        for bits in 0..=0b1111u8 {
+            let access = [
+                FsAccess::READ,
+                FsAccess::WRITE,
+                FsAccess::EXECUTE,
+                FsAccess::RESOLVE_UNIX,
+            ]
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| bits & (1 << at) != 0)
+            .fold(FsAccess::empty(), |set, (_, right)| set | right);
             assert_eq!(access.to_string().parse::<FsAccess>(), Ok(access));
         }
     }
 
     #[test]
     fn fs_access_parse_is_order_and_case_insensitive() {
-        let rwx = FsAccess::all();
+        let rwx = FsAccess::READ | FsAccess::WRITE | FsAccess::EXECUTE;
         assert_eq!("xwr".parse::<FsAccess>(), Ok(rwx));
         assert_eq!("RWX".parse::<FsAccess>(), Ok(rwx));
+        assert_eq!("UXWR".parse::<FsAccess>(), Ok(FsAccess::all()));
+    }
+
+    /// The unix-socket restriction is handled only where it is on, a grant of
+    /// its right alone enrolls no file right, and such a grant where the
+    /// restriction is off is refused rather than read as granting nothing.
+    #[test]
+    fn the_unix_socket_restriction_is_handled_only_where_it_applies() {
+        let mut files = Request::default();
+        files.grant_fs(FsAccess::all(), Path::new("/usr"));
+        let plan = files.lower(false).unwrap();
+        assert_eq!(plan.landlock_handled, fs_access::ALL);
+        assert_eq!(
+            plan.landlock[0].access & fs_access::RESOLVE_UNIX,
+            0,
+            "a grant's right is dropped where nothing handles it"
+        );
+        let plan = files.lower(true).unwrap();
+        assert_eq!(
+            plan.landlock_handled,
+            fs_access::ALL | fs_access::RESOLVE_UNIX
+        );
+
+        let mut sockets = Request::default();
+        sockets.grant_fs(FsAccess::RESOLVE_UNIX, Path::new("/run/egress"));
+        assert!(matches!(
+            sockets.lower(false),
+            Err(ConfigError::ResolveUnixUnhandled { .. })
+        ));
+        sockets.set_resolve_unix(true);
+        let plan = sockets.lower(false).unwrap();
+        assert_eq!(plan.landlock_handled, fs_access::RESOLVE_UNIX);
+        assert_eq!(plan.landlock[0].access, fs_access::RESOLVE_UNIX);
+        assert!(sockets.is_unrestricted(), "a socket grant closes no file");
+
+        let mut off = Request::default();
+        off.set_resolve_unix(false);
+        assert_eq!(off.lower(true).unwrap().landlock_handled, 0);
+        assert_eq!(
+            Request::default().lower(true).unwrap().landlock_handled,
+            fs_access::RESOLVE_UNIX
+        );
+    }
+
+    /// Asked for, the restriction is refused on a kernel below ABI 9 or
+    /// without Landlock; as a default, it is dropped there, and kept on ABI 9.
+    #[test]
+    fn the_unix_socket_restriction_is_refused_when_named_and_dropped_as_a_default() {
+        assert_eq!(fs_access_for_abi(8) & fs_access::RESOLVE_UNIX, 0);
+        assert_ne!(fs_access_for_abi(9) & fs_access::RESOLVE_UNIX, 0);
+        let lowered = |default| {
+            let mut request = Request::default();
+            request.grant_fs(FsAccess::all(), Path::new("/"));
+            request.lower(default).unwrap()
+        };
+        for abi in [None, Some(5), Some(8)] {
+            assert!(
+                matches!(
+                    settle_resolve_unix(&mut lowered(true), true, || abi),
+                    Err(ConfigError::LandlockResolveUnixUnenforceable { abi: refused }) if refused == abi
+                ),
+                "{abi:?}"
+            );
+            let mut plan = lowered(true);
+            settle_resolve_unix(&mut plan, false, || abi).unwrap();
+            assert_eq!(plan.landlock_handled, fs_access::ALL, "{abi:?}");
+            assert_eq!(plan.landlock[0].access & fs_access::RESOLVE_UNIX, 0);
+        }
+        let mut plan = lowered(true);
+        settle_resolve_unix(&mut plan, true, || Some(9)).unwrap();
+        assert_eq!(
+            plan.landlock_handled,
+            fs_access::ALL | fs_access::RESOLVE_UNIX
+        );
+        // A plan without the restriction asks the kernel nothing.
+        settle_resolve_unix(&mut lowered(false), true, || unreachable!()).unwrap();
     }
 
     #[test]
     fn fs_access_parse_rejects_unknown_and_repeated_letters() {
         let err = "rq".parse::<FsAccess>().unwrap_err();
         assert_eq!(err.text(), "rq");
-        assert!(err.to_string().contains("r, w, and x"));
+        assert!(err.to_string().contains("r, w, x, and u"));
         assert!("rr".parse::<FsAccess>().is_err());
     }
 
@@ -3208,7 +3416,7 @@ mod tests {
         let mut request = Request::default();
         request.grant_net(NetAccess::BIND, 8080);
         request.grant_net(NetAccess::CONNECT, 443);
-        let plan = request.lower().unwrap();
+        let plan = request.lower(false).unwrap();
         assert_eq!(plan.landlock_net.len(), 2);
         assert_eq!(plan.landlock_net[0].port, 8080);
         assert_eq!(plan.landlock_net[0].access, net_access::BIND_TCP);
@@ -3657,7 +3865,7 @@ mod tests {
         let mut request = Request::default();
         request.set_seccomp(SeccompPolicy::Program(program));
         assert!(matches!(
-            request.lower(),
+            request.lower(false),
             Err(ConfigError::SeccompProgramTooLong {
                 len,
                 max: BPF_MAXINSNS,
@@ -3766,7 +3974,7 @@ mod tests {
     fn drop_all_lowers_to_empty_keep_set() {
         let mut request = Request::default();
         request.drop_all_capabilities();
-        let plan = request.lower().unwrap();
+        let plan = request.lower(false).unwrap();
         assert_eq!(plan.keep_caps, Some(0));
     }
 
@@ -3774,14 +3982,14 @@ mod tests {
     fn keep_list_lowers_to_named_bits() {
         let mut request = Request::default();
         request.keep_capabilities([Capability::NetBindService, Capability::Chown]);
-        let plan = request.lower().unwrap();
+        let plan = request.lower(false).unwrap();
         let expected = (CapabilitySet::NET_BIND_SERVICE | CapabilitySet::CHOWN).bits();
         assert_eq!(plan.keep_caps, Some(expected));
     }
 
     #[test]
     fn no_hardening_lowers_to_an_empty_plan() {
-        let plan = Request::default().lower().unwrap();
+        let plan = Request::default().lower(false).unwrap();
         assert!(plan.landlock.is_empty());
         assert_eq!(plan.landlock_handled, 0);
         assert!(plan.landlock_net.is_empty());
@@ -3798,13 +4006,16 @@ mod tests {
         // The kernel accepts these, and only these, on a rule whose target is
         // not a directory. Every right besides them acts on a directory's
         // entries.
+        // `RESOLVE_UNIX` among them: a grant on one socket allows that socket,
+        // measured on Linux 7.1.
         assert_eq!(
             fs_access::FILE,
             fs_access::EXECUTE
                 | fs_access::WRITE_FILE
                 | fs_access::READ_FILE
                 | fs_access::TRUNCATE
-                | fs_access::IOCTL_DEV,
+                | fs_access::IOCTL_DEV
+                | fs_access::RESOLVE_UNIX,
         );
         // Every grant keeps something on a file, so narrowing one never leaves
         // a rule that permits nothing.
@@ -3824,7 +4035,7 @@ mod tests {
         request.grant_net(NetAccess::CONNECT, 443);
         request.grant_fs(FsAccess::READ | FsAccess::EXECUTE, Path::new("/usr"));
         request.grant_fs(FsAccess::READ | FsAccess::WRITE, Path::new("/dev/null"));
-        let plan = request.lower().unwrap();
+        let plan = request.lower(false).unwrap();
         assert_eq!(
             plan.landlock_labels,
             ["rx on /usr", "rw on /dev/null", "c on tcp:443"],
@@ -3879,7 +4090,7 @@ mod tests {
     fn a_sandbox_refuses_the_signal_scope_only_without_a_pid_namespace() {
         let mut request = Request::default();
         request.set_scope([LandlockScope::Signal]);
-        let plan = request.lower().unwrap();
+        let plan = request.lower(false).unwrap();
         let unasked = || -> Option<i32> { panic!("the ABI was probed with nothing to check") };
 
         // Behind a PID namespace the scope is additive, so nothing is checked
@@ -3912,7 +4123,7 @@ mod tests {
 
         let mut scoped = Request::default();
         scoped.set_scope([LandlockScope::AbstractUnixSocket]);
-        let scoped = scoped.lower().unwrap();
+        let scoped = scoped.lower(false).unwrap();
         // In a network namespace of its own, and without a PID namespace, the
         // socket scope is additive.
         assert!(
@@ -3938,7 +4149,7 @@ mod tests {
         let mut granted = Request::default();
         granted.grant_net(NetAccess::CONNECT, 443);
         let mut both = granted.clone();
-        let granted = granted.lower().unwrap();
+        let granted = granted.lower(false).unwrap();
         assert!(
             granted
                 .ensure_sandbox_enforceable(false, true, unasked)
@@ -3957,7 +4168,7 @@ mod tests {
                 .is_ok()
         );
         both.set_scope([LandlockScope::AbstractUnixSocket]);
-        let both = both.lower().unwrap();
+        let both = both.lower(false).unwrap();
         assert!(refuses_scope(
             both.ensure_sandbox_enforceable(true, false, || Some(5)),
             "abstract-unix-socket",
@@ -3996,7 +4207,7 @@ mod tests {
         // A restriction asks for scopes unasked, so they cannot be what saves
         // one from the empty-restriction guard.
         assert!(request.is_unrestricted());
-        let plan = request.lower().unwrap();
+        let plan = request.lower(false).unwrap();
         assert_eq!(plan.landlock_scoped, scope::SIGNAL);
         assert!(!plan.is_empty());
     }
