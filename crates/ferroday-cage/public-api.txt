@@ -2942,12 +2942,15 @@ pub fn ferroday_cage::Running<'obs>::kill(&mut self) -> core::result::Result<(),
 pub fn ferroday_cage::Running<'obs>::kill_handle(&self) -> core::result::Result<ferroday_cage::KillHandle, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::pid(&self) -> u32
 pub fn ferroday_cage::Running<'obs>::terminate(&mut self) -> core::result::Result<(), ferroday_cage::Error>
+pub fn ferroday_cage::Running<'obs>::try_wait(&mut self) -> core::result::Result<core::option::Option<ferroday_cage::ExitStatus>, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::usage(&self) -> core::option::Option<ferroday_cage::ResourceUsage>
 pub fn ferroday_cage::Running<'obs>::wait(&mut self) -> core::result::Result<ferroday_cage::ExitStatus, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::wait_deadline(&mut self, std::time::Instant) -> core::result::Result<core::option::Option<ferroday_cage::ExitStatus>, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::wait_timeout(&mut self, core::time::Duration) -> core::result::Result<core::option::Option<ferroday_cage::ExitStatus>, ferroday_cage::Error>
 impl core::fmt::Debug for ferroday_cage::Running<'_>
 pub fn ferroday_cage::Running<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl std::os::fd::owned::AsFd for ferroday_cage::Running<'_>
+pub fn ferroday_cage::Running<'_>::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl<'obs> core::marker::Freeze for ferroday_cage::Running<'obs>
 impl<'obs> !core::marker::Send for ferroday_cage::Running<'obs>
 impl<'obs> !core::marker::Sync for ferroday_cage::Running<'obs>

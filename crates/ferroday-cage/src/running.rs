@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use rustix::event::{PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags, Timespec, epoll};
 use rustix::fs::{FlockOperation, Stat};
 use rustix::io::Errno;
 use rustix::net::SendFlags;
@@ -60,6 +60,12 @@ const PUMP_BUF: usize = 8192;
 /// typed at it reaches the caller's group rather than the sandbox. While the
 /// sandbox holds the terminal, the caller's group is the background job: a
 /// process in it that reads the terminal stops until its shell resumes it.
+///
+/// A caller that drives many sandboxes from one thread, such as an async
+/// runtime's, waits on the handle's readiness descriptor instead of blocking a
+/// thread on each: [`as_fd`](AsFd::as_fd) is readable whenever the handle has
+/// work, and [`try_wait`](Self::try_wait) does it without blocking. The
+/// embedding chapter of the guide gives the recipe for tokio.
 ///
 /// The escalation recipe, for callers that need a bounded stop:
 ///
@@ -134,6 +140,11 @@ pub struct Running<'obs> {
     /// handle drops. A field with a `Drop` of its own rather than a `Drop` on
     /// the handle, for the reason [`PlaceholderGuard`] gives.
     foreground: Option<mechanism::Foreground>,
+    /// The readiness descriptor: an epoll set over the channels the pump
+    /// would poll. See [`sync_readiness`](Self::sync_readiness).
+    ready: OwnedFd,
+    /// Which channels the readiness set holds, one bit per [`Watch`].
+    registered: u8,
 }
 
 /// Which channel one of the pump's poll slots watches, and where its readiness
@@ -152,6 +163,24 @@ enum Watch {
     Supervisor,
     /// A waiter's own descriptor; see [`Running::wait_or_readable`].
     Wake,
+}
+
+/// What one pass of the pump over the live channels ended with.
+enum Pass {
+    /// Nothing became ready before the pass's timeout.
+    TimedOut,
+    /// The waiter's own descriptor became ready.
+    Woken,
+    /// The channels that were ready have been served.
+    Served,
+}
+
+/// Creates the readiness descriptor a handle owns, before the launch it will
+/// serve, so a failure leaves nothing running.
+fn readiness() -> Result<OwnedFd, Error> {
+    epoll::create(epoll::CreateFlags::CLOEXEC).map_err(|errno| Error::Spawn {
+        source: errno.into(),
+    })
 }
 
 /// Which captured stream a read belongs to.
@@ -177,6 +206,7 @@ impl<'obs> Running<'obs> {
         if observe {
             check_capture_composes(plan)?;
         }
+        let ready = readiness()?;
         // The progress sink borrows the observer only for the launch; the
         // borrow ends with the statement, leaving the observer to move into
         // the handle for the output pump.
@@ -195,7 +225,12 @@ impl<'obs> Running<'obs> {
         let (launched, primary) = guarded(plan, &created, spawned)?;
         debug_assert!(primary.is_none(), "a launch with no terminal returns none");
         let placeholders = PlaceholderGuard::new(plan, &created, Some(launched.pidfd.as_fd()));
-        Ok(Running::from_launched(launched, observer, placeholders))
+        Ok(Running::from_launched(
+            launched,
+            observer,
+            placeholders,
+            ready,
+        ))
     }
 
     /// Launches the plan capturing both streams whole, waits for it, and
@@ -222,13 +257,14 @@ impl<'obs> Running<'obs> {
         terminal: &Terminal,
     ) -> Result<(Running<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
+        let ready = readiness()?;
         let mut created = Vec::new();
         let spawned = mechanism::spawn(plan, false, Some(terminal), &mut |_| {}, &mut created);
         let (launched, primary) = guarded(plan, &created, spawned)?;
         let placeholders = PlaceholderGuard::new(plan, &created, Some(launched.pidfd.as_fd()));
         let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
         Ok((
-            Running::from_launched(launched, None, placeholders),
+            Running::from_launched(launched, None, placeholders, ready),
             Pty::new(primary),
         ))
     }
@@ -238,6 +274,7 @@ impl<'obs> Running<'obs> {
         launched: mechanism::Launched,
         observer: Option<&'obs mut dyn Observer>,
         placeholders: PlaceholderGuard,
+        ready: OwnedFd,
     ) -> Running<'obs> {
         let buf = if observer.is_some() {
             vec![0; PUMP_BUF]
@@ -262,6 +299,8 @@ impl<'obs> Running<'obs> {
             buf,
             _placeholders: placeholders,
             foreground: launched.foreground,
+            ready,
+            registered: 0,
         }
     }
 
@@ -329,6 +368,53 @@ impl<'obs> Running<'obs> {
         match Instant::now().checked_add(timeout) {
             Some(deadline) => self.pump(Some(deadline), None),
             None => self.pump(None, None),
+        }
+    }
+
+    /// Serves whatever of the handle's channels is ready, without blocking,
+    /// and returns the command's outcome once it is known.
+    ///
+    /// `Ok(None)` means the sandbox is still running, or still being torn
+    /// down. Like [`wait`](Self::wait), it delivers captured output to the
+    /// observer as it reads it, and reports the outcome only once every
+    /// channel has settled, so it returns the same outcome a wait would.
+    ///
+    /// It is the non-blocking half of the readiness descriptor
+    /// [`as_fd`](AsFd::as_fd) returns. A caller registers that descriptor
+    /// with its event loop, calls `try_wait` once, and calls it again each
+    /// time the descriptor is readable, until it returns the outcome:
+    ///
+    /// ```no_run
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// # let cage = ferroday_cage::Cage::builder().rootfs("/r").command("/bin/x").build()?;
+    /// # fn readable(_: std::os::fd::BorrowedFd<'_>) {}
+    /// use std::os::fd::AsFd;
+    ///
+    /// let mut running = cage.spawn()?;
+    /// let status = loop {
+    ///     if let Some(status) = running.try_wait()? {
+    ///         break status;
+    ///     }
+    ///     // The event loop's wait for the descriptor to be readable.
+    ///     readable(running.as_fd());
+    /// };
+    /// # let _ = status;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// One call reads at most one chunk of each captured stream, so a command
+    /// writing without pause cannot hold it, and the descriptor stays readable
+    /// while more is waiting.
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, Error> {
+        if !self.settled() {
+            let now = poll::timeout(Duration::ZERO);
+            self.pass(Some(&now), None)?;
+        }
+        self.sync_readiness()?;
+        match self.settled() {
+            true => self.resolve().map(Some),
+            false => Ok(None),
         }
     }
 
@@ -515,69 +601,128 @@ impl<'obs> Running<'obs> {
                     Some(poll::timeout(remaining))
                 }
             };
-
-            // Only the live channels are polled: each is gathered to the front
-            // of a fixed array, so the hot loop allocates nothing, and the
-            // slice handed to `poll` ends where they do. A retired channel
-            // left in it would be ready on every pass (see `poll`), the
-            // supervisor's pidfd above all once its process is reaped, so it is
-            // watched only until it is first seen ready. The entries past the
-            // live ones are never polled; they hold the pidfd only because
-            // every entry of the array needs a descriptor.
-            let mut watched = [Watch::Stdout; 5];
-            let mut pollfds: [PollFd<'_>; 5] =
-                std::array::from_fn(|_| PollFd::new(&self.pidfd, PollFlags::empty()));
-            let mut live = 0;
-            for (watch, fd) in [
-                (Watch::Stdout, self.stdout.as_ref().map(AsFd::as_fd)),
-                (Watch::Stderr, self.stderr.as_ref().map(AsFd::as_fd)),
-                (Watch::Status, self.status.as_ref().map(AsFd::as_fd)),
-                (
-                    Watch::Supervisor,
-                    self.awaiting_supervisor().then(|| self.pidfd.as_fd()),
-                ),
-                (Watch::Wake, wake),
-            ] {
-                if let Some(fd) = fd {
-                    watched[live] = watch;
-                    pollfds[live] = PollFd::from_borrowed_fd(fd, PollFlags::IN);
-                    live += 1;
+            match self.pass(timeout.as_ref(), wake)? {
+                Pass::TimedOut => return Ok(None),
+                // The waiter's channel is answered after this pass's own
+                // reads, so an outcome that arrived beside it is reported
+                // rather than left for the next wait.
+                Pass::Woken => {
+                    return match self.settled() {
+                        true => self.resolve().map(Some),
+                        false => Ok(None),
+                    };
                 }
-            }
-
-            match rustix::event::poll(&mut pollfds[..live], timeout.as_ref()) {
-                Ok(0) => return Ok(None),
-                Ok(_) => {}
-                Err(Errno::INTR) => continue,
-                Err(errno) => return Err(wait_syscall_error(errno)),
-            }
-
-            let mut ready = [false; 5];
-            for (&watch, fd) in watched[..live].iter().zip(&pollfds) {
-                ready[watch as usize] = !fd.revents().is_empty();
-            }
-            if ready[Watch::Stdout as usize] {
-                self.drain_stream(Channel::Stdout)?;
-            }
-            if ready[Watch::Stderr as usize] {
-                self.drain_stream(Channel::Stderr)?;
-            }
-            if ready[Watch::Status as usize] {
-                self.drain_status()?;
-            }
-            if ready[Watch::Supervisor as usize] {
-                self.supervisor_exited = true;
-            }
-            // The waiter's channel is answered after this pass's own reads,
-            // so an outcome that arrived beside it is reported rather than
-            // left for the next wait.
-            if ready[Watch::Wake as usize] {
-                return match self.settled() {
-                    true => self.resolve().map(Some),
-                    false => Ok(None),
-                };
+                Pass::Served => {}
             }
         }
+    }
+
+    /// One pass of the pump: polls the live channels until one is ready or
+    /// `timeout` passes, and serves each that is.
+    fn pass(
+        &mut self,
+        timeout: Option<&Timespec>,
+        wake: Option<BorrowedFd<'_>>,
+    ) -> Result<Pass, Error> {
+        // Only the live channels are polled: each is gathered to the front
+        // of a fixed array, so the hot loop allocates nothing, and the
+        // slice handed to `poll` ends where they do. A retired channel
+        // left in it would be ready on every pass (see `poll`), the
+        // supervisor's pidfd above all once its process is reaped, so it is
+        // watched only until it is first seen ready. The entries past the
+        // live ones are never polled; they hold the pidfd only because
+        // every entry of the array needs a descriptor.
+        let mut watched = [Watch::Stdout; 5];
+        let mut pollfds: [PollFd<'_>; 5] =
+            std::array::from_fn(|_| PollFd::new(&self.pidfd, PollFlags::empty()));
+        let mut live = 0;
+        for (watch, fd) in [
+            (Watch::Stdout, self.stdout.as_ref().map(AsFd::as_fd)),
+            (Watch::Stderr, self.stderr.as_ref().map(AsFd::as_fd)),
+            (Watch::Status, self.status.as_ref().map(AsFd::as_fd)),
+            (
+                Watch::Supervisor,
+                self.awaiting_supervisor().then(|| self.pidfd.as_fd()),
+            ),
+            (Watch::Wake, wake),
+        ] {
+            if let Some(fd) = fd {
+                watched[live] = watch;
+                pollfds[live] = PollFd::from_borrowed_fd(fd, PollFlags::IN);
+                live += 1;
+            }
+        }
+
+        match rustix::event::poll(&mut pollfds[..live], timeout) {
+            Ok(0) => return Ok(Pass::TimedOut),
+            Ok(_) => {}
+            Err(Errno::INTR) => return Ok(Pass::Served),
+            Err(errno) => return Err(wait_syscall_error(errno)),
+        }
+
+        let mut ready = [false; 5];
+        for (&watch, fd) in watched[..live].iter().zip(&pollfds) {
+            ready[watch as usize] = !fd.revents().is_empty();
+        }
+        if ready[Watch::Stdout as usize] {
+            self.drain_stream(Channel::Stdout)?;
+        }
+        if ready[Watch::Stderr as usize] {
+            self.drain_stream(Channel::Stderr)?;
+        }
+        if ready[Watch::Status as usize] {
+            self.drain_status()?;
+        }
+        if ready[Watch::Supervisor as usize] {
+            self.supervisor_exited = true;
+        }
+        self.sync_readiness()?;
+        Ok(match ready[Watch::Wake as usize] {
+            true => Pass::Woken,
+            false => Pass::Served,
+        })
+    }
+
+    /// Brings the readiness set in line with the channels the pump polls.
+    ///
+    /// The set holds what the next pass would poll, so it is readable exactly
+    /// when that pass has work: a stream or the status pipe while it is live,
+    /// and the supervisor's pidfd while the outcome is known and the
+    /// supervisor has not been seen to exit. A pidfd stays readable once its
+    /// process is gone, so the pump watches it only until it is first seen
+    /// ready, and the set drops it then too. A stream and the status pipe
+    /// leave the set by being closed, which removes them.
+    ///
+    /// Run after every pass and by [`try_wait`](Self::try_wait), so the set
+    /// follows the handle however it is driven.
+    fn sync_readiness(&mut self) -> Result<(), Error> {
+        let mut registered = self.registered;
+        let awaiting = self.awaiting_supervisor();
+        for (watch, fd) in [
+            (Watch::Stdout, self.stdout.as_ref().map(AsFd::as_fd)),
+            (Watch::Stderr, self.stderr.as_ref().map(AsFd::as_fd)),
+            (Watch::Status, self.status.as_ref().map(AsFd::as_fd)),
+            (Watch::Supervisor, awaiting.then(|| self.pidfd.as_fd())),
+        ] {
+            let bit = 1u8 << watch as u8;
+            match (fd, registered & bit != 0) {
+                (Some(fd), false) => {
+                    let data = epoll::EventData::new_u64(watch as u64);
+                    epoll::add(&self.ready, fd, data, epoll::EventFlags::IN)
+                        .map_err(wait_syscall_error)?;
+                    registered |= bit;
+                }
+                (None, true) => {
+                    if watch == Watch::Supervisor {
+                        epoll::delete(&self.ready, &self.pidfd).map_err(wait_syscall_error)?;
+                    }
+                    registered &= !bit;
+                }
+                _ => {}
+            }
+        }
+        self.registered = registered;
+        Ok(())
     }
 
     /// Reads one chunk from a captured stream and delivers it; end-of-file
@@ -653,6 +798,23 @@ impl<'obs> Running<'obs> {
             }
         }
         Ok(())
+    }
+}
+
+impl AsFd for Running<'_> {
+    /// The handle's readiness descriptor, readable whenever
+    /// [`try_wait`](Running::try_wait) has work: output to deliver, the
+    /// outcome to read, or the teardown to observe.
+    ///
+    /// It is an epoll set the handle owns, over the channels a wait polls,
+    /// and it follows them as each closes. Register it with an event loop as
+    /// readable, level-triggered, and call `try_wait` once before the first
+    /// wait on it and again each time it is readable. Once `try_wait` has
+    /// returned the outcome the set is empty, and it never becomes readable
+    /// again. A duplicate, such as one an event loop that owns its descriptors
+    /// takes, watches the same set.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.ready.as_fd()
     }
 }
 
@@ -1132,6 +1294,9 @@ impl<'obs> Pending<'obs> {
     /// configured for; the returned [`Running`] waits for, signals, or kills
     /// it.
     pub fn proceed(mut self) -> Result<Running<'obs>, Error> {
+        // Before the gate opens: a failure here drops the pending launch,
+        // which tears it down.
+        let ready = readiness()?;
         let inner = self
             .inner
             .take()
@@ -1146,6 +1311,7 @@ impl<'obs> Pending<'obs> {
             launched,
             observer,
             std::mem::take(&mut self.placeholders),
+            ready,
         ))
     }
 }
@@ -1414,6 +1580,7 @@ mod tests {
             },
             Some(&mut observer),
             PlaceholderGuard::default(),
+            readiness().expect("an epoll set"),
         );
 
         let thread = rustix::thread::gettid().as_raw_nonzero().get();

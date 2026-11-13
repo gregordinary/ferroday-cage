@@ -76,6 +76,75 @@ const CPU_LOOP: &str = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
 const LOOP_FLOOR: Duration = Duration::from_millis(150);
 
 /// The processor time a process's usage reports, user and system together.
+/// Drives `running` to its outcome through the readiness descriptor and
+/// `try_wait` alone, as an event loop would, and reports how many calls it
+/// took.
+fn drive(running: &mut ferroday_cage::Running<'_>) -> (ferroday_cage::ExitStatus, usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        if let Some(status) = running.try_wait().expect("the channels are served") {
+            return (status, calls);
+        }
+        assert!(
+            common::readable_by(&*running, deadline),
+            "the descriptor became readable while the sandbox had work",
+        );
+    }
+}
+
+#[test]
+fn the_readiness_descriptor_drives_a_capturing_launch_to_its_outcome() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let cage = sh(rootfs, "echo out; sleep 0.3; echo done");
+    let mut observer = Collect::default();
+    let (status, calls) = {
+        let mut running = cage
+            .spawn_with(&mut observer)
+            .expect("the sandbox launches");
+        let (status, calls) = drive(&mut running);
+        // Fused, as a wait is, and quiet: an event loop that went on waiting
+        // on the descriptor would not be woken again.
+        assert_eq!(running.try_wait().expect("fused"), Some(status));
+        assert!(
+            !common::readable_by(&running, Instant::now() + Duration::from_millis(200)),
+            "the descriptor is quiet once the outcome is known",
+        );
+        assert!(
+            running.usage().is_some(),
+            "the usage arrives with the outcome"
+        );
+        (status, calls)
+    };
+    assert!(status.success(), "{status}");
+    assert_eq!(observer.stdout, b"out\ndone\n");
+    // A loop that spun on a descriptor readable for nothing would call
+    // thousands of times in the command's 300 ms.
+    assert!(calls < 50, "{calls} calls");
+}
+
+#[test]
+fn the_readiness_descriptor_reports_a_kill() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut running = sh(rootfs, "sleep 30")
+        .spawn()
+        .expect("the sandbox launches");
+    assert_eq!(running.try_wait().expect("nothing is ready"), None);
+    assert!(
+        !common::readable_by(&running, Instant::now() + Duration::from_millis(100)),
+        "nothing is ready while the command sleeps",
+    );
+    running.kill().expect("the kill is delivered");
+    let (status, calls) = drive(&mut running);
+    assert_eq!(status.signal(), Some(9), "{status}");
+    assert!(calls < 50, "{calls} calls");
+}
+
 #[test]
 fn a_core_dump_is_reported_as_the_kernel_reported_it() {
     use std::os::unix::process::ExitStatusExt;

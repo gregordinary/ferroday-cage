@@ -89,21 +89,11 @@ pub fn send(fd: impl AsFd, text: &str) {
 /// read on a quiet session would ignore it and hang the whole run. `EINTR` and
 /// `EAGAIN` both mean "nothing yet, ask again" and neither ends the session.
 pub fn drain_until(primary: impl AsFd, deadline: Instant, into: &mut String) -> bool {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use rustix::io::Errno;
 
     let primary = primary.as_fd();
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let timeout = Timespec {
-        tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
-        tv_nsec: i64::from(remaining.subsec_nanos()),
-    };
-    let mut slots = [PollFd::new(&primary, PollFlags::IN)];
-    match poll(&mut slots, Some(&timeout)) {
-        Ok(0) => return false,
-        Ok(_) => {}
-        Err(Errno::INTR) => return true,
-        Err(errno) => panic!("waiting on the session failed: {errno}"),
+    if !crate::fd::readable_by(primary, deadline) {
+        return false;
     }
     let mut buf = [0u8; 4096];
     match rustix::io::read(primary, &mut buf) {

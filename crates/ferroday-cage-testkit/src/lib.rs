@@ -28,6 +28,7 @@
 //! - `pty`: rustix's terminal calls, for `pty`.
 
 pub mod deb;
+pub mod fd;
 pub mod fixture;
 #[cfg(feature = "hex")]
 pub mod hex;

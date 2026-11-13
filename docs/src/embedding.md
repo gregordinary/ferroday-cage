@@ -7,9 +7,10 @@ outside that path. An attached [native network stack](userspace-networking.md)
 runs its pump on a thread of its own for as long as it is attached.
 `HttpFetch::fetch_all`, which a provisioner's downloads reach, runs a batch on
 scoped workers and joins every one before it returns. A service that wants to
-launch sandboxes from a thread pool or an async runtime therefore drives the
-library from a blocking context and connects it to the rest of the program
-itself. This chapter is that connection.
+launch sandboxes from a thread pool or an async runtime therefore launches from
+a blocking context. It waits there, or hands the wait to its event loop through
+the handle's [readiness descriptor](#waiting-without-a-thread). This chapter is
+that connection.
 
 ## One cage, many launches
 
@@ -66,6 +67,46 @@ let status = tokio::task::spawn_blocking(move || cage.run()).await??;
 ```
 
 That much is unremarkable. The part that is not obvious is cancellation.
+
+## Waiting without a thread
+
+A wait blocks its thread for the sandbox's whole life, so a service running
+many sandboxes this way parks a thread on each. The handle offers the wait in
+a form an event loop drives instead. [`Running`] implements `AsFd`: its
+descriptor is readable whenever the handle has work, such as output to
+deliver, the outcome to read, or the teardown to observe.
+[`Running::try_wait`] does that work without blocking, and returns the outcome
+once it is known.
+
+In tokio, the descriptor goes to an `AsyncFd`, and the task calls `try_wait`
+once and again each time the descriptor is readable:
+
+```rust,ignore
+use std::os::fd::AsFd;
+
+use ferroday_cage::{Cage, ExitStatus};
+use tokio::io::unix::AsyncFd;
+
+async fn run(cage: &Cage) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    // Blocks only until the command is executing.
+    let mut running = cage.spawn()?;
+    let ready = AsyncFd::new(running.as_fd().try_clone_to_owned()?)?;
+    loop {
+        if let Some(status) = running.try_wait()? {
+            return Ok(status);
+        }
+        ready.readable().await?.clear_ready();
+    }
+}
+```
+
+The launch itself still blocks, for as long as the sandbox's setup takes. A
+handle is not `Send`, for the reason the next section gives, so a future that
+holds one runs on a `LocalSet` or on a current-thread runtime. An observer
+given to `spawn_with` is called inside `try_wait`, on that thread. One call
+reads at most one chunk of each captured stream, so a command that writes
+without pause cannot hold the task, and the descriptor stays readable while
+more is waiting.
 
 ## Cancelling from async
 
@@ -301,6 +342,7 @@ it is worth doing.
 
 [`Cage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html
 [`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html
+[`Running::try_wait`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.try_wait
 [`Pending`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html
 [`KillHandle`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.KillHandle.html
 [`output`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.output

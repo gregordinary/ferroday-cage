@@ -243,6 +243,11 @@ consumer upgrading can skip it.
   `ExitStatus::signaled_with_core_dump` for a caller reporting an outcome of
   its own. A status that dumped core displays as `terminated by signal 11 (core
   dumped)`. `shell_code` is unchanged.
+- `Running` implements `AsFd`: a readiness descriptor, readable whenever the
+  handle has output to deliver, an outcome to read, or a teardown to observe.
+  `Running::try_wait` does that work without blocking and returns the outcome
+  once it is known, so an event loop drives a sandbox's wait without parking a
+  thread on it. The embedding chapter gives the recipe for tokio.
 
 ### Changed
 
