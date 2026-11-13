@@ -10,21 +10,27 @@
 //! the sandbox runs is charged there, and the cgroup namespace the sandbox
 //! creates is rooted at it.
 //!
-//! The handle reads what the whole tree used from the cgroup once the command's
-//! outcome is known, ends the tree through `cgroup.kill` where the kernel has
-//! one, and removes the cgroup once nothing is left in it.
+//! The running handle reads what the whole tree used from the cgroup once the
+//! command's outcome is known, and removes the cgroup then if nothing is left
+//! in it. A kill through the handle or one of its kill handles ends the tree
+//! through `cgroup.kill`, where the kernel has one, whether or not the outcome
+//! is known yet. The handles share the cgroup, and the last of them to drop
+//! removes it, once a tree a kill ended has emptied.
 
 use std::ffi::CString;
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::Error;
+use crate::mechanism::frame::retry_on_intr;
 
 /// A limit a sandbox's cgroup holds its whole process tree to.
 ///
@@ -495,8 +501,27 @@ const CGROUP2_SUPER_MAGIC: rustix::fs::FsWord = 0x6367_7270;
 /// offers them, whether or not a limit needs them.
 const ACCOUNTED: [&str; 2] = ["memory", "pids"];
 
-/// The sandbox's cgroup, from its creation before the launch until the handle
-/// has read what the tree used and removed it.
+/// How long the drop of a cgroup whose tree a kill ended waits for the tree to
+/// empty before it removes the cgroup.
+///
+/// A killed process leaves the cgroup as its exit completes: within a
+/// millisecond for most, and within a fraction of a second for one releasing
+/// gigabytes of memory. One in an uninterruptible sleep, on an unresponsive
+/// filesystem, leaves only once that sleep ends, and past the bound its cgroup
+/// stays beneath the parent rather than hold the drop.
+const EMPTYING_BOUND: Duration = Duration::from_secs(5);
+
+/// The sandbox's cgroup, from its creation before the launch until its
+/// removal.
+///
+/// The running handle and each of its kill handles share it. The handle reads
+/// what the tree used once the outcome is known, and removes the cgroup then
+/// through [`remove_if_empty`](Self::remove_if_empty). A process the sandbox
+/// left behind keeps it occupied past that, and the drop of the last owner
+/// removes it instead: after a [`kill`](Self::kill), once the tree has emptied,
+/// waiting up to [`EMPTYING_BOUND`] for it, and without one only if the tree
+/// has emptied by itself. A cgroup still holding a process stays beneath the
+/// parent.
 pub(crate) struct Cgroup {
     /// The parent directory, which the cgroup is removed from.
     parent: OwnedFd,
@@ -510,6 +535,12 @@ pub(crate) struct Cgroup {
     procs: OwnedFd,
     /// Its `cgroup.kill`, where the kernel has one (Linux 5.14).
     kill: Option<OwnedFd>,
+    /// Whether [`kill`](Self::kill) has ended the tree, so that the drop waits
+    /// for it to empty.
+    killed: AtomicBool,
+    /// Whether [`remove_if_empty`](Self::remove_if_empty) has removed the
+    /// cgroup, so that the drop has nothing to do.
+    removed: AtomicBool,
 }
 
 impl Cgroup {
@@ -673,6 +704,8 @@ impl Cgroup {
                 dir,
                 procs,
                 kill,
+                killed: AtomicBool::new(false),
+                removed: AtomicBool::new(false),
             }),
             Err(err) => {
                 let _ = rustix::fs::unlinkat(&parent, name.as_c_str(), AtFlags::REMOVEDIR);
@@ -687,10 +720,77 @@ impl Cgroup {
         self.procs.as_fd()
     }
 
-    /// A duplicate of the cgroup's `cgroup.kill`, for a handle that kills from
-    /// elsewhere, or `None` where the kernel has none.
-    pub(crate) fn kill_switch(&self) -> Option<OwnedFd> {
-        self.kill.as_ref().and_then(|fd| fd.try_clone().ok())
+    /// Ends every process of the tree through `cgroup.kill`, where the kernel
+    /// has one, and nothing without it.
+    ///
+    /// A cgroup already removed has nothing left in it to end. The kernel
+    /// answers a write to its `cgroup.kill` with `ENODEV`, or with `ENOENT`
+    /// while the removal is under way, and neither is a failure here.
+    pub(crate) fn kill(&self) -> Result<(), Errno> {
+        let Some(kill) = &self.kill else {
+            return Ok(());
+        };
+        match rustix::io::write(kill, b"1") {
+            Ok(_) => {
+                self.killed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(Errno::NODEV | Errno::NOENT) => Ok(()),
+            Err(errno) => Err(errno),
+        }
+    }
+
+    /// Removes the cgroup if nothing is left in it. One that still holds a
+    /// process stays, for the drop to remove.
+    pub(crate) fn remove_if_empty(&self) {
+        if rustix::fs::unlinkat(&self.parent, self.name.as_c_str(), AtFlags::REMOVEDIR).is_ok() {
+            self.removed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Waits until no process is left in the tree, or `deadline` passes;
+    /// `None` is no deadline.
+    ///
+    /// `cgroup.events` reports the tree's state on its `populated` line, and
+    /// a change to the file raises `POLLPRI` and `POLLERR` on a descriptor of
+    /// it until the descriptor reads the file again. `POLLIN` it raises
+    /// whatever the state, so only `POLLPRI` is asked for, and each read comes
+    /// before the poll it rearms. A cgroup removed meanwhile raises both at
+    /// once and refuses the read, which ends the wait.
+    fn await_empty(&self, deadline: Option<Instant>) {
+        let Ok(events) = rustix::fs::openat(
+            &self.dir,
+            "cgroup.events",
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) else {
+            return;
+        };
+        // `populated 0` and `frozen 0`, one line each.
+        let mut text = [0; 64];
+        loop {
+            let Ok(len) = retry_on_intr!(rustix::io::pread(&events, &mut text, 0)) else {
+                return;
+            };
+            let populated = std::str::from_utf8(&text[..len])
+                .ok()
+                .and_then(|text| keyed(text, "populated"));
+            if populated == Some(0) {
+                return;
+            }
+            let timeout = match deadline {
+                None => None,
+                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                    Some(remaining) => Some(crate::poll::timeout(remaining)),
+                    None => return,
+                },
+            };
+            let mut ready = [PollFd::new(&events, PollFlags::PRI)];
+            match rustix::event::poll(&mut ready, timeout.as_ref()) {
+                Ok(_) | Err(Errno::INTR) => {}
+                Err(_) => return,
+            }
+        }
     }
 
     /// What the tree used, as far as the cgroup's files report it.
@@ -719,16 +819,18 @@ impl fmt::Debug for Cgroup {
 
 impl Drop for Cgroup {
     /// Removes the cgroup, which the kernel allows once no process is left in
-    /// it. One that still holds processes, as a sandbox without a PID namespace
+    /// it, waiting up to [`EMPTYING_BOUND`] for a tree a kill ended to empty.
+    /// One that still holds processes, as a sandbox without a PID namespace
     /// can leave behind, stays beneath the parent.
     fn drop(&mut self) {
+        if *self.removed.get_mut() {
+            return;
+        }
+        if *self.killed.get_mut() {
+            self.await_empty(Instant::now().checked_add(EMPTYING_BOUND));
+        }
         let _ = rustix::fs::unlinkat(&self.parent, self.name.as_c_str(), AtFlags::REMOVEDIR);
     }
-}
-
-/// Ends every process of a cgroup through its `cgroup.kill`.
-pub(crate) fn kill_tree(kill: &OwnedFd) -> Result<(), Errno> {
-    rustix::io::write(kill, b"1").map(drop)
 }
 
 /// What a sandbox's whole process tree used, read from its cgroup.

@@ -2317,8 +2317,11 @@ impl CageBuilder {
     /// [`ResourceUsage`](crate::ResourceUsage) reports what the whole tree
     /// used, read from it. The handle removes the cgroup once the outcome is
     /// known and no process is left in it. A sandbox without a PID namespace
-    /// can leave processes running, and its cgroup then stays beneath the
-    /// parent until they end.
+    /// can leave processes running past the outcome, and the handle then keeps
+    /// the cgroup: a kill ends them, and the handle's drop removes it once
+    /// they have exited. Without a kill, a cgroup still holding them when the
+    /// handle drops stays beneath the parent; [`Running`](crate::Running)
+    /// states the detail.
     ///
     /// A cgroup with processes of its own cannot enable controllers for its
     /// children, so a caller that runs inside `parent` moves itself into a

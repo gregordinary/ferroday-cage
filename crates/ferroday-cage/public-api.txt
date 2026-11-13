@@ -2795,7 +2795,7 @@ impl core::fmt::Debug for ferroday_cage::Pending<'_>
 pub fn ferroday_cage::Pending<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for ferroday_cage::Pending<'_>
 pub fn ferroday_cage::Pending<'_>::drop(&mut self)
-impl<'obs> core::marker::Freeze for ferroday_cage::Pending<'obs>
+impl<'obs> !core::marker::Freeze for ferroday_cage::Pending<'obs>
 impl<'obs> !core::marker::Send for ferroday_cage::Pending<'obs>
 impl<'obs> !core::marker::Sync for ferroday_cage::Pending<'obs>
 impl<'obs> core::marker::Unpin for ferroday_cage::Pending<'obs>

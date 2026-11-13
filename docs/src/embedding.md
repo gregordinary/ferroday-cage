@@ -151,6 +151,14 @@ async side holds it for the whole life of the sandbox. `kill_handle` can be
 called again later from the blocking side if a second one is wanted; each owns
 its own duplicated channel ends.
 
+A sandbox's [cgroup](hardening.md#limits-on-the-whole-tree), where it has one,
+is shared by the `Running` and its kill handles, and the last of them to drop
+removes it. After a kill, that drop first waits for the killed processes to
+exit. That takes about a millisecond, a fraction of a second for one releasing
+gigabytes of memory, and five seconds at most, where one is in an
+uninterruptible sleep. A kill handle the async side drops while the blocking
+task still holds the `Running` leaves that wait to the blocking task.
+
 For a graceful stop, `KillHandle::terminate` sends SIGTERM instead, and the
 escalation recipe in [the process model](process-model.md) applies unchanged —
 either driven from the blocking side with `wait_deadline`, or from the async

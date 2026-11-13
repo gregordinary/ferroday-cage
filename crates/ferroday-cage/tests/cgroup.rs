@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{CgroupLimit, CgroupRefusal, Error, host};
+use ferroday_cage::{CgroupLimit, CgroupRefusal, Error, Stdio, host};
 
 /// Limits whose controllers the tests' sandboxes need the parent to offer.
 const LIMITS: [CgroupLimit; 2] = [CgroupLimit::PidsMax(8), CgroupLimit::MemoryMax(64 << 20)];
@@ -107,6 +107,28 @@ fn sh_in(parent: &Path, script: &str) -> ferroday_cage::CageBuilder {
         .cgroup_parent(parent)
 }
 
+/// A builder whose command starts a sleeper and exits at once, without a PID
+/// namespace, so the sleeper outlives it in the sandbox's cgroup. Its streams
+/// are null, so the sleeper holds none of the sandbox's channels open and the
+/// wait returns with the command.
+fn leaving_a_sleeper(parent: &Path) -> ferroday_cage::CageBuilder {
+    sh_in(parent, "sleep 60 & exit 0")
+        .pid_namespace(false)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+}
+
+/// A parent of the test's own beneath the delegated one, for a test that
+/// counts the cgroups beneath its parent: the tests beside it create cgroups
+/// beneath the shared one at the same time. It holds no process and needs no
+/// controller.
+fn own_parent(parent: &Path, test: &str) -> PathBuf {
+    let own = parent.join(format!("fcage-test-{test}"));
+    std::fs::create_dir_all(&own).expect("a cgroup of the test's own");
+    own
+}
+
 /// The sandbox cgroups beneath `parent`, by name.
 fn sandbox_cgroups(parent: &Path) -> Vec<String> {
     std::fs::read_dir(parent)
@@ -114,6 +136,31 @@ fn sandbox_cgroups(parent: &Path) -> Vec<String> {
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
         .filter(|name| name.starts_with("fcage-") && !name.starts_with("fcage-test-"))
         .collect()
+}
+
+/// The one sandbox cgroup beneath `parent`, and the processes it holds.
+fn sole_sandbox_cgroup(parent: &Path) -> (PathBuf, Vec<u32>) {
+    let names = sandbox_cgroups(parent);
+    assert_eq!(names.len(), 1, "one sandbox cgroup: {names:?}");
+    let cgroup = parent.join(&names[0]);
+    let members = std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .expect("the cgroup lists its processes")
+        .lines()
+        .map(|pid| pid.parse().expect("a process id"))
+        .collect();
+    (cgroup, members)
+}
+
+/// Asserts that every process of `members` is gone, as a kill of the tree
+/// they were in leaves them.
+#[track_caller]
+fn assert_gone(members: &[u32]) {
+    for &pid in members {
+        assert!(
+            common::wait_gone(pid, Duration::from_secs(5)),
+            "the process {pid} the command left outlived the kill",
+        );
+    }
 }
 
 #[test]
@@ -219,13 +266,14 @@ fn a_kill_reaches_a_descendant_that_left_the_command_without_a_pid_namespace() {
     let Some(parent) = delegated() else {
         return;
     };
+    let own = own_parent(parent, "kill-before-outcome");
     // The orphan outlives the command's own process tree: setsid gives it a
     // session of its own, and the command waits on something else. It holds
     // none of the sandbox's streams, which would hold the wait open until it
     // ended by itself.
     let mut observer = common::Collect::default();
     let cage = sh_in(
-        parent,
+        &own,
         "setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exec sleep 30",
     )
     .pid_namespace(false)
@@ -246,6 +294,9 @@ fn a_kill_reaches_a_descendant_that_left_the_command_without_a_pid_namespace() {
     let status = running.wait().expect("the outcome is collected");
     drop(running);
     assert_eq!(status.signal(), Some(9));
+    // The kill can leave the orphan still exiting as the outcome arrives; the
+    // handle's drop waits for the tree to empty and removes the cgroup.
+    assert_eq!(sandbox_cgroups(&own), Vec::<String>::new());
     let orphan: u32 = String::from_utf8_lossy(&observer.stdout)
         .trim()
         .parse()
@@ -257,6 +308,127 @@ fn a_kill_reaches_a_descendant_that_left_the_command_without_a_pid_namespace() {
 }
 
 #[test]
+fn a_kill_after_the_outcome_ends_what_the_command_left_and_removes_its_cgroup() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let own = own_parent(parent, "kill-after-outcome");
+    let mut running = leaving_a_sleeper(&own)
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn()
+        .expect("the sandbox launches");
+    let status = running.wait().expect("the outcome is collected");
+    assert!(status.success(), "{status:?}");
+    let (_, members) = sole_sandbox_cgroup(&own);
+    assert!(!members.is_empty(), "the sleeper outlived the command");
+    running.kill().expect("the kill is delivered");
+    drop(running);
+    assert_eq!(
+        sandbox_cgroups(&own),
+        Vec::<String>::new(),
+        "the cgroup is removed once the kill has emptied it",
+    );
+    assert_gone(&members);
+}
+
+#[test]
+fn a_kill_handle_s_kill_after_the_outcome_removes_the_cgroup_whichever_handle_drops_last() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let own = own_parent(parent, "kill-handle-after-outcome");
+    for running_drops_first in [true, false] {
+        let mut running = leaving_a_sleeper(&own)
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn()
+            .expect("the sandbox launches");
+        let killer = running.kill_handle().expect("a kill handle");
+        let status = running.wait().expect("the outcome is collected");
+        assert!(status.success(), "{status:?}");
+        let (_, members) = sole_sandbox_cgroup(&own);
+        assert!(!members.is_empty(), "the sleeper outlived the command");
+        if running_drops_first {
+            drop(running);
+            std::thread::spawn(move || killer.kill())
+                .join()
+                .expect("the killing thread ends")
+                .expect("the kill is delivered");
+        } else {
+            std::thread::spawn(move || killer.kill())
+                .join()
+                .expect("the killing thread ends")
+                .expect("the kill is delivered");
+            drop(running);
+        }
+        assert_eq!(
+            sandbox_cgroups(&own),
+            Vec::<String>::new(),
+            "the cgroup is removed once the last handle drops, running_drops_first \
+             {running_drops_first}",
+        );
+        assert_gone(&members);
+    }
+}
+
+#[test]
+fn a_cgroup_still_holding_what_the_command_left_stays_beneath_the_parent() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let own = own_parent(parent, "left-populated");
+    let mut running = leaving_a_sleeper(&own)
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn()
+        .expect("the sandbox launches");
+    let status = running.wait().expect("the outcome is collected");
+    assert!(status.success(), "{status:?}");
+    drop(running);
+    let (cgroup, members) = sole_sandbox_cgroup(&own);
+    assert!(
+        !members.is_empty(),
+        "the sleeper outlived the command and the handle"
+    );
+    // What ends it now is the caller's own: the cgroup's kill, and then its
+    // removal once the tree has emptied.
+    std::fs::write(cgroup.join("cgroup.kill"), "1").expect("the tree is killed");
+    assert_gone(&members);
+    remove_once_empty(&cgroup, Duration::from_secs(10));
+}
+
+/// Removes `cgroup` once its tree has emptied, failing past `within`.
+///
+/// The kernel refuses the removal with `EBUSY` while it counts a process in
+/// the cgroup, which a killed process leaves only as its exit completes.
+fn remove_once_empty(cgroup: &Path, within: Duration) {
+    let deadline = Instant::now() + within;
+    loop {
+        match std::fs::remove_dir(cgroup) {
+            Ok(()) => return,
+            Err(err) if err.kind() == std::io::ErrorKind::ResourceBusy => {}
+            Err(err) => panic!("{} is not removed: {err}", cgroup.display()),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} still holds a process",
+            cgroup.display()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
 fn a_cgroup_is_removed_once_its_sandbox_is_done() {
     if !common::require::userns() {
         return;
@@ -264,11 +436,7 @@ fn a_cgroup_is_removed_once_its_sandbox_is_done() {
     let Some(parent) = delegated() else {
         return;
     };
-    // A parent of this test's own, since the tests beside it create cgroups
-    // beneath the shared one at the same time. It holds no process and needs
-    // no controller.
-    let own = parent.join("fcage-test-removal");
-    std::fs::create_dir_all(&own).expect("a cgroup of the test's own");
+    let own = own_parent(parent, "removal");
     for pid_namespace in [true, false] {
         let output = sh_in(&own, "cat /proc/self/cgroup")
             .pid_namespace(pid_namespace)
@@ -430,10 +598,7 @@ fn a_parent_that_can_hold_a_sandbox_s_cgroup_is_answered_so_and_left_as_found() 
     let Some(parent) = delegated() else {
         return;
     };
-    // A parent of this test's own, since the tests beside it create cgroups
-    // beneath the shared one at the same time.
-    let own = parent.join("fcage-test-probe");
-    std::fs::create_dir_all(&own).expect("a cgroup of the test's own");
+    let own = own_parent(parent, "probe");
     assert_eq!(host::cgroup_blocker(&own, &LIMITS), None);
     assert_eq!(
         sandbox_cgroups(&own),

@@ -18,7 +18,7 @@ use rustix::process;
 use rustix::process::Signal;
 
 use crate::Network;
-use crate::cgroup::{self, Cgroup};
+use crate::cgroup::Cgroup;
 use crate::error::{Error, ListenRefusal};
 use crate::mechanism::netns::{self, ListenFailure, Namespaces};
 use crate::mechanism::{
@@ -52,6 +52,16 @@ const PUMP_BUF: usize = 8192;
 /// until the caller exits. A file the launch created in the root as a file
 /// bind's target stays there too, since removing it would unmount the running
 /// sandbox's bind. Prefer waiting — including after a kill.
+///
+/// A sandbox with a cgroup of its own, from [`cgroup_parent`], has it removed
+/// once the handle collects the outcome, where nothing is left in it then.
+/// Without a PID namespace a process the command left behind can still occupy
+/// it, and the handle keeps it. A [`kill`](Self::kill), through this handle or
+/// a [`KillHandle`], ends that process through the cgroup, and the last of the
+/// handle and its kill handles to drop removes the cgroup once its tree has
+/// emptied, waiting up to five seconds for it. Without a kill, a cgroup still
+/// occupied when the last of them drops stays beneath the parent, for the
+/// caller to remove once what is in it has ended.
 ///
 /// Where the launch gave the sandbox the foreground of the caller's terminal
 /// (see [`Stdio`](crate::Stdio)), the wait that observes the outcome gives it
@@ -98,6 +108,7 @@ const PUMP_BUF: usize = 8192;
 /// [`Cage::spawn`]: crate::Cage::spawn
 /// [`Cage::spawn_with`]: crate::Cage::spawn_with
 /// [`stop_with_caller`]: crate::CageBuilder::stop_with_caller
+/// [`cgroup_parent`]: crate::CageBuilder::cgroup_parent
 pub struct Running<'obs> {
     /// Pidfd of the supervisor; the kill anchor, immune to pid reuse.
     pidfd: OwnedFd,
@@ -144,12 +155,13 @@ pub struct Running<'obs> {
     /// The readiness descriptor: an epoll set over the channels the pump
     /// would poll. See [`sync_readiness`](Self::sync_readiness).
     ready: Readiness,
-    /// The sandbox's cgroup, where the launch has one: read for the tree's
-    /// usage and removed once the outcome is known.
-    cgroup: Option<Cgroup>,
-    /// The cgroup's `cgroup.kill`, which a kill writes to as well, kept apart
-    /// from [`cgroup`](Self::cgroup) because a kill can follow the outcome.
-    cgroup_kill: Option<OwnedFd>,
+    /// The sandbox's cgroup, where the launch has one, shared with each
+    /// [`KillHandle`]: a kill ends its tree, before the outcome or after it,
+    /// and the last of the handles to drop removes it.
+    cgroup: Option<Arc<Cgroup>>,
+    /// Whether [`resolve`](Self::resolve) has read the cgroup's account of the
+    /// tree and tried to remove it, which it does once.
+    cgroup_read: bool,
 }
 
 /// Which channel one of the pump's poll slots watches, and where its readiness
@@ -379,8 +391,8 @@ impl<'obs> Running<'obs> {
             _placeholders: placeholders,
             foreground: launched.foreground,
             ready,
-            cgroup_kill: cgroup.as_ref().and_then(Cgroup::kill_switch),
-            cgroup,
+            cgroup: cgroup.map(Arc::new),
+            cgroup_read: false,
         }
     }
 
@@ -555,8 +567,13 @@ impl<'obs> Running<'obs> {
     ///
     /// With a PID namespace this kills its init, and the kernel then kills
     /// every process in the namespace — nothing survives. Without one, only
-    /// the command process itself is killed; descendants it spawned are
-    /// beyond the library's reach.
+    /// the command process itself is killed, and descendants it spawned are
+    /// beyond the library's reach unless the sandbox has a cgroup of its own:
+    /// the kill then also writes the cgroup's `cgroup.kill` (Linux 5.14),
+    /// which ends every process of its tree. It does so once the outcome is
+    /// known too, so a kill after a wait has returned ends what the command
+    /// left behind, and the last handle to drop then removes the cgroup, as
+    /// stated above.
     ///
     /// The kill is delivered through a pidfd and cannot hit a recycled pid.
     /// Killing a sandbox that has already exited is not an error. After a
@@ -576,7 +593,7 @@ impl<'obs> Running<'obs> {
     ///
     /// [`Error::SupervisorLost`]: crate::Error::SupervisorLost
     pub fn kill(&mut self) -> Result<(), Error> {
-        send_kill(&self.pidfd, &self.kill_sent, self.cgroup_kill.as_ref())
+        send_kill(&self.pidfd, &self.kill_sent, self.cgroup.as_deref())
     }
 
     /// Returns a handle that can terminate or kill the sandbox from another
@@ -595,7 +612,7 @@ impl<'obs> Running<'obs> {
             pidfd: duplicate(&self.pidfd)?,
             control: duplicate(&self.control)?,
             kill_sent: Arc::clone(&self.kill_sent),
-            cgroup_kill: self.cgroup_kill.as_ref().map(duplicate).transpose()?,
+            cgroup: self.cgroup.clone(),
         })
     }
 
@@ -646,10 +663,16 @@ impl<'obs> Running<'obs> {
             let _ = mechanism::reap_via_pidfd(pidfd.as_fd());
         }
         // The cgroup's own account of the tree, read once the outcome is known
-        // and before the cgroup is removed, which dropping it does. It stands
-        // alone where the supervisor reported nothing, as after a kill.
-        if let Some(cgroup) = self.cgroup.take() {
+        // and before the cgroup is removed. It stands alone where the
+        // supervisor reported nothing, as after a kill. A cgroup still holding
+        // a process the sandbox left behind stays with the handles, for a kill
+        // to end its tree and the last of them to drop to remove it.
+        if let Some(cgroup) = &self.cgroup
+            && !self.cgroup_read
+        {
+            self.cgroup_read = true;
             self.usage = ResourceUsage::joined(self.usage, cgroup.usage());
+            cgroup.remove_if_empty();
         }
         if let Some(outcome) = self.outcome {
             return Ok(outcome);
@@ -1096,13 +1119,21 @@ fn remove_placeholder(root: &Rooted, placeholder: &Placeholder) {
 /// while another thread blocks in [`Running::wait`]. As long as it exists
 /// it holds the [`stop_with_caller`] tie alongside the `Running`.
 ///
+/// It shares the sandbox's cgroup, where the launch has one, with the
+/// `Running`. Its [`kill`](Self::kill) ends the cgroup's tree as
+/// [`Running::kill`] does, before the outcome or after it, and whichever of
+/// the handles drops last removes the cgroup, waiting up to five seconds for a
+/// killed tree to empty first; [`Running`] states when the cgroup goes.
+///
 /// [`stop_with_caller`]: crate::CageBuilder::stop_with_caller
 #[derive(Debug)]
 pub struct KillHandle {
     pidfd: OwnedFd,
     control: OwnedFd,
     kill_sent: Arc<AtomicBool>,
-    cgroup_kill: Option<OwnedFd>,
+    /// The sandbox's cgroup, shared with the [`Running`] and every other kill
+    /// handle of it.
+    cgroup: Option<Arc<Cgroup>>,
 }
 
 impl KillHandle {
@@ -1116,7 +1147,7 @@ impl KillHandle {
     /// including the note on the cross-thread kill racing a wait, which is
     /// exactly the case this handle serves.
     pub fn kill(&self) -> Result<(), Error> {
-        send_kill(&self.pidfd, &self.kill_sent, self.cgroup_kill.as_ref())
+        send_kill(&self.pidfd, &self.kill_sent, self.cgroup.as_deref())
     }
 }
 
@@ -1500,30 +1531,24 @@ fn send_terminate(control: &OwnedFd) -> Result<(), Error> {
     }
 }
 
-/// Sends SIGKILL through the supervisor's pidfd; a supervisor that already
-/// exited is not an error. The kill flag is raised only once the signal is
-/// known delivered (or moot), so an unexpected failure cannot fabricate a
-/// killed outcome.
 /// Kills the supervisor through its pidfd, and every process of the sandbox's
 /// cgroup through `cgroup.kill` where the launch has one.
 ///
-/// The cgroup reaches what the supervisor's death does not: without a PID
-/// namespace, the descendants that left the command's process tree. A cgroup
-/// already removed, because the outcome was known and nothing was left in it,
-/// has nothing to kill, which its `ENODEV` says.
+/// A supervisor that already exited is not an error. The kill flag is raised
+/// only once the signal is known delivered, or moot, so an unexpected failure
+/// cannot fabricate a killed outcome. The cgroup reaches what the supervisor's
+/// death does not: without a PID namespace, the descendants that left the
+/// command's process tree, whether the outcome is known yet or not.
 fn send_kill(
     pidfd: &OwnedFd,
     kill_sent: &AtomicBool,
-    cgroup_kill: Option<&OwnedFd>,
+    cgroup: Option<&Cgroup>,
 ) -> Result<(), Error> {
     match process::pidfd_send_signal(pidfd, Signal::KILL) {
         Ok(()) | Err(Errno::SRCH) => kill_sent.store(true, Ordering::SeqCst),
         Err(errno) => return Err(signal_error(errno)),
     }
-    match cgroup_kill.map(cgroup::kill_tree) {
-        None | Some(Ok(()) | Err(Errno::NODEV | Errno::NOENT)) => Ok(()),
-        Some(Err(errno)) => Err(signal_error(errno)),
-    }
+    cgroup.map_or(Ok(()), Cgroup::kill).map_err(signal_error)
 }
 
 fn signal_error(errno: Errno) -> Error {

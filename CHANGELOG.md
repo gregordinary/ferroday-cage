@@ -296,13 +296,17 @@ consumer upgrading can skip it.
   `cpu.weight`. `ResourceUsage` gains the tree's processor time, peak memory,
   peak process count and OOM kills, read from the cgroup, and reported for a
   killed sandbox as well. `Running::kill` and `KillHandle::kill` also write
-  `cgroup.kill`, which reaches descendants that left the command's process
-  tree. The handle removes the cgroup once nothing is left in it. A launch the
-  parent cannot serve fails with `Error::CgroupRefused` and a `CgroupRefusal`:
-  a parent that is missing, outside a cgroup v2 hierarchy, read-only, not
-  delegated to the caller, lacking a controller, or holding processes, a kernel
-  without a limit's file, or a caller the launch cannot move from into the
-  parent's subtree. A host failure preparing the cgroup fails with
+  `cgroup.kill`, which reaches descendants that left the command's process tree,
+  before the outcome or after it. The handle removes the cgroup once the outcome
+  is known and nothing is left in it. Where a process the command left behind
+  still holds it then, the last of the handle and its kill handles to drop
+  removes it after a kill, once the tree has emptied, waiting up to five seconds
+  for it. A cgroup still holding a process nothing killed stays beneath the
+  parent. A launch the parent cannot serve fails with `Error::CgroupRefused` and
+  a `CgroupRefusal`: a parent that is missing, outside a cgroup v2 hierarchy,
+  read-only, not delegated to the caller, lacking a controller, or holding
+  processes, a kernel without a limit's file, or a caller the launch cannot move
+  from into the parent's subtree. A host failure preparing the cgroup fails with
   `Error::Cgroup`, and a value the kernel would refuse with
   `ConfigError::CgroupLimitInvalid`. `SetupStep::JoinCgroup` is the step that
   joins it. A limit with no parent is refused at build, unless

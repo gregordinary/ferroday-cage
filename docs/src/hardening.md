@@ -552,12 +552,18 @@ The cgroup does three things besides the limits:
   process the cgroup held, an orphan collected outside the sandbox included,
   and the launching process's own pages are not among them. They are read for
   a killed sandbox too, whose init a kill ends before it reports.
-- **A kill that reaches every process.** `Running::kill` also writes
-  `cgroup.kill`, where the kernel has it (Linux 5.14). Without a PID namespace,
-  that is what ends the descendants that left the command's process tree.
+- **A kill that reaches every process.** `Running::kill` and `KillHandle::kill`
+  also write `cgroup.kill`, where the kernel has it (Linux 5.14). Without a PID
+  namespace, that is what ends the descendants that left the command's process
+  tree, before the outcome is known or after it.
 - **Removal.** The handle removes the cgroup once the outcome is known and no
   process is left in it. A sandbox without a PID namespace can leave processes
-  running, and its cgroup then stays beneath the parent until they end.
+  running past the outcome, and the handle then keeps the cgroup. A kill ends
+  them, and the last of the handle and its kill handles to drop removes the
+  cgroup once they have exited, waiting up to five seconds for them. Without a
+  kill, a cgroup still holding them when the last handle drops stays beneath
+  the parent. The caller removes it with an `rmdir` once they have ended, by
+  themselves or through a write of `1` to its `cgroup.kill`.
 
 A cgroup with processes of its own cannot enable controllers for its children.
 A caller that runs inside the parent therefore moves itself into a leaf beside

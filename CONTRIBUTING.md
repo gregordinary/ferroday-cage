@@ -521,7 +521,7 @@ report name a package and its version bare.
 | Can the sandboxes a provisioner runs the target's binaries in install their network filter, asked before it downloads anything? | `provision::layer::network_filter_preflight`, over `host::seccomp_available` |
 | Can this process install a seccomp filter? | `host::seccomp_available`, which installs one in a forked child through `mechanism::seccomp::installable` |
 | Can a sandbox with a PID namespace of its own mount its procfs here, and why not? | `host::procfs_blocker`, which mounts one in a forked child through `mechanism::probe_procfs_mount`, and `host::procfs_refusal` for the explanation alone |
-| Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, and remove it | `cgroup::Cgroup`, which a launch creates before the fork and the launch stage joins through `cgroup.procs` |
+| Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork and the launch stage joins through `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |
 | Would a launch beneath this parent be refused its cgroup, and why? | `host::cgroup_blocker`, which carries out `cgroup::Cgroup::create` and a join through `mechanism::probe_cgroup_join`, with every errno read by `cgroup::refusal` as the launch's own are |
 | Which cgroup does this process run in? | `host::own_cgroup`, over `host::MountEntry::parse` |
 | Read this process's mount table | `host::MountEntry::parse`, one line of the kernel's `mountinfo` at a time |
