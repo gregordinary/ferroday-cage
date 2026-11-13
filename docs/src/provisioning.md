@@ -668,10 +668,11 @@ A sample of Debian trixie's `.orig.tar.*` files finds roughly one in twelve is
 v7.
 
 Two of the three compressions let the archive name its own memory cost, in a
-header far smaller than the allocation it asks for. A zstd frame declares the
+header far smaller than the memory it asks for. A zstd frame declares the
 window the decoder buffers, and an xz block declares the dictionary the decoder
-allocates and zeroes. Both are capped at 128 MiB, which is twice the largest
-either uses in the archives this library reads.
+grows as output arrives, so any input that decodes to a long enough run pays
+for all of it. Both are capped at 128 MiB, which is twice the largest either
+uses in the archives this library reads.
 
 Each decoder is given its cap and checks the header against it before
 allocating. An archive over the cap therefore fails the provisioning run rather
