@@ -126,10 +126,11 @@ fcage --profile ./build.toml -- /usr/bin/make
 
 `--restricted-profile` is the path for a profile from a source you do not control. It
 refuses the keys that map host resources in, write to the host, or share a host namespace.
-Those are binds, raw mounts, symbolic links, host networking, the host PID namespace, and
-an overlay root. It also refuses Landlock grants and kept capabilities, which the hardening
-flags add to rather than replace. Flags given alongside a profile override it, and each
-default-on toggle has a counterpart in both directions.
+Those are binds, raw mounts, symbolic links, host networking, the host PID namespace, an
+overlay root, the host's own root and a path it hides taken back, and a cgroup parent. It
+also refuses Landlock grants and kept capabilities, which the hardening flags add to rather
+than replace, and the unix-socket restriction turned off. Flags given alongside a profile
+override it, and each default-on toggle has a counterpart in both directions.
 
 ## Exit codes
 

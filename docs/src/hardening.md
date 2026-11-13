@@ -46,11 +46,13 @@ let status = Cage::builder()
 # }
 ```
 
-[`FsAccess`] composes three primitives with `|`: `READ` (read files and list
-directories), `WRITE` (write files and create, remove, and rename entries), and
-`EXECUTE` (execute files). Paths are sandbox paths, resolved after the pivot, so
-a grant describes the mounted view — the rootfs, the bind mounts, and the
-`/proc`, `/dev`, and `/tmp` mounts alike. A read-write grant on the tmpfs `/tmp`
+[`FsAccess`] composes four primitives with `|`: `READ` (read files and list
+directories), `WRITE` (write files and create, remove, and rename entries),
+`EXECUTE` (execute files), and `RESOLVE_UNIX` (connect to the unix sockets
+beneath it, as [Landlock and unix sockets](#landlock-and-unix-sockets)
+describes). Paths are sandbox paths, resolved after the pivot, so a grant
+describes the mounted view — the rootfs, the bind mounts, and the `/proc`,
+`/dev`, and `/tmp` mounts alike. A read-write grant on the tmpfs `/tmp`
 governs exactly the files the sandbox mounts there. A grant may also name a
 single file or device node, such as `/etc/hostname` or `/dev/null`. There it
 allows only the rights that act on a file, since there are no entries to list,

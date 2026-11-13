@@ -340,6 +340,7 @@ drop-caps = true                    # drop every capability...
 # keep-caps = ["net-bind-service"]  # ...or keep only these, dropping the rest
 
 landlock-scope = ["signal"]         # no signals to processes outside the sandbox
+resolve-unix = true                 # no connections to unix sockets ungranted
 
 seccomp = "curated"                 # the curated deny-list of dangerous syscalls
 
@@ -350,6 +351,10 @@ path = "/usr"
 [[hardening.landlock-fs]]
 access = "rwx"
 path = "/work"
+
+[[hardening.landlock-fs]]
+access = "u"                        # connecting to the unix sockets beneath it
+path = "/run/egress"
 
 [[hardening.landlock-net]]
 access = "bc"                       # the b (bind) and c (connect) letters
@@ -362,13 +367,20 @@ exclusive. Capabilities are named in kebab-case (`net-bind-service`). An empty
 capability.
 
 An `[[hardening.landlock-fs]]` entry grants an `access` set beneath a `path`, in
-the `r`, `w`, and `x` letters. An `[[hardening.landlock-net]]` entry grants an
-`access` set on a TCP `port`, in the `b` (bind) and `c` (connect) letters.
-Enrolling any grant denies every path, bind, and connect not granted. Paths are
-sandbox paths, resolved after the pivot, and network rights require Landlock ABI
-4. `landlock-scope` lists the scopes, `signal` and `abstract-unix-socket`, that
-confine those reaches to the sandbox's own processes. Scopes require Landlock
-ABI 6.
+the `r`, `w`, and `x` letters, and `u` for connecting to the unix sockets there.
+An `[[hardening.landlock-net]]` entry grants an `access` set on a TCP `port`, in
+the `b` (bind) and `c` (connect) letters. Enrolling any grant denies every path,
+bind, and connect not granted, except that a grant of `u` alone denies nothing
+else. Paths are sandbox paths, resolved after the pivot, and network rights
+require Landlock ABI 4. `landlock-scope` lists the scopes, `signal` and
+`abstract-unix-socket`, that confine those reaches to the sandbox's own
+processes. Scopes require Landlock ABI 6.
+
+`resolve-unix = true` refuses the command a connection to a pathname unix socket
+it did not create, except beneath a path granted `u`, and needs Landlock ABI 9.
+The [hardening chapter](hardening.md#landlock-and-unix-sockets) describes it. A
+sandbox on the host's own root has it on unless `resolve-unix = false` turns it
+off.
 
 `seccomp` is either the string `"curated"` or a table naming syscalls to
 filter — a deny-list, or an allow-list that must name every syscall the command
@@ -476,8 +488,7 @@ exits. A link at `/etc/ld.so.preload` there, pointing at a path the command can
 write, reaches every later sandbox on that tree. A restricted profile binds
 nothing, so an empty root gains nothing from a link either.
 
-The policy also refuses the parts of `[hardening]` that the consumer's own calls
-add to rather than replace. A profile's part would otherwise widen whatever the
+The policy also refuses the parts of `[hardening]` that would widen whatever the
 consumer configures after loading:
 
 - `landlock-fs` and `landlock-net`, the Landlock grants. Grants are an
@@ -485,11 +496,15 @@ consumer configures after loading:
   added to the consumer's.
 - `keep-caps`, a kept capability set. It survives the switch to a non-root
   `run_as` identity the consumer adds, which otherwise clears every capability.
+- `resolve-unix = false`, the unix-socket restriction turned off. It would take
+  the restriction away from the host's own root, which applies it by default,
+  should the consumer root the sandbox there.
 
 The rest of `[hardening]` only removes, and a restricted profile can carry it. A
-seccomp policy refuses syscalls, `drop-caps` drops every capability, and a
-Landlock scope denies a reach outside the sandbox. A consumer's own call for
-any of them replaces the profile's.
+seccomp policy refuses syscalls, `drop-caps` drops every capability, a Landlock
+scope denies a reach outside the sandbox, and `resolve-unix = true` refuses
+connections to unix sockets. A consumer's own call for any of them replaces the
+profile's.
 
 Deserializing a `RestrictedProfile` reports a refusal through the format's own
 error, as text. A consumer that matches on the refusal deserializes a
