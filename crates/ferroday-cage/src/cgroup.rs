@@ -522,6 +522,11 @@ const EMPTYING_BOUND: Duration = Duration::from_secs(5);
 /// waiting up to [`EMPTYING_BOUND`] for it, and without one only if the tree
 /// has emptied by itself. A cgroup still holding a process stays beneath the
 /// parent.
+///
+/// Its descriptors are the launch's, and are kept off the standard streams'
+/// numbers as every descriptor of the launch's is; see
+/// [`mechanism::above_stdio`](crate::mechanism::above_stdio). The launch stage
+/// inherits them at the fork.
 pub(crate) struct Cgroup {
     /// The parent directory, which the cgroup is removed from.
     parent: OwnedFd,
@@ -581,11 +586,14 @@ impl Cgroup {
             parent: plan.parent.clone(),
             reason,
         };
+        // Each descriptor the cgroup keeps, off the standard streams' numbers.
+        let kept = |mut fd: OwnedFd| crate::mechanism::above_stdio(&mut fd).map(|()| fd);
         let parent = rustix::fs::open(
             &plan.parent,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
+        .and_then(kept)
         .map_err(failed(
             Step::OpenParent,
             "opening the cgroup parent",
@@ -674,6 +682,7 @@ impl Cgroup {
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
             )
+            .and_then(kept)
             .map_err(io_error("opening the sandbox's cgroup", &path))?;
             for write in &plan.writes {
                 let file = open_write(&dir, write.file).map_err(|errno| match errno {
@@ -688,16 +697,18 @@ impl Cgroup {
                     .map(drop)
                     .map_err(io_error("writing a limit to the sandbox's cgroup", &path))?;
             }
-            let procs = open_write(&dir, "cgroup.procs").map_err(failed(
-                Step::OpenFile,
-                "opening the sandbox's cgroup.procs",
-                &path,
-            ))?;
+            let procs = open_write(&dir, "cgroup.procs")
+                .and_then(kept)
+                .map_err(failed(
+                    Step::OpenFile,
+                    "opening the sandbox's cgroup.procs",
+                    &path,
+                ))?;
             // A kernel before Linux 5.14 has no `cgroup.kill`, and the tree is
             // then ended only as far as the supervisor's death reaches. Any
             // other failure to open it is one of the host's, reported rather
             // than read as that kernel.
-            let kill = match open_write(&dir, "cgroup.kill") {
+            let kill = match open_write(&dir, "cgroup.kill").and_then(kept) {
                 Ok(kill) => Some(kill),
                 Err(Errno::NOENT) => None,
                 Err(errno) => {

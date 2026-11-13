@@ -216,10 +216,15 @@ struct Readiness {
 impl Readiness {
     /// Creates the set a handle owns, before the launch it will serve, so a
     /// failure leaves nothing running.
+    ///
+    /// The set is kept off the standard streams' numbers, as every descriptor
+    /// of the launch's is; see [`mechanism::above_stdio`].
     fn new() -> Result<Readiness, Error> {
-        let set = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(|errno| Error::Spawn {
+        let failed = |errno: Errno| Error::Spawn {
             source: errno.into(),
-        })?;
+        };
+        let mut set = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(failed)?;
+        mechanism::above_stdio(&mut set).map_err(failed)?;
         Ok(Readiness { set, registered: 0 })
     }
 

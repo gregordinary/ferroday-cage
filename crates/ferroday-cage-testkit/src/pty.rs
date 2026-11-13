@@ -47,8 +47,10 @@ pub fn winsize(rows: u16, cols: u16) -> Winsize {
 /// only one in which raw mode, the size copy, job control and the terminal's
 /// restoration can be observed from outside.
 ///
-/// The one `unsafe` block in this crate: `pre_exec` is how a child process
-/// joins a session of its own before it executes.
+/// One of the two `unsafe` blocks in this crate, beside
+/// [`with_standard_streams_closed`](crate::fd::with_standard_streams_closed)'s:
+/// `pre_exec` is how a child process joins a session of its own before it
+/// executes.
 #[expect(unsafe_code)]
 pub fn spawn_controlled(command: &mut Command, replica: &OwnedFd) -> Child {
     use std::os::unix::process::CommandExt as _;

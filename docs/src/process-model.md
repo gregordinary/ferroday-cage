@@ -64,7 +64,10 @@ with:
   command is forked, so no caller descriptor leaks into the sandbox and no
   caller resource is pinned by it. This is stronger than the usual
   close-on-exec convention, which depends on every descriptor in the
-  process having been opened carefully.
+  process having been opened carefully. The launch keeps its own
+  descriptors above the standard streams' numbers, so a standard stream the
+  caller has closed reaches the command closed, unless the configuration or
+  the launch wires it.
 - **the composed environment**, standard streams per the configuration,
   and the working directory, as described in
   [How the sandbox is built](how-the-sandbox-is-built.md).

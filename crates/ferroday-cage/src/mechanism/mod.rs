@@ -27,7 +27,8 @@
 //! A launch forks a short-lived stage that creates the namespaces and forks
 //! the sandbox's long-lived processes (see [`child`] for the full process
 //! tree). Four channels connect the caller to them, all created here before
-//! the fork:
+//! the fork, and all above the standard streams' numbers (see
+//! [`above_stdio`]):
 //!
 //! - the **report pipe** carries the setup's account of itself as a stream of
 //!   little-endian records, each opening with a 4-byte tag: one for each
@@ -126,7 +127,7 @@ pub(crate) use procfs::{ProcfsProbe, probe_procfs_mount};
 pub(crate) use remove::{RemoveFailure, delete_tree, remove_tree_mapped};
 
 use std::ffi::{CStr, CString};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1669,6 +1670,51 @@ pub(super) fn abandon_gated_child(child: &Forked) {
     let _ = child.reap();
 }
 
+/// Moves a descriptor of the launch's own off the standard streams' numbers,
+/// if it holds one: a close-on-exec copy at 3 or above takes its place, and the
+/// standard number is closed again.
+///
+/// A descriptor is created at the lowest number free, so a caller that has
+/// closed one of 0, 1 and 2 would find the next descriptor the launch creates
+/// there. The launch keeps every one of its own above them instead, on both
+/// sides of the fork:
+///
+/// - The sandbox's processes inherit the caller's descriptor table, and the
+///   command stage `dup2`s the wired streams onto 0, 1 and 2. A channel on one
+///   of them would be replaced in the command process, and one on a stream the
+///   plan leaves inherited would reach the command. A report pipe replaced
+///   that way ends early, and its end of input reads as a successful exec.
+/// - The caller's own table keeps a closed standard number closed. It is the
+///   caller's to reuse, and a later launch that inherits the stream hands the
+///   command nothing.
+///
+/// Every descriptor the launch creates passes through here: the channels
+/// [`fork_launch`] creates, the handle's readiness set, and the cgroup's
+/// descriptors. One created before the fork that cannot be moved fails the
+/// launch, as its creation failing would. One the caller comes to hold once the
+/// fork is behind it, the launch stage's pidfd, the supervisor's, and a
+/// terminal's primary, is moved where a number above the standard streams is
+/// free and kept where the kernel put it where none is: the sandbox's processes
+/// never hold it, and failing a launch already under way would cost more than
+/// the number. A copy the standard library takes with `try_clone` or
+/// `try_clone_to_owned`, as of the caller's terminal or of the supervisor's
+/// pidfd, needs nothing more, since its search starts at 3.
+///
+/// The sandbox's side of the rule is the launch stage's: before it creates a
+/// descriptor of its own, it holds every standard number the caller left closed
+/// with a close-on-exec placeholder, so nothing a stage creates can land there.
+pub(crate) fn above_stdio(fd: &mut OwnedFd) -> Result<(), Errno> {
+    if fd.as_raw_fd() > STDERR_FILENO {
+        return Ok(());
+    }
+    // The assignment drops the descriptor on the standard number, closing it.
+    *fd = rustix::io::fcntl_dupfd_cloexec(&*fd, STDERR_FILENO + 1)?;
+    Ok(())
+}
+
+/// The highest of the standard streams' descriptor numbers, standard error's.
+pub(crate) const STDERR_FILENO: RawFd = 2;
+
 /// Marshals the launch data, creates the launch channels, and forks the
 /// launch stage.
 ///
@@ -1712,52 +1758,59 @@ fn fork_launch(
         IdentityPlan::Ranged { .. } => (Vec::new(), Vec::new()),
     };
 
-    let (report_read, report_write) = pipe::pipe_with(PipeFlags::CLOEXEC).map_err(spawn_error)?;
-    let (status_read, status_write) = pipe::pipe_with(PipeFlags::CLOEXEC).map_err(spawn_error)?;
-    // Seqpacket keeps the pidfd delivery and each control request a single
-    // atomic message.
-    let (host_sock, cage_sock) = rustix::net::socketpair(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(spawn_error)?;
+    // Both ends of every channel are kept off the standard streams' numbers,
+    // the caller's as well as the sandbox's; see `above_stdio`.
+    let pair = |(mut first, mut second): (OwnedFd, OwnedFd)| {
+        above_stdio(&mut first)?;
+        above_stdio(&mut second)?;
+        Ok((first, second))
+    };
+    let pipe = || pipe::pipe_with(PipeFlags::CLOEXEC).and_then(pair);
+    // Seqpacket keeps each message whole: the pidfd delivery and each control
+    // request on the control socket, ready and go on the map gate, and the
+    // primary on the terminal channel.
+    let seqpacket = || {
+        rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .and_then(pair)
+    };
+
+    let (report_read, report_write) = pipe().map_err(spawn_error)?;
+    let (status_read, status_write) = pipe().map_err(spawn_error)?;
+    let (host_sock, cage_sock) = seqpacket().map_err(spawn_error)?;
     // The map gate, created only when a delegate writes the map: one
     // seqpacket pair carries ready out and go back, the shape the control
     // socket already set.
     let map_gate = if plan.identity.is_ranged() {
-        Some(
-            rustix::net::socketpair(
-                AddressFamily::UNIX,
-                SocketType::SEQPACKET,
-                SocketFlags::CLOEXEC,
-                None,
-            )
-            .map_err(spawn_error)?,
-        )
+        Some(seqpacket().map_err(spawn_error)?)
     } else {
         None
     };
-    // One descriptor serves the null stdin disposition and the supervisor's
-    // own stdio; opened read-write so it fits both.
-    let null = rustix::fs::open(
+    // One descriptor serves the null stdin disposition, the placeholders the
+    // launch stage holds closed standard numbers with, and the supervisor's
+    // own stdio; opened read-write so it fits all three.
+    let mut null = rustix::fs::open(
         c"/dev/null",
         rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )
     .map_err(spawn_error)?;
+    above_stdio(&mut null).map_err(spawn_error)?;
     let (stdout_pipe, stderr_pipe) = if observe {
         (
-            Some(pipe::pipe_with(PipeFlags::CLOEXEC).map_err(spawn_error)?),
-            Some(pipe::pipe_with(PipeFlags::CLOEXEC).map_err(spawn_error)?),
+            Some(pipe().map_err(spawn_error)?),
+            Some(pipe().map_err(spawn_error)?),
         )
     } else {
         (None, None)
     };
     // The proceed pipe exists only for a gated launch.
     let proceed = if gated {
-        Some(pipe::pipe_with(PipeFlags::CLOEXEC).map_err(spawn_error)?)
+        Some(pipe().map_err(spawn_error)?)
     } else {
         None
     };
@@ -1766,15 +1819,7 @@ fn fork_launch(
     // `/dev/ptmx` the sandbox sees, so its replica is a node the command can
     // name; only the primary crosses back.
     let terminal_channel = if terminal.is_some() {
-        Some(
-            rustix::net::socketpair(
-                AddressFamily::UNIX,
-                SocketType::SEQPACKET,
-                SocketFlags::CLOEXEC,
-                None,
-            )
-            .map_err(spawn_error)?,
-        )
+        Some(seqpacket().map_err(spawn_error)?)
     } else {
         None
     };
@@ -1822,7 +1867,10 @@ fn fork_launch(
             };
             child::stage_a(&context)
         }
-        Ok(PidfdFork::ParentOf(stage_a)) => {
+        Ok(PidfdFork::ParentOf(mut stage_a)) => {
+            // The pidfd the fork opened, kept off a standard number where a
+            // number above them is free; see `above_stdio`.
+            let _ = above_stdio(&mut stage_a.pidfd);
             // Close the caller's copies of the sandbox-side ends: from here
             // on, end-of-file on each read side means the sandbox's copies
             // are gone.
@@ -1877,7 +1925,12 @@ fn receive_primary(channel: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
         frame::recv_with_fd(channel.as_fd(), &mut payload).map_err(wait_syscall_error)?;
     match (bytes, primary) {
         (0, _) => Ok(None),
-        (1, Some(primary)) if payload[0] == TERMINAL_BYTE => Ok(Some(primary)),
+        (1, Some(mut primary)) if payload[0] == TERMINAL_BYTE => {
+            // Kept off a standard number where a number above them is free;
+            // see `above_stdio`.
+            let _ = above_stdio(&mut primary);
+            Ok(Some(primary))
+        }
         _ => Err(wait_syscall_error(Errno::PROTO)),
     }
 }
@@ -2601,7 +2654,12 @@ fn receive_supervisor(sock: &OwnedFd) -> Result<(OwnedFd, u32), Error> {
     // A short message means the stage died before publishing the supervisor.
     // A descriptor a truncated message still carried is dropped with it here.
     match pidfd {
-        Some(pidfd) if bytes == payload.len() => Ok((pidfd, u32::from_le_bytes(payload))),
+        Some(mut pidfd) if bytes == payload.len() => {
+            // Kept off a standard number where a number above them is free;
+            // see `above_stdio`.
+            let _ = above_stdio(&mut pidfd);
+            Ok((pidfd, u32::from_le_bytes(payload)))
+        }
         _ => Err(Error::SupervisorLost),
     }
 }

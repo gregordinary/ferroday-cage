@@ -592,6 +592,15 @@ consumer upgrading can skip it.
   `kexec_file_load`, which i386 lacks. The build refuses a `Rules` policy there
   with `ConfigError::SeccompUnsupportedArch`, as on every 32-bit target, and the
   layer's Landlock rules and capability drops apply.
+- A launch keeps its own descriptors off the standard streams' numbers. A
+  caller that had closed one of descriptors 0, 1 and 2 had a launch channel
+  take the number, and wiring the command's streams replaced the channel in
+  the command process: a command that failed to execute was reported as
+  running, with the setup's failure record in its captured output. A launch
+  with a cgroup was refused with `Error::StreamIsDirectory` where the cgroup's
+  directory took a closed stream's number. A standard stream the caller has
+  closed now reaches the command closed unless the launch wires it, and stays
+  closed in the caller through the launch.
 - `fcage --help` names `--no-stop-with-caller` among the counterpart toggles,
   where it named `--stop-with-caller`.
 

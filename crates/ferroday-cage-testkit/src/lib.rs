@@ -3,7 +3,8 @@
 //! Both crates' suites need the same things: the pinned Alpine minirootfs,
 //! scratch directories that clear themselves, the rule for skipping a test the
 //! host cannot run, a tar writer, `ar` and `.deb` writers, a hex encoder, a
-//! pseudoterminal to play the user at, and a few process and sandbox helpers.
+//! pseudoterminal to play the user at, and a few descriptor, process and
+//! sandbox helpers.
 //! One copy of each is what keeps them agreeing: a skip that honors its
 //! `REQUIRE` variable in one suite honors it in every suite.
 //!

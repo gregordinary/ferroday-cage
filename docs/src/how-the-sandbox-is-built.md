@@ -39,7 +39,11 @@ sequence itself.
    inherited except the launch channels and the standard streams. The
    sandbox processes are forked from the swept table, so the command starts
    with only its streams and the supervisor pins no caller resource for the
-   sandbox's lifetime.
+   sandbox's lifetime. The launch channels sit above the standard streams'
+   numbers, and before the launch stage opens anything, it holds each
+   standard stream the caller left closed with a close-on-exec placeholder.
+   No descriptor the setup opens lands on a standard stream's number, so
+   wiring the streams replaces nothing of the launch's.
 4. **Replace the session keyring.** The launch joins a fresh, anonymous session
    keyring in place of the one it inherited from the caller. A keyring is a
    credential rather than a descriptor, so the sweep does not reach it. No

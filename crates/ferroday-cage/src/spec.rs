@@ -344,6 +344,11 @@ pub enum Stdio {
     /// [Job control](#job-control). A launch refuses a
     /// caller's stream that is a directory; see
     /// [A stream that is a directory](#a-stream-that-is-a-directory).
+    ///
+    /// A stream the caller has closed reaches the command closed. The launch
+    /// keeps every descriptor of its own above the standard streams' numbers,
+    /// so none of them takes the closed stream's place, and the caller's closed
+    /// number stays closed through the launch.
     #[default]
     Inherit,
     /// The stream is wired to `/dev/null`: immediate end-of-file on standard

@@ -110,7 +110,8 @@ wire_enum! {
         MountProc = 25 => "mounting a fresh procfs",
         /// Perform a raw mount.
         MountRaw = 26 => "performing a raw mount",
-        /// Sweep inherited file descriptors.
+        /// Sweep inherited file descriptors, having first held each standard
+        /// stream number the caller left closed.
         SweepFds = 27 => "sweeping inherited file descriptors",
         /// Fork the command process.
         ForkCommand = 28 => "forking the command process",

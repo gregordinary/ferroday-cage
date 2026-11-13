@@ -339,7 +339,8 @@ therefore replaces the crate page with that line's metadata.
   open the descriptor those signals arrive on. `fcage` has none. The only other
   `unsafe` is in test code that drives the kernel directly: `tests/keyring.rs`,
   `tests/relay.rs`, `tests/network_filter.rs`, `tests/process.rs`, and the
-  testkit's pseudoterminal harness.
+  testkit's pseudoterminal harness and its closing of a probe's standard
+  descriptors.
 - **Every `unsafe` block states its invariant.** Every crate in the workspace
   denies `unsafe` by default. Each block that needs it carries a `SAFETY:`
   comment stating the invariant it relies on, which
@@ -505,6 +506,7 @@ report name a package and its version bare.
 | Fork, exec, exit, change signal state, or read signals from a descriptor, without libc | `mechanism::sys` |
 | Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
 | Fork a helper child and signal or reap it whatever else in the caller reaps | `mechanism::sys::fork_with_pidfd`, which hands back a `mechanism::Forked` |
+| Keep a descriptor the launch creates off the standard streams' numbers | `mechanism::above_stdio` in the caller, and in the sandbox's processes the launch stage's `child::hold_closed_streams`, which holds each number the caller left closed before any stage creates a descriptor |
 | Do work in a sandbox's network namespace and get one descriptor back | `mechanism::netns::in_network_namespace`, after `netns::Namespaces::of` |
 | Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
@@ -560,6 +562,7 @@ report name a package and its version bare.
 | Skip a test the host cannot run, or fail it where a `REQUIRE` variable says it must run | `ferroday_cage_testkit::require` |
 | Play the user at a pseudoterminal in a test | `ferroday_cage_testkit::pty` |
 | Wait in a test until a descriptor is readable, failing past a deadline | `ferroday_cage_testkit::fd::readable_by` |
+| Run a probe with its standard descriptors closed, and put them back | `ferroday_cage_testkit::fd::with_standard_streams_closed`, and `fd::is_open` to ask of one without opening another |
 | Run a host process in a test, failing the test past a deadline | `ferroday_cage_testkit::process::run_bounded`, or `spawn_grouped` then `finish_bounded` |
 | How much processor time has a process or a thread used? | `ferroday_cage_testkit::process::cpu_ticks`, `thread_ticks` |
 

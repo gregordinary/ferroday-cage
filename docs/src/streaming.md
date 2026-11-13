@@ -230,6 +230,14 @@ let cage = Cage::builder()
 # }
 ```
 
+A caller may run with a standard stream closed, as a daemon that has detached
+from its terminal does. The launch keeps every descriptor of its own above the
+standard streams' numbers, in the caller and in the sandbox alike, so none of
+its channels takes a closed stream's place. Under `Inherit` the command finds
+the stream closed, as the caller has it. `Null` and `from_fd` wire it as they
+wire an open one, and so does a capturing or a terminal launch. The caller's
+closed numbers stay closed through the launch, for the caller to reuse.
+
 ### The dispositions and the caller's terminal
 
 They also decide what the sandbox reaches of the caller's terminal. A

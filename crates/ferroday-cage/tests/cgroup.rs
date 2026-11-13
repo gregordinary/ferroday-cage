@@ -615,3 +615,102 @@ fn a_parent_that_can_hold_a_sandbox_s_cgroup_is_answered_so_and_left_as_found() 
         .expect("the sandbox runs");
     assert!(output.status.success(), "{output:?}");
 }
+
+/// Set in the copy of this test binary that
+/// [`a_launch_in_a_cgroup_leaves_the_callers_closed_streams_closed`] starts,
+/// naming the delegated parent its probe places its sandboxes beneath.
+const CLOSED_STREAMS_PROBE: &str = "FERRODAY_CAGE_TEST_CGROUP_CLOSED_STREAMS";
+
+#[test]
+fn a_launch_in_a_cgroup_leaves_the_callers_closed_streams_closed() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    // The probe is a copy of this test binary, since closing a standard
+    // descriptor is process-wide. It starts in this process's leaf, so its
+    // sandboxes' cgroups are made beneath the parent as this process's are.
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = common::run_bounded(
+        std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "probe_closed_streams",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CLOSED_STREAMS_PROBE, parent)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+        Duration::from_secs(120),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("probe done"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// The probe [`a_launch_in_a_cgroup_leaves_the_callers_closed_streams_closed`]
+/// starts: closes all three standard descriptors, and launches in a cgroup
+/// beneath the parent [`CLOSED_STREAMS_PROBE`] names, directly and held at the
+/// gate.
+///
+/// A launch opens its cgroup's descriptors before anything else of its own, so
+/// they are the first that could take a closed number: a directory of the
+/// cgroup's on standard input's, where the launch would refuse it as a
+/// directory handed to the command, and the caller's closed number held for as
+/// long as the sandbox runs.
+#[test]
+fn probe_closed_streams() {
+    let Some(parent) = std::env::var_os(CLOSED_STREAMS_PROBE) else {
+        return;
+    };
+    let cage = sh_in(Path::new(&parent), "exit 0")
+        .cgroup_limit(CgroupLimit::PidsMax(8))
+        .stop_with_caller(true)
+        .build()
+        .expect("a valid sandbox configuration");
+    let closed = [0, 1, 2];
+    let findings = common::with_standard_streams_closed(&closed, || {
+        let mut findings = Vec::new();
+        let still_closed = |when: &str, findings: &mut Vec<String>| {
+            for fd in closed {
+                if common::is_open(fd) {
+                    findings.push(format!("{when}, the caller's descriptor {fd} is open"));
+                }
+            }
+        };
+        // The command's outcome, or what kept it from one.
+        let outcome = |launched: Result<ferroday_cage::Running<'_>, Error>| match launched {
+            Ok(mut running) => match running.wait_timeout(Duration::from_secs(30)) {
+                Ok(Some(status)) if status.success() => None,
+                other => {
+                    let _ = running.kill();
+                    Some(format!("the sandbox ended {other:?}"))
+                }
+            },
+            Err(err) => Some(format!("the launch failed: {err:?}")),
+        };
+
+        let launched = cage.spawn();
+        still_closed("while a launch runs", &mut findings);
+        findings.extend(outcome(launched));
+
+        let launched = match cage.spawn_pending() {
+            Ok(pending) => {
+                still_closed("while a launch is held", &mut findings);
+                pending.proceed()
+            }
+            Err(err) => Err(err),
+        };
+        findings.extend(outcome(launched));
+        findings
+    });
+    assert!(findings.is_empty(), "{}", findings.join("\n"));
+    println!("probe done");
+}

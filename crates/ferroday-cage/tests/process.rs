@@ -8,10 +8,15 @@
 mod common;
 
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::fd::RawFd;
+use std::path::PathBuf;
 use std::process::Stdio as HostStdio;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, ConfigError, Error, Limit, Resource, Stdio};
+use ferroday_cage::{
+    Cage, ConfigError, Error, ExitStatus, Limit, Output, Pending, Pty, Resource, Running,
+    SetupStep, Stdio, Terminal,
+};
 use rustix::process::Pid;
 
 /// Set inside the sandbox, and in the probe's own child, to make a probe test
@@ -627,4 +632,425 @@ fn is_zombie(pid: u32) -> bool {
             rest.split_whitespace().next().map(|state| state == "Z")
         })
         .unwrap_or(false)
+}
+
+// -- A caller's closed standard streams ---------------------------------------
+
+/// Set in a copy of this test binary that [`run_closed_stream_probes`] starts,
+/// to have [`probe_closed_streams`] close the standard descriptors its value
+/// names and launch with them closed. The value is the confinement, `sandbox`
+/// or `restriction`, then the numbers: `sandbox 0 1 2`.
+const CLOSED: &str = "FERRODAY_CAGE_TEST_PROCESS_CLOSED";
+
+/// The sets of standard descriptors a caller has closed that the launches are
+/// tried under, each in a process of its own.
+const CLOSED_SETS: [&str; 4] = ["0", "1", "2", "0 1 2"];
+
+/// A command that is nowhere, so its launch fails at the exec.
+const ABSENT: &str = "/usr/bin/ferroday-cage-absent-command";
+
+/// How long one launch of the probe may take to finish.
+const PATIENCE: Duration = Duration::from_secs(30);
+
+/// Sets `fds` to the word `fds` and then every descriptor number below 64 the
+/// shell holds.
+///
+/// Builtins and path checks only, as in
+/// [`the_command_starts_with_a_clean_descriptor_table`]: a forked helper or a
+/// command substitution would add descriptors to the very table it examines.
+const LIST_FDS: &str = "fds=fds; fd=0; while [ $fd -lt 64 ]; do \
+     [ -e /proc/$$/fd/$fd ] && fds=\"$fds $fd\"; fd=$((fd+1)); done";
+
+#[test]
+fn a_sandbox_launch_leaves_the_callers_closed_streams_closed() {
+    if common::fixture_rootfs().is_none() {
+        return;
+    }
+    run_closed_stream_probes("sandbox");
+}
+
+#[cfg(feature = "hardening")]
+#[test]
+fn a_restriction_launch_leaves_the_callers_closed_streams_closed() {
+    if !common::landlock() {
+        return;
+    }
+    run_closed_stream_probes("restriction");
+}
+
+/// Runs [`probe_closed_streams`] for `confinement` under each of
+/// [`CLOSED_SETS`], in a copy of this test binary of its own for each, and
+/// fails on the first whose probe does not pass.
+///
+/// A process apart, because closing a standard descriptor is process-wide: in
+/// the harness's own process it would take the harness's output, and every
+/// test running beside it would launch with the descriptor closed.
+fn run_closed_stream_probes(confinement: &str) {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    for closed in CLOSED_SETS {
+        let output = common::run_bounded(
+            std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "probe_closed_streams",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CLOSED, format!("{confinement} {closed}"))
+                .stdin(HostStdio::null())
+                .stdout(HostStdio::piped())
+                .stderr(HostStdio::piped()),
+            Duration::from_secs(300),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("probe done"),
+            "a {confinement} launch with {closed} closed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+/// The probe [`run_closed_stream_probes`] starts: closes the standard
+/// descriptors [`CLOSED`] names, launches with them closed in every way the
+/// confinement offers, and reports what it found once they are open again.
+#[test]
+fn probe_closed_streams() {
+    let Ok(spec) = std::env::var(CLOSED) else {
+        return;
+    };
+    let mut words = spec.split(' ');
+    let confinement = words.next().expect("the probe names its confinement");
+    let closed: Vec<RawFd> = words
+        .map(|word| word.parse().expect("a descriptor number"))
+        .collect();
+    let launchers = Launchers::new(confinement, &spec.replace(' ', "-"));
+
+    let mut findings = common::with_standard_streams_closed(&closed, || launchers.run(&closed));
+
+    // The reports the uncaptured launches wrote, read now that reading a file
+    // cannot take one of the closed numbers.
+    let left_open = listing((0..3).filter(|fd| !closed.contains(fd)));
+    for name in launchers.reports() {
+        let written =
+            std::fs::read_to_string(launchers.report.join(name)).expect("the report file reads");
+        if written.trim_end() != left_open {
+            findings.push(format!(
+                "a {name} launch held {written:?} where it inherited {left_open:?}"
+            ));
+        }
+    }
+    assert!(findings.is_empty(), "{}", findings.join("\n"));
+    println!("probe done");
+}
+
+/// The descriptor listing [`LIST_FDS`] makes of a table holding `numbers`.
+fn listing(numbers: impl IntoIterator<Item = RawFd>) -> String {
+    numbers
+        .into_iter()
+        .fold(String::from("fds"), |listing, fd| format!("{listing} {fd}"))
+}
+
+/// Whether `err` is the exec step failing to find the command.
+fn exec_absent(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Setup { step: SetupStep::Exec, source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Waits for `running` within [`PATIENCE`], killing it past that, and returns
+/// its outcome, keeping in `findings` what went wrong.
+fn settle(running: &mut Running<'_>, what: &str, findings: &mut Vec<String>) -> Option<ExitStatus> {
+    match running.wait_timeout(PATIENCE) {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => {
+            findings.push(format!("{what}: the command did not finish"));
+            let _ = running.kill();
+            let _ = running.wait_timeout(PATIENCE);
+            None
+        }
+        Err(err) => {
+            findings.push(format!("{what}: the wait failed: {err:?}"));
+            None
+        }
+    }
+}
+
+/// What the probe asks of a cage and of a restriction alike.
+trait Launch {
+    fn output(&self) -> Result<Output, Error>;
+    fn spawn(&self) -> Result<Running<'static>, Error>;
+    fn spawn_terminal(&self) -> Result<(Running<'static>, Pty), Error>;
+    /// A launch held at its gate, or `None` where the confinement has none.
+    fn spawn_pending(&self) -> Option<Result<Pending<'static>, Error>>;
+}
+
+impl Launch for Cage {
+    fn output(&self) -> Result<Output, Error> {
+        Cage::output(self)
+    }
+
+    fn spawn(&self) -> Result<Running<'static>, Error> {
+        Cage::spawn(self)
+    }
+
+    fn spawn_terminal(&self) -> Result<(Running<'static>, Pty), Error> {
+        Cage::spawn_terminal(self, &Terminal::new())
+    }
+
+    fn spawn_pending(&self) -> Option<Result<Pending<'static>, Error>> {
+        Some(Cage::spawn_pending(self))
+    }
+}
+
+#[cfg(feature = "hardening")]
+impl Launch for ferroday_cage::Restriction {
+    fn output(&self) -> Result<Output, Error> {
+        ferroday_cage::Restriction::output(self)
+    }
+
+    fn spawn(&self) -> Result<Running<'static>, Error> {
+        ferroday_cage::Restriction::spawn(self)
+    }
+
+    fn spawn_terminal(&self) -> Result<(Running<'static>, Pty), Error> {
+        ferroday_cage::Restriction::spawn_terminal(self, &Terminal::new())
+    }
+
+    fn spawn_pending(&self) -> Option<Result<Pending<'static>, Error>> {
+        None
+    }
+}
+
+/// The launches [`probe_closed_streams`] makes, built before it closes
+/// anything.
+///
+/// Each stops with the probe, so the bound [`run_closed_stream_probes`] holds
+/// the probe to also bounds a launch whose own wait takes none, as `output`
+/// does.
+struct Launchers {
+    /// Lists its descriptors on standard output and writes `err` to standard
+    /// error, for a capturing launch.
+    capture: Box<dyn Launch>,
+    /// Lists its descriptors into the report file `spawn`, leaving every
+    /// stream inherited.
+    spawn: Box<dyn Launch>,
+    /// Lists its descriptors into the report file `pending`, leaving every
+    /// stream inherited.
+    pending: Box<dyn Launch>,
+    /// Lists its descriptors on its terminal.
+    terminal: Box<dyn Launch>,
+    /// Runs [`ABSENT`].
+    absent: Box<dyn Launch>,
+    /// The directory the report files are in.
+    report: PathBuf,
+    /// Whether the confinement has a gate, and so writes a `pending` report.
+    gated: bool,
+}
+
+impl Launchers {
+    /// The launches for `confinement`, reporting into a scratch directory named
+    /// for `tag`.
+    fn new(confinement: &str, tag: &str) -> Launchers {
+        let report = common::scratch_dir(&format!("closed-streams-{tag}"));
+        for name in ["spawn", "pending"] {
+            std::fs::write(report.join(name), "").expect("the report file is created");
+        }
+        // Where the command names the report directory: bound at `/mnt` in a
+        // sandbox, and the host path itself under a restriction.
+        let (inside, gated) = match confinement {
+            "sandbox" => ("/mnt".to_string(), true),
+            _ => (
+                report.to_str().expect("a UTF-8 scratch path").to_string(),
+                false,
+            ),
+        };
+        let build = |script: Option<&str>| -> Box<dyn Launch> {
+            match confinement {
+                "sandbox" => {
+                    let builder = Cage::builder()
+                        .rootfs(common::fixture_rootfs().expect("the fixture root"))
+                        .bind(&report, "/mnt")
+                        .stop_with_caller(true);
+                    let builder = match script {
+                        Some(script) => builder.command("/bin/sh").args(["-c", script]),
+                        None => builder.command(ABSENT),
+                    };
+                    Box::new(builder.build().expect("a valid sandbox configuration"))
+                }
+                #[cfg(feature = "hardening")]
+                "restriction" => {
+                    let builder = common::grant_system_trees(ferroday_cage::Restriction::builder())
+                        .landlock_fs(
+                            ferroday_cage::FsAccess::READ | ferroday_cage::FsAccess::WRITE,
+                            &report,
+                        )
+                        .stop_with_caller(true);
+                    let builder = match script {
+                        Some(script) => builder.command("/bin/sh").args(["-c", script]),
+                        None => builder.command(ABSENT),
+                    };
+                    Box::new(builder.build().expect("a valid restriction configuration"))
+                }
+                other => panic!("no confinement {other:?}"),
+            }
+        };
+        Launchers {
+            capture: build(Some(&format!("{LIST_FDS}; echo \"$fds\"; echo err >&2"))),
+            spawn: build(Some(&format!(
+                "{LIST_FDS}; echo \"$fds\" >> '{inside}/spawn'"
+            ))),
+            pending: build(Some(&format!(
+                "{LIST_FDS}; echo \"$fds\" >> '{inside}/pending'"
+            ))),
+            terminal: build(Some(&format!("{LIST_FDS}; echo \"$fds\""))),
+            absent: build(None),
+            report,
+            gated,
+        }
+    }
+
+    /// The report files the launches write.
+    fn reports(&self) -> &'static [&'static str] {
+        if self.gated {
+            &["spawn", "pending"]
+        } else {
+            &["spawn"]
+        }
+    }
+
+    /// Launches each way with the standard descriptors `closed` closed, and
+    /// returns what went wrong.
+    fn run(&self, closed: &[RawFd]) -> Vec<String> {
+        let mut findings = Vec::new();
+        // The caller's closed numbers stay closed whatever the launch holds.
+        let still_closed = |when: &str, findings: &mut Vec<String>| {
+            for &fd in closed {
+                if common::is_open(fd) {
+                    findings.push(format!("{when}, the caller's descriptor {fd} is open"));
+                }
+            }
+        };
+
+        match self.capture.output() {
+            Ok(output) => {
+                let held = listing((0..3).filter(|&fd| fd != 0 || !closed.contains(&0)));
+                if output.stdout != format!("{held}\n").as_bytes()
+                    || output.stderr != b"err\n"
+                    || !output.status.success()
+                {
+                    findings.push(format!(
+                        "a capturing launch wrote {:?} and {:?} where it held {held:?}, and \
+                         ended {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                        output.status,
+                    ));
+                }
+            }
+            Err(err) => findings.push(format!("a capturing launch failed: {err:?}")),
+        }
+        still_closed("after a capturing launch", &mut findings);
+        match self.absent.output() {
+            Err(err) if exec_absent(&err) => {}
+            other => findings.push(format!(
+                "a capturing launch of an absent command answered {other:?}"
+            )),
+        }
+        still_closed("after a failed capturing launch", &mut findings);
+
+        match self.spawn.spawn() {
+            Ok(mut running) => {
+                still_closed("while a launch runs", &mut findings);
+                if let Some(status) = settle(&mut running, "a launch", &mut findings)
+                    && !status.success()
+                {
+                    findings.push(format!("a launch ended {status}"));
+                }
+            }
+            Err(err) => findings.push(format!("a launch failed: {err:?}")),
+        }
+        still_closed("after a launch", &mut findings);
+        match self.absent.spawn() {
+            Err(err) if exec_absent(&err) => {}
+            Err(err) => findings.push(format!("a launch of an absent command failed: {err:?}")),
+            Ok(mut running) => {
+                let status = settle(&mut running, "an absent command", &mut findings);
+                findings.push(format!(
+                    "a launch of an absent command ran, ending {status:?}"
+                ));
+            }
+        }
+        still_closed("after a failed launch", &mut findings);
+
+        if let Some(pending) = self.pending.spawn_pending() {
+            match pending {
+                Ok(pending) => {
+                    still_closed("while a launch is held", &mut findings);
+                    match pending.proceed() {
+                        Ok(mut running) => {
+                            if let Some(status) =
+                                settle(&mut running, "a held launch", &mut findings)
+                                && !status.success()
+                            {
+                                findings.push(format!("a held launch ended {status}"));
+                            }
+                        }
+                        Err(err) => findings.push(format!("a held launch failed: {err:?}")),
+                    }
+                }
+                Err(err) => findings.push(format!("a held launch failed: {err:?}")),
+            }
+            still_closed("after a held launch", &mut findings);
+            match self
+                .absent
+                .spawn_pending()
+                .map(|held| held.and_then(Pending::proceed))
+            {
+                Some(Err(err)) if exec_absent(&err) => {}
+                Some(Ok(mut running)) => {
+                    let status = settle(&mut running, "an absent command", &mut findings);
+                    findings.push(format!(
+                        "a held launch of an absent command ran, ending {status:?}"
+                    ));
+                }
+                other => findings.push(format!(
+                    "a held launch of an absent command answered {:?}",
+                    other.map(|held| held.map(drop)),
+                )),
+            }
+            still_closed("after a failed held launch", &mut findings);
+        }
+
+        match self.terminal.spawn_terminal() {
+            Ok((mut running, pty)) => {
+                still_closed("while a terminal launch runs", &mut findings);
+                let deadline = Instant::now() + PATIENCE;
+                let mut written = String::new();
+                while common::pty::drain_until(&pty, deadline, &mut written) {}
+                settle(&mut running, "a terminal launch", &mut findings);
+                if !written.lines().any(|line| line.trim_end() == "fds 0 1 2") {
+                    findings.push(format!("a terminal launch wrote {written:?}"));
+                }
+            }
+            Err(err) => findings.push(format!("a terminal launch failed: {err:?}")),
+        }
+        still_closed("after a terminal launch", &mut findings);
+        match self.absent.spawn_terminal() {
+            Err(err) if exec_absent(&err) => {}
+            Err(err) => findings.push(format!(
+                "a terminal launch of an absent command failed: {err:?}"
+            )),
+            Ok((mut running, _pty)) => {
+                let status = settle(&mut running, "an absent command", &mut findings);
+                findings.push(format!(
+                    "a terminal launch of an absent command ran, ending {status:?}"
+                ));
+            }
+        }
+        still_closed("after a failed terminal launch", &mut findings);
+        findings
+    }
 }

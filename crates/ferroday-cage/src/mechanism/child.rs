@@ -3,10 +3,11 @@
 //!
 //! A launch runs across a small tree of forked processes. Stage A is forked
 //! from the caller and is short-lived: it scrubs the inherited signal state,
-//! unshares the namespaces, sweeps the inherited descriptor table, replaces the
-//! inherited session keyring or, where it cannot, refuses the key syscalls to
-//! everything it forks, forks the next stage, and publishes that stage's pidfd
-//! back to the caller over the control socket.
+//! holds each standard stream number the caller left closed, unshares the
+//! namespaces, sweeps the inherited descriptor table, replaces the inherited
+//! session keyring or, where it cannot, refuses the key syscalls to everything
+//! it forks, forks the next stage, and publishes that stage's pidfd back to the
+//! caller over the control socket.
 //!
 //! With a PID namespace (the default), the process A forks is the sandbox
 //! init — PID 1 inside the namespace. It leaves the caller's session or
@@ -87,7 +88,7 @@ use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
     IdentityPlan, LaunchPlan, MountAction, MountOp, RootPlan, STATUS_DUMPED, STATUS_EXITED,
-    STATUS_SIGNALED, StdioPlan, encode_status,
+    STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
 };
 use crate::error::SetupStep;
 
@@ -113,8 +114,9 @@ pub(super) struct Context<'a> {
     pub(super) status_fd: BorrowedFd<'a>,
     /// Sandbox end of the control socket.
     pub(super) control_fd: BorrowedFd<'a>,
-    /// The shared `/dev/null` descriptor: the null stdin disposition and
-    /// the supervisor's own stdio.
+    /// The shared `/dev/null` descriptor: the null stdin disposition, the
+    /// placeholders [`hold_closed_streams`] holds closed standard numbers
+    /// with, and the supervisor's own stdio.
     pub(super) null_fd: BorrowedFd<'a>,
     /// Write end of the captured standard output, when observing.
     pub(super) capture_stdout_fd: Option<BorrowedFd<'a>>,
@@ -206,6 +208,11 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // delivered at its default disposition before that would be discarded.
     reset_signals(&SigSet::all().without(&SUPERVISOR_FAULTS))
         .map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
+
+    // Every standard number the caller left closed, held before anything here
+    // creates a descriptor that would land on it. Nothing above created one,
+    // and the fork's pidfd is the caller's alone.
+    hold_closed_streams(context.null_fd).map_err(|errno| (SetupStep::SweepFds, errno, 0))?;
 
     // The sandbox's cgroup, before any namespace: every process forked from
     // here on is charged there, and the cgroup namespace the unshare below
@@ -941,29 +948,22 @@ fn apply_rlimits(context: &Context<'_>) -> Result<(), Failure> {
 ///
 /// Every source is moved above the standard-stream numbers first, so no source
 /// is ever also a target. Only a caller-supplied
-/// [`StdioPlan::Fd`](super::StdioPlan::Fd) can be low — the launch creates six
-/// descriptors of its own before the null descriptor and the capture pipes, and
-/// the terminal replica is opened after all of them, so each lands at 3 or
-/// above — and with three streams
-/// to wire, a low one is not merely the `dup2(fd, fd)` no-op that leaves
-/// close-on-exec set: wiring one stream would *destroy* the source another had
-/// not been copied from yet. With standard input on the caller's descriptor 1
-/// and standard output somewhere else, the `dup2` onto 1 would take standard
+/// [`StdioPlan::Fd`](super::StdioPlan::Fd) can be low. The launch keeps its own
+/// channels above them, the null descriptor and the capture pipes among them
+/// (see [`above_stdio`](super::above_stdio)), and the terminal replica is
+/// opened once [`hold_closed_streams`] holds every standard number the caller
+/// left closed, so it cannot land on one either. With three streams to wire, a
+/// low source is not merely the `dup2(fd, fd)` no-op that leaves close-on-exec
+/// set: wiring one stream would *destroy* the source another had not been
+/// copied from yet. With standard input on the caller's descriptor 1 and
+/// standard output somewhere else, the `dup2` onto 1 would take standard
 /// input's source with it.
 ///
-/// The relocation covers the sources. It does not cover the launch's own
-/// channels: a caller that had already closed one of 0, 1 and 2 when it called
-/// `spawn` would have the report pipe, the status pipe, the control socket or
-/// the nested identity map's gate land there, and the `dup2`s below would
-/// clobber it in the command process. A `std` program cannot start in that
-/// state — the runtime's startup opens `/dev/null` over any standard descriptor
-/// that is closed — so this is reachable only for a consumer that closes one at
-/// runtime. A terminal launch is the widest exposure, since it wires all three
-/// streams where a capturing launch wires at most two.
+/// A stream the plan leaves inherited is not touched. Where the caller had
+/// closed it, its number holds the launch stage's close-on-exec placeholder,
+/// and the exec closes it: the command finds the stream closed, as the caller
+/// had it, and no channel of the launch's in its place.
 fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result<(), Errno> {
-    /// The highest standard stream number: the ceiling a source must be above
-    /// before anything is wired, and the floor it is moved to.
-    const STDERR: RawFd = 2;
     /// The descriptor a stream's plan names, or `None` where it names no
     /// destination and the launch leaves the inherited one in place.
     fn wired<'fd>(
@@ -1003,9 +1003,9 @@ fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result
     let mut moved: [Option<OwnedFd>; 3] = [None, None, None];
     for (slot, source) in moved.iter_mut().zip([stdin, stdout, stderr]) {
         if let Some(source) = source
-            && source.as_raw_fd() <= STDERR
+            && source.as_raw_fd() <= STDERR_FILENO
         {
-            *slot = Some(rustix::io::fcntl_dupfd_cloexec(source, STDERR + 1)?);
+            *slot = Some(rustix::io::fcntl_dupfd_cloexec(source, STDERR_FILENO + 1)?);
         }
     }
     let stdin = moved[0].as_ref().map(AsFd::as_fd).or(stdin);
@@ -1036,7 +1036,7 @@ fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result
     // copy is untouched.
     for caller in [context.stdin_fd, context.stdout_fd, context.stderr_fd] {
         if let Some(caller) = caller
-            && caller.as_raw_fd() > STDERR
+            && caller.as_raw_fd() > STDERR_FILENO
         {
             rustix::io::fcntl_setfd(caller, rustix::io::FdFlags::CLOEXEC)?;
         }
@@ -1776,7 +1776,7 @@ fn supervisor_hygiene(context: &Context<'_>, role: Role) {
             .map(|fd| fd.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
         for index in 0..caller.len() {
             let fd = caller[index];
-            if fd > 2 && !caller[..index].contains(&fd) {
+            if fd > STDERR_FILENO && !caller[..index].contains(&fd) {
                 rustix::io::close(fd);
             }
         }
@@ -2198,9 +2198,50 @@ pub(super) fn reset_signals(blocked: &SigSet) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Holds each standard stream number the caller left closed with a
+/// close-on-exec copy of the null descriptor, so that nothing a stage creates
+/// afterwards can land there.
+///
+/// A descriptor is created at the lowest number free. With a standard number
+/// empty, the next one a stage opened would take it: the descriptor sweep's own
+/// directory, the pseudoterminal of a terminal launch, the init's pidfd of the
+/// command. The last is what the init sleeps on, and [`supervisor_hygiene`]
+/// repoints all three standard numbers at the null descriptor, which would
+/// replace it there and leave the init waiting on `/dev/null`.
+///
+/// A stream the plan wires replaces its copy through [`wire_stdio`]'s `dup2`,
+/// as it replaces whatever the number holds, and a stream the plan leaves
+/// inherited reaches the command closed, as the caller had it, since its copy
+/// closes at the exec. A supervisor's repointing replaces its copies.
+///
+/// `F_DUPFD_CLOEXEC` from zero takes the lowest number free, so each call takes
+/// the lowest closed standard number until none is left, and the first copy
+/// above them is closed again at once. `EMFILE` means no number is free at all,
+/// which leaves nothing to land on a closed standard number either.
+///
+/// The launch stage calls it before it creates a descriptor of its own, and
+/// every later stage is forked from it. The caller's side of the same rule is
+/// [`above_stdio`](super::above_stdio).
+///
+/// Post-fork safe: raw syscalls only.
+fn hold_closed_streams(null: BorrowedFd<'_>) -> Result<(), Errno> {
+    loop {
+        match rustix::io::fcntl_dupfd_cloexec(null, 0) {
+            Ok(copy) if copy.as_raw_fd() <= STDERR_FILENO => {
+                // Held until the exec closes it or a `dup2` replaces it.
+                let _ = copy.into_raw_fd();
+            }
+            // Above the standard numbers, so none is closed; the copy drops.
+            Ok(_) | Err(Errno::MFILE) => return Ok(()),
+            Err(errno) => return Err(errno),
+        }
+    }
+}
+
 /// Closes every descriptor the launch does not own.
 ///
-/// Keeps the standard streams (the command may inherit them) and the launch
+/// Keeps the standard streams (the command may inherit them, and
+/// [`hold_closed_streams`] holds the ones the caller closed) and the launch
 /// channels; [`sweep_fds_keeping`] does the work.
 fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
     // The kept set is the channel list mapped one for one, so it is exactly
@@ -2255,7 +2296,7 @@ pub(crate) fn sweep_fds_keeping(keep: &[RawFd]) -> Result<(), Errno> {
         let Some(fd) = parse_fd(entry.file_name()) else {
             continue;
         };
-        if fd <= 2 || fd == dir.as_fd().as_raw_fd() || keep.contains(&fd) {
+        if fd <= STDERR_FILENO || fd == dir.as_fd().as_raw_fd() || keep.contains(&fd) {
             continue;
         }
         // SAFETY: the descriptor was just listed, is not the directory
@@ -3483,5 +3524,56 @@ mod tests {
             MountFlags::BIND | MountFlags::RDONLY,
             "an atime bit reached the remount flags",
         );
+    }
+
+    #[test]
+    fn a_closed_standard_number_is_held_until_the_exec() {
+        // In a forked child of its own, since closing a standard stream is
+        // process-wide. The child answers through its exit code, the only thing
+        // it can report without allocating.
+        let null = fs::open(c"/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+            .expect("/dev/null opens");
+        // SAFETY: the child makes raw syscalls only, through rustix, and ends
+        // in `exit_group`.
+        match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
+            sys::PidfdFork::Child => {
+                // SAFETY: the numbers are this child's own copies of the
+                // standard streams, which nothing in it holds or uses again.
+                unsafe {
+                    rustix::io::close(0);
+                    rustix::io::close(2);
+                }
+                if hold_closed_streams(null.as_fd()).is_err() {
+                    sys::exit_group(1)
+                }
+                let flags = |fd| rustix::io::fcntl_getfd(fd).ok();
+                // The closed ones are held, close-on-exec, and the open one is
+                // left as it was.
+                let cloexec = Some(rustix::io::FdFlags::CLOEXEC);
+                if flags(rustix::stdio::stdin()) != cloexec
+                    || flags(rustix::stdio::stderr()) != cloexec
+                    || flags(rustix::stdio::stdout()) == cloexec
+                {
+                    sys::exit_group(2)
+                }
+                // Nothing created afterwards lands on a standard number.
+                match fs::open(
+                    c"/dev/null",
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) if fd.as_raw_fd() > STDERR_FILENO => sys::exit_group(0),
+                    _ => sys::exit_group(3),
+                }
+            }
+            sys::PidfdFork::ParentOf(child) => {
+                assert_eq!(
+                    child.reap(),
+                    Ok(Some(0)),
+                    "1: the hold failed; 2: a number was not held close-on-exec, or the \
+                     open one was touched; 3: a descriptor landed on a standard number",
+                );
+            }
+        }
     }
 }
