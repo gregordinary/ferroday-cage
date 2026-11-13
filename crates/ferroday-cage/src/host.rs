@@ -311,6 +311,90 @@ pub(crate) fn procfs_refusal() -> ProcfsBlocker {
         })
 }
 
+/// Probes whether a launch with a cgroup of its own beneath `parent`, holding
+/// the tree to `limits`, would be refused its cgroup, returning why where it
+/// would.
+///
+/// It answers what [`CageBuilder::cgroup_parent`] and
+/// [`CageBuilder::cgroup_limit`] meet at launch, by the launch's own steps
+/// rather than a reading of the parent's files: it creates a cgroup beneath
+/// `parent` as a launch does, enabling the controllers the limits need and
+/// writing the limits, forks a short-lived child that moves itself into it as
+/// the launch stage moves, and removes it once the child has exited. The
+/// [`CgroupRefusal`] it returns is the one the launch would fail with, as
+/// [`Error::CgroupRefused`](crate::Error::CgroupRefused). That covers a parent
+/// that does not exist, one outside a cgroup v2 hierarchy or on a read-only
+/// one, one not delegated to this process, a missing controller, a parent
+/// holding processes, a limit's file the kernel lacks, and a caller in a cgroup
+/// the launch cannot move out of into the parent's subtree.
+///
+/// `None` means a launch would be given its cgroup. It also means a step failed
+/// for a reason of the host's that no refusal names, such as running out of
+/// descriptors, which a launch reports as
+/// [`Error::Cgroup`](crate::Error::Cgroup), or that a value the build
+/// refuses, such as a relative `parent`, stopped the probe before it began.
+///
+/// The probe changes the parent as a launch does, and as a launch leaves it:
+/// the controllers the limits need, and the `memory` and `pids` controllers a
+/// launch accounts with where the parent offers them, stay enabled in its
+/// `cgroup.subtree_control`. A parent holding processes refuses before
+/// anything is changed.
+///
+/// [`CageBuilder::cgroup_parent`]: crate::CageBuilder::cgroup_parent
+/// [`CageBuilder::cgroup_limit`]: crate::CageBuilder::cgroup_limit
+/// [`CgroupRefusal`]: crate::CgroupRefusal
+pub fn cgroup_blocker(
+    parent: impl AsRef<Path>,
+    limits: &[crate::CgroupLimit],
+) -> Option<crate::CgroupRefusal> {
+    crate::cgroup::probe(parent.as_ref(), limits)
+}
+
+/// The directory of the cgroup v2 hierarchy that this process runs in, as
+/// this process's mount table places it: `/sys/fs/cgroup/user.slice/…` on a
+/// host that mounts the hierarchy at `/sys/fs/cgroup`.
+///
+/// `None` where this process is in no cgroup v2 hierarchy, or where none its
+/// mount table shows holds its cgroup, as inside a cgroup namespace whose
+/// hierarchy was mounted from outside it.
+///
+/// A caller that runs in a delegated cgroup names it with
+/// [`CageBuilder::cgroup_parent`] once it has moved itself into a leaf beside
+/// the sandboxes' cgroups, since a cgroup holding processes cannot enable a
+/// controller for its children. The move is the caller's to make: the library
+/// moves no process of the caller's. [`cgroup_blocker`] then answers whether
+/// the cgroup can hold a launch's.
+///
+/// [`CageBuilder::cgroup_parent`]: crate::CageBuilder::cgroup_parent
+pub fn own_cgroup() -> Option<PathBuf> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    cgroup_directory(&membership, &mountinfo)
+}
+
+/// Where the cgroup `membership`, a `/proc/self/cgroup`, names in the cgroup
+/// v2 hierarchy lies in `mountinfo`, a `/proc/self/mountinfo` table: beneath
+/// the first cgroup v2 mount whose root holds it.
+fn cgroup_directory(membership: &str, mountinfo: &str) -> Option<PathBuf> {
+    // The unified hierarchy's line has hierarchy id 0 and no controller list.
+    let own = Path::new(
+        membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?,
+    );
+    mountinfo
+        .lines()
+        .filter_map(MountEntry::parse)
+        .filter(|entry| entry.fstype == "cgroup2")
+        .find_map(|entry| {
+            let beneath = own.strip_prefix(&entry.root).ok()?;
+            Some(match beneath.as_os_str().is_empty() {
+                true => entry.mount_point,
+                false => entry.mount_point.join(beneath),
+            })
+        })
+}
+
 /// The procfs entries the kernel keeps as permanently empty directories for
 /// other filesystems to mount on, relative to the procfs's root. A mount on
 /// one leaves the procfs fully visible.
@@ -1055,6 +1139,31 @@ pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+
+    #[test]
+    fn a_process_s_cgroup_lies_beneath_the_cgroup2_mount_that_holds_it() {
+        let table = "24 30 0:22 / /sys rw,nosuid - sysfs sysfs rw\n\
+                     31 24 0:27 / /sys/fs/cgroup rw,nosuid shared:9 - cgroup2 cgroup2 rw\n";
+        let at = |membership: &str, table: &str| cgroup_directory(membership, table);
+        assert_eq!(
+            at("0::/user.slice/run-r1.scope\n", table),
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/run-r1.scope"))
+        );
+        assert_eq!(at("0::/\n", table), Some(PathBuf::from("/sys/fs/cgroup")));
+        // A v1 hierarchy's line names no cgroup of the unified one.
+        assert_eq!(at("1:name=systemd:/user.slice\n", table), None);
+        assert_eq!(
+            at("0::/a\n", "24 30 0:22 / /sys rw - sysfs sysfs rw\n"),
+            None
+        );
+        // A mount presenting a subtree holds only what lies beneath its root.
+        let subtree = "40 30 0:27 /machine/ct /mnt/cgroup rw - cgroup2 cgroup2 rw\n";
+        assert_eq!(at("0::/elsewhere\n", subtree), None);
+        assert_eq!(
+            at("0::/machine/ct/leaf\n", subtree),
+            Some(PathBuf::from("/mnt/cgroup/leaf"))
+        );
+    }
 
     #[test]
     fn probe_runs_without_panicking() {

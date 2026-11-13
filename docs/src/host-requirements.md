@@ -21,7 +21,7 @@ short-lived child, so it answers for both cases. A Debian or Alpine bootstrap
 runs its packages' scripts in such sandboxes, and asks the same before it
 downloads anything. `Network::Host` installs no filter and needs none.
 
-Two opt-in capabilities have host requirements of their own. A [uid/gid range
+Three opt-in capabilities have host requirements of their own. A [uid/gid range
 map](identity-maps.md) requested by an unprivileged caller needs the shadow
 suite's `newuidmap` and `newgidmap` helpers and a subordinate-id allocation,
 and [`host::range_map_blocker`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.range_map_blocker.html)
@@ -29,8 +29,12 @@ reports what a host is missing. An [overlay-rooted cage](#overlay-rooted-cages)
 needs a kernel that permits an unprivileged overlay mount and an upper layer on a
 filesystem that records `user.*` extended attributes, and
 [`host::overlay_blocker`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.overlay_blocker.html)
-reports what a host is missing. Neither is used unless requested; a plain,
-single-identity cage needs nothing beyond this page.
+reports what a host is missing. [Limits on the whole
+tree](hardening.md#limits-on-the-whole-tree) need a cgroup v2 directory
+delegated to the caller, and
+[`host::cgroup_blocker`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.cgroup_blocker.html)
+reports why one cannot hold a sandbox's cgroup. None is used unless requested;
+a plain, single-identity cage needs nothing beyond this page.
 
 Most desktop and server distributions permit this by default, but several
 common configurations disable it:

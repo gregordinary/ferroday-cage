@@ -1490,8 +1490,9 @@ pub enum Error {
         /// Why it cannot hold the sandbox's cgroup.
         reason: CgroupRefusal,
     },
-    /// Preparing the sandbox's cgroup failed for a reason of the host's, such
-    /// as a parent the caller may not write. Nothing was launched.
+    /// Preparing the sandbox's cgroup failed for a reason of the host's that no
+    /// [`CgroupRefusal`] names, such as running out of descriptors. Nothing
+    /// was launched.
     #[non_exhaustive]
     Cgroup {
         /// What the step was doing.

@@ -100,6 +100,14 @@ const MEMORY_MAX: u64 = 4 << 30;
 /// under a cgroup, and per user id under the per-process limits.
 const PROCESSES_MAX: u64 = 1024;
 
+/// The limits on the whole tree. Without the swap limit, a tree past its memory
+/// limit goes on in swap.
+const CGROUP_LIMITS: [CgroupLimit; 3] = [
+    CgroupLimit::MemoryMax(MEMORY_MAX),
+    CgroupLimit::MemorySwapMax(0),
+    CgroupLimit::PidsMax(PROCESSES_MAX),
+];
+
 /// What the example exits with when the command outlived its timeout, as
 /// `timeout(1)` and `fcage --timeout` do.
 const TIMED_OUT: u8 = 124;
@@ -434,12 +442,9 @@ fn posture(config: &Config, worktree: &Path, limits: &Limits, resolve_unix: bool
         .envs(config.env.iter().map(|(name, value)| (name, value)));
 
     match limits {
-        // Without a swap limit, a tree past its memory limit goes on in swap.
-        Limits::Cgroup(parent) => builder
-            .cgroup_parent(parent)
-            .cgroup_limit(CgroupLimit::MemoryMax(MEMORY_MAX))
-            .cgroup_limit(CgroupLimit::MemorySwapMax(0))
-            .cgroup_limit(CgroupLimit::PidsMax(PROCESSES_MAX)),
+        Limits::Cgroup(parent) => CGROUP_LIMITS
+            .into_iter()
+            .fold(builder.cgroup_parent(parent), CageBuilder::cgroup_limit),
         Limits::PerProcess => builder
             .rlimit(Resource::Data, MEMORY_MAX, MEMORY_MAX)
             .rlimit(Resource::Processes, PROCESSES_MAX, PROCESSES_MAX),
@@ -522,15 +527,10 @@ fn prepare_protected(worktree: &Path) -> Result<(), Failure> {
 /// arranges for a service or a scope with `Delegate=yes`. A cgroup that holds
 /// processes cannot enable a controller for its children, so the example takes
 /// its cgroup only where it runs there alone, and steps into a leaf of its own
-/// first. The commands' cgroups then sit beside that leaf.
+/// first. The commands' cgroups then sit beside that leaf, and the library
+/// answers whether the cgroup can hold them.
 fn delegated_cgroup() -> Result<PathBuf, String> {
-    let own = std::fs::read_to_string("/proc/self/cgroup")
-        .map_err(|err| format!("cannot read this process's cgroup: {err}"))?;
-    let relative = own
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .ok_or("this host mounts no cgroup v2 hierarchy")?;
-    let cgroup = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+    let cgroup = host::own_cgroup().ok_or("this process runs in no cgroup v2 hierarchy")?;
     let members = std::fs::read_to_string(cgroup.join("cgroup.procs"))
         .map_err(|err| format!("cannot list the processes of {}: {err}", cgroup.display()))?;
     let me = std::process::id().to_string();
@@ -546,14 +546,20 @@ fn delegated_cgroup() -> Result<PathBuf, String> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(err) => {
             return Err(format!(
-                "cannot create a cgroup in {}, which is not delegated: {err}",
+                "cannot create a cgroup in {}: {err}",
                 cgroup.display()
             ));
         }
     }
     std::fs::write(leaf.join("cgroup.procs"), "0")
         .map_err(|err| format!("cannot move into {}: {err}", leaf.display()))?;
-    Ok(cgroup)
+    match host::cgroup_blocker(&cgroup, &CGROUP_LIMITS) {
+        None => Ok(cgroup),
+        Some(refusal) => Err(format!(
+            "{} cannot hold the commands' cgroups: {refusal}",
+            cgroup.display()
+        )),
+    }
 }
 
 /// Answers the command's connections on `listener` until its outcome is known,

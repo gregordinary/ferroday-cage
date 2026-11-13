@@ -499,6 +499,8 @@ report name a package and its version bare.
 | Can this process install a seccomp filter? | `host::seccomp_available`, which installs one in a forked child through `mechanism::seccomp::installable` |
 | Can a sandbox with a PID namespace of its own mount its procfs here, and why not? | `host::procfs_blocker`, which mounts one in a forked child through `mechanism::probe_procfs_mount`, and `host::procfs_refusal` for the explanation alone |
 | Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, and remove it | `cgroup::Cgroup`, which a launch creates before the fork and the launch stage joins through `cgroup.procs` |
+| Would a launch beneath this parent be refused its cgroup, and why? | `host::cgroup_blocker`, which carries out `cgroup::Cgroup::create` and a join through `mechanism::probe_cgroup_join`, with every errno read by `cgroup::refusal` as the launch's own are |
+| Which cgroup does this process run in? | `host::own_cgroup`, over `host::MountEntry::parse` |
 | Read this process's mount table | `host::MountEntry::parse`, one line of the kernel's `mountinfo` at a time |
 | Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |

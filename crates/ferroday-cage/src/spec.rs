@@ -2322,11 +2322,18 @@ impl CageBuilder {
     ///
     /// A cgroup with processes of its own cannot enable controllers for its
     /// children, so a caller that runs inside `parent` moves itself into a
-    /// leaf cgroup beside the sandboxes' first. The launch fails with
-    /// [`Error::CgroupRefused`](crate::Error::CgroupRefused) where the parent is
-    /// not a cgroup v2 directory, does not offer a controller a limit needs, or
-    /// holds processes, and where the kernel lacks a limit's file: a limit is
-    /// never silently left unenforced.
+    /// leaf cgroup beside the sandboxes' first;
+    /// [`host::own_cgroup`](crate::host::own_cgroup) names the cgroup it runs
+    /// in. The launch fails with
+    /// [`Error::CgroupRefused`](crate::Error::CgroupRefused), and a
+    /// [`CgroupRefusal`](crate::CgroupRefusal) saying why, where the parent
+    /// cannot hold the sandbox's cgroup: one that is missing, outside a cgroup
+    /// v2 hierarchy, read-only, not delegated to the caller, lacking a
+    /// controller a limit needs, or holding processes, a kernel without a
+    /// limit's file, and a caller that runs where the launch cannot move into
+    /// the parent's subtree from. A limit is never silently left unenforced.
+    /// [`host::cgroup_blocker`](crate::host::cgroup_blocker) gives the same
+    /// answer before a launch.
     ///
     /// ```no_run
     /// use ferroday_cage::{Cage, CgroupLimit};

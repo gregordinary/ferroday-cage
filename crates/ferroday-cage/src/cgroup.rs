@@ -74,12 +74,25 @@ impl CgroupLimit {
 
 /// Why a sandbox could not be given a cgroup of its own beneath the parent the
 /// caller named.
+///
+/// A launch reports it as [`Error::CgroupRefused`], and
+/// [`host::cgroup_blocker`](crate::host::cgroup_blocker) answers it before a
+/// launch, by the launch's own steps.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CgroupRefusal {
+    /// Nothing is at the parent's path, or a component of it is not a
+    /// directory.
+    Missing,
     /// The parent is not a directory of a cgroup v2 hierarchy. A host that
     /// mounts only the v1 hierarchies offers none.
     NotCgroup2,
+    /// The cgroup filesystem the parent is on is mounted read-only, as a
+    /// container runtime mounts a container's by default.
+    ReadOnly,
+    /// This process may not create a cgroup beneath the parent, or enable a
+    /// controller in it: the parent is not delegated to this process.
+    NotDelegated,
     /// A limit needs a controller the parent does not offer: its
     /// `cgroup.controllers` lists only what its own parent enabled for it.
     #[non_exhaustive]
@@ -98,14 +111,30 @@ pub enum CgroupRefusal {
         /// The file the limit is written to.
         file: &'static str,
     },
+    /// The launch cannot move into a cgroup beneath the parent from the cgroup
+    /// this process runs in. The kernel lets a process move another, itself
+    /// included, only where it may write the `cgroup.procs` of the nearest
+    /// cgroup the two share, and only within its cgroup namespace, so a caller
+    /// outside the delegated subtree cannot move a launch into it.
+    CallerOutside,
 }
 
 impl fmt::Display for CgroupRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CgroupRefusal::Missing => f.write_str("it does not exist"),
             CgroupRefusal::NotCgroup2 => f.write_str(
                 "it is not a directory of a cgroup v2 hierarchy, which a host that mounts only \
                  the v1 hierarchies has none of",
+            ),
+            CgroupRefusal::ReadOnly => f.write_str(
+                "the cgroup filesystem it is on is mounted read-only, as a container runtime \
+                 mounts a container's by default",
+            ),
+            CgroupRefusal::NotDelegated => f.write_str(
+                "this process may not create a cgroup in it or enable its controllers; it is \
+                 not delegated to this process, as systemd's Delegate=yes delegates a scope or \
+                 a service",
             ),
             CgroupRefusal::ControllerUnavailable { controller } => write!(
                 f,
@@ -122,7 +151,91 @@ impl fmt::Display for CgroupRefusal {
                     "the kernel offers no {file}, which a limit is written to"
                 )
             }
+            CgroupRefusal::CallerOutside => f.write_str(
+                "a launch cannot move from the cgroup this process runs in to one beneath it, \
+                 since the nearest cgroup the two share is not this process's to write; run \
+                 the caller in a leaf cgroup beside the sandbox's",
+            ),
         }
+    }
+}
+
+/// A step of giving a launch its cgroup whose failure can be a refusal: what
+/// [`refusal`] reads an errno against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Opening the parent directory.
+    OpenParent,
+    /// Enabling a controller in the parent's `cgroup.subtree_control`.
+    Enable,
+    /// Creating the sandbox's cgroup beneath the parent.
+    Create,
+    /// Opening a file of the sandbox's cgroup to write: a limit, or its
+    /// `cgroup.procs`.
+    OpenFile,
+    /// Moving the launch stage into the sandbox's cgroup.
+    Join,
+}
+
+/// The refusal an errno from `step` stands for, where it stands for one; an
+/// errno it does not name is a failure of the host's.
+///
+/// The one reading of what the kernel answered, whether the launch's own
+/// steps met it or [`probe`] did on their behalf.
+fn refusal(step: Step, errno: Errno) -> Option<CgroupRefusal> {
+    Some(match (step, errno) {
+        (Step::OpenParent, Errno::NOENT | Errno::NOTDIR) => CgroupRefusal::Missing,
+        (Step::Enable | Step::Create | Step::OpenFile, Errno::ROFS) => CgroupRefusal::ReadOnly,
+        (Step::OpenParent | Step::Enable | Step::Create, Errno::ACCESS | Errno::PERM) => {
+            CgroupRefusal::NotDelegated
+        }
+        // A domain controller cannot be enabled where the parent holds
+        // processes, and with only a threaded controller enabled the parent
+        // accepts the child and its limits and then refuses the move.
+        (Step::Enable, Errno::BUSY) | (Step::Join, Errno::OPNOTSUPP) => {
+            CgroupRefusal::ParentHoldsProcesses
+        }
+        // The nearest cgroup the writer and the destination share is not the
+        // writer's to write, or the destination lies outside its cgroup
+        // namespace.
+        (Step::Join, Errno::ACCESS | Errno::PERM | Errno::NOENT) => CgroupRefusal::CallerOutside,
+        _ => return None,
+    })
+}
+
+/// The refusal the launch stage's move into the sandbox's cgroup failed with,
+/// where its errno stands for one.
+pub(crate) fn join_refusal(errno: Errno) -> Option<CgroupRefusal> {
+    refusal(Step::Join, errno)
+}
+
+/// Whether a launch beneath `parent` holding the tree to `limits` would be
+/// refused its cgroup, and why: [`host::cgroup_blocker`]'s answer.
+///
+/// The launch's own steps, carried out: [`Cgroup::create`], then a child of
+/// this process moving itself into the cgroup as the launch stage does, and
+/// last the cgroup's removal. `None` where every step succeeded, and where one
+/// failed for a reason of the host's rather than a refusal, or a value the
+/// build refuses stopped the probe before it began.
+///
+/// [`host::cgroup_blocker`]: crate::host::cgroup_blocker
+pub(crate) fn probe(parent: &Path, limits: &[CgroupLimit]) -> Option<CgroupRefusal> {
+    let mut settings = CgroupSettings {
+        parent: Some(parent.to_path_buf()),
+        ..CgroupSettings::default()
+    };
+    for limit in limits {
+        settings.set(*limit);
+    }
+    let plan = settings.plan().ok()??;
+    let cgroup = match Cgroup::create(&plan) {
+        Ok(cgroup) => cgroup,
+        Err(Error::CgroupRefused { reason, .. }) => return Some(reason),
+        Err(_) => return None,
+    };
+    match crate::mechanism::probe_cgroup_join(cgroup.procs()) {
+        crate::mechanism::JoinProbe::Refused(errno) => join_refusal(errno),
+        crate::mechanism::JoinProbe::Joined | crate::mechanism::JoinProbe::Inconclusive => None,
     }
 }
 
@@ -365,9 +478,25 @@ impl Cgroup {
     /// # Errors
     ///
     /// [`Error::CgroupRefused`] where the parent cannot hold such a cgroup, and
-    /// [`Error::Cgroup`] where a step fails for a reason of the host's, such as
-    /// a parent the caller may not write.
+    /// [`Error::Cgroup`] where a step fails for a reason of the host's that no
+    /// [`CgroupRefusal`] names.
     pub(crate) fn create(plan: &CgroupPlan) -> Result<Cgroup, Error> {
+        // An errno a step met: the refusal it stands for, or else the host's
+        // failure, named by what the step was doing.
+        let failed = |step: Step, op: &'static str, path: &Path| {
+            let path = path.to_path_buf();
+            move |errno: Errno| match refusal(step, errno) {
+                Some(reason) => Error::CgroupRefused {
+                    parent: plan.parent.clone(),
+                    reason,
+                },
+                None => Error::Cgroup {
+                    op,
+                    path,
+                    source: errno.into(),
+                },
+            }
+        };
         let io_error = |op: &'static str, path: &Path| {
             let path = path.to_path_buf();
             move |errno: Errno| Error::Cgroup {
@@ -385,7 +514,11 @@ impl Cgroup {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(io_error("opening the cgroup parent", &plan.parent))?;
+        .map_err(failed(
+            Step::OpenParent,
+            "opening the cgroup parent",
+            &plan.parent,
+        ))?;
         let magic = rustix::fs::fstatfs(&parent)
             .map_err(io_error(
                 "reading the cgroup parent's filesystem",
@@ -431,16 +564,11 @@ impl Cgroup {
             if enabled.iter().any(|on| on == controller) {
                 continue;
             }
-            match enable(&parent, controller) {
-                Ok(()) => {}
-                Err(Errno::BUSY) => return Err(refused(CgroupRefusal::ParentHoldsProcesses)),
-                Err(errno) => {
-                    return Err(io_error(
-                        "enabling a controller in the parent's cgroup.subtree_control",
-                        &plan.parent,
-                    )(errno));
-                }
-            }
+            enable(&parent, controller).map_err(failed(
+                Step::Enable,
+                "enabling a controller in the parent's cgroup.subtree_control",
+                &plan.parent,
+            ))?;
         }
         // Accounting a limit does not need is enabled where it can be and left
         // out where it cannot: what is not enabled is reported as unknown.
@@ -457,7 +585,11 @@ impl Cgroup {
         let name = CString::new(format!("fcage-{}", crate::host::unique_hex()))
             .expect("a hex name holds no NUL");
         rustix::fs::mkdirat(&parent, name.as_c_str(), Mode::from_raw_mode(0o755)).map_err(
-            io_error("creating the sandbox's cgroup beneath", &plan.parent),
+            failed(
+                Step::Create,
+                "creating the sandbox's cgroup beneath",
+                &plan.parent,
+            ),
         )?;
         let path = plan
             .parent
@@ -472,24 +604,23 @@ impl Cgroup {
             )
             .map_err(io_error("opening the sandbox's cgroup", &path))?;
             for write in &plan.writes {
-                match open_write(&dir, write.file) {
-                    Ok(file) => rustix::io::write(&file, write.value.as_bytes())
-                        .map(drop)
-                        .map_err(io_error("writing a limit to the sandbox's cgroup", &path))?,
-                    Err(Errno::NOENT) => {
-                        return Err(refused(CgroupRefusal::LimitUnsupported {
-                            file: write.file,
-                        }));
-                    }
-                    Err(errno) => {
-                        return Err(io_error("opening a limit of the sandbox's cgroup", &path)(
-                            errno,
-                        ));
-                    }
-                }
+                let file = open_write(&dir, write.file).map_err(|errno| match errno {
+                    Errno::NOENT => refused(CgroupRefusal::LimitUnsupported { file: write.file }),
+                    errno => failed(
+                        Step::OpenFile,
+                        "opening a limit of the sandbox's cgroup",
+                        &path,
+                    )(errno),
+                })?;
+                rustix::io::write(&file, write.value.as_bytes())
+                    .map(drop)
+                    .map_err(io_error("writing a limit to the sandbox's cgroup", &path))?;
             }
-            let procs = open_write(&dir, "cgroup.procs")
-                .map_err(io_error("opening the sandbox's cgroup.procs", &path))?;
+            let procs = open_write(&dir, "cgroup.procs").map_err(failed(
+                Step::OpenFile,
+                "opening the sandbox's cgroup.procs",
+                &path,
+            ))?;
             let kill = open_write(&dir, "cgroup.kill").ok();
             Ok((dir, procs, kill))
         })();
@@ -677,6 +808,53 @@ mod tests {
                 "{limit:?}",
             );
         }
+    }
+
+    #[test]
+    fn an_errno_reads_as_the_refusal_its_step_stands_for() {
+        let cases = [
+            (Step::OpenParent, Errno::NOENT, Some(CgroupRefusal::Missing)),
+            (
+                Step::OpenParent,
+                Errno::NOTDIR,
+                Some(CgroupRefusal::Missing),
+            ),
+            (Step::Create, Errno::ROFS, Some(CgroupRefusal::ReadOnly)),
+            (Step::Enable, Errno::ROFS, Some(CgroupRefusal::ReadOnly)),
+            (
+                Step::Create,
+                Errno::ACCESS,
+                Some(CgroupRefusal::NotDelegated),
+            ),
+            (Step::Enable, Errno::PERM, Some(CgroupRefusal::NotDelegated)),
+            (
+                Step::Enable,
+                Errno::BUSY,
+                Some(CgroupRefusal::ParentHoldsProcesses),
+            ),
+            (
+                Step::Join,
+                Errno::OPNOTSUPP,
+                Some(CgroupRefusal::ParentHoldsProcesses),
+            ),
+            (
+                Step::Join,
+                Errno::ACCESS,
+                Some(CgroupRefusal::CallerOutside),
+            ),
+            (Step::Join, Errno::NOENT, Some(CgroupRefusal::CallerOutside)),
+            // A failure no refusal names stays the host's.
+            (Step::Create, Errno::NOSPC, None),
+            (Step::OpenFile, Errno::MFILE, None),
+            (Step::Join, Errno::NOMEM, None),
+        ];
+        for (step, errno, expected) in cases {
+            assert_eq!(refusal(step, errno), expected, "{step:?} {errno:?}");
+        }
+        assert_eq!(
+            join_refusal(Errno::ACCESS),
+            Some(CgroupRefusal::CallerOutside)
+        );
     }
 
     #[test]

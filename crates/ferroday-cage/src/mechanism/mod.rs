@@ -89,6 +89,7 @@ compile_error!(
 );
 
 pub(crate) mod bounds;
+mod cgroup;
 mod child;
 mod copyin;
 #[cfg(feature = "tarball")]
@@ -107,6 +108,7 @@ pub(crate) mod sys;
 #[cfg(feature = "hardening")]
 pub(crate) use harden::probe_landlock_abi;
 
+pub(crate) use cgroup::{JoinProbe, probe_cgroup_join};
 pub(crate) use child::CONTROL_TERMINATE;
 pub(crate) use copyin::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_OWN, COPY_SYMLINK,
@@ -2430,6 +2432,9 @@ impl PendingLaunch {
                         ops: &self.op_labels,
                         exec: &self.exec_label,
                         rlimits: &self.rlimit_labels,
+                        // The cgroup is joined before the launch is held, so
+                        // no step after release names it.
+                        cgroup_parent: None,
                         #[cfg(feature = "hardening")]
                         landlock: &self.landlock_labels,
                     },
@@ -2468,6 +2473,8 @@ struct Labels<'a> {
     ops: &'a [String],
     exec: &'a str,
     rlimits: &'a [String],
+    /// The parent the sandbox's cgroup is created beneath, where it has one.
+    cgroup_parent: Option<&'a std::path::Path>,
     #[cfg(feature = "hardening")]
     landlock: &'a [String],
 }
@@ -2479,6 +2486,7 @@ impl<'a> Labels<'a> {
             ops: &plan.op_labels,
             exec: &plan.exec_label,
             rlimits: &plan.rlimit_labels,
+            cgroup_parent: plan.cgroup.as_ref().map(|cgroup| cgroup.parent.as_path()),
             #[cfg(feature = "hardening")]
             landlock: &plan.hardening.landlock_labels,
         }
@@ -2541,6 +2549,17 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
         return Error::ProcfsRefused {
             blocker: host::procfs_refusal(),
             source: std::io::Error::from_raw_os_error(errno),
+        };
+    }
+    // The launch stage's move into the sandbox's cgroup is refused for the
+    // reasons the cgroup's own preparation is, and is reported as one of them.
+    if step == SetupStep::JoinCgroup
+        && let Some(parent) = labels.cgroup_parent
+        && let Some(reason) = crate::cgroup::join_refusal(Errno::from_raw_os_error(errno))
+    {
+        return Error::CgroupRefused {
+            parent: parent.to_path_buf(),
+            reason,
         };
     }
     // A `devpts` instance answers an open of its multiplexer with `ENOSPC` when
@@ -2744,9 +2763,44 @@ mod tests {
             ops: &[],
             exec: "",
             rlimits: &[],
+            cgroup_parent: None,
             #[cfg(feature = "hardening")]
             landlock: rules,
         }
+    }
+
+    #[test]
+    fn a_refused_cgroup_join_is_reported_as_the_refusal_it_stands_for() {
+        let parent = std::path::Path::new("/sys/fs/cgroup/delegated");
+        let labels = || Labels {
+            cgroup_parent: Some(parent),
+            ..labels_with_rules(&[])
+        };
+        match setup_error(
+            SetupStep::JoinCgroup,
+            Errno::ACCESS.raw_os_error(),
+            0,
+            labels(),
+        ) {
+            Error::CgroupRefused {
+                parent: reported,
+                reason: crate::CgroupRefusal::CallerOutside,
+            } => assert_eq!(reported, parent),
+            other => panic!("{other:?}"),
+        }
+        // An errno no refusal names stays the setup step's failure.
+        assert!(matches!(
+            setup_error(
+                SetupStep::JoinCgroup,
+                Errno::NOMEM.raw_os_error(),
+                0,
+                labels()
+            ),
+            Error::Setup {
+                step: SetupStep::JoinCgroup,
+                ..
+            }
+        ));
     }
 
     #[test]

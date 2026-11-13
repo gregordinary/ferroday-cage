@@ -94,7 +94,8 @@ that grants `userns`.
 A runtime mounts the container's cgroup filesystem read-only, unless the
 container is privileged. A sandbox inside then has no directory to create a
 cgroup in, so the [cgroup limits](hardening.md#limits-on-the-whole-tree) do
-not apply inside a default container. Limit the container itself instead,
+not apply inside a default container, and a launch that names a parent there
+is refused with `CgroupRefusal::ReadOnly`. Limit the container itself instead,
 through the runtime's own resource settings.
 
 ## Docker

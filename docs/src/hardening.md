@@ -561,7 +561,10 @@ The cgroup does three things besides the limits:
 
 A cgroup with processes of its own cannot enable controllers for its children.
 A caller that runs inside the parent therefore moves itself into a leaf beside
-the sandboxes' cgroups first:
+the sandboxes' cgroups first. The library moves no process of the caller's.
+[`host::own_cgroup`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.own_cgroup.html)
+names the cgroup a process runs in, and a shell reads it from
+`/proc/self/cgroup`:
 
 ```sh
 systemd-run --user --scope -p Delegate=yes sh -c '
@@ -573,12 +576,25 @@ systemd-run --user --scope -p Delegate=yes sh -c '
 ```
 
 A limit is never left silently unenforced. A launch fails with
-`Error::CgroupRefused` where the parent is outside a cgroup v2 hierarchy or
-lacks a controller a limit needs. It fails the same way where the parent holds
-processes of its own, or the kernel lacks a limit's file. A value the kernel
-would refuse is refused at build. Inside a container, the runtime mounts the
-cgroup filesystem read-only by default, which leaves a sandbox there no parent.
-[Running inside a container](running-in-a-container.md) gives the detail.
+`Error::CgroupRefused`, and a `CgroupRefusal` saying why, where the parent
+cannot hold the sandbox's cgroup:
+
+- it is missing, or outside a cgroup v2 hierarchy;
+- its cgroup filesystem is mounted read-only;
+- it is not delegated to the caller;
+- it lacks a controller a limit needs, or holds processes of its own;
+- the kernel lacks a limit's file;
+- the caller runs where the launch cannot move from into the parent's subtree.
+  The kernel lets a process move one only where it may write the
+  `cgroup.procs` of the nearest cgroup the two share.
+
+A value the kernel would refuse is refused at build.
+[`host::cgroup_blocker`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.cgroup_blocker.html)
+gives the same answer before a launch, by the launch's own steps: it creates a
+cgroup beneath the parent, moves a short-lived child into it, and removes it.
+Inside a container, the runtime mounts the cgroup filesystem read-only by
+default, which leaves a sandbox there no parent. [Running inside a
+container](running-in-a-container.md) gives the detail.
 
 The limits, in the units of the files they are written to. The name in the
 first column is what a profile's `[cgroup]` table and `fcage --cgroup` both

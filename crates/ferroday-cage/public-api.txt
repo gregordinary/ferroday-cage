@@ -60,11 +60,13 @@ impl core::marker::Unpin for ferroday_cage::host::UsernsBlocker
 impl core::marker::UnsafeUnpin for ferroday_cage::host::UsernsBlocker
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::host::UsernsBlocker
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::host::UsernsBlocker
+pub fn ferroday_cage::host::cgroup_blocker(impl core::convert::AsRef<std::path::Path>, &[ferroday_cage::CgroupLimit]) -> core::option::Option<ferroday_cage::CgroupRefusal>
 pub fn ferroday_cage::host::landlock_abi() -> core::option::Option<i32>
 pub fn ferroday_cage::host::landlock_enforces_fs(ferroday_cage::FsAccess) -> bool
 pub fn ferroday_cage::host::landlock_enforces_net(ferroday_cage::NetAccess) -> bool
 pub fn ferroday_cage::host::landlock_enforces_scope(ferroday_cage::LandlockScope) -> bool
 pub fn ferroday_cage::host::overlay_blocker(impl core::convert::AsRef<std::path::Path>) -> core::option::Option<ferroday_cage::host::OverlayBlocker>
+pub fn ferroday_cage::host::own_cgroup() -> core::option::Option<std::path::PathBuf>
 pub fn ferroday_cage::host::procfs_blocker() -> core::option::Option<ferroday_cage::host::ProcfsBlocker>
 pub fn ferroday_cage::host::range_map_blocker() -> core::option::Option<ferroday_cage::host::RangeMapBlocker>
 pub fn ferroday_cage::host::seccomp_available() -> bool
@@ -1626,12 +1628,16 @@ impl core::marker::UnsafeUnpin for ferroday_cage::CgroupLimit
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::CgroupLimit
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::CgroupLimit
 #[non_exhaustive] pub enum ferroday_cage::CgroupRefusal
+pub ferroday_cage::CgroupRefusal::CallerOutside
 #[non_exhaustive] pub ferroday_cage::CgroupRefusal::ControllerUnavailable
 pub ferroday_cage::CgroupRefusal::ControllerUnavailable::controller: &'static str
 #[non_exhaustive] pub ferroday_cage::CgroupRefusal::LimitUnsupported
 pub ferroday_cage::CgroupRefusal::LimitUnsupported::file: &'static str
+pub ferroday_cage::CgroupRefusal::Missing
 pub ferroday_cage::CgroupRefusal::NotCgroup2
+pub ferroday_cage::CgroupRefusal::NotDelegated
 pub ferroday_cage::CgroupRefusal::ParentHoldsProcesses
+pub ferroday_cage::CgroupRefusal::ReadOnly
 impl core::fmt::Display for ferroday_cage::CgroupRefusal
 pub fn ferroday_cage::CgroupRefusal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::CgroupRefusal

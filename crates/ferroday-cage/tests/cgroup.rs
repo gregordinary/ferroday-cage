@@ -14,39 +14,54 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{CgroupLimit, CgroupRefusal, Error};
+use ferroday_cage::{CgroupLimit, CgroupRefusal, Error, host};
+
+/// Limits whose controllers the tests' sandboxes need the parent to offer.
+const LIMITS: [CgroupLimit; 2] = [CgroupLimit::PidsMax(8), CgroupLimit::MemoryMax(64 << 20)];
 
 /// The delegated directory the sandboxes' cgroups are created beneath, with
 /// the test process already moved into a leaf of it, or `None` where the run
 /// has none.
 fn delegated() -> Option<&'static Path> {
-    static PARENT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static PARENT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     let parent = PARENT.get_or_init(|| {
-        let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-        let relative = own.lines().find_map(|line| line.strip_prefix("0::"))?;
-        let parent = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-        let leaf = parent.join(format!("fcage-test-caller-{}", std::process::id()));
-        std::fs::create_dir(&leaf).ok()?;
-        std::fs::write(leaf.join("cgroup.procs"), "0").ok()?;
+        let parent = host::own_cgroup().ok_or("the tests run in no cgroup v2 hierarchy")?;
         // A cgroup holding processes of its own cannot enable a controller
-        // for its children, so anything else left in the parent is a run
-        // started in a cgroup it shares.
-        let others = std::fs::read_to_string(parent.join("cgroup.procs")).ok()?;
-        if !others.trim().is_empty() {
-            return None;
+        // for its children, so a cgroup the tests share is not one to divide.
+        let members = std::fs::read_to_string(parent.join("cgroup.procs"))
+            .map_err(|err| format!("{} lists no processes: {err}", parent.display()))?;
+        let me = std::process::id().to_string();
+        if members.lines().any(|pid| pid != me) {
+            return Err(format!(
+                "{} holds processes besides the tests'",
+                parent.display()
+            ));
         }
-        // The leaf offers what the parent enables for its children, which the
-        // refusal test needs: pids, at least.
-        std::fs::write(parent.join("cgroup.subtree_control"), "+pids").ok()?;
-        Some(parent)
+        let leaf = parent.join(format!("fcage-test-caller-{me}"));
+        std::fs::create_dir(&leaf)
+            .and_then(|()| std::fs::write(leaf.join("cgroup.procs"), "0"))
+            .map_err(|err| {
+                format!(
+                    "the tests cannot move into a leaf of {}: {err}",
+                    parent.display()
+                )
+            })?;
+        // The probe leaves the controllers the limits need enabled, as a
+        // launch does, so the leaf offers pids to the refusal test below.
+        match host::cgroup_blocker(&parent, &LIMITS) {
+            None => Ok(parent),
+            Some(refusal) => Err(format!(
+                "{} cannot hold the sandboxes' cgroups: {refusal}",
+                parent.display()
+            )),
+        }
     });
     match parent {
-        Some(parent) => Some(parent.as_path()),
-        None => {
-            common::require::premise_unmet(
-                "the tests run outside a delegated cgroup of their own; run them under \
-                 systemd-run --user --scope -p Delegate=yes",
-            );
+        Ok(parent) => Some(parent.as_path()),
+        Err(reason) => {
+            common::require::premise_unmet(format!(
+                "{reason}; run the tests under systemd-run --user --scope -p Delegate=yes"
+            ));
             None
         }
     }
@@ -250,6 +265,10 @@ fn a_parent_holding_processes_is_refused_and_creates_nothing() {
         return;
     };
     let leaf = parent.join(format!("fcage-test-caller-{}", std::process::id()));
+    assert_eq!(
+        host::cgroup_blocker(&leaf, &[CgroupLimit::PidsMax(8)]),
+        Some(CgroupRefusal::ParentHoldsProcesses),
+    );
     let err = sh_in(&leaf, "true")
         .cgroup_limit(CgroupLimit::PidsMax(8))
         .build()
@@ -275,6 +294,10 @@ fn a_parent_outside_a_cgroup_v2_hierarchy_is_refused() {
         return;
     }
     let scratch = common::scratch_dir("cgroup-not-a-cgroup");
+    assert_eq!(
+        host::cgroup_blocker(&scratch, &[]),
+        Some(CgroupRefusal::NotCgroup2)
+    );
     let err = common::host_userland()
         .command("/bin/true")
         .cgroup_parent(&scratch)
@@ -294,4 +317,105 @@ fn a_parent_outside_a_cgroup_v2_hierarchy_is_refused() {
     );
     let rendered = ferroday_cage::ErrorChain::new(&err).to_string();
     assert!(rendered.contains("cgroup v2"), "{rendered}");
+}
+
+#[test]
+fn a_missing_parent_is_refused_alike_by_the_probe_and_the_launch() {
+    if !common::require::userns() {
+        return;
+    }
+    let missing = common::scratch_dir("cgroup-missing").join("absent");
+    assert_eq!(
+        host::cgroup_blocker(&missing, &[]),
+        Some(CgroupRefusal::Missing)
+    );
+    let err = common::host_userland()
+        .command("/bin/true")
+        .cgroup_parent(&missing)
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect_err("nothing is at the parent's path");
+    assert!(
+        matches!(
+            &err,
+            Error::CgroupRefused {
+                reason: CgroupRefusal::Missing,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_parent_not_delegated_to_the_caller_is_refused_alike_by_the_probe_and_the_launch() {
+    if !common::require::userns() {
+        return;
+    }
+    // A cgroup of the service manager's, which an unprivileged caller may read
+    // and not divide.
+    let Some(hierarchy) = host::own_cgroup().and_then(|own| {
+        own.ancestors()
+            .find(|dir| dir.join("system.slice").is_dir())
+            .map(Path::to_path_buf)
+    }) else {
+        common::require::premise_unmet("the host's cgroup hierarchy has no system.slice");
+        return;
+    };
+    if rustix::process::geteuid().is_root() {
+        common::require::premise_unmet("root may divide any cgroup");
+        return;
+    }
+    let parent = hierarchy.join("system.slice");
+    assert_eq!(
+        host::cgroup_blocker(&parent, &[]),
+        Some(CgroupRefusal::NotDelegated)
+    );
+    let err = common::host_userland()
+        .command("/bin/true")
+        .cgroup_parent(&parent)
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect_err("the service manager's cgroup is not the caller's");
+    assert!(
+        matches!(
+            &err,
+            Error::CgroupRefused {
+                reason: CgroupRefusal::NotDelegated,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_parent_that_can_hold_a_sandbox_s_cgroup_is_answered_so_and_left_as_found() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    // A parent of this test's own, since the tests beside it create cgroups
+    // beneath the shared one at the same time.
+    let own = parent.join("fcage-test-probe");
+    std::fs::create_dir_all(&own).expect("a cgroup of the test's own");
+    assert_eq!(host::cgroup_blocker(&own, &LIMITS), None);
+    assert_eq!(
+        sandbox_cgroups(&own),
+        Vec::<String>::new(),
+        "the probe's cgroup is removed"
+    );
+    // The answer is the launch's: one is given its cgroup there.
+    let output = sh_in(&own, "true")
+        .cgroup_limit(LIMITS[0])
+        .cgroup_limit(LIMITS[1])
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox runs");
+    assert!(output.status.success(), "{output:?}");
 }

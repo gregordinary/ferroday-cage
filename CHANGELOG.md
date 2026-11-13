@@ -292,10 +292,15 @@ consumer upgrading can skip it.
   `KillHandle::kill` also write `cgroup.kill`, which reaches descendants that
   left the command's process tree. The handle removes the cgroup once nothing is
   left in it. A launch the parent cannot serve fails with `Error::CgroupRefused`
-  and a `CgroupRefusal`, a host failure preparing the cgroup with
-  `Error::Cgroup`, and a value the kernel would refuse with
+  and a `CgroupRefusal`: a parent that is missing, outside a cgroup v2
+  hierarchy, read-only, not delegated to the caller, lacking a controller, or
+  holding processes, a kernel without a limit's file, or a caller the launch
+  cannot move from into the parent's subtree. A host failure preparing the
+  cgroup fails with `Error::Cgroup`, and a value the kernel would refuse with
   `ConfigError::CgroupLimitInvalid`. `SetupStep::JoinCgroup` is the step that
-  joins it. Profiles take a `[cgroup]` table, which `RestrictedProfile` refuses
+  joins it. `host::cgroup_blocker` answers whether a launch beneath a parent
+  with given limits would be refused, and why, by the launch's own steps, and
+  `host::own_cgroup` names the cgroup the calling process runs in. Profiles take a `[cgroup]` table, which `RestrictedProfile` refuses
   where it names a parent, and `fcage` takes `--cgroup-parent DIR` and `--cgroup
   LIMIT=VALUE`.
 - An `agent-tools` example and a guide chapter for it: a sandbox for a coding

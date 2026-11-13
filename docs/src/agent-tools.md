@@ -244,7 +244,8 @@ let builder = match delegated {
 A memory limit alone lets a tree that reaches it go on in swap, and a swap limit
 of 0 keeps the tree in memory. A host that does not account swap has no
 `memory.swap.max`, and the library refuses the launch with
-`Error::CgroupRefused`. The per-process limits bound less: each process can hold
+`Error::CgroupRefused`, which the example learns from `host::cgroup_blocker`
+before it chooses the limits. The per-process limits bound less: each process can hold
 4 GiB of writable memory, and [Resource limits](hardening.md#resource-limits)
 says how the kernel counts processes.
 
@@ -253,17 +254,22 @@ says how the kernel counts processes.
 A delegated cgroup is one the caller can create cgroups in. The example looks for
 one in the cgroup it runs in:
 
-1. It reads its own cgroup from `/proc/self/cgroup`.
+1. [`host::own_cgroup`] names the cgroup it runs in.
 2. It takes that cgroup only where it runs there alone, since a cgroup that holds
    processes cannot enable a controller for its children.
 3. It creates a leaf named `agent-tools`, and moves itself into it. The
-   commands' cgroups are then created beside the leaf.
+   commands' cgroups are then created beside the leaf. The move is the
+   example's own: the library moves no process of the caller's.
+4. [`host::cgroup_blocker`] answers whether the cgroup can hold a command's
+   cgroup with the limits, by the steps a launch takes. Its answer is the
+   refusal a launch would fail with: a cgroup not delegated to the example, a
+   controller the cgroup does not offer, or a kernel without
+   `memory.swap.max`, among others.
 
 Where a step fails, the example uses the per-process limits, and says why on
-standard error. Creating the leaf is the test of delegation: it fails where the
-cgroup is not the caller's to divide. A scope from `systemd-run --user --scope -p
-Delegate=yes` is a delegated cgroup with nothing else in it, and so is a service
-with `Delegate=yes`.
+standard error. A scope from `systemd-run --user --scope -p Delegate=yes` is a
+delegated cgroup with nothing else in it, and so is a service with
+`Delegate=yes`.
 
 ## The report
 
@@ -363,6 +369,8 @@ remain the caller's to decide:
 [`SeccompRules::curated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.curated
 [`landlock_resolve_unix`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.landlock_resolve_unix
 [`host::landlock_enforces_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_enforces_fs.html
+[`host::own_cgroup`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.own_cgroup.html
+[`host::cgroup_blocker`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.cgroup_blocker.html
 [`Pending::listen`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html#method.listen
 [`Running::try_wait`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.try_wait
 [`Escalation`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/relay/struct.Escalation.html
