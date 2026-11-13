@@ -1279,7 +1279,11 @@ mod tests {
 
         // Anything but a directory at an entry's name hides it. A whiteout is
         // the overlay's own shape for that, where the host lets one be made;
-        // a regular file takes the same path through the upper.
+        // a regular file takes the same path through the upper. Made here
+        // rather than through the testkit's `overlay::whiteout`, which skips
+        // where the kernel refuses one: a regular file shows this case as
+        // well, so the test goes on with one rather than skipping the cases
+        // after it.
         let zlib = upper.join(DB_DIR).join("sys-libs/zlib-1.3.1-r1");
         std::fs::create_dir_all(zlib.parent().expect("a category")).unwrap();
         let whiteout = rustix::fs::mknodat(
