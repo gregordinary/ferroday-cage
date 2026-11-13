@@ -457,14 +457,24 @@ fn dropping_the_primary_hangs_the_terminal_up() {
     );
 }
 
-/// Reads from the primary until `needle` has arrived, returning everything read.
+/// Reads from the primary until `needle` has arrived, returning everything read,
+/// and fails the test if it has not within a minute.
 ///
 /// Used where a test has to act at a point in the session — after the command
 /// has installed a handler, say — rather than after it has ended.
 fn read_until(pty: &mut Pty, needle: &str) -> String {
+    let patience = std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now()
+        .checked_add(patience)
+        .expect("a deadline");
     let mut seen = Vec::new();
     let mut chunk = [0u8; 256];
     loop {
+        assert!(
+            common::readable_by(&*pty, deadline),
+            "{needle:?} had not arrived after {patience:?}: {:?}",
+            String::from_utf8_lossy(&seen),
+        );
         let read = pty.read(&mut chunk).expect("the primary reads");
         assert_ne!(read, 0, "the session ended before {needle:?} arrived");
         seen.extend_from_slice(&chunk[..read]);

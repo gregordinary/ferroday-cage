@@ -597,7 +597,7 @@ report name a package and its version bare.
 | Skip a test the host cannot run, or fail it where a `REQUIRE` variable says it must run | `ferroday_cage_testkit::require` |
 | A sandbox running a shell script in a test, with nothing else set, or one that keeps running, and an observer that keeps what it writes | `ferroday_cage_testkit::sandbox::shell`, `sandbox::sleeper`, `sandbox::Collect` |
 | Play the user at a pseudoterminal in a test | `ferroday_cage_testkit::pty` |
-| Wait in a test until a descriptor is readable, failing past a deadline | `ferroday_cage_testkit::fd::readable_by` |
+| Wait in a test until a descriptor is readable or a deadline passes | `ferroday_cage_testkit::fd::readable_by`, which answers whether it became readable, for the caller to assert |
 | Run a probe with its standard descriptors closed, and put them back | `ferroday_cage_testkit::fd::with_standard_streams_closed`, and `fd::is_open` to ask of one without opening another |
 | Run a host process in a test, failing the test past a deadline | `ferroday_cage_testkit::process::run_bounded`, or `spawn_grouped` then `finish_bounded` |
 | Run one test of the test binary again, as a process of its own | `ferroday_cage_testkit::process::rerun`, or `process::rerun_args` for one a sandbox starts |
