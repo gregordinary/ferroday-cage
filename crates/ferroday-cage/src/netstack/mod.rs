@@ -39,11 +39,12 @@
 //!
 //! Only TCP and UDP are forwarded, and only from the guest's own address: a
 //! segment or datagram from any other source is dropped, since nothing sent
-//! back to it could be delivered. The stack answers ICMP echo for the
-//! gateway address and for nothing else, so a ping inside the guest tells the
-//! guest that its gateway is up and says nothing at all about the destination
-//! — a reachable address does not answer, and neither does a refused one.
-//! Reachability is what a connection reports.
+//! back to it could be delivered. The stack answers ICMP echo for the gateway
+//! address and for nothing else, and a sandboxed command cannot send one: it
+//! holds no capability over its network namespace and is outside the
+//! namespace's `ping_group_range`, so `ping` is refused inside a sandbox
+//! whether or not a stack is attached. Reachability is what a TCP or UDP
+//! connection reports.
 //!
 //! Attachment happens in a forked, short-lived helper process that joins
 //! the sandbox's user and network namespaces, creates and configures the

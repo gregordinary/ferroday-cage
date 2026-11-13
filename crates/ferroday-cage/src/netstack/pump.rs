@@ -28,9 +28,10 @@
 //! own subnet other than the gateway is on-link as far as the guest is
 //! concerned, so the guest asks for its hardware address, nothing replies, and
 //! no segment for it ever reaches the stack — which is why that refusal alone
-//! is not a reset, see [`host_target`]. And a successful ping inside the guest
-//! means the gateway answered, rather than the stack answering in the name of
-//! whatever was pinged.
+//! is not a reset, see [`host_target`]. And the interface answers an echo
+//! request only for the gateway, rather than in the name of whatever the
+//! request named. A sandboxed command cannot send one in the first place: it
+//! holds no capability over its network namespace, which `ping` needs.
 //!
 //! A published port runs the other way. Its host listener sits in the same
 //! poll, and each connection it accepts becomes a flow whose guest-facing

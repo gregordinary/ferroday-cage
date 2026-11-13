@@ -285,7 +285,7 @@ segment, and the stack answers ARP and neighbor discovery only for the gateway.
 Nothing replies, and the connection fails a few seconds later, when the guest's
 own address resolution gives up.
 
-### What answers, and what a ping means
+### What answers, and what checks reachability
 
 The stack holds one address per family — the gateway — and answers for that and
 nothing else. That is narrower than it sounds, because the interface accepts
@@ -295,11 +295,15 @@ underlying stack. The pump asks the narrower one instead: an address-resolution
 request or an ICMP echo request naming an address the stack does not hold is
 dropped before the interface can answer it.
 
-So a `ping` inside the guest reports on the gateway and on nothing else. Pinging
-the gateway succeeds — it is the stack, and it is up. Pinging anything else
-receives no reply whether or not that destination is reachable, since only TCP
-and UDP are forwarded and the stack has no way to ask. A connection is what
-reports reachability here; a ping reports the link to the stack.
+The stack answers ICMP echo for the gateway, and a sandboxed command cannot send
+one. `ping` needs a raw socket or an ICMP datagram socket, and the command holds
+no capability over the sandbox's network namespace and is outside that
+namespace's `ping_group_range`, so `ping` is refused in every sandbox, with a
+stack attached or without one; [what the command gives
+up](how-the-sandbox-is-built.md#what-the-command-gives-up) explains why. A
+refused `ping` says nothing about the stack. A TCP or UDP connection is the
+reachability check, since those are what the stack forwards: a connection to a
+destination reports whether that destination answers.
 
 The gateway address is the one deliberate exception. With
 [`host_loopback(true)`][`NetStackBuilder::host_loopback`], a connection to the
