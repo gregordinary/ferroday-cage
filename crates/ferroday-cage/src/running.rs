@@ -1919,16 +1919,22 @@ mod tests {
         };
 
         // The command writes its output and closes it; its outcome is still
-        // to come.
+        // to come. The end of the stream arrives once every copy of its write
+        // end has closed, and a test forking beside this one holds a copy of
+        // its own until that fork executes or exits, so it is waited for.
         rustix::io::write(&stdout_write, b"out").expect("the output fits the pipe");
         drop(stdout_write);
-        for _ in 0..10 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert_eq!(running.try_wait().expect("the stream is served"), None);
             if running.stdout.is_none() {
                 break;
             }
-            assert_eq!(running.try_wait().expect("the stream is served"), None);
+            assert!(
+                readable_by(&running, deadline),
+                "the stream was never closed"
+            );
         }
-        assert!(running.stdout.is_none(), "the stream was never closed");
         assert!(quiet(&running), "the set reports the closed stream");
 
         // The outcome arrives, and the supervisor that sent it is gone.
