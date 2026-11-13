@@ -54,7 +54,9 @@ impl Pins {
     /// answer to which governs. A plan this library resolved cannot contain one;
     /// a hand-written document can.
     pub(super) fn of(plan: &Plan) -> Result<Pins, AlpineError> {
-        if let Some((first, again)) = plan.named_twice() {
+        if let Some((first, again)) =
+            crate::provision::settings::named_twice(&plan.packages, |package| &package.name)
+        {
             return Err(AlpineError::config(format!(
                 "the pin names the package {} twice, at {} and at {}, so there is no \
                      version to hold it at",

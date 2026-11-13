@@ -71,7 +71,7 @@ pub use repository::{Repository, RepositoryBuilder};
 
 use super::binfmt;
 use super::cache;
-use super::coordinate::{self, Nesting};
+
 use super::digest::{Algorithm, Digest};
 use super::extract::{Extraction, Placement};
 use super::identity::Ownership;
@@ -81,6 +81,7 @@ use super::layer::{Rooting, Staging};
 use super::layer_error::layer_error;
 use super::observe::layer_observer;
 use super::rooted::Rooted;
+use super::settings;
 use super::tar::TarReader;
 use super::{
     Available, BuildLayer, Delegate, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
@@ -994,31 +995,12 @@ impl AlpineBuilder {
     /// something this configuration could install, or when the
     /// [`source_date_epoch`](Self::source_date_epoch) is negative.
     pub fn build(self) -> Result<Alpine, AlpineError> {
-        if let Some(epoch) = self.source_date_epoch
-            && epoch < 0
-        {
-            return Err(AlpineError::config(format!(
-                "the source date epoch {epoch} is negative, and /etc/shadow records days \
-                     since 1970"
-            )));
-        }
-        // A plan states which architecture it is for, so a builder that names
-        // none adopts it: refusing a plan the caller never contradicted, over a
-        // default the caller never chose, would be a confusing rejection. A pin
-        // states one for the same reason and is adopted the same way. This is
-        // the Debian builder's rule, and it has to be the same rule, because it
-        // is what decides whether the check below ever fires for a caller who
-        // simply did not say.
+        settings::check_source_date_epoch(self.source_date_epoch).map_err(AlpineError::config)?;
         let stated = self.plan.as_ref().or(self.pin.as_ref());
-        let architecture = match (&self.architecture, stated) {
-            (Some(architecture), _) => architecture.clone(),
-            (None, Some(plan)) => plan.architecture.clone(),
-            (None, None) => host_architecture(),
-        };
-        coordinate::check(
-            "the bootstrap's architecture",
-            &architecture,
-            Nesting::Single,
+        let architecture = settings::settle_architecture(
+            self.architecture.as_deref(),
+            stated.map(|plan| plan.architecture.as_str()),
+            host_architecture,
         )
         .map_err(AlpineError::config)?;
 
@@ -1192,20 +1174,7 @@ fn validate_plan(
     excludes: &[String],
 ) -> Result<(), AlpineError> {
     let contradiction = |reason: String| Err(AlpineError::config(reason));
-    if !includes.is_empty() {
-        return contradiction(
-            "a plan already names every package to install, so include() has nothing to add; \
-             drop one of the two"
-                .to_string(),
-        );
-    }
-    if !excludes.is_empty() {
-        return contradiction(
-            "a plan already names every package to install, so exclude() has nothing to remove; \
-             drop one of the two"
-                .to_string(),
-        );
-    }
+    settings::plan_with_selection(includes, excludes).map_err(AlpineError::config)?;
     if pin_set {
         return contradiction(
             "plan() installs a resolved plan instead of resolving, so there is no resolution for \
@@ -1213,13 +1182,7 @@ fn validate_plan(
                 .to_string(),
         );
     }
-    if plan.architecture != architecture {
-        return contradiction(format!(
-            "the plan resolves architecture {:?} but the bootstrap is configured for \
-             {architecture}",
-            plan.architecture,
-        ));
-    }
+    settings::plan_architecture(&plan.architecture, architecture).map_err(AlpineError::config)?;
     // Each package names the index it came from, and a bootstrap fetches it
     // through the repository that serves that index, so a plan resolved against
     // more indexes than the configuration publishes has packages with no mirror
@@ -1277,11 +1240,11 @@ fn validate_plan(
     }
     // Installed twice, a package would be recorded twice and its scripts run
     // twice, into a root that can only hold it once.
-    if let Some((first, again)) = plan.named_twice() {
-        return contradiction(format!(
-            "the plan names the package {} twice, at {} and at {}, and a root holds one package \
-             of each name",
-            again.name, first.version, again.version,
+    if let Some((first, again)) = settings::named_twice(&plan.packages, |package| &package.name) {
+        return contradiction(settings::plan_names_twice(
+            &again.name,
+            &first.version,
+            &again.version,
         ));
     }
     Ok(())

@@ -75,6 +75,7 @@ use super::layer::Staging;
 use super::layer_error::layer_error;
 use super::observe::layer_observer;
 use super::rooted::Rooted;
+use super::settings;
 use super::{
     Available, BuildLayer, Delegate, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
     ProvisionError, ProvisionRequest, Provisioner, Staged, Stream, compose_mirrors, fetch_bounded,
@@ -311,20 +312,7 @@ fn validate_plan(
     excludes: &[String],
 ) -> Result<(), DebianError> {
     let contradiction = |reason: String| Err(DebianError::config(reason));
-    if !includes.is_empty() {
-        return contradiction(
-            "a plan already names every package to install, so include() has nothing to \
-             add; drop one of the two"
-                .to_string(),
-        );
-    }
-    if !excludes.is_empty() {
-        return contradiction(
-            "a plan already names every package to install, so exclude() has nothing to \
-             remove; drop one of the two"
-                .to_string(),
-        );
-    }
+    settings::plan_with_selection(includes, excludes).map_err(DebianError::config)?;
     if base_priority_set {
         return contradiction(
             "a plan already names its base system, so base_priority() has no seed to \
@@ -338,13 +326,7 @@ fn validate_plan(
             plan.suite,
         ));
     }
-    if plan.architecture != architecture {
-        return contradiction(format!(
-            "the plan resolves architecture {:?} but the bootstrap is configured for \
-             {architecture}",
-            plan.architecture,
-        ));
-    }
+    settings::plan_architecture(&plan.architecture, architecture).map_err(DebianError::config)?;
     // Each package names the archive it came from as an index, and a verbatim
     // install fetches through the repository at that index, so a plan resolved
     // against more repositories than are configured has packages with nowhere
@@ -383,11 +365,11 @@ fn validate_plan(
     // Installed twice, a package's files would be extracted twice, the later
     // version's over the earlier's, into a root whose database records one
     // package of each name.
-    if let Some((first, again)) = plan.named_twice() {
-        return contradiction(format!(
-            "the plan names the package {} twice, at {} and at {}, and a root holds one package \
-             of each name",
-            again.name, first.version, again.version,
+    if let Some((first, again)) = settings::named_twice(&plan.packages, |package| &package.name) {
+        return contradiction(settings::plan_names_twice(
+            &again.name,
+            &first.version,
+            &again.version,
         ));
     }
     Ok(())
@@ -1510,24 +1492,14 @@ impl DebianBuilder {
                          would be in the merged root and in no database; drop one of the two",
             ));
         }
-        if let Some(epoch) = self.source_date_epoch
-            && epoch < 0
-        {
-            return Err(DebianError::config(format!(
-                "the source date epoch {epoch} is negative, and the tools that read \
-                     SOURCE_DATE_EPOCH date from the clock instead"
-            )));
-        }
-        // A plan states which architecture it is for, so a builder that names
-        // none adopts it: refusing a plan the caller never contradicted, over a
-        // default the caller never chose, would be a confusing rejection. A pin
-        // states one for the same reason and is adopted the same way.
+        settings::check_source_date_epoch(self.source_date_epoch).map_err(DebianError::config)?;
         let stated = self.plan.as_ref().or(self.pin.as_ref());
-        let architecture = match (&self.architecture, stated) {
-            (Some(architecture), _) => architecture.clone(),
-            (None, Some(plan)) => plan.architecture.clone(),
-            (None, None) => arch::host_architecture(),
-        };
+        let architecture = settings::settle_architecture(
+            self.architecture.as_deref(),
+            stated.map(|plan| plan.architecture.as_str()),
+            arch::host_architecture,
+        )
+        .map_err(DebianError::config)?;
         // The architecture is a path segment of every index URL and of the
         // merged-usr layout, so it passes the same check the suite and the
         // components do at repository construction. It is a single segment: the

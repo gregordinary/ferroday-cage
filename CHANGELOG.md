@@ -529,6 +529,9 @@ consumer upgrading can skip it.
   package, is read only as a run of ASCII digits. One with a leading sign, which
   read as the number it signed, now reads as malformed, as the field's own
   rules for a malformed value say.
+- The Debian and Alpine builders refuse a negative `source_date_epoch` with one
+  reason, naming both the tools that date from the clock and `/etc/shadow`'s
+  count of days.
 
 ### Fixed
 

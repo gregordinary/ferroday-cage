@@ -89,6 +89,8 @@ mod layer_error;
 pub(crate) mod number;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod observe;
+#[cfg(any(feature = "debian", feature = "alpine"))]
+mod settings;
 // The overlay upper a layered build installs into, which is a disposal handle
 // rather than anything one userland knows about.
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
