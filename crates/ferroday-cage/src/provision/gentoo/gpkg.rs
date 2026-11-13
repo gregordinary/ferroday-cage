@@ -562,7 +562,10 @@ fn unreadable(path: &Path, err: ProvisionError) -> GentooError {
             path: read,
             source,
         } => GentooError::io(op, read, source),
-        other => GentooError::container(path, ErrorChain::new(&other).to_string()),
+        other => GentooError::container(
+            path,
+            ErrorChain::new(&other.named_by_caller(path)).to_string(),
+        ),
     }
 }
 
@@ -1310,10 +1313,17 @@ mod tests {
             reason: "the archive ends inside an entry's data".to_string(),
             source: None,
         };
+        let refused = unreadable(path, cut);
         assert!(
-            matches!(unreadable(path, cut), GentooError::Container { .. }),
+            matches!(refused, GentooError::Container { .. }),
             "a container cut short is the container's",
         );
+        // The container is named by the layer's own error, so the archive
+        // refusal beneath it does not name it again.
+        let rendered = ErrorChain::new(&refused).to_string();
+        let name = path.display().to_string();
+        assert_eq!(rendered.matches(&name).count(), 1, "{rendered}");
+        assert!(rendered.contains("at offset 9216"), "{rendered}");
     }
 
     /// Opens `built` and reports what happened, as the plan entry `wanted`

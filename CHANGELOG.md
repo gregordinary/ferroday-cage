@@ -532,6 +532,9 @@ consumer upgrading can skip it.
 - The Debian and Alpine builders refuse a negative `source_date_epoch` with one
   reason, naming both the tools that date from the clock and `/etc/shadow`'s
   count of days.
+- A Gentoo binary package, and a `.deb` offered to `Pool::publish`, that is a
+  malformed archive is named once in the rendered error. The archive refusal
+  beneath the layer's own error named the file a second time.
 
 ### Fixed
 

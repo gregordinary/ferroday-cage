@@ -663,6 +663,31 @@ which arises for the same reason.
 }
 
 impl ProvisionError {
+    /// This failure, reported inside an error of the caller's own that names
+    /// `file` already: an [`Archive`](Self::Archive) refusal of that very file
+    /// loses its path, and renders as one of an archive held in memory does,
+    /// which its caller names. Any other failure is returned as it is.
+    ///
+    /// For a layer that reads a package file and reports a refusal of it in its
+    /// own terms, so the rendered chain names the file once.
+    #[cfg(any(feature = "debian", feature = "gentoo"))]
+    pub(crate) fn named_by_caller(self, file: &Path) -> ProvisionError {
+        match self {
+            ProvisionError::Archive {
+                path,
+                offset,
+                reason,
+                source,
+            } if path == file => ProvisionError::Archive {
+                path: PathBuf::new(),
+                offset,
+                reason,
+                source,
+            },
+            other => other,
+        }
+    }
+
     /// Wraps a provisioner's own error.
     ///
     /// The channel for a [`Provisioner`] implemented outside this crate: its

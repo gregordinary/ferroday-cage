@@ -1100,7 +1100,7 @@ fn unreadable(deb_path: &Path, err: ProvisionError) -> DebianError {
         ProvisionError::Io { op, path, source } => DebianError::io(op, path, source),
         other => DebianError::Deb {
             path: deb_path.to_path_buf(),
-            reason: ErrorChain::new(&other).to_string(),
+            reason: ErrorChain::new(&other.named_by_caller(deb_path)).to_string(),
         },
     }
 }
