@@ -32,10 +32,13 @@
 //! moment it arrives, while unread bytes are still queued both in the receive
 //! buffer and in the transmit buffer, so forwarding continues as the buffer
 //! reopens and it is the eventual read of zero — not the hangup — that ends the
-//! stream. What the hangup starts is a [`HANGUP_DEADLINE`], measured from the
-//! last byte moved, past which a guest that never drains is reclaimed. Neither
-//! covers a peer that dies silently on an otherwise idle flow, so both sides
-//! carry keep-alive: the guest-facing smoltcp socket has a
+//! stream. A side that has finished sending, the host by its hangup or the
+//! guest by its FIN or a reset, leaves the flow draining what it sent toward
+//! the other, and a draining flow that moves nothing for [`DRAIN_DEADLINE`] is
+//! reclaimed: a guest that never reads behind a host that has finished, and a
+//! host that never reads behind a guest that has. Neither the error watch nor
+//! the drain deadline covers a peer that dies silently on an otherwise idle
+//! flow, so both sides carry keep-alive: the guest-facing smoltcp socket has a
 //! [`KEEP_ALIVE_INTERVAL`] keep-alive and an [`IDLE_TIMEOUT`], and the host
 //! kernel socket is tuned to the same cadence. A peer that crashes without a
 //! FIN or RST is then probed and, when it does not answer, the flow is aborted
@@ -126,20 +129,24 @@ pub(super) const IDLE_TIMEOUT: Duration =
 /// contract above.
 const _: () = assert!(KEEP_ALIVE_INTERVAL.as_secs() < IDLE_TIMEOUT.as_secs());
 
-/// How long a flow whose host side has hung up may go without moving a byte
-/// before it is reclaimed.
+/// How long a draining flow may go without moving a byte before it is
+/// reclaimed.
 ///
-/// A hangup says nothing on its own about whether the bytes still queued behind
-/// it are wanted: a bulk transfer ending in a prompt close is exactly that
-/// shape, and its tail is still being acknowledged when the FIN is reported.
-/// What the hangup bounds is patience. A guest that establishes a flow and then
-/// never reads holds the transmit buffer full indefinitely while answering
-/// keep-alive probes, so [`IDLE_TIMEOUT`] never fires; this deadline is what
-/// releases the slot, its buffers, and the host descriptor. Measured from the
-/// last byte moved, so a flow that is draining, however slowly, is left alone;
-/// the budget is the idle timeout's, for one silence tolerance across the
-/// module.
-pub(super) const HANGUP_DEADLINE: Duration = IDLE_TIMEOUT;
+/// A flow is draining once one side has finished sending and what it sent still
+/// waits on the other side: the host has hung up and the guest has yet to take
+/// the bytes behind the hangup, or the guest's FIN or reset has arrived and the
+/// host has yet to take the bytes ahead of it. The finish says nothing on its
+/// own about whether those bytes are wanted: a bulk transfer ending in a prompt
+/// close is exactly that shape, and its tail is still being acknowledged when
+/// the FIN arrives. What it bounds is patience. A peer that never reads holds
+/// the bytes queued toward it indefinitely while answering keep-alive probes,
+/// and a guest answers zero-window probes too, so [`IDLE_TIMEOUT`] never fires;
+/// this deadline is what releases the slot, its buffers, and the host
+/// descriptor. Measured from the last byte moved, by a copy or by the guest
+/// acknowledging what was sent to it, so a flow that is draining, however
+/// slowly, is left alone; the budget is the idle timeout's, for one silence
+/// tolerance across the module.
+pub(super) const DRAIN_DEADLINE: Duration = IDLE_TIMEOUT;
 
 /// What became of one servicing pass.
 enum Copy {
@@ -185,10 +192,14 @@ pub(super) struct TcpFlow {
     guest_closed: bool,
     /// When to give up on a flow that has not established both sides.
     deadline: Instant,
-    /// When a hung-up host side first found no room in the guest's transmit
-    /// buffer; `None` whenever the flow can still move a byte. Bounds a guest
-    /// that never drains, per [`HANGUP_DEADLINE`].
+    /// When the flow last moved a byte while draining; `None` whenever it is
+    /// not draining or the last pass moved one. Bounds a peer that never takes
+    /// what the other side left, per [`DRAIN_DEADLINE`].
     stalled_since: Option<Instant>,
+    /// The bytes the guest's transmit buffer held at the end of the last pass,
+    /// so a pass can tell the guest acknowledging them, which moves nothing of
+    /// the flow's own, from a guest taking nothing.
+    unacknowledged: usize,
     /// The flow is finished; the pump reaps it and its socket.
     pub(super) dead: bool,
     /// The flow arrived through a published port, which decides the budget
@@ -235,6 +246,7 @@ impl TcpFlow {
             guest_closed: false,
             deadline: now + ESTABLISH_DEADLINE,
             stalled_since: None,
+            unacknowledged: 0,
             dead: false,
             published: false,
         })
@@ -268,6 +280,7 @@ impl TcpFlow {
             guest_closed: false,
             deadline: now + ESTABLISH_DEADLINE,
             stalled_since: None,
+            unacknowledged: 0,
             dead: false,
             published: true,
         }
@@ -282,9 +295,9 @@ impl TcpFlow {
     /// How long until this flow's next deadline, for the pump's poll timeout.
     ///
     /// Before both sides establish that is the establish deadline; afterwards
-    /// it is the hangup deadline of a flow stalled against a guest that is not
-    /// draining. `None` when neither applies, which is the ordinary case: a
-    /// live flow is woken by its descriptors, not by a timer.
+    /// it is the drain deadline of a flow stalled against a peer that takes
+    /// nothing. `None` when neither applies, which is the ordinary case: a live
+    /// flow is woken by its descriptors, not by a timer.
     pub(super) fn deadline_in(&self, socket: &tcp::Socket, now: Instant) -> Option<Duration> {
         if self.dead {
             return None;
@@ -293,7 +306,7 @@ impl TcpFlow {
             return Some(self.deadline.saturating_duration_since(now));
         }
         self.stalled_since
-            .map(|since| (since + HANGUP_DEADLINE).saturating_duration_since(now))
+            .map(|since| (since + DRAIN_DEADLINE).saturating_duration_since(now))
     }
 
     /// The poll interest of the host descriptor right now, judged against
@@ -325,7 +338,7 @@ impl TcpFlow {
         // wake the pump on every pass — RDHUP is level-triggered — for a flow
         // that cannot move until the guest reads. The remaining bytes are
         // drained by the read path and the stall is bounded by
-        // [`HANGUP_DEADLINE`], which the pump folds into its poll timeout.
+        // [`DRAIN_DEADLINE`], which the pump folds into its poll timeout.
         if !self.host_eof && !self.host_hangup {
             interest |= PollFlags::RDHUP;
         }
@@ -389,6 +402,9 @@ impl TcpFlow {
             self.host_hangup = true;
         }
 
+        // Taken before the copy toward the guest refills the buffer that a
+        // guest's acknowledgement has drained.
+        let acknowledged = socket.send_queue() < self.unacknowledged;
         progress |= self.guest_to_host(socket);
         if self.dead {
             return true;
@@ -397,8 +413,10 @@ impl TcpFlow {
         if self.dead {
             return true;
         }
+        self.unacknowledged = socket.send_queue();
 
-        self.note_stall(socket.can_send(), progress, now);
+        let draining = self.draining(socket);
+        self.note_stall(draining, progress || acknowledged, now);
 
         // Both directions have half-closed: the host socket is done both ways,
         // so release its descriptor now rather than hold it while the guest
@@ -472,7 +490,7 @@ impl TcpFlow {
     }
 
     /// Aborts the flow if it has run out of time: the establish deadline before
-    /// both sides are up, the hangup deadline for a stall that never resolves.
+    /// both sides are up, the drain deadline for a stall that never resolves.
     /// Returns whether it did, since the guest's reset then waits on the
     /// socket's next dispatch.
     pub(super) fn enforce_deadline(&mut self, socket: &mut tcp::Socket, now: Instant) -> bool {
@@ -481,7 +499,7 @@ impl TcpFlow {
         }
         let expired = if self.established(socket) {
             self.stalled_since
-                .is_some_and(|since| now >= since + HANGUP_DEADLINE)
+                .is_some_and(|since| now >= since + DRAIN_DEADLINE)
         } else {
             now >= self.deadline
         };
@@ -492,24 +510,54 @@ impl TcpFlow {
         expired
     }
 
-    /// Records whether the pass that just ran left the flow stalled, which is
-    /// what [`enforce_deadline`](Self::enforce_deadline) reclaims a flow on.
+    /// Whether one side has finished sending and what it sent still waits on
+    /// the other, the shape [`DRAIN_DEADLINE`] bounds.
     ///
-    /// A hung-up host side with no room left in the guest's transmit buffer can
-    /// move nothing until the guest reads. That is ordinary mid-transfer and
-    /// resolves itself; a guest that never reads at all does not, and keep-alive
-    /// will not reclaim it because it answers the probes.
+    /// The host has finished once it has hung up. What it sent waits on the
+    /// guest while the transmit buffer has no room for the rest of it, its end
+    /// of stream included, and once that end has been read, while the buffer
+    /// holds bytes the guest has yet to acknowledge. The guest has finished once
+    /// its FIN or a reset has arrived, which leaves the socket in one of the
+    /// states past it. What it sent waits on the host while the receive buffer
+    /// holds any of it.
+    fn draining(&self, socket: &tcp::Socket) -> bool {
+        let host_finished = self.host_hangup || self.host_eof;
+        let toward_guest = if self.host_eof {
+            socket.send_queue() > 0
+        } else {
+            !socket.can_send()
+        };
+        let guest_finished = matches!(
+            socket.state(),
+            tcp::State::CloseWait
+                | tcp::State::LastAck
+                | tcp::State::Closing
+                | tcp::State::TimeWait
+                | tcp::State::Closed
+        );
+        let toward_host = !self.host_shutdown && socket.can_recv();
+        (host_finished && toward_guest) || (guest_finished && toward_host)
+    }
+
+    /// Records whether the pass that just ran left the flow stalled, which is
+    /// what [`enforce_deadline`](Self::enforce_deadline) reclaims a flow on: it
+    /// was [`draining`](Self::draining) and `moved` nothing.
+    ///
+    /// A draining flow that moves nothing is waiting on a peer to read. That is
+    /// ordinary mid-transfer and resolves itself; a peer that never reads at all
+    /// does not, and keep-alive will not reclaim it because it answers the
+    /// probes.
     ///
     /// The clock runs from the last pass that moved the flow rather than from
-    /// the moment the buffer first filled, which is what [`HANGUP_DEADLINE`]
+    /// the moment the flow began to drain, which is what [`DRAIN_DEADLINE`]
     /// states and what `moved` is here for. A guest reading steadily but slower
     /// than the host queued would otherwise never clear it: the check runs after
     /// both copy directions, and a pass that drains a little and refills the
     /// buffer completely ends with no room and bytes having moved. Timing that
     /// as a stall reclaims a flow that is draining, which is the one thing this
     /// deadline exists not to do.
-    fn note_stall(&mut self, can_send: bool, moved: bool, now: Instant) {
-        if !self.host_eof && self.host_hangup && !can_send && !moved {
+    fn note_stall(&mut self, draining: bool, moved: bool, now: Instant) {
+        if draining && !moved {
             self.stalled_since.get_or_insert(now);
         } else {
             self.stalled_since = None;
@@ -716,6 +764,7 @@ mod tests {
                 guest_closed: false,
                 deadline: Instant::now() + ESTABLISH_DEADLINE,
                 stalled_since: None,
+                unacknowledged: 0,
                 dead: false,
                 published: false,
             },
@@ -853,7 +902,7 @@ mod tests {
     fn a_host_error_aborts_the_flow_at_once() {
         // Unlike a hangup, an error leaves nothing to read: every recv would
         // return it. The guest learns through a reset rather than waiting out
-        // the hangup deadline.
+        // the drain deadline.
         let (mut sockets, handle) = listening_socket();
         let (mut flow, _peer) = connected_flow(handle);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -876,25 +925,29 @@ mod tests {
         let started = Instant::now();
         let later = started + Duration::from_secs(1);
 
-        // No room and nothing moved: the flow is stuck, and the clock starts.
-        flow.note_stall(false, false, started);
+        // Draining and nothing moved: the flow is stuck, and the clock starts.
+        flow.note_stall(true, false, started);
         assert_eq!(flow.stalled_since, Some(started));
-        // Still no room, but the pass moved bytes: the flow is draining.
-        flow.note_stall(false, true, later);
-        assert_eq!(flow.stalled_since, None, "a draining flow is not stalled");
-        // Room again clears it too, whether or not this pass moved anything.
-        flow.note_stall(false, false, started);
-        flow.note_stall(true, false, later);
+        // Still draining, but the pass moved bytes: the peer is reading.
+        flow.note_stall(true, true, later);
+        assert_eq!(
+            flow.stalled_since, None,
+            "a flow moving bytes is not stalled"
+        );
+        // Nothing left waiting clears it too, whether or not this pass moved
+        // anything.
+        flow.note_stall(true, false, started);
+        flow.note_stall(false, false, later);
         assert_eq!(flow.stalled_since, None);
         // A clock already running is not restarted by a later stalled pass, or
         // a flow that never moves would never reach the deadline.
-        flow.note_stall(false, false, started);
-        flow.note_stall(false, false, later);
+        flow.note_stall(true, false, started);
+        flow.note_stall(true, false, later);
         assert_eq!(flow.stalled_since, Some(started));
     }
 
     #[test]
-    fn a_guest_that_never_drains_is_reclaimed_at_the_hangup_deadline() {
+    fn a_guest_that_never_drains_is_reclaimed_at_the_drain_deadline() {
         // Keep-alive cannot reclaim this flow: the guest is alive and answers
         // the probes, it simply never reads. The deadline is what releases the
         // slot, its buffers, and the host descriptor.
@@ -907,13 +960,10 @@ mod tests {
 
         // The pump sleeps no longer than what is left of the deadline, since a
         // stalled flow is out of the poll set entirely.
-        assert_eq!(flow.deadline_in(socket, stalled_at), Some(HANGUP_DEADLINE));
-        flow.enforce_deadline(
-            socket,
-            stalled_at + HANGUP_DEADLINE - Duration::from_secs(1),
-        );
+        assert_eq!(flow.deadline_in(socket, stalled_at), Some(DRAIN_DEADLINE));
+        flow.enforce_deadline(socket, stalled_at + DRAIN_DEADLINE - Duration::from_secs(1));
         assert!(!flow.dead, "the deadline has not fallen due");
-        flow.enforce_deadline(socket, stalled_at + HANGUP_DEADLINE);
+        flow.enforce_deadline(socket, stalled_at + DRAIN_DEADLINE);
         assert!(flow.dead);
     }
 

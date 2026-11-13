@@ -211,9 +211,10 @@ not throttled by the table.
 A connection that ends any other way ends with a reset to each peer it has.
 That covers a reset from either peer, a host connect that fails, and a flow the
 stack reclaims: one that has not established both sides within 30 seconds, or
-one whose guest stops reading after the host has finished and moves nothing for
-100 seconds. Neither peer is handed an end of stream for a connection that did
-not finish, so a cut-off transfer never reads as a complete one.
+one where a peer has finished sending and the other stops reading what it sent,
+so that the flow moves nothing for 100 seconds. Neither peer is handed an end of
+stream for a connection that did not finish, so a cut-off transfer never reads
+as a complete one.
 
 Those caps are per attachment, not per process. The pump and every host socket
 run in the caller's own process. Several attachments in one process therefore

@@ -34,7 +34,7 @@ path = "crates/ferroday-cage/src/netstack/tcp.rs"
 count = 4
 why = """\
 A TCP flow's own deadlines: `ESTABLISH_DEADLINE` (30 seconds) and \
-`HANGUP_DEADLINE` (the stack's idle timeout, minutes) added to a reading of \
+`DRAIN_DEADLINE` (the stack's idle timeout, minutes) added to a reading of \
 the monotonic clock. Both are constants of the stack's own rather than a \
 caller's number, and no duration that short can carry the clock past what it \
 expresses."""

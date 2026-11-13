@@ -547,6 +547,13 @@ consumer upgrading can skip it.
   FIN that answers the host's, and the host had not taken them within ten
   seconds, the network stack discarded them as the guest's socket left
   TIME_WAIT, and then reset the host.
+- The network stack reclaims a TCP flow, with a reset to each peer, once one
+  peer has finished sending and the other has taken nothing of what it sent
+  for 100 seconds, whichever peer finished. A guest that never read the tail of
+  a host's stream once all of it, the host's end included, fit in the stack's
+  buffer, and a host that never read what a guest sent before its FIN or reset,
+  each held a flow slot, its buffers, and a host descriptor until the sandbox
+  ended.
 - `NetStackBuilder::build` refuses an interface name holding `%`. The kernel
   took such a name as a template and named the interface itself, so the stack's
   configuration of it failed at attach with "No such device".

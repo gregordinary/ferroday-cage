@@ -2003,10 +2003,10 @@ mod tests {
         );
     }
 
-    /// A flow the hangup deadline reclaims, a guest that never reads behind a
+    /// A flow the drain deadline reclaims, a guest that never reads behind a
     /// host that has finished sending, resets the guest the same way.
     #[test]
-    fn a_flow_the_hangup_deadline_reclaims_resets_the_guest() {
+    fn a_flow_the_drain_deadline_reclaims_resets_the_guest() {
         use std::io::Write as _;
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
@@ -2061,7 +2061,7 @@ mod tests {
         assert!(
             flow.deadline_in(engine.sockets.get(flow.handle), now)
                 .is_some_and(|left| left > Duration::ZERO),
-            "the flow is stalled, under the hangup deadline",
+            "the flow is stalled, under the drain deadline",
         );
         let delivered: usize = sent_to_guest(&guest)
             .iter()
@@ -2072,13 +2072,124 @@ mod tests {
             "the guest's window, and no more, was filled: {delivered} bytes",
         );
 
-        engine.reap(now + tcp::HANGUP_DEADLINE);
+        engine.reap(now + tcp::DRAIN_DEADLINE);
         assert!(engine.flows.is_empty(), "the deadline reclaimed the flow");
         let sent = sent_to_guest(&guest);
         assert!(
             sent.iter().any(|segment| segment.rst),
             "the guest was never told the connection is gone: {sent:?}",
         );
+    }
+
+    /// A guest that never acknowledges the tail a finished host left in the
+    /// transmit buffer is reclaimed at the drain deadline, though the host's
+    /// whole stream, its end included, fits in the buffer and nothing is left
+    /// for the flow itself to copy.
+    ///
+    /// A real guest answering the stack's zero-window probes keeps the guest
+    /// socket's own idle timeout from firing; this one says nothing at all,
+    /// and the deadline is reached on the host's clock before that timeout
+    /// would be on the interface's.
+    #[test]
+    fn a_guest_that_never_reads_behind_a_finished_host_is_reclaimed() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, mapping(port), Vec::new());
+        guest_connects(&mut engine, &guest, port);
+        let (mut peer, _) = listener.accept().expect("the stack's connect arrives");
+        engine.flows[0].events = PollFlags::OUT;
+        engine.service();
+
+        // Twice what the guest's window takes, and the end of stream behind it.
+        peer.write_all(&[b'x'; 2 * GUEST_WINDOW as usize])
+            .expect("the host writes");
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("the host hangs up");
+        let patience = std::time::Instant::now() + Duration::from_secs(5);
+        let handle = engine.flows[0].handle;
+        while engine.sockets.get::<tcp_socket::Socket>(handle).state()
+            != tcp_socket::State::FinWait1
+        {
+            assert!(
+                std::time::Instant::now() < patience,
+                "the host's end of stream never reached the guest socket"
+            );
+            engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
+            engine.service();
+            engine
+                .iface
+                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        }
+        assert!(
+            engine
+                .sockets
+                .get::<tcp_socket::Socket>(handle)
+                .send_queue()
+                > 0,
+            "the guest has the host's tail to take",
+        );
+
+        // A pass that moves nothing finds the flow stalled.
+        engine.flows[0].events = PollFlags::empty();
+        engine.service();
+        let now = std::time::Instant::now();
+        let flow = &engine.flows[0];
+        assert!(
+            flow.deadline_in(engine.sockets.get(flow.handle), now)
+                .is_some_and(|left| left > Duration::ZERO),
+            "the flow is stalled, under the drain deadline",
+        );
+
+        engine.reap(now + tcp::DRAIN_DEADLINE);
+        assert!(engine.flows.is_empty(), "the deadline reclaimed the flow");
+        let sent = sent_to_guest(&guest);
+        assert!(
+            sent.iter().any(|segment| segment.rst),
+            "the guest was never told the connection is gone: {sent:?}",
+        );
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is settable");
+        let mut rest = Vec::new();
+        let ended = peer.read_to_end(&mut rest);
+        assert!(
+            matches!(&ended, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+            "the host peer saw {ended:?} where its stream was cut off",
+        );
+    }
+
+    /// A host that never reads the bytes a reset guest left queued for it is
+    /// reclaimed at the drain deadline. The guest is gone, so nothing answers
+    /// probes on its side, but the host side answers its own keep-alive.
+    #[test]
+    fn a_host_that_never_reads_behind_a_finished_guest_is_reclaimed() {
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, NetStack::default().plan, Vec::new());
+        let mut published = Published::open(&mut engine, &guest);
+
+        published.upload(&mut engine);
+        // The stall begins no earlier than the reset, which bounds the
+        // deadline from below whatever the scheduler does between here and
+        // the checks.
+        let before = std::time::Instant::now();
+        published.guest_sends(&mut engine, TcpControl::Rst, &[]);
+        let socket = published.socket(&engine);
+        assert_eq!(socket.state(), tcp_socket::State::Closed);
+        assert!(socket.recv_queue() > 0, "the guest's tail is still queued");
+
+        let now = std::time::Instant::now();
+        let flow = &engine.flows[0];
+        assert!(
+            flow.deadline_in(engine.sockets.get(flow.handle), now)
+                .is_some(),
+            "the flow is stalled, under the drain deadline",
+        );
+        engine.reap(before + tcp::DRAIN_DEADLINE - Duration::from_millis(1));
+        assert_eq!(engine.flows.len(), 1, "the flow was reclaimed early");
+        engine.reap(now + tcp::DRAIN_DEADLINE);
+        assert!(engine.flows.is_empty(), "the deadline reclaimed the flow");
     }
 
     /// What the host peer of a guest's upload reads: the bytes, then how the
