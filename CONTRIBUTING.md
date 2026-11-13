@@ -488,7 +488,7 @@ report name a package and its version bare.
 | Which id does a root's `/etc/passwd` or `/etc/group` give a name? | `provision::accounts::ids` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag`, `atom::use_flag` |
-| What can a package's name and version contain, as an index or a plan states them? | `provision::debian::index::is_package_name` and `debian::version::is_version`, `alpine::index::is_package_name` and `alpine::version::parse`, `gentoo::atom::is_package` and `gentoo::version::parse` |
+| What can a package's name and version contain, as an index, a plan, or a root's package database states them? | `provision::debian::index::is_package_name` and `debian::version::is_version`, `alpine::index::is_package_name` and `alpine::version::parse`, `gentoo::atom::is_package` and `gentoo::version::parse`, which `gentoo::installed` holds a database entry's `category/name` and version to |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | Which architecture is a build for, and which of a builder's settings does a plan already decide? | `provision::settings::settle_architecture`, `settings::check_source_date_epoch`, `settings::plan_with_selection`, `settings::plan_architecture`, and `settings::named_twice` for a plan naming one package twice |
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
