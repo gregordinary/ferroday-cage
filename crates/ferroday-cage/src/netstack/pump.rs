@@ -1450,6 +1450,21 @@ mod tests {
         engine.service();
     }
 
+    /// Receives one datagram, retrying a read a signal interrupted: the test
+    /// binary's other tests deliver signals to this process, and a read with a
+    /// timeout is not restarted after a handler runs.
+    fn recv_retrying(
+        socket: &UdpSocket,
+        buffer: &mut [u8],
+    ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+        loop {
+            match socket.recv_from(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     fn a_datagram_from_another_source_opens_no_flow_whatever_carries_it() {
         let Ok(socket) = UdpSocket::bind((StdIpv6Addr::LOCALHOST, 0)) else {
@@ -1471,9 +1486,7 @@ mod tests {
         assert!(engine.consider(classify(&own)));
         deliver(&mut engine, &own);
         let mut buffer = [0u8; 64];
-        let (len, _) = socket
-            .recv_from(&mut buffer)
-            .expect("the guest's datagram arrives");
+        let (len, _) = recv_retrying(&socket, &mut buffer).expect("the guest's datagram arrives");
         assert_eq!(&buffer[..len], b"from the guest");
 
         // A stranger's behind a hop-by-hop header is withheld as one without
@@ -1491,7 +1504,7 @@ mod tests {
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .expect("the timeout is settable");
-        match socket.recv_from(&mut buffer) {
+        match recv_retrying(&socket, &mut buffer) {
             Ok((len, _)) => panic!(
                 "a stranger's datagram was carried to the host: {:?}",
                 String::from_utf8_lossy(&buffer[..len]),
