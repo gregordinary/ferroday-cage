@@ -547,6 +547,13 @@ consumer upgrading can skip it.
   FIN that answers the host's, and the host had not taken them within ten
   seconds, the network stack discarded them as the guest's socket left
   TIME_WAIT, and then reset the host.
+- `relay::restore_terminal`, and the hook `relay::install_panic_restore`
+  installs, restore the caller's terminal during a panic only where the panic
+  ends the session or the process: on the thread the session runs on, on the
+  main thread, or in a build that aborts on panic. A panic on any other thread,
+  the network stack pump's among them, which the library catches, restored the
+  terminal under a session that went on, so `fcage --terminal --netstack`
+  carried on in cooked mode with the caller's `^C` ending the command.
 - The network stack reclaims a TCP flow, with a reset to each peer, once one
   peer has finished sending and the other has taken nothing of what it sent
   for 100 seconds, whichever peer finished. A guest that never read the tail of

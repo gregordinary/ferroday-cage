@@ -12,6 +12,7 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
+use rustix::process::Pid;
 use rustix::termios::{self, OptionalActions, Termios};
 
 use super::RelayError;
@@ -31,6 +32,9 @@ struct Saved {
     /// The guard that recorded it, so a guard retires its own record and no
     /// other.
     session: u64,
+    /// The thread that entered raw mode, which is the thread the session runs
+    /// on: a panic there ends the session.
+    thread: Pid,
 }
 
 /// The raw session in force, for [`restore_terminal`]: `None` whenever no
@@ -76,6 +80,24 @@ fn session() -> MutexGuard<'static, Option<Saved>> {
 /// session that no longer exists, and discarding them beats letting half an
 /// escape sequence land at the caller's prompt.
 ///
+/// # Which panics it restores for
+///
+/// Called while the calling thread panics, from a panic hook or from a drop
+/// the panic is unwinding through, it restores only for a panic that ends the
+/// session or the process: one on the thread the session runs on, one on the
+/// process's main thread, or any panic in a build that aborts on panic. A panic
+/// on another thread of a build that unwinds ends that thread alone, and the
+/// session goes on in raw mode, which restoring would take from it: the session
+/// would carry on with the caller's line discipline in force, and a typed `^C`
+/// would reach the relay as a signal, which terminates the sandbox, rather than
+/// reach the sandbox's own line discipline as a byte. The
+/// network stack's pump is such a thread, and the library catches its panic
+/// and goes on serving. A panic on the main thread that the caller catches is
+/// the one case restored for that ends nothing.
+///
+/// Called outside a panic, from an exit path that ends the process, it restores
+/// from any thread.
+///
 /// # What it reaches
 ///
 /// The terminal of the session that holds one in raw mode now, with the
@@ -108,6 +130,9 @@ pub fn restore_terminal() {
     let Some(saved) = record.as_ref() else {
         return;
     };
+    if std::thread::panicking() && !panic_ends(saved.thread) {
+        return;
+    }
     if !in_foreground(saved.fd.as_fd()) {
         return;
     }
@@ -115,8 +140,30 @@ pub fn restore_terminal() {
     *record = None;
 }
 
+/// Whether a panic on the calling thread ends the session that `session`, the
+/// thread that entered raw mode, runs, or the process; see [`restore_terminal`].
+///
+/// Thread and process ids are read by system call, which a panic hook can make
+/// on any thread, whatever state its thread-local storage is in.
+fn panic_ends(session: Pid) -> bool {
+    ends_the_session(
+        cfg!(panic = "abort"),
+        rustix::thread::gettid(),
+        session,
+        rustix::process::getpid(),
+    )
+}
+
+/// The rule [`panic_ends`] applies, over its facts: whether the build aborts on
+/// panic, the panicking thread, the session's thread, and the main thread,
+/// whose id is the process's.
+fn ends_the_session(aborts: bool, panicking: Pid, session: Pid, main: Pid) -> bool {
+    aborts || panicking == session || panicking == main
+}
+
 /// Installs a panic hook that calls [`restore_terminal`] before the hook it
-/// replaces prints, once per process.
+/// replaces prints, once per process. It restores for the panics that end the
+/// session or the process, as `restore_terminal` states.
 ///
 /// Explicit and optional, because installing a hook is process-global and the
 /// library does nothing process-global a caller did not ask for. A program with
@@ -255,6 +302,7 @@ impl<'fd> RawMode<'fd> {
             fd: duplicate,
             original,
             session: self.session,
+            thread: rustix::thread::gettid(),
         });
         if let Err(errno) = termios::tcsetattr(self.fd, OptionalActions::Now, &raw) {
             self.retire();
@@ -761,5 +809,117 @@ mod tests {
             in_the_foreground.local_modes, original.local_modes,
             "the hook did not restore the session's terminal in the foreground",
         );
+    }
+
+    #[test]
+    fn a_panic_ends_the_session_on_its_thread_on_the_main_thread_or_where_panics_abort() {
+        let [main, session, other] =
+            [1, 2, 3].map(|id| Pid::from_raw(id).expect("a positive id is a pid"));
+        assert!(ends_the_session(false, session, session, main));
+        assert!(ends_the_session(false, main, session, main));
+        assert!(
+            !ends_the_session(false, other, session, main),
+            "a panic that ends only its own thread ended the session",
+        );
+        assert!(ends_the_session(true, other, session, main));
+    }
+
+    /// Names the role this test binary plays when it runs itself as the child
+    /// process of [`the_panic_hook_leaves_a_session_a_panic_elsewhere_does_not_end`].
+    const PANIC_HELPER: &str = "FERRODAY_CAGE_TEST_PANIC_BESIDE_A_SESSION";
+
+    /// A panic caught on a thread other than the session's, as the network
+    /// stack's pump has its own caught, leaves the session in raw mode under
+    /// the installed hook, and one on the session's own thread restores it.
+    ///
+    /// The hook is process-global and stays installed, so this runs this test
+    /// binary as a child process of its own, where installing it reaches no
+    /// other test; see [`helper_panics_beside_a_session`].
+    #[test]
+    fn the_panic_hook_leaves_a_session_a_panic_elsewhere_does_not_end() {
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let mut command = std::process::Command::new(exe);
+        command
+            .args([
+                "--exact",
+                "relay::raw::tests::helper_panics_beside_a_session",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PANIC_HELPER, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output =
+            ferroday_cage_testkit::process::run_bounded(&mut command, Duration::from_secs(60));
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the helper failed; it printed:\n{printed}"
+        );
+        assert!(
+            printed.contains("1 passed"),
+            "the helper ran no test; it printed:\n{printed}",
+        );
+    }
+
+    /// Not a test of its own: when [`PANIC_HELPER`] is set, this installs the
+    /// panic hook, runs a session on a thread of its own, and panics beside it
+    /// and then on it. Without the variable it does nothing.
+    #[test]
+    fn helper_panics_beside_a_session() {
+        if std::env::var_os(PANIC_HELPER).is_none() {
+            return;
+        }
+        install_panic_restore();
+        let (primary, replica) = pair();
+        let raw = |primary: &OwnedFd| {
+            !settings(primary)
+                .local_modes
+                .intersects(LocalModes::ICANON | LocalModes::ECHO)
+        };
+        let (entered, on_entry) = std::sync::mpsc::channel::<()>();
+        let (go, on_go) = std::sync::mpsc::channel::<()>();
+        let (panicked, on_panic) = std::sync::mpsc::channel::<()>();
+        let patience = Duration::from_secs(30);
+
+        std::thread::scope(|scope| {
+            let session = scope.spawn(move || {
+                let guard = RawMode::enter(replica.as_fd()).expect("raw mode is enterable");
+                entered.send(()).expect("the helper waits for the session");
+                on_go
+                    .recv_timeout(patience)
+                    .expect("the helper lets the session go on");
+                let caught = std::panic::catch_unwind(|| panic!("a panic that ends the session"));
+                assert!(caught.is_err());
+                panicked.send(()).expect("the helper waits for the panic");
+                drop(guard);
+            });
+            on_entry
+                .recv_timeout(patience)
+                .expect("the session enters raw mode");
+            assert!(raw(&primary), "the session is not in raw mode");
+
+            let elsewhere = scope.spawn(|| {
+                std::panic::catch_unwind(|| panic!("a panic its own thread catches")).is_err()
+            });
+            assert!(elsewhere.join().expect("the panic was caught"));
+            assert!(
+                raw(&primary),
+                "a panic on another thread restored the session's terminal under it",
+            );
+
+            go.send(()).expect("the session waits");
+            on_panic.recv_timeout(patience).expect("the session panics");
+            assert!(
+                !raw(&primary),
+                "a panic on the session's own thread left its terminal raw",
+            );
+            session.join().expect("the session ends");
+        });
     }
 }

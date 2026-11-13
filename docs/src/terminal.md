@@ -505,6 +505,14 @@ overwrites whatever the shell has set since. It also does nothing while the
 process is in the background. The job in the foreground holds the terminal
 then, and the session's own guard restores it as the session ends.
 
+Called during a panic, from the hook or from a drop the panic unwinds through,
+it restores only for a panic that ends the session or the process: one on the
+thread the session runs on, one on the main thread, or any panic in a build that
+aborts on panic. A panic on another thread of a build that unwinds ends that
+thread alone, and the session goes on in raw mode. The network stack's pump is
+such a thread: the library catches its panic, and a `--terminal --netstack`
+session keeps its raw mode through it.
+
 ### What the sandbox's output reaches
 
 The relay copies the sandbox's output to the caller's terminal byte for byte, so
