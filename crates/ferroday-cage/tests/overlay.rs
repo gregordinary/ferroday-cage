@@ -240,7 +240,7 @@ fn a_work_directory_on_another_filesystem_is_refused_by_name() {
         std::fs::metadata(&dir).map(|meta| std::os::unix::fs::MetadataExt::dev(&meta)),
         std::fs::metadata(elsewhere).map(|meta| std::os::unix::fs::MetadataExt::dev(&meta)),
     ) else {
-        common::require::premise_unmet("no second filesystem to place the work directory on");
+        common::require::FILESYSTEM.skip("no second filesystem to place the work directory on");
         return;
     };
     if here == there {

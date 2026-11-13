@@ -1811,9 +1811,8 @@ mod tests {
             ferroday_cage_testkit::xattr::ACCESS_ACL,
             &list,
         ) {
-            ferroday_cage_testkit::require::premise_unmet(
-                "this filesystem holds no POSIX access control lists",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
             return;
         }
         assert_eq!(mode_of(&secret), 0o660, "the source's mode shows the mask");
@@ -2154,9 +2153,8 @@ mod list_tests {
         // own entry is `---`.
         let root = Scratch::for_test("extract", "access-lists");
         if !xattr::holds_acls(&root) {
-            ferroday_cage_testkit::require::premise_unmet(
-                "this filesystem holds no POSIX access control lists",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
             return;
         }
         let caller = rustix::process::geteuid().as_raw();
@@ -2667,9 +2665,8 @@ mod layered_tests {
         // set, so it carries none of its own.
         fs::create_dir_all(base.join("var/log/journal")).unwrap();
         if !xattr::set(&mail, xattr::ACCESS_ACL, &acl(4242)) {
-            ferroday_cage_testkit::require::premise_unmet(
-                "this filesystem holds no POSIX access control lists",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
             return;
         }
         assert!(xattr::set(&mail, xattr::DEFAULT_ACL, &acl(4243)));
@@ -2750,9 +2747,8 @@ mod layered_tests {
             (0x20, 5, NO_ID),
         ]);
         if !xattr::set(&shared, xattr::ACCESS_ACL, &list) {
-            ferroday_cage_testkit::require::premise_unmet(
-                "this filesystem holds no POSIX access control lists",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
             return;
         }
         let upper = scratch.join("upper");

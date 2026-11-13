@@ -219,7 +219,7 @@ fn a_memory_limit_ends_the_tree_and_is_reported_as_an_oom_kill() {
             reason: CgroupRefusal::LimitUnsupported { file, .. },
             ..
         }) => {
-            common::require::premise_unmet(format!("this kernel offers no {file}"));
+            common::require::CGROUP.skip(format!("this kernel offers no {file}"));
             return;
         }
         other => other.expect("the sandbox runs"),

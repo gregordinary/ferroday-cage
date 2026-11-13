@@ -1630,9 +1630,8 @@ mod tests {
     fn an_attribute_block_lands_on_the_entry_the_copy_created() {
         let dir = Scratch::new("copyin-attributes");
         if !ferroday_cage_testkit::xattr::holds_user_attributes(dir.path()) {
-            ferroday_cage_testkit::require::premise_unmet(
-                "this filesystem holds no user extended attributes",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no user extended attributes");
             return;
         }
         std::fs::create_dir(dir.join("kept")).unwrap();

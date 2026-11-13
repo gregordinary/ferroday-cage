@@ -561,9 +561,8 @@ mod tests {
             &[(1 << 30, b"middle"), (SIZE - 4, b"tail")],
         );
         if !reports_holes(&source) {
-            ferroday_cage_testkit::require::premise_unmet(
-                "this filesystem reports no holes in a sparse file",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem reports no holes in a sparse file");
             return;
         }
 

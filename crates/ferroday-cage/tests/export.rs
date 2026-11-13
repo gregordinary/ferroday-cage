@@ -1706,7 +1706,7 @@ fn a_copy_creates_a_named_pipe() {
     std::fs::create_dir_all(&source).unwrap();
     let fifo = source.join("initctl");
     if !make_fifo(&fifo) {
-        common::require::premise_unmet("this filesystem will not hold a named pipe");
+        common::require::FILESYSTEM.skip("this filesystem will not hold a named pipe");
         return;
     }
     // A mode the copy does not create the pipe at, so it is the one the copy
@@ -1754,11 +1754,11 @@ fn a_copy_carries_user_attributes_and_access_control_lists() {
         (0x20, 0, xattr::NO_ID),
     ]);
     if !xattr::set(&notes, xattr::ACCESS_ACL, &access) {
-        common::require::premise_unmet("this filesystem holds no POSIX access control lists");
+        common::require::FILESYSTEM.skip("this filesystem holds no POSIX access control lists");
         return;
     }
     if !xattr::set(&notes, "user.comment", b"kept") {
-        common::require::premise_unmet("this filesystem holds no user extended attributes");
+        common::require::FILESYSTEM.skip("this filesystem holds no user extended attributes");
         return;
     }
     let default = xattr::acl(&[
@@ -1831,7 +1831,7 @@ fn a_copy_names_a_list_it_cannot_carry_and_narrows_the_entry_instead() {
         (0x20, 0, xattr::NO_ID),
     ]);
     if !xattr::set(&secret, xattr::ACCESS_ACL, &access) {
-        common::require::premise_unmet("this filesystem holds no POSIX access control lists");
+        common::require::FILESYSTEM.skip("this filesystem holds no POSIX access control lists");
         return;
     }
     assert_eq!(
@@ -1900,7 +1900,7 @@ fn an_exported_access_control_list_is_applied_where_the_archive_is_extracted() {
         (0x20, 0, xattr::NO_ID),
     ]);
     if !xattr::set(&shared, xattr::ACCESS_ACL, &list) {
-        common::require::premise_unmet("this filesystem holds no POSIX access control lists");
+        common::require::FILESYSTEM.skip("this filesystem holds no POSIX access control lists");
         return;
     }
 
@@ -1938,7 +1938,7 @@ fn an_attribute_name_holding_an_equals_sign_is_spelled_as_gnu_tar_spells_it() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("file"), b"x").unwrap();
     if !xattr::set(&root.join("file"), "user.a=b%c", b"the value") {
-        common::require::premise_unmet("this filesystem holds no user extended attributes");
+        common::require::FILESYSTEM.skip("this filesystem holds no user extended attributes");
         return;
     }
     let mut out = Vec::new();

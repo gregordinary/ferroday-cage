@@ -64,8 +64,15 @@ pub const SECCOMP: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_SECCO
 
 /// A delegated cgroup v2 directory the run has to itself and can divide, as a
 /// scope from `systemd-run --user --scope -p Delegate=yes` is, which the
-/// cgroup suite places its sandboxes' cgroups beneath.
+/// cgroup suite places its sandboxes' cgroups beneath, and the limit files the
+/// suite sets: a kernel with swap accounting off has no `memory.swap.max`.
 pub const CGROUP: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_CGROUP");
+
+/// What the filesystem a test's scratch directory is on holds, for the tests
+/// that copy, extract and export a tree: named pipes, POSIX access control
+/// lists, `user.` attributes, and a sparse file's holes; and a second
+/// filesystem, at `/dev/shm`, for a work directory placed apart from its upper.
+pub const FILESYSTEM: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_FILESYSTEM");
 
 /// The network suites, which run only when their own variable opts in; see
 /// [`network_suite`].
@@ -138,14 +145,23 @@ impl Requirement {
     }
 }
 
-/// Reports a skip that no variable governs: the test's premise is a state of
-/// the host or of the caller rather than a facility, and a capable runner meets
-/// some of them in neither state.
+/// Reports a skip that no variable governs: the test's premise is not a
+/// facility a host is asked to provide.
 ///
-/// A test of what happens *without* a delegate, or without Landlock, cannot run
-/// on the runner that has them, and one that needs a caller other than root, or
-/// a caller with a controlling terminal, depends on how the run was started.
-/// None of those is a host that failed to provide something.
+/// - A test of what happens *without* a facility, a delegate or Landlock,
+///   cannot run on the runner that has it.
+/// - One that needs a caller other than root, a controlling terminal, a limit
+///   not already raised, a host with a `resolv.conf`, a scratch directory off
+///   `/dev/shm`'s filesystem, or a host that is not a container masking its
+///   procfs depends on how the run was started.
+/// - One whose subject a kernel can be built without has nothing to test on
+///   such a kernel: the 32-bit x86 entry points a network filter closes and an
+///   i386 root runs through, or a refusal a filter test needs the kernel not
+///   to make itself.
+/// - One whose facility is newer than the kernels CI runs on has no variable
+///   until they carry it: Landlock's unix-socket right, from ABI 9.
+///
+/// None of those is a host that failed to provide what a run asked of it.
 #[track_caller]
 pub fn premise_unmet(reason: impl Display) {
     report_skip("premise", &reason);

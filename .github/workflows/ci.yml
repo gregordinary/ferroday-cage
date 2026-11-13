@@ -106,6 +106,9 @@ jobs:
           FERRODAY_CAGE_REQUIRE_OVERLAY: '1'
           FERRODAY_CAGE_REQUIRE_LANDLOCK: '1'
           FERRODAY_CAGE_REQUIRE_SECCOMP: '1'
+          # The runner's filesystem holds named pipes, access control lists,
+          # user attributes and holes, and /dev/shm is a tmpfs of its own.
+          FERRODAY_CAGE_REQUIRE_FILESYSTEM: '1'
           # The scope tests need Landlock ABI 6 (Linux 6.12). The hosted image
           # behind `ubuntu-latest` runs a 6.17 kernel on Ubuntu 24.04 and 7.0 on
           # 26.04, which the label is moving to, so a skip here is a regression
@@ -139,10 +142,10 @@ jobs:
           FERRODAY_CAGE_REQUIRE_USERNS: '1'
           FERRODAY_CAGE_REQUIRE_CGROUP: '1'
       - name: Skipped tests
-        # The REQUIRE variables leave the skips whose premise is how the run
-        # was started, and the network suites nothing opted into. A skip still
-        # counts as a pass, so the steps above log each one, and this lists
-        # them by the variable that governs it, or `premise`.
+        # The REQUIRE variables leave the skips no variable governs, which
+        # CONTRIBUTING.md lists, and the network suites nothing opted into. A
+        # skip still counts as a pass, so the steps above log each one, and
+        # this lists them by the variable that governs it, or `premise`.
         if: always()
         run: |
           log="$RUNNER_TEMP/skips.log"

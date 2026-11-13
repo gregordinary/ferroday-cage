@@ -10194,9 +10194,8 @@ read-only = true
         let other = Path::new("/dev/shm");
         let device = |path: &Path| rustix::fs::stat(path).map(|stat| stat.st_dev);
         let (Ok(here), Ok(there)) = (device(&scratch), device(other)) else {
-            ferroday_cage_testkit::require::premise_unmet(
-                "no second filesystem to place the work directory on",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("no second filesystem to place the work directory on");
             return;
         };
         if here == there {

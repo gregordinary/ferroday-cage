@@ -67,16 +67,27 @@ CI asserts the security-property suites actually ran:
 | `FERRODAY_CAGE_REQUIRE_LANDLOCK` | The kernel offers no Landlock LSM, or one that predates network rules (ABI 4, Linux 6.7) |
 | `FERRODAY_CAGE_REQUIRE_LANDLOCK_SCOPE` | The kernel's Landlock ABI predates scopes (ABI 6, Linux 6.12) |
 | `FERRODAY_CAGE_REQUIRE_SECCOMP` | The kernel offers no seccomp |
-| `FERRODAY_CAGE_REQUIRE_CGROUP` | The cgroup suite runs outside a delegated cgroup v2 directory of its own that can hold its sandboxes' cgroups |
+| `FERRODAY_CAGE_REQUIRE_CGROUP` | The cgroup suite runs outside a delegated cgroup v2 directory of its own that can hold its sandboxes' cgroups, or the kernel lacks a limit file the suite sets, as `memory.swap.max` is absent with swap accounting off |
+| `FERRODAY_CAGE_REQUIRE_FILESYSTEM` | The scratch directory's filesystem holds no named pipe, POSIX access control list, `user.` attribute or hole in a sparse file, or no second filesystem is mounted at `/dev/shm` |
 | `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` | A network suite was not opted into |
 
 A variable governs every test that needs its facility, including the host tools
 such a test drives. A Landlock test that finds no `nc` fails under
 `FERRODAY_CAGE_REQUIRE_LANDLOCK` too. A few skips have no variable, because
-their premise is how the run was started rather than what the host provides. A
-test of what happens without a delegate cannot run where one exists. One that
-needs a caller other than root, or one with a controlling terminal, depends on
-how it was started.
+their premise is not a facility a host is asked to provide:
+
+- A test of what happens without a delegate, or without Landlock, cannot run
+  where one exists.
+- One that needs a caller other than root, a controlling terminal, a limit not
+  already raised, or a scratch directory off `/dev/shm`'s filesystem depends on
+  how the run was started, and so does one that needs a host with a
+  `resolv.conf`, or one that is not a container masking its procfs.
+- One whose subject a kernel can be built without has nothing to test there.
+  A kernel without IA32 emulation has no 32-bit x86 entry point for the network
+  filter to close, and runs no i386 root. One without vsock or io_uring refuses
+  them itself, so the filter's refusal cannot be told from the kernel's.
+- Landlock's unix-socket right, from ABI 9, is newer than the kernels CI runs
+  on, and its test has no variable until they carry it.
 
 Every skip goes through the testkit's `require` module, which is what keeps a
 variable honored at every site. A new test that skips calls it rather than

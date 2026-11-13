@@ -1855,9 +1855,8 @@ mod tests {
         drop(file);
         let held = std::fs::metadata(source.join("big")).unwrap();
         if held.blocks() * 512 >= 1 << 30 {
-            ferroday_cage_testkit::require::premise_unmet(
-                "this filesystem keeps no holes in a sparse file",
-            );
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem keeps no holes in a sparse file");
             return;
         }
 
