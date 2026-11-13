@@ -1216,9 +1216,21 @@ mod tests {
         ack: Option<u32>,
         payload: &[u8],
     ) -> Vec<u8> {
+        tcp_v4((src, GUEST_PORT), (dst, port), control, seq, ack, payload)
+    }
+
+    /// A TCP segment from `src` to `dst`, address and port, in an IPv4 frame.
+    fn tcp_v4(
+        (src, src_port): (Ipv4Addr, u16),
+        (dst, dst_port): (Ipv4Addr, u16),
+        control: TcpControl,
+        seq: u32,
+        ack: Option<u32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let repr = TcpRepr {
-            src_port: GUEST_PORT,
-            dst_port: port,
+            src_port,
+            dst_port,
             control,
             seq_number: TcpSeqNumber(i32::from_ne_bytes(seq.to_ne_bytes())),
             ack_number: ack.map(|ack| TcpSeqNumber(i32::from_ne_bytes(ack.to_ne_bytes()))),
@@ -1736,6 +1748,7 @@ mod tests {
     struct Sent {
         syn: bool,
         rst: bool,
+        fin: bool,
         seq: u32,
         payload: usize,
     }
@@ -1770,6 +1783,7 @@ mod tests {
             sent.push(Sent {
                 syn: tcp.syn(),
                 rst: tcp.rst(),
+                fin: tcp.fin(),
                 seq: u32::from_ne_bytes(tcp.seq_number().0.to_ne_bytes()),
                 payload: tcp.payload().len(),
             });
@@ -1808,8 +1822,10 @@ mod tests {
     /// The guest's handshake completes against the stack's own listener at
     /// once, while the host connect runs in parallel. Nothing reports that
     /// connect's conclusion to the flow until the test does, so the flow is
-    /// left established on the guest's side alone.
-    fn guest_connects(engine: &mut Engine, guest: &OwnedFd, port: u16) {
+    /// left established on the guest's side alone. Returns the sequence number
+    /// the stack's next byte to the guest carries, which the guest's own
+    /// segments acknowledge.
+    fn guest_connects(engine: &mut Engine, guest: &OwnedFd, port: u16) -> u32 {
         guest_sends(engine, &resolve_gateway());
         guest_sends(engine, &syn_v4(GUEST, GATEWAY, port));
         let sent = sent_to_guest(guest);
@@ -1838,6 +1854,7 @@ mod tests {
             tcp_socket::State::Established,
             "the guest's side of the connection is established",
         );
+        next
     }
 
     /// A flow the establish deadline aborts resets the guest, whose side of the
@@ -1943,5 +1960,255 @@ mod tests {
             sent.iter().any(|segment| segment.rst),
             "the guest was never told the connection is gone: {sent:?}",
         );
+    }
+
+    /// What the host peer of a guest's upload reads: the bytes, then how the
+    /// stream ended, `Ok` for an end of stream and the error otherwise.
+    ///
+    /// The guest connects, sends `UPLOAD`, and ends the connection with
+    /// `ending`, a FIN or a reset, sequenced after the upload. The flow is
+    /// then reaped, as the pump's pass ends, and dropped if it is over.
+    fn upload_ending_in(ending: TcpControl) -> (Vec<u8>, std::io::Result<()>) {
+        use std::io::Read as _;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, mapping(port), Vec::new());
+        let next = guest_connects(&mut engine, &guest, port);
+        let (mut peer, _) = listener.accept().expect("the stack's connect arrives");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the timeout is settable");
+        engine.flows[0].events = PollFlags::OUT;
+        engine.service();
+
+        let after = GUEST_ISN + 1 + u32::try_from(UPLOAD.len()).expect("a short upload");
+        guest_sends(
+            &mut engine,
+            &segment_v4(
+                GUEST,
+                GATEWAY,
+                port,
+                TcpControl::Psh,
+                GUEST_ISN + 1,
+                Some(next),
+                UPLOAD,
+            ),
+        );
+        let ack = (ending != TcpControl::Rst).then_some(next);
+        guest_sends(
+            &mut engine,
+            &segment_v4(GUEST, GATEWAY, port, ending, after, ack, &[]),
+        );
+        engine.reap(std::time::Instant::now());
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 256];
+        let ended = loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(read) => received.extend_from_slice(&buf[..read]),
+                Err(error) => break Err(error),
+            }
+        };
+        (received, ended)
+    }
+
+    /// What [`upload_ending_in`]'s guest sends ahead of its ending.
+    const UPLOAD: &[u8] = b"the first part of an upload";
+
+    /// A reset from the guest reaches the host peer as a reset, after the bytes
+    /// the guest sent ahead of it. An end of stream in its place would pass the
+    /// truncated stream off as complete: a server reading an upload to its end
+    /// takes what arrived as the whole of it.
+    #[test]
+    fn a_reset_from_the_guest_resets_the_host_peer() {
+        let (received, ended) = upload_ending_in(TcpControl::Rst);
+        assert_eq!(received, UPLOAD, "the bytes ahead of the reset arrived");
+        assert!(
+            matches!(&ended, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+            "the host peer saw {ended:?} where the guest reset the connection",
+        );
+    }
+
+    /// The guest's FIN reaches the host peer as an end of stream, after the
+    /// bytes ahead of it: the orderly close a reset is told apart from.
+    #[test]
+    fn a_fin_from_the_guest_ends_the_host_peers_stream() {
+        let (received, ended) = upload_ending_in(TcpControl::Fin);
+        assert_eq!(received, UPLOAD, "the bytes ahead of the FIN arrived");
+        assert!(
+            ended.is_ok(),
+            "the host peer saw {ended:?} where the guest finished its stream",
+        );
+    }
+
+    /// Bytes the guest sent that the host side has yet to take outlast the
+    /// guest socket's close: the flow forwards them, then passes the guest's
+    /// end of stream on.
+    ///
+    /// An orderly exchange reaches that close while a slow host still has
+    /// bytes to take. The guest finishes, the host finishes without reading,
+    /// and the guest acknowledges the stack's FIN, which closes the socket
+    /// with the guest's tail still queued in it.
+    #[test]
+    fn bytes_queued_for_the_host_outlast_the_guests_close() {
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, NetStack::default().plan, Vec::new());
+        guest_sends(&mut engine, &resolve_gateway());
+
+        // A published connection whose host side takes a few kilobytes and
+        // then nothing more until its peer reads.
+        let (host_side, peer) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("a socket pair stands in for the host side");
+        rustix::net::sockopt::set_socket_send_buffer_size(&host_side, 4096)
+            .expect("the buffer is sizable");
+        let (guest_at, stack_at) = ((GUEST, 8000), (GATEWAY, 50_000));
+        let guest_end = IpEndpoint::new(GUEST.into(), guest_at.1);
+        let stack_end = IpEndpoint::new(GATEWAY.into(), stack_at.1);
+        let mut socket = tcp_socket::Socket::new(
+            tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
+            tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
+        );
+        socket
+            .connect(engine.iface.context(), guest_end, stack_end)
+            .expect("the stack connects to the guest");
+        let handle = engine.sockets.add(socket);
+        engine.flows.push(TcpFlow::accepted(
+            handle,
+            guest_end,
+            stack_end,
+            host_side,
+            std::time::Instant::now(),
+        ));
+        engine
+            .iface
+            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        let sent = sent_to_guest(&guest);
+        let syn = sent
+            .iter()
+            .find(|segment| segment.syn)
+            .unwrap_or_else(|| panic!("the stack never connected to the guest: {sent:?}"));
+        let stack_next = syn.seq.wrapping_add(1);
+
+        // The guest accepts, uploads more than the host side takes, and
+        // finishes.
+        let mut seq = 1000;
+        guest_sends(
+            &mut engine,
+            &tcp_v4(
+                guest_at,
+                stack_at,
+                TcpControl::Syn,
+                seq,
+                Some(stack_next),
+                &[],
+            ),
+        );
+        seq += 1;
+        let mut uploaded = Vec::new();
+        for fill in b'a'..b'q' {
+            let chunk = [fill; 1024];
+            guest_sends(
+                &mut engine,
+                &tcp_v4(
+                    guest_at,
+                    stack_at,
+                    TcpControl::Psh,
+                    seq,
+                    Some(stack_next),
+                    &chunk,
+                ),
+            );
+            seq += 1024;
+            uploaded.extend_from_slice(&chunk);
+        }
+        assert!(
+            engine
+                .sockets
+                .get::<tcp_socket::Socket>(handle)
+                .recv_queue()
+                > 0,
+            "the host side stopped taking the upload",
+        );
+        guest_sends(
+            &mut engine,
+            &tcp_v4(
+                guest_at,
+                stack_at,
+                TcpControl::Fin,
+                seq,
+                Some(stack_next),
+                &[],
+            ),
+        );
+        seq += 1;
+
+        // The host side finishes without reading, the stack passes its FIN on,
+        // and the guest acknowledges it, which closes the guest's socket.
+        rustix::net::shutdown(&peer, rustix::net::Shutdown::Write).expect("the peer finishes");
+        engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
+        engine.service();
+        engine
+            .iface
+            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        let sent = sent_to_guest(&guest);
+        let fin = sent
+            .iter()
+            .find(|segment| segment.fin)
+            .unwrap_or_else(|| panic!("the stack never finished its side: {sent:?}"));
+        guest_sends(
+            &mut engine,
+            &tcp_v4(
+                guest_at,
+                stack_at,
+                TcpControl::None,
+                seq,
+                Some(fin.seq.wrapping_add(1)),
+                &[],
+            ),
+        );
+        let socket = engine.sockets.get::<tcp_socket::Socket>(handle);
+        assert_eq!(socket.state(), tcp_socket::State::Closed);
+        assert!(socket.recv_queue() > 0, "the guest's tail is still queued");
+        engine.reap(std::time::Instant::now());
+
+        // The host side reads: the whole upload, then the guest's end of
+        // stream.
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        let patience = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < patience,
+                "the upload never finished arriving: {} of {} bytes",
+                received.len(),
+                uploaded.len(),
+            );
+            match rustix::io::read(&peer, &mut buf) {
+                Ok(0) => break,
+                Ok(read) => received.extend_from_slice(&buf[..read]),
+                Err(Errno::AGAIN) => {
+                    if let Some(flow) = engine.flows.first_mut() {
+                        flow.events = PollFlags::OUT;
+                    }
+                    engine.service();
+                    engine.reap(std::time::Instant::now());
+                }
+                Err(errno) => panic!("the host side failed: {errno}"),
+            }
+        }
+        assert!(
+            received == uploaded,
+            "{} of {} bytes arrived",
+            received.len(),
+            uploaded.len()
+        );
+        assert!(engine.flows.is_empty(), "the finished flow was reclaimed");
     }
 }

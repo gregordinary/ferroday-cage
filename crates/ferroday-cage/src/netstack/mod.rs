@@ -701,7 +701,7 @@ impl NetStackBuilder {
     /// same family, arriving from the gateway address. That is how a server
     /// inside the sandbox, a development web server say, is reached from the
     /// host. A connection the guest refuses, because nothing listens on the
-    /// port, is closed on the host side.
+    /// port, is reset on the host side.
     ///
     /// At most 128 published connections are carried at once, a budget apart
     /// from the guest's own connections, so neither kind can crowd out the

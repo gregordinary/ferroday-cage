@@ -128,6 +128,13 @@ host socket are released once the exchange has closed on both sides, whichever
 closed first. A guest opening and closing connections back to back is therefore
 not throttled by the table.
 
+A connection that ends any other way ends with a reset to both peers. That
+covers a reset from either peer, a host connect that fails, and a flow the stack
+reclaims: one that has not established both sides within 30 seconds, or one
+whose guest stops reading after the host has finished and moves nothing for 100
+seconds. Neither peer is handed an end of stream for a connection that did not
+finish, so a cut-off transfer never reads as a complete one.
+
 Those caps are per attachment, not per process. The pump and every host socket
 run in the caller's own process. Several attachments in one process therefore
 share one descriptor table and one heap, which the per-guest caps do not
@@ -261,7 +268,7 @@ handle.stop()?;
 
 A published connection reaches the guest from the gateway address, on the
 guest's address of the listener's family. A guest with nothing listening on the
-port refuses it, and the stack closes the host side. Once both ends are up, a
+port refuses it, and the stack resets the host side. Once both ends are up, a
 published connection is forwarded like any other flow, with the same
 half-closes and the same deadlines. It counts against a budget of its own, 128
 published connections at once. The stack closes a connection past that on the

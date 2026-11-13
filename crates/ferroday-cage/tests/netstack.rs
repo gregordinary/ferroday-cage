@@ -804,7 +804,7 @@ fn a_named_loopback_port_is_the_only_one_mapped() {
 /// the connected stream and the first line it sent.
 ///
 /// The host listener accepts at once, but the guest's server may not be
-/// listening yet, and a connection the guest refuses is closed on the host side
+/// listening yet, and a connection the guest refuses is reset on the host side
 /// before anything arrives. So each attempt reads, and one that ends empty is
 /// retried.
 fn connect_published(address: std::net::SocketAddr) -> (std::net::TcpStream, String) {
@@ -913,7 +913,7 @@ fn a_published_port_already_in_use_is_refused_at_attach() {
 }
 
 #[test]
-fn a_published_connection_the_guest_refuses_is_closed_on_the_host() {
+fn a_published_connection_the_guest_refuses_is_reset_on_the_host() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
@@ -921,8 +921,8 @@ fn a_published_connection_the_guest_refuses_is_closed_on_the_host() {
         return;
     }
     // Nothing in the guest listens on the published port. The host listener
-    // accepts regardless, so the guest's refusal reaches the host as the
-    // stack closing the connection, before any byte.
+    // accepts regardless, so the guest's refusal, its kernel's reset, reaches
+    // the host as a reset before any byte, never as an end of stream.
     let pending = sleeper(rootfs)
         .spawn_pending()
         .expect("the pending sandbox launches");
@@ -946,9 +946,8 @@ fn a_published_connection_the_guest_refuses_is_closed_on_the_host() {
     handle.stop().expect("the stack stops cleanly");
 
     assert!(
-        matches!(outcome, Ok(0))
-            || matches!(&outcome, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
-        "the refused connection was not closed on the host side: {outcome:?}",
+        matches!(&outcome, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "the refused connection was not reset on the host side: {outcome:?}",
     );
 }
 

@@ -19,9 +19,11 @@
 //! TIME_WAIT, which the flow collapses rather than hold a slot through (see
 //! [`TcpFlow::only_time_wait_remains`]). A failure on either side — a failed
 //! or refused host connect, a host socket error, a reset from the guest —
-//! aborts the other side. A flow that has not established both sides within
-//! [`ESTABLISH_DEADLINE`] is aborted, which bounds what a connection flood
-//! can pin.
+//! aborts the other side, and an abort is a reset on both: the guest's socket
+//! sends one, and the host socket is closed with a zero linger, so neither
+//! peer takes a cut-off stream for a finished one. A flow that has not
+//! established both sides within [`ESTABLISH_DEADLINE`] is aborted, which
+//! bounds what a connection flood can pin.
 //!
 //! An established flow whose guest stops reading fills the transmit buffer, so
 //! no forwarding is possible until the guest reads again. Such a flow stays
@@ -412,9 +414,11 @@ impl TcpFlow {
             socket.abort();
         }
 
-        // A fully closed guest socket ends the flow; dropping the host
-        // descriptor with it releases the host side.
-        if socket.state() == tcp::State::Closed {
+        // A fully closed guest socket ends the flow once nothing it received
+        // is still queued for the host, which takes those bytes whether the
+        // guest ended with a FIN or a reset: the guest was told they arrived.
+        // Dropping the host descriptor with the flow releases the host side.
+        if socket.state() == tcp::State::Closed && !socket.can_recv() {
             self.dead = true;
             progress = true;
         }
@@ -507,6 +511,19 @@ impl TcpFlow {
 
     /// Copies guest bytes to the host and propagates the guest's end of
     /// stream. Returns whether anything moved.
+    ///
+    /// The end of stream passed on is the guest's FIN, once every byte ahead of
+    /// it has been: smoltcp reports exactly that as
+    /// [`RecvError::Finished`](tcp::RecvError::Finished), the case its own
+    /// documentation guarantees received data complete in. Every other way a
+    /// guest socket stops receiving reports
+    /// [`InvalidState`](tcp::RecvError::InvalidState) instead. Before both
+    /// handshakes, the guest has yet to say anything rather than finished
+    /// saying it, and shutting the host write side down there would answer a
+    /// request the guest has not sent with an end of stream. After a reset, or
+    /// smoltcp's own timeout, the stream ended without a FIN and may be
+    /// truncated, and the flow's end resets the host side instead; see the
+    /// [`Drop`] implementation.
     fn guest_to_host(&mut self, socket: &mut tcp::Socket) -> bool {
         // The descriptor is released only after both half-closes, at which
         // point `host_shutdown` is already set and this does nothing.
@@ -514,15 +531,18 @@ impl TcpFlow {
             return false;
         };
         let mut progress = false;
-        while socket.can_recv() && !self.host_shutdown {
-            let outcome =
-                socket.recv(
-                    |buf| match rustix::net::send(host, buf, SendFlags::NOSIGNAL) {
-                        Ok(sent) => (sent, Copy::Moved(sent)),
-                        Err(Errno::AGAIN | Errno::INTR) => (0, Copy::Blocked),
-                        Err(_) => (0, Copy::Failed),
-                    },
-                );
+        while !self.host_shutdown {
+            let outcome = socket.recv(|buf| {
+                // Nothing queued while the guest's stream is open.
+                if buf.is_empty() {
+                    return (0, Copy::Blocked);
+                }
+                match rustix::net::send(host, buf, SendFlags::NOSIGNAL) {
+                    Ok(sent) => (sent, Copy::Moved(sent)),
+                    Err(Errno::AGAIN | Errno::INTR) => (0, Copy::Blocked),
+                    Err(_) => (0, Copy::Failed),
+                }
+            });
             match outcome {
                 Ok(Copy::Moved(0)) | Ok(Copy::Blocked) => break,
                 Ok(Copy::Moved(_)) => progress = true,
@@ -533,26 +553,15 @@ impl TcpFlow {
                     return true;
                 }
                 Ok(Copy::Finished) => unreachable!("a socket read does not produce Finished"),
-                Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => break,
+                // The guest's FIN, with everything it sent passed on:
+                // half-close the host side, once.
+                Err(tcp::RecvError::Finished) => {
+                    let _ = rustix::net::shutdown(host, rustix::net::Shutdown::Write);
+                    self.host_shutdown = true;
+                    progress = true;
+                }
+                Err(tcp::RecvError::InvalidState) => break,
             }
-        }
-        // The guest has finished sending and everything it sent has been
-        // passed on: half-close the host side once. Gated on both sides being
-        // past their handshakes, because a socket still in Listen, SynSent, or
-        // SynReceived also reports that it may not receive — the guest has yet
-        // to say anything, not finished saying it. Without the gate a host
-        // connect that concludes before the guest's ACK is ingested (a loopback
-        // target against a tap round trip, say) would shut the host write side
-        // down before the guest had sent its request, and the flow would linger
-        // to the idle timeout with nothing forwarded.
-        if !self.host_shutdown
-            && self.established(socket)
-            && !socket.may_recv()
-            && socket.recv_queue() == 0
-        {
-            let _ = rustix::net::shutdown(host, rustix::net::Shutdown::Write);
-            self.host_shutdown = true;
-            progress = true;
         }
         progress
     }
@@ -607,6 +616,24 @@ impl TcpFlow {
             progress = true;
         }
         progress
+    }
+}
+
+impl Drop for TcpFlow {
+    /// Resets the host side of a flow that did not end in order.
+    ///
+    /// An orderly end releases the host descriptor as soon as both half-closes
+    /// are through, before the guest socket finishes its own close. A flow
+    /// that still holds the descriptor when it goes ended some other way: the
+    /// guest reset it or went silent, a deadline reclaimed it, the host side
+    /// failed, or the pump stopped under it. Closing the descriptor plainly
+    /// would hand the host peer an end of stream, and a peer reading to the end
+    /// would take a truncated stream for a complete one. A zero linger makes
+    /// the close a reset instead.
+    fn drop(&mut self) {
+        if let Some(host) = self.host.take() {
+            let _ = sockopt::set_socket_linger(&host, Some(Duration::ZERO));
+        }
     }
 }
 
@@ -758,20 +785,19 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_guest_half_closes_the_host_write_side() {
-        // The guest will send no more and everything it sent has been passed
-        // on, so the host peer must see end of stream rather than wait on a
-        // descriptor nothing will write to again.
+    fn a_guest_socket_closed_without_a_fin_is_no_end_of_stream() {
+        // A guest socket closes without the guest's FIN when it is reset or
+        // times out. What the guest sent may be cut short, so the host peer
+        // must not be handed an end of stream for it: the flow ends without the
+        // half-close, and its drop resets the host side. The orderly half-close
+        // after a FIN is the pump's tests', which drive a real guest.
         let (mut sockets, handle) = guest_socket();
         let (mut flow, peer) = connected_flow(handle);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
 
-        assert!(
-            flow.service(socket, Instant::now()),
-            "the half-close is progress"
-        );
-        assert!(flow.host_shutdown, "the host write side is shut down");
-        assert!(peer_at_eof(&peer), "the host peer sees end of stream");
+        assert!(flow.service(socket, Instant::now()), "the end is progress");
+        assert!(!flow.host_shutdown, "no end of stream was passed on");
+        assert!(!peer_at_eof(&peer), "the host peer sees no end of stream");
         // A closed guest socket ends the flow; the pump reaps it next pass.
         assert!(flow.dead);
     }
