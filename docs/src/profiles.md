@@ -401,12 +401,39 @@ let builder = restricted.into_builder();      // extend with the consumer's own 
 ```
 
 The restricted policy refuses the operations that map host resources into the
-sandbox, write to the host outside it, or share a host namespace: a bind mount,
-a raw mount, host networking, an overlay root, and sharing the host PID
-namespace. An overlay root is refused because, unlike the rootfs, its upper
-layer is created rather than required to exist: the profile would choose a host
-path for the library to create directories at. A trusted consumer configures one
-with `overlay` after loading.
+sandbox, write to the host outside it, or share a host namespace:
+
+- a bind mount or a raw mount
+- a symbolic link, a `[[mount]]` entry with `kind = "symlink"`
+- host networking
+- an overlay root
+- sharing the host PID namespace
+
+An overlay root is refused because, unlike the root filesystem, its upper layer
+is created rather than required to exist. The profile would choose a host path
+for the library to create directories at. A trusted consumer configures one with
+`overlay` after loading.
+
+A symbolic link is refused because the setup makes it before any confinement
+applies. In a plain root filesystem it stays on the host after the sandbox
+exits. A link at `/etc/ld.so.preload` there, pointing at a path the command can
+write, reaches every later sandbox on that tree. A restricted profile binds
+nothing, so an empty root gains nothing from a link either.
+
+The policy also refuses the parts of `[hardening]` that the consumer's own calls
+add to rather than replace. A profile's part would otherwise widen whatever the
+consumer configures after loading:
+
+- `landlock-fs` and `landlock-net`, the Landlock grants. Grants are an
+  allow-list the builder only appends to, so the profile's grants would be
+  added to the consumer's.
+- `keep-caps`, a kept capability set. It survives the switch to a non-root
+  `run_as` identity the consumer adds, which otherwise clears every capability.
+
+The rest of `[hardening]` only removes, and a restricted profile can carry it. A
+seccomp policy refuses syscalls, `drop-caps` drops every capability, and a
+Landlock scope denies a reach outside the sandbox. A consumer's own call for
+any of them replaces the profile's.
 
 Deserializing a `RestrictedProfile` reports a refusal through the format's own
 error, as text. A consumer that matches on the refusal deserializes a
@@ -469,9 +496,9 @@ fcage --profile build.toml --isolate-net
 `--profile` trusts the file like a script: it can bind any host path, issue
 raw mounts, share the host network, and share the host PID namespace. Load only
 a profile you trust. `--restricted-profile FILE` loads under the restricted
-policy instead, refusing those operations for a profile from an untrusted
-source; the rootfs it names still grants access to that host subtree, so pass a
-rootfs you control.
+policy instead, refusing what [Untrusted profiles](#untrusted-profiles) lists
+for a profile from an untrusted source. The root filesystem it names still
+grants access to that host subtree, so pass one you control.
 
 A profile is plain data: loading one performs no filesystem access and
 grants nothing by itself. Validation happens at `build`, launch behavior is

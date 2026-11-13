@@ -1244,11 +1244,13 @@ const FLAGS: &[Flag] = &[
         help: &[
             "Load a TOML profile from an untrusted source: like",
             "--profile, but the operations that map host resources",
-            "into the sandbox or share a host namespace (binds, raw",
-            "mounts, host networking, the host PID namespace, an",
-            "overlay root) are refused. The rootfs it names still",
-            "grants access to that host subtree, so pass a rootfs",
-            "you control",
+            "into the sandbox, write to the host, or share a host",
+            "namespace (binds, raw mounts, symlinks, host",
+            "networking, the host PID namespace, an overlay root)",
+            "are refused, and so are the Landlock grants and the",
+            "kept capabilities the hardening flags would add to.",
+            "The rootfs it names still grants access to that host",
+            "subtree, so pass a rootfs you control",
         ],
         take: Take::One(|options, _flag, value| {
             let path = PathBuf::from(value);
@@ -7517,6 +7519,41 @@ mod tests {
             .expect("the profile is written");
         let (_, meta) = load_profile(&silent, false, false).expect("the profile loads");
         assert!(!meta.sets_stop_with_caller);
+    }
+
+    #[test]
+    fn a_restricted_profile_carries_nothing_the_flags_would_add_to() {
+        // The Landlock flags add grants to a profile's table, and a run-as
+        // identity keeps whatever capabilities the profile keeps, so under
+        // --restricted-profile a profile carries neither. Nor does it carry a
+        // link, which the setup makes before any confinement applies. The same
+        // profile loads under --profile, which trusts it.
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-restricted-refusals");
+        let profile = dir.join("profile.toml");
+        for (table, refused) in [
+            (
+                "[[hardening.landlock-fs]]\naccess = \"rwx\"\npath = \"/\"\n",
+                "landlock-fs",
+            ),
+            (
+                "[[hardening.landlock-net]]\naccess = \"c\"\nport = 443\n",
+                "landlock-net",
+            ),
+            ("[hardening]\nkeep-caps = [\"dac-override\"]\n", "keep-caps"),
+            (
+                "[[mount]]\nkind = \"symlink\"\ntarget = \"/var/tmp/x.so\"\n\
+                 path = \"/etc/ld.so.preload\"\n",
+                "a symbolic link",
+            ),
+        ] {
+            std::fs::write(&profile, format!("rootfs = \"/tmp\"\n{table}"))
+                .expect("the profile is written");
+            let Err(error) = load_profile(&profile, false, true) else {
+                panic!("--restricted-profile accepted {table}");
+            };
+            assert!(error.contains(refused), "{error}");
+            assert!(load_profile(&profile, false, false).is_ok(), "{table}");
+        }
     }
 
     #[test]

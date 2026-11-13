@@ -142,7 +142,8 @@ connections to the ports the caller publishes.
 //! Deserializing one into a `CageBuilder` trusts it as code-equivalent
 //! configuration; a profile from an untrusted source is loaded through
 //! `RestrictedProfile`, which forbids the operations that reach host
-//! resources. See the [`CageBuilder`] "Trust" section.
+//! resources and the hardening that would widen the consumer's own. See the
+//! [`CageBuilder`] "Trust" section.
 //!
 // The hardening and restriction-fallback sections describe feature-gated
 // items, so their doc text (with its intra-doc links) is gated on the feature
