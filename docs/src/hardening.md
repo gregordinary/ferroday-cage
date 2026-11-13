@@ -272,10 +272,17 @@ outside 1 through 4095, whether given here or as a `SeccompAction::Errno`. Zero
 reports a success the syscall never performed, and the C library reads a larger
 number as the value the syscall returned.
 
-The filter binds the command and its descendants. Seccomp filtering is available
-on the `x86_64`, `aarch64`, and `riscv64` architectures; a policy on any other
-is a build error. [`host::seccomp_available`] reports whether the kernel offers
-seccomp at all.
+The filter binds the command and its descendants. The `hardening` feature
+builds for the `x86_64`, `aarch64`, and `riscv64` architectures. A `Rules`
+policy is compiled for the host's own syscall ABI, and kills a process that
+makes a syscall under any other audit architecture, as a natively run 32-bit
+userland does at its first syscall. [Host
+requirements](host-requirements.md#architecture) describes that case. A
+`Program` is installed as given, and a syscall made under another architecture
+gets whatever the program answers. A program written by hand therefore checks
+the architecture first, as every program the library compiles does.
+[`host::seccomp_available`] reports whether this process can install a filter
+at all.
 
 A sandbox with a network namespace of its own already carries a filter of the
 launch's own. It refuses vsock, io_uring, and socket creation through x86's

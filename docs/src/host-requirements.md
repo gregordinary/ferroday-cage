@@ -157,13 +157,25 @@ binaries inside the rootfs must be ones the host CPU executes — its own
 architecture, or one it runs natively, such as i386 on an amd64 host — or a
 matching `qemu-user` binfmt handler must be registered for them.
 
-An i386 userland runs on an amd64 host as it would on its own, with one
-exception. Under a network posture with a namespace of its own, a 32-bit
-program built against glibc creates no socket. That C library creates every
-socket through `socketcall`, which [the network
-filter](how-the-sandbox-is-built.md#the-network-filter) refuses. A userland
-emulated through `qemu-user` is unaffected: the emulator makes the host's own
-`socket` call.
+An i386 userland runs on an amd64 host as it would on its own, with two
+exceptions:
+
+- **Sockets under the network filter.** Under a network posture with a
+  namespace of its own, a 32-bit program built against glibc creates no socket.
+  That C library creates every socket through `socketcall`, which [the network
+  filter](how-the-sandbox-is-built.md#the-network-filter) refuses with
+  `EAFNOSUPPORT`, the answer for an address family the kernel does not offer. A
+  program that opens a socket only for an optional facility carries on without
+  it. A 32-bit Debian bootstrap creates its system accounts for that reason.
+- **A seccomp policy of the hardening layer.** A `Rules` policy is compiled for
+  the host's 64-bit syscall ABI and kills a process that makes a syscall under
+  any other audit architecture. A 32-bit program makes every syscall through
+  the 32-bit compat layer, so under any such policy `SIGSYS` kills it at its
+  first one. A 32-bit userland runs without a policy, or under a precompiled
+  `SeccompPolicy::Program` that handles the 32-bit architecture itself.
+
+A userland emulated through `qemu-user` meets neither: the emulator is a host
+binary, and it makes the host's own syscalls on the guest's behalf.
 
 A full Debian bootstrap for an architecture the host does not run natively runs
 that architecture's dpkg and maintainer scripts, so the `qemu-user` handler must

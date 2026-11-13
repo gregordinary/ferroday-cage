@@ -101,12 +101,18 @@ the provisioner reads it back: a cage is told a root filesystem and a command,
 and it neither knows nor asks what either was built for. That is what makes the
 foreign case work without a mode of its own.
 
-A **seccomp filter** is the one place a reader might expect an architecture
-problem and not find one. A filter gates on the audit architecture of the task
-making the syscall, and under `qemu-user` that task is the emulator — a native
-binary. The syscalls reaching the kernel are the host's, issued by qemu on the
-guest's behalf, so a filter compiled for the host applies exactly as it does to
-any other process. There is no translation to get wrong.
+A **seccomp filter** raises no architecture problem under emulation. A filter
+gates on the audit architecture of the task making the syscall, and under
+`qemu-user` that task is the emulator — a native binary. The syscalls reaching
+the kernel are the host's, issued by qemu on the guest's behalf, so a filter
+compiled for the host applies exactly as it does to any other process. There is
+no translation to get wrong.
+
+A root the host runs without an emulator is the exception. An i386 root on an
+amd64 host makes its syscalls itself, under the 32-bit audit architecture, and
+a policy the hardening layer compiles names only the host's. Any such policy
+kills the root's first process at its first syscall. [Host
+requirements](host-requirements.md#architecture) describes this.
 
 What does change is the *set* of syscalls a workload makes. An emulator maps the
 guest's address space, keeps threads of its own, and turns guest calls into host
