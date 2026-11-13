@@ -1187,6 +1187,7 @@ mod tests {
     // there is testable without a tap device or a sandbox.
 
     use rustix::net::{AddressFamily, SocketType};
+    use smoltcp::iface::SocketHandle;
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, EthernetRepr,
@@ -2160,6 +2161,173 @@ mod tests {
         );
     }
 
+    /// A published connection the guest has accepted, carried by a flow whose
+    /// host side takes a few kilobytes and then nothing more until its peer
+    /// reads.
+    struct Published {
+        /// The guest-facing socket.
+        handle: SocketHandle,
+        /// The host side's peer, which the test reads as the host would.
+        peer: OwnedFd,
+        /// The guest's end of the connection, address and port.
+        guest_at: (Ipv4Addr, u16),
+        /// The stack's end of the connection, address and port.
+        stack_at: (Ipv4Addr, u16),
+        /// The sequence number the stack's next byte to the guest carries.
+        stack_next: u32,
+        /// The sequence number the guest's next byte carries.
+        guest_next: u32,
+    }
+
+    impl Published {
+        /// Opens the connection: the stack connects to the guest, which
+        /// accepts.
+        fn open(engine: &mut Engine, guest: &OwnedFd) -> Published {
+            guest_sends(engine, &resolve_gateway());
+            let (host_side, peer) = rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+                None,
+            )
+            .expect("a socket pair stands in for the host side");
+            rustix::net::sockopt::set_socket_send_buffer_size(&host_side, 4096)
+                .expect("the buffer is sizable");
+            let (guest_at, stack_at) = ((GUEST, 8000), (GATEWAY, 50_000));
+            let guest_end = IpEndpoint::new(GUEST.into(), guest_at.1);
+            let stack_end = IpEndpoint::new(GATEWAY.into(), stack_at.1);
+            let mut socket = tcp_socket::Socket::new(
+                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
+                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
+            );
+            socket
+                .connect(engine.iface.context(), guest_end, stack_end)
+                .expect("the stack connects to the guest");
+            let handle = engine.sockets.add(socket);
+            engine.flows.push(TcpFlow::accepted(
+                handle,
+                guest_end,
+                stack_end,
+                host_side,
+                std::time::Instant::now(),
+            ));
+            engine
+                .iface
+                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            let sent = sent_to_guest(guest);
+            let syn = sent
+                .iter()
+                .find(|segment| segment.syn)
+                .unwrap_or_else(|| panic!("the stack never connected to the guest: {sent:?}"));
+            let mut published = Published {
+                handle,
+                peer,
+                guest_at,
+                stack_at,
+                stack_next: syn.seq.wrapping_add(1),
+                guest_next: 1000,
+            };
+            published.guest_sends(engine, TcpControl::Syn, &[]);
+            published
+        }
+
+        /// Sends one segment from the guest, acknowledging everything the
+        /// stack has sent, and advances the guest's sequence past it.
+        fn guest_sends(&mut self, engine: &mut Engine, control: TcpControl, payload: &[u8]) {
+            guest_sends(
+                engine,
+                &tcp_v4(
+                    self.guest_at,
+                    self.stack_at,
+                    control,
+                    self.guest_next,
+                    Some(self.stack_next),
+                    payload,
+                ),
+            );
+            let flags = u32::from(matches!(control, TcpControl::Syn | TcpControl::Fin));
+            let length = u32::try_from(payload.len()).expect("a segment's payload fits");
+            self.guest_next = self.guest_next.wrapping_add(length + flags);
+        }
+
+        /// Uploads more than the host side takes, and returns what was sent.
+        fn upload(&mut self, engine: &mut Engine) -> Vec<u8> {
+            let mut uploaded = Vec::new();
+            for fill in b'a'..b'q' {
+                let chunk = [fill; 1024];
+                self.guest_sends(engine, TcpControl::Psh, &chunk);
+                uploaded.extend_from_slice(&chunk);
+            }
+            assert!(
+                self.socket(engine).recv_queue() > 0,
+                "the host side stopped taking the upload",
+            );
+            uploaded
+        }
+
+        /// The host side finishes without reading, and the stack passes its
+        /// end of stream on as a FIN, which the guest's next segment
+        /// acknowledges.
+        fn host_finishes(&mut self, engine: &mut Engine, guest: &OwnedFd) {
+            rustix::net::shutdown(&self.peer, rustix::net::Shutdown::Write)
+                .expect("the peer finishes");
+            engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
+            engine.service();
+            engine
+                .iface
+                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            let sent = sent_to_guest(guest);
+            let fin = sent
+                .iter()
+                .find(|segment| segment.fin)
+                .unwrap_or_else(|| panic!("the stack never finished its side: {sent:?}"));
+            let length = u32::try_from(fin.payload).expect("a segment's payload fits");
+            self.stack_next = fin.seq.wrapping_add(length + 1);
+        }
+
+        /// The guest-facing socket.
+        fn socket<'a>(&self, engine: &'a Engine) -> &'a tcp_socket::Socket<'static> {
+            engine.sockets.get::<tcp_socket::Socket>(self.handle)
+        }
+
+        /// Reads the host side to its end as the host would, servicing the
+        /// flow whenever the host has taken what was there, and returns what
+        /// arrived.
+        fn host_reads(&self, engine: &mut Engine, expected: usize) -> Vec<u8> {
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            let patience = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(
+                    std::time::Instant::now() < patience,
+                    "the upload never finished arriving: {} of {expected} bytes",
+                    received.len(),
+                );
+                match rustix::io::read(&self.peer, &mut buf) {
+                    Ok(0) => return received,
+                    Ok(read) => received.extend_from_slice(&buf[..read]),
+                    Err(Errno::AGAIN) => {
+                        if let Some(flow) = engine.flows.first_mut() {
+                            flow.events = PollFlags::OUT;
+                        }
+                        engine.service();
+                        engine.reap(std::time::Instant::now());
+                    }
+                    Err(errno) => panic!("the host side failed: {errno}"),
+                }
+            }
+        }
+    }
+
+    /// Moves the interface's clock `by` ahead of the host's, as though that
+    /// much time had passed with nothing to wake the pump.
+    fn advance_clock(engine: &mut Engine, by: Duration) {
+        engine.epoch = engine
+            .epoch
+            .checked_sub(by)
+            .expect("the monotonic clock has run for longer than the advance");
+    }
+
     /// Bytes the guest sent that the host side has yet to take outlast the
     /// guest socket's close: the flow forwards them, then passes the guest's
     /// end of stream on.
@@ -2172,154 +2340,18 @@ mod tests {
     fn bytes_queued_for_the_host_outlast_the_guests_close() {
         let (tap, guest) = tap_pair();
         let mut engine = engine(tap, NetStack::default().plan, Vec::new());
-        guest_sends(&mut engine, &resolve_gateway());
+        let mut published = Published::open(&mut engine, &guest);
 
-        // A published connection whose host side takes a few kilobytes and
-        // then nothing more until its peer reads.
-        let (host_side, peer) = rustix::net::socketpair(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-            None,
-        )
-        .expect("a socket pair stands in for the host side");
-        rustix::net::sockopt::set_socket_send_buffer_size(&host_side, 4096)
-            .expect("the buffer is sizable");
-        let (guest_at, stack_at) = ((GUEST, 8000), (GATEWAY, 50_000));
-        let guest_end = IpEndpoint::new(GUEST.into(), guest_at.1);
-        let stack_end = IpEndpoint::new(GATEWAY.into(), stack_at.1);
-        let mut socket = tcp_socket::Socket::new(
-            tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-            tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-        );
-        socket
-            .connect(engine.iface.context(), guest_end, stack_end)
-            .expect("the stack connects to the guest");
-        let handle = engine.sockets.add(socket);
-        engine.flows.push(TcpFlow::accepted(
-            handle,
-            guest_end,
-            stack_end,
-            host_side,
-            std::time::Instant::now(),
-        ));
-        engine
-            .iface
-            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
-        let sent = sent_to_guest(&guest);
-        let syn = sent
-            .iter()
-            .find(|segment| segment.syn)
-            .unwrap_or_else(|| panic!("the stack never connected to the guest: {sent:?}"));
-        let stack_next = syn.seq.wrapping_add(1);
-
-        // The guest accepts, uploads more than the host side takes, and
-        // finishes.
-        let mut seq = 1000;
-        guest_sends(
-            &mut engine,
-            &tcp_v4(
-                guest_at,
-                stack_at,
-                TcpControl::Syn,
-                seq,
-                Some(stack_next),
-                &[],
-            ),
-        );
-        seq += 1;
-        let mut uploaded = Vec::new();
-        for fill in b'a'..b'q' {
-            let chunk = [fill; 1024];
-            guest_sends(
-                &mut engine,
-                &tcp_v4(
-                    guest_at,
-                    stack_at,
-                    TcpControl::Psh,
-                    seq,
-                    Some(stack_next),
-                    &chunk,
-                ),
-            );
-            seq += 1024;
-            uploaded.extend_from_slice(&chunk);
-        }
-        assert!(
-            engine
-                .sockets
-                .get::<tcp_socket::Socket>(handle)
-                .recv_queue()
-                > 0,
-            "the host side stopped taking the upload",
-        );
-        guest_sends(
-            &mut engine,
-            &tcp_v4(
-                guest_at,
-                stack_at,
-                TcpControl::Fin,
-                seq,
-                Some(stack_next),
-                &[],
-            ),
-        );
-        seq += 1;
-
-        // The host side finishes without reading, the stack passes its FIN on,
-        // and the guest acknowledges it, which closes the guest's socket.
-        rustix::net::shutdown(&peer, rustix::net::Shutdown::Write).expect("the peer finishes");
-        engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
-        engine.service();
-        engine
-            .iface
-            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
-        let sent = sent_to_guest(&guest);
-        let fin = sent
-            .iter()
-            .find(|segment| segment.fin)
-            .unwrap_or_else(|| panic!("the stack never finished its side: {sent:?}"));
-        guest_sends(
-            &mut engine,
-            &tcp_v4(
-                guest_at,
-                stack_at,
-                TcpControl::None,
-                seq,
-                Some(fin.seq.wrapping_add(1)),
-                &[],
-            ),
-        );
-        let socket = engine.sockets.get::<tcp_socket::Socket>(handle);
+        let uploaded = published.upload(&mut engine);
+        published.guest_sends(&mut engine, TcpControl::Fin, &[]);
+        published.host_finishes(&mut engine, &guest);
+        published.guest_sends(&mut engine, TcpControl::None, &[]);
+        let socket = published.socket(&engine);
         assert_eq!(socket.state(), tcp_socket::State::Closed);
         assert!(socket.recv_queue() > 0, "the guest's tail is still queued");
         engine.reap(std::time::Instant::now());
 
-        // The host side reads: the whole upload, then the guest's end of
-        // stream.
-        let mut received = Vec::new();
-        let mut buf = [0u8; 4096];
-        let patience = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            assert!(
-                std::time::Instant::now() < patience,
-                "the upload never finished arriving: {} of {} bytes",
-                received.len(),
-                uploaded.len(),
-            );
-            match rustix::io::read(&peer, &mut buf) {
-                Ok(0) => break,
-                Ok(read) => received.extend_from_slice(&buf[..read]),
-                Err(Errno::AGAIN) => {
-                    if let Some(flow) = engine.flows.first_mut() {
-                        flow.events = PollFlags::OUT;
-                    }
-                    engine.service();
-                    engine.reap(std::time::Instant::now());
-                }
-                Err(errno) => panic!("the host side failed: {errno}"),
-            }
-        }
+        let received = published.host_reads(&mut engine, uploaded.len());
         assert!(
             received == uploaded,
             "{} of {} bytes arrived",
@@ -2327,5 +2359,66 @@ mod tests {
             uploaded.len()
         );
         assert!(engine.flows.is_empty(), "the finished flow was reclaimed");
+    }
+
+    /// Bytes the guest sent with the FIN that answers the host's outlast
+    /// TIME_WAIT, however long the host takes to read them: the flow takes the
+    /// guest socket out of TIME_WAIT keeping them, and smoltcp's own expiry of
+    /// that state, which empties the socket, never comes.
+    #[test]
+    fn bytes_queued_for_the_host_outlast_time_wait() {
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, NetStack::default().plan, Vec::new());
+        let mut published = Published::open(&mut engine, &guest);
+
+        // The host finishes first, the guest uploads behind the stack's FIN,
+        // and its own FIN brings the socket to TIME_WAIT with the upload still
+        // queued for a host that has yet to read it.
+        published.host_finishes(&mut engine, &guest);
+        let uploaded = published.upload(&mut engine);
+        published.guest_sends(&mut engine, TcpControl::Fin, &[]);
+        let socket = published.socket(&engine);
+        assert_eq!(
+            socket.state(),
+            tcp_socket::State::Closed,
+            "the guest socket was left in TIME_WAIT",
+        );
+        assert!(socket.recv_queue() > 0, "the guest's tail is still queued");
+
+        // The host reads nothing for far longer than smoltcp holds TIME_WAIT,
+        // which is ten seconds.
+        engine.reap(std::time::Instant::now());
+        advance_clock(&mut engine, Duration::from_secs(30));
+        engine
+            .iface
+            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.service();
+        engine.reap(std::time::Instant::now());
+
+        let received = published.host_reads(&mut engine, uploaded.len());
+        assert!(
+            received == uploaded,
+            "{} of {} bytes arrived",
+            received.len(),
+            uploaded.len()
+        );
+        assert!(engine.flows.is_empty(), "the finished flow was reclaimed");
+    }
+
+    /// A host-closes-first exchange whose host has taken everything ends its
+    /// flow as the guest's FIN arrives, rather than holding a slot and two
+    /// buffers through TIME_WAIT.
+    #[test]
+    fn a_finished_host_closes_first_exchange_releases_its_flow_at_once() {
+        let (tap, guest) = tap_pair();
+        let mut engine = engine(tap, NetStack::default().plan, Vec::new());
+        let mut published = Published::open(&mut engine, &guest);
+
+        published.host_finishes(&mut engine, &guest);
+        published.guest_sends(&mut engine, TcpControl::Psh, b"the last word");
+        published.guest_sends(&mut engine, TcpControl::Fin, &[]);
+        engine.reap(std::time::Instant::now());
+        assert!(engine.flows.is_empty(), "the finished flow is still held");
+        assert_eq!(published.host_reads(&mut engine, 13), b"the last word");
     }
 }

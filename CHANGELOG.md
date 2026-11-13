@@ -540,6 +540,11 @@ consumer upgrading can skip it.
   truncated one as complete. A published connection the guest refuses is
   likewise reset on the host side rather than closed. A guest that finishes
   while a slow host is still taking its last bytes no longer loses them.
+- A TCP flow whose host side closes first forwards the guest's last bytes
+  however long the host takes to read them. Where the guest sent them with the
+  FIN that answers the host's, and the host had not taken them within ten
+  seconds, the network stack discarded them as the guest's socket left
+  TIME_WAIT, and then reset the host.
 - `NetStackBuilder::build` refuses an interface name holding `%`. The kernel
   took such a name as a template and named the interface itself, so the stack's
   configuration of it failed at attach with "No such device".
