@@ -1,10 +1,11 @@
 //! Host processes a test starts or watches: whether one still exists, waiting
-//! for one to go, how much processor time one has used, and running one with a
-//! bound on how long it may take.
+//! for one to go, how much processor time one has used, running one with a
+//! bound on how long it may take, and running one test of the test binary
+//! again as a process of its own.
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -58,6 +59,37 @@ fn ticks_of(stat: &str) -> Option<u64> {
     let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
     let field = |at: usize| fields.get(at)?.parse::<u64>().ok();
     Some(field(11)? + field(12)?)
+}
+
+/// The arguments that run one test of a test binary alone: `test` by its exact
+/// name, as the harness lists it, on one thread, with what it prints left
+/// uncaptured for the process that started it to read.
+///
+/// For a test binary started where [`rerun`] cannot start it, such as inside a
+/// sandbox, as the command a launch executes.
+pub fn rerun_args(test: &str) -> [&str; 4] {
+    ["--exact", test, "--nocapture", "--test-threads=1"]
+}
+
+/// A command that runs this test binary again, for `test` alone, with
+/// [`rerun_args`]: a test that changes what is process-wide, or that must stand
+/// where a test process cannot, runs its part as a process of its own.
+///
+/// Its standard input is null and its output is piped, for [`run_bounded`], or
+/// [`spawn_grouped`] then [`finish_bounded`], to collect. A test that wants
+/// other streams sets them before starting it, and starts it through one of
+/// those, or through the pseudoterminal harness's `spawn_controlled` with a
+/// deadline of its own, so a run that never ends fails its test rather than
+/// hanging the suite.
+pub fn rerun(test: &str) -> Command {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let mut command = Command::new(exe);
+    command
+        .args(rerun_args(test))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
 }
 
 /// Runs `command` to its end and returns what it wrote to whichever of its

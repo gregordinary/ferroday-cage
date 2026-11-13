@@ -1146,22 +1146,12 @@ const BACKGROUND_HELPER: &str = "FERRODAY_CAGE_TEST_BACKGROUND_RELAY";
 /// [`helper_relay_started_in_the_background`].
 #[test]
 fn a_session_started_in_the_background_leaves_the_terminal_to_its_shell() {
-    use std::process::Command;
-
     let Some(_) = common::fixture_rootfs() else {
         return;
     };
     let (primary, replica) = pty::pair(24, 80);
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let mut command = Command::new(exe);
-    command
-        .args([
-            "--exact",
-            "helper_relay_started_in_the_background",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(BACKGROUND_HELPER, "1");
+    let mut command = common::rerun("helper_relay_started_in_the_background");
+    command.env(BACKGROUND_HELPER, "1");
     let mut child = pty::spawn_controlled(&mut command, &replica);
     // The test's own copy goes, so the helper's exit hangs the primary up.
     drop(replica);

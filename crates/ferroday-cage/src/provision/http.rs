@@ -2313,18 +2313,20 @@ mod tests {
         for at in 0..3 {
             std::fs::write(dir.join(format!("body-{at}")), format!("body {at}")).unwrap();
         }
-        let status = std::process::Command::new(
-            std::env::current_exe().expect("the test binary has a path"),
-        )
-        .args([
-            "--exact",
-            "provision::http::tests::a_batch_the_host_starts_no_thread_for_still_fetches_every_job",
-            "--test-threads=1",
-        ])
-        .env(TASK_LIMITED, dir.path())
-        .status()
-        .expect("the child test process runs");
-        assert!(status.success(), "the child process failed: {status}");
+        let child = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun(
+                "provision::http::tests::a_batch_the_host_starts_no_thread_for_still_fetches_every_job",
+            )
+            .env(TASK_LIMITED, dir.path()),
+            std::time::Duration::from_secs(60),
+        );
+        assert!(
+            child.status.success(),
+            "the child process failed: {}\n{}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
         // A child that matched no test would succeed having asserted nothing.
         assert!(
             dir.join("done").exists() || dir.join("unheld").exists(),

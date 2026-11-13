@@ -370,12 +370,7 @@ fn probe_connections(
         .bind(sockets, "/tmp/s")
         .bind_ro(&exe, PROBE_PATH)
         .command(PROBE_PATH)
-        .args([
-            "--exact",
-            "probe_unix_connect",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(common::rerun_args("probe_unix_connect"))
         .env(PROBE, "/tmp/s/granted/sock:/tmp/s/other/sock")
         .build()
         .expect("a valid sandbox configuration")

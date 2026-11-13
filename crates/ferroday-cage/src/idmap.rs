@@ -2401,18 +2401,15 @@ mod tests {
         if no_new_privs() {
             return;
         }
-        let exe = std::env::current_exe().expect("the test binary has a path");
         let run = |path: &std::path::Path, expected: &str| {
-            let output = std::process::Command::new(&exe)
-                .args([
-                    "--exact",
+            let output = ferroday_cage_testkit::process::run_bounded(
+                ferroday_cage_testkit::process::rerun(
                     "idmap::tests::helpers_that_cannot_work_refuse_the_build_and_the_preflight",
-                    "--test-threads=1",
-                ])
+                )
                 .env("PATH", path)
-                .env(HELPER_REFUSAL, expected)
-                .output()
-                .expect("the child test process runs");
+                .env(HELPER_REFUSAL, expected),
+                std::time::Duration::from_secs(60),
+            );
             assert!(
                 output.status.success(),
                 "the child refused otherwise:\n{}\n{}",

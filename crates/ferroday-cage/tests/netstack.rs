@@ -105,12 +105,7 @@ fn attach_refuses_a_network_grant_the_kernel_cannot_enforce() {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let output = Restriction::builder()
         .command(&exe)
-        .args([
-            "--exact",
-            "probe_attach_where_landlock_is_absent",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(common::rerun_args("probe_attach_where_landlock_is_absent"))
         .env(NO_LANDLOCK_PROBE, "1")
         .seccomp(SeccompPolicy::Rules(
             SeccompRules::denying([]).errno_for(landlock, enosys),

@@ -2378,20 +2378,19 @@ mod tests {
         rustix::fs::symlinkat(c"/nowhere", &deepest, c"dangling").unwrap();
         drop(deepest);
 
-        let status = std::process::Command::new(
-            std::env::current_exe().expect("the test binary has a path"),
-        )
-        .args([
-            "--exact",
-            "provision::tests::a_tree_deeper_than_the_descriptor_limit_is_removed",
-            "--test-threads=1",
-        ])
-        .env(DEEP_TREE, &tree)
-        .status()
-        .expect("the child test process runs");
+        let child = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun(
+                "provision::tests::a_tree_deeper_than_the_descriptor_limit_is_removed",
+            )
+            .env(DEEP_TREE, &tree),
+            std::time::Duration::from_secs(120),
+        );
         assert!(
-            status.success(),
-            "the removal failed in the child: {status}"
+            child.status.success(),
+            "the removal failed in the child: {}\n{}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
         );
         assert!(!tree.exists(), "the tree survived removal");
     }

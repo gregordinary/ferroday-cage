@@ -250,7 +250,7 @@ fn probe(network: Network, test: &str) -> (Report, Option<ResolvedNetworkFilter>
     let exe = std::env::current_exe().expect("the test binary has a path");
     let cage = common::host_userland()
         .command(PROBE_PATH)
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .args(common::rerun_args(test))
         .env(PROBE, "1")
         .network(network)
         .resolv_conf(false)
@@ -439,7 +439,7 @@ fn report_under(test: &str, key: &str, policy: Option<ferroday_cage::SeccompPoli
     let exe = std::env::current_exe().expect("the test binary has a path");
     let mut builder = common::host_userland()
         .command(PROBE_PATH)
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .args(common::rerun_args(test))
         .env(PROBE, "1")
         .resolv_conf(false)
         .bind_ro(&exe, PROBE_PATH);

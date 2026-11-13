@@ -384,21 +384,17 @@ fn the_peak_is_at_least_the_launching_process_resident_set() {
     // the process that executes it. A caller holding much more than the
     // command ever does sets the figure, as `ResourceUsage::peak_rss_bytes`
     // states.
-    let exe = std::env::current_exe().expect("the test binary has a path");
     let output = common::run_bounded(
-        std::process::Command::new(exe)
-            .args(["--exact", "helper_report_peak", "--nocapture"])
-            .env("FERRODAY_CAGE_TEST_PEAK_FLOOR", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
+        common::rerun("helper_report_peak").env("FERRODAY_CAGE_TEST_PEAK_FLOOR", "1"),
         Duration::from_secs(60),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
+    // The harness names the test before running it on its one thread, and
+    // ends that line only once it has run, so the report lands on it.
     let peak: u64 = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("peak="))
+        .find_map(|line| Some(line.split_once("peak=")?.1))
         .expect("the helper reports the peak")
         .trim()
         .parse()
@@ -446,17 +442,15 @@ fn helper_spawn_and_abandon() {
 /// travels through a file instead.
 fn spawn_abandoning_caller(mode: &str) -> u32 {
     let pidfile = common::scratch_dir(&format!("stop-with-caller-{mode}")).join("supervisor.pid");
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let status = std::process::Command::new(exe)
-        .args(["--exact", "helper_spawn_and_abandon", "--nocapture"])
-        .env("FERRODAY_CAGE_TEST_HELPER", mode)
-        .env("FERRODAY_CAGE_TEST_PIDFILE", &pidfile)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("the helper process runs");
-    assert!(status.success(), "the helper process failed");
+    let helper = common::run_bounded(
+        common::rerun("helper_spawn_and_abandon")
+            .env("FERRODAY_CAGE_TEST_HELPER", mode)
+            .env("FERRODAY_CAGE_TEST_PIDFILE", &pidfile)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        Duration::from_secs(60),
+    );
+    assert!(helper.status.success(), "the helper process failed");
     std::fs::read_to_string(&pidfile)
         .expect("the helper recorded the supervisor pid")
         .trim()

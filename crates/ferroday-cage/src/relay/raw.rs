@@ -704,16 +704,10 @@ mod tests {
     #[test]
     fn the_panic_restore_leaves_a_terminal_its_session_lost_to_the_foreground() {
         let (primary, replica) = pair();
-        let exe = std::env::current_exe().expect("the test binary has a path");
-        let mut command = std::process::Command::new(exe);
-        command
-            .args([
-                "--exact",
-                "relay::raw::tests::helper_restore_in_the_background",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(BACKGROUND_HELPER, "1");
+        let mut command = ferroday_cage_testkit::process::rerun(
+            "relay::raw::tests::helper_restore_in_the_background",
+        );
+        command.env(BACKGROUND_HELPER, "1");
         let mut child = ferroday_cage_testkit::pty::spawn_controlled(&mut command, &replica);
         drop(replica);
 
@@ -836,21 +830,13 @@ mod tests {
     /// other test; see [`helper_panics_beside_a_session`].
     #[test]
     fn the_panic_hook_leaves_a_session_a_panic_elsewhere_does_not_end() {
-        let exe = std::env::current_exe().expect("the test binary has a path");
-        let mut command = std::process::Command::new(exe);
-        command
-            .args([
-                "--exact",
+        let output = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun(
                 "relay::raw::tests::helper_panics_beside_a_session",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(PANIC_HELPER, "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let output =
-            ferroday_cage_testkit::process::run_bounded(&mut command, Duration::from_secs(60));
+            )
+            .env(PANIC_HELPER, "1"),
+            Duration::from_secs(60),
+        );
         let printed = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),

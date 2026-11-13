@@ -93,12 +93,7 @@ fn a_masked_procfs_refuses_a_fresh_one_and_a_shared_pid_namespace_launches() {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let output = common::host_userland()
         .command(PROBE_PATH)
-        .args([
-            "--exact",
-            "probe_launches",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(common::rerun_args("probe_launches"))
         .env(PROBE, "1")
         .bind_ro(&exe, PROBE_PATH)
         .bind_ro("/dev/null", MASKED)

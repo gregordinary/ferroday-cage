@@ -371,15 +371,8 @@ fn a_session_in_the_background_leaves_the_input_to_its_shell() {
         return;
     };
     let (primary, replica) = pty::pair(24, 80);
-    let mut command = Command::new(std::env::current_exe().expect("the test binary has a path"));
-    command
-        .args([
-            "--exact",
-            "helper_shell_with_a_background_session",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(BACKGROUND_SHELL, "1");
+    let mut command = common::rerun("helper_shell_with_a_background_session");
+    command.env(BACKGROUND_SHELL, "1");
     let mut child = pty::spawn_controlled(&mut command, &replica);
     // The test's own copy goes, so the helper's exit hangs the primary up.
     drop(replica);

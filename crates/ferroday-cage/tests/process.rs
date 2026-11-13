@@ -469,7 +469,7 @@ fn probe_traced_command() {
     }
     let me = std::process::id();
     let mut tracer = std::process::Command::new(PROBE_PATH)
-        .args(["--exact", "probe_tracer", "--nocapture", "--test-threads=1"])
+        .args(common::rerun_args("probe_tracer"))
         .env(PROBE, "tracer")
         .env(TRACEE, me.to_string())
         .stdin(HostStdio::piped())
@@ -538,12 +538,7 @@ fn traced_exit(pid_namespace: bool, hold: Duration) -> Cage {
     common::host_userland()
         .pid_namespace(pid_namespace)
         .command(PROBE_PATH)
-        .args([
-            "--exact",
-            "probe_traced_command",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(common::rerun_args("probe_traced_command"))
         .env(PROBE, "command")
         .env(HOLD, hold.as_millis().to_string())
         .bind_ro(&exe, PROBE_PATH)
@@ -686,20 +681,9 @@ fn a_restriction_launch_leaves_the_callers_closed_streams_closed() {
 /// the harness's own process it would take the harness's output, and every
 /// test running beside it would launch with the descriptor closed.
 fn run_closed_stream_probes(confinement: &str) {
-    let exe = std::env::current_exe().expect("the test binary has a path");
     for closed in CLOSED_SETS {
         let output = common::run_bounded(
-            std::process::Command::new(&exe)
-                .args([
-                    "--exact",
-                    "probe_closed_streams",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CLOSED, format!("{confinement} {closed}"))
-                .stdin(HostStdio::null())
-                .stdout(HostStdio::piped())
-                .stderr(HostStdio::piped()),
+            common::rerun("probe_closed_streams").env(CLOSED, format!("{confinement} {closed}")),
             Duration::from_secs(300),
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1081,20 +1065,10 @@ fn a_supervisor_whose_pidfd_cannot_be_received_ends_the_launch() {
             "this host cannot mount a PID namespace's procfs: {blocker}"
         )),
     }
-    let exe = std::env::current_exe().expect("the test binary has a path");
     for (entry, pid_namespace) in cases {
         let output = common::run_bounded(
-            std::process::Command::new(&exe)
-                .args([
-                    "--exact",
-                    "probe_unreceived_supervisor",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(UNRECEIVED, format!("{entry} {pid_namespace}"))
-                .stdin(HostStdio::null())
-                .stdout(HostStdio::piped())
-                .stderr(HostStdio::piped()),
+            common::rerun("probe_unreceived_supervisor")
+                .env(UNRECEIVED, format!("{entry} {pid_namespace}")),
             Duration::from_secs(120),
         );
         let stdout = String::from_utf8_lossy(&output.stdout);

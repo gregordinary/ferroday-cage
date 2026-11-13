@@ -10,7 +10,9 @@
 //! helper.
 #![allow(unused_imports, dead_code)]
 
-pub use ferroday_cage_testkit::process::{cpu_ticks, finish_bounded, run_bounded, spawn_grouped};
+pub use ferroday_cage_testkit::process::{
+    cpu_ticks, finish_bounded, rerun, run_bounded, spawn_grouped,
+};
 pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;
 pub use ferroday_cage_testkit::scratch::scratch_dir;

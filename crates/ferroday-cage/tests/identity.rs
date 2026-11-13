@@ -1040,6 +1040,7 @@ fn provision_remove_deletes_a_subordinate_owned_tree() {
 #[cfg(feature = "subid")]
 #[test]
 fn a_nested_cage_writes_its_own_range_map() {
+    use std::os::unix::process::CommandExt as _;
     use std::process::Command;
 
     // The inner run: already inside the range-mapped outer namespace, where
@@ -1100,7 +1101,7 @@ fn a_nested_cage_writes_its_own_range_map() {
         return;
     }
     let exe = std::env::current_exe().expect("the test binary path");
-    let output = Command::new("unshare")
+    let started = Command::new("unshare")
         .args([
             "--setgroups",
             "allow",
@@ -1110,11 +1111,15 @@ fn a_nested_cage_writes_its_own_range_map() {
             "--",
         ])
         .arg(&exe)
-        .args(["--exact", "a_nested_cage_writes_its_own_range_map"])
+        .args(common::rerun_args("a_nested_cage_writes_its_own_range_map"))
         .env("FERRODAY_CAGE_NESTED_INNER", "1")
-        .output();
-    let output = match output {
-        Ok(output) => output,
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn();
+    let output = match started {
+        Ok(child) => common::finish_bounded(child, std::time::Duration::from_secs(120)),
         Err(err) => {
             common::require::SUBID.skip(format!("the host unshare could not run: {err}"));
             return;

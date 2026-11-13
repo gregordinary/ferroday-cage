@@ -1043,17 +1043,13 @@ mod tests {
         // The child's output goes to pipes, which the limit does not cover. An
         // inherited standard output may be a file already past it, and the
         // harness's own report would then fail to be written.
-        let child = std::process::Command::new(
-            std::env::current_exe().expect("the test binary has a path"),
-        )
-        .args([
-            "--exact",
-            "provision::cache::tests::a_staging_file_that_refuses_a_write_is_a_host_failure",
-            "--test-threads=1",
-        ])
-        .env(FILE_SIZE_LIMITED, dir.path())
-        .output()
-        .expect("the child test process runs");
+        let child = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun(
+                "provision::cache::tests::a_staging_file_that_refuses_a_write_is_a_host_failure",
+            )
+            .env(FILE_SIZE_LIMITED, dir.path()),
+            std::time::Duration::from_secs(60),
+        );
         assert!(
             child.status.success(),
             "the child process failed: {}\n{}{}",

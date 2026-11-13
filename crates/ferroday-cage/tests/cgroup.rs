@@ -729,7 +729,7 @@ fn a_restricted_command_can_neither_lift_its_limit_nor_leave_its_tree() {
     // on the cgroup hierarchy, and clone3 answered with an errno.
     let output = common::grant_system_trees(Restriction::builder())
         .command(&exe)
-        .args(["--exact", "probe_reach", "--nocapture", "--test-threads=1"])
+        .args(common::rerun_args("probe_reach"))
         .env(REACH_PROBE, "restriction")
         .env(REACH_OUTSIDE, &outside)
         .landlock_fs(
@@ -775,7 +775,7 @@ fn a_caged_command_mounting_its_cgroup_namespace_sees_no_limit_to_lift() {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let output = common::host_userland()
         .command(REACH_PROBE_PATH)
-        .args(["--exact", "probe_reach", "--nocapture", "--test-threads=1"])
+        .args(common::rerun_args("probe_reach"))
         .env(REACH_PROBE, "cage")
         .resolv_conf(false)
         .bind_ro(&exe, REACH_PROBE_PATH)
@@ -994,19 +994,8 @@ fn a_launch_in_a_cgroup_leaves_the_callers_closed_streams_closed() {
     // The probe is a copy of this test binary, since closing a standard
     // descriptor is process-wide. It starts in this process's leaf, so its
     // sandboxes' cgroups are made beneath the parent as this process's are.
-    let exe = std::env::current_exe().expect("the test binary has a path");
     let output = common::run_bounded(
-        std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "probe_closed_streams",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CLOSED_STREAMS_PROBE, parent)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
+        common::rerun("probe_closed_streams").env(CLOSED_STREAMS_PROBE, parent),
         Duration::from_secs(120),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);

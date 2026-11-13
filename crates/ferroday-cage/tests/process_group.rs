@@ -59,12 +59,8 @@ fn script(scenario: &str) -> &'static str {
 
 /// A command line running this test binary's `test` alone, in `role`.
 fn rerun(test: &str, role: &str, scenario: &str) -> Command {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let mut command = Command::new(exe);
-    command
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
-        .env(ROLE, role)
-        .env(SCENARIO, scenario);
+    let mut command = common::rerun(test);
+    command.env(ROLE, role).env(SCENARIO, scenario);
     command
 }
 
@@ -99,7 +95,12 @@ fn helper_shell() {
     };
     let pipeline = scenario == "pipeline";
     let mut caller = rerun("helper_caller", "caller", &scenario);
-    caller.process_group(0);
+    // The caller stands at the shell's terminal, as a job a shell starts does.
+    caller
+        .process_group(0)
+        .stdin(HostStdio::inherit())
+        .stdout(HostStdio::inherit())
+        .stderr(HostStdio::inherit());
     if pipeline {
         caller.stdout(HostStdio::piped());
     }

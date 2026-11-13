@@ -4244,17 +4244,13 @@ mod tests {
         }
 
         let dir = Scratch::new("alpine-nofile");
-        let child = std::process::Command::new(
-            std::env::current_exe().expect("the test binary has a path"),
-        )
-        .args([
-            "--exact",
-            "provision::alpine::tests::a_closure_larger_than_the_open_file_limit_installs",
-            "--test-threads=1",
-        ])
-        .env(NOFILE_LIMITED, dir.path())
-        .output()
-        .expect("the child test process runs");
+        let child = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun(
+                "provision::alpine::tests::a_closure_larger_than_the_open_file_limit_installs",
+            )
+            .env(NOFILE_LIMITED, dir.path()),
+            std::time::Duration::from_secs(120),
+        );
         assert!(
             child.status.success(),
             "the child process failed: {}\n{}{}",

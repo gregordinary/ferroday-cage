@@ -35,9 +35,6 @@ use ferroday_cage::Cage;
 /// [`probe_keys`] reads, which makes that test probe rather than return.
 const PROBE: &str = "FERRODAY_CAGE_TEST_KEYRING_PROBE";
 
-/// The arguments that run [`probe_keys`] alone.
-const PROBE_ARGS: [&str; 4] = ["--exact", "probe_keys", "--nocapture", "--test-threads=1"];
-
 /// Where a sandbox binds this test binary.
 const PROBE_PATH: &str = "/probe";
 
@@ -465,7 +462,7 @@ fn assert_keys_unreadable_under(
         let exe = std::env::current_exe().expect("the test binary has a path");
         let direct = common::run_bounded(
             std::process::Command::new(&exe)
-                .args(PROBE_ARGS)
+                .args(common::rerun_args("probe_keys"))
                 .env(PROBE, &serial)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped()),
@@ -512,7 +509,7 @@ fn a_sandbox_under_a_policy_refusing_the_join_cannot_read_the_callers_keys() {
             let exe = std::env::current_exe().expect("the test binary has a path");
             let output = common::host_userland()
                 .command(PROBE_PATH)
-                .args(PROBE_ARGS)
+                .args(common::rerun_args("probe_keys"))
                 .env(PROBE, serial)
                 .resolv_conf(false)
                 .bind_ro(&exe, PROBE_PATH)
@@ -540,7 +537,7 @@ fn a_restriction_under_a_policy_refusing_the_join_cannot_read_the_callers_keys()
             let exe = std::env::current_exe().expect("the test binary has a path");
             let mut builder = Restriction::builder()
                 .command(&exe)
-                .args(PROBE_ARGS)
+                .args(common::rerun_args("probe_keys"))
                 .env(PROBE, serial)
                 .landlock_fs(
                     FsAccess::READ | FsAccess::EXECUTE,
