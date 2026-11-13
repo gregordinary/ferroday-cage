@@ -2628,7 +2628,7 @@ pub enum AlpineError {
     /// reader refuses.
     #[non_exhaustive]
     Container {
-        /// What was being read: a package's path, or the URL of an index.
+        /// What was being read: a package's file name, or the URL of an index.
         subject: String,
         /// What was wrong with it.
         reason: String,
@@ -2641,7 +2641,8 @@ pub enum AlpineError {
     /// the signature member was refused on its own terms.
     #[non_exhaustive]
     Signature {
-        /// What was being verified: a package's path, or the URL of an index.
+        /// What was being verified: a package's file name, or the URL of an
+        /// index.
         subject: String,
         /// Why the signature was not accepted.
         reason: String,
@@ -2659,8 +2660,7 @@ pub enum AlpineError {
     /// package's `.PKGINFO` states, as it spells it.
     #[non_exhaustive]
     Digest {
-        /// What was being checked: a package's file name, or the identity of
-        /// its control segment.
+        /// The file name of the package that was checked, in either case.
         subject: String,
         /// The digest that was expected, as the archive spells it.
         expected: String,

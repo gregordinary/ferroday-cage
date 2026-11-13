@@ -335,8 +335,10 @@ impl Signatures {
     /// and verifies is the answer. A member naming a key the repository does not
     /// trust is passed over rather than refused — that is the whole of what
     /// makes a rotation-era container readable — so a segment nothing verifies
-    /// is reported against the last member that got as far as being checked,
-    /// and against the whole segment where none did.
+    /// is reported against the last member that got as far as being checked.
+    /// Where none did, it is reported against the first member, by the key it
+    /// names that the repository does not hold or the algorithm it names that
+    /// this reader does not implement.
     ///
     /// `apk` passes over an untrusted member too, and stops at the first
     /// member whose key it holds: that one signature is verified, and its
@@ -348,8 +350,8 @@ impl Signatures {
     /// # Errors
     ///
     /// Returns [`AlpineError::Signature`] where no member verifies: naming the
-    /// failure of the last one that could be attempted, or reporting that no
-    /// member names a key this repository holds.
+    /// failure of the last one that could be attempted, or the first member's
+    /// key or algorithm where none could be.
     pub(super) fn verify(
         &self,
         subject: &str,
@@ -372,13 +374,13 @@ impl Signatures {
         }
         match attempted {
             Some(Err(err)) => Err(err),
-            // Every member both named a held key and verified, which the loop
-            // above returns from, so this is unreachable; it is written as an
-            // error rather than a panic because a `Signatures` is built from
-            // whatever a mirror served.
+            // Every member sets `attempted` or returns, so this is a segment
+            // with no member, which `parse` refuses. It is written as an error
+            // rather than a panic because a `Signatures` is built from whatever
+            // a mirror served.
             _ => Err(AlpineError::signature(
                 subject,
-                "its signature segment holds no member that could be checked".to_string(),
+                "its signature segment holds no members".to_string(),
             )),
         }
     }
