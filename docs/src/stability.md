@@ -15,30 +15,20 @@ by entry, in the [changelog](https://github.com/gregordinary/ferroday-cage/blob/
 compatibility contract is its flags, exit codes, and output format, so a
 library release does not move it and a library break does not force one.
 
-### The userlands version with the library, deliberately
+### The userlands version with the library
 
 `provision::debian`, `provision::alpine` and `provision::gentoo` are a little
 over a third of the library's public functions, and their shape is driven by
-three external archives' formats rather than by this library's design. That is
-the part of the surface most likely to have to move, tied to the version number
-of the part least likely to: a Debian layer that has to break to follow a change
-in the archive breaks the whole library's minor version with it.
+three external archives' formats rather than by this library's design. They
+version with the library: a Debian layer that has to break to follow a change in
+the archive breaks the whole library's minor version with it.
 
-They are in the library because nothing has needed that break. Four crates
-cost four release cycles and four sets of feature plumbing. A separate crate
-would also need items that are internal now to become public.
-
-Two things would settle it. A userland needing a breaking change the rest of the
-library does not is the direct one. So is a consumer who wants one archive
-format without the others' dependency weight.
-
-What keeps the decision cheap is that the layers already sit on
-a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
-tar, compress, extract, digest, document and OpenPGP machinery -- and reach
-around it in forty places, twelve of which are internal. `tools/seam.toml`
-records every one with what it would cost, `tools/check-seam.py` fails on any
-difference, and a layer naming another layer is refused outright. A split, when
-it comes, is that list plus the mechanical work.
+The layers sit on a seam: `Provisioner`, `Fetch`, `ProvisionError`,
+`BuildLayer`, and the shared tar, compress, extract, digest, document and
+OpenPGP machinery. `tools/seam.toml` records every place a layer reaches around
+it, with what each would cost a layer that was a crate of its own, and whether
+it is public API already or internal. `tools/check-seam.py` fails on any
+difference from that record, and refuses a layer naming another layer outright.
 
 ## What the Rust API promises
 

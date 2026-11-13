@@ -8,11 +8,11 @@ public functions are behind that seam, driven by three external archives'
 formats -- the part of the surface most likely to have to move, tied to the
 version number of the part least likely to.
 
-Whether those layers ever become crates of their own is a decision for later;
-`docs/src/stability.md` records it and what would force it. What this keeps true
-in the meantime is that the decision stays cheap. A layer that reaches only
-through `provision` is one that could move; every other name it uses is a thing
-that would first have to move with it, become public, or be copied.
+The layers version with the library, as `docs/src/stability.md` records. What
+this keeps true is that one could become a crate of its own cheaply. A layer
+that reaches only through `provision` is one that could move; every other name
+it uses is a thing that would first have to move with it, become public, or be
+copied.
 
 `tools/seam.toml` records those reaches, one per name, with what each would
 cost. This compares the record against the tree and fails on any difference. It

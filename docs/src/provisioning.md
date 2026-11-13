@@ -798,10 +798,8 @@ every later run finds it published. But a sandbox writes into the root it is
 given. A bind mount creates its target inside the tree when the target does not
 exist. A `bind("/host/data", "/work")` therefore makes `/work` there, and the
 directory stays on the host after the sandbox exits. Over many runs with
-different binds,
-a shared root accretes empty mount-point directories. This project's own test
-fixture shows it: an Alpine root the tests treat as read-only has picked up
-`/candidates`, `/raw`, and `/work` from bind targets.
+different binds, a shared root accretes empty mount-point directories, one for
+each bind target it did not already hold.
 
 Nothing is broken by this, since the directories are empty and the next run
 reuses them. But a root meant to be pristine no longer is, and it drifts from

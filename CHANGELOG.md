@@ -256,13 +256,9 @@ consumer upgrading can skip it.
 - `Running::usage` reports what the command and its descendants used once a
   wait has returned the outcome, as a `ResourceUsage`: user and system processor
   time, and the largest peak resident set size one process reached. `Output`
-  carries it as `usage`. The supervisor reads it after collecting the command's
-  exit, so it covers every process collected by then, which under a PID
-  namespace includes the orphans the init collected. A kill under a PID
-  namespace leaves these three fields `None`. The peak is never below the
-  resident set the calling process had at the launch: the command's image
-  before its `execve` is a copy of the caller, and the kernel counts the
-  replaced image's peak toward the command.
+  carries it as `usage`. A kill under a PID namespace leaves these three fields
+  `None`, and the peak is never below the resident set the calling process had
+  at the launch.
 - `CageBuilder::empty_rootfs` roots a sandbox on an empty tmpfs of its own, for
   a sandbox composed from binds that needs no root directory on the host. The
   launch writes nothing on the host, and the root itself becomes read-only once
@@ -325,39 +321,23 @@ consumer upgrading can skip it.
   thread on it. The embedding chapter gives the recipe for tokio.
 - Cgroup limits and whole-tree accounting. `CageBuilder::cgroup_parent` and
   `RestrictionBuilder::cgroup_parent` place each launch in a cgroup of its own
-  beneath a delegated cgroup v2 directory, which the launch stage joins before
-  it creates any namespace. `cgroup_limit` holds the whole tree to a
-  `CgroupLimit`: `memory.max`, `memory.swap.max`, `pids.max`, `cpu.max`, or
-  `cpu.weight`. `ResourceUsage` gains the tree's processor time, peak memory,
-  peak process count and OOM kills, read from the cgroup, and reported for a
-  killed sandbox as well. `Running::kill` and `KillHandle::kill` also write
-  `cgroup.kill`, which reaches descendants that left the command's process tree,
-  before the outcome or after it. The handle removes the cgroup once the outcome
-  is known and nothing is left in it. Where a process the command left behind
-  still holds it then, the last of the handle and its kill handles to drop
-  removes it after a kill, once the tree has emptied, waiting up to five seconds
-  for it. Under `stop_with_caller`, dropping the last of them ends the tree
-  through `cgroup.kill` and removes the cgroup the same way. A cgroup still
-  holding a process nothing killed stays beneath the parent. A launch the parent
-  cannot serve fails with `Error::CgroupRefused` and
-  a `CgroupRefusal`: a parent that is missing, outside a cgroup v2 hierarchy,
-  read-only, not delegated to the caller, lacking a controller, or holding
-  processes, a kernel without a limit's file, or a caller the launch cannot move
-  from into the parent's subtree. A host failure preparing the cgroup fails with
-  `Error::Cgroup`, and a value the kernel would refuse with
-  `ConfigError::CgroupLimitInvalid`. `SetupStep::JoinCgroup` is the step that
-  joins it. A limit with no parent is refused at build, unless
-  `cgroup_required(false)` on either builder says the limits are not required:
-  the launch then runs without them, `ResolvedInputs::cgroup` reports them as
-  `ResolvedCgroup::NotApplied`, and `fcage` says so on standard error.
-  `ResolvedInputs::cgroup` reports an applied cgroup and its limits as
-  `ResolvedCgroup::Applied`. `host::cgroup_blocker` answers whether a launch
-  beneath a parent with given limits would be refused, and why, by the launch's
-  own steps, and `host::own_cgroup` names the cgroup the calling process runs
-  in. Profiles take a `[cgroup]` table, `required` among its keys, which
-  `RestrictedProfile` refuses where it names a parent, and `fcage` takes
-  `--cgroup-parent DIR`, `--cgroup LIMIT=VALUE`, and `--cgroup-required` and
-  `--no-cgroup-required`.
+  beneath a delegated cgroup v2 directory, and `cgroup_limit` holds the whole
+  tree to a `CgroupLimit`: `memory.max`, `memory.swap.max`, `pids.max`,
+  `cpu.max`, or `cpu.weight`. `ResourceUsage` gains the tree's processor time,
+  peak memory, peak process count and OOM kills. `Running::kill` and
+  `KillHandle::kill` also write `cgroup.kill`, and the cgroup is removed once its
+  tree has emptied. A launch the parent cannot serve fails with
+  `Error::CgroupRefused` and a `CgroupRefusal`, a host failure preparing the
+  cgroup with `Error::Cgroup`, and a value the kernel would refuse with
+  `ConfigError::CgroupLimitInvalid`; `SetupStep::JoinCgroup` is the step that
+  joins it. A limit with no parent is refused at build unless
+  `cgroup_required(false)` says the limits are not required.
+  `ResolvedInputs::cgroup` reports the cgroup as `ResolvedCgroup::Applied` or
+  `ResolvedCgroup::NotApplied`, `host::cgroup_blocker` answers whether a launch
+  beneath a parent would be refused, and `host::own_cgroup` names the caller's
+  own. Profiles take a `[cgroup]` table, which `RestrictedProfile` refuses where
+  it names a parent, and `fcage` takes `--cgroup-parent DIR`,
+  `--cgroup LIMIT=VALUE`, `--cgroup-required` and `--no-cgroup-required`.
 - An `agent-tools` example and a guide chapter for it: a sandbox for a coding
   agent's tool commands, over the host's own root or an empty one, with the
   working tree writable and its hooks read-only, the caller's own identity, one

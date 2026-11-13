@@ -1633,8 +1633,8 @@ therefore pays one handshake rather than a few hundred.
 A bootstrap is nearly all network on a cold cache. The packages it is about to
 install are therefore asked for in batches through `Fetch::fetch_all`, before
 the package-by-package wave runs. That method has a default body, one `fetch`
-per job in order. A transport that overrides nothing therefore behaves exactly
-as it did before it existed.
+per job in order. A transport that overrides nothing therefore fetches a batch
+one job after another, as `fetch` alone would.
 
 `HttpFetch` overrides it and runs four at once, each on a connection of its own.
 `HttpFetch::concurrency` changes how many. The ceiling is deliberately low. An

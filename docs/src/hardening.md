@@ -196,8 +196,9 @@ right, so it opens a socket directory without closing the rest of the
 filesystem. In a profile the grant's access letter is `u`, and the setting is
 `resolve-unix` in the `[hardening]` table.
 
-The restriction is off by default, so a sandbox's existing grants behave as
-they did. The [host's own root](how-the-sandbox-is-built.md#the-hosts-own-root)
+The restriction is off by default: without it, a sandbox's Landlock grants
+leave connecting to a pathname socket unrestricted, as a kernel before ABI 9
+does. The [host's own root](how-the-sandbox-is-built.md#the-hosts-own-root)
 turns it on, since that root leaves the host's sockets in view wherever no hide
 covers them.
 

@@ -238,7 +238,7 @@ println!("{} packages", installed.len());
 # }
 ```
 
-### Which build, and why the rule is that rule
+### Which build
 
 The archive publishes a version more than once. `binpkg-multi-instance` gives
 2,774 of the index's versions between two and twenty-four builds. Those builds
@@ -247,21 +247,11 @@ depend on. `dev-vcs/git` is the clean illustration: the build without `keyring`
 pulls twelve packages, and the build with it pulls seventy through the GTK
 stack.
 
-Choosing among them is therefore not a tie-break, it decides whether resolution
-succeeds at all. Measured over four hundred sampled package names against an
-`amd64-openrc` stage3:
-
-| Rule | Resolves cleanly | Unsatisfiable atoms | Conflicts | p90 closure |
-| --- | --- | --- | --- | --- |
-| newest build time | 262/400 | 884 | 129 | 173 |
-| fewest dependencies | 338/400 | 206 | 74 | 148 |
-| **fewest USE flags** | **361/400** | **26** | **50** | **126** |
-
-Fewest USE flags wins every column at once, which is the argument for it: it is
-not a trade. Portage makes the same choice from a profile's computed USE. This
-layer has no profile, so it needs a rule of its own, and this is the one the
-numbers chose. Each atom takes the highest version that satisfies it and then
-the fewest-flags build of that version.
+Choosing among them therefore decides whether resolution succeeds at all. Each
+atom takes the highest version that satisfies it and then the build of that
+version with the fewest USE flags, which asks least of the rest of the root.
+Portage makes the same choice from a profile's computed USE, and this layer has
+no profile, so the flags a build was compiled with stand in for one.
 
 ### A constraint fails loudly; a preference cannot
 
@@ -316,11 +306,10 @@ conflict, and the run fails naming both sides. The root's own packages state
 blockers too, in their database entries. One that matches a chosen build is the
 same conflict from the other side.
 
-There is no backtracking, and the evidence is why. An any-of policy that preferred a non-conflicting alternative
-changed nothing over the same four hundred seeds. The conflicts that remain are
-ones portage refuses too. Almost all are a desktop stack asked for in a root
-built against the other init system. The commonest single case, 27 of the 50, is
-`!sys-apps/sysvinit` meeting the openrc stage3's own `sys-apps/sysvinit`.
+There is no backtracking. The conflicts a resolution meets are ones portage
+refuses too. Almost all are a desktop stack asked for in a root built against
+the other init system, the commonest being `!sys-apps/sysvinit` meeting the
+openrc stage3's own `sys-apps/sysvinit`.
 
 Every refusal is reported before the run fails, so a caller fixing an install
 list sees the whole list rather than its first entry. Each names which wall it
@@ -617,8 +606,8 @@ vendored release certificates
 
 The subkey that signs a `Manifest` is the same one that signs
 `latest-stage3.txt` and the `.DIGESTS` documents. The binary-package half
-therefore adds no trust anchor, no keyring and no verification path.
-`Keyring::verify` is called on one more document.
+therefore adds no trust anchor, no keyring and no verification path. The same
+verification runs over one more document.
 
 **The index is not signed, and nothing about that is fixable.** No
 `Packages.gpg`, `.asc`, `.sig`, `Manifest` or `.DIGESTS` is published beside it

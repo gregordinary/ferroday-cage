@@ -274,7 +274,7 @@ Two further gates matter when the public API moves:
   either kind of reach would go unseen. The
   [stability
   chapter](https://gregordinary.github.io/ferroday-cage/stability.html) records
-  the decision itself and what would settle it.
+  how the userlands version with the library.
 
 One gate deliberately does not run here. `tools/check-keyrings.py` compares each
 vendored trust anchor against what its distribution publishes today, and it
