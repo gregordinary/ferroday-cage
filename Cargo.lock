@@ -685,7 +685,7 @@ checksum = "eb53b18ade783ba88f5eb383735fbfc83b8816b5b1e6ed4bd3314ad58f372f6f"
 
 [[package]]
 name = "ferroday-cage"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "ferrata",
  "ferroday-cage-testkit",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "ferroday-cage-cli"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "ferroday-cage",
  "ferroday-cage-testkit",

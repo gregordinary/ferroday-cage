@@ -25,6 +25,13 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-13
+
+`fcage` 0.7.0. Entries below marked **Breaking.** change the library's API and
+behaviour and `fcage`'s flags, exit codes and output, so both take a new minor
+version. `fcage` requires library 0.6.0. The library requires irongall 0.2.0,
+and its `alpine` feature ferrata 0.1.0.
+
 ### Security
 
 - **Breaking.** A sandbox with a network namespace of its own, under
@@ -3615,7 +3622,8 @@ Initial public release. The [README](README.md) describes what the library
 does, and the [guide](https://gregordinary.github.io/ferroday-cage/) covers
 it in full.
 
-[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/gregordinary/ferroday-cage/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/gregordinary/ferroday-cage/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/gregordinary/ferroday-cage/compare/v0.4.5...v0.5.0
