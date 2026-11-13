@@ -8,10 +8,12 @@
 //! concrete file entries with their effective path, link target, size, and
 //! times. Header checksums are verified.
 //!
-//! The writing side is here too, as [`ustar_block`]: one header block, its
-//! checksum, and the padding that follows an entry's data. It is the whole of
+//! The writing side is here too: [`ustar_block`], one header block and its
+//! checksum; [`pad`], the padding that follows an entry's data; and
+//! [`pax_record`], one record of a pax extended header. They are the whole of
 //! what a writer shares with a reader, and keeping the two in one module is
-//! what stops the field offsets being written down twice.
+//! what stops the field offsets and the record framing being written down
+//! twice.
 //!
 //! v7 is a subset rather than a separate format: the first 257 bytes of a
 //! header are laid out identically, and what v7 lacks is everything after them
@@ -1132,6 +1134,33 @@ pub(crate) const MAX_USTAR_MTIME: i64 = (1 << 33) - 1;
 /// a clamped placeholder the reader ignores, the way an out-of-range time does.
 pub(crate) const MAX_USTAR_ID: u32 = (1 << 21) - 1;
 
+/// A pax extended-header record, `<length> <key>=<value>` and a newline, whose
+/// length counts the whole record, its own digits included.
+///
+/// The framing [`parse_pax`] reads, written once for every writer: an export's
+/// records, and every test that builds a record by hand.
+pub(crate) fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+    // Everything but the leading length digits: a space, the key, `=`, the
+    // value, and a newline.
+    let content = 1 + key.len() + 1 + value.len() + 1;
+    let mut length = content + 1;
+    loop {
+        let total = length.to_string().len() + content;
+        if total == length {
+            break;
+        }
+        length = total;
+    }
+    let mut out = Vec::with_capacity(length);
+    out.extend_from_slice(length.to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(key);
+    out.push(b'=');
+    out.extend_from_slice(value);
+    out.push(b'\n');
+    out
+}
+
 /// Writes the zero padding after `size` bytes of data, up to the next block.
 pub(crate) fn pad(out: &mut impl Write, size: u64) -> io::Result<()> {
     let rem = (size % BLOCK) as usize;
@@ -1297,16 +1326,7 @@ mod tests {
             ),
             (b"SCHILY.xattr.user.comment", b"ignored"),
         ] {
-            let mut record = key.to_vec();
-            record.push(b'=');
-            record.extend_from_slice(value);
-            record.push(b'\n');
-            let mut length = record.len() + 3;
-            if length.to_string().len() + 1 + record.len() != length {
-                length += 1;
-            }
-            data.extend_from_slice(format!("{length} ").as_bytes());
-            data.extend_from_slice(&record);
+            data.extend_from_slice(&pax_record(key, value));
         }
         let records = parse_pax(&data).unwrap();
         assert_eq!(records.acl_access.as_deref(), Some(&b"\x02\0\0\0list"[..]));
@@ -1314,6 +1334,24 @@ mod tests {
             records.acl_default.as_deref(),
             Some(&b"\x02\0\0\0default"[..])
         );
+    }
+
+    #[test]
+    fn pax_record_length_is_self_counting() {
+        // "SCHILY.xattr.security.capability" = 32-byte value, per the spec's
+        // self-referential length.
+        let record = pax_record(b"path", b"x");
+        // "9 path=x\n" — the 9 counts the whole record, itself included.
+        assert_eq!(record, b"9 path=x\n");
+        // A record whose length crosses a digit boundary still self-counts.
+        let value = "y".repeat(90);
+        let record = pax_record(b"path", value.as_bytes());
+        let space = record.iter().position(|b| *b == b' ').unwrap();
+        let declared: usize = std::str::from_utf8(&record[..space])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(declared, record.len());
     }
 
     #[test]

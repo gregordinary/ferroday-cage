@@ -2107,6 +2107,7 @@ mod naming_tests {
 #[cfg(test)]
 mod list_tests {
     use super::{Placement, TarReader, extract_archive};
+    use crate::provision::tar::pax_record;
     use crate::scratch::Scratch;
     use ferroday_cage_testkit::tar::Tar;
     use std::os::unix::fs::PermissionsExt;
@@ -2135,16 +2136,6 @@ mod list_tests {
             (0x10, 6, NONE),
             (0x20, 0, NONE),
         ])
-    }
-
-    /// One pax record, its value bytes as they stand.
-    fn record(key: &[u8], value: &[u8]) -> Vec<u8> {
-        let content = [b" ", key, b"=", value, b"\n"].concat();
-        let mut length = content.len();
-        while length.to_string().len() + content.len() != length {
-            length = length.to_string().len() + content.len();
-        }
-        [length.to_string().as_bytes(), &content].concat()
     }
 
     /// `user::rwx,user:<named>:rwx,group::---,mask::rwx,other::---`, a
@@ -2218,12 +2209,12 @@ mod list_tests {
         let mut tar = Tar::new();
         pax(
             &mut tar,
-            &record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
+            &pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
         );
         tar.file("shared", 0o660, b"for root\n");
         pax(
             &mut tar,
-            &record(b"SCHILY.xattr.system.posix_acl_access", &masked(4242)),
+            &pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(4242)),
         );
         tar.file("narrowed", 0o4660, b"for someone else\n");
         // A directory's default list waits for the deferred pass, so the file
@@ -2231,8 +2222,8 @@ mod list_tests {
         pax(
             &mut tar,
             &[
-                record(b"SCHILY.xattr.system.posix_acl_access", &masked_dir(0)),
-                record(b"SCHILY.xattr.system.posix_acl_default", &masked_dir(0)),
+                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked_dir(0)),
+                pax_record(b"SCHILY.xattr.system.posix_acl_default", &masked_dir(0)),
             ]
             .concat(),
         );
@@ -2280,7 +2271,7 @@ mod list_tests {
         let mut tar = Tar::new();
         pax(
             &mut tar,
-            &record(b"SCHILY.xattr.system.posix_acl_access", b"not a list"),
+            &pax_record(b"SCHILY.xattr.system.posix_acl_access", b"not a list"),
         );
         tar.file("file", 0o640, b"x");
         let err = extract_archive(

@@ -35,7 +35,7 @@ use super::containment;
 use super::identity::compose_child_map;
 use super::tar::{
     BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
-    ustar_block, xattr_keyword,
+    pax_record, ustar_block, xattr_keyword,
 };
 use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
@@ -1023,41 +1023,6 @@ fn split_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
     None
 }
 
-/// Builds a pax extended-header record: `"<len> key=value\n"`, where `len`
-/// counts the whole record including its own digits.
-fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
-    // Everything but the leading length digits: a space, the key, `=`, the
-    // value, and a newline.
-    let content = 1 + key.len() + 1 + value.len() + 1;
-    let mut len = content + 1;
-    loop {
-        let total = decimal_len(len) + content;
-        if total == len {
-            break;
-        }
-        len = total;
-    }
-    let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(len.to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(key);
-    out.push(b'=');
-    out.extend_from_slice(value);
-    out.push(b'\n');
-    out
-}
-
-/// The number of decimal digits in `n`.
-fn decimal_len(n: usize) -> usize {
-    let mut digits = 1;
-    let mut v = n;
-    while v >= 10 {
-        v /= 10;
-        digits += 1;
-    }
-    digits
-}
-
 // Frame decoding: the little-endian shapes the child emits.
 
 fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
@@ -1341,24 +1306,6 @@ mod tests {
         let mut reader = TarReader::in_memory(&buf[..]);
         let entry = reader.next_entry().unwrap().unwrap();
         assert_eq!(entry.path, long.as_bytes());
-    }
-
-    #[test]
-    fn pax_record_length_is_self_counting() {
-        // "SCHILY.xattr.security.capability" = 32-byte value, per the spec's
-        // self-referential length.
-        let record = pax_record(b"path", b"x");
-        // "9 path=x\n" — the 9 counts the whole record, itself included.
-        assert_eq!(record, b"9 path=x\n");
-        // A record whose length crosses a digit boundary still self-counts.
-        let value = "y".repeat(90);
-        let record = pax_record(b"path", value.as_bytes());
-        let space = record.iter().position(|b| *b == b' ').unwrap();
-        let declared: usize = std::str::from_utf8(&record[..space])
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(declared, record.len());
     }
 
     #[test]

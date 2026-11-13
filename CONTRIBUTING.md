@@ -487,6 +487,7 @@ report name a package and its version bare.
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
 | Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
+| Write a tar header block, or one pax extended-header record | `provision::tar::ustar_block`, `tar::pax_record` |
 | Which compression does a stream begin with, and what does it decode to? | `provision::compress::decoder`, or `compress::Codec::of` for a document already in memory |
 | Decompress a document held in memory, bounded, telling a stream the decoder refuses from one that decodes past the bound | `provision::compress::inflate` |
 | Fill a buffer from a reader, short only at the end of its input | `provision::compress::read_fully` |
