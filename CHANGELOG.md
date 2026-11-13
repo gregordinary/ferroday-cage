@@ -827,6 +827,12 @@ consumer upgrading can skip it.
   marker once decompressed, where it was refused past one. GNU `tar -b 4096`
   pads its archive to two-mebibyte records, which was refused. A plain archive
   is read to its marker and no further, where it was read on for nothing.
+- `AlpineError::Collision` quotes the path the two packages ship with `{:?}`,
+  and a base layer refused because a package watching paths has no archived
+  trigger script quotes the paths it watches. The first is an archive entry's
+  own spelling and the second a line of the base's `triggers` file, which the
+  base's own scripts can rewrite; each reached the terminal raw, control
+  characters included.
 
 ### Internal
 

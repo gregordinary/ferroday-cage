@@ -2838,8 +2838,8 @@ impl fmt::Display for AlpineError {
                 directory: None,
             } => write!(
                 f,
-                "{claimant} and {owner} both ship {path}, and neither declares that it replaces \
-                 the other",
+                "{claimant} and {owner} both ship {path:?}, and neither declares that it \
+                 replaces the other",
             ),
             AlpineError::Collision {
                 owner,
@@ -2848,7 +2848,7 @@ impl fmt::Display for AlpineError {
                 directory: Some(_),
             } if owner == claimant => write!(
                 f,
-                "{claimant} ships {path} both as a directory and as an entry that is not one",
+                "{claimant} ships {path:?} both as a directory and as an entry that is not one",
             ),
             AlpineError::Collision {
                 owner,
@@ -2859,8 +2859,8 @@ impl fmt::Display for AlpineError {
                 let other = if directory == owner { claimant } else { owner };
                 write!(
                     f,
-                    "{directory} ships {path} as a directory and {other} as an entry that is not \
-                     one, which no replaces settles",
+                    "{directory} ships {path:?} as a directory and {other} as an entry that is \
+                     not one, which no replaces settles",
                 )
             }
             AlpineError::Script {
@@ -5365,8 +5365,8 @@ mod tests {
         };
         assert_eq!(
             kinds.to_string(),
-            "two ships usr/lib/thing as a directory and one as an entry that is not one, which \
-             no replaces settles",
+            "two ships \"usr/lib/thing\" as a directory and one as an entry that is not one, \
+             which no replaces settles",
         );
         let itself = AlpineError::Collision {
             owner: "one".to_string(),
@@ -5376,8 +5376,26 @@ mod tests {
         };
         assert_eq!(
             itself.to_string(),
-            "one ships usr/lib/thing both as a directory and as an entry that is not one",
+            "one ships \"usr/lib/thing\" both as a directory and as an entry that is not one",
         );
+    }
+
+    #[test]
+    fn a_collision_quotes_the_path_its_archives_named() {
+        // The path is an archive entry's name, which nothing vouches for, so a
+        // control character in it reaches the rendering escaped.
+        let path = format!("usr/lib/{}", crate::failure::hostile::TEXT);
+        // Two files, two kinds of entry, and one package shipping both kinds:
+        // each of the three renderings.
+        for (claimant, directory) in [("two", None), ("two", Some("two")), ("one", Some("one"))] {
+            let collision = AlpineError::Collision {
+                owner: "one".to_string(),
+                claimant: claimant.to_string(),
+                path: path.clone(),
+                directory: directory.map(str::to_string),
+            };
+            crate::failure::hostile::assert_escaped(&collision.to_string());
+        }
     }
 
     #[test]

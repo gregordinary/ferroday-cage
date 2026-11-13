@@ -350,8 +350,11 @@ impl Base {
                         .map(|(_, member)| *member)
                 })
                 .ok_or_else(|| {
+                    // The patterns are the triggers file's, which the base's own
+                    // scripts can write, so they are quoted; the name is one
+                    // the database's records are held to an alphabet for.
                     self.refusal(format!(
-                        "{} watches {} and its archived trigger script is not in \
+                        "{} watches {:?} and its archived trigger script is not in \
                          {DB_DIR}/{SCRIPTS}",
                         record.name,
                         patterns.join(" "),
@@ -752,6 +755,30 @@ mod tests {
             matches!(&err, AlpineError::Config { reason } if reason.contains(&name)),
             "{err}",
         );
+    }
+
+    #[test]
+    fn a_watched_path_reaches_a_refusal_quoted() {
+        // The triggers file is one the base's own scripts can rewrite, so a
+        // pattern carrying a terminal escape is named escaped when the base is
+        // refused over it.
+        let (identity, _, _) = first_record();
+        let hostile = crate::failure::hostile::TEXT;
+        let dir = root(
+            "base-trigger-hostile",
+            &[
+                (&format!("{DB_DIR}/{INSTALLED}"), minirootfs()),
+                (
+                    &format!("{DB_DIR}/{TRIGGERS}"),
+                    format!("{identity} /usr/{hostile}\n").as_bytes(),
+                ),
+                (&format!("{DB_DIR}/{SCRIPTS}"), &[0u8; 1024]),
+            ],
+        );
+        let Some(err) = watchers(&base_of(&dir)).err() else {
+            panic!("the archive holds no trigger script");
+        };
+        crate::failure::hostile::assert_escaped(&err.to_string());
     }
 
     #[test]
