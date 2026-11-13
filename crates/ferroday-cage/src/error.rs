@@ -39,7 +39,7 @@ use std::path::PathBuf;
 
 use crate::cgroup::{CgroupReach, CgroupRefusal};
 use crate::host::{ProcfsBlocker, UsernsBlocker};
-use crate::spec::is_command_name;
+use crate::spec::{HOST_ROOT_HIDDEN, is_command_name};
 use crate::wire::wire_enum;
 
 wire_enum! {
@@ -1272,11 +1272,25 @@ impl fmt::Display for ConfigError {
                 "the Landlock grant {grant} allows only connecting to unix sockets, which nothing \
                  restricts unless the unix-socket restriction is on"
             ),
-            ConfigError::RevealUnhidden { path } => write!(
-                f,
-                "{path:?} is not a path the root hides by default, so revealing it is a mistake \
-                 (the host's own root hides /home, /root, /run, /var/run, and /var/tmp)",
-            ),
+            // The hidden paths are read from the list the build hides, so the
+            // message cannot name a list the root no longer has.
+            ConfigError::RevealUnhidden { path } => {
+                write!(
+                    f,
+                    "{path:?} is not a path the root hides by default, so revealing it is a \
+                     mistake (the host's own root hides "
+                )?;
+                let hidden = HOST_ROOT_HIDDEN;
+                for (at, hidden_path) in hidden.iter().enumerate() {
+                    match at {
+                        0 => {}
+                        at if at + 1 == hidden.len() => f.write_str(", and ")?,
+                        _ => f.write_str(", ")?,
+                    }
+                    f.write_str(hidden_path)?;
+                }
+                f.write_str(")")
+            }
             ConfigError::CgroupLimitInvalid { reason } => {
                 write!(f, "the cgroup settings cannot be carried out: {reason}")
             }
@@ -1919,6 +1933,20 @@ mod tests {
         let denied = missing(13);
         assert!(!denied.contains("is not in"), "{denied}");
         assert!(denied.contains("could not be looked up"), "{denied}");
+    }
+
+    #[test]
+    fn a_reveal_of_an_unhidden_path_names_what_the_host_root_hides() {
+        let message = ConfigError::RevealUnhidden {
+            path: PathBuf::from("/srv"),
+        }
+        .to_string();
+        assert!(
+            message.ends_with(
+                "(the host's own root hides /home, /root, /run, /var/run, and /var/tmp)"
+            ),
+            "{message}"
+        );
     }
 
     #[test]

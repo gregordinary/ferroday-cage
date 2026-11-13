@@ -78,8 +78,9 @@ const DIR_MODE: RawMode = 0o755;
 /// read-only mount does not stop a `connect` to.
 ///
 /// `/tmp` and `/dev/shm` are not here because the managed profile already
-/// replaces them with tmpfs instances of the sandbox's own.
-const HOST_ROOT_HIDDEN: [&str; 5] = ["/home", "/root", "/run", "/var/run", "/var/tmp"];
+/// replaces them with tmpfs instances of the sandbox's own. A
+/// [`ConfigError::RevealUnhidden`] names this list as it stands.
+pub(crate) const HOST_ROOT_HIDDEN: [&str; 5] = ["/home", "/root", "/run", "/var/run", "/var/tmp"];
 
 /// The sandbox path the host's resolver configuration is bound onto, and the
 /// one a caller's own mount there replaces.
