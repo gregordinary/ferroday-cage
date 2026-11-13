@@ -1714,17 +1714,21 @@ impl Drop for Staged {
     }
 }
 
-/// Writes bytes to `dest` atomically, through a [`Staged`] file renamed onto
-/// it.
+/// Writes bytes to `dest` atomically and durably, through a [`Staged`] file
+/// renamed onto it.
 ///
 /// For bytes already in hand, such as a pool's index files or a digest document
 /// a cache keeps. What arrives as a stream is staged the same way at the point
 /// it is written to disk.
 ///
-/// The staging file is not synced before the rename. What a reader takes from
-/// these files is verified against a digest, so a file left short by a crash is
-/// rejected and written again, which is cheaper than syncing every write against
-/// a failure that costs only a repeat.
+/// The staging file is synced before the rename, and the directory after it, so
+/// once this returns the name holds the new bytes across a crash, and never a
+/// file a crash left short. Not every file written here is checked when it is
+/// read back. A pool's `Release` is the document digests are read from, and no
+/// digest covers it. A publish merges into the `Packages` the pool already
+/// holds without verifying it, so a short one would drop every package
+/// published before. A by-hash index copy is never rewritten once its name
+/// exists, so a short one would never be repaired.
 ///
 /// Errors name the staging file only when the failure is the staging file's
 /// own; the caller wraps them against the destination it asked for.
@@ -1734,8 +1738,10 @@ pub(crate) fn write_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
 
     let (staged, mut file) = Staged::beside(dest)?;
     file.write_all(bytes)?;
+    file.sync_all()?;
     drop(file);
-    staged.publish()
+    staged.publish()?;
+    fs::File::open(crate::path::parent_of(dest))?.sync_all()
 }
 
 #[cfg(test)]

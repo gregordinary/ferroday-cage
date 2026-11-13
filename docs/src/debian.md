@@ -820,9 +820,9 @@ provision::ensure("/srv/images/replay", &mut debian)?;
 
 Ordinarily `resolve` and a bootstrap each run a full resolution. A pipeline that
 resolves once to key its cache and then provisions therefore resolves twice. It
-has to reconcile the two when the archive publishes in between. Pinning removes
-both the second resolution and the divergence, along with the roughly 9 MB index
-download that dominates it.
+has to reconcile the two when the archive publishes in between. Installing the
+plan removes both the second resolution and the divergence, along with the
+roughly 9 MB index download that dominates it.
 
 ### The trust model changes
 
@@ -835,11 +835,11 @@ caught. What is no longer checked is that the plan still describes what the
 archive says.
 
 That is exactly what a reproduce mode wants, and exactly what an ordinary build
-must not take. So pinning is opt-in by construction. A builder that sets no plan
-resolves as it always has, chaining every digest to a repository signature at
-install time. Nothing about an ordinary bootstrap changes.
+must not take. So installing a plan is opt-in by construction. A builder that
+sets no plan resolves as it always has, chaining every digest to a repository
+signature at install time. Nothing about an ordinary bootstrap changes.
 
-### What a plan pins, and what it does not
+### What a plan fixes, and what it does not
 
 A plan describes a resolution that already happened. Anything that would shape a
 resolution therefore contradicts it. `include`, `exclude`, and `base_priority`
@@ -856,9 +856,9 @@ and the fetcher. A
 package is fetched from the repository its `archive` index names, so configuring
 a snapshot mirror is enough to replay the same plan against one.
 
-A pinned install against an archive that has moved on installs the pinned
-versions, which is the point. Where a `.deb` the plan names is no longer on the
-mirror, the failure names the package and its digest. It does not report a
+A plan installed against an archive that has moved on installs the versions the
+plan records, which is the point. Where a `.deb` the plan names is no longer on
+the mirror, the fetch fails, naming the URL it asked for. It does not report a
 resolution that found nothing: the plan is intact, and the archive no longer
 holds what it names.
 
@@ -1361,8 +1361,8 @@ over only the delta. Most components share build-dependencies already present in
 A plan reproduces a layer exactly as it reproduces a whole root. Keep the one
 [`resolve_layer`] returned and hand it back through [`plan`] alongside the same
 [`base_layer`]. `stage_layer` then installs those packages at those versions
-without fetching a release or an index, which is the increment's counterpart of
-the pinned install below.
+without fetching a release or an index. That is the increment's counterpart of
+[installing a plan](#installing-a-plan-without-resolving-again) as a whole root.
 
 `stage_layer` installs the delta into the overlay upper and returns a
 [`BuildLayer`]. Root a sandbox on [`overlay_rootfs`] with the base as the
