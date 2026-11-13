@@ -16,7 +16,7 @@ pub struct ExitStatus(Kind);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
-    Exited(i32),
+    Exited(u8),
     Signaled { signal: i32, core_dumped: bool },
 }
 
@@ -27,7 +27,12 @@ impl ExitStatus {
     /// this to read one. It is for a caller that reports an outcome of its own
     /// in the same terms, and through [`shell_code`](Self::shell_code) in the
     /// same convention, as a status the library collected.
-    pub fn exited(code: i32) -> ExitStatus {
+    ///
+    /// The code is a `u8` because the kernel reports a process's exit code in
+    /// eight bits: whatever a process passes to `exit`, its parent collects the
+    /// low eight, so no status outside `0..=255` can be collected, and none can
+    /// be made here.
+    pub fn exited(code: u8) -> ExitStatus {
         ExitStatus(Kind::Exited(code))
     }
 
@@ -68,10 +73,11 @@ impl ExitStatus {
         self.code() == Some(0)
     }
 
-    /// The exit code, if the command exited normally.
+    /// The exit code, if the command exited normally: in `0..=255`, as an
+    /// `i32` to match [`std::process::ExitStatus::code`].
     pub fn code(&self) -> Option<i32> {
         match self.0 {
-            Kind::Exited(code) => Some(code),
+            Kind::Exited(code) => Some(i32::from(code)),
             Kind::Signaled { .. } => None,
         }
     }
@@ -114,8 +120,8 @@ impl ExitStatus {
     /// re-exports a sandboxed command's outcome should return.
     ///
     /// The result is a `u8` because that is the width a process exit status
-    /// has: `wait` carries eight bits, so a code outside `0..=255` was never
-    /// reachable and no case is lost by narrowing here.
+    /// has: `wait` carries eight bits, which is also the width
+    /// [`exited`](Self::exited) takes, so an exit code is reported as it is.
     ///
     /// # Example
     ///
@@ -135,7 +141,7 @@ impl ExitStatus {
     /// ```
     pub fn shell_code(&self) -> u8 {
         match self.0 {
-            Kind::Exited(code) => code as u8,
+            Kind::Exited(code) => code,
             // A signal number never approaches 128, so the sum is in range;
             // the wrapping form states what happens to a nonsensical one
             // rather than leaving it to a debug-only panic.

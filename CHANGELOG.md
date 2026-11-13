@@ -953,6 +953,10 @@ consumer upgrading can skip it.
   matching either case moves to the new variant. `MountTargetMissing` now says
   a target is not in the host's root only where the lookup found nothing there,
   and otherwise that it could not be looked up.
+- **Breaking.** `ExitStatus::exited` takes the exit code as a `u8`, the eight
+  bits a parent collects of a process's exit. It took an `i32`, so it made
+  statuses no process can exit with: `ExitStatus::exited(256)` reported failure
+  while its `shell_code()` was 0. `ExitStatus::code` still answers an `i32`.
 
 ### Internal
 

@@ -1318,9 +1318,10 @@ pub(crate) fn encode_status(
 /// Decodes the status record [`encode_status`] writes, into the command's exit
 /// status and, where the supervisor could read it, what the command used.
 ///
-/// `None` for a kind or a usage flag this build never writes, which is a defect
-/// in this library: the reader reports it as a broken protocol rather than
-/// panicking, the same posture the report decoder takes.
+/// `None` for a kind, a usage flag, or an exit code wider than eight bits that
+/// this build never writes, which is a defect in this library: the reader
+/// reports it as a broken protocol rather than panicking, the same posture the
+/// report decoder takes.
 pub(crate) fn decode_status(
     record: [u8; STATUS_RECORD_LEN],
 ) -> Option<(ExitStatus, Option<ResourceUsage>)> {
@@ -1328,7 +1329,8 @@ pub(crate) fn decode_status(
     let wide = |at: usize| u64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"));
     let value = word(4) as i32;
     let status = match word(0) {
-        STATUS_EXITED => ExitStatus::exited(value),
+        // `WEXITSTATUS` is eight bits wide, so a wider code is a defect too.
+        STATUS_EXITED => ExitStatus::exited(u8::try_from(value).ok()?),
         STATUS_SIGNALED => ExitStatus::signaled(value),
         STATUS_DUMPED => ExitStatus::signaled_with_core_dump(value),
         _ => return None,
@@ -2882,6 +2884,16 @@ mod tests {
             decoded.peak_rss_bytes,
             Some(u64::try_from(usage.maxrss).expect("a size is not negative") * 1024)
         );
+    }
+
+    #[test]
+    fn an_exit_code_no_wait_status_holds_decodes_to_nothing() {
+        assert_eq!(
+            decode_status(record(STATUS_EXITED, 255)).map(|(status, _)| status.code()),
+            Some(Some(255)),
+        );
+        assert!(decode_status(record(STATUS_EXITED, 256)).is_none());
+        assert!(decode_status(record(STATUS_EXITED, -1)).is_none());
     }
 
     #[test]
