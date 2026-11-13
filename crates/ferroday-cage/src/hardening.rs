@@ -1312,6 +1312,7 @@ impl SeccompRules {
 
     /// Whether these are the curated roster with nothing added: what a profile
     /// spells as the string `"curated"`.
+    #[cfg(feature = "serde")]
     fn is_plain_curated(&self) -> bool {
         self.curated
             && self.rules.is_empty()
