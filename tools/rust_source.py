@@ -10,16 +10,20 @@ Two things are removed:
 
 - Every comment: line comments wherever they start, doc comments, and block
   comments, nested ones included. A `//` inside a string literal is part of the
-  string, so the scan tracks string, raw-string, byte-string and character
-  literals to tell the two apart. A removed comment leaves its newlines behind,
-  so the lines that follow keep their place.
+  string, so the scan tracks string, raw-string, byte-string, C-string and
+  character literals to tell the two apart. A removed comment leaves its
+  newlines behind, so the lines that follow keep their place.
 - Every item gated on a `cfg` that holds only in a test build, wherever it
   sits: the trailing test module, a test-only module or function between
   production items, and a test-only item nested inside one. A gate is
   test-only when its predicate cannot hold without `test` or `doctest`:
   `cfg(test)`, `cfg(all(feature = "x", test))`, `cfg(all(any(test, doctest),
   ...))`. `cfg(any(test, feature = "x"))` is not one, since such an item is
-  also built for whatever else the `any` names.
+  also built for whatever else the `any` names. A `#[test]` function is
+  test-only wherever it sits, since the attribute builds it only for a test.
+- The whole of a module file that only a test build reads: one whose `mod`
+  declaration is test-only, such as `#[cfg(test)] mod scratch;`, and every file
+  beneath such a module.
 
 An item's extent is read by matching its delimiters, over a copy of the file
 in which every literal is blanked, so a brace or a bracket inside a string is
@@ -33,6 +37,7 @@ counts the wrong lines reports "unchanged" about code it never read.
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -56,10 +61,11 @@ ITEM = re.compile(
 
 
 def code(path: Path) -> str:
-    """The file's own code: no comments, no test-only items.
+    """The file's own code: no comments, no test-only items, and nothing at all
+    for a file only a test build reads.
 
-    The first call reads the shapes in `CASES` first, and refuses to read
-    anything when one of them comes out wrong.
+    The first call reads the shapes in `CASES` and `MODULE_CASES` first, and
+    refuses to read anything when one of them comes out wrong.
     """
     global PROVEN
     if not PROVEN:
@@ -69,7 +75,58 @@ def code(path: Path) -> str:
                 "the reading gets shapes it must read wrong:\n    " + "\n    ".join(problems)
             )
         PROVEN = True
+    if test_only_file(path):
+        return ""
     return code_of(path.read_text(encoding="utf-8"), path)
+
+
+# A module declared by name, whose body is the file the declaration names.
+DECLARATION = re.compile(
+    r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M
+)
+
+
+@functools.cache
+def test_only_file(path: Path) -> bool:
+    """Whether only a test build reads `path`: the module file a test-only
+    `mod` declaration names, or one beneath such a module."""
+    declared = declaring_file(path)
+    if declared is None:
+        return False
+    parent, name = declared
+    if test_only_file(parent):
+        return True
+    return name in test_only_modules(parent.read_text(encoding="utf-8"), parent)
+
+
+def declaring_file(path: Path) -> tuple[Path, str] | None:
+    """The file that declares the module `path` holds, and the name it declares
+    it by, or `None` for a crate root or a file no module file beside it
+    declares.
+
+    `a/b.rs` and `a/b/mod.rs` are both the module `b`, declared in `a.rs` or
+    `a/mod.rs`, or in `lib.rs` or `main.rs` where `a` is the crate's `src`.
+    """
+    if path.name == "mod.rs":
+        name, directory = path.parent.name, path.parent.parent
+    else:
+        name, directory = path.stem, path.parent
+    candidates = [directory / "mod.rs", directory.with_suffix(".rs")]
+    if directory.name == "src":
+        candidates += [directory / "lib.rs", directory / "main.rs"]
+    for candidate in candidates:
+        if candidate != path and candidate.exists():
+            return candidate, name
+    return None
+
+
+def test_only_modules(text: str, path: Path) -> set[str]:
+    """The modules `text` declares by name that only a test build reads: those
+    its comments do not hide and its test-only items do."""
+    kept, shape = strip_comments(text)
+    declared = set(DECLARATION.findall(kept))
+    built = set(DECLARATION.findall(without_tests(kept, shape, path)))
+    return declared - built
 
 
 def code_of(text: str, path: Path) -> str:
@@ -99,7 +156,7 @@ def strip_comments(text: str) -> tuple[str, str]:
             at = skip_block_comment(text, at, out, shape)
         elif char == '"':
             at = literal(text, at, string_end(text, at), out, shape)
-        elif char in "rb" and starts_raw_string(text, at):
+        elif char in "rbc" and starts_raw_string(text, at):
             at = literal(text, at, raw_string_end(text, at), out, shape)
         elif char == "b" and text[at + 1 : at + 2] in ('"', "'"):
             out.append(char)
@@ -171,13 +228,14 @@ def string_end(text: str, at: int) -> int:
 
 
 def starts_raw_string(text: str, at: int) -> bool:
-    """Whether a raw string literal (`r"`, `r#"`, `br"`, ...) opens at `at`."""
-    return re.match(r'b?r#*"', text[at : at + 260]) is not None
+    """Whether a raw string literal (`r"`, `r#"`, `br"`, `cr#"`, ...) opens at
+    `at`."""
+    return re.match(r'[bc]?r#*"', text[at : at + 260]) is not None
 
 
 def raw_string_end(text: str, at: int) -> int:
     """Past the raw string literal opening at `at`, which has no escapes."""
-    opening = re.match(r'b?r(#*)"', text[at:])
+    opening = re.match(r'[bc]?r(#*)"', text[at:])
     closing = '"' + opening.group(1)
     finish = text.find(closing, at + opening.end())
     return len(text) if finish < 0 else finish + len(closing)
@@ -332,7 +390,10 @@ TOKEN = re.compile(r'\s*(?:([A-Za-z_][A-Za-z0-9_]*)|("(?:[^"\\]|\\.)*")|([(),=])
 
 
 def test_only(attribute: str, path: Path) -> bool:
-    """Whether `attribute` is a `cfg` whose predicate holds only in a test build."""
+    """Whether `attribute` builds its item only for a test: `#[test]`, or a
+    `cfg` whose predicate holds only in a test build."""
+    if re.fullmatch(r"#\[\s*test\s*\]", attribute):
+        return True
     match = re.fullmatch(r"#!?\[\s*cfg\s*\((.*)\)\s*\]", attribute, re.DOTALL)
     if not match:
         return False
@@ -502,6 +563,26 @@ CASES = [
         ],
     ),
     (
+        "a test function outside a test module",
+        """
+        pub fn kept() {}
+
+        #[test]
+        fn checks_kept() {
+            kept();
+        }
+        """,
+        ["pub fn kept() {}", ""],
+    ),
+    (
+        "a raw C string holding a quote and a comment's opener",
+        """
+        const NAME: &CStr = cr#"a"//b"#;
+        pub fn kept() {}
+        """,
+        ['const NAME: &CStr = cr#"a"//b"#;', "pub fn kept() {}"],
+    ),
+    (
         "comments, and a comment's opener inside a string",
         """
         /// A doc comment.
@@ -514,11 +595,38 @@ CASES = [
 ]
 
 
+# Module declarations the reading must sort right, each a source and the
+# modules it declares that only a test build reads.
+MODULE_CASES = [
+    (
+        "a test-only module declared by name beside production ones",
+        """
+        mod kept;
+        #[cfg(test)]
+        mod scratch;
+        #[cfg(feature = "x")]
+        pub(crate) mod gated;
+        // mod commented;
+        """,
+        {"scratch"},
+    ),
+]
+
+
 def self_test() -> list[str]:
     """Every case the reading gets wrong, described."""
     import textwrap
 
     failures = []
+    for name, source, expected in MODULE_CASES:
+        text = textwrap.dedent(source).strip("\n") + "\n"
+        try:
+            got = test_only_modules(text, Path(f"<{name}>"))
+        except ValueError as error:
+            failures.append(f"{name}: {error}")
+            continue
+        if got != expected:
+            failures.append(f"{name}: read {sorted(got)!r}, expected {sorted(expected)!r}")
     for name, source, expected in CASES:
         text = textwrap.dedent(source).strip("\n") + "\n"
         try:
@@ -539,5 +647,5 @@ if __name__ == "__main__":
     for problem in problems:
         print(problem, file=sys.stderr)
     if not problems:
-        print(f"{len(CASES)} shapes read as expected.")
+        print(f"{len(CASES) + len(MODULE_CASES)} shapes read as expected.")
     sys.exit(1 if problems else 0)

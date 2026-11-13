@@ -6,8 +6,9 @@
 # file is how a second answer gets decided rather than merely written.
 #
 # `pattern` is a Python regular expression, matched against each crate's `src`
-# and `examples` trees with every test-only item and every comment removed
-# (`tools/rust_source.py` is that reading).
+# and `examples` trees with every test-only item, every module file only a test
+# build reads, and every comment removed (`tools/rust_source.py` is that
+# reading).
 #
 # What is deliberately not here: a concept clippy can name as a method. Those
 # live in `clippy.toml`, which refuses them at the call rather than counting
@@ -381,17 +382,14 @@ why = "The answer."
 [[idiom]]
 name = "the host's temporary directory"
 # Not anchored on the call: the function passed by name, as a fallback, reads it
-# just the same.
+# just the same. The answer is a unit test's scratch directory, built only for
+# the library's tests, so the census, which reads no test code, counts no site
+# for it: the library itself reads the directory nowhere.
 pattern = 'env::temp_dir\b'
 answer = """\
 `Scratch`, which owns the library's one reading of it and removes what it \
 creates. A second reading is a directory nothing cleans up, named by a rule \
 that is no longer stated once."""
-
-[[idiom.site]]
-path = "crates/ferroday-cage/src/scratch.rs"
-count = 1
-why = "The answer."
 
 [[idiom.site]]
 path = "crates/ferroday-cage-testkit/src/scratch.rs"

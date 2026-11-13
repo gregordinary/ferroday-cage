@@ -24,8 +24,9 @@ least likely to read twice. Integration tests are not scanned: a test's numbers
 and paths are its own literals rather than a caller's, so the shapes these
 idioms name are usually not the hazard they name, and the test conventions
 belong to `CONTRIBUTING.md`. Within a file only code counts: every test-only
-item and every comment are cut first, so a test constructing the shape under
-test and a comment naming it are not sites. `tools/rust_source.py` is that
+item and every comment are cut first, and a module file only a test build reads
+is cut whole, so a test constructing the shape under test and a comment naming
+it are not sites. `tools/rust_source.py` is that
 reading, shared with `tools/check-seam.py`.
 
 Usage:
