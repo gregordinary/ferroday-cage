@@ -39,7 +39,9 @@ The library's job is to build the boundary it says it builds. In scope:
   the sandboxed command must not leave. A restriction builds with a cgroup only
   under the confinement that holds it there, as the [restriction
   chapter](https://gregordinary.github.io/ferroday-cage/restriction-fallback.html#cgroups)
-  states.
+  states. A Landlock right or scope narrowed away on a kernel that cannot
+  enforce it, where the guide documents that narrowing, is not silently
+  unapplied.
 - **Identity-map defects.** A sandbox acting as an id outside its configured
   map, or a map established differently from what was requested.
 - **Provisioning containment.** An archive or package that writes outside the
@@ -55,9 +57,10 @@ The library's job is to build the boundary it says it builds. In scope:
   [hardening](https://gregordinary.github.io/ferroday-cage/hardening.html)
   layer. A report that untrusted code did something the default profile never
   claimed to prevent is a documentation question rather than a vulnerability.
-- **Resource exhaustion outside the per-process limits.** The library sets
-  `setrlimit` values on request. Cgroup governance and disk quotas are the
-  host's, as the hardening chapter states.
+- **Resource exhaustion outside the limits requested.** The library sets
+  `setrlimit` values and cgroup limits on request, and a sandbox without them
+  is bounded only by what the host imposes. I/O throttling and disk quotas are
+  the host's, as the hardening chapter states.
 - **A trusted profile doing what the trusted path allows.** A profile loaded
   through the trusted path is code-equivalent configuration and can bind any
   host path. Loading an untrusted profile through that path is the caller's

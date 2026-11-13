@@ -576,8 +576,12 @@ impl<'obs> Running<'obs> {
     /// PID namespace a [`kill`](Self::kill) ends the init that would have
     /// reported the collected processes' figures, so a killed sandbox reports
     /// only what its cgroup read for the whole tree, and without a cgroup it
-    /// reports no usage at all. Without a PID namespace the kill ends only the
-    /// command, and its usage is reported as for any other exit.
+    /// reports no usage at all. Without a PID namespace the kill ends the
+    /// command, and where the sandbox has no cgroup its usage is reported as
+    /// for any other exit. With a cgroup, the kill's `cgroup.kill` also ends
+    /// the launch stage that collects the command's outcome from outside,
+    /// which runs in the cgroup too, as a rule before it reports, and the
+    /// sandbox then reports only what its cgroup read.
     pub fn usage(&self) -> Option<ResourceUsage> {
         self.usage
     }

@@ -21,6 +21,12 @@ sequence itself.
 
 ## The setup sequence
 
+The sequence is that of a sandbox with a PID namespace, the default. Without
+one there is no init: at step 7 the launch stage forks the command process
+itself, which carries out the remaining steps before it executes, and the
+launch stage stays outside the sandbox as its supervisor, as [The process
+model](process-model.md) describes.
+
 1. **Reset the signal state.** Every signal disposition returns to its
    default immediately after the first fork, which leaves every signal
    blocked until then. The caller's ignored dispositions would otherwise
@@ -29,13 +35,22 @@ sequence itself.
    signal but the faults blocked for as long as it lives. Each process it
    forks sets its own mask: the command starts with none blocked, and the init
    blocks only `SIGCHLD`, which it reads from a descriptor.
-2. **Unshare.** One `unshare` call creates user, mount, PID, UTS, IPC, and
-   cgroup namespaces, plus a network namespace unless the host network is
-   shared. The user namespace is owned by the process with full
+2. **Join the sandbox's cgroup**, where the launch has one from
+   `cgroup_parent`. The caller created the cgroup and wrote its limits before
+   the fork, and created a leaf beneath it. The launch stage moves itself into
+   the leaf through the leaf's `cgroup.procs`, before any namespace exists, so
+   every process forked from here on is charged to the cgroup and held to its
+   limits, and the cgroup namespace created next is rooted at the leaf, below
+   them. [Limits on the whole tree](hardening.md#limits-on-the-whole-tree)
+   gives the detail.
+3. **Unshare.** One `unshare` call creates user, mount, UTS, IPC, and cgroup
+   namespaces, a PID namespace unless the sandbox shares the caller's, and a
+   network namespace unless the host network is shared. The user namespace is
+   owned by the process with full
    capabilities over it, and every other namespace is owned by that user
    namespace — the ownership is what lets an unprivileged process perform
    the mount, hostname, and network steps below.
-3. **Sweep the descriptors.** The launch closes every descriptor it
+4. **Sweep the descriptors.** The launch closes every descriptor it
    inherited except the launch channels and the standard streams. The
    sandbox processes are forked from the swept table, so the command starts
    with only its streams and the supervisor pins no caller resource for the
@@ -44,13 +59,13 @@ sequence itself.
    standard stream the caller left closed with a close-on-exec placeholder.
    No descriptor the setup opens lands on a standard stream's number, so
    wiring the streams replaces nothing of the launch's.
-4. **Replace the session keyring.** The launch joins a fresh, anonymous session
+5. **Replace the session keyring.** The launch joins a fresh, anonymous session
    keyring in place of the one it inherited from the caller. A keyring is a
    credential rather than a descriptor, so the sweep does not reach it. No
    namespace partitions it either. Where the kernel refuses the join, the launch
    installs a seccomp filter that refuses the sandbox the key syscalls instead.
    See [The session keyring](#the-session-keyring).
-5. **Identity map.** The launch stage establishes the map of its freshly
+6. **Identity map.** The launch stage establishes the map of its freshly
    created user namespace, per the configured
    [identity map](identity-maps.md). The default single-identity map is
    written in process: `deny` to `/proc/self/setgroups`, then a one-line
@@ -63,11 +78,11 @@ sequence itself.
    anything else is forked. Either way the map is complete before the next
    step, so every process the caller can observe lives in a fully mapped
    namespace.
-6. **Publish the supervisor.** The launch stage forks the sandbox init,
+7. **Publish the supervisor.** The launch stage forks the sandbox init,
    opens a pidfd for it, and passes it back to the caller — the anchor for
    `kill`, immune to pid reuse. The remaining steps run in the init, inside
    all the new namespaces.
-7. **Leave the caller's process group.** A launch that does not inherit the
+8. **Leave the caller's process group.** A launch that does not inherit the
    caller's standard input, and every terminal launch, starts a session of
    its own with `setsid`. One that inherits it stays in the caller's session
    and moves into a process group of its own with `setpgid`, so a signal the
@@ -77,19 +92,19 @@ sequence itself.
    its own group the foreground with `tcsetpgrp`, before the command exists.
    The caller takes it back once the outcome is collected. See [Signals and the
    caller](process-model.md#signals-and-the-caller).
-8. **Hostname.** When a hostname is configured, `sethostname` sets it in the
+9. **Hostname.** When a hostname is configured, `sethostname` sets it in the
    new UTS namespace; otherwise the sandbox keeps the host's hostname, and
    either way a change inside the sandbox never reaches the host.
-9. **Loopback.** In an isolated network namespace the only interface is
+10. **Loopback.** In an isolated network namespace the only interface is
    loopback, which starts down; the init brings it up with the
    interface-flags ioctls on a throwaway datagram socket. To give the
    isolated namespace outbound connectivity, a caller attaches a userspace
    network stack at the seam described in
    [Userspace networking](userspace-networking.md).
-10. **Privatize propagation.** Mount propagation for the inherited tree is
+11. **Privatize propagation.** Mount propagation for the inherited tree is
     made recursively private, so nothing done here propagates back to the
     host, and because `pivot_root` refuses to operate under shared mounts.
-11. **Mount the root.** `pivot_root` requires the new root to be a mount
+12. **Mount the root.** `pivot_root` requires the new root to be a mount
     point. A plain root filesystem is bind-mounted onto itself, recursively,
     which makes it one without a staging directory. An overlay root is mounted
     over its base. The canonical path validated at build time is opened here,
@@ -102,7 +117,7 @@ sequence itself.
     and targets to be attached in the caller's own mount namespace, so a
     descriptor opened before the unshare cannot anchor this step. An [empty
     root](#an-empty-root) has no path: it is a tmpfs created for the launch.
-12. **The mount profile.** The init executes the frozen mount operations in
+13. **The mount profile.** The init executes the frozen mount operations in
     order: the fresh `/proc`, the minimal `/dev`, the `/tmp` tmpfs, the
     caller's own mounts, and the `resolv.conf` bind, as configured. Bind
     sources are host paths, canonical at build time, and are opened as the
@@ -120,17 +135,17 @@ sequence itself.
     5.12, which lacks `mount_setattr`, only the top mount is made read-only
     (carrying along the flags the user namespace holds locked) and any
     submounts of the source keep their own flags. The restriction becomes a
-    boundary at step 14, where the command enters a nested user namespace and
+    boundary at step 15, where the command enters a nested user namespace and
     the kernel locks it — see [A read-only bind is a
     boundary](#a-read-only-bind-is-a-boundary). An empty root is made read-only
     once the profile is in place.
-13. **Pivot.** The init enters the new mount and calls
+14. **Pivot.** The init enters the new mount and calls
     `pivot_root(".", ".")`, stacking the old root on the same mount point,
     then lazily detaches the old root and changes directory to the new `/`.
     When the step completes, the host filesystem is no longer reachable
     from the sandbox's view.
-14. **Fork and exec.** After changing to the configured working directory,
-    the init forks the command process — PID 2. Where step 7 gave the sandbox
+15. **Fork and exec.** After changing to the configured working directory,
+    the init forks the command process — PID 2. Where step 8 gave the sandbox
     a process group of its own, it waits for the launch stage to exit first.
     The command wires its standard
     streams per the configuration, applies the configured [resource
