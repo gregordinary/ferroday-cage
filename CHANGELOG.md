@@ -745,6 +745,8 @@ consumer upgrading can skip it.
   one line each, and CI lists the skips its test steps logged.
 - The restriction suites take the grants a host binary runs under from one
   `common::grant_system_trees`.
+- The network stack builds a flow's guest-facing TCP socket in one
+  `tcp::guest_facing_socket`, which an outbound flow and a published one share.
 
 ## [0.5.2] - 2026-11-10
 

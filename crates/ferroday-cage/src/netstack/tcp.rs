@@ -101,13 +101,13 @@ const KEEP_ALIVE_SECS: u64 = 25;
 /// it alone; a peer that has crashed without a FIN or RST does not answer, and
 /// after [`KEEP_ALIVE_COUNT`] unanswered probes the flow is reclaimed near
 /// [`IDLE_TIMEOUT`].
-pub(super) const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(KEEP_ALIVE_SECS);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(KEEP_ALIVE_SECS);
 
 /// Unanswered keep-alive probes tolerated before a flow's peer is declared
 /// dead. Used directly as the host socket's `TCP_KEEPCNT`; the guest-facing
 /// smoltcp socket has no probe counter of its own, so [`IDLE_TIMEOUT`]
 /// expresses the same budget as a single duration.
-pub(super) const KEEP_ALIVE_COUNT: u32 = 3;
+const KEEP_ALIVE_COUNT: u32 = 3;
 
 /// How long an established flow tolerates silence from its peer before it is
 /// aborted.
@@ -120,8 +120,7 @@ pub(super) const KEEP_ALIVE_COUNT: u32 = 3;
 /// (`KEEP_ALIVE_INTERVAL * (KEEP_ALIVE_COUNT + 1)`), so the guest-facing
 /// timeout and the host socket's `TCP_KEEPIDLE + KEEP_ALIVE_COUNT *
 /// TCP_KEEPINTVL` detection both land at the same point.
-pub(super) const IDLE_TIMEOUT: Duration =
-    Duration::from_secs(KEEP_ALIVE_SECS * (KEEP_ALIVE_COUNT as u64 + 1));
+const IDLE_TIMEOUT: Duration = Duration::from_secs(KEEP_ALIVE_SECS * (KEEP_ALIVE_COUNT as u64 + 1));
 
 /// Keep-alive must fire, and be answerable, strictly before the idle timeout,
 /// or the timeout aborts every idle flow before a single probe is sent. This
@@ -147,6 +146,25 @@ const _: () = assert!(KEEP_ALIVE_INTERVAL.as_secs() < IDLE_TIMEOUT.as_secs());
 /// slowly, is left alone; the budget is the idle timeout's, for one silence
 /// tolerance across the module.
 pub(super) const DRAIN_DEADLINE: Duration = IDLE_TIMEOUT;
+
+/// A guest-facing socket for a flow: [`BUFFER_SIZE`] buffers each way, and the
+/// liveness watch every flow's guest side carries.
+///
+/// The socket probes an idle guest every [`KEEP_ALIVE_INTERVAL`] and aborts the
+/// flow at [`IDLE_TIMEOUT`] if the guest stops answering: a guest that
+/// establishes a flow and then vanishes without a FIN or RST would otherwise
+/// pin its slot and buffers until the sandbox ends. A live but idle guest
+/// answers the keep-alive and is left alone. smoltcp folds these timers into
+/// its poll delay, so the pump wakes to enforce them.
+pub(super) fn guest_facing_socket() -> tcp::Socket<'static> {
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
+        tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
+    );
+    socket.set_keep_alive(Some(KEEP_ALIVE_INTERVAL.into()));
+    socket.set_timeout(Some(IDLE_TIMEOUT.into()));
+    socket
+}
 
 /// What became of one servicing pass.
 enum Copy {

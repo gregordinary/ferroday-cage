@@ -566,18 +566,7 @@ impl Engine {
         let Some(target) = host_target(dst, &self.plan) else {
             return;
         };
-        let mut socket = tcp_socket::Socket::new(
-            tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-            tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-        );
-        // Probe an idle guest for liveness and abort the flow if it stops
-        // answering: a guest that establishes a flow then vanishes without a
-        // FIN or RST would otherwise pin its slot and buffers until the sandbox
-        // ends. A live but idle guest answers the keep-alive and is left alone.
-        // smoltcp folds these timers into its poll delay, so the pump wakes to
-        // enforce them.
-        socket.set_keep_alive(Some(tcp::KEEP_ALIVE_INTERVAL.into()));
-        socket.set_timeout(Some(tcp::IDLE_TIMEOUT.into()));
+        let mut socket = tcp::guest_facing_socket();
         if socket.listen(dst).is_err() {
             return;
         }
@@ -623,13 +612,7 @@ impl Engine {
                 continue;
             };
             let local = IpEndpoint::new(local_addr, port);
-            let mut socket = tcp_socket::Socket::new(
-                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-            );
-            // The same liveness watch an outbound flow's guest side carries.
-            socket.set_keep_alive(Some(tcp::KEEP_ALIVE_INTERVAL.into()));
-            socket.set_timeout(Some(tcp::IDLE_TIMEOUT.into()));
+            let mut socket = tcp::guest_facing_socket();
             if socket.connect(self.iface.context(), guest, local).is_err() {
                 continue;
             }
@@ -2310,10 +2293,7 @@ mod tests {
             let (guest_at, stack_at) = ((GUEST, 8000), (GATEWAY, 50_000));
             let guest_end = IpEndpoint::new(GUEST.into(), guest_at.1);
             let stack_end = IpEndpoint::new(GATEWAY.into(), stack_at.1);
-            let mut socket = tcp_socket::Socket::new(
-                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-                tcp_socket::SocketBuffer::new(vec![0; tcp::BUFFER_SIZE]),
-            );
+            let mut socket = tcp::guest_facing_socket();
             socket
                 .connect(engine.iface.context(), guest_end, stack_end)
                 .expect("the stack connects to the guest");
