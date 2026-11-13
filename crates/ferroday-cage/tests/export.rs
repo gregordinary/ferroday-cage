@@ -1546,6 +1546,36 @@ fn a_copy_into_a_merged_usr_root_lands_through_its_aliases() {
     let _ = provision::remove(&dir);
 }
 
+/// Two names for one file in a source that is not merged, `bin/x` and
+/// `usr/bin/x`, are one name in a merged-usr root, where `bin` is a link to
+/// `usr/bin`. The second arrives as a link onto a name already holding its
+/// file, which is already done; replacing the name would remove the file.
+#[test]
+fn a_copy_of_two_names_one_alias_joins_into_one_keeps_the_file() {
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("copyin-hardlink-alias");
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+    std::os::unix::fs::symlink("usr/bin", rootfs.join("bin")).unwrap();
+    let source = dir.join("source");
+    std::fs::create_dir_all(source.join("bin")).unwrap();
+    std::fs::create_dir_all(source.join("usr/bin")).unwrap();
+    std::fs::write(source.join("bin/x"), b"#!/bin/sh\n").unwrap();
+    std::fs::hard_link(source.join("bin/x"), source.join("usr/bin/x")).unwrap();
+
+    let report = provision::CopyIn::new(&source, &rootfs)
+        .run()
+        .expect("the copy succeeds");
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(
+        std::fs::read(rootfs.join("usr/bin/x")).unwrap(),
+        b"#!/bin/sh\n"
+    );
+    let _ = provision::remove(&dir);
+}
+
 /// Several names for one file arrive as one file with several names.
 ///
 /// The round trip is the point: an `Export` coalesces hard links, so a `CopyIn`

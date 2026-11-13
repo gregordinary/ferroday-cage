@@ -151,6 +151,49 @@ fn hardlinks_share_the_inode() {
 }
 
 #[test]
+fn a_hardlink_to_a_name_already_holding_its_target_is_already_done() {
+    // GNU tar lists a multiply-linked path it is given twice as the file and
+    // then as a link onto itself. Replacing the name to make room for the link
+    // removes the file the link is to, so the name already holding the target
+    // is taken as done, by inode, however the two names are spelled.
+    let mut tar = archive();
+    tar.file("twice", 0o644, b"listed twice")
+        .hardlink("twice", "twice")
+        .file("original", 0o644, b"shared")
+        .hardlink("copy", "original")
+        .hardlink("copy", "original");
+    let rootfs = provision("extract-hardlink-to-itself", &tar.finish());
+    assert_eq!(fs::read(rootfs.join("twice")).unwrap(), b"listed twice");
+    let ino = |name: &str| fs::symlink_metadata(rootfs.join(name)).unwrap().ino();
+    assert_eq!(ino("copy"), ino("original"));
+    assert_eq!(
+        fs::symlink_metadata(rootfs.join("original"))
+            .unwrap()
+            .nlink(),
+        2
+    );
+}
+
+#[test]
+fn a_hardlink_reaching_its_target_through_a_merged_usr_alias_is_already_done() {
+    // `bin` is a link to `usr/bin`, so `bin/x` and `usr/bin/x` are one name,
+    // which an archive of a tree that was not merged lists as a file and a link.
+    let mut tar = archive();
+    tar.dir("usr/bin", 0o755)
+        .symlink("bin", "usr/bin")
+        .file("bin/x", 0o755, b"#!/bin/sh\n")
+        .hardlink("usr/bin/x", "bin/x");
+    let rootfs = provision("extract-hardlink-alias", &tar.finish());
+    assert_eq!(fs::read(rootfs.join("usr/bin/x")).unwrap(), b"#!/bin/sh\n");
+    assert!(
+        fs::symlink_metadata(rootfs.join("bin"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn fifos_extract_devices_and_labels_skip() {
     let mut tar = archive();
     tar.dir("dev", 0o755)

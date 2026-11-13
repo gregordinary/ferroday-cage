@@ -709,6 +709,12 @@ fn enter_dir(
 /// destination root that [`contained_path`] has already admitted, replacing
 /// what holds `name` as every other entry the copy lays in does.
 ///
+/// A `name` that already holds the anchor's file is already done, through
+/// [`containment::link_replacing`]. A source tree whose `bin/x` and
+/// `usr/bin/x` are one file copies into a merged-usr root, where `bin` is a
+/// link to `usr/bin`, as one name reached twice, and replacing it would remove
+/// the file the link is to.
+///
 /// `anchor` is the path followed by its terminator. The directory part is
 /// resolved from the root with `RESOLVE_IN_ROOT`, so no component of it — an
 /// alias [`enter_dir`] adopted included — can take the resolution out of the
@@ -723,10 +729,8 @@ fn link_to_anchor(
 ) -> Result<(), (CopyStep, Errno)> {
     let (dir, leaf) = parent_in_root(root, anchor, CopyStep::Link)?;
     let dir = dir.as_ref().map_or(root.as_fd(), AsFd::as_fd);
-    containment::replacing(current, name, || {
-        fs::linkat(dir, leaf, current, name, AtFlags::empty())
-    })
-    .map_err(|errno| (CopyStep::Link, errno))
+    containment::link_replacing(dir, leaf, current.as_fd(), name)
+        .map_err(|errno| (CopyStep::Link, errno))
 }
 
 /// Splits `path`, a path from the destination root that [`contained_path`] has
@@ -1522,6 +1526,35 @@ mod tests {
             ino("run/first"),
             "the link is not onto the root's file"
         );
+    }
+
+    /// A link onto a name that already holds the anchor's file is already
+    /// done: `bin/x` and `usr/bin/x` are one name where `bin` is a link to
+    /// `usr/bin`, and replacing the name would remove the file.
+    #[test]
+    fn a_link_onto_a_name_already_holding_the_file_is_already_done() {
+        let dir = Scratch::new("copyin-link-same");
+        std::fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", dir.join("bin")).unwrap();
+
+        let mut frames = dir_frame(b"bin", 0o755);
+        frames.extend(file_frame(b"x", 0o755, b"#!/bin/sh\n"));
+        frames.push(COPY_LEAVE);
+        frames.extend(dir_frame(b"usr", 0o755));
+        frames.extend(dir_frame(b"bin", 0o755));
+        frames.extend(link_frame(b"x", b"bin/x"));
+        frames.push(COPY_LEAVE);
+        frames.push(COPY_LEAVE);
+        // And a link naming itself.
+        frames.extend(file_frame(b"self", 0o644, b"once\n"));
+        frames.extend(link_frame(b"self", b"self"));
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
+        assert_eq!(
+            std::fs::read(dir.join("usr/bin/x")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        assert_eq!(std::fs::read(dir.join("self")).unwrap(), b"once\n");
     }
 
     /// Anything else at a directory's name is replaced, as a file entry

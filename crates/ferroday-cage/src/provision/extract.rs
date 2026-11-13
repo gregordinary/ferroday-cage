@@ -916,6 +916,12 @@ fn extract_symlink(
 ///
 /// The target is an entry this extraction wrote, so in a layered one its chain
 /// is already in the root: its own entry put it there.
+///
+/// A name that already holds the target is already done, through
+/// [`containment::link_replacing`]: a link naming itself as its target, as GNU
+/// tar writes one for a path it lists twice, and a link reaching its target's
+/// own name through an alias, `usr/bin/x` onto `bin/x` where `bin` is a link
+/// to `usr/bin`.
 fn extract_hardlink(
     tree: Tree<'_>,
     entry: &Entry,
@@ -936,21 +942,13 @@ fn extract_hardlink(
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
-    create_replacing(
-        &entry.path,
-        || {
-            rustix::fs::linkat(
-                &target_parent,
-                &target_leaf,
-                &parent.dir,
-                &leaf,
-                AtFlags::empty(),
-            )
-        },
-        &parent.dir,
+    containment::link_replacing(
+        target_parent.as_fd(),
+        &target_leaf,
+        parent.dir.as_fd(),
         &leaf,
-    )?;
-    Ok(())
+    )
+    .map_err(|errno| creating_error(errno, &entry.path))
 }
 
 /// Extracts a FIFO.
@@ -1021,20 +1019,23 @@ fn create_replacing<T>(
     parent: &OwnedFd,
     leaf: &CString,
 ) -> Result<T, ProvisionError> {
-    containment::replacing(parent, leaf, create).map_err(|errno| {
-        if errno == Errno::EXIST {
-            ProvisionError::io(
-                "creating",
-                bytes_to_path(entry_path),
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "the name could not be replaced",
-                ),
-            )
-        } else {
-            ProvisionError::io("creating", bytes_to_path(entry_path), errno.into())
-        }
-    })
+    containment::replacing(parent, leaf, create).map_err(|errno| creating_error(errno, entry_path))
+}
+
+/// A replacing creation's failure, as [`create_replacing`] reports it.
+fn creating_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
+    if errno == Errno::EXIST {
+        ProvisionError::io(
+            "creating",
+            bytes_to_path(entry_path),
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the name could not be replaced",
+            ),
+        )
+    } else {
+        ProvisionError::io("creating", bytes_to_path(entry_path), errno.into())
+    }
 }
 
 /// [`containment::remove_at`], reported as this side's failure: naming the

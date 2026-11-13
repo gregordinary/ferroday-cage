@@ -919,6 +919,51 @@ pub(crate) fn replacing<T>(
     Err(Errno::EXIST)
 }
 
+/// Makes `leaf` in `parent` another name for the entry `target_leaf` of
+/// `target_dir`, replacing whatever else holds the name as [`replacing`] does.
+///
+/// A name that already holds that entry is already done. It is the same rule
+/// GNU tar applies, and the replacement cannot apply it for itself: what it
+/// would unlink to make room is a name of the very file the link is to, and
+/// where the two names are one, a link whose target is its own name or a name
+/// reached through a directory alias such as merged-usr's `bin -> usr/bin`,
+/// the unlink removes the file and the link after it fails with `ENOENT`. GNU
+/// tar writes such an entry wherever it lists a multiply-linked path twice.
+///
+/// The two are compared by device and inode, without following a link at
+/// either name, once the link has been refused for the name being taken.
+/// Neither final component is followed by the link either: `linkat` without
+/// `AT_SYMLINK_FOLLOW` links a symbolic link as itself.
+///
+/// It allocates nothing, so the copy-in child links after the fork as the
+/// extractor does in process.
+pub(crate) fn link_replacing(
+    target_dir: BorrowedFd<'_>,
+    target_leaf: &CStr,
+    parent: BorrowedFd<'_>,
+    leaf: &CStr,
+) -> Result<(), Errno> {
+    replacing(parent, leaf, || {
+        match rustix::fs::linkat(target_dir, target_leaf, parent, leaf, AtFlags::empty()) {
+            Err(Errno::EXIST) if same_entry(target_dir, target_leaf, parent, leaf)? => Ok(()),
+            linked => linked,
+        }
+    })
+}
+
+/// Whether `leaf_a` of `dir_a` and `leaf_b` of `dir_b` name one entry, by
+/// device and inode, following a link at neither.
+fn same_entry(
+    dir_a: BorrowedFd<'_>,
+    leaf_a: &CStr,
+    dir_b: BorrowedFd<'_>,
+    leaf_b: &CStr,
+) -> Result<bool, Errno> {
+    let a = rustix::fs::statat(dir_a, leaf_a, AtFlags::SYMLINK_NOFOLLOW)?;
+    let b = rustix::fs::statat(dir_b, leaf_b, AtFlags::SYMLINK_NOFOLLOW)?;
+    Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+}
+
 /// Removes the entry at `leaf` in `parent`, whichever kind it is.
 ///
 /// An empty directory is removed; a non-empty one keeps the `ENOTEMPTY` the
