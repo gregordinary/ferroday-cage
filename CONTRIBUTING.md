@@ -561,6 +561,7 @@ report name a package and its version bare.
 | Freeze a sandbox path as a mount target, or name a frozen target as the sandbox path it is | `spec::sandbox_target`, and `spec::sandbox_path` back |
 | Does a launch bind the host's `resolv.conf`, or has a mount of the caller's claimed it? | `CageBuilder::get_resolv_conf` |
 | Does the network stack carry the guest's traffic to this destination? | `NetStack::forwards` |
+| Declare what surrounds a layer's observer trait: a closure as an observer, a download's view of it, a run's, and the layer with a sink bound | `provision::observe::layer_observer!` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
 | Declare an enum together with the roster of its own variants | `roster::roster_enum!` |
 | State a `poll` deadline | `poll::timeout` for a duration, `poll::until` for an instant, which is zero once the instant has passed |

@@ -101,12 +101,13 @@ use super::compress;
 use super::coordinate::{self, Nesting};
 use super::digest::{self, Digest};
 use super::layer::{BuildLayer, Staging};
+use super::observe::layer_observer;
 use super::openpgp::{Keyring, OpenPgpError};
 use super::rooted::Rooted;
 use super::{
     Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache, ProvisionError,
-    ProvisionEvent, ProvisionRequest, Provisioner, Tarball, compose_mirrors, fetch_first,
-    mirror_url, no_mirror, walk_mirrors,
+    ProvisionRequest, Provisioner, Tarball, compose_mirrors, fetch_first, mirror_url, no_mirror,
+    walk_mirrors,
 };
 use crate::IdentityMap;
 use crate::failure::path_io_error;
@@ -2091,25 +2092,13 @@ fn verify(mut file: File, tarball: &Path, expected: &Digest) -> Result<File, Gen
     Ok(file)
 }
 
-/// A download's view of the observer: the layer's own fetch event, and its
-/// answer to whether the run should stop.
-impl super::Watch for dyn GentooObserver + '_ {
-    fn fetching(&mut self, url: &str) {
-        self.progress(GentooEvent::Fetching { url });
-    }
-
-    fn cancelled(&mut self) -> bool {
-        GentooObserver::cancelled(self)
-    }
-}
-
 /// Something the Gentoo provisioner is doing, reported to a [`GentooObserver`]
 /// or to a run's observer.
 ///
-/// Nested in [`ProvisionEvent::Gentoo`], so one observer attached with
-/// [`Provision::observe`](super::Provision::observe) covers every provisioner;
-/// [`Gentoo::observe`] binds a sink that receives these directly, including on
-/// the read-half calls no run drives.
+/// Nested in [`ProvisionEvent::Gentoo`](super::ProvisionEvent::Gentoo), so one
+/// observer attached with [`Provision::observe`](super::Provision::observe)
+/// covers every provisioner; [`Gentoo::observe`] binds a sink that receives
+/// these directly, including on the read-half calls no run drives.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum GentooEvent<'a> {
@@ -2357,80 +2346,12 @@ pub trait GentooObserver {
     }
 }
 
-/// A closure is an observer that reports and never cancels.
-impl<F: FnMut(GentooEvent<'_>)> GentooObserver for F {
-    fn progress(&mut self, event: GentooEvent<'_>) {
-        self(event);
-    }
-}
-
-/// The observer an unobserved call reports to: nowhere, and never cancelled.
-struct Silent;
-
-impl GentooObserver for Silent {}
-
-/// An observer that reports nowhere of its own and takes both answers from the
-/// provisioning run: what an unobserved [`Gentoo`] uses as a [`Provisioner`].
-///
-/// The events still reach the run's own observer, wrapped in the shared
-/// vocabulary — that is the one channel every provisioner reports through.
-struct RunObserver<'a, 'r> {
-    request: &'a ProvisionRequest<'r>,
-}
-
-impl GentooObserver for RunObserver<'_, '_> {
-    fn progress(&mut self, event: GentooEvent<'_>) {
-        self.request.report(ProvisionEvent::Gentoo(&event));
-    }
-
-    fn cancelled(&mut self) -> bool {
-        self.request.cancelled()
-    }
-}
-
-/// An observer that reports to a sink the caller bound with [`Gentoo::observe`]
-/// and stops when either that sink or the provisioning run asks it to.
-///
-/// The caller chose the richer, Gentoo-specific channel for events, and the
-/// sink's own [`cancelled`](GentooObserver::cancelled) stops a bootstrap as it
-/// stops a resolution; a
-/// [`Provision::observe`](crate::provision::Provision::observe) observer can
-/// still stop a bootstrap it is not reporting on.
-struct ObservedRun<'a, 'r, 'o> {
-    sink: &'o mut dyn GentooObserver,
-    request: &'a ProvisionRequest<'r>,
-}
-
-impl GentooObserver for ObservedRun<'_, '_, '_> {
-    fn progress(&mut self, event: GentooEvent<'_>) {
-        self.sink.progress(event);
-    }
-
-    fn cancelled(&mut self) -> bool {
-        self.sink.cancelled() || self.request.cancelled()
-    }
-}
-
-/// A [`Gentoo`] with a progress sink bound for one call.
-///
-/// Returned by [`Gentoo::observe`]. It implements [`Provisioner`], so it is
-/// what a caller hands to [`provision::ensure`](super::ensure) when it wants
-/// progress; and it mirrors the provisioner's own entry points so a resolution
-/// or a staged layer reports too.
-pub struct Observed<'o> {
-    gentoo: &'o mut Gentoo,
-    sink: &'o mut dyn GentooObserver,
-}
-
-impl fmt::Debug for Observed<'_> {
-    /// Renders the provisioner being observed. The sink is a caller's closure,
-    /// so it renders as its presence rather than its contents.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Observed")
-            .field("gentoo", &self.gentoo)
-            .field("sink", &Delegate("dyn GentooObserver"))
-            .finish()
-    }
+layer_observer! {
+    observer: GentooObserver,
+    event: GentooEvent,
+    shared: Gentoo,
+    layer: Gentoo,
+    field: gentoo,
 }
 
 impl Observed<'_> {
@@ -2464,21 +2385,6 @@ impl Observed<'_> {
     /// [`Gentoo::stage_layer`].
     pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
         self.gentoo.stage_layer_reporting(upper.as_ref(), self.sink)
-    }
-}
-
-impl Provisioner for Observed<'_> {
-    /// Reports to the sink bound here rather than to the run's observer: the
-    /// caller chose the richer, Gentoo-specific channel by using
-    /// [`Gentoo::observe`]. Cancellation comes from either, so a
-    /// [`Provision::observe`](crate::provision::Provision::observe) observer
-    /// can stop a bootstrap it is not reporting on.
-    fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        let mut observer = ObservedRun {
-            sink: self.sink,
-            request,
-        };
-        self.gentoo.provision_reporting(request, &mut observer)
     }
 }
 
@@ -3013,9 +2919,9 @@ mod tests {
 
     use super::*;
     use crate::ErrorChain;
-    use crate::provision::FetchRequest;
     use crate::provision::digest::Algorithm;
     use crate::provision::openpgp::fixture;
+    use crate::provision::{FetchRequest, ProvisionEvent};
     use crate::scratch::Scratch;
 
     /// A planned package weighing `size`, otherwise minimal.

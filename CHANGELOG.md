@@ -518,6 +518,9 @@ consumer upgrading can skip it.
   not UTF-8 is refused with `AlpineError::Io` naming the file, an
   `InvalidData` failure beneath it, as a file the layer cannot read is. It was
   refused with `AlpineError::Config`.
+- `alpine::Observed` renders its sink in its `Debug` output as
+  `<dyn AlpineObserver>`, as the Debian and Gentoo layers' `Observed` render
+  theirs.
 
 ### Fixed
 

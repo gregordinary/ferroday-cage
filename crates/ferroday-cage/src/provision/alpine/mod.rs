@@ -78,6 +78,7 @@ use super::identity::Ownership;
 // `super::layer` is the shared one; this module has a `layer` of its own, which
 // reads a provisioned base rather than describing how a cage is rooted on it.
 use super::layer::{Rooting, Staging};
+use super::observe::layer_observer;
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
@@ -1489,23 +1490,12 @@ pub trait AlpineObserver {
     }
 }
 
-/// A download's view of the observer: the layer's own fetch event, and its
-/// answer to whether the run should stop.
-impl super::Watch for dyn AlpineObserver + '_ {
-    fn fetching(&mut self, url: &str) {
-        self.progress(AlpineEvent::Fetching { url });
-    }
-
-    fn cancelled(&mut self) -> bool {
-        AlpineObserver::cancelled(self)
-    }
-}
-
-/// A closure is an observer that reports and never cancels.
-impl<F: FnMut(AlpineEvent<'_>)> AlpineObserver for F {
-    fn progress(&mut self, event: AlpineEvent<'_>) {
-        self(event);
-    }
+layer_observer! {
+    observer: AlpineObserver,
+    event: AlpineEvent,
+    shared: Alpine,
+    layer: Alpine,
+    field: alpine,
 }
 
 /// A progress event from an Alpine bootstrap.
@@ -1573,8 +1563,7 @@ impl Provisioner for Alpine {
     /// Reached through [`provision::ensure`](super::ensure), which publishes the
     /// finished tree atomically and removes it on any failure.
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        let mut observer = RunObserver { request };
-        self.provision_reporting(request.staging(), &mut observer)
+        self.provision_reporting(request, &mut RunObserver { request })
     }
 }
 
@@ -1592,26 +1581,10 @@ impl Alpine {
     /// The bootstrap, with an observer already chosen.
     fn provision_reporting(
         &mut self,
-        staging: &Path,
+        request: &ProvisionRequest<'_>,
         observer: &mut dyn AlpineObserver,
     ) -> Result<(), ProvisionError> {
-        bootstrap_release(self, staging, observer)
-    }
-}
-
-/// An [`Alpine`] with an observer attached, from [`Alpine::observe`].
-pub struct Observed<'o> {
-    alpine: &'o mut Alpine,
-    sink: &'o mut dyn AlpineObserver,
-}
-
-impl fmt::Debug for Observed<'_> {
-    /// Renders the provisioner. The sink is the caller's value, with nothing
-    /// renderable about one.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Observed")
-            .field("alpine", &self.alpine)
-            .finish_non_exhaustive()
+        bootstrap_release(self, request.staging(), observer)
     }
 }
 
@@ -1660,64 +1633,6 @@ impl Observed<'_> {
         self.alpine.stage_layer_reporting(upper.as_ref(), self.sink)
     }
 }
-
-impl Provisioner for Observed<'_> {
-    /// Bootstraps as [`Alpine`] does, reporting to the attached sink rather than
-    /// through the run's shared vocabulary.
-    fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        let mut observer = ObservedRun {
-            sink: self.sink,
-            request,
-        };
-        self.alpine
-            .provision_reporting(request.staging(), &mut observer)
-    }
-}
-
-/// An observer that reports through the run's shared vocabulary and takes its
-/// cancellation from the run: what an unobserved [`Alpine`] uses.
-struct RunObserver<'a, 'r> {
-    request: &'a ProvisionRequest<'r>,
-}
-
-impl AlpineObserver for RunObserver<'_, '_> {
-    fn progress(&mut self, event: AlpineEvent<'_>) {
-        self.request.report(super::ProvisionEvent::Alpine(&event));
-    }
-
-    fn cancelled(&mut self) -> bool {
-        self.request.cancelled()
-    }
-}
-
-/// An observer that reports to a sink the caller bound with [`Alpine::observe`]
-/// and stops when either that sink or the provisioning run asks it to.
-///
-/// The caller chose the richer, Alpine-specific channel for events, and a sink
-/// that answers [`cancelled`](AlpineObserver::cancelled) stops the bootstrap
-/// it watches, as it does a layered build it is handed directly. A
-/// [`Provision::observe`](crate::provision::Provision::observe) observer can
-/// still stop a bootstrap it is not reporting on.
-struct ObservedRun<'a, 'r, 'o> {
-    sink: &'o mut dyn AlpineObserver,
-    request: &'a ProvisionRequest<'r>,
-}
-
-impl AlpineObserver for ObservedRun<'_, '_, '_> {
-    fn progress(&mut self, event: AlpineEvent<'_>) {
-        self.sink.progress(event);
-    }
-
-    fn cancelled(&mut self) -> bool {
-        self.sink.cancelled() || self.request.cancelled()
-    }
-}
-
-/// An observer that reports nowhere and never cancels: what an entry point the
-/// caller attached no sink to uses.
-struct Silent;
-
-impl AlpineObserver for Silent {}
 
 /// One package the cache holds as the plan names it, waiting to be laid down.
 ///

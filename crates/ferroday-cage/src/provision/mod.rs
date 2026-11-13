@@ -83,6 +83,8 @@ mod fetch;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod http;
 mod identity;
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+mod observe;
 // The overlay upper a layered build installs into, which is a disposal handle
 // rather than anything one userland knows about.
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]

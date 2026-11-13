@@ -72,11 +72,12 @@ use super::document::Carried;
 use super::extract::{Extraction, Placement};
 use super::identity::Ownership;
 use super::layer::Staging;
+use super::observe::layer_observer;
 use super::rooted::Rooted;
 use super::{
     Available, BuildLayer, Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
-    ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Staged, Stream, compose_mirrors,
-    fetch_bounded, fetch_first, mirror_url, walk_mirrors,
+    ProvisionError, ProvisionRequest, Provisioner, Staged, Stream, compose_mirrors, fetch_bounded,
+    fetch_first, mirror_url, walk_mirrors,
 };
 use crate::failure::path_io_error;
 use crate::provision::digest::{Algorithm, Digest};
@@ -1654,7 +1655,7 @@ impl DebianBuilder {
 
 impl Provisioner for Debian {
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        self.provision_reporting(request.staging(), &mut RunObserver { request })
+        self.provision_reporting(request, &mut RunObserver { request })
     }
 }
 
@@ -1699,33 +1700,11 @@ impl Debian {
     /// stopping when it answers `true` to being cancelled.
     fn provision_reporting(
         &mut self,
-        staging: &Path,
+        request: &ProvisionRequest<'_>,
         observer: &mut dyn DebianObserver,
     ) -> Result<(), ProvisionError> {
         let (config, fetcher) = self.split();
-        bootstrap_suite(staging, &config, fetcher, observer)
-    }
-}
-
-/// A [`Debian`] with a progress sink bound for one run.
-///
-/// Returned by [`Debian::observe`]. It implements [`Provisioner`], so it is what
-/// a caller hands to [`provision::ensure`](crate::provision::ensure) when it
-/// wants progress; and it mirrors the provisioner's own entry points so a
-/// resolution or a staged layer can report too.
-pub struct Observed<'o> {
-    debian: &'o mut Debian,
-    sink: &'o mut dyn DebianObserver,
-}
-
-impl fmt::Debug for Observed<'_> {
-    /// Renders the bootstrap being observed. The sink is a caller's closure, so
-    /// it renders as its presence rather than its contents.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Observed")
-            .field("debian", &self.debian)
-            .field("sink", &Delegate("dyn DebianObserver"))
-            .finish()
+        bootstrap_suite(request.staging(), &config, fetcher, observer)
     }
 }
 
@@ -1777,23 +1756,6 @@ impl Observed<'_> {
     /// [`Debian::stage_layer`].
     pub fn stage_layer(&mut self, upper: impl AsRef<Path>) -> Result<BuildLayer, ProvisionError> {
         self.debian.stage_layer_reporting(upper.as_ref(), self.sink)
-    }
-}
-
-impl Provisioner for Observed<'_> {
-    /// Reports to the sink bound here rather than to the run's observer: the
-    /// caller chose the richer, Debian-specific channel by using
-    /// [`Debian::observe`]. Either can stop the bootstrap: the sink through
-    /// its own [`cancelled`](DebianObserver::cancelled), and a
-    /// [`Provision::observe`](crate::provision::Provision::observe) observer
-    /// that is not reporting on it through the run.
-    fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        let mut observer = ObservedRun {
-            sink: self.sink,
-            request,
-        };
-        self.debian
-            .provision_reporting(request.staging(), &mut observer)
     }
 }
 
@@ -3079,71 +3041,12 @@ pub trait DebianObserver {
     }
 }
 
-/// A download's view of the observer: the layer's own fetch event, and its
-/// answer to whether the run should stop.
-impl super::Watch for dyn DebianObserver + '_ {
-    fn fetching(&mut self, url: &str) {
-        self.progress(DebianEvent::Fetching { url });
-    }
-
-    fn cancelled(&mut self) -> bool {
-        DebianObserver::cancelled(self)
-    }
-}
-
-/// A closure is an observer that reports and never cancels.
-impl<F: FnMut(DebianEvent<'_>)> DebianObserver for F {
-    fn progress(&mut self, event: DebianEvent<'_>) {
-        self(event)
-    }
-}
-
-/// An observer that reports nowhere and never cancels: what an entry point the
-/// caller did not attach a sink to uses.
-struct Silent;
-
-impl DebianObserver for Silent {}
-
-/// An observer that reports nowhere and takes its cancellation from the
-/// provisioning run: what an unobserved [`Debian`] used as a [`Provisioner`].
-///
-/// The events still reach the run's own observer, wrapped in the shared
-/// vocabulary — that is the one channel every provisioner reports through.
-struct RunObserver<'a, 'r> {
-    request: &'a ProvisionRequest<'r>,
-}
-
-impl DebianObserver for RunObserver<'_, '_> {
-    fn progress(&mut self, event: DebianEvent<'_>) {
-        self.request.report(ProvisionEvent::Debian(&event));
-    }
-
-    fn cancelled(&mut self) -> bool {
-        self.request.cancelled()
-    }
-}
-
-/// An observer that reports to a sink the caller bound with [`Debian::observe`]
-/// and stops when either that sink or the provisioning run asks it to.
-///
-/// The caller chose the richer, Debian-specific channel for events, and the
-/// sink's own [`cancelled`](DebianObserver::cancelled) is the one its trait
-/// documents, so it stops a bootstrap as it stops a resolve or a layered build.
-/// A [`Provision::observe`](crate::provision::Provision::observe) observer can
-/// still stop a bootstrap it is not reporting on.
-struct ObservedRun<'a, 'r, 'o> {
-    sink: &'o mut dyn DebianObserver,
-    request: &'a ProvisionRequest<'r>,
-}
-
-impl DebianObserver for ObservedRun<'_, '_, '_> {
-    fn progress(&mut self, event: DebianEvent<'_>) {
-        self.sink.progress(event);
-    }
-
-    fn cancelled(&mut self) -> bool {
-        self.sink.cancelled() || self.request.cancelled()
-    }
+layer_observer! {
+    observer: DebianObserver,
+    event: DebianEvent,
+    shared: Debian,
+    layer: Debian,
+    field: debian,
 }
 
 /// A progress event from a Debian bootstrap.
