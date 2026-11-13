@@ -181,12 +181,31 @@ degrades automatically.
 
 A restriction launch takes the same shape as a cage without a PID namespace:
 a supervisor process watches the command from outside, and the same caveats
-apply. Descendants of the command can outlive it, a kill reaches only the
-command process itself, and when output is captured, a surviving descendant
-that holds the streams keeps an unbounded wait blocked — prefer a deadline
-wait for commands that may leave children behind. The Landlock ruleset, the
-seccomp filter, and no-new-privileges are all inherited by every process the
-command starts, so the confinement itself does extend to descendants.
+apply. Descendants of the command can outlive it. A kill reaches only the
+command process itself, unless the restriction has a [cgroup](#cgroups) of its
+own, through which it ends every process of the tree. When output is captured,
+a surviving descendant that holds the streams keeps an unbounded wait blocked —
+prefer a deadline wait for commands that may leave children behind. The
+Landlock ruleset, the seccomp filter, and no-new-privileges are all inherited
+by every process the command starts, so the confinement itself does extend to
+descendants.
+
+## Cgroups
+
+[`cgroup_parent`] places each launch in a cgroup of its own beneath a
+delegated cgroup v2 directory, [`cgroup_limit`] holds the command's whole
+process tree to a limit on its memory, its processes, or its processor time,
+and [`cgroup_required`] says whether a limit with no parent is refused or runs
+without its limits. They behave as they do for a cage, as [Limits on the whole
+tree](hardening.md#limits-on-the-whole-tree) describes: the launch stage joins
+the cgroup before the command starts, [`ResourceUsage`] reports what the whole
+tree used, and [`Running::kill`] ends every process of the tree through the
+cgroup's `cgroup.kill`, descendants that left the command's process tree
+included.
+
+An [`rlimit`] bounds each process alone, so a command can stay under it and
+still use as much as it likes by starting more processes. A cgroup's limits
+bound the tree together, which is the bound a restriction otherwise lacks.
 
 ## Host support
 
@@ -222,9 +241,9 @@ off. Scopes named this way are refused on a kernel that cannot enforce them.
 as they do for a sandbox. The flags that shape the command's process, its
 environment, standard streams, terminal, timeout, resource limits, and cgroup,
 behave as they do for a sandbox, and `fcage --help` lists every flag
-`--restrict` takes. [`rlimit`] matters more here than in a cage: without
-namespaces, a resource limit is the only thing bounding what the command
-consumes.
+`--restrict` takes. Resource limits matter more here than in a cage: without
+namespaces, the [`rlimit`]s and a cgroup's limits are the only things bounding
+what the command consumes.
 
 [`Restriction`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Restriction.html
 [`landlock_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_fs
@@ -238,6 +257,11 @@ consumes.
 [`stdin`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.stdin
 [`stop_with_caller`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.stop_with_caller
 [`rlimit`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.rlimit
+[`cgroup_parent`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.cgroup_parent
+[`cgroup_limit`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.cgroup_limit
+[`cgroup_required`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.cgroup_required
+[`ResourceUsage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.ResourceUsage.html
+[`Running::kill`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.kill
 [`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html
 [`Error::UsernsUnavailable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Error.html
 [`host::landlock_abi`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_abi.html

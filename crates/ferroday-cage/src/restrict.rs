@@ -137,7 +137,11 @@
 //! with waiting, deadlines, termination, and kill. Because there is no PID
 //! namespace, the same caveats as [`CageBuilder::pid_namespace`]`(false)`
 //! apply: descendants of the command can outlive it, and a kill reaches only
-//! the command process itself.
+//! the command process itself, unless the restriction has a cgroup of its own
+//! from [`cgroup_parent`](RestrictionBuilder::cgroup_parent), through which it
+//! ends every process of the tree. The cgroup is also what bounds the tree
+//! together, where an [`rlimit`](RestrictionBuilder::rlimit) bounds each
+//! process alone.
 //!
 //! [`Cage`]: crate::Cage
 //! [`CageBuilder::pid_namespace`]: crate::CageBuilder::pid_namespace
@@ -394,7 +398,9 @@ impl RestrictionBuilder {
     /// hardening layer and inherited by every process it starts. It matters
     /// more here than in a cage, because a restriction has no namespaces at
     /// all — the only thing bounding what the command consumes is what the
-    /// caller sets.
+    /// caller sets, this and a cgroup's limits. Each process is held to it
+    /// alone, so a command that starts more processes uses more in all;
+    /// [`cgroup_limit`](Self::cgroup_limit) bounds the tree together.
     pub fn rlimit(
         mut self,
         resource: Resource,
