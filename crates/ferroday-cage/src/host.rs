@@ -117,22 +117,26 @@ pub fn landlock_abi() -> Option<i32> {
     crate::mechanism::probe_landlock_abi()
 }
 
-/// Whether the running kernel offers seccomp syscall filtering.
+/// Whether this process can install a seccomp filter.
 ///
-/// `false` means the kernel was built without `CONFIG_SECCOMP`. A sandbox with
-/// a network namespace of its own, [`Network::Isolated`] or [`Network::None`],
-/// then fails to launch, since the filter that closes the routes out such a
-/// namespace does not cover cannot be installed. A seccomp policy of the
-/// hardening layer would fail to install too. [`Network::Host`] needs no
-/// filter.
+/// `false` on a kernel built without `CONFIG_SECCOMP_FILTER`, and where a
+/// seccomp policy the caller already runs under refuses the `seccomp` syscall,
+/// as a container runtime's profile can. A sandbox with a network namespace of
+/// its own, [`Network::Isolated`] or [`Network::None`], then fails to launch,
+/// since the filter that closes the routes out such a namespace does not cover
+/// cannot be installed. A seccomp policy of the hardening layer would fail to
+/// install too. [`Network::Host`] needs no filter.
+///
+/// The probe forks a short-lived child that installs the filter a launch
+/// installs and exits, so it answers what a launch would meet rather than what
+/// the kernel was configured with. It changes nothing in the calling process.
+/// A fork that fails answers `false`.
 ///
 /// [`Network::Isolated`]: crate::Network::Isolated
 /// [`Network::None`]: crate::Network::None
 /// [`Network::Host`]: crate::Network::Host
 pub fn seccomp_available() -> bool {
-    // PR_GET_SECCOMP answers with the current mode when seccomp is compiled
-    // in, and errors when it is not. The probe changes no state.
-    rustix::thread::secure_computing_mode().is_ok()
+    crate::mechanism::seccomp::installable()
 }
 
 /// Reads a sysctl file and parses its leading integer value.

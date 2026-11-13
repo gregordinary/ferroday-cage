@@ -157,7 +157,7 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 /// A host that cannot install the filter fails the launch at
 /// [`SetupStep::InstallNetworkFilter`](crate::SetupStep::InstallNetworkFilter).
 /// [`host::seccomp_available`](crate::host::seccomp_available) reports whether
-/// the kernel offers seccomp at all. [`Host`](Self::Host) carries no filter.
+/// this process can install one. [`Host`](Self::Host) carries no filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 #[cfg_attr(

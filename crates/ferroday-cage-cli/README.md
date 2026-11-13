@@ -135,7 +135,10 @@ directions.
 
 Rust 1.91 or later to build, and Linux 5.6 or later with unprivileged user namespaces
 enabled. A host that denies them is reported by name, with the blocking configuration and
-its remedy. `--restrict` is the exception: it needs only Landlock or seccomp.
+its remedy. The default network posture also installs a seccomp filter, which a kernel
+without `CONFIG_SECCOMP_FILTER` or a container runtime's seccomp profile can refuse.
+`--share-net` needs none. `--restrict` is the exception: it needs only Landlock or
+seccomp.
 
 ## Documentation
 

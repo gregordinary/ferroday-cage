@@ -90,6 +90,62 @@ fn probe_native() {
     println!("probe done");
 }
 
+/// Reports whether the host probe finds a seccomp filter installable from
+/// inside the sandbox.
+#[test]
+fn probe_seccomp_available() {
+    if !probing() {
+        return;
+    }
+    println!(
+        "seccomp-available {}",
+        ferroday_cage::host::seccomp_available()
+    );
+    println!("probe done");
+}
+
+/// A mirror nothing listens on: a bootstrap that reaches its first download
+/// fails there, fetching from it.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+const DEAD_MIRROR: &str = "http://127.0.0.1:9/";
+
+/// Reports how a Debian bootstrap from [`DEAD_MIRROR`] fails inside the
+/// sandbox.
+#[test]
+#[cfg(feature = "debian")]
+fn probe_debian_preflight() {
+    if !probing() {
+        return;
+    }
+    let mut debian = ferroday_cage::provision::debian::Debian::builder("trixie")
+        .mirror(DEAD_MIRROR)
+        .build()
+        .expect("a valid provisioner");
+    let failure = ferroday_cage::provision::ensure("/tmp/debian", &mut debian)
+        .expect_err("nothing can be fetched");
+    println!("debian {}", ferroday_cage::ErrorChain::new(&failure));
+    println!("probe done");
+}
+
+/// Reports how an Alpine bootstrap from [`DEAD_MIRROR`] fails inside the
+/// sandbox.
+#[test]
+#[cfg(feature = "alpine")]
+fn probe_alpine_preflight() {
+    if !probing() {
+        return;
+    }
+    let mut alpine = ferroday_cage::provision::alpine::Alpine::builder("v3.22")
+        .mirror(DEAD_MIRROR)
+        .include(["alpine-baselayout"])
+        .build()
+        .expect("a valid provisioner");
+    let failure = ferroday_cage::provision::ensure("/tmp/alpine", &mut alpine)
+        .expect_err("nothing can be fetched");
+    println!("alpine {}", ferroday_cage::ErrorChain::new(&failure));
+    println!("probe done");
+}
+
 /// A 32-bit x86 syscall from this 64-bit process, through `int 0x80`, which
 /// takes its arguments in `ebx`, `ecx`, and `edx`.
 ///
@@ -387,4 +443,101 @@ fn an_isolated_network_closes_the_32_bit_entry_points() {
     }
     // The host network carries no filter, and socketcall works there.
     assert_eq!(outcome(&host, "i386-socketcall-unix"), Ok(()));
+}
+
+/// Runs the probe test `test` in a sandbox under `policy`, or under no policy
+/// of its own where `None`, and returns what it reported on its line starting
+/// with `key`.
+#[cfg(feature = "hardening")]
+fn report_under(test: &str, key: &str, policy: Option<ferroday_cage::SeccompPolicy>) -> String {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let mut builder = host_userland()
+        .command(PROBE_PATH)
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(PROBE, "1")
+        .resolv_conf(false)
+        .bind_ro(&exe, PROBE_PATH);
+    if let Some(policy) = policy {
+        builder = builder.seccomp(policy);
+    }
+    let output = builder
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox launches");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let prefix = format!("{key} ");
+    let report = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "the probe reported no {key}:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    report.to_string()
+}
+
+/// A policy refusing the `seccomp` syscall, as a container runtime's profile
+/// can.
+#[cfg(feature = "hardening")]
+fn refusing_seccomp() -> Option<ferroday_cage::SeccompPolicy> {
+    let rules = ferroday_cage::SeccompRules::denying([libc::SYS_seccomp]);
+    Some(ferroday_cage::SeccompPolicy::Rules(rules))
+}
+
+/// What the host probe answers inside a sandbox under `policy`.
+#[cfg(feature = "hardening")]
+fn seccomp_available_under(policy: Option<ferroday_cage::SeccompPolicy>) -> bool {
+    report_under("probe_seccomp_available", "seccomp-available", policy)
+        .parse()
+        .expect("the probe reports a boolean")
+}
+
+/// The host probe answers what a launch would meet rather than what the kernel
+/// was built with: inside a sandbox whose seccomp policy refuses the `seccomp`
+/// syscall, as a container runtime's profile can, no filter can be installed,
+/// and the probe says so.
+#[test]
+#[cfg(feature = "hardening")]
+fn the_seccomp_probe_reports_a_policy_that_refuses_the_install() {
+    if !host_runs_the_filter() {
+        return;
+    }
+    assert!(
+        seccomp_available_under(None),
+        "a sandbox under no policy of its own can install a filter",
+    );
+    assert!(
+        !seccomp_available_under(refusing_seccomp()),
+        "a policy refusing seccomp leaves no filter installable",
+    );
+}
+
+/// A bootstrap runs the target's binaries in sandboxes that carry the network
+/// filter, so on a host that cannot install one it is refused before its first
+/// download, naming the filter. Where the filter installs, the same bootstrap
+/// reaches the download, which is what makes the refusal the preflight's.
+#[test]
+#[cfg(all(feature = "hardening", feature = "debian", feature = "alpine"))]
+fn a_bootstrap_refuses_a_host_without_seccomp_before_downloading() {
+    if !host_runs_the_filter() {
+        return;
+    }
+    for (test, key) in [
+        ("probe_debian_preflight", "debian"),
+        ("probe_alpine_preflight", "alpine"),
+    ] {
+        let refused = report_under(test, key, refusing_seccomp());
+        assert!(
+            refused.contains("network filter") && !refused.contains("127.0.0.1"),
+            "{key}: {refused}"
+        );
+        let reached = report_under(test, key, None);
+        assert!(
+            !reached.contains("network filter") && reached.contains("127.0.0.1"),
+            "{key}: {reached}"
+        );
+    }
 }

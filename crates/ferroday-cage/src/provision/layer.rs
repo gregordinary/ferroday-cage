@@ -91,6 +91,30 @@ impl<'a> Rooting<'a> {
     }
 }
 
+/// Whether the cages a bootstrap's waves run in can launch on this host, as far
+/// as the network filter they carry decides it: the preflight a layer takes
+/// before it downloads anything, beside
+/// [`idmap::establishable`](crate::idmap::establishable).
+///
+/// [`Rooting::builder`] leaves a wave's cage the default network, a namespace of
+/// its own, so every wave installs the network filter. A host where
+/// [`host::seccomp_available`](crate::host::seccomp_available) answers `false`
+/// fails each one at its launch, and asked before the download the refusal
+/// costs nothing and names its remedy.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) fn network_filter_preflight() -> Result<(), String> {
+    if crate::host::seccomp_available() {
+        return Ok(());
+    }
+    Err(
+        "a bootstrap runs the target's binaries in sandboxes that carry a seccomp network \
+         filter, and this host cannot install one: its kernel lacks CONFIG_SECCOMP_FILTER, or a \
+         seccomp policy this process runs under refuses the seccomp syscall; use extract_only \
+         to lay out the root filesystem without running its binaries"
+            .to_string(),
+    )
+}
+
 /// A staged build layer: the disposable overlay upper an increment was installed
 /// into, removed when the handle is dropped.
 ///

@@ -703,6 +703,8 @@ impl Debian {
         // binaries, and a range map must be establishable.
         arch::preflight_foreign(&arch::host_architecture(), &self.architecture)
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
+        crate::provision::layer::network_filter_preflight()
+            .map_err(|reason| wrap(DebianError::Config { reason }))?;
         crate::idmap::establishable(&self.identity_map, self.id_mapper.as_ref()).map_err(
             |refusal| {
                 wrap(DebianError::Config {
@@ -1767,6 +1769,8 @@ fn bootstrap_suite(
     // A full bootstrap must be able to run the target's binaries.
     if !extract_only {
         arch::preflight_foreign(&arch::host_architecture(), architecture)
+            .map_err(|reason| wrap(DebianError::Config { reason }))?;
+        crate::provision::layer::network_filter_preflight()
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
 
         // A range map must be establishable before anything is downloaded:

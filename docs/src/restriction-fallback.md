@@ -188,8 +188,9 @@ restriction with any Landlock grant at build, with
 one with a network grant the same way. A seccomp-only restriction runs on
 either, without the default scopes a kernel below ABI 6 cannot enforce. One
 that names its scopes is refused there instead, with
-[`ConfigError::LandlockScopeUnenforceable`]. [`host::landlock_abi`] and
-[`host::seccomp_available`] report what the kernel offers.
+[`ConfigError::LandlockScopeUnenforceable`]. [`host::landlock_abi`] reports the
+kernel's Landlock ABI, and [`host::seccomp_available`] whether this process can
+install a seccomp filter.
 
 ## On the command line
 

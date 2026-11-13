@@ -1706,10 +1706,11 @@ struct Acquired {
 
 /// What must hold before anything is downloaded.
 ///
-/// An unavailable identity map or an unrunnable architecture is a configuration
-/// problem, and both are cheaper to report now than after a closure has been
-/// fetched. Neither applies to an extract-only run, which executes nothing, so
-/// such a run reaches none of this.
+/// An unavailable identity map, an unrunnable architecture, or a host that
+/// cannot install the network filter the scripts' sandboxes carry is a
+/// configuration problem, and each is cheaper to report now than after a
+/// closure has been fetched. None applies to an extract-only run, which
+/// executes nothing, so such a run reaches none of this.
 ///
 /// A caller-supplied plan is not checked here: it is checked by
 /// [`validate_plan`] at `build()`, where the configuration is frozen and where
@@ -1719,6 +1720,8 @@ fn preflight(alpine: &Alpine) -> Result<(), AlpineError> {
         return Ok(());
     }
     preflight_foreign(&host_architecture(), &alpine.architecture)?;
+    crate::provision::layer::network_filter_preflight()
+        .map_err(|reason| AlpineError::Config { reason })?;
     // The identity posture is never quietly downgraded to the single-identity
     // form.
     crate::idmap::establishable(&alpine.identity_map, alpine.id_mapper.as_ref()).map_err(

@@ -484,6 +484,8 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Resolve a range identity map into the extents a delegate writes, validated | `idmap::resolve_delegate`, through the configured delegate or the bundled chain |
 | Can a provisioner establish its range map, asked before it downloads anything? | `idmap::establishable` |
+| Can the sandboxes a provisioner runs the target's binaries in install their network filter, asked before it downloads anything? | `provision::layer::network_filter_preflight`, over `host::seccomp_available` |
+| Can this process install a seccomp filter? | `host::seccomp_available`, which installs one in a forked child through `mechanism::seccomp::installable` |
 | Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |
 | What does the single-identity map write? | `idmap::single_identity_lines` |

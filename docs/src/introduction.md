@@ -81,7 +81,8 @@ fallback](restriction-fallback.md).
 
 - Rust 1.91 or later. See [Stability and versioning](stability.md#minimum-supported-rust-version)
   for how that floor moves.
-- Linux 5.6 or later, with unprivileged user namespaces enabled. See [Host
+- Linux 5.6 or later, with unprivileged user namespaces enabled, and able to
+  install a seccomp filter, which the default network posture does. See [Host
   requirements](host-requirements.md). The [restriction
   fallback](restriction-fallback.md) is the exception: it needs only
   Landlock or seccomp.

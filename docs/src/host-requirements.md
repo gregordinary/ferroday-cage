@@ -16,8 +16,10 @@ A kernel built without `CONFIG_SECCOMP_FILTER` fails such a launch at
 `SetupStep::InstallNetworkFilter`. So does a container runtime whose seccomp
 profile refuses the `seccomp` syscall.
 [`host::seccomp_available`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.seccomp_available.html)
-reports whether the kernel offers seccomp. `Network::Host` installs no filter
-and needs none.
+reports whether this process can install a filter. It installs one in a
+short-lived child, so it answers for both cases. A Debian or Alpine bootstrap
+runs its packages' scripts in such sandboxes, and asks the same before it
+downloads anything. `Network::Host` installs no filter and needs none.
 
 Two opt-in capabilities have host requirements of their own. A [uid/gid range
 map](identity-maps.md) requested by an unprivileged caller needs the shadow

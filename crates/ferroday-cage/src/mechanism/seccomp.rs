@@ -14,7 +14,7 @@ use rustix::io::Errno;
 use rustix::thread::UnshareFlags;
 use syscalls::Sysno;
 
-use super::sys::errno;
+use super::sys::{self, Fork, errno};
 use super::{LaunchPlan, SockFilter};
 
 /// Classic-BPF opcodes and `seccomp_data` field offsets.
@@ -466,6 +466,51 @@ pub(crate) fn install(program: &[SockFilter]) -> Result<(), Errno> {
     }
     .map(|_| ())
     .map_err(errno)
+}
+
+/// Whether this process can install a seccomp filter, found by installing
+/// [`NETWORK_FILTER`] in a forked child that does nothing else and exits.
+///
+/// Whatever refuses a launch's install refuses this one, so the answer is
+/// exact: a kernel built without `CONFIG_SECCOMP_FILTER` answers the install
+/// `EINVAL`, and a seccomp policy the caller already runs under, such as a
+/// container runtime's, may answer the `seccomp` syscall with an errno or kill
+/// whatever makes it. Either way the child fails and the caller is untouched.
+/// A query made in the calling process answers less. `PR_GET_SECCOMP` sees
+/// neither case, `SECCOMP_GET_ACTION_AVAIL` is served by a kernel whose
+/// filters are compiled out, and a probe of the `seccomp` syscall itself dies
+/// with the caller under a policy that kills.
+///
+/// The child sets no-new-privileges first. A launch installs the filter
+/// holding the capability its nested user namespace grants instead, and the
+/// kernel accepts either. A fork that fails answers `false`: it established
+/// nothing, and a launch would fail at the same fork.
+pub(crate) fn installable() -> bool {
+    // SAFETY: the child branch makes only raw syscalls over static data — no
+    // allocation, no lock, no libc, no panic — and always ends in
+    // `exit_group`. It leaves every signal blocked, as the fork hands it, so
+    // no inherited handler can run before it exits.
+    match unsafe { sys::fork() } {
+        Err(_) => false,
+        Ok(Fork::Child) => sys::exit_group(install_in_probe()),
+        Ok(Fork::ParentOf(child)) => {
+            super::wait_for_exit(child).is_ok_and(|status| status.exit_status() == Some(0))
+        }
+    }
+}
+
+/// The probe child of [`installable`]: closes the caller's descriptors, takes
+/// no-new-privileges, and installs the filter, answering the exit code the
+/// parent reads.
+///
+/// The descriptors are closed for every forked child's reason, which
+/// `sweep_fds_keeping` states. That close is not what is asked, so a sweep
+/// that fails, as one does where `/proc` is not mounted, changes no answer.
+fn install_in_probe() -> i32 {
+    let _ = super::child::sweep_fds_keeping(&[]);
+    let installed =
+        rustix::thread::set_no_new_privs(true).is_ok() && install(NETWORK_FILTER).is_ok();
+    if installed { 0 } else { 1 }
 }
 
 /// A classic-BPF seccomp program, run the way the kernel runs it, for the unit

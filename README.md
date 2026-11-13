@@ -81,8 +81,10 @@ fcage --rootfs /srv/rootfs/alpine -- /bin/sh -c 'echo hello from the cage'
 
 Requires Rust 1.91 or later, and Linux 5.6 or later with unprivileged user namespaces
 enabled. A host that denies them is reported by name, with the blocking configuration
-and its remedy. Two capabilities need more: an unprivileged overlay mount needs 5.11, and
-an overlay upper on tmpfs needs 6.6. The
+and its remedy. The default network posture also installs a seccomp filter, which a
+kernel without `CONFIG_SECCOMP_FILTER` or a container runtime's seccomp profile can
+refuse. `Network::Host` needs none. Two capabilities need more: an unprivileged overlay
+mount needs 5.11, and an overlay upper on tmpfs needs 6.6. The
 [guide](https://gregordinary.github.io/ferroday-cage/) covers all of this, and its [host
 requirements](https://gregordinary.github.io/ferroday-cage/host-requirements.html) chapter
 states each floor.
