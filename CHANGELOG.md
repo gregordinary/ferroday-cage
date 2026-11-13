@@ -657,6 +657,13 @@ consumer upgrading can skip it.
   container's `CATEGORY`, `PF` and `CHOST`, the `CHOST`s a root's database
   states, and a link path a container ships are quoted with `{:?}` where a
   refusal names them.
+- A Debian resolution asks for a repository's indexes first at the mirror that
+  served its release, then at the rest in the order they are configured. The
+  index walk started again at the first mirror, so where a backstop served the
+  release, the live mirror's index of the same name was read against it and
+  failed its digest check, which ends the walk: a live mirror with a snapshot
+  backstop failed the bootstrap with `DebianError::Digest` after a transient
+  failure of the live release.
 
 ### Internal
 

@@ -1995,12 +1995,6 @@ fn merged_index(
     let mut archives: Vec<ResolvedArchive> = Vec::new();
     for (origin, repository) in repositories.iter().enumerate() {
         let (release, served) = fetch_release(fetcher, repository, observer)?;
-        let Served {
-            url,
-            mirror,
-            signed_by,
-            signing_key,
-        } = served;
         release
             .check(
                 &repository.suite,
@@ -2009,9 +2003,23 @@ fn merged_index(
                 repository.require_fresh(),
             )
             .map_err(|reason| DebianError::Release {
-                subject: url.clone(),
+                subject: served.url.clone(),
                 reason,
             })?;
+        let text = fetch_index(
+            fetcher,
+            repository,
+            architecture,
+            &release,
+            &served,
+            observer,
+        )?;
+        let Served {
+            mirror,
+            signed_by,
+            signing_key,
+            ..
+        } = served;
         archives.push(ResolvedArchive {
             mirror,
             suite: repository.suite.clone(),
@@ -2025,7 +2033,6 @@ fn merged_index(
             // so there is nothing to carry.
             carried: Carried::new(),
         });
-        let text = fetch_index(fetcher, repository, architecture, &release, &url, observer)?;
         index_inputs.push((origin, release.priority(), text));
     }
 
@@ -2153,10 +2160,12 @@ struct Served {
     url: String,
     /// The mirror that served the release.
     ///
-    /// Where the release came from, and not where the packages go to: a
-    /// bootstrap walks the mirrors its repositories are configured with, so this
-    /// records the choice that was made rather than deciding a later one. It
-    /// reaches a caller as [`ResolvedArchive::mirror`].
+    /// The first mirror the release's indexes are asked of, since they are
+    /// held to what this release records; see [`served_first`]. It is not where
+    /// the packages go to: a bootstrap walks the mirrors its repositories are
+    /// configured with, so this records the choice that was made rather than
+    /// deciding a later one. It reaches a caller as
+    /// [`ResolvedArchive::mirror`].
     mirror: String,
     /// The verifying certificate's primary-key fingerprint, or empty for a
     /// trusted-unsigned repository.
@@ -2182,14 +2191,15 @@ struct Served {
 /// so an empty component — a pool created before the build that fills it — does
 /// not introduce a stray paragraph break.
 ///
-/// `release_url` is where `release` came from, which a release that lists no
-/// index for a component is reported against.
+/// `served` is where `release` came from: its URL, which a release that lists
+/// no index for a component is reported against, and the mirror that served
+/// it, which every component's walk asks first.
 fn fetch_index(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
     architecture: &str,
     release: &Release,
-    release_url: &str,
+    served: &Served,
     observer: &mut dyn DebianObserver,
 ) -> Result<String, DebianError> {
     let mut merged = String::new();
@@ -2200,7 +2210,7 @@ fn fetch_index(
             architecture,
             component,
             release,
-            release_url,
+            served,
             observer,
         )?;
         append_component(&mut merged, &text);
@@ -2226,13 +2236,17 @@ fn append_component(merged: &mut String, text: &str) {
     merged.push('\n');
 }
 
-/// Fetches one component's index, walking the repository's mirror list.
+/// Fetches one component's index, walking the repository's mirror list from
+/// the mirror that served the release.
 ///
 /// The candidate compressions the release lists a digest for are determined
 /// once, from the release; the mirror walk then tries them in order on each
 /// mirror, advancing to the next mirror when one reports the index missing. A
 /// fetched index is verified against the release digest — a mismatch is fatal,
 /// not a reason to try another mirror — and decompressed.
+///
+/// The walk starts at the mirror that served the release and goes on through
+/// the rest in the order they are configured; see [`served_first`] for why.
 ///
 /// Where the release declares `Acquire-By-Hash`, each compression is asked for
 /// by its digest first and by its name second, the order apt queues the two
@@ -2241,15 +2255,14 @@ fn append_component(merged: &mut String, text: &str) {
 /// only when the digest path failed to serve: bytes that arrived and do not
 /// match the digest stop the walk there, as they do everywhere else.
 ///
-/// `release_url` is where `release` came from, which a release listing no index
-/// for the component is reported against.
+/// `served` is where `release` came from, as [`fetch_index`] takes it.
 fn fetch_component_index(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
     architecture: &str,
     component: &str,
     release: &Release,
-    release_url: &str,
+    served: &Served,
     observer: &mut dyn DebianObserver,
 ) -> Result<String, DebianError> {
     // Prefer the smallest available index; every candidate is verified against
@@ -2269,7 +2282,7 @@ fn fetch_component_index(
         .collect();
     if candidates.is_empty() {
         return Err(DebianError::Release {
-            subject: release_url.to_string(),
+            subject: served.url.clone(),
             reason: format!("it lists no index for component {component} on {architecture}"),
         });
     }
@@ -2294,7 +2307,7 @@ fn fetch_component_index(
     // refused above, and a repository with no mirror at construction.
     let not_served = || DebianError::Fetch(FetchError::not_found(&unserved));
     walk_mirrors(
-        &repository.mirrors,
+        &served_first(&repository.mirrors, &served.mirror),
         |mirror| {
             // A mirror boundary: nothing is half-read, so stopping here costs
             // nothing, and a resolve stops between one mirror and the next
@@ -2337,6 +2350,29 @@ fn fetch_component_index(
         },
         not_served,
     )
+}
+
+/// The mirrors an index walk asks, in order: `served`, the mirror that served
+/// the release the index is held to, then the rest of `mirrors` as configured.
+///
+/// The release records the digest every index is held to, and the mirrors of
+/// one repository need not publish the same state at one moment: a snapshot
+/// backstop publishes the state of its date, and a live mirror today's. A walk
+/// from the first mirror would ask the live mirror for the index of a release
+/// the snapshot served, and the live mirror's index, published under the same
+/// name, is not the one that release records. A digest mismatch ends a walk
+/// rather than advancing it, so the run would fail as though a mirror had
+/// tampered with the index, over a transient failure that had sent the release
+/// to the backstop.
+fn served_first<'m>(mirrors: &'m [String], served: &'m str) -> Vec<&'m str> {
+    std::iter::once(served)
+        .chain(
+            mirrors
+                .iter()
+                .map(String::as_str)
+                .filter(|mirror| *mirror != served),
+        )
+        .collect()
 }
 
 /// Fetches `suffix` (a mirror-relative path) from the first mirror that serves
@@ -3977,6 +4013,55 @@ mod tests {
             .expect("the index is read");
         assert!(available.contains("kept") && available.contains("also-kept"));
         assert_eq!(counts.0, [(2, 5)]);
+    }
+
+    #[test]
+    fn a_release_s_indexes_are_asked_of_the_mirror_that_served_it_first() {
+        // A live mirror and a backstop, each publishing its own state under the
+        // same names and at the same length. The live one serves no release, so
+        // the backstop's is the one read, and the index it records is the
+        // backstop's: the live mirror's, asked for first, would fail the digest
+        // check, which ends a walk rather than advancing it.
+        let dir = Scratch::new("index-from-the-serving-mirror");
+        let stanza = |name: &str| {
+            format!(
+                "Package: {name}\nVersion: 1\nArchitecture: amd64\nFilename: pool/{name}.deb\n\
+                 SHA256: {}\n",
+                "0".repeat(64),
+            )
+        };
+        let packages = "dists/trixie/main/binary-amd64/Packages";
+        let live = dir.join("live");
+        let backstop = dir.join("backstop");
+        for (mirror, index) in [(&live, stanza("fresh")), (&backstop, stanza("stale"))] {
+            let path = mirror.join(packages);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a mirror tree");
+            std::fs::write(path, index).expect("the index is written");
+        }
+        let recorded = stanza("stale");
+        std::fs::write(
+            backstop.join("dists/trixie/Release"),
+            format!(
+                "Suite: trixie\nArchitectures: amd64\nComponents: main\nSHA256:\n {} {} \
+                 main/binary-amd64/Packages\n",
+                Algorithm::Sha256.hex_of(recorded.as_bytes()),
+                recorded.len(),
+            ),
+        )
+        .expect("the release is written");
+
+        let mut debian = Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(crate::provision::file_url(&live).expect("a file:// URL"))
+            .mirror_fallback(crate::provision::file_url(&backstop).expect("a file:// URL"))
+            .trust_unsigned(true)
+            .build()
+            .expect("the builder validates");
+        let available = debian
+            .available()
+            .expect("the index the backstop's release records is read");
+        assert!(available.contains("stale"));
+        assert!(!available.contains("fresh"));
     }
 
     #[test]
