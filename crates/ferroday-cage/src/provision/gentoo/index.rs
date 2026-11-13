@@ -392,12 +392,11 @@ impl Index {
     /// Parses an index document.
     ///
     /// The first stanza is the preamble and every stanza after it is a build. A
-    /// stanza that is not one this layer can act on — no `CPV` it can split, a
-    /// `PATH` that would not stay inside the archive, a dependency class it
-    /// cannot read — is left out and counted rather than failing the whole
-    /// index: an unsigned document is one a mirror composes, and letting a
-    /// single stanza refuse fifteen thousand others would make a denial of
-    /// service out of a typo.
+    /// stanza that is not one this layer can act on, or one a plan could not
+    /// record, is left out and counted rather than failing the whole index:
+    /// [`read_record`] says which those are. An unsigned document is one a
+    /// mirror composes, and letting a single stanza refuse fifteen thousand
+    /// others would make a denial of service out of a typo.
     ///
     /// The stanzas are read one at a time and only the records are kept, so
     /// what parsing holds beyond the text is the records themselves.
@@ -497,6 +496,15 @@ fn read_preamble(stanza: &Stanza<'_>) -> Preamble {
 }
 
 /// Reads one build's stanza, or `None` where it is not one.
+///
+/// It is not one where it lacks a field a build needs (`CPV`, `MD5`,
+/// `BUILD_ID`, `PATH`, `SIZE`), or states one this layer cannot act on or a
+/// plan cannot record: a `CPV` that does not split or names a package the
+/// specification does not permit, an MD5, a build id or a size that is not
+/// one, a dependency class [`read_class`] refuses, an empty slot, a value
+/// folded over several lines, or a field longer than [`overlong`] admits. A
+/// path that would not stay inside the archive is refused by the caller,
+/// through [`Record::unaddressable`].
 fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
     let [
         cpv,

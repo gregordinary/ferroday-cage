@@ -265,9 +265,9 @@ impl PlannedPackage {
     /// [`filename`](Self::filename) is interpolated verbatim into the URL the
     /// `.deb` is fetched from and, for a `file://` mirror, into a local path, so
     /// one holding a `..`, a leading slash, or a byte a request line ends on
-    /// would fetch from somewhere other than the mirror root. And
-    /// Its [`digest`](Self::digest) is held to its algorithm's shape by its
-    /// type, so it has nothing to be refused for here.
+    /// would fetch from somewhere other than the mirror root. Its
+    /// [`digest`](Self::digest) is held to its algorithm's shape by its type,
+    /// so it has nothing to be refused for here.
     ///
     /// A package resolved from an index passed
     /// [`index::is_package_name`](super::index::is_package_name),

@@ -303,8 +303,9 @@ pub enum GentooError {
     /// keyring, or the keyring itself could not be read.
     #[non_exhaustive]
     Signature {
-        /// What was being verified: the URL a document was served from, or the
-        /// keyring.
+        /// What was being verified: the URL a document was served from, the
+        /// cache entry a digest document was kept at, a binary package's
+        /// `Manifest`, or the keyring.
         subject: String,
         /// Why it was not accepted.
         reason: String,
@@ -316,8 +317,9 @@ pub enum GentooError {
     /// recording no usable SHA-512 for the tarball beside it.
     #[non_exhaustive]
     Document {
-        /// The URL the document was served from, mirror included, so a walk
-        /// over several of them names the one that answered.
+        /// Where the document came from: the URL it was served from, mirror
+        /// included, so a walk over several of them names the one that
+        /// answered, or the cache entry a digest document was kept at.
         subject: String,
         /// What was wrong with it.
         reason: String,
@@ -406,7 +408,8 @@ pub enum GentooError {
         reason: String,
     },
     /// A root's own package database holds something that is not a package
-    /// entry.
+    /// entry, costs more to read than the layer reads of one, or states a
+    /// merge counter too near its largest value for the merges a plan needs.
     ///
     /// The database is read to learn what a root already has, so an entry that
     /// cannot be read is a gap in that answer rather than a detail to pass
@@ -2212,9 +2215,13 @@ pub enum GentooEvent<'a> {
     Index {
         /// How many published builds it names.
         builds: usize,
-        /// How many stanzas were read and not kept: a record whose `CPV` this
-        /// layer could not split, whose path would not stay inside the archive,
-        /// or whose dependency classes it could not read. A live archive
+        /// How many stanzas were read and not kept: a record missing a field a
+        /// build needs, or stating one this layer cannot act on or a plan
+        /// cannot record. That is a `CPV` it cannot split or a name the
+        /// specification does not permit, a path that would not stay inside
+        /// the archive, an MD5, build id or size that is not one, dependency
+        /// classes it cannot read, an empty slot, a value folded over several
+        /// lines, or a field longer than a record may state. A live archive
         /// reports zero.
         skipped: usize,
         /// The epoch the index states it was generated at, where it states one.
@@ -2439,9 +2446,11 @@ impl GentooObserver for RunObserver<'_, '_> {
 }
 
 /// An observer that reports to a sink the caller bound with [`Gentoo::observe`]
-/// and takes its cancellation from the provisioning run.
+/// and stops when either that sink or the provisioning run asks it to.
 ///
-/// The caller chose the richer, Gentoo-specific channel for events; a
+/// The caller chose the richer, Gentoo-specific channel for events, and the
+/// sink's own [`cancelled`](GentooObserver::cancelled) stops a bootstrap as it
+/// stops a resolution; a
 /// [`Provision::observe`](crate::provision::Provision::observe) observer can
 /// still stop a bootstrap it is not reporting on.
 struct ObservedRun<'a, 'r, 'o> {

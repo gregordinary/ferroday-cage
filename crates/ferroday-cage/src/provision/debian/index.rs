@@ -450,8 +450,10 @@ impl Index {
     /// no package, is left out and counted in [`skipped`](Self::skipped) rather
     /// than refusing the index: a package the closure needs and the mirror
     /// malformed is still refused, by name, when nothing else answers it, and
-    /// one it does not need costs nothing. A stanza for another architecture is
-    /// neither kept nor counted, since it is not this bootstrap's.
+    /// one it does not need costs nothing. A stanza this layer can read that is
+    /// for another architecture is neither kept nor counted, since it is not
+    /// this bootstrap's. One it cannot read is counted whatever architecture it
+    /// states, since the architecture is one of the fields it could not read.
     pub(crate) fn merge<'a>(
         sources: impl IntoIterator<Item = Source<'a>>,
         architecture: &str,
