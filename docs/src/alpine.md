@@ -147,6 +147,11 @@ needs no repository at all — and [`repository`] merges in additional sources,
 each with its own [`KeySet`], so multiplying repositories repeats the
 authenticity check per source rather than weakening it.
 
+A mirror URL is one line of the finished root's `/etc/apk/repositories`, so one
+carrying whitespace or a control character is refused at `build`, whether it is
+the primary, a fallback, or an additional repository's. A local path that holds
+either takes a percent escape, which [`file_url`] writes.
+
 Resolution is highest-version-wins across the merged repositories. An exact tie
 resolves to the *later* repository, which is what makes an additional repository
 an overlay: a package it republishes at the version the primary already offers is
@@ -778,6 +783,7 @@ $ fcage --rootfs ./pmos --provision-alpine v3.23 \
 [`plan`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.AlpineBuilder.html#method.plan
 [`pin`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.AlpineBuilder.html#method.pin
 [`KeySet`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.KeySet.html
+[`file_url`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/fn.file_url.html
 [`KeySet::alpine`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.KeySet.html#method.alpine
 [`KeySet::insert`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/provision/alpine/struct.KeySet.html#method.insert
 [`overlay_rootfs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_rootfs
