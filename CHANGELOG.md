@@ -677,6 +677,10 @@ consumer upgrading can skip it.
 - `fcage --gentoo-packages` without `--gentoo-binhost`, and `fcage
   --export-rootfs` given an empty value, are usage errors and exit 2, as the
   other modes' missing and empty values are. Each ran and failed with 125.
+- `fcage --help` lists every flag `--restrict` takes, generated from the rule
+  the parser applies. It left out the cgroup flags and those of the unix-socket
+  restriction, which a restriction takes. A flag a restriction refuses is named
+  in the refusal, where a family of flags was.
 
 ### Internal
 

@@ -219,9 +219,10 @@ $ fcage --restrict \
 `--landlock-scope` replaces the default scopes, and an empty list turns them
 off. Scopes named this way are refused on a kernel that cannot enforce them.
 `--landlock-resolve-unix` and `--landlock-unix PATH` restrict pathname sockets
-as they do for a sandbox. Alongside the grant flags, `--setenv`, `--no-base-env`, `--chdir`,
-`--stdin`, `--rlimit`, `--timeout`, `--kill-after`, and `--stop-with-caller`
-behave as they do for a sandbox. [`rlimit`] matters more here than in a cage: without
+as they do for a sandbox. The flags that shape the command's process, its
+environment, standard streams, terminal, timeout, resource limits, and cgroup,
+behave as they do for a sandbox, and `fcage --help` lists every flag
+`--restrict` takes. [`rlimit`] matters more here than in a cage: without
 namespaces, a resource limit is the only thing bounding what the command
 consumes.
 

@@ -272,8 +272,17 @@ struct Flag {
     /// broken where it reads well rather than at a column, and re-wrapping it
     /// would move a line break the person who wrote the sentence chose.
     help: &'static [&'static str],
-    /// Whether a roster generated from the library follows the entry.
-    roster: bool,
+    /// The names a roster generated from the code lists after the entry, where
+    /// one follows it.
+    roster: Option<fn() -> Vec<&'static str>>,
+    /// Whether a `--restrict` launch takes it.
+    ///
+    /// A restriction has no root filesystem and no namespace of its own, so
+    /// only the flags that shape the command's process and its confinement
+    /// apply to one. This is the parser's rule and the help's list both: the
+    /// parser refuses every flag given beside `--restrict` that does not say
+    /// so here, and `--restrict`'s entry lists every one that does.
+    restriction: bool,
     /// The invocation it belongs to.
     mode: Mode,
     /// Whether naming this flag is what selects its mode.
@@ -292,7 +301,8 @@ impl Flag {
         placeholder: "",
         section: Section::Command,
         help: &[],
-        roster: false,
+        roster: None,
+        restriction: false,
         mode: Mode::Launch,
         selects: false,
         needs: "a value",
@@ -1507,7 +1517,8 @@ const FLAGS: &[Flag] = &[
             "Repeatable (e.g. --rlimit processes=64 --rlimit",
             "address-space=536870912). RES is one of:",
         ],
-        roster: true,
+        roster: Some(resource_names),
+        restriction: true,
         take: Take::One(|options, flag, value| {
             options
                 .rlimits
@@ -1527,6 +1538,7 @@ const FLAGS: &[Flag] = &[
             "-p Delegate=yes gives it. The cgroup accounts for and",
             "kills the whole process tree",
         ],
+        restriction: true,
         take: Take::One(|options, _flag, value| {
             options.cgroup_parent = Some(PathBuf::from(value));
             Ok(())
@@ -1544,6 +1556,7 @@ const FLAGS: &[Flag] = &[
             "cpu-max (QUOTA[:PERIOD], microseconds, PERIOD default",
             "100000), and cpu-weight (1 to 10000)",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             options
                 .cgroup_limits
@@ -1560,6 +1573,7 @@ const FLAGS: &[Flag] = &[
             "--cgroup-parent to apply them beneath (the default;",
             "--no-cgroup-required runs it without them)",
         ],
+        restriction: true,
         take: Take::Bare(|options| {
             options.cgroup_required = Some(true);
         }),
@@ -1583,6 +1597,7 @@ const FLAGS: &[Flag] = &[
         placeholder: "NAME VALUE",
         help: &["Set an environment variable for the command"],
         needs: "a name and a value",
+        restriction: true,
         take: Take::Two(|options, flag, value, second| {
             // Validated here so a bad name is the usage error it is (exit 2),
             // rather than deferring to the library's build-time rejection
@@ -1614,6 +1629,7 @@ const FLAGS: &[Flag] = &[
         section: Section::Command,
         placeholder: "DIR",
         help: &["Working directory inside the sandbox (default /)"],
+        restriction: true,
         take: Take::One(|options, _flag, value| {
             options.chdir = Some(PathBuf::from(value));
             Ok(())
@@ -1633,6 +1649,7 @@ const FLAGS: &[Flag] = &[
             "reach that terminal unless redirected, which a shell",
             "already spells and a profile carries as stdout/stderr",
         ],
+        restriction: true,
         take: Take::One(|options, _flag, value| {
             options.stdin = Some(parse_stdin(&value)?);
             Ok(())
@@ -1653,6 +1670,7 @@ const FLAGS: &[Flag] = &[
             "sandbox that still has a real terminal of its own, at",
             "80x24",
         ],
+        restriction: true,
         take: Take::Bare(|options| {
             options.terminal = true;
         }),
@@ -1666,6 +1684,7 @@ const FLAGS: &[Flag] = &[
             "Terminate the command after SECS seconds, kill it",
             "--kill-after seconds later, and exit 124",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             options.timeout = Some(parse_seconds(flag, &value)?);
             Ok(())
@@ -1677,6 +1696,7 @@ const FLAGS: &[Flag] = &[
         section: Section::Command,
         placeholder: "SECS",
         help: &["Grace between terminate and kill (default 10)"],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             options.kill_after = parse_seconds(flag, &value)?;
             options.kill_after_given = true;
@@ -1691,6 +1711,7 @@ const FLAGS: &[Flag] = &[
             "Stop the sandbox when fcage itself exits (the default;",
             "--no-stop-with-caller leaves it running)",
         ],
+        restriction: true,
         take: Take::Bare(|options| {
             options.stop_with_caller = Some(true);
         }),
@@ -1925,12 +1946,11 @@ const FLAGS: &[Flag] = &[
             "host paths. The fallback for hosts without",
             "unprivileged user namespaces; requires a Landlock",
             "grant (--landlock-ro, --landlock-rw, --landlock-bind,",
-            "--landlock-connect) or a seccomp flag, and accepts",
-            "only those, --landlock-scope, --setenv,",
-            "--no-base-env, --chdir, --stdin, --terminal,",
-            "--timeout, --kill-after, --rlimit, and",
-            "--stop-with-caller, with their counterparts",
+            "--landlock-connect) or a seccomp flag, and takes",
+            "only these flags beside it:",
         ],
+        roster: Some(restriction_flags),
+        restriction: true,
         take: Take::Bare(|options| {
             options.restrict = true;
         }),
@@ -1945,6 +1965,7 @@ const FLAGS: &[Flag] = &[
             "a Landlock ruleset (repeatable; enrolling any grant",
             "denies all filesystem access not granted)",
         ],
+        restriction: true,
         take: Take::One(|options, _flag, value| {
             options
                 .landlock
@@ -1961,6 +1982,7 @@ const FLAGS: &[Flag] = &[
             "Grant read, write, and execute beneath PATH",
             "(repeatable)",
         ],
+        restriction: true,
         take: Take::One(|options, _flag, value| {
             options.landlock.push((
                 PathBuf::from(value),
@@ -1979,6 +2001,7 @@ const FLAGS: &[Flag] = &[
             "--landlock-unix path. On by default with",
             "--host-rootfs. Needs Landlock ABI 9",
         ],
+        restriction: true,
         take: Take::Bare(|options| {
             options.landlock_resolve_unix = Some(true);
         }),
@@ -1993,6 +2016,7 @@ const FLAGS: &[Flag] = &[
             "beneath PATH past --landlock-resolve-unix",
             "(repeatable)",
         ],
+        restriction: true,
         take: Take::One(|options, _flag, value| {
             options
                 .landlock
@@ -2011,6 +2035,7 @@ const FLAGS: &[Flag] = &[
             "every bind and connect not granted; port 0 permits a",
             "kernel-assigned ephemeral port; needs Landlock ABI 4)",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
             options
@@ -2025,6 +2050,7 @@ const FLAGS: &[Flag] = &[
         section: Section::Hardening,
         placeholder: "PORT",
         help: &["Allow connecting a TCP socket to PORT (repeatable)"],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
             options
@@ -2045,6 +2071,7 @@ const FLAGS: &[Flag] = &[
             "abstract-unix-socket, or empty for none. Default: none,",
             "or both with --restrict. Needs Landlock ABI 6",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             options.landlock_scope = Some(parse_scopes(&into_string(flag, value)?)?);
             Ok(())
@@ -2060,6 +2087,7 @@ const FLAGS: &[Flag] = &[
             "syscalls to the command, which --seccomp-deny,",
             "--seccomp-deny-rule and --seccomp-errno extend",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             parse_seccomp(&into_string(flag, value)?, &mut options.seccomp_curated)?;
             Ok(())
@@ -2075,6 +2103,7 @@ const FLAGS: &[Flag] = &[
             "(comma-separated names, repeatable; must name every",
             "syscall the command needs)",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
             parse_seccomp_names(flag, &value, &mut options.seccomp_allow)?;
@@ -2090,6 +2119,7 @@ const FLAGS: &[Flag] = &[
             "Deny these syscalls with EPERM, allowing the rest",
             "(comma-separated names, repeatable)",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
             parse_seccomp_names(flag, &value, &mut options.seccomp_deny)?;
@@ -2110,6 +2140,7 @@ const FLAGS: &[Flag] = &[
             "accepts any of the rules. Example:",
             "'ioctl arg=1 len=dword op=eq value=0x5413'",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
             options
@@ -2127,6 +2158,7 @@ const FLAGS: &[Flag] = &[
             "Deny a syscall only when its arguments match, in the",
             "same form as --seccomp-allow-rule",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
             options
@@ -2148,6 +2180,7 @@ const FLAGS: &[Flag] = &[
             "clone3=ENOSYS, which the C library answers by falling",
             "back to clone)",
         ],
+        restriction: true,
         take: Take::One(|options, flag, value| {
             let value = into_string(flag, value)?;
             options
@@ -2197,6 +2230,7 @@ const FLAGS: &[Flag] = &[
             "names a parent, saying so on standard error, rather",
             "than refuse the launch",
         ],
+        restriction: true,
         take: Take::Bare(|options| {
             options.cgroup_required = Some(false);
         }),
@@ -2210,6 +2244,7 @@ const FLAGS: &[Flag] = &[
             "sockets unrestricted, as --host-rootfs otherwise does",
             "not",
         ],
+        restriction: true,
         take: Take::Bare(|options| {
             options.landlock_resolve_unix = Some(false);
         }),
@@ -2282,6 +2317,7 @@ const FLAGS: &[Flag] = &[
             "profile name, with no PATH, HOME, or host TERM",
             "supplied underneath them",
         ],
+        restriction: true,
         take: Take::Bare(|options| {
             options.base_env = Some(false);
         }),
@@ -2346,6 +2382,7 @@ const FLAGS: &[Flag] = &[
     Flag {
         long: "--base-env",
         section: Section::Counterpart,
+        restriction: true,
         take: Take::Bare(|options| {
             options.base_env = Some(true);
         }),
@@ -2362,6 +2399,7 @@ const FLAGS: &[Flag] = &[
     Flag {
         long: "--no-stop-with-caller",
         section: Section::Counterpart,
+        restriction: true,
         take: Take::Bare(|options| {
             options.stop_with_caller = Some(false);
         }),
@@ -2650,11 +2688,27 @@ enum CapsChoice {
     Keep(Vec<Capability>),
 }
 
-/// The help text, with its generated sections filled in.
+/// The resource names `--rlimit` takes, which its entry in the help lists.
 ///
-/// The resource-limit names come from the library's own roster rather than a
-/// second copy here, so a resource the library gains is offered by `--help` as
-/// soon as `--rlimit` accepts it.
+/// They come from the library's own roster rather than a second copy here, so a
+/// resource the library gains is offered by `--help` as soon as `--rlimit`
+/// accepts it.
+fn resource_names() -> Vec<&'static str> {
+    Resource::ALL.iter().map(|r| r.spelling()).collect()
+}
+
+/// The flags a `--restrict` launch takes beside `--restrict` itself, which its
+/// entry in the help lists: every one [`Flag::restriction`] marks, in the
+/// order the help lists them.
+fn restriction_flags() -> Vec<&'static str> {
+    FLAGS
+        .iter()
+        .filter(|flag| flag.restriction && flag.long != "--restrict")
+        .map(|flag| flag.long)
+        .collect()
+}
+
+/// The help text, with its generated rosters filled in.
 fn usage() -> String {
     /// The column an entry's description starts in, and the widest name that
     /// still shares a line with it.
@@ -2687,12 +2741,8 @@ fn usage() -> String {
             for line in body {
                 out.push_str(&format!("{:DESCRIPTION$}{line}\n", ""));
             }
-            if flag.roster {
-                // The resource names come from the library's own roster rather
-                // than a second copy here, so a resource the library gains is
-                // offered by --help as soon as --rlimit accepts it.
-                let names: Vec<&str> = Resource::ALL.iter().map(|r| r.spelling()).collect();
-                out.push_str(&wrapped(&names));
+            if let Some(roster) = flag.roster {
+                out.push_str(&wrapped(&roster()));
                 out.push('\n');
             }
         }
@@ -3045,7 +3095,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     // The flags the loop below applied, in order, for the no-effect check at
     // the end. A value is the flag's, whatever it looks like, so only what the
     // loop took as a flag is a flag here.
-    let mut applied: Vec<&'static str> = Vec::new();
+    let mut applied: Vec<&'static Flag> = Vec::new();
 
     let mut options = Options {
         profile: None,
@@ -3177,7 +3227,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             // exactly one value, so this is `Some` for those and nothing else.
             let joined = flag_value(&arg, format!("{}=", flag.long).as_bytes());
             apply_flag(flag, &mut options, joined, &mut args)?;
-            applied.push(flag.long);
+            applied.push(flag);
             continue;
         }
         if arg.as_bytes().starts_with(b"-") && arg != "-" {
@@ -3216,101 +3266,11 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     }
 
     if options.restrict {
-        // A restriction knows nothing of a rootfs or namespaces; every flag
-        // that configures one is a contradiction, named explicitly.
-        let conflicts = [
-            (options.rootfs.is_some(), "--rootfs"),
-            (options.empty_rootfs, "--empty-rootfs"),
-            (options.host_rootfs, "--host-rootfs"),
-            (!options.reveal.is_empty(), "--reveal"),
-            (
-                options.profile.is_some(),
-                "--profile or --restricted-profile",
-            ),
-            (options.provision_tar.is_some(), "--provision-tar"),
-            (options.provision_debian.is_some(), "--provision-debian"),
-            (
-                family_given(&applied, DEBIAN_FLAGS),
-                "the --debian-* options",
-            ),
-            (options.provision_alpine.is_some(), "--provision-alpine"),
-            (
-                family_given(&applied, ALPINE_FLAGS),
-                "the --alpine-* options",
-            ),
-            (options.provision_gentoo.is_some(), "--provision-gentoo"),
-            (
-                family_given(&applied, GENTOO_FLAGS),
-                "the --gentoo-* options",
-            ),
-            (
-                options
-                    .mounts
-                    .iter()
-                    .any(|mount| matches!(mount, Mount::Bind(_))),
-                "--bind and --ro-bind",
-            ),
-            (options.hostname.is_some(), "--hostname"),
-            (options.network.is_some(), "the network options"),
-            (options.pid_namespace.is_some(), "the PID-namespace options"),
-            (
-                options.mount_proc.is_some()
-                    || options.mount_dev.is_some()
-                    || options.mount_tmp.is_some()
-                    || options.managed_mounts.is_some(),
-                "the mount toggles",
-            ),
-            (options.resolv_conf.is_some(), "the resolv.conf options"),
-            (options.caps.is_some(), "the capability options"),
-            (
-                options
-                    .mounts
-                    .iter()
-                    .any(|mount| matches!(mount, Mount::Raw(_))),
-                "--raw-mount",
-            ),
-            (
-                options
-                    .mounts
-                    .iter()
-                    .any(|mount| matches!(mount, Mount::Symlink(_))),
-                "--symlink",
-            ),
-            (
-                options
-                    .mounts
-                    .iter()
-                    .any(|mount| matches!(mount, Mount::Hide(_))),
-                "--hide",
-            ),
-            (
-                options
-                    .mounts
-                    .iter()
-                    .any(|mount| matches!(mount, Mount::ReadOnly(_))),
-                "--read-only",
-            ),
-            (
-                !options.overlay_lowers.is_empty()
-                    || options.overlay_upper.is_some()
-                    || options.overlay_work.is_some(),
-                "the --overlay-* options",
-            ),
-            (options.identity_map.is_some(), "--identity-map"),
-            (options.run_as.is_some(), "--run-as"),
-            (options.present_as.is_some(), "--present-as"),
-            (options.path_lookup.is_some(), "the path-lookup options"),
-            (options.netstack, "--netstack"),
-            (
-                family_given(&applied, NETSTACK_FLAGS),
-                "the --netstack-* options",
-            ),
-            (!options.forwards.is_empty(), "--forward-loopback"),
-        ];
-        for (given, name) in conflicts {
-            if given {
-                return Err(format!("{name} cannot be used with --restrict"));
-            }
+        // A restriction knows nothing of a rootfs or namespaces, so a flag
+        // that configures one is a contradiction. The table says which flags a
+        // restriction takes, and the help lists them from the same field.
+        if let Some(flag) = applied.iter().find(|flag| !flag.restriction) {
+            return Err(format!("{} cannot be used with --restrict", flag.long));
         }
         if options.command_line.is_empty() {
             return Err("no command given".to_string());
@@ -3499,11 +3459,12 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     // the way the command line said.
     if options.command_line.is_empty()
         && options.profile.is_none()
-        && let Some(flag) = applied.into_iter().find(|flag| !provisions(flag))
+        && let Some(flag) = applied.into_iter().find(|flag| !provisions(flag.long))
     {
         return Err(format!(
-            "{flag} configures a launch, and a provisioning run without a command does not \
+            "{} configures a launch, and a provisioning run without a command does not \
              launch one",
+            flag.long,
         ));
     }
     Ok(Invocation::Run(Box::new(options)))
@@ -3554,8 +3515,8 @@ const NETSTACK_FLAGS: &str = "--netstack-";
 
 /// Whether a flag of the family `prefix` names, such as [`DEBIAN_FLAGS`], is
 /// among the flags `applied`.
-fn family_given(applied: &[&str], prefix: &str) -> bool {
-    applied.iter().any(|flag| flag.starts_with(prefix))
+fn family_given(applied: &[&Flag], prefix: &str) -> bool {
+    applied.iter().any(|flag| flag.long.starts_with(prefix))
 }
 
 /// Records the profile to load, refusing a mix of the two trust models.
@@ -9992,6 +9953,85 @@ mod tests {
         .err()
         .expect("the native stack has no meaning under a restriction");
         assert!(err.contains("--netstack"), "{err}");
+    }
+
+    /// `flag` with a value it accepts, and anything else it needs beside it
+    /// to parse.
+    fn given(flag: &Flag) -> Vec<&'static str> {
+        let value: &[&'static str] = match flag.long {
+            "--kill-after" => return vec!["--timeout", "1", "--kill-after", "1"],
+            "--debian-base-priority" => &["required"],
+            "--debian-source-date-epoch"
+            | "--alpine-source-date-epoch"
+            | "--gentoo-max-pointer-age"
+            | "--timeout" => &["1"],
+            "--debian-identity-map" | "--alpine-identity-map" | "--identity-map" => &["single"],
+            "--debian-repository" => &["suite=trixie mirror=file:///srv/pool trust-unsigned"],
+            "--alpine-keys" => &["alpine"],
+            "--alpine-repository" => &["release=v3.23 keys=alpine"],
+            "--raw-mount" => &["target=/sys"],
+            "--run-as" => &["1000:1000"],
+            "--present-as" => &["own"],
+            "--rlimit" => &["open-files=64"],
+            "--cgroup" => &["pids-max=8"],
+            "--stdin" => &["null"],
+            "--forward-loopback" => &["8080", "127.0.0.1:80"],
+            "--netstack-cidr" => &["10.0.2.0/24"],
+            "--netstack-cidr6" => &["fd00::/64"],
+            "--netstack-mtu" => &["1400"],
+            "--netstack-host-port" | "--landlock-bind" | "--landlock-connect" => &["80"],
+            "--netstack-publish" => &["8080", "80"],
+            "--landlock-scope" => &["signal"],
+            "--seccomp" => &["curated"],
+            "--seccomp-allow"
+            | "--seccomp-deny"
+            | "--seccomp-allow-rule"
+            | "--seccomp-deny-rule" => &["ptrace"],
+            "--seccomp-errno" => &["ptrace=EPERM"],
+            "--keep-caps" => &["chown"],
+            _ => match flag.arity() {
+                Arity::Bare => &[],
+                Arity::One => &["/srv/x"],
+                Arity::Two => &["/srv/x", "/srv/y"],
+            },
+        };
+        [&[flag.long][..], value].concat()
+    }
+
+    #[test]
+    fn a_restriction_takes_exactly_the_flags_its_help_lists() {
+        // The table's field is the parser's rule and the help's list both, so
+        // this holds the two to what a command line actually does: every
+        // launch flag, given beside --restrict with a value it accepts, either
+        // parses or is refused by name, and the ones that parse are the ones
+        // --restrict's entry lists.
+        let mut taken = Vec::new();
+        for flag in FLAGS.iter().filter(|flag| flag.mode == Mode::Launch) {
+            let mut args = vec!["--restrict", "--landlock-ro", "/usr"];
+            args.extend(given(flag));
+            args.push("/bin/true");
+            match parse_args(&args) {
+                Ok(Invocation::Run(_)) => taken.push(flag.long),
+                Ok(_) => panic!("{args:?} parses as another mode"),
+                Err(error) => assert_eq!(
+                    error,
+                    format!("{} cannot be used with --restrict", flag.long),
+                    "{args:?}",
+                ),
+            }
+            assert_eq!(
+                taken.last() == Some(&flag.long),
+                flag.restriction,
+                "{} is taken or refused against what the table says",
+                flag.long,
+            );
+        }
+        taken.retain(|flag| *flag != "--restrict");
+        assert_eq!(taken, restriction_flags());
+        assert!(
+            usage().contains(&wrapped(&restriction_flags())),
+            "--restrict's entry does not list the flags it takes",
+        );
     }
 
     #[test]
