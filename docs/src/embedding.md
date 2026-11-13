@@ -1,10 +1,15 @@
 # Embedding in a runtime
 
-The library is synchronous and spawns no threads: a launch blocks the thread
-that made it, and captured output is pumped inside that blocking call. A
-service that wants to launch sandboxes from a thread pool or an async runtime
-therefore drives the library from a blocking context and connects it to the
-rest of the program itself. This chapter is that connection.
+The library is synchronous: a launch blocks the thread that made it, and
+captured output is pumped inside that blocking call, on that thread. Launching
+and waiting start no thread. The library starts threads in two places, both
+outside that path. An attached [native network stack](userspace-networking.md)
+runs its pump on a thread of its own for as long as it is attached.
+`HttpFetch::fetch_all`, which a provisioner's downloads reach, runs a batch on
+scoped workers and joins every one before it returns. A service that wants to
+launch sandboxes from a thread pool or an async runtime therefore drives the
+library from a blocking context and connects it to the rest of the program
+itself. This chapter is that connection.
 
 ## One cage, many launches
 
