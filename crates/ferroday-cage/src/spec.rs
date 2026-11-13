@@ -5640,11 +5640,21 @@ fn search_candidates(path: &OsStr, command: &Path) -> Result<Vec<CString>, Confi
 /// API keeps its full `OsStr` capability.
 #[cfg(feature = "serde")]
 pub(crate) mod serde_os {
+    use std::ffi::OsStr;
+
+    /// `value` as the string a profile holds it as, or the serialization error
+    /// for one that is not UTF-8, naming it as `what`: the one refusal every
+    /// adapter here makes.
+    fn text<'a, E: serde::ser::Error>(value: &'a OsStr, what: &str) -> Result<&'a str, E> {
+        value
+            .to_str()
+            .ok_or_else(|| E::custom(format_args!("a non-UTF-8 {what} cannot be serialized")))
+    }
+
     /// `Vec<OsString>` as a sequence of strings.
     pub(super) mod string_vec {
         use std::ffi::OsString;
 
-        use serde::ser::Error as _;
         use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
         pub(crate) fn serialize<S: Serializer>(
@@ -5653,12 +5663,8 @@ pub(crate) mod serde_os {
         ) -> Result<S::Ok, S::Error> {
             let strings = values
                 .iter()
-                .map(|value| {
-                    value
-                        .to_str()
-                        .ok_or_else(|| S::Error::custom("a non-UTF-8 value cannot be serialized"))
-                })
-                .collect::<Result<Vec<&str>, _>>()?;
+                .map(|value| super::text(value, "value"))
+                .collect::<Result<Vec<&str>, S::Error>>()?;
             strings.serialize(serializer)
         }
 
@@ -5677,17 +5683,13 @@ pub(crate) mod serde_os {
     pub(crate) mod string {
         use std::ffi::OsStr;
 
-        use serde::ser::Error as _;
         use serde::{Serialize, Serializer};
 
         pub(crate) fn serialize<S: Serializer>(
             value: &OsStr,
             serializer: S,
         ) -> Result<S::Ok, S::Error> {
-            value
-                .to_str()
-                .ok_or_else(|| S::Error::custom("a non-UTF-8 value cannot be serialized"))?
-                .serialize(serializer)
+            super::text::<S::Error>(value, "value")?.serialize(serializer)
         }
     }
 
@@ -5695,7 +5697,6 @@ pub(crate) mod serde_os {
     pub(super) mod string_opt {
         use std::ffi::OsString;
 
-        use serde::ser::Error as _;
         use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
         pub(crate) fn serialize<S: Serializer>(
@@ -5703,10 +5704,7 @@ pub(crate) mod serde_os {
             serializer: S,
         ) -> Result<S::Ok, S::Error> {
             match value {
-                Some(value) => value
-                    .to_str()
-                    .ok_or_else(|| S::Error::custom("a non-UTF-8 value cannot be serialized"))?
-                    .serialize(serializer),
+                Some(value) => super::text::<S::Error>(value, "value")?.serialize(serializer),
                 None => serializer.serialize_none(),
             }
         }
@@ -5729,7 +5727,6 @@ pub(crate) mod serde_os {
         use std::collections::BTreeMap;
         use std::ffi::OsString;
 
-        use serde::ser::Error as _;
         use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
         pub(crate) fn serialize<S: Serializer>(
@@ -5738,13 +5735,10 @@ pub(crate) mod serde_os {
         ) -> Result<S::Ok, S::Error> {
             let mut map = BTreeMap::new();
             for (name, value) in pairs {
-                let name = name
-                    .to_str()
-                    .ok_or_else(|| S::Error::custom("a non-UTF-8 name cannot be serialized"))?;
-                let value = value
-                    .to_str()
-                    .ok_or_else(|| S::Error::custom("a non-UTF-8 value cannot be serialized"))?;
-                map.insert(name, value);
+                map.insert(
+                    super::text::<S::Error>(name, "name")?,
+                    super::text::<S::Error>(value, "value")?,
+                );
             }
             map.serialize(serializer)
         }
@@ -9509,6 +9503,26 @@ read-only = true
             Some(Path::new("/srv/rootfs/alpine"))
         );
         assert_eq!(builder.command.as_deref(), Some(Path::new("/bin/sh")));
+    }
+
+    /// A profile is text, so a value that is not UTF-8 fails to serialize,
+    /// through whichever adapter carries it, naming what it is.
+    #[test]
+    fn a_value_that_is_not_utf8_fails_to_serialize() {
+        let invalid = OsStr::from_bytes(b"\xff");
+        for (builder, what) in [
+            (Cage::builder().args([invalid]), "value"),
+            (Cage::builder().hostname(invalid), "value"),
+            (Cage::builder().env("NAME", invalid), "value"),
+            (Cage::builder().env(invalid, "value"), "name"),
+        ] {
+            let err = toml::to_string(&builder).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("a non-UTF-8 {what} cannot be serialized")),
+                "{err}",
+            );
+        }
     }
 
     /// What a restricted profile states reaches an error, and the label a setup
