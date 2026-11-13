@@ -360,6 +360,15 @@ for every mirror of a repository, for one that is itself a past state. A
 backstop is a fetch-time concern only: the finished tree's `sources.list` names
 the live mirror, not the snapshot.
 
+An expired release is accepted, so the expiry no longer says which past release
+a snapshot serves. The URL does, where it ends in the moment the snapshot was
+taken, as a `snapshot.debian.org` or `snapshot.ubuntu.com` URL does. A release
+from such a mirror must be dated no later than that moment, and where it states
+a `Valid-Until`, still be valid at it. Whatever answers for the URL on a plain
+transport can therefore serve only the release current when the snapshot was
+taken, not an older one the same key signed. A mirror whose URL ends in
+anything else holds its release to no moment.
+
 Every authenticity check runs once per repository: the signature against that
 repository's keyring, the release bound to its suite, and the transport
 `trust_unsigned` requires. Package names are not divided between repositories,
@@ -1639,8 +1648,9 @@ as apt accepts it. The Debian stable suite does exactly that, so its release
 does not expire between point releases. [`allow_stale_release`] relaxes the
 freshness check for every mirror of a repository, the signature still being
 verified. It is for the legitimate case of pinning a historical archive state,
-such as a `snapshot.debian.org` suite. [`snapshot_fallback`] relaxes it for one
-backstop, so a live mirror's release is still held to it. A key that signed
+such as a `snapshot.debian.org` suite, whose release is still held to the moment
+its URL names. [`snapshot_fallback`] relaxes it for one backstop, so a live
+mirror's release is still held to it. A key that signed
 that state must still be in force. A `trust_unsigned` mirror is never
 freshness-checked.
 

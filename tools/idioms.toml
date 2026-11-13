@@ -141,11 +141,13 @@ one ends the name and what follows is the release."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/debian/release.rs"
-count = 1
+count = 2
 why = """\
-Not a path: a component a release lists, which is compared and never fetched. \
+Not a path. A component a release lists, which is compared and never fetched: \
 apt offers one listed under a prefix, as the security archive lists \
-`updates/main`, under the part after its last `/` as well."""
+`updates/main`, under the part after its last `/` as well. And a mirror URL's \
+last segment, read for the moment a snapshot service names there and never \
+used to address anything."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/extract.rs"

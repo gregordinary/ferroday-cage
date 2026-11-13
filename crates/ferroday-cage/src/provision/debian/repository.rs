@@ -324,6 +324,14 @@ impl RepositoryBuilder {
     /// force. Every other mirror's release is still held to its freshness, so a
     /// live mirror, or whatever answers in its place, cannot deliver an
     /// expired release.
+    ///
+    /// A mirror whose URL ends in the moment it was taken, as a
+    /// `snapshot.debian.org` URL does in `20260101T000000Z`, has its release
+    /// held to that moment: dated no later than it, and where the release
+    /// states a `Valid-Until`, valid at it. So whatever answers for the URL can
+    /// serve only the release current when the snapshot was taken, not any
+    /// older one the key signed. A URL ending in anything else holds the
+    /// release to no moment.
     pub fn snapshot_fallback(mut self, url: impl Into<String>) -> Self {
         let url = url.into();
         self.snapshots.push(url.clone());
@@ -373,12 +381,14 @@ impl RepositoryBuilder {
     /// mirror.
     ///
     /// For a repository that is itself a past state, such as one whose primary
-    /// mirror is a `snapshot.debian.org` timestamp. A live mirror with a
-    /// snapshot backstop waives freshness for the backstop alone, through
-    /// [`snapshot_fallback`](Self::snapshot_fallback). The signature is still
-    /// verified, and the key that made it must still be in force. It has no effect on a
-    /// [`trust_unsigned`](Self::trust_unsigned) repository, which is never
-    /// freshness-checked. The repository's source in the finished rootfs
+    /// mirror is a `snapshot.debian.org` timestamp, whose release is held to
+    /// the moment the URL names, as
+    /// [`snapshot_fallback`](Self::snapshot_fallback) describes. A live mirror
+    /// with a snapshot backstop waives freshness for the backstop alone,
+    /// through [`snapshot_fallback`](Self::snapshot_fallback). The signature is
+    /// still verified, and the key that made it must still be in force. It has
+    /// no effect on a [`trust_unsigned`](Self::trust_unsigned) repository,
+    /// which is never freshness-checked. The repository's source in the finished rootfs
     /// carries `check-valid-until=no`, so the root's `apt` accepts what the
     /// bootstrap accepted.
     pub fn allow_stale_release(mut self, allow: bool) -> Self {

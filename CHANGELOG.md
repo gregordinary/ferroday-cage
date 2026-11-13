@@ -42,6 +42,15 @@ consumer upgrading can skip it.
   `SetupStep::InstallNetworkFilter`, and a Debian or Alpine bootstrap that runs
   its packages' scripts refuses such a host before it downloads anything.
   `Network::Host` is unchanged.
+- A Debian release served by a mirror whose URL ends in the moment a snapshot
+  was taken, `YYYYMMDDTHHMMSSZ` as `snapshot.debian.org` and
+  `snapshot.ubuntu.com` spell it, must be dated no later than that moment and,
+  where it states a `Valid-Until`, be valid at it, or is refused with
+  `DebianError::Release`. Such a mirror, added with `snapshot_fallback` or
+  read under `allow_stale_release`, has its release accepted past its expiry,
+  so on the plain transport whatever answered for its URL could serve any
+  older release the archive key signed. A release from it that states no
+  `Date` is refused too. A mirror URL ending in anything else is unchanged.
 - A sandbox with a PID namespace that inherits the caller's standard input runs
   in a process group of its own, in the caller's session, which its init
   creates before the command exists. A sandboxed command could previously

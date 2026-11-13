@@ -925,6 +925,14 @@ impl DebianBuilder {
     /// mirror serves is still held to its freshness. That keeps the live
     /// mirror, or whatever answers in its place, from delivering an expired
     /// release.
+    ///
+    /// A mirror whose URL ends in the moment it was taken, as a
+    /// `snapshot.debian.org` URL does in `20260101T000000Z`, has its release
+    /// held to that moment: dated no later than it, and where the release
+    /// states a `Valid-Until`, valid at it. So whatever answers for the URL can
+    /// serve only the release current when the snapshot was taken, not any
+    /// older one the key signed. A URL ending in anything else holds the
+    /// release to no moment.
     pub fn snapshot_fallback(mut self, url: impl Into<String>) -> Self {
         let url = url.into();
         self.snapshot_fallbacks.push(url.clone());
@@ -1432,8 +1440,10 @@ impl DebianBuilder {
     /// still verifying the signature, for the legitimate case of pinning a
     /// historical archive state — for example a primary mirror that is a
     /// `snapshot.debian.org` suite, whose `Valid-Until` has deliberately
-    /// passed. A live mirror with a snapshot backstop relaxes it for the
-    /// backstop alone, with [`snapshot_fallback`](Self::snapshot_fallback). The
+    /// passed, and whose release is held to the moment its URL names, as
+    /// [`snapshot_fallback`](Self::snapshot_fallback) describes. A live mirror
+    /// with a snapshot backstop relaxes it for the backstop alone, with
+    /// [`snapshot_fallback`](Self::snapshot_fallback). The
     /// key that made the signature must still be in force: a state signed
     /// only by keys that have since expired is refused. It has no effect on a
     /// [`trust_unsigned`](Self::trust_unsigned) mirror, which is never
@@ -1944,6 +1954,10 @@ fn merged_index(
                 &repository.components,
                 repository.require_fresh(&served.mirror),
             )
+            .and_then(|()| match release::snapshot_taken(&served.mirror) {
+                Some(taken) => release.check_snapshot(taken),
+                None => Ok(()),
+            })
             .map_err(|reason| DebianError::Release {
                 subject: served.url.clone(),
                 reason,
@@ -4324,7 +4338,8 @@ mod tests {
         const INRELEASE: &[u8] =
             include_bytes!("../../../tests/fixtures/debian-archive/forky-InRelease");
         const LIVE: &str = "http://live.example/debian";
-        const SNAPSHOT: &str = "http://snapshot.example/debian/20260721T000000Z";
+        // A day into the week the release is valid for.
+        const SNAPSHOT: &str = "http://snapshot.example/debian/20260722T000000Z";
         let answering = |mirror: &str, snapshot: bool| {
             let fetcher = Canned::new(
                 [(
@@ -4367,6 +4382,64 @@ mod tests {
             matches!(&accepted, DebianError::Fetch(FetchError::NotFound { url }) if url.contains("Packages")),
             "{accepted:?}",
         );
+    }
+
+    #[test]
+    fn a_snapshot_s_release_is_held_to_the_moment_its_url_names() {
+        // The release is dated 21 Jul 2026 14:11:47 and valid until a week
+        // later. A snapshot taken before it was dated, or after it expired,
+        // cannot be serving it, whatever else answers for the snapshot's URL;
+        // one whose URL names no moment holds it to none.
+        const INRELEASE: &[u8] =
+            include_bytes!("../../../tests/fixtures/debian-archive/forky-InRelease");
+        let serving = |snapshot: &str| {
+            let fetcher = Canned::new(
+                [(
+                    format!("{snapshot}/dists/forky/InRelease"),
+                    INRELEASE.to_vec(),
+                )]
+                .into_iter()
+                .collect(),
+            );
+            Debian::builder("forky")
+                .architecture("amd64")
+                .mirror("http://live.example/debian")
+                .snapshot_fallback(snapshot)
+                .fetcher(fetcher)
+                .build()
+                .expect("the builder validates")
+                .available()
+                .expect_err("nothing serves the index")
+        };
+        for (snapshot, refusal) in [
+            (
+                "http://snapshot.example/archive/debian/20260721T141146Z",
+                "the release is dated \"Tue, 21 Jul 2026 14:11:47 UTC\", after the snapshot \
+                 serving it was taken at Tue, 21 Jul 2026 14:11:46 UTC",
+            ),
+            (
+                "http://snapshot.example/archive/debian/20260728T141148Z",
+                "the release expired at \"Tue, 28 Jul 2026 14:11:47 UTC\", before the \
+                 snapshot serving it was taken at Tue, 28 Jul 2026 14:11:48 UTC",
+            ),
+        ] {
+            let refused = serving(snapshot);
+            assert!(
+                matches!(&refused, DebianError::Release { reason, .. } if reason == refusal),
+                "{refused:?}",
+            );
+        }
+        for snapshot in [
+            "http://snapshot.example/archive/debian/20260721T141147Z",
+            "http://snapshot.example/archive/debian/20260728T141147Z",
+            "http://snapshot.example/debian",
+        ] {
+            let accepted = serving(snapshot);
+            assert!(
+                matches!(&accepted, DebianError::Fetch(FetchError::NotFound { url }) if url.contains("Packages")),
+                "{snapshot}: {accepted:?}",
+            );
+        }
     }
 
     #[test]

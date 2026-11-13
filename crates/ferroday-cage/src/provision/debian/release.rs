@@ -70,8 +70,10 @@ pub(crate) struct Release {
     architectures: Vec<String>,
     components: Vec<String>,
     valid_until: Option<String>,
-    /// The release's own `Date:` field, as written. Read for provenance rather
-    /// than for any check: freshness is judged against `Valid-Until`.
+    /// The release's own `Date:` field, as written. Read for provenance, and
+    /// held to the moment a snapshot mirror serving the release was taken
+    /// ([`check_snapshot`](Self::check_snapshot)); freshness is judged against
+    /// `Valid-Until`.
     date: Option<String>,
     /// The release's own `Suite:` field (for example `stable`), if present.
     suite: Option<String>,
@@ -318,6 +320,53 @@ impl Release {
         Ok(())
     }
 
+    /// Holds a release a snapshot mirror served to the moment the snapshot was
+    /// taken, `taken`, as [`snapshot_taken`] reads it from the mirror's URL:
+    /// the release is dated no later than that moment, and where it states a
+    /// `Valid-Until`, was still valid at it.
+    ///
+    /// A snapshot's release is accepted past its `Valid-Until`, so nothing
+    /// else bounds which past release it is. Over a plain transport, whatever
+    /// answers for the snapshot URL could otherwise serve any older release of
+    /// the suite the key signed, and every one of them verifies. The release
+    /// current at the moment the URL names is dated before it and valid at it,
+    /// and one older than its own `Valid-Until` allows is not.
+    ///
+    /// apt 2.8.4 holds a snapshot's release to neither bound: it compares the
+    /// `Date` with the clock alone, refusing one in the future, and judges
+    /// `Valid-Until` against the clock, which refuses every past snapshot of a
+    /// suite that states one unless `Check-Valid-Until` is off. A release that
+    /// states no `Date`, which apt accepts with a warning, is refused here, as
+    /// an unreadable one is: without it the release cannot be placed before
+    /// the snapshot.
+    pub(crate) fn check_snapshot(&self, taken: i64) -> Result<(), Refusal> {
+        let when = format_rfc5322(taken);
+        let Some(date) = self.date.as_deref() else {
+            return Err(format!(
+                "the release states no Date, so it cannot be held to the snapshot taken at {when}"
+            ));
+        };
+        let dated = parse_rfc5322(date)
+            .ok_or_else(|| format!("the release Date {date:?} is unparseable"))?;
+        if dated > taken {
+            return Err(format!(
+                "the release is dated {date:?}, after the snapshot serving it was taken at {when}"
+            ));
+        }
+        let Some(valid_until) = self.valid_until.as_deref() else {
+            return Ok(());
+        };
+        let deadline = parse_rfc5322(valid_until)
+            .ok_or_else(|| format!("the release Valid-Until {valid_until:?} is unparseable"))?;
+        if deadline < taken {
+            return Err(format!(
+                "the release expired at {valid_until:?}, before the snapshot serving it was taken \
+                 at {when}"
+            ));
+        }
+        Ok(())
+    }
+
     /// The size and the digests recorded for an index path, if any.
     pub(crate) fn digest(&self, path: &str) -> Option<(u64, &Digests)> {
         self.hashes
@@ -329,6 +378,41 @@ impl Release {
     pub(crate) fn acquire_by_hash(&self) -> bool {
         self.acquire_by_hash
     }
+}
+
+/// The moment a snapshot mirror serves its repository at, as a Unix timestamp,
+/// where the mirror's URL states one: a final path segment `YYYYMMDDTHHMMSSZ`,
+/// as `http://snapshot.debian.org/archive/debian/20260101T000000Z/` and
+/// `https://snapshot.ubuntu.com/ubuntu/20260101T000000Z` spell it, and as
+/// apt's `Snapshot` option takes its id.
+///
+/// `None` for a URL ending in anything else, and for a segment of that shape
+/// naming no instant, such as a thirteenth month: such a mirror's release is
+/// held to no moment.
+pub(crate) fn snapshot_taken(mirror: &str) -> Option<i64> {
+    // The last segment that is not empty, so a URL ending in a `/` reads as
+    // one that does not.
+    let segment = mirror
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())?
+        .as_bytes();
+    if segment.len() != 16 || segment[8] != b'T' || segment[15] != b'Z' {
+        return None;
+    }
+    let field = |at: usize, width: usize| number::digits::<i64>(&segment[at..at + width]);
+    let (year, month, day) = (field(0, 4)?, field(4, 2)?, field(6, 2)?);
+    let (hour, minute, second) = (field(9, 2)?, field(11, 2)?, field(13, 2)?);
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    days_from_civil(year, month, day)?
+        .checked_mul(86400)?
+        .checked_add(hour * 3600 + minute * 60 + second)
 }
 
 /// Parses an RFC 5322 date (`Sat, 11 Jul 2026 09:02:23 UTC`) to a Unix
@@ -915,6 +999,69 @@ Valid-Until: Mon, 01 Jan 1990 00:00:00 UTC
         release
             .check("trixie", "amd64", &["main".to_string()], false)
             .unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_url_states_the_moment_it_was_taken() {
+        let taken = |url: &str| snapshot_taken(url);
+        let expected = parse_rfc5322("Thu, 01 Jan 2026 03:04:05 UTC");
+        for url in [
+            "http://snapshot.debian.org/archive/debian/20260101T030405Z",
+            "http://snapshot.debian.org/archive/debian-security/20260101T030405Z/",
+            "https://snapshot.ubuntu.com/ubuntu/20260101T030405Z",
+        ] {
+            assert_eq!(taken(url), expected, "{url}");
+        }
+        for url in [
+            "http://deb.debian.org/debian",
+            "http://snapshot.debian.org/archive/debian/20260101T030405Z/pool",
+            "http://snapshot.debian.org/archive/debian/20260101",
+            "http://snapshot.debian.org/archive/debian/20261301T000000Z",
+            "http://snapshot.debian.org/archive/debian/20260230T000000Z",
+            "http://snapshot.debian.org/archive/debian/20260101T240000Z",
+            "http://snapshot.debian.org/archive/debian/2026+101T000000Z",
+            "http://snapshot.debian.org/archive/debian/20260101t000000z",
+        ] {
+            assert_eq!(taken(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_s_release_is_dated_before_it_and_valid_at_it() {
+        let release = |fields: &str| Release::parse(&format!("Suite: sid\n{fields}")).unwrap();
+        let at = |text: &str| parse_rfc5322(text).unwrap();
+        let dated = release(
+            "Date: Thu, 01 Jan 2026 00:00:00 UTC\nValid-Until: Thu, 08 Jan 2026 00:00:00 UTC",
+        );
+        for moment in [
+            "Thu, 01 Jan 2026 00:00:00 UTC",
+            "Thu, 08 Jan 2026 00:00:00 UTC",
+        ] {
+            dated.check_snapshot(at(moment)).expect(moment);
+        }
+        let early = dated
+            .check_snapshot(at("Wed, 31 Dec 2025 23:59:59 UTC"))
+            .unwrap_err();
+        assert!(early.contains("after the snapshot"), "{early}");
+        let late = dated
+            .check_snapshot(at("Thu, 08 Jan 2026 00:00:01 UTC"))
+            .unwrap_err();
+        assert!(late.contains("expired"), "{late}");
+
+        // Stable states no Valid-Until, and is held to its Date alone.
+        let stable = release("Date: Thu, 01 Jan 2026 00:00:00 UTC");
+        stable
+            .check_snapshot(at("Thu, 01 Jan 2027 00:00:00 UTC"))
+            .expect("no deadline to pass");
+        // A Date that is absent or unreadable places the release nowhere.
+        for fields in ["", "Date: sometime"] {
+            assert!(
+                release(fields)
+                    .check_snapshot(at("Thu, 01 Jan 2026 00:00:00 UTC"))
+                    .is_err(),
+                "{fields:?}",
+            );
+        }
     }
 
     #[test]
