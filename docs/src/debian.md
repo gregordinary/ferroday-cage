@@ -413,6 +413,15 @@ copied. The pool path drops the epoch, as the archive's does, so `1:1.0-1` and
 `1.0-1` share one file name. Copying the lower version would replace the file
 the index describes.
 
+A pool path is not one index's alone. Each suite that publishes a package into
+one component stores it at the same path, and so does each architecture's index
+for an `Architecture: all` package. A publish that would replace such a file
+with other bytes, at the same version or at a higher one differing only by its
+epoch, fails with `DebianError::Deb` where another index names the bytes the
+file holds now. That index would otherwise go on naming bytes the pool no longer
+holds. A refused publish changes nothing. Publishing the same `.deb` into each
+index, or a new version, succeeds.
+
 Publishing an empty set writes a valid, empty repository. The `Release` still
 declares the architecture and component, so the pool can be created before the
 first `.deb` exists and referenced from the start. It then resolves against an

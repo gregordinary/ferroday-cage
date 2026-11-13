@@ -1106,6 +1106,126 @@ fn hermetic_a_version_sharing_a_pool_path_never_replaces_the_file_the_index_name
     assert_eq!(held(&pool), epoch_bytes);
 }
 
+#[test]
+fn hermetic_a_pool_file_another_index_names_keeps_its_bytes() {
+    // Every architecture's index names an `Architecture: all` package at one
+    // path, and so does every suite publishing it into one component. A publish
+    // replacing that file with other bytes would leave the other indexes naming
+    // a digest the file no longer has, so it is refused where one of them names
+    // the bytes there now, and changes nothing.
+    let dir = common::scratch_dir("debian-pool-shared-path");
+    let build = |file: &str, package: &str, version: &str, contents: &[u8]| {
+        let bytes = deb_with_control(
+            &format!(
+                "Package: {package}\nVersion: {version}\nArchitecture: all\nDescription: a tool\n"
+            ),
+            &Tar::new()
+                .dir("./usr", 0o755)
+                .file("./usr/bin/tool", 0o755, contents)
+                .finish(),
+        );
+        let path = dir.join(file);
+        std::fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    };
+    let (first, first_bytes) = build("first.deb", "tool", "1.0-1", b"one build\n");
+    let (second, second_bytes) = build("second.deb", "tool", "1.0-1", b"another build\n");
+    let (epoch, _) = build("epoch.deb", "tool", "1:1.0-1", b"with an epoch\n");
+    let (other, _) = build("other.deb", "helper", "1.0-1", b"another package\n");
+    let shared = "pool/main/t/tool/tool_1.0-1_all.deb";
+    let pool_for = |pool: &Path, suite: &str, architecture: &str| {
+        Pool::at(pool)
+            .suite(suite)
+            .component("main")
+            .architecture(architecture)
+    };
+    // The digest an index records for the shared file.
+    let recorded = |pool: &Path, index: &str| {
+        let packages = std::fs::read_to_string(pool.join(index)).unwrap();
+        packages
+            .split("\n\n")
+            .find(|stanza| stanza.contains(&format!("Filename: {shared}\n")))
+            .and_then(|stanza| {
+                stanza
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SHA256: "))
+            })
+            .unwrap_or_else(|| panic!("{index} does not name {shared}"))
+            .to_string()
+    };
+    let refused_naming = |result: Result<(), DebianError>, index: &str| match result {
+        Err(DebianError::Deb { reason, .. }) => assert!(
+            reason.contains(shared) && reason.contains(index),
+            "the refusal names the file and the index: {reason}"
+        ),
+        other => panic!("the publish replaced a file {index} names: {other:?}"),
+    };
+    let amd64 = "dists/trixie/main/binary-amd64/Packages";
+    let arm64 = "dists/trixie/main/binary-arm64/Packages";
+
+    // Another architecture's index. The same bytes go into both; other bytes
+    // at the same version, or at a version differing only by its epoch, are
+    // refused from either side, even in a call that also publishes something
+    // the pool can take.
+    let pool = dir.join("architectures");
+    pool_for(&pool, "trixie", "amd64")
+        .publish([&first])
+        .unwrap();
+    pool_for(&pool, "trixie", "arm64")
+        .publish([&first])
+        .unwrap();
+    refused_naming(pool_for(&pool, "trixie", "arm64").publish([&second]), amd64);
+    refused_naming(
+        pool_for(&pool, "trixie", "amd64").publish([&other, &second]),
+        arm64,
+    );
+    refused_naming(pool_for(&pool, "trixie", "amd64").publish([&epoch]), arm64);
+    assert_eq!(std::fs::read(pool.join(shared)).unwrap(), first_bytes);
+    let digest = common::deb_repo::sha256_hex(&first_bytes);
+    assert_eq!(recorded(&pool, amd64), digest);
+    assert_eq!(recorded(&pool, arm64), digest);
+    assert!(
+        !pool
+            .join("pool/main/h/helper/helper_1.0-1_all.deb")
+            .exists(),
+        "a refused publish placed none of its packages",
+    );
+
+    // Another suite's index, in the same component. Another component is
+    // another path, and shares nothing.
+    let pool = dir.join("suites");
+    pool_for(&pool, "trixie", "amd64")
+        .publish([&first])
+        .unwrap();
+    refused_naming(pool_for(&pool, "forky", "amd64").publish([&second]), amd64);
+    Pool::at(&pool)
+        .suite("forky")
+        .component("contrib")
+        .architecture("amd64")
+        .publish([&second])
+        .unwrap();
+    assert_eq!(std::fs::read(pool.join(shared)).unwrap(), first_bytes);
+
+    // An index already naming other bytes than the file holds is not made
+    // worse by replacing them, and does not stand in the way of the repair.
+    let pool = dir.join("damaged");
+    pool_for(&pool, "trixie", "amd64")
+        .publish([&first])
+        .unwrap();
+    pool_for(&pool, "trixie", "arm64")
+        .publish([&first])
+        .unwrap();
+    std::fs::write(pool.join(shared), b"damaged out of band").unwrap();
+    pool_for(&pool, "trixie", "amd64")
+        .publish([&second])
+        .unwrap();
+    assert_eq!(std::fs::read(pool.join(shared)).unwrap(), second_bytes);
+    assert_eq!(
+        recorded(&pool, amd64),
+        common::deb_repo::sha256_hex(&second_bytes)
+    );
+}
+
 /// Makes a named pipe at `path`.
 fn make_fifo(path: &Path) {
     use rustix::fs::{CWD, FileType, Mode, mknodat};
