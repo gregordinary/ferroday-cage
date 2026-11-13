@@ -957,6 +957,7 @@ pub(super) use super::apk::ScriptKind;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provision::rooted::scratch_tree;
     use crate::scratch::Scratch;
 
     #[test]
@@ -1241,14 +1242,6 @@ mod tests {
         assert_eq!(once, again);
     }
 
-    /// A scratch tree, and the same tree opened as the scripts' host side
-    /// opens it.
-    fn rooted_tree(tag: &str) -> (Scratch, Rooted) {
-        let scratch = Scratch::for_test("alpine-bootstrap", tag);
-        let tree = Rooted::open(&scratch).expect("the scratch tree opens");
-        (scratch, tree)
-    }
-
     /// One entry of `tree` stated owned by `uname`:`gname`, or by `uid`:`gid`
     /// where the root has no such names, as it is on disk now.
     fn stated(
@@ -1314,7 +1307,7 @@ mod tests {
     fn under_the_single_identity_map_no_owner_is_given() {
         // Root is the only id the map holds, so every entry is the root it was
         // laid down as, and the database says so.
-        let (staging, tree) = rooted_tree("owners-single");
+        let (staging, tree) = scratch_tree("alpine-bootstrap", "owners-single");
         tree.write_mode("usr/libexec/helper", b"#!/bin/sh\n", 0o4750)
             .unwrap();
         tree.write("etc/group", b"messagebus:x:101:\n").unwrap();
@@ -1359,7 +1352,7 @@ mod tests {
         {
             return;
         }
-        let (staging, tree) = rooted_tree("owners-subordinate");
+        let (staging, tree) = scratch_tree("alpine-bootstrap", "owners-subordinate");
         tree.write(
             "etc/passwd",
             b"root:x:0:0:root:/root:/bin/sh\nmessagebus:x:100:101::/:/sbin/nologin\n",
@@ -1455,7 +1448,7 @@ mod tests {
     /// Dates the shadow file `after` in a scratch tree as a run that found
     /// `before` and was given `epoch`, and returns what the file then holds.
     fn date(tag: &str, before: &accounts::Dates, after: &[u8], epoch: i64) -> Vec<u8> {
-        let (staging, tree) = rooted_tree(tag);
+        let (staging, tree) = scratch_tree("alpine-bootstrap", tag);
         tree.write_mode("etc/shadow", after, 0o640).unwrap();
         date_accounts(&tree, before, epoch).expect("the accounts are dated");
         std::fs::read(staging.join("etc/shadow")).unwrap()
@@ -1505,7 +1498,7 @@ mod tests {
     #[test]
     fn a_generated_machine_id_is_removed() {
         // What `dbus-uuidgen --ensure` leaves: 32 hex digits and a newline.
-        let (staging, tree) = rooted_tree("machine-id");
+        let (staging, tree) = scratch_tree("alpine-bootstrap", "machine-id");
         tree.write_mode(MACHINE_ID, b"bab73fe9c7e4506ef70334906ab8378f\n", 0o444)
             .unwrap();
 
@@ -1518,7 +1511,7 @@ mod tests {
     fn a_machine_id_the_run_did_not_generate_is_left_alone() {
         // No id: nothing is created, since dbus's service generates one from
         // the missing file at boot.
-        let (staging, tree) = rooted_tree("no-machine-id");
+        let (staging, tree) = scratch_tree("alpine-bootstrap", "no-machine-id");
         clear_run_state(&tree).expect("an absent id clears");
         assert!(std::fs::symlink_metadata(staging.join(MACHINE_ID)).is_err());
 
@@ -1540,7 +1533,7 @@ mod tests {
         // The cleanup runs after every script, so a script can leave a link
         // there. It is not an id the run generated, and the file it names is
         // not inspected through it.
-        let (staging, tree) = rooted_tree("machine-id-link");
+        let (staging, tree) = scratch_tree("alpine-bootstrap", "machine-id-link");
         let victim = staging.join("victim");
         std::fs::write(&victim, b"host contents\n").unwrap();
         std::fs::create_dir_all(staging.join("etc")).unwrap();

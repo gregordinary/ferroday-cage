@@ -242,15 +242,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::scratch::Scratch;
-
-    /// A scratch tree, and the same tree opened as the scripts' host side
-    /// opens it.
-    fn rooted_tree(tag: &str) -> (Scratch, Rooted) {
-        let scratch = Scratch::for_test("accounts", tag);
-        let tree = Rooted::open(&scratch).expect("the scratch tree opens");
-        (scratch, tree)
-    }
+    use crate::provision::rooted::scratch_tree;
 
     /// The accounts `found` in a shadow file, as `account_dates` records them.
     fn found(lines: &[(&str, &str)]) -> Dates {
@@ -290,7 +282,7 @@ mod tests {
         // second. The day recorded is the first line's, so the run's untouched
         // account is not taken for one it dated, and the second line is not an
         // account to date.
-        let (_staging, tree) = rooted_tree("shadow-twice");
+        let (_staging, tree) = scratch_tree("accounts", "shadow-twice");
         let shipped = b"root:*:17000:0:::::\nroot:*:18000:0:::::\n";
         tree.write_mode("etc/shadow", shipped, 0o640).unwrap();
         let before = account_dates(&tree, None).expect("the accounts read");
@@ -328,7 +320,7 @@ mod tests {
 
     #[test]
     fn the_accounts_are_dated_in_place_in_both_files() {
-        let (staging, tree) = rooted_tree("shadow");
+        let (staging, tree) = scratch_tree("accounts", "shadow");
         let shipped = b"root:::0:::::\n";
         tree.write_mode("etc/shadow", shipped, 0o640).unwrap();
         let before = account_dates(&tree, None).expect("the accounts read");
@@ -365,10 +357,10 @@ mod tests {
     fn a_layered_build_reads_the_accounts_of_the_base_beneath_it() {
         // The upper holds no shadow file until a script writes one, so what the
         // run found is the base's.
-        let (_base_dir, base) = rooted_tree("shadow-base");
+        let (_base_dir, base) = scratch_tree("accounts", "shadow-base");
         base.write("etc/shadow", b"root:::0:::::\nklogd:!:19000:0:99999:7:::\n")
             .unwrap();
-        let (_upper_dir, upper) = rooted_tree("shadow-upper");
+        let (_upper_dir, upper) = scratch_tree("accounts", "shadow-upper");
         let before = account_dates(&upper, Some(&base)).expect("the accounts read");
         assert_eq!(before, found(&[("root", ""), ("klogd", "19000")]));
 
@@ -382,7 +374,7 @@ mod tests {
     fn a_name_is_given_the_id_its_first_line_states() {
         // As getpwnam reads the file: the first line naming an account counts,
         // and a line whose third field is no number names no id.
-        let (_dir, tree) = rooted_tree("ids");
+        let (_dir, tree) = scratch_tree("accounts", "ids");
         let [passwd, group] = ACCOUNTS;
         tree.write(
             passwd,
@@ -399,7 +391,7 @@ mod tests {
         // No file is no names, and a layered build reads its base's where the
         // upper holds none.
         assert!(ids(&tree, None, group).expect("no file").is_empty());
-        let (_upper_dir, upper) = rooted_tree("ids-upper");
+        let (_upper_dir, upper) = scratch_tree("accounts", "ids-upper");
         tree.write(group, b"messagebus:x:101:\n").unwrap();
         let groups = ids(&upper, Some(&tree), group).expect("the base's file reads");
         assert_eq!(groups.get(&b"messagebus"[..]), Some(&101));
@@ -418,10 +410,10 @@ mod tests {
     fn a_whiteout_at_the_accounts_is_a_root_with_none() {
         // A layered build whose scripts removed the base's files: the merged
         // root holds neither, so the run found no accounts and has none to date.
-        let (_base_dir, base) = rooted_tree("whiteout-base");
+        let (_base_dir, base) = scratch_tree("accounts", "whiteout-base");
         base.write("etc/shadow", b"root:::0:::::\nklogd:!:19000:0:99999:7:::\n")
             .unwrap();
-        let (upper_dir, upper) = rooted_tree("whiteout-upper");
+        let (upper_dir, upper) = scratch_tree("accounts", "whiteout-upper");
         for path in SHADOW {
             if !whiteout(&upper_dir, path) {
                 return;
@@ -453,18 +445,18 @@ mod tests {
         // The merged root shows nothing of the base beneath a whiteout or an
         // opaque directory at `/etc`, so neither does a read of its accounts:
         // the base's `/etc/shadow` and `/etc/passwd` are not the root's.
-        let (_base_dir, base) = rooted_tree("hidden-etc-base");
+        let (_base_dir, base) = scratch_tree("accounts", "hidden-etc-base");
         base.write("etc/shadow", b"klogd:!:19000:0:99999:7:::\n")
             .unwrap();
         base.write("etc/passwd", b"klogd:x:100:101::/:/sbin/nologin\n")
             .unwrap();
         let [shadow, _] = SHADOW;
 
-        let (whited_dir, whited) = rooted_tree("hidden-etc-whiteout");
+        let (whited_dir, whited) = scratch_tree("accounts", "hidden-etc-whiteout");
         if !whiteout(&whited_dir, "etc") {
             return;
         }
-        let (opaque_dir, opaque) = rooted_tree("hidden-etc-opaque");
+        let (opaque_dir, opaque) = scratch_tree("accounts", "hidden-etc-opaque");
         opaque.write("etc/hostname", b"recreated\n").unwrap();
         if let Err(errno) = rustix::fs::setxattr(
             opaque_dir.join("etc"),
@@ -489,7 +481,7 @@ mod tests {
         }
 
         // A plain `/etc` in the upper hides nothing: the base's file shows.
-        let (_plain_dir, plain) = rooted_tree("hidden-etc-plain");
+        let (_plain_dir, plain) = scratch_tree("accounts", "hidden-etc-plain");
         plain.write("etc/hostname", b"kept\n").unwrap();
         assert_eq!(
             account_dates(&plain, Some(&base)).unwrap(),

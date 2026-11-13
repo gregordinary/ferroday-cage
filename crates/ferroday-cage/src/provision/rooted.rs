@@ -1047,6 +1047,15 @@ fn components(relative: &Path) -> Result<Vec<&[u8]>, Errno> {
     Ok(components)
 }
 
+/// A scratch directory for a unit test of `subject` named `tag`, and the same
+/// directory opened as a tree, as a layer's host side opens a root.
+#[cfg(all(test, any(feature = "debian", feature = "alpine")))]
+pub(crate) fn scratch_tree(subject: &str, tag: &str) -> (crate::scratch::Scratch, Rooted) {
+    let scratch = crate::scratch::Scratch::for_test(subject, tag);
+    let tree = Rooted::open(&scratch).expect("the scratch tree opens");
+    (scratch, tree)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,6 +1110,10 @@ mod tests {
         ));
     }
 
+    /// A scratch directory holding a tree a level down, and the tree opened.
+    ///
+    /// Unlike `scratch_tree`, the tree is not the scratch directory itself, so
+    /// a test can place what a link inside it points out to beside it.
     fn tree(tag: &str) -> (Scratch, Rooted) {
         let scratch = Scratch::new(&format!("rooted-{tag}"));
         let root = scratch.join("tree");

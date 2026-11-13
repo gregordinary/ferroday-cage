@@ -1254,15 +1254,9 @@ fn at(op: &'static str, tree: &Rooted, rootfs_path: &str) -> impl FnOnce(io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provision::rooted::scratch_tree;
     use crate::scratch::Scratch;
     use std::fs;
-
-    /// A scratch tree, and a [`Rooted`] anchored to it.
-    fn rooted_tree(tag: &str) -> (Scratch, Rooted) {
-        let scratch = Scratch::for_test("bootstrap", tag);
-        let tree = open_tree(&scratch).expect("the scratch tree opens");
-        (scratch, tree)
-    }
 
     /// A signed repository over the given mirror, suite, and components.
     fn signed_repo(
@@ -1289,7 +1283,7 @@ mod tests {
         // package it installs can lay a real tool over one. Removing that would
         // delete a file the merged database says is installed and reveal the
         // base's older copy through the overlay in its place.
-        let (upper, tree) = rooted_tree("delta-ownership-stubs");
+        let (upper, tree) = scratch_tree("bootstrap", "delta-ownership-stubs");
         install_delta_ownership_stubs(&tree).expect("the stubs are written");
         // What an unpack of a real coreutils leaves behind.
         let real = b"\x7fELF real chown\n";
@@ -1314,7 +1308,7 @@ mod tests {
         // rather than invoke-rc.d is not stopped by policy-rc.d, so the launcher
         // itself starts nothing until the configure wave is over, as under
         // debootstrap and mmdebstrap.
-        let (staging, tree) = rooted_tree("start-stop-daemon");
+        let (staging, tree) = scratch_tree("bootstrap", "start-stop-daemon");
         let real = b"\x7fELF the real start-stop-daemon\n";
         tree.write(START_STOP_DAEMON, real).unwrap();
 
@@ -1332,7 +1326,7 @@ mod tests {
         );
 
         // A root that never carried the launcher is not given the stand-in.
-        let (staging, tree) = rooted_tree("start-stop-daemon-absent");
+        let (staging, tree) = scratch_tree("bootstrap", "start-stop-daemon-absent");
         stub_out(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("diverted");
         restore_stubbed(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("restored");
         assert!(fs::symlink_metadata(staging.join(START_STOP_DAEMON)).is_err());
@@ -1343,7 +1337,7 @@ mod tests {
         // In an upper the stand-in shadows the base's launcher, and removing it
         // reveals the base's again. One the increment laid over the stand-in is
         // the increment's, and stays.
-        let (upper, tree) = rooted_tree("delta-start-stop-daemon");
+        let (upper, tree) = scratch_tree("bootstrap", "delta-start-stop-daemon");
         write_script(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).unwrap();
         unshadow(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("unshadowed");
         assert!(!upper.join(START_STOP_DAEMON).exists());
@@ -1395,7 +1389,7 @@ mod tests {
         // The primary owns sources.list and the canonical keyring path; the deb
         // line must carry a signed-by naming it, or apt would reject the release
         // for want of a trusted keyring.
-        let (staging, tree) = rooted_tree("sources-list");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-list");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -1470,7 +1464,7 @@ mod tests {
         // the keyring package's upgrades, so a root verified against the
         // embedded keyring names the package's file rather than a copy that
         // would never learn them, and writes nothing over it.
-        let (staging, tree) = rooted_tree("sources-archive-keyring");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-archive-keyring");
         record_keyring_package(
             &tree,
             "install ok installed",
@@ -1526,7 +1520,7 @@ mod tests {
         }
 
         // A bootstrap's verification asks the same question of the database.
-        let (_staging, tree) = rooted_tree("status-held");
+        let (_staging, tree) = scratch_tree("bootstrap", "status-held");
         tree.write(
             STATUS,
             b"Package: held\nStatus: hold ok installed\n\n\
@@ -1559,7 +1553,7 @@ mod tests {
                 &["/usr/share/keyrings/other.pgp"][..],
             ),
         ] {
-            let (staging, tree) = rooted_tree(&format!("sources-archive-{tag}"));
+            let (staging, tree) = scratch_tree("bootstrap", &format!("sources-archive-{tag}"));
             match status {
                 Some(status) => record_keyring_package(&tree, status, owns),
                 None => tree
@@ -1590,7 +1584,7 @@ mod tests {
         // A caller's keyring is the caller's to rotate, and the package's
         // upgrades must not replace it, so it is written where no package
         // writes even when the keyring package is installed.
-        let (staging, tree) = rooted_tree("sources-caller-keyring");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-caller-keyring");
         record_keyring_package(
             &tree,
             "install ok installed",
@@ -1626,7 +1620,7 @@ mod tests {
     fn an_additional_signed_repository_writes_its_own_entry_and_anchor() {
         // The second repository writes a named sources.list.d entry signed by
         // its own keyring, distinct from the primary's anchor.
-        let (staging, tree) = rooted_tree("sources-additional");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-additional");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -1660,7 +1654,7 @@ mod tests {
     fn an_unsigned_repository_writes_a_trusted_line_and_no_keyring() {
         // A trust_unsigned repository writes [trusted=yes] and lays down no
         // keyring, apt's posture for a source under the caller's control.
-        let (staging, tree) = rooted_tree("sources-unsigned");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-unsigned");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -1697,7 +1691,7 @@ mod tests {
         // which a sandbox rooted at the finished tree does not see, and an
         // unreachable source fails every apt-get update there. Neither its
         // line nor its keyring is written; the other sources are.
-        let (staging, tree) = rooted_tree("sources-host-path");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-host-path");
         let primary = signed_repo(
             "http://deb.debian.org/debian",
             "trixie",
@@ -1737,7 +1731,7 @@ mod tests {
         }
 
         // A primary on a host path leaves the root no sources.list at all.
-        let (staging, tree) = rooted_tree("sources-host-path-primary");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-host-path-primary");
         let primary = signed_repo("file:///srv/mirror", "trixie", &["main"], b"k", None);
         write_repository_sources(&tree, &[primary]).expect("the sources are written");
         assert!(fs::symlink_metadata(staging.join("etc/apt/sources.list")).is_err());
@@ -1754,7 +1748,7 @@ mod tests {
         // The bootstrap accepted the snapshot's expired release, so the root's
         // apt is told to as well, or its first update refuses the release the
         // root was built from.
-        let (staging, tree) = rooted_tree("sources-stale");
+        let (staging, tree) = scratch_tree("bootstrap", "sources-stale");
         let mut primary = signed_repo(
             "http://snapshot.debian.org/archive/debian/20250101T000000Z",
             "trixie",
@@ -1778,7 +1772,7 @@ mod tests {
     fn the_single_identity_apt_config_runs_methods_as_root() {
         // Under the single-identity map apt cannot drop to _apt, so the
         // written config points its sandbox user at root instead.
-        let (staging, tree) = rooted_tree("apt-sandbox-user");
+        let (staging, tree) = scratch_tree("bootstrap", "apt-sandbox-user");
         write_apt_sandbox_user(&tree).expect("the apt config is written");
 
         let conf = fs::read_to_string(staging.join("etc/apt/apt.conf.d/00fcage-single-identity"))
@@ -1793,7 +1787,7 @@ mod tests {
         // script is free to leave an absolute link where one of them writes.
         // The write must land in the tree, and the host file it names must be
         // untouched.
-        let (staging, tree) = rooted_tree("planted-link");
+        let (staging, tree) = scratch_tree("bootstrap", "planted-link");
         let victim = staging.join("victim");
         fs::write(&victim, b"host contents\n").unwrap();
         for path in [
@@ -1855,7 +1849,7 @@ mod tests {
         // A zero demands a new password at the next login, which is not what
         // the epoch meant; useradd leaves the field empty for the same day.
         for epoch in [0, 86_399] {
-            let (staging, tree) = rooted_tree("day-zero");
+            let (staging, tree) = scratch_tree("bootstrap", "day-zero");
             for path in accounts::SHADOW {
                 tree.write_mode(path, DAY_ZERO_SHADOW, 0o640).unwrap();
             }
@@ -1874,7 +1868,7 @@ mod tests {
     fn a_zero_is_a_date_only_under_the_epoch_whose_day_it_is() {
         // Under any later epoch every tool wrote that day itself, so a zero
         // the run wrote is a script's demand for a new password, and is kept.
-        let (staging, tree) = rooted_tree("day-zero-later-epoch");
+        let (staging, tree) = scratch_tree("bootstrap", "day-zero-later-epoch");
         tree.write_mode("etc/shadow", DAY_ZERO_SHADOW, 0o640)
             .unwrap();
         date_accounts(&tree, &accounts::Dates::new(), 86_400).expect("nothing to date");
@@ -1885,10 +1879,10 @@ mod tests {
 
         // And a zero the run found, in a layered build's base, is the base's
         // own whatever the epoch.
-        let (_base_dir, base) = rooted_tree("day-zero-base");
+        let (_base_dir, base) = scratch_tree("bootstrap", "day-zero-base");
         base.write("etc/shadow", b"root:*:0:0:99999:7:::\n")
             .unwrap();
-        let (upper_dir, upper) = rooted_tree("day-zero-upper");
+        let (upper_dir, upper) = scratch_tree("bootstrap", "day-zero-upper");
         let found = found_dates(Some(0), &upper, Some(&base))
             .expect("the accounts read")
             .expect("an epoch was given");
@@ -1910,7 +1904,7 @@ mod tests {
     fn the_run_state_is_cleared_and_the_machine_id_emptied() {
         // What the waves left of their own run: two logs, the ldconfig cache,
         // and the two copies of a machine id the scripts generated.
-        let (staging, tree) = rooted_tree("run-state");
+        let (staging, tree) = scratch_tree("bootstrap", "run-state");
         let id = b"bab73fe9c7e4506ef70334906ab8378f\n";
         for path in RUN_RECORDS {
             tree.write(path, b"recorded during the run\n").unwrap();
@@ -1943,7 +1937,7 @@ mod tests {
     fn a_machine_id_grown_without_writing_is_emptied_without_being_read() {
         // A script can make the id enormous for nothing, since a sparse file
         // takes no space. Emptying asks the file's size, never its contents.
-        let (staging, tree) = rooted_tree("machine-id-sparse");
+        let (staging, tree) = scratch_tree("bootstrap", "machine-id-sparse");
         tree.write_mode(MACHINE_ID, b"", 0o444).unwrap();
         let machine_id = staging.join(MACHINE_ID);
         use std::os::unix::fs::PermissionsExt;
@@ -1965,7 +1959,7 @@ mod tests {
         // In an overlay upper, a whiteout is the run having deleted the base's
         // copy. Removing it, or emptying through it, would bring the base's
         // copy back through the overlay.
-        let (staging, tree) = rooted_tree("run-state-whiteouts");
+        let (staging, tree) = scratch_tree("bootstrap", "run-state-whiteouts");
         let mut whiteouts = Vec::new();
         for path in RUN_RECORDS.into_iter().chain([DBUS_MACHINE_ID, MACHINE_ID]) {
             let at = staging.join(path);
@@ -1992,7 +1986,7 @@ mod tests {
     fn a_root_without_a_machine_id_is_not_given_one() {
         // A root without systemd carries no machine id, and clearing the run's
         // state creates none; an already-empty one is not rewritten.
-        let (staging, tree) = rooted_tree("no-machine-id");
+        let (staging, tree) = scratch_tree("bootstrap", "no-machine-id");
         clear_run_state(&tree).expect("an absent state clears");
         assert!(fs::symlink_metadata(staging.join(MACHINE_ID)).is_err());
 
@@ -2016,7 +2010,7 @@ mod tests {
         // a link at any of the paths it clears. A link at a record is removed as
         // the name it is; a link at the machine id is not an id the run
         // generated, and the file it names is not emptied through it.
-        let (staging, tree) = rooted_tree("run-state-links");
+        let (staging, tree) = scratch_tree("bootstrap", "run-state-links");
         let victim = staging.join("victim");
         fs::write(&victim, b"host contents\n").unwrap();
         for path in ["var/log/dpkg.log", MACHINE_ID] {
@@ -2038,7 +2032,7 @@ mod tests {
         // run, and a script can leave a named pipe there, which a plain open
         // for reading waits on for a writer. The cleanup answers at once and
         // leaves the pipe alone, as it leaves anything that is not an id.
-        let (staging, tree) = rooted_tree("machine-id-fifo");
+        let (staging, tree) = scratch_tree("bootstrap", "machine-id-fifo");
         let pipe = staging.join(MACHINE_ID);
         fs::create_dir_all(pipe.parent().unwrap()).unwrap();
         rustix::fs::mknodat(
@@ -2070,8 +2064,8 @@ mod tests {
         // statoverride is read and carried into the upper. A link there would
         // otherwise make the read an arbitrary host-file read, published in the
         // tree the caller exports.
-        let (base, _) = rooted_tree("delta-base");
-        let (upper, upper_tree) = rooted_tree("delta-upper");
+        let (base, _) = scratch_tree("bootstrap", "delta-base");
+        let (upper, upper_tree) = scratch_tree("bootstrap", "delta-upper");
         let secret = base.join("secret");
         fs::write(&secret, b"root root 4755 /host/secret\n").unwrap();
         fs::create_dir_all(base.join("var/lib/dpkg")).unwrap();
