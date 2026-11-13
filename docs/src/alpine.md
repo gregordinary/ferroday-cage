@@ -229,6 +229,15 @@ exactly as [their Debian counterparts](debian.md#the-resolved-plan) do, includin
 what a plan refuses to compose with and the trust model a plan carries, so that
 chapter is the reference for all of it.
 
+The layers differ in how many routes lead to a version. A Debian pin holds a
+name on each of several. An Alpine resolution has one: the merged index keeps a
+single record for each name, the pinned one where the pin names it, and a
+dependency, a provided name and an `install_if` condition all reach a package
+through it. A name a base layer carries keeps the base's version, since a layered
+build never upgrades its base. A dependency the pinned version does not meet, and
+nothing else answers, fails the resolution with `AlpineError::Pin`, naming the
+requirement.
+
 One refusal is this layer's own, and it follows from where an apk package lives.
 A package is fetched from the directory of the index that named it, so the
 correspondence between a plan's indexes and the configured repositories is

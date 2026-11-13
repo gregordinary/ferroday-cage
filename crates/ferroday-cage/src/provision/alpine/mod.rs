@@ -739,6 +739,12 @@ impl AlpineBuilder {
     /// highest offered. Everything else, including a package added to the closure
     /// since and a dependency the pinned version pulls in, resolves normally.
     ///
+    /// The merged index keeps one record for each name, the pinned one where
+    /// the pin names it, and every route to a package goes through it: a
+    /// dependency, a provided name, and an `install_if` condition alike. A name
+    /// a [`base_layer`](Self::base_layer) carries keeps the base's version,
+    /// since a layered build never upgrades its base.
+    ///
     /// # The trust model does not change
     ///
     /// Nothing here leaves the repository signature chain: every control
@@ -762,7 +768,8 @@ impl AlpineBuilder {
     /// have published past the pinned version, dropped the package, or record a
     /// different control segment for it. Alpine keeps one version of each
     /// package per release, so a pin outlives a publication only where the
-    /// caller keeps a mirror that does.
+    /// caller keeps a mirror that does. So does a dependency the pinned version
+    /// does not meet where nothing else answers it, naming the requirement.
     pub fn pin(mut self, pin: Plan) -> Self {
         self.pin = Some(pin);
         self
@@ -2607,7 +2614,8 @@ pub enum AlpineError {
         reason: String,
     },
     /// A pin could not be held: the repositories no longer supply a package at
-    /// the version and with the bytes a plan recorded.
+    /// the version and with the bytes a plan recorded, or the resolution
+    /// requires a pinned package at a version other than the pinned one.
     #[non_exhaustive]
     Pin {
         /// Every package that could not be held, in name order.
@@ -2750,8 +2758,13 @@ impl From<FetchError> for AlpineError {
 
 impl From<resolve::ResolveError> for AlpineError {
     fn from(err: resolve::ResolveError) -> AlpineError {
-        AlpineError::Resolve {
-            reason: err.to_string(),
+        match err {
+            resolve::ResolveError::Pinned { unheld } => AlpineError::Pin {
+                unheld: vec![unheld],
+            },
+            err => AlpineError::Resolve {
+                reason: err.to_string(),
+            },
         }
     }
 }

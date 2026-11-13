@@ -188,6 +188,9 @@ pub ferroday_cage::provision::alpine::UnheldReason::Absent
 #[non_exhaustive] pub ferroday_cage::provision::alpine::UnheldReason::Identity
 pub ferroday_cage::provision::alpine::UnheldReason::Identity::pin: alloc::string::String
 pub ferroday_cage::provision::alpine::UnheldReason::Identity::repository: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::alpine::UnheldReason::Requirement
+pub ferroday_cage::provision::alpine::UnheldReason::Requirement::required_by: alloc::string::String
+pub ferroday_cage::provision::alpine::UnheldReason::Requirement::requirement: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::alpine::UnheldReason::Version
 pub ferroday_cage::provision::alpine::UnheldReason::Version::repository: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::alpine::UnheldReason

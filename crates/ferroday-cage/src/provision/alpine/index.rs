@@ -404,6 +404,9 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
 pub(super) struct Index {
     by_name: HashMap<String, Record>,
     providers: HashMap<String, Vec<String>>,
+    /// The pin the index was merged under, which chose each pinned name's
+    /// record.
+    pins: Pins,
 }
 
 impl fmt::Debug for Index {
@@ -507,7 +510,17 @@ impl Index {
             names.sort();
         }
 
-        Index { by_name, providers }
+        Index {
+            by_name,
+            providers,
+            pins: pins.clone(),
+        }
+    }
+
+    /// The pin the index was merged under, for the resolver to hold a
+    /// dependency nothing answers to.
+    pub(super) fn pins(&self) -> &Pins {
+        &self.pins
     }
 
     /// The record for `name`, if it is a real package in this index.

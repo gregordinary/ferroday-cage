@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use super::AlpineError;
-use super::index::Index;
+use super::index::{Dependency, Index};
 use super::plan::Plan;
 use super::version;
 
@@ -114,6 +114,31 @@ impl Pins {
         }
     }
 
+    /// Holds a dependency on a package to the pin on its name.
+    ///
+    /// `None` where the pin does not name the package `dependency` names, or
+    /// holds it at a version the dependency accepts. Otherwise the refusal
+    /// names the dependency as `required_by` declares it, as
+    /// [`UnheldReason::Requirement`].
+    pub(super) fn refuse_requirement(
+        &self,
+        dependency: &Dependency,
+        required_by: &str,
+    ) -> Option<UnheldPin> {
+        let pinned = self.by_name.get(&dependency.name)?;
+        if dependency.accepts(Some(&pinned.version)) {
+            return None;
+        }
+        Some(UnheldPin {
+            package: dependency.name.clone(),
+            version: pinned.version.clone(),
+            reason: UnheldReason::Requirement {
+                requirement: dependency.to_string(),
+                required_by: required_by.to_string(),
+            },
+        })
+    }
+
     /// Checks that the merged index can supply every pinned package at the
     /// version and with the control segment the pin records.
     ///
@@ -193,11 +218,13 @@ pub struct UnheldPin {
 
 /// Why a pinned package could not be supplied at its pinned version.
 ///
-/// The three are worth telling apart. A [`Version`](Self::Version) is a
+/// The four are worth telling apart. A [`Version`](Self::Version) is a
 /// repository that has published since the pin was taken; an
 /// [`Absent`](Self::Absent) is a package the repositories no longer carry at
-/// all; and an [`Identity`](Self::Identity) is one version of one package with
-/// two sets of bytes, which is the event a recorded identity exists to catch.
+/// all; an [`Identity`](Self::Identity) is one version of one package with two
+/// sets of bytes, which is the event a recorded identity exists to catch; and a
+/// [`Requirement`](Self::Requirement) is a resolution that asks for the package
+/// at a version other than the pinned one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnheldReason {
@@ -217,6 +244,15 @@ pub enum UnheldReason {
         pin: String,
         /// The identity the repositories record.
         repository: String,
+    },
+    /// A package the resolution selects requires the package at a version the
+    /// pinned one does not meet, and nothing else answers the requirement.
+    #[non_exhaustive]
+    Requirement {
+        /// The requirement as the requiring package declares it.
+        requirement: String,
+        /// The package that declares it.
+        required_by: String,
     },
 }
 
@@ -239,7 +275,25 @@ impl fmt::Display for UnheldPin {
                  {repository}",
                 self.package, self.version,
             ),
+            UnheldReason::Requirement {
+                requirement,
+                required_by,
+            } => write!(
+                f,
+                "{} is pinned to {} and {required_by} requires {requirement}",
+                self.package, self.version,
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+impl Pins {
+    /// The pin a plan recording exactly `packages` makes, for a test that holds
+    /// records an index offers.
+    pub(super) fn holding(packages: &[super::index::Record]) -> Pins {
+        Pins::of(&Plan::project("v3.23", "x86_64", packages, &[]))
+            .expect("the packages name no package twice")
     }
 }
 

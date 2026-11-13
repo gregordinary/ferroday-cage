@@ -78,6 +78,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 
 use super::index::{Dependency, Index, Record};
+use super::pin::UnheldPin;
 use super::version;
 
 /// A closure the archives cannot supply.
@@ -99,6 +100,12 @@ pub(super) enum ResolveError {
         dependency: String,
         /// The package that needed it, or `None` for a requested one.
         required_by: Option<String>,
+    },
+    /// A dependency names a package the pin holds at a version the dependency
+    /// does not accept, and nothing else answers it.
+    Pinned {
+        /// The pinned package, and the requirement it does not meet.
+        unheld: UnheldPin,
     },
     /// A dependency's name is offered, and at no version it accepts.
     Unsatisfied {
@@ -176,6 +183,7 @@ impl fmt::Display for ResolveError {
                 "everything that could satisfy {dependency}{} is excluded",
                 by(required_by),
             ),
+            ResolveError::Pinned { unheld } => write!(f, "{unheld}"),
             ResolveError::Unsatisfied {
                 dependency,
                 required_by,
@@ -267,7 +275,8 @@ impl fmt::Display for ResolveError {
 /// # Errors
 ///
 /// Returns a [`ResolveError`] for a requested name nothing offers, a dependency
-/// no offered version satisfies, a name whose only providers cannot be chosen
+/// no offered version satisfies or only the pin's version could, a name whose
+/// only providers cannot be chosen
 /// between, a `!` entry the closure breaks, an exclusion that leaves a
 /// dependency unsatisfiable, a name more than one package answers where only one
 /// may, or a dependency that needs a newer version of a package the base already
@@ -610,6 +619,16 @@ fn select(
                 dependency: dependency.to_string(),
                 required_by: required_by.map(str::to_string),
             });
+        }
+        // The index offers a pinned package at its pinned version alone, so
+        // where that version is what the dependency rules out, the pin is what
+        // refuses it. A requested name accepts every version, so it is never
+        // one.
+        if let Some(declared_by) = required_by
+            && index.get(&dependency.name).is_some()
+            && let Some(unheld) = index.pins().refuse_requirement(dependency, declared_by)
+        {
+            return Err(ResolveError::Pinned { unheld });
         }
         return Err(ResolveError::Unsatisfied {
             dependency: dependency.to_string(),
@@ -1046,8 +1065,9 @@ impl Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provision::alpine::AlpineError;
     use crate::provision::alpine::index;
-    use crate::provision::alpine::pin::Pins;
+    use crate::provision::alpine::pin::{Pins, UnheldReason};
 
     /// One record, spelled as an index spells it: the fields every record
     /// carries, then whatever the case is about.
@@ -1808,5 +1828,147 @@ mod tests {
             closure(&index, &["app"]),
             ["app", "pipewire-jack", "pipewire-jack-dev"],
         );
+    }
+
+    /// An index over `records` merged under a pin holding the versions
+    /// `pinned` names, each a `(name, version)` pair of one of the records.
+    fn merged_under(records: &[(&str, &str, &str)], pinned: &[(&str, &str)]) -> Index {
+        let text: String = records
+            .iter()
+            .map(|(name, version, fields)| record(name, version, fields))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = index::parse("the index", &text, 0)
+            .unwrap_or_else(|err| panic!("the index parses: {err}"));
+        let held: Vec<Record> = parsed
+            .iter()
+            .filter(|record| pinned.contains(&(record.name.as_str(), record.version.as_str())))
+            .cloned()
+            .collect();
+        assert_eq!(held.len(), pinned.len(), "every pinned version is offered");
+        Index::merge([parsed], "x86_64", &Pins::holding(&held))
+    }
+
+    /// The closure of `world` over a base carrying `installed`, as
+    /// `name=version` entries.
+    fn versions(index: &Index, world: &[&str], installed: &[Record]) -> Vec<String> {
+        let world: Vec<String> = world.iter().map(|name| (*name).to_string()).collect();
+        resolve(index, &world, &[], installed)
+            .unwrap_or_else(|err| panic!("the closure resolves: {err}"))
+            .into_iter()
+            .map(|record| format!("{}={}", record.name, record.version))
+            .collect()
+    }
+
+    #[test]
+    fn a_pinned_name_is_held_on_every_route_to_it() {
+        // A dependency, a provided name, and an `i:` condition each reach a
+        // package through the one record the index keeps for its name, so the
+        // pin holds on all three. Unpinned, the same closures take 2.0.
+        let records = [
+            ("app", "1.0-r0", "D:lib"),
+            ("user", "1.0-r0", "D:so:liblib.so.1"),
+            ("lib", "1.0-r0", "p:so:liblib.so.1=1.0"),
+            ("lib", "2.0-r0", "p:so:liblib.so.1=2.0"),
+            ("lib-tools", "1.0-r0", "i:lib"),
+            ("lib-tools", "2.0-r0", "i:lib"),
+        ];
+        let pinned = merged_under(&records, &[("lib", "1.0-r0"), ("lib-tools", "1.0-r0")]);
+        let unpinned = merged_under(&records, &[]);
+        for (index, version) in [(&pinned, "1.0-r0"), (&unpinned, "2.0-r0")] {
+            assert_eq!(
+                versions(index, &["app"], &[]),
+                [
+                    "app=1.0-r0".to_string(),
+                    format!("lib={version}"),
+                    format!("lib-tools={version}"),
+                ],
+            );
+            assert_eq!(
+                versions(index, &["user"], &[]),
+                [
+                    format!("lib={version}"),
+                    format!("lib-tools={version}"),
+                    "user=1.0-r0".to_string(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_the_pinned_version_does_not_meet_refuses_the_pin() {
+        let index = merged_under(
+            &[
+                ("app", "1.0-r0", "D:lib>=2.0"),
+                ("lib", "1.0-r0", ""),
+                ("lib", "2.0-r0", ""),
+            ],
+            &[("lib", "1.0-r0")],
+        );
+        let world = ["app".to_string()];
+        let err = resolve(&index, &world, &[], []).expect_err("the pin rules out lib 2.0");
+        let ResolveError::Pinned { unheld } = &err else {
+            panic!("expected the pin's refusal, got {err}");
+        };
+        assert_eq!(
+            (unheld.package.as_str(), unheld.version.as_str()),
+            ("lib", "1.0-r0")
+        );
+        assert!(
+            matches!(
+                &unheld.reason,
+                UnheldReason::Requirement { requirement, required_by }
+                    if requirement == "lib>=2.0" && required_by == "app"
+            ),
+            "{unheld:?}",
+        );
+        assert_eq!(
+            err.to_string(),
+            "lib is pinned to 1.0-r0 and app requires lib>=2.0"
+        );
+        assert!(
+            matches!(AlpineError::from(err), AlpineError::Pin { unheld } if unheld.len() == 1),
+            "the refusal is the pin's, as the provisioner reports it",
+        );
+
+        // Another package answering the requirement leaves nothing to refuse,
+        // and an exclusion in the way is reported as the exclusion.
+        let index = merged_under(
+            &[
+                ("app", "1.0-r0", "D:lib>=2.0"),
+                ("lib", "1.0-r0", ""),
+                ("lib", "2.0-r0", ""),
+                ("lib-compat", "1.0-r0", "p:lib=2.0"),
+            ],
+            &[("lib", "1.0-r0")],
+        );
+        assert_eq!(closure(&index, &["app"]), ["app", "lib-compat"]);
+        assert!(matches!(
+            resolved(&index, &["app"], &["lib-compat"]),
+            Err(ResolveError::ExcludedButRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn a_name_the_base_carries_keeps_the_base_s_version_under_a_pin() {
+        // A layered build installs over its base rather than upgrading it, so a
+        // pinned name the base carries is answered by the base wherever its
+        // version will do, and one it will not is the upgrade refusal it is
+        // without a pin.
+        let index = merged_under(
+            &[
+                ("app", "1.0-r0", "D:lib"),
+                ("newer-app", "1.0-r0", "D:lib>=2.0"),
+                ("lib", "1.0-r0", ""),
+                ("lib", "2.0-r0", ""),
+            ],
+            &[("lib", "2.0-r0")],
+        );
+        let base = carried(&[("lib", "1.0-r0", "")]);
+        assert_eq!(versions(&index, &["app"], &base), ["app=1.0-r0"]);
+        assert!(matches!(
+            resolved_over(&index, &["newer-app"], &[], &base),
+            Err(ResolveError::WouldUpgrade { name, .. }) if name == "lib"
+        ));
     }
 }
