@@ -2,6 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fmt;
+use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -16,7 +17,9 @@ use rustix::net::SendFlags;
 use rustix::process;
 use rustix::process::Signal;
 
-use crate::error::Error;
+use crate::Network;
+use crate::error::{Error, ListenRefusal};
+use crate::mechanism::netns::{self, ListenFailure, Namespaces};
 use crate::mechanism::{
     self, CONTROL_TERMINATE, CreatedTarget, LaunchPlan, ManagedPlaceholders, MountOp,
     STATUS_RECORD_LEN, wait_syscall_error,
@@ -1005,6 +1008,107 @@ impl<'obs> Pending<'obs> {
             .as_ref()
             .expect("a Pending holds its launch until proceed consumes it")
             .netns_pid()
+    }
+
+    /// Makes a TCP listener at `address` on the sandbox's loopback, for the
+    /// caller to accept the connections the command makes there.
+    ///
+    /// The command connects to `address` as to any server on its own loopback,
+    /// and each connection arrives at the returned listener, in the caller's
+    /// process. Nothing of the caller's runs inside the sandbox, and the
+    /// command is the sandbox's only program: a
+    /// [`terminate`](Running::terminate) reaches it rather than a relay
+    /// standing in front of it. Made before [`proceed`](Self::proceed), the
+    /// listener is in place before the command's first connection.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let cage = ferroday_cage::Cage::builder().rootfs("/r").command("/bin/x").build()?;
+    /// use std::io::Read;
+    ///
+    /// let pending = cage.spawn_pending()?;
+    /// let listener = pending.listen("127.0.0.1:4100".parse()?)?;
+    /// let mut running = pending.proceed()?;
+    /// let (mut connection, _) = listener.accept()?;
+    /// let mut request = Vec::new();
+    /// connection.read_to_end(&mut request)?;
+    /// let status = running.wait()?;
+    /// drop(listener);
+    /// # let _ = status;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// `address` is a loopback address, in `127.0.0.0/8` or `::1`, and any
+    /// port, a privileged one included: a helper process makes the listener
+    /// inside the sandbox's user namespace, where it holds
+    /// `CAP_NET_BIND_SERVICE`. Port 0 has the kernel choose one, which
+    /// [`local_addr`](TcpListener::local_addr) reports. The sandbox has a
+    /// loopback of its own only under
+    /// [`Network::Isolated`](crate::Network::Isolated), the default, so a
+    /// sandbox under [`Network::None`](crate::Network::None) or
+    /// [`Network::Host`](crate::Network::Host) is refused with
+    /// [`Error::ListenRefused`], as is an address that is not a loopback one.
+    /// A failure to make the listener is [`Error::Listen`], whose
+    /// `EADDRINUSE` means an earlier listener already holds the address.
+    ///
+    /// # Lifetime
+    ///
+    /// A socket keeps its network namespace alive, so the listener keeps the
+    /// sandbox's namespace in being until the caller closes it, whatever has
+    /// become of the sandbox. Once the sandbox has exited no connection can
+    /// arrive, and an `accept` waits forever: the caller closes the listener
+    /// once its wait returns, and a thread of its own that accepts is
+    /// released by a `shutdown` of the listener's socket.
+    ///
+    /// # Landlock
+    ///
+    /// A Landlock network grant governs `connect` to every TCP port, loopback
+    /// included. A sandbox carrying one, from the hardening layer's
+    /// `CageBuilder::landlock_net`, grants `NetAccess::CONNECT` on the
+    /// listener's port, or the command's connection is refused.
+    pub fn listen(&self, address: SocketAddr) -> Result<TcpListener, Error> {
+        let refused = |reason| Error::ListenRefused { address, reason };
+        if !address.ip().is_loopback() {
+            return Err(refused(ListenRefusal::NotLoopback));
+        }
+        match self.network() {
+            Network::Isolated => {}
+            Network::None => return Err(refused(ListenRefusal::LoopbackDown)),
+            Network::Host => return Err(refused(ListenRefusal::SharedNamespace)),
+        }
+        let failed = |op, source| Error::Listen {
+            address,
+            op,
+            source,
+        };
+        let namespaces = self
+            .namespaces()
+            .map_err(|(which, errno)| failed(which, Some(errno.into())))?;
+        let listener = netns::listen(&namespaces, address).map_err(|failure| match failure {
+            ListenFailure::Spawn(errno) => {
+                failed("starting the listener's helper", Some(errno.into()))
+            }
+            ListenFailure::Step(step, errno) => failed(step.describe(), Some(errno.into())),
+            ListenFailure::Lost => failed("receiving the listener from its helper", None),
+        })?;
+        Ok(TcpListener::from(listener))
+    }
+
+    /// The network the sandbox was built with.
+    pub(crate) fn network(&self) -> Network {
+        self.inner
+            .as_ref()
+            .expect("a Pending holds its launch until proceed consumes it")
+            .network()
+    }
+
+    /// Opens the sandbox's user and network namespaces, for a helper to join.
+    ///
+    /// The supervisor is alive while this handle holds the launch, so the pid
+    /// they are opened through names it.
+    pub(crate) fn namespaces(&self) -> Result<Namespaces, (&'static str, Errno)> {
+        Namespaces::of(self.netns_pid())
     }
 
     /// The handled mask of the sandbox's Landlock network grants, zero where

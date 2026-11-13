@@ -62,6 +62,7 @@ const _: () = assert_send_sync::<ferroday_cage::Error>();
 const _: () = assert_send_sync::<ferroday_cage::ConfigError>();
 const _: () = assert_send_sync::<ferroday_cage::SetupStep>();
 const _: () = assert_send_sync::<ferroday_cage::OverlayLayer>();
+const _: () = assert_send_sync::<ferroday_cage::ListenRefusal>();
 const _: () = assert_send_sync::<ferroday_cage::IdMapError>();
 
 // Observability values.

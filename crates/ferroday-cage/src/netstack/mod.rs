@@ -66,7 +66,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use rustix::fs::{Mode, OFlags};
 use rustix::pipe::{self, PipeFlags};
 use smoltcp::wire::IpAddress;
 
@@ -314,47 +313,21 @@ impl NetStack {
             .collect::<Result<Vec<_>, _>>()?;
         let published = listeners.iter().map(|listener| listener.bound).collect();
 
-        let pid = pending.netns_pid();
-        let target = format!("/proc/{pid}/ns/net");
-
         // Refuse a sandbox that shares the caller's namespace: attaching
         // would create a tap on the host network, which is never what a
-        // caller means. The namespace links compare equal exactly when the
-        // namespaces are the same.
-        let caller = std::fs::read_link("/proc/self/ns/net").map_err(|err| {
-            NetStackError::NamespaceJoin {
-                which: "reading the caller's namespace link",
-                source: err.raw_os_error().is_some().then_some(err),
-            }
-        })?;
-        let sandbox = std::fs::read_link(&target).map_err(|err| NetStackError::NamespaceJoin {
-            which: "reading the sandbox's namespace link",
-            source: err.raw_os_error().is_some().then_some(err),
-        })?;
-        if caller == sandbox {
+        // caller means.
+        if pending.network() == crate::Network::Host {
             return Err(NetStackError::SharedNamespace);
         }
+        let namespaces =
+            pending
+                .namespaces()
+                .map_err(|(which, errno)| NetStackError::NamespaceJoin {
+                    which,
+                    source: Some(errno.into()),
+                })?;
 
-        // The Pending handle keeps the supervisor alive, so the pid cannot
-        // be recycled while these descriptors are being opened. The user
-        // namespace is joined for its capabilities; the network namespace
-        // is where the tap is created.
-        let netns = rustix::fs::open(&target, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .map_err(|errno| NetStackError::NamespaceJoin {
-                which: "opening the sandbox's network namespace",
-                source: Some(errno.into()),
-            })?;
-        let userns = rustix::fs::open(
-            format!("/proc/{pid}/ns/user"),
-            OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| NetStackError::NamespaceJoin {
-            which: "opening the sandbox's user namespace",
-            source: Some(errno.into()),
-        })?;
-
-        let tap = tap::create(userns, netns, &self.plan)?;
+        let tap = tap::create(&namespaces, &self.plan)?;
 
         // The stop pipe wakes the pump: stop() writes a byte, and a dropped
         // handle closes the write end, which the pump sees as a hangup.

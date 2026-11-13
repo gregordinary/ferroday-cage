@@ -110,7 +110,10 @@
 //! [`netns_pid`](Pending::netns_pid) names a process in the sandbox's
 //! network namespace. The caller attaches a stack to that namespace, then
 //! calls [`proceed`](Pending::proceed) to release the command — so the network
-//! is up before the command's first instruction.
+//! is up before the command's first instruction. A sandbox that needs one way
+//! out rather than a network gets a listener on its loopback from
+//! [`listen`](Pending::listen), and the caller accepts what the command
+//! connects to there.
 // The closing sentence names the netstack items when the feature provides
 // them; without the feature the seam is all the library ships, and the text
 // (with its intra-doc links) says so instead.
@@ -286,7 +289,7 @@ mod status;
 mod terminal;
 mod wire;
 
-pub use error::{ConfigError, Error, OverlayLayer, SetupStep};
+pub use error::{ConfigError, Error, ListenRefusal, OverlayLayer, SetupStep};
 pub use failure::ErrorChain;
 #[cfg(feature = "hardening")]
 pub use hardening::{

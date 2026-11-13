@@ -40,6 +40,57 @@ The seam is meaningful only where the sandbox has a private network namespace:
 [`Network::Host`] the sandbox shares the host's namespace, where attaching a
 stack is neither needed nor correct.
 
+## A listener on the sandbox's loopback
+
+A sandbox often needs exactly one way out: the command speaks TCP to a loopback
+address, such as an HTTP base URL, and the service it reaches lives outside.
+[`Pending::listen`] serves that without a stack. It makes a TCP listener on the
+sandbox's loopback and hands it to the caller, which accepts the connections the
+command makes there:
+
+```rust,no_run
+# use ferroday_cage::Cage;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let cage = Cage::builder().rootfs("/srv/rootfs").command("/usr/bin/agent").build()?;
+let pending = cage.spawn_pending()?;
+let listener = pending.listen("127.0.0.1:4100".parse()?)?;
+let mut running = pending.proceed()?;
+std::thread::spawn(move || {
+    for connection in listener.incoming() {
+        // ... serve the command's request, or carry it elsewhere ...
+        # let _ = connection;
+    }
+});
+let status = running.wait()?;
+# let _ = status;
+# Ok(())
+# }
+```
+
+The listener belongs to the sandbox's network namespace, and the caller holds
+it. Nothing of the caller's runs inside the sandbox, so the command is the
+sandbox's only program, and a [`terminate`][`Running::terminate`] reaches the
+command itself rather than a relay standing in front of it. Made before
+`proceed`, the listener is in place for the command's first connection.
+
+The address is a loopback address, in `127.0.0.0/8` or `::1`, on any port. A
+privileged port is as available as any other: a helper process makes the
+listener inside the sandbox's user namespace, where it holds
+`CAP_NET_BIND_SERVICE`. Only [`Network::Isolated`] gives the sandbox a loopback
+of its own, so a sandbox under [`Network::None`] or [`Network::Host`] is refused
+with [`Error::ListenRefused`], as is an address that is not a loopback one.
+
+A socket keeps its network namespace alive. The listener therefore keeps the
+sandbox's namespace in being until the caller closes it, and once the sandbox
+has exited an `accept` on it waits for a connection that cannot come. The caller
+closes the listener when its wait returns, and a thread of its own that accepts
+is released by a `shutdown` of the listener's socket or by polling it beside a
+signal of the caller's.
+
+A Landlock network grant governs `connect` to every TCP port, loopback
+included. A sandbox carrying one grants `NetAccess::CONNECT` on the listener's
+port, or the command's connection is refused.
+
 ## The native stack
 
 With the `netstack` feature, [`NetStack`] is the library's own stack, attached
@@ -449,6 +500,9 @@ outside the sandbox and is not filtered.
 [`Pending::netns_pid`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html#method.netns_pid
 [`Pending::proceed`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html#method.proceed
 [`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html
+[`Pending::listen`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Pending.html#method.listen
+[`Running::terminate`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.terminate
+[`Error::ListenRefused`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Error.html#variant.ListenRefused
 [`NetStack`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html
 [`NetStack::attach`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.attach
 [`NetStack::default`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html

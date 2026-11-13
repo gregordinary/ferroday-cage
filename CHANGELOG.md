@@ -112,6 +112,14 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `Pending::listen` makes a TCP listener on the sandbox's loopback and hands it
+  to the caller, which accepts the connections the command makes there. A
+  helper process makes it inside the sandbox's user and network namespaces, so
+  a privileged port is available, and nothing of the caller's runs inside the
+  sandbox. The address is in `127.0.0.0/8` or `::1`, under `Network::Isolated`;
+  anything else is refused with the new `Error::ListenRefused`, whose
+  `ListenRefusal` says why, and a failure to make the listener is the new
+  `Error::Listen`.
 - `CageBuilder::present_as` presents the caller to the command as another
   identity under the single-identity map. The command sees the caller as the
   given uid and gid rather than as root, or, with `PresentedIdentity::Own`, as
@@ -373,6 +381,11 @@ consumer upgrading can skip it.
   the root's reader uses.
 - The relay and the supervisor open their signal descriptors through one
   `mechanism::sys::signalfd`.
+- The network stack's tap helper and the listener `Pending::listen` makes run on
+  one helper, `mechanism::netns`, which joins the sandbox's user and network
+  namespaces and hands one descriptor back. `NetStack::attach` refuses a
+  `Network::Host` sandbox by the network it was built with rather than by
+  comparing namespace links.
 - CI runs clippy over every target for x86, 32-bit arm, aarch64, and riscv64,
   the architectures beside the runner's that the library builds for.
 - The relay suite reads the caller's terminal to its end once a session

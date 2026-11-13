@@ -34,6 +34,7 @@
 
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::host::UsernsBlocker;
@@ -1313,6 +1314,61 @@ pub enum Error {
         /// `"standard output"`, or `"standard error"`.
         stream: &'static str,
     },
+    /// [`Pending::listen`](crate::Pending::listen) was asked for a listener it
+    /// does not make, and created nothing.
+    #[non_exhaustive]
+    ListenRefused {
+        /// The address the listener was asked for.
+        address: SocketAddr,
+        /// Why no listener is made there.
+        reason: ListenRefusal,
+    },
+    /// [`Pending::listen`](crate::Pending::listen) could not make the listener
+    /// in the sandbox's network namespace.
+    ///
+    /// `EADDRINUSE` from the bind means the sandbox already listens at the
+    /// address, through an earlier listener of the caller's.
+    #[non_exhaustive]
+    Listen {
+        /// The address the listener was to bind.
+        address: SocketAddr,
+        /// What was being done, as a phrase that completes "while".
+        op: &'static str,
+        /// The error the operation failed with, absent where the helper that
+        /// makes the listener ended without saying why.
+        source: Option<io::Error>,
+    },
+}
+
+/// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
+/// address, carried by [`Error::ListenRefused`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ListenRefusal {
+    /// The address is not a loopback address: it is outside `127.0.0.0/8` and
+    /// is not `::1`. A listener carries what the command connects to on its
+    /// own loopback, and nothing else.
+    NotLoopback,
+    /// The sandbox runs under [`Network::None`](crate::Network::None), whose
+    /// loopback is down.
+    LoopbackDown,
+    /// The sandbox runs under [`Network::Host`](crate::Network::Host) and has
+    /// no network namespace of its own: its loopback is the host's.
+    SharedNamespace,
+}
+
+impl fmt::Display for ListenRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ListenRefusal::NotLoopback => "the address is not a loopback address",
+            ListenRefusal::LoopbackDown => {
+                "the sandbox runs without a network, whose loopback is down"
+            }
+            ListenRefusal::SharedNamespace => {
+                "the sandbox shares the host's network namespace, whose loopback is the host's"
+            }
+        })
+    }
 }
 
 impl Error {
@@ -1434,6 +1490,14 @@ impl fmt::Display for Error {
                 "the command's {stream} would be a directory, which reaches the host's \
                  filesystem by path; a launch hands no directory to the command"
             ),
+            Error::ListenRefused { address, reason } => write!(
+                f,
+                "no listener is made at {address} on the sandbox's loopback: {reason}"
+            ),
+            Error::Listen { address, op, .. } => write!(
+                f,
+                "could not listen at {address} on the sandbox's loopback while {op}"
+            ),
         }
     }
 }
@@ -1443,10 +1507,12 @@ impl std::error::Error for Error {
     ///
     /// Every OS failure this type carries is an [`io::Error`], so every one of
     /// them is returned here, including the syscall a recognized exhaustion
-    /// came from. The two variants that answer `None` carry nothing, since no
+    /// came from. The variants that answer `None` carry nothing, since no
     /// syscall failed: [`SupervisorLost`](Self::SupervisorLost) is an absence
-    /// the library noticed, and [`StreamIsDirectory`](Self::StreamIsDirectory)
-    /// a refusal it made before it made any.
+    /// the library noticed, [`StreamIsDirectory`](Self::StreamIsDirectory) and
+    /// [`ListenRefused`](Self::ListenRefused) are refusals it made before it
+    /// made any, and [`Listen`](Self::Listen) answers `None` where its helper
+    /// ended without saying why.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Config(err) => Some(err),
@@ -1461,7 +1527,12 @@ impl std::error::Error for Error {
             | Error::KillHandle { source }
             | Error::Terminal { source }
             | Error::TerminalsExhausted { source } => Some(source),
-            Error::SupervisorLost | Error::StreamIsDirectory { .. } => None,
+            Error::Listen { source, .. } => source
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            Error::SupervisorLost
+            | Error::StreamIsDirectory { .. }
+            | Error::ListenRefused { .. } => None,
         }
     }
 }

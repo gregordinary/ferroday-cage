@@ -3,35 +3,21 @@
 //!
 //! This module is one of the crate's three homes of `unsafe`; the others are
 //! the launch mechanism and the terminal relay's signals. The unsafe surface
-//! here is the fork of the helper process and the interface-ioctl boundary:
-//! each ioctl passes a `#[repr(C)]` view of the kernel's request struct, laid
-//! out field-for-field with a compile-time size assertion, and carries a
-//! SAFETY comment stating the layout it relies on.
+//! here is the interface-ioctl boundary, and the call that runs this module's
+//! configuration on the helper process: each ioctl passes a `#[repr(C)]` view
+//! of the kernel's request struct, laid out field-for-field with a
+//! compile-time size assertion, and carries a SAFETY comment stating the layout
+//! it relies on.
 //!
-//! The work happens in a forked, short-lived helper process, and the shape
-//! is dictated by a kernel rule: `setns` to a network namespace demands
-//! `CAP_SYS_ADMIN` in the caller's *own* user namespace as well as the
-//! target's, so no thread of an unprivileged caller can join the sandbox's
-//! network namespace directly — owning it is not enough. Entering the
-//! sandbox's *user* namespace first acquires those capabilities (the
-//! caller's user created it, which is exactly what that entry requires),
-//! but the kernel refuses user-namespace entry to any multithreaded
-//! process. A freshly forked child is single-threaded by construction, so
-//! the helper forks, joins the user namespace and then the network
-//! namespace, builds the tap, and hands the descriptor back over a
-//! socketpair before exiting.
+//! The work happens on the forked, short-lived helper that
+//! [`mechanism::netns`](crate::mechanism::netns) runs in the sandbox's network
+//! namespace, which explains why a helper is needed. The helper's
+//! configuration therefore runs under the same constraints as the launch
+//! stages (see [`crate::mechanism::child`]): everything it needs is marshaled
+//! before the fork, and it allocates nothing, takes no locks, and never panics.
+//! Failures travel back as a step-and-errno record, and the parent turns them
+//! into typed errors.
 //!
-//! The fork may happen while other caller threads hold locks, so the child
-//! runs under the same constraints as the launch stages (see
-//! [`crate::mechanism::child`]): everything it needs is marshaled before
-//! the fork, and it allocates nothing, takes no locks, and never panics.
-//! Failures travel back as a fixed-size step-and-errno record, and the
-//! parent turns them into typed errors.
-//!
-//! Everything the helper opens after joining belongs to the sandbox's
-//! network namespace: the tun clone device captures its namespace at open,
-//! the configuration sockets act on the namespace they were created in,
-//! and `/proc/sys/net` resolves against the opener's namespace.
 //! Configuration runs in interface-down order first — hardware address and
 //! MTU, then the sysctls that disable IPv6 duplicate address detection,
 //! then the IPv4 address and netmask — and brings the interface up before
@@ -43,18 +29,15 @@
 
 use std::ffi::{CStr, CString};
 use std::net::Ipv4Addr;
-use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use rustix::ioctl;
-use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
-use rustix::thread::LinkNameSpaceType;
+use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
-use crate::mechanism::frame;
-use crate::mechanism::sweep_fds_keeping;
-use crate::mechanism::sys::{self, PidfdFork};
+use crate::mechanism::netns::{self, HelperFailure, JoinSteps, Namespaces};
 use crate::wire::wire_enum;
 
 /// `TUNSETIFF`: create or attach to a tun/tap interface (`_IOW('T', 202, int)`).
@@ -99,8 +82,7 @@ const DAD_ALL: &CStr = c"/proc/sys/net/ipv6/conf/all/accept_dad";
 wire_enum! {
     /// The steps of the helper's work, in wire form: a failure report names the
     /// step and the errno. The explicit discriminants are the record encoding
-    /// between the helper and its parent within one build; zero is reserved for
-    /// the success record.
+    /// between the helper and its parent within one build.
     enum Step {
         /// Close the inherited descriptors this process does not own.
         SweepFds = 1 => "closing the tap helper's inherited descriptors",
@@ -279,15 +261,9 @@ const _: () = assert!(size_of::<In6Rtmsg>() == 80);
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(size_of::<In6Rtmsg>() == 72);
 
-/// Everything the helper needs, marshaled before the fork so the child
-/// performs no allocating or fallible preparation of its own.
+/// Everything the helper's configuration needs, marshaled before the fork so
+/// the helper performs no allocating or fallible preparation of its own.
 struct HelperContext<'a> {
-    /// The sandbox's user namespace, joined first for its capabilities.
-    userns: BorrowedFd<'a>,
-    /// The sandbox's network namespace, where the tap is created.
-    netns: BorrowedFd<'a>,
-    /// The helper's end of the result socketpair.
-    sock: BorrowedFd<'a>,
     /// The interface name, NUL-padded to the ifreq field size.
     name: [u8; 16],
     /// The address and interface plan.
@@ -297,100 +273,49 @@ struct HelperContext<'a> {
 }
 
 /// Creates and configures the tap device inside the sandbox's namespaces
-/// and returns its descriptor, via the forked helper described in the
-/// module documentation.
-pub(super) fn create(
-    userns: OwnedFd,
-    netns: OwnedFd,
-    plan: &Plan,
-) -> Result<OwnedFd, NetStackError> {
+/// and returns its descriptor, on the helper [`netns`] runs there.
+pub(super) fn create(namespaces: &Namespaces, plan: &Plan) -> Result<OwnedFd, NetStackError> {
     let dad_interface = CString::new(format!(
         "/proc/sys/net/ipv6/conf/{}/accept_dad",
         plan.interface
     ))
     .expect("a validated interface name has no NUL byte");
-    let (parent_sock, child_sock) = rustix::net::socketpair(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(|errno| NetStackError::Spawn {
-        source: errno.into(),
-    })?;
     let context = HelperContext {
-        userns: userns.as_fd(),
-        netns: netns.as_fd(),
-        sock: child_sock.as_fd(),
         name: interface_name(&plan.interface),
         plan,
         dad_interface: &dad_interface,
     };
+    let steps = JoinSteps {
+        sweep_fds: Step::SweepFds.wire(),
+        join_user: Step::JoinUser.wire(),
+        join_net: Step::JoinNet.wire(),
+        send: Step::SendTap.wire(),
+    };
 
-    // SAFETY: the child branch runs only `helper`, which performs no
-    // allocation, takes no locks, and ends in `exit_group` — the post-fork
-    // constraints documented in `crate::mechanism::child` — and all its
-    // inputs were marshaled above.
-    match unsafe { sys::fork_with_pidfd() } {
-        Err(errno) => Err(NetStackError::Spawn {
+    // SAFETY: `build_tap` makes raw syscalls and ioctls over the context
+    // marshaled above, opening only what it creates itself once the helper has
+    // joined; it performs no allocation, takes no locks, and cannot panic.
+    let made = unsafe {
+        netns::in_network_namespace(namespaces, &steps, || {
+            build_tap(&context).map_err(|(step, errno)| (step.wire(), errno))
+        })
+    };
+    made.map_err(|failure| match failure {
+        HelperFailure::Spawn(errno) => NetStackError::Spawn {
             source: errno.into(),
-        }),
-        Ok(PidfdFork::Child) => helper(&context),
-        Ok(PidfdFork::ParentOf(child)) => {
-            // Close this process's copy of the helper's end so the helper's
-            // exit hangs the socket up, then collect the result and reap.
-            drop(child_sock);
-            let outcome = receive_tap(&parent_sock, plan);
-            let _ = child.reap();
-            outcome
-        }
-    }
+        },
+        HelperFailure::Step { wire, errno } => match Step::from_wire(wire) {
+            Some(step) => step_error(step, errno.raw_os_error(), plan),
+            None => NetStackError::HelperLost,
+        },
+        HelperFailure::Lost => NetStackError::HelperLost,
+    })
 }
 
-/// The helper process: joins the sandbox's namespaces, builds the tap,
-/// sends the descriptor back, and exits. Failures are reported as a
-/// step-and-errno record; there is no one to report a reporting failure to.
-fn helper(context: &HelperContext<'_>) -> ! {
-    match run_helper(context) {
-        Ok(()) => sys::exit_group(0),
-        Err((step, errno)) => {
-            let mut record = [0u8; 8];
-            record[0..4].copy_from_slice(&(step as u32).to_le_bytes());
-            record[4..8].copy_from_slice(&errno.raw_os_error().to_le_bytes());
-            let _ = rustix::net::send(context.sock, &record, SendFlags::NOSIGNAL);
-            sys::exit_group(127)
-        }
-    }
-}
-
-/// The helper's work. Returns only on failure, naming the step.
-fn run_helper(context: &HelperContext<'_>) -> Result<(), (Step, Errno)> {
-    // Every signal stays blocked, as the fork left it: the copied address
-    // space still names the caller's signal handlers, which must not run here,
-    // and nothing here relies on receiving a signal. `SIGKILL` still ends the
-    // helper, which the parent process observes as a hangup.
-    //
-    // The descriptor table first, before anything that can block. The fork
-    // copied the caller's whole table into this process, and an inherited copy
-    // is not inert: it holds open a concurrently live sandbox's control socket
-    // (which defers the supervisor's hangup detection), a concurrently
-    // allocated pseudoterminal replica (which defers end-of-file on the
-    // primary), and a concurrently open map gate. The helper's life is short
-    // but bounded by nothing — a namespace join, a device open, a dozen ioctls
-    // and two sysctl writes — so it sweeps like every other forked child. Only
-    // the three channels it was given survive.
-    sweep_fds_keeping(&[
-        context.userns.as_raw_fd(),
-        context.netns.as_raw_fd(),
-        context.sock.as_raw_fd(),
-    ])
-    .map_err(|errno| (Step::SweepFds, errno))?;
-
-    rustix::thread::move_into_link_name_space(context.userns, Some(LinkNameSpaceType::User))
-        .map_err(|errno| (Step::JoinUser, errno))?;
-    rustix::thread::move_into_link_name_space(context.netns, Some(LinkNameSpaceType::Network))
-        .map_err(|errno| (Step::JoinNet, errno))?;
-
+/// The helper's configuration, in the sandbox's network namespace: creates
+/// the tap, configures it, and returns its descriptor, or the step it failed
+/// at.
+fn build_tap(context: &HelperContext<'_>) -> Result<OwnedFd, (Step, Errno)> {
     // Open the clone device only now: a tun descriptor belongs to the
     // namespace its opener was in, and TUNSETIFF creates the interface
     // there. Nonblocking, as the pump's poll loop requires.
@@ -454,32 +379,7 @@ fn run_helper(context: &HelperContext<'_>) -> Result<(), (Step, Errno)> {
         add_v6_default_route(&inet6, index, v6).map_err(|errno| (Step::AddV6Route, errno))?;
     }
 
-    send_tap(context.sock, tap.as_fd()).map_err(|errno| (Step::SendTap, errno))
-}
-
-/// Sends the success record with the tap descriptor attached.
-fn send_tap(sock: BorrowedFd<'_>, tap: BorrowedFd<'_>) -> Result<(), Errno> {
-    frame::send_with_fd(sock, &[0u8; 8], tap)
-}
-
-/// Receives the helper's one record: the tap descriptor on success, a
-/// step-and-errno report on failure, or a hangup if the helper died.
-fn receive_tap(sock: &OwnedFd, plan: &Plan) -> Result<OwnedFd, NetStackError> {
-    let mut payload = [0u8; 8];
-    let (bytes, tap) =
-        frame::recv_with_fd(sock.as_fd(), &mut payload).map_err(|_| NetStackError::HelperLost)?;
-    if bytes != payload.len() {
-        return Err(NetStackError::HelperLost);
-    }
-    let step = u32::from_le_bytes(payload[0..4].try_into().expect("four bytes"));
-    let errno = i32::from_le_bytes(payload[4..8].try_into().expect("four bytes"));
-    if step != 0 {
-        return Err(match Step::from_wire(step) {
-            Some(step) => step_error(step, errno, plan),
-            None => NetStackError::HelperLost,
-        });
-    }
-    tap.ok_or(NetStackError::HelperLost)
+    Ok(tap)
 }
 
 /// Maps a reported step failure onto the public error.
@@ -741,10 +641,12 @@ mod tests {
         }
     }
 
-    /// Zero is the success record, and nothing past the last step is a step.
+    /// Neither zero nor the success record is a step, and nothing past the
+    /// last step is one either.
     #[test]
     fn unknown_wire_values_are_rejected() {
         assert_eq!(Step::from_wire(0), None);
+        assert_eq!(Step::from_wire(crate::mechanism::frame::RECORD_DONE), None);
         assert_eq!(Step::from_wire(Step::past_the_last()), None);
         assert_eq!(Step::from_wire(u32::MAX), None);
     }

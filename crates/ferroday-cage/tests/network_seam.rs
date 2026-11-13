@@ -1,14 +1,19 @@
 //! Integration tests for the userspace-network seam: the pending launch, the
 //! network-namespace target it exposes, the gate that holds the command until
-//! the caller proceeds, and the teardown when a pending launch is abandoned.
+//! the caller proceeds, the listener it makes on the sandbox's loopback, and
+//! the teardown when a pending launch is abandoned.
 
 mod common;
 
 use common::{Collect, process_exists, sleeper, wait_gone};
 
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, Error, Network, SetupStep};
+use ferroday_cage::{
+    Cage, CageBuilder, Error, ListenRefusal, Network, PresentedIdentity, SetupStep,
+};
 
 /// The network namespace a process is in, as the `net:[...]` symlink target
 /// under `/proc/<pid>/ns/net`.
@@ -180,4 +185,218 @@ fn a_setup_step_that_fails_before_the_gate_fails_the_pending_launch() {
             ),
         }
     }
+}
+
+/// Accepts one connection on `listener`, or gives up at `within`: a command
+/// that never connects fails the test rather than hanging it.
+fn accept_within(listener: &TcpListener, within: Duration) -> Option<TcpStream> {
+    listener
+        .set_nonblocking(true)
+        .expect("the listener turns non-blocking");
+    let deadline = Instant::now().checked_add(within)?;
+    loop {
+        match listener.accept() {
+            Ok((connection, _)) => {
+                connection
+                    .set_nonblocking(false)
+                    .expect("the connection turns blocking");
+                return Some(connection);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("the accept fails: {err}"),
+        }
+    }
+}
+
+/// Runs `builder`'s sandbox with a listener at `address` on its loopback,
+/// where the command sends a request with `nc` and prints the reply, and
+/// returns what the caller read and what the command printed, its errors
+/// included.
+fn round_trip(builder: CageBuilder, address: SocketAddr, connect_to: &str) -> (String, String) {
+    let mut observer = Collect::default();
+    let cage = builder
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!(
+                "echo request-from-the-sandbox | nc {connect_to} {}",
+                address.port()
+            ),
+        ])
+        .build()
+        .expect("a valid sandbox configuration");
+    let pending = cage
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let listener = pending.listen(address).expect("the listener is made");
+    let mut running = pending.proceed().expect("the command is released");
+    let Some(mut connection) = accept_within(&listener, Duration::from_secs(30)) else {
+        let _ = running.kill();
+        let status = running.wait();
+        drop(running);
+        panic!(
+            "the command never connected ({status:?}): {}",
+            String::from_utf8_lossy(&observer.stdout)
+        );
+    };
+    let mut request = [0u8; "request-from-the-sandbox\n".len()];
+    connection
+        .read_exact(&mut request)
+        .expect("the request arrives");
+    connection
+        .write_all(b"reply-from-the-caller\n")
+        .expect("the reply is sent");
+    drop(connection);
+    let status = running.wait().expect("the wait completes");
+    drop(listener);
+    assert!(status.success(), "the command exits cleanly: {status:?}");
+    (
+        String::from_utf8_lossy(&request).into_owned(),
+        String::from_utf8_lossy(&observer.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn a_command_s_connection_to_its_loopback_reaches_the_caller() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Port 80 is privileged: the helper binds it holding the sandbox's
+    // CAP_NET_BIND_SERVICE, which the caller does not hold on the host.
+    let (request, printed) = round_trip(
+        Cage::builder().rootfs(rootfs),
+        "127.0.0.1:80".parse().unwrap(),
+        "127.0.0.1",
+    );
+    assert_eq!(request, "request-from-the-sandbox\n");
+    assert_eq!(printed, "reply-from-the-caller\n");
+}
+
+#[test]
+fn a_listener_serves_the_ipv6_loopback() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let (request, printed) = round_trip(
+        Cage::builder().rootfs(rootfs),
+        "[::1]:4100".parse().unwrap(),
+        "::1",
+    );
+    assert_eq!(request, "request-from-the-sandbox\n");
+    assert_eq!(printed, "reply-from-the-caller\n");
+}
+
+#[test]
+fn a_listener_serves_a_presented_identity() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let (_, printed) = round_trip(
+        Cage::builder()
+            .rootfs(rootfs)
+            .present_as(PresentedIdentity::Own),
+        "127.0.0.1:4100".parse().unwrap(),
+        "127.0.0.1",
+    );
+    assert_eq!(printed, "reply-from-the-caller\n");
+}
+
+#[cfg(feature = "hardening")]
+#[test]
+fn a_listener_serves_a_command_whose_landlock_grant_names_its_port() {
+    use ferroday_cage::{FsAccess, NetAccess};
+
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::landlock_net() {
+        return;
+    }
+    // busybox `nc` binds its ephemeral source port explicitly, which a network
+    // grant governs as a bind on port 0.
+    let (_, printed) = round_trip(
+        Cage::builder()
+            .rootfs(rootfs)
+            .landlock_fs(FsAccess::all(), "/")
+            .landlock_net(NetAccess::BIND, 0)
+            .landlock_net(NetAccess::CONNECT, 4100),
+        "127.0.0.1:4100".parse().unwrap(),
+        "127.0.0.1",
+    );
+    assert_eq!(printed, "reply-from-the-caller\n");
+}
+
+#[test]
+fn a_second_listener_at_one_address_is_refused_with_the_bind_s_errno() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let pending = sleeper(rootfs)
+        .spawn_pending()
+        .expect("the pending sandbox launches");
+    let address: SocketAddr = "127.0.0.1:4100".parse().unwrap();
+    let first = pending.listen(address).expect("the first listener is made");
+    match pending.listen(address) {
+        Err(Error::Listen {
+            address: at,
+            source: Some(source),
+            ..
+        }) => {
+            assert_eq!(at, address);
+            assert_eq!(source.raw_os_error(), Some(98), "EADDRINUSE: {source}");
+        }
+        other => panic!("a second listener at one address: {other:?}"),
+    }
+    drop(first);
+    drop(pending);
+}
+
+#[test]
+fn a_listener_is_refused_off_the_loopback_and_without_one() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let refused = |network: Network, address: &str| {
+        let pending = Cage::builder()
+            .rootfs(rootfs)
+            .network(network)
+            .command("/bin/true")
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn_pending()
+            .expect("the pending sandbox launches");
+        let address: SocketAddr = address.parse().unwrap();
+        match pending.listen(address) {
+            Err(Error::ListenRefused {
+                address: at,
+                reason,
+                ..
+            }) => {
+                assert_eq!(at, address);
+                reason
+            }
+            other => panic!("{network:?} at {address}: {other:?}"),
+        }
+    };
+    assert_eq!(
+        refused(Network::Isolated, "10.0.2.15:80"),
+        ListenRefusal::NotLoopback
+    );
+    assert_eq!(
+        refused(Network::Isolated, "[::ffff:127.0.0.1]:80"),
+        ListenRefusal::NotLoopback
+    );
+    assert_eq!(
+        refused(Network::None, "127.0.0.1:80"),
+        ListenRefusal::LoopbackDown
+    );
+    assert_eq!(
+        refused(Network::Host, "127.0.0.1:80"),
+        ListenRefusal::SharedNamespace
+    );
 }

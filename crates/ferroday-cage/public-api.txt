@@ -1687,6 +1687,13 @@ pub ferroday_cage::Error::IdentityMap(ferroday_cage::IdMapError)
 pub ferroday_cage::Error::KeyQuotaExhausted::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::KillHandle
 pub ferroday_cage::Error::KillHandle::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::Error::Listen
+pub ferroday_cage::Error::Listen::address: core::net::socket_addr::SocketAddr
+pub ferroday_cage::Error::Listen::op: &'static str
+pub ferroday_cage::Error::Listen::source: core::option::Option<core::io::error::Error>
+#[non_exhaustive] pub ferroday_cage::Error::ListenRefused
+pub ferroday_cage::Error::ListenRefused::address: core::net::socket_addr::SocketAddr
+pub ferroday_cage::Error::ListenRefused::reason: ferroday_cage::ListenRefusal
 #[non_exhaustive] pub ferroday_cage::Error::NamespaceLimitReached
 pub ferroday_cage::Error::NamespaceLimitReached::source: core::io::error::Error
 pub ferroday_cage::Error::NamespaceLimitReached::step: ferroday_cage::SetupStep
@@ -1789,6 +1796,19 @@ impl core::marker::Unpin for ferroday_cage::LandlockScope
 impl core::marker::UnsafeUnpin for ferroday_cage::LandlockScope
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::LandlockScope
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::LandlockScope
+#[non_exhaustive] pub enum ferroday_cage::ListenRefusal
+pub ferroday_cage::ListenRefusal::LoopbackDown
+pub ferroday_cage::ListenRefusal::NotLoopback
+pub ferroday_cage::ListenRefusal::SharedNamespace
+impl core::fmt::Display for ferroday_cage::ListenRefusal
+pub fn ferroday_cage::ListenRefusal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::ListenRefusal
+impl core::marker::Send for ferroday_cage::ListenRefusal
+impl core::marker::Sync for ferroday_cage::ListenRefusal
+impl core::marker::Unpin for ferroday_cage::ListenRefusal
+impl core::marker::UnsafeUnpin for ferroday_cage::ListenRefusal
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ListenRefusal
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ListenRefusal
 #[non_exhaustive] pub enum ferroday_cage::Mount
 pub ferroday_cage::Mount::Bind(ferroday_cage::Bind)
 pub ferroday_cage::Mount::Raw(ferroday_cage::RawMount)
@@ -2608,6 +2628,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParsePresentedId
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParsePresentedIdentityError
 pub struct ferroday_cage::Pending<'obs>
 impl<'obs> ferroday_cage::Pending<'obs>
+pub fn ferroday_cage::Pending<'obs>::listen(&self, core::net::socket_addr::SocketAddr) -> core::result::Result<std::net::tcp::TcpListener, ferroday_cage::Error>
 pub fn ferroday_cage::Pending<'obs>::netns_pid(&self) -> u32
 pub fn ferroday_cage::Pending<'obs>::proceed(self) -> core::result::Result<ferroday_cage::Running<'obs>, ferroday_cage::Error>
 impl core::fmt::Debug for ferroday_cage::Pending<'_>

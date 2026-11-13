@@ -252,6 +252,11 @@ mod tests {
             ))),
             Box::new(Error::Terminal { source: os_error() }),
             Box::new(Error::TerminalsExhausted { source: os_error() }),
+            Box::new(Error::Listen {
+                address: std::net::SocketAddr::from(([127, 0, 0, 1], 4100)),
+                op: "binding the listening socket",
+                source: Some(os_error()),
+            }),
             Box::new(ProvisionError::io("opening", "/srv/rootfs.tar", os_error())),
             Box::new(ProvisionError::other(ProvisionError::io(
                 "opening",

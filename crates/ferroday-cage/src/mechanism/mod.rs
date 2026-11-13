@@ -96,6 +96,7 @@ mod export;
 pub(crate) mod frame;
 #[cfg(feature = "hardening")]
 mod harden;
+pub(crate) mod netns;
 mod overlay;
 mod remove;
 pub(crate) mod resolve;
@@ -106,10 +107,6 @@ pub(crate) mod sys;
 pub(crate) use harden::probe_landlock_abi;
 
 pub(crate) use child::CONTROL_TERMINATE;
-// The network stack's tap helper is the one forked child outside this module,
-// and it sweeps like every child inside it.
-#[cfg(feature = "netstack")]
-pub(crate) use child::sweep_fds_keeping;
 pub(crate) use copyin::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_OWN, COPY_SYMLINK,
     CopyFailure, start_copy_in,
@@ -140,6 +137,7 @@ use rustix::process::Signal;
 use rustix::process::{self, Pid, WaitId, WaitIdOptions};
 use rustix::thread::UnshareFlags;
 
+use crate::Network;
 use crate::error::{Error, SetupStep};
 use crate::host;
 use crate::idmap::{IdMapper, ResolvedMap};
@@ -2158,6 +2156,9 @@ pub(crate) struct PendingLaunch {
     proceed_write: OwnedFd,
     /// Whether the sandbox has its own PID namespace, deciding the reap.
     pid_namespace: bool,
+    /// The network the sandbox was built with, which decides whether it has a
+    /// network namespace of its own and a loopback up in it.
+    network: Network,
     /// The caller's terminal, where the launch lent the sandbox its
     /// foreground. Handed to the running handle at proceed, and handed back
     /// when the launch fails or is abandoned.
@@ -2297,6 +2298,7 @@ pub(crate) fn spawn_pending(
             stderr: parent.stderr,
             proceed_write,
             pid_namespace: plan.pid_namespace,
+            network: plan.network,
             foreground: parent.foreground,
             op_labels: plan.op_labels.clone(),
             exec_label: plan.exec_label.clone(),
@@ -2315,6 +2317,11 @@ impl PendingLaunch {
     /// namespace, the target for `/proc/<pid>/ns/net`.
     pub(crate) fn netns_pid(&self) -> u32 {
         self.pid
+    }
+
+    /// The network the sandbox was built with.
+    pub(crate) fn network(&self) -> Network {
+        self.network
     }
 
     /// The handled mask of the launch's Landlock network grants, zero where it
