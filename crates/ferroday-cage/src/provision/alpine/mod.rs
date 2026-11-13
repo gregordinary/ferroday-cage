@@ -888,7 +888,12 @@ impl AlpineBuilder {
     /// Without one, packages are downloaded into a directory beside the rootfs
     /// being built and removed with it, so a repeated bootstrap re-downloads
     /// everything. A cache directory is the caller's: this layer only ever adds
-    /// to it, and never removes an entry it did not just write.
+    /// to it. An entry is named for the package's control identity as well as
+    /// its file name, so packages that share a file name and differ in
+    /// architecture or content, such as one architecture's build and another's
+    /// or a postmarketOS republish of an Alpine package, are kept side by side
+    /// rather than replacing each other. The one entry a download replaces is
+    /// one at that name that does not read back as the package.
     ///
     /// An entry is used only when it reads back as the package the plan names —
     /// its control identity matches, and its file tree digests to what its own
@@ -2013,7 +2018,16 @@ fn acquire(
                     ),
                 })
             })?;
-        let path = cache.join(planned.file_name());
+        let name = planned.cache_name().ok_or_else(|| {
+            wrap(AlpineError::Config {
+                reason: format!(
+                    "the plan states {:?} with the control identity {:?}, which names no cache \
+                     entry",
+                    planned.name, planned.control_identity,
+                ),
+            })
+        })?;
+        let path = cache.join(name);
 
         // A cached entry that does not read back as this package is not an
         // error; it is a download waiting to happen.
@@ -4585,9 +4599,12 @@ mod tests {
         let cache = scratch.join("cache");
         std::fs::create_dir_all(&cache).expect("the cache is creatable");
         // One of the two already in the cache, which is the everyday state of a
-        // second run.
-        std::fs::write(cache.join("musl-1.2.5-r23.apk"), fixtures::MUSL)
-            .expect("the cached package is writable");
+        // second run, under the name its control identity gives it.
+        std::fs::write(
+            cache.join("musl-1.2.5-r23.1b6c50426d3c0656e9c5a567a5a59601c7f4307a.apk"),
+            fixtures::MUSL,
+        )
+        .expect("the cached package is writable");
 
         #[derive(Default)]
         struct Counting(Vec<(String, usize, usize)>);

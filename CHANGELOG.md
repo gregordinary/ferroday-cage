@@ -839,6 +839,13 @@ consumer upgrading can skip it.
   `AlpineError::Config`. The identity was admitted and could never equal the
   one computed over the package, so the refusal came at download as an
   `AlpineError::Digest`, worded as a mirror serving another package.
+- The Alpine layer keeps a package in its cache under its file name and the
+  SHA-1 its control identity names, as
+  `musl-1.2.5-r23.1b6c50426d3c0656e9c5a567a5a59601c7f4307a.apk`. Two packages
+  sharing a file name, such as one architecture's build and another's or an
+  Alpine package and its postmarketOS republish, replaced each other's entry
+  in a cache two runs share. An entry under the previous name is not read, and
+  the package is downloaded again.
 
 ### Internal
 

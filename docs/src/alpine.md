@@ -240,8 +240,14 @@ than refused.
 
 It has to work that way, and the reason is a real difference from the Debian
 pool: an apk index publishes no digest of the whole `.apk` file, so there is no
-content address to name a cache entry by. Entries are keyed by published file
-name instead, and the full re-verification is what makes that safe.
+content address to name a cache entry by. An entry is named for the package's
+published file name and the control identity the index records for it, as
+`musl-1.2.5-r23.1b6c50426d3c0656e9c5a567a5a59601c7f4307a.apk`, and the full
+re-verification is what makes a name that is not a digest of the whole file
+safe. The identity covers `.PKGINFO`, which states the architecture and the
+digest of the file tree, so packages that share a file name and differ in
+either keep an entry each: an x86_64 and an aarch64 build of one version, or
+an Alpine package and the postmarketOS republish of it.
 
 A package is never held in memory: the bytes are written to a staging file as
 they arrive. That file is read back and checked as a cache entry is. It is

@@ -270,6 +270,35 @@ impl PlannedPackage {
         format!("{}-{}{PACKAGE_SUFFIX}", self.name, self.version)
     }
 
+    /// The name this package is kept under in a package cache, or `None` where
+    /// its [`control_identity`](Self::control_identity) is not one.
+    ///
+    /// The [`file_name`](Self::file_name), with the SHA-1 the control identity
+    /// names in hexadecimal before its suffix:
+    /// `musl-1.2.5-r23.1b6c50426d3c0656e9c5a567a5a59601c7f4307a.apk`. A file
+    /// name names a package
+    /// and a version and nothing else, so two packages can share one: one
+    /// architecture's build and another's, or an Alpine package and the
+    /// postmarketOS republish of it at the same version. Under one name in a
+    /// cache two runs share, each would replace the other's entry. The control
+    /// identity is a digest of the control segment, whose `.PKGINFO` states the
+    /// architecture and binds the file tree through `datahash`, so two packages
+    /// differing in either are kept apart, and two copies of one package share an
+    /// entry.
+    ///
+    /// The identity is held to its spelling before a plan is used, by
+    /// [`unaddressable`](Self::unaddressable) or by the index reader, so `None`
+    /// is a plan that reached a cache unchecked.
+    pub(super) fn cache_name(&self) -> Option<String> {
+        let digest = super::sign::identity_digest(&self.control_identity)?;
+        Some(format!(
+            "{}-{}.{}{PACKAGE_SUFFIX}",
+            self.name,
+            self.version,
+            crate::provision::digest::hex(&digest),
+        ))
+    }
+
     /// Why this entry cannot be addressed, or `None` where it can.
     ///
     /// [`file_name`](Self::file_name) interpolates the name and the version and
@@ -1125,5 +1154,23 @@ Origin: postmarketos-base
             plan.packages[1].file_name(),
             "postmarketos-baselayout-1.0-r0.apk",
         );
+    }
+
+    #[test]
+    fn a_cached_package_is_named_for_its_control_identity_as_well() {
+        let busybox = sample().packages.remove(0);
+        assert_eq!(
+            busybox.cache_name().as_deref(),
+            Some("busybox-1.37.0-r30.f1347801bb96b1aa40d17f82237c3f4ff02a4725.apk"),
+        );
+        // Another build of the same package and version, such as another
+        // architecture's or a republish, shares the file name and not the entry.
+        let mut other = busybox.clone();
+        other.control_identity = super::super::sign::identity_for_test("another build");
+        assert_eq!(other.file_name(), busybox.file_name());
+        assert_ne!(other.cache_name(), busybox.cache_name());
+        // An identity that is not one names no entry.
+        other.control_identity = "Q1".to_string();
+        assert_eq!(other.cache_name(), None);
     }
 }
