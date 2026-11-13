@@ -1118,6 +1118,10 @@ and its `alpine` feature ferrata 0.1.0.
 
 ### Internal
 
+- The vendored Gentoo service keyring is refreshed to the bytes
+  `qa-reports.gentoo.org` publishes. They add certifications of its keys made
+  by keys it does not hold, and an older self-signature of the release key; no
+  key, user ID, expiry or revocation changed, so nothing it vouches for did.
 - CI runs `fcage` inside Docker, from a stock image, under the generated
   seccomp profile, Docker's own profiles, and an unmasked procfs, and asserts
   what the container chapter says of each.
