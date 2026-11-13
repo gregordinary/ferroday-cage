@@ -532,12 +532,15 @@ report name a package and its version bare.
 | Stop a provisioning run on `SIGINT`, removing what it staged | `provision::Interrupt`, which an observer answers `ProvisionObserver::cancelled` from |
 | Which cgroup limit does `NAME=VALUE` spell? | `CgroupLimit`'s `FromStr`, whose names are the keys of a profile's `[cgroup]` table |
 | Read this process's mount table | `host::MountEntry::parse`, one line of the kernel's `mountinfo` at a time |
+| Where does a mount table mount the cgroup v2 hierarchy? | `host::cgroup2_mounts`, over `host::MountEntry::parse` |
+| Can a restriction's command write its cgroup's files or start a process in another cgroup? | `restrict::ensure_cgroup_held`, which names the `CgroupReach` left open |
 | Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |
 | Can this caller write a range map directly, without a delegate? | `idmap::direct_write_refusal`, over `idmap::effective_capabilities`, which `DirectMapper` asks of a request and `host::range_map_blocker` of no extent at all |
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |
 | What does the single-identity map write? | `idmap::single_identity_lines` |
 | Validate the command a sandbox or a restriction executes | `spec::validate_command` |
 | Which syscall number, or which errno, does a name spell for a seccomp policy? | `SeccompRules::syscall`, `SeccompRules::errno` |
+| Does a seccomp policy answer every call of a syscall with an errno, whatever its arguments? | `SeccompPolicy::answers_with_errno` |
 | Write a classic-BPF seccomp program by hand, or install one | `mechanism::seccomp`: its `bpf` opcodes and offsets, its audit architectures, and `seccomp::install` |
 | Run a seccomp program over a syscall in a unit test | `mechanism::seccomp::eval` |
 | Does a launch install the network filter, and what does the filter refuse? | `mechanism::seccomp::installs_network_filter` and `seccomp::NETWORK_FILTER_REFUSALS`, which the launch and the provenance record both read |

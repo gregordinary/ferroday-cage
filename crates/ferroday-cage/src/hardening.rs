@@ -1426,6 +1426,28 @@ impl SeccompRules {
         (rules, errnos)
     }
 
+    /// Whether every call of `syscall` is answered with an errno, whatever its
+    /// arguments, so that it never runs.
+    ///
+    /// An errno given for it answers it so. Otherwise a listing without
+    /// conditions takes the listed action, no listing takes the default
+    /// action, and a listing with conditions only takes either by the
+    /// arguments, so both must be errnos.
+    fn answers_with_errno(&self, syscall: i64) -> bool {
+        let (rules, errnos) = self.lowered();
+        if errnos.contains_key(&syscall) {
+            return true;
+        }
+        let listed: Vec<&SyscallRule> = rules
+            .iter()
+            .filter(|rule| rule.syscall == syscall)
+            .collect();
+        let errno = |action: SeccompAction| matches!(action, SeccompAction::Errno(_));
+        let unconditional = listed.iter().any(|rule| rule.conditions.is_empty());
+        (listed.is_empty() || errno(self.listed_action))
+            && (unconditional || errno(self.default_action))
+    }
+
     /// Whether these are the curated roster with nothing added: what a profile
     /// spells as the string `"curated"`.
     #[cfg(feature = "serde")]
@@ -1462,6 +1484,18 @@ impl SeccompPolicy {
             // restrict, an empty one (which the kernel would reject anyway)
             // does not.
             SeccompPolicy::Program(program) => !program.is_empty(),
+        }
+    }
+
+    /// Whether the policy answers every call of `syscall` with an errno, so
+    /// that it never runs.
+    ///
+    /// A precompiled [`Program`](Self::Program) is not read, so it answers no
+    /// syscall this way as far as the crate can tell.
+    pub(crate) fn answers_with_errno(&self, syscall: i64) -> bool {
+        match self {
+            SeccompPolicy::Rules(rules) => rules.answers_with_errno(syscall),
+            SeccompPolicy::Program(_) => false,
         }
     }
 }

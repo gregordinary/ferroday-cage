@@ -292,7 +292,7 @@ mod status;
 mod terminal;
 mod wire;
 
-pub use cgroup::{CgroupLimit, CgroupRefusal, ParseCgroupLimitError};
+pub use cgroup::{CgroupLimit, CgroupReach, CgroupRefusal, ParseCgroupLimitError};
 pub use error::{ConfigError, Error, ListenRefusal, OverlayLayer, SetupStep};
 pub use failure::ErrorChain;
 #[cfg(feature = "hardening")]

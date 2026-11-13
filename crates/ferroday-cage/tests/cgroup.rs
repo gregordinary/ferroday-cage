@@ -661,6 +661,10 @@ fn a_parent_that_can_hold_a_sandbox_s_cgroup_is_answered_so_and_left_as_found() 
 /// `cage` or `restriction`, the kind of sandbox it runs in.
 const REACH_PROBE: &str = "FERRODAY_CAGE_TEST_CGROUP_REACH";
 
+/// Set beside [`REACH_PROBE`] for a restriction, naming a cgroup outside the
+/// sandbox's tree for the probe to try to move into.
+const REACH_OUTSIDE: &str = "FERRODAY_CAGE_TEST_CGROUP_REACH_OUTSIDE";
+
 /// Where the reach probe is bound in a sandbox.
 const REACH_PROBE_PATH: &str = "/probe";
 
@@ -708,6 +712,58 @@ fn assert_held_to_the_limit(
     assert!(peak <= 8, "the tree held {peak} tasks: {report:?}");
 }
 
+#[cfg(feature = "hardening")]
+#[test]
+fn a_restricted_command_can_neither_lift_its_limit_nor_leave_its_tree() {
+    use ferroday_cage::{FsAccess, Restriction, SeccompPolicy, SeccompRules};
+
+    if !(common::landlock() && common::require::seccomp()) {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let outside = parent.join(format!("fcage-test-caller-{}", std::process::id()));
+    // What the build requires of a restriction with a cgroup: no write granted
+    // on the cgroup hierarchy, and clone3 answered with an errno.
+    let output = common::grant_system_trees(Restriction::builder())
+        .command(&exe)
+        .args(["--exact", "probe_reach", "--nocapture", "--test-threads=1"])
+        .env(REACH_PROBE, "restriction")
+        .env(REACH_OUTSIDE, &outside)
+        .landlock_fs(
+            FsAccess::READ | FsAccess::EXECUTE,
+            exe.parent().expect("the test binary is in a directory"),
+        )
+        .landlock_fs(FsAccess::READ, "/proc")
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+        .cgroup_parent(parent)
+        .cgroup_limit(CgroupLimit::PidsMax(8))
+        .build()
+        .expect("a restriction held from its cgroup's files and from clone3")
+        .output()
+        .expect("the restriction runs");
+    let report = reach_report(&output);
+    assert!(
+        report
+            .get("own")
+            .is_some_and(|own| own.ends_with("/sandbox")),
+        "{report:?}"
+    );
+    let refused = Some(format!("errno {}", libc::EACCES));
+    assert_eq!(report.get("leaf").map(String::as_str), Some("absent"));
+    for step in ["limits", "parent", "leave"] {
+        assert_eq!(report.get(step), refused.as_ref(), "{step}: {report:?}");
+    }
+    assert_eq!(
+        report.get("clone3"),
+        Some(&format!("errno {}", libc::ENOSYS)),
+        "{report:?}"
+    );
+    assert_held_to_the_limit(&output, &report);
+}
+
 #[test]
 fn a_caged_command_mounting_its_cgroup_namespace_sees_no_limit_to_lift() {
     if !common::require::userns() {
@@ -753,6 +809,68 @@ fn a_caged_command_mounting_its_cgroup_namespace_sees_no_limit_to_lift() {
     assert_held_to_the_limit(&output, &report);
 }
 
+/// Starts a child that exits at once in the cgroup at `cgroup`, through
+/// `clone3` with `CLONE_INTO_CGROUP` and a descriptor of the cgroup opened with
+/// `O_PATH`, which no Landlock right governs.
+#[expect(unsafe_code)]
+fn clone_into(cgroup: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    /// `struct clone_args` as far as `cgroup`, every field 64 bits wide.
+    #[repr(C)]
+    #[derive(Default)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+        set_tid: u64,
+        set_tid_size: u64,
+        cgroup: u64,
+    }
+    const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+    let dir = rustix::fs::open(
+        cgroup,
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let args = CloneArgs {
+        flags: CLONE_INTO_CGROUP,
+        exit_signal: u64::try_from(libc::SIGCHLD).expect("a signal number"),
+        cgroup: u64::try_from(dir.as_raw_fd()).expect("a descriptor"),
+        ..CloneArgs::default()
+    };
+    // SAFETY: `args` is a valid `struct clone_args` of the size passed, and
+    // with no `CLONE_VM` the child gets a copy of this process's memory. The
+    // child makes one async-signal-safe call, `_exit`, so the locks other
+    // threads held at the clone do not matter to it.
+    let pid = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw const args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    match pid {
+        -1 => Err(std::io::Error::last_os_error()),
+        0 => {
+            // SAFETY: `_exit` ends the child without running anything of the
+            // parent's.
+            unsafe { libc::_exit(0) }
+        }
+        // The probe has no other child, so the one to wait for is this one.
+        _ => {
+            rustix::process::wait(rustix::process::WaitOptions::empty())?;
+            Ok(())
+        }
+    }
+}
+
 /// Writes `max` to the limit file `file`, which the write does not create.
 fn lift(file: &Path) -> std::io::Result<()> {
     use std::io::Write;
@@ -763,13 +881,16 @@ fn lift(file: &Path) -> std::io::Result<()> {
         .write_all(b"max")
 }
 
-/// The probe the reach tests start in a sandbox: it mounts the cgroup
-/// hierarchy where it can, tries to lift the limits it finds, and then starts
-/// threads past its limit, reporting each step.
+/// The probe the reach tests start in a sandbox: it tries to lift the limits
+/// it can find and to leave its cgroup, and then starts threads past its
+/// limit, reporting each step.
 ///
 /// In a cage it creates a mount and a cgroup namespace of its own, which its
 /// user namespace owns, and mounts cgroup2 there, the hierarchy's root then
-/// being the root of the sandbox's cgroup namespace.
+/// being the root of the sandbox's cgroup namespace. In a restriction it uses
+/// the host's hierarchy: it writes `max` to each `pids.max` from its own
+/// cgroup up to the parent, writes its process id to the `cgroup.procs` of the
+/// cgroup [`REACH_OUTSIDE`] names, and starts a child there with `clone3`.
 #[test]
 #[expect(unsafe_code)]
 fn probe_reach() {
@@ -810,6 +931,30 @@ fn probe_reach() {
         for file in ["pids.max", "memory.max"] {
             report(file, &attempt(lift(&mount.join(file))));
         }
+    }
+    if kind == "restriction" {
+        // The host's hierarchy: the leaf, the cgroup holding the limits above
+        // it, and the parent above that.
+        let own = host::own_cgroup().expect("the probe finds its cgroup");
+        for (step, cgroup) in ["leaf", "limits", "parent"]
+            .into_iter()
+            .zip(own.ancestors())
+        {
+            report(step, &attempt(lift(&cgroup.join("pids.max"))));
+        }
+        let outside = PathBuf::from(
+            std::env::var_os(REACH_OUTSIDE).expect("the test names a cgroup outside the tree"),
+        );
+        let leave = || {
+            use std::io::Write;
+
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(outside.join("cgroup.procs"))?
+                .write_all(std::process::id().to_string().as_bytes())
+        };
+        report("leave", &attempt(leave()));
+        report("clone3", &attempt(clone_into(&outside)));
     }
     // Each thread waits until `hold` drops, the first on the channel and the
     // rest on the lock, so all are alive at once.

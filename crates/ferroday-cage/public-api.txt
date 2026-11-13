@@ -1646,6 +1646,22 @@ impl core::marker::Unpin for ferroday_cage::CgroupLimit
 impl core::marker::UnsafeUnpin for ferroday_cage::CgroupLimit
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::CgroupLimit
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::CgroupLimit
+#[non_exhaustive] pub enum ferroday_cage::CgroupReach
+pub ferroday_cage::CgroupReach::Clone3Allowed
+pub ferroday_cage::CgroupReach::MountTableUnread
+#[non_exhaustive] pub ferroday_cage::CgroupReach::WriteGranted
+pub ferroday_cage::CgroupReach::WriteGranted::grant: std::path::PathBuf
+pub ferroday_cage::CgroupReach::WriteGranted::mount: std::path::PathBuf
+pub ferroday_cage::CgroupReach::WritesUngoverned
+impl core::fmt::Display for ferroday_cage::CgroupReach
+pub fn ferroday_cage::CgroupReach::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::CgroupReach
+impl core::marker::Send for ferroday_cage::CgroupReach
+impl core::marker::Sync for ferroday_cage::CgroupReach
+impl core::marker::Unpin for ferroday_cage::CgroupReach
+impl core::marker::UnsafeUnpin for ferroday_cage::CgroupReach
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::CgroupReach
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::CgroupReach
 #[non_exhaustive] pub enum ferroday_cage::CgroupRefusal
 pub ferroday_cage::CgroupRefusal::CallerOutside
 #[non_exhaustive] pub ferroday_cage::CgroupRefusal::ControllerUnavailable
@@ -1741,6 +1757,8 @@ pub ferroday_cage::ConfigError::PresentAsWithRangeMap
 pub ferroday_cage::ConfigError::ProfileOperationForbidden::operation: &'static str
 #[non_exhaustive] pub ferroday_cage::ConfigError::ResolveUnixUnhandled
 pub ferroday_cage::ConfigError::ResolveUnixUnhandled::grant: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::ConfigError::RestrictionCgroupReachable
+pub ferroday_cage::ConfigError::RestrictionCgroupReachable::reach: ferroday_cage::CgroupReach
 pub ferroday_cage::ConfigError::RestrictionEmpty
 #[non_exhaustive] pub ferroday_cage::ConfigError::RestrictionLandlockUnenforceable
 pub ferroday_cage::ConfigError::RestrictionLandlockUnenforceable::abi: core::option::Option<i32>

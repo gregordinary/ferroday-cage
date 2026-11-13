@@ -37,7 +37,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::cgroup::CgroupRefusal;
+use crate::cgroup::{CgroupReach, CgroupRefusal};
 use crate::host::{ProcfsBlocker, UsernsBlocker};
 use crate::spec::is_command_name;
 use crate::wire::wire_enum;
@@ -893,6 +893,20 @@ rendered as text.
         /// What is wrong with it.
         reason: String,
     },
+    /// A restriction with a cgroup leaves its command a way to lift the
+    /// cgroup's limits or to leave the cgroup.
+    ///
+    /// A restriction carrying a cgroup parent or a limit builds only where its
+    /// Landlock domain keeps every write off the cgroup v2 hierarchy and its
+    /// seccomp policy answers `clone3` with an errno; [`CgroupReach`] says
+    /// which of those does not hold. Limits that are not
+    /// [required](crate::RestrictionBuilder::cgroup_required) are refused the
+    /// same way.
+    #[non_exhaustive]
+    RestrictionCgroupReachable {
+        /// What the command could reach the cgroup through.
+        reach: CgroupReach,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -1229,6 +1243,11 @@ impl fmt::Display for ConfigError {
             ConfigError::CgroupLimitInvalid { reason } => {
                 write!(f, "the cgroup settings cannot be carried out: {reason}")
             }
+            ConfigError::RestrictionCgroupReachable { reach } => write!(
+                f,
+                "the restriction's command could lift its cgroup's limits or leave its cgroup: \
+                 {reach}"
+            ),
             ConfigError::NestedUsernsProcfsReadOnly { target } => write!(
                 f,
                 "the procfs at {} is read-only, and the nested user namespace that locks the \

@@ -153,7 +153,7 @@ use std::path::Path;
 
 use rustix::thread::UnshareFlags;
 
-use crate::cgroup::{CgroupLimit, CgroupSettings};
+use crate::cgroup::{CgroupLimit, CgroupReach, CgroupSettings};
 use crate::error::{ConfigError, Error};
 use crate::hardening::{FsAccess, LandlockScope, NetAccess, Request, SeccompPolicy};
 use crate::limits::{Limit, Resource};
@@ -415,9 +415,58 @@ impl RestrictionBuilder {
     ///
     /// The restriction's counterpart of
     /// [`CageBuilder::cgroup_parent`](crate::CageBuilder::cgroup_parent), with
-    /// the same semantics: the launch stage joins the cgroup before it runs
-    /// anything, so the command and every process it starts are charged there,
-    /// and [`Running::kill`](crate::Running::kill) ends them all through it.
+    /// the same semantics: the launch stage joins the cgroup's leaf before it
+    /// runs anything, so the command and every process it starts are charged
+    /// to the cgroup and held to its limits, and
+    /// [`Running::kill`](crate::Running::kill) ends every process of the tree
+    /// through it.
+    ///
+    /// # What the build requires
+    ///
+    /// The command runs as the caller's user in the host's cgroup namespace,
+    /// and the kernel gives a cgroup's files to the user that created it. Left
+    /// to itself, the command could lift its limits by writing the files that
+    /// hold them, or leave the tree by writing its process id to the parent's
+    /// `cgroup.procs`. It could also start a process in another cgroup with
+    /// `clone3` and `CLONE_INTO_CGROUP`, which names the cgroup by a
+    /// descriptor that may be opened with `O_PATH`, and Landlock checks no such
+    /// open. A restriction with a cgroup parent or a
+    /// [`cgroup_limit`](Self::cgroup_limit) therefore builds only where both
+    /// reaches are closed:
+    ///
+    /// - its Landlock domain governs file writes, which a filesystem grant
+    ///   gives it, and no grant carrying [`FsAccess::WRITE`] lies at, above, or
+    ///   beneath a mount of the cgroup v2 hierarchy in this process's mount
+    ///   table, judged through links as the launch resolves the grant;
+    /// - its [`seccomp`](Self::seccomp) policy answers `clone3` with an errno,
+    ///   as the [curated roster](crate::SeccompRules::curated) does with
+    ///   `ENOSYS`. A precompiled [`SeccompPolicy::Program`] is not read, so it
+    ///   does not count.
+    ///
+    /// Otherwise [`build`](Self::build) fails with
+    /// [`ConfigError::RestrictionCgroupReachable`], whose
+    /// [`CgroupReach`](crate::CgroupReach) names the reach left open. Limits
+    /// that are not [required](Self::cgroup_required) are refused the same way:
+    /// what is refused is a cgroup the command could escape, not a missing
+    /// parent.
+    ///
+    /// ```no_run
+    /// use ferroday_cage::{CgroupLimit, FsAccess, Restriction, SeccompPolicy, SeccompRules};
+    ///
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// let restriction = Restriction::builder()
+    ///     .command("/usr/bin/sort")
+    ///     .args(["/work/input"])
+    ///     .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/usr")
+    ///     .landlock_fs(FsAccess::READ | FsAccess::WRITE, "/work")
+    ///     .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+    ///     .cgroup_parent("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/sandboxes.scope")
+    ///     .cgroup_limit(CgroupLimit::PidsMax(64))
+    ///     .build()?;
+    /// # let _ = restriction;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn cgroup_parent(mut self, parent: impl AsRef<Path>) -> Self {
         self.cgroup.parent = Some(parent.as_ref().to_path_buf());
         self
@@ -426,7 +475,11 @@ impl RestrictionBuilder {
     /// Holds the command's whole process tree to `limit`, through its cgroup.
     ///
     /// The restriction's counterpart of
-    /// [`CageBuilder::cgroup_limit`](crate::CageBuilder::cgroup_limit).
+    /// [`CageBuilder::cgroup_limit`](crate::CageBuilder::cgroup_limit). The
+    /// build requires the confinement
+    /// [`cgroup_parent`](Self::cgroup_parent) states, which keeps the command
+    /// from lifting the limit or leaving the cgroup, whether or not the limits
+    /// are [required](Self::cgroup_required).
     pub fn cgroup_limit(mut self, limit: CgroupLimit) -> Self {
         self.cgroup.set(limit);
         self
@@ -436,7 +489,8 @@ impl RestrictionBuilder {
     ///
     /// The restriction's counterpart of
     /// [`CageBuilder::cgroup_required`](crate::CageBuilder::cgroup_required),
-    /// with the same semantics.
+    /// with the same semantics. It does not waive the confinement
+    /// [`cgroup_parent`](Self::cgroup_parent) states.
     pub fn cgroup_required(mut self, required: bool) -> Self {
         self.cgroup.required = Some(required);
         self
@@ -801,6 +855,21 @@ impl RestrictionBuilder {
         let mut hardening = self.hardening.lower(false)?;
         let abi = crate::mechanism::probe_landlock_abi();
         settle_landlock(&mut hardening, self.scopes_named, abi)?;
+        if self.cgroup.parent.is_some() || !self.cgroup.limits().is_empty() {
+            let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+                .ok()
+                .map(|table| {
+                    crate::host::cgroup2_mounts(&table)
+                        .map(|mount| mount.mount_point)
+                        .collect::<Vec<_>>()
+                });
+            ensure_cgroup_held(
+                &hardening,
+                self.hardening.seccomp(),
+                mounts.as_deref(),
+                |grant| std::fs::canonicalize(grant).unwrap_or_else(|_| grant.to_path_buf()),
+            )?;
+        }
         // The grants are host paths, resolved as the host resolves them: a
         // merged-`/usr` host's `/lib` is a link, and refusing links would refuse
         // the very grants that make a host command runnable.
@@ -902,6 +971,60 @@ fn settle_landlock(
         hardening.landlock_scoped &= abi.map_or(0, crate::hardening::scope_for_abi);
         Ok(())
     }
+}
+
+/// Refuses a restriction with a cgroup whose command could lift the cgroup's
+/// limits or leave the cgroup, naming the [`CgroupReach`] it would have.
+///
+/// The command could write the cgroup's files unless its Landlock domain
+/// governs file writes and grants none at, above, or beneath a mount of the
+/// cgroup v2 hierarchy, and could start a process in another cgroup unless its
+/// seccomp policy answers `clone3` with an errno. A grant is judged both as
+/// named and as resolved through links, as the launch resolves it.
+///
+/// `mounts` is where this process's mount table mounts the hierarchy, or
+/// `None` where the table cannot be read, and `resolve` reads a grant's path
+/// through its links.
+fn ensure_cgroup_held(
+    hardening: &HardeningPlan,
+    seccomp: Option<&SeccompPolicy>,
+    mounts: Option<&[std::path::PathBuf]>,
+    resolve: impl Fn(&Path) -> std::path::PathBuf,
+) -> Result<(), ConfigError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::hardening::fs_access::WRITE_FILE;
+
+    let refused = |reach| Err(ConfigError::RestrictionCgroupReachable { reach });
+    if hardening.landlock_handled & WRITE_FILE == 0 {
+        return refused(CgroupReach::WritesUngoverned);
+    }
+    let Some(mounts) = mounts else {
+        return refused(CgroupReach::MountTableUnread);
+    };
+    for rule in &hardening.landlock {
+        if rule.access & WRITE_FILE == 0 {
+            continue;
+        }
+        let grant = Path::new(OsStr::from_bytes(rule.path.to_bytes()));
+        let resolved = resolve(grant);
+        let reaches = |mount: &Path| {
+            [grant, resolved.as_path()]
+                .iter()
+                .any(|path| path.starts_with(mount) || mount.starts_with(path))
+        };
+        if let Some(mount) = mounts.iter().find(|mount| reaches(mount)) {
+            return refused(CgroupReach::WriteGranted {
+                grant: grant.to_path_buf(),
+                mount: mount.clone(),
+            });
+        }
+    }
+    let clone3 = i64::from(syscalls::Sysno::clone3.id());
+    if !seccomp.is_some_and(|policy| policy.answers_with_errno(clone3)) {
+        return refused(CgroupReach::Clone3Allowed);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1343,5 +1466,181 @@ mod tests {
         // dropped rather than inherited by the command.
         assert!(plan.hardening.seccomp.is_some());
         assert_eq!(plan.hardening.keep_caps, Some(0));
+    }
+
+    /// The reach `builder`'s Landlock grants and seccomp policy leave a
+    /// command to a cgroup beneath `/sys/fs/cgroup`, with every grant's path
+    /// resolving as `resolve` reads it.
+    fn reach(
+        builder: RestrictionBuilder,
+        resolve: impl Fn(&Path) -> std::path::PathBuf,
+    ) -> Option<CgroupReach> {
+        let hardening = builder.hardening.lower(false).expect("a valid request");
+        let mounts = [std::path::PathBuf::from("/sys/fs/cgroup")];
+        match ensure_cgroup_held(
+            &hardening,
+            builder.hardening.seccomp(),
+            Some(&mounts),
+            resolve,
+        ) {
+            Ok(()) => None,
+            Err(ConfigError::RestrictionCgroupReachable { reach }) => Some(reach),
+            Err(err) => panic!("{err:?}"),
+        }
+    }
+
+    /// A grant's path as it stands, with no link on it.
+    fn as_named(path: &Path) -> std::path::PathBuf {
+        path.to_path_buf()
+    }
+
+    /// A restriction granted read and execute on the system and write on a
+    /// working tree, under `policy`.
+    fn confined(policy: SeccompPolicy) -> RestrictionBuilder {
+        Restriction::builder()
+            .landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/")
+            .landlock_fs(FsAccess::READ | FsAccess::WRITE, "/home/user/work")
+            .seccomp(policy)
+    }
+
+    #[test]
+    fn a_restriction_held_from_its_cgroup_s_files_and_clone3_keeps_its_cgroup() {
+        let curated = || SeccompPolicy::Rules(SeccompRules::curated());
+        assert_eq!(reach(confined(curated()), as_named), None);
+        // The roster's errno for clone3 can be the caller's own.
+        let enosys = SeccompRules::curated().errno_for(clone3_number(), 38);
+        assert_eq!(
+            reach(confined(SeccompPolicy::Rules(enosys)), as_named),
+            None
+        );
+        // An allowlist answers what it does not list with its default errno.
+        let allowlist = SeccompRules::allowing([clone3_number() - 1]);
+        assert_eq!(
+            reach(confined(SeccompPolicy::Rules(allowlist)), as_named),
+            None
+        );
+        let denied = SeccompRules::denying([clone3_number()]);
+        assert_eq!(
+            reach(confined(SeccompPolicy::Rules(denied)), as_named),
+            None
+        );
+    }
+
+    #[test]
+    fn a_restriction_whose_landlock_domain_governs_no_write_is_refused_a_cgroup() {
+        let curated = SeccompPolicy::Rules(SeccompRules::curated());
+        let no_grant = Restriction::builder().seccomp(curated.clone());
+        assert_eq!(
+            reach(no_grant, as_named),
+            Some(CgroupReach::WritesUngoverned)
+        );
+        // A network grant governs no file.
+        let network = Restriction::builder()
+            .landlock_net(NetAccess::CONNECT, 443)
+            .seccomp(curated);
+        assert_eq!(
+            reach(network, as_named),
+            Some(CgroupReach::WritesUngoverned)
+        );
+    }
+
+    #[test]
+    fn a_write_grant_at_above_or_beneath_the_cgroup_mount_is_refused_a_cgroup() {
+        let curated = || SeccompPolicy::Rules(SeccompRules::curated());
+        for path in [
+            "/",
+            "/sys",
+            "/sys/fs/cgroup",
+            "/sys/fs/cgroup/user.slice/x.scope",
+        ] {
+            let builder = confined(curated()).landlock_fs(FsAccess::WRITE, path);
+            assert_eq!(
+                reach(builder, as_named),
+                Some(CgroupReach::WriteGranted {
+                    grant: path.into(),
+                    mount: "/sys/fs/cgroup".into(),
+                }),
+                "{path}",
+            );
+        }
+        // A sibling of the mount, and a name that only begins like it.
+        for path in ["/sys/fs/bpf", "/sys/fs/cgroupx"] {
+            let builder = confined(curated()).landlock_fs(FsAccess::WRITE, path);
+            assert_eq!(reach(builder, as_named), None, "{path}");
+        }
+        // A grant reaching the mount through a link.
+        let linked = confined(curated()).landlock_fs(FsAccess::WRITE, "/home/user/cgroup");
+        let through_link = |path: &Path| match path == Path::new("/home/user/cgroup") {
+            true => "/sys/fs/cgroup/user.slice".into(),
+            false => path.to_path_buf(),
+        };
+        assert_eq!(
+            reach(linked, through_link),
+            Some(CgroupReach::WriteGranted {
+                grant: "/home/user/cgroup".into(),
+                mount: "/sys/fs/cgroup".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_restriction_whose_seccomp_policy_lets_clone3_run_is_refused_a_cgroup() {
+        let clone3 = clone3_number();
+        let flags_on_the_stack =
+            SeccompRules::denying([]).rule(clone3, [crate::SeccompArg::eq_qword(1, 88)]);
+        let killed =
+            SeccompRules::denying([clone3]).listed_action(crate::SeccompAction::KillThread);
+        for policy in [
+            None,
+            Some(SeccompPolicy::Rules(SeccompRules::denying([
+                clone3_number() - 1,
+            ]))),
+            Some(SeccompPolicy::Rules(SeccompRules::allowing([clone3]))),
+            Some(SeccompPolicy::Rules(flags_on_the_stack)),
+            Some(SeccompPolicy::Rules(killed)),
+            // A program the build cannot read.
+            Some(SeccompPolicy::Program(Vec::new())),
+        ] {
+            let mut builder =
+                Restriction::builder().landlock_fs(FsAccess::READ | FsAccess::EXECUTE, "/");
+            if let Some(policy) = policy.clone() {
+                builder = builder.seccomp(policy);
+            }
+            assert_eq!(
+                reach(builder, as_named),
+                Some(CgroupReach::Clone3Allowed),
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restriction_s_cgroup_is_refused_whether_or_not_its_limits_are_required() {
+        let seccomp_only = || {
+            Restriction::builder()
+                .command("/bin/true")
+                .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+        };
+        seccomp_only()
+            .build()
+            .expect("a seccomp policy is a restriction");
+        for builder in [
+            seccomp_only().cgroup_parent("/sys/fs/cgroup/delegated"),
+            seccomp_only()
+                .cgroup_limit(CgroupLimit::PidsMax(8))
+                .cgroup_required(false),
+        ] {
+            assert!(matches!(
+                builder.build(),
+                Err(Error::Config(ConfigError::RestrictionCgroupReachable {
+                    reach: CgroupReach::WritesUngoverned,
+                }))
+            ));
+        }
+    }
+
+    /// `clone3`'s number on the host architecture.
+    fn clone3_number() -> i64 {
+        SeccompRules::syscall("clone3").expect("the host has clone3")
     }
 }

@@ -173,6 +173,15 @@ consumer upgrading can skip it.
   `cgroup.procs` there, whatever the host's mount options. The usage the handle
   reports, its kill, and its wait for a killed tree to empty read and write
   `fcage-<unique>`, and its removal takes the leaf and then the cgroup.
+- A restriction with a cgroup parent or a cgroup limit builds only where its
+  command can neither write the cgroup's files nor start a process in another
+  cgroup. Its Landlock domain must govern file writes and grant none at, above,
+  or beneath a mount of the cgroup v2 hierarchy, and its seccomp policy must
+  answer `clone3` with an errno, as the curated policy does. Otherwise the build
+  fails with the new `ConfigError::RestrictionCgroupReachable`, and the new
+  `CgroupReach` names the reach left open. `cgroup_required(false)` does not
+  waive the rule, and `fcage --restrict` with the cgroup flags is refused the
+  same way.
 
 ### Added
 

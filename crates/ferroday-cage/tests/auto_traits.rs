@@ -58,6 +58,7 @@ const _: () = assert_send_sync::<ferroday_cage::ResourceUsage>();
 const _: () = assert_send_sync::<ferroday_cage::CgroupLimit>();
 const _: () = assert_send_sync::<ferroday_cage::CgroupRefusal>();
 const _: () = assert_send_sync::<ferroday_cage::ParseCgroupLimitError>();
+const _: () = assert_send_sync::<ferroday_cage::CgroupReach>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedCgroup>();
 const _: () = assert_send_sync::<ferroday_cage::Output>();
 const _: () = assert_send_sync::<ferroday_cage::KillHandle>();

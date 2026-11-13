@@ -392,17 +392,13 @@ fn cgroup_directory(membership: &str, mountinfo: &str) -> Option<PathBuf> {
             .lines()
             .find_map(|line| line.strip_prefix("0::"))?,
     );
-    mountinfo
-        .lines()
-        .filter_map(MountEntry::parse)
-        .filter(|entry| entry.fstype == "cgroup2")
-        .find_map(|entry| {
-            let beneath = own.strip_prefix(&entry.root).ok()?;
-            Some(match beneath.as_os_str().is_empty() {
-                true => entry.mount_point,
-                false => entry.mount_point.join(beneath),
-            })
+    cgroup2_mounts(mountinfo).find_map(|entry| {
+        let beneath = own.strip_prefix(&entry.root).ok()?;
+        Some(match beneath.as_os_str().is_empty() {
+            true => entry.mount_point,
+            false => entry.mount_point.join(beneath),
         })
+    })
 }
 
 /// The procfs entries the kernel keeps as permanently empty directories for
@@ -450,9 +446,19 @@ fn procfs_covers(mountinfo: &str) -> Option<Vec<PathBuf>> {
     found.then_some(covering)
 }
 
-/// One line of a `/proc/self/mountinfo` table, as far as the procfs scan reads
-/// it.
-struct MountEntry {
+/// The mounts of the cgroup v2 hierarchy in `mountinfo`, a
+/// `/proc/self/mountinfo` table, in the table's order: the hierarchy's own
+/// mount and every bind of a directory of it.
+pub(crate) fn cgroup2_mounts(mountinfo: &str) -> impl Iterator<Item = MountEntry> + '_ {
+    mountinfo
+        .lines()
+        .filter_map(MountEntry::parse)
+        .filter(|entry| entry.fstype == "cgroup2")
+}
+
+/// One line of a `/proc/self/mountinfo` table: the fields of it the crate
+/// reads.
+pub(crate) struct MountEntry {
     /// The mount's id.
     id: u64,
     /// The id of the mount it is mounted on.
@@ -460,7 +466,7 @@ struct MountEntry {
     /// The directory of its filesystem that the mount presents.
     root: PathBuf,
     /// Where it is mounted.
-    mount_point: PathBuf,
+    pub(crate) mount_point: PathBuf,
     /// Its filesystem type.
     fstype: String,
 }

@@ -8,7 +8,8 @@
 //!
 //! The sandbox tests skip explicitly, on stderr, on a host that cannot create
 //! unprivileged user namespaces, the restriction tests on a kernel that offers
-//! no seccomp, and the network stack's on a host without `/dev/net/tun`. Every
+//! no seccomp or no Landlock, and the network stack's on a host without
+//! `/dev/net/tun`. Every
 //! run is bounded, so a launch that never finishes fails its test rather than
 //! hanging the suite.
 
@@ -74,10 +75,14 @@ fn a_sandbox_says_its_limits_are_not_applied_however_it_starts() {
 
 #[test]
 fn a_restriction_says_its_limits_are_not_applied_however_it_starts() {
-    if !common::require::seccomp() {
+    if !(common::require::seccomp()
+        && common::require::landlock(ferroday_cage::host::landlock_abi()))
+    {
         return;
     }
-    let restricted = ["--restrict", "--seccomp", "curated"];
+    // A restriction with cgroup limits builds only where its command can
+    // neither write the cgroup's files nor call clone3, required or not.
+    let restricted = ["--restrict", "--landlock-ro", "/", "--seccomp", "curated"];
     assert_notice("plain", &restricted);
     assert_notice("terminal", &[&restricted[..], &["--terminal"]].concat());
 }

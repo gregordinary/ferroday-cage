@@ -34,7 +34,12 @@ The library's job is to build the boundary it says it builds. In scope:
   process, or host resource the configuration did not grant.
 - **A restriction that does not restrict.** A configured Landlock grant or
   scope, seccomp filter, capability drop, or resource limit that is silently
-  not applied, applied more permissively than configured, or escapable.
+  not applied, applied more permissively than configured, or escapable. A
+  cgroup limit a launch was given is such a limit, and so is its cgroup, which
+  the sandboxed command must not leave. A restriction builds with a cgroup only
+  under the confinement that holds it there, as the [restriction
+  chapter](https://gregordinary.github.io/ferroday-cage/restriction-fallback.html#cgroups)
+  states.
 - **Identity-map defects.** A sandbox acting as an id outside its configured
   map, or a map established differently from what was requested.
 - **Provisioning containment.** An archive or package that writes outside the

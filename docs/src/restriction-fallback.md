@@ -207,6 +207,41 @@ An [`rlimit`] bounds each process alone, so a command can stay under it and
 still use as much as it likes by starting more processes. A cgroup's limits
 bound the tree together, which is the bound a restriction otherwise lacks.
 
+A cage keeps its command away from the cgroup's files with a cgroup namespace
+of its own. A restriction's command shares the host's, and runs as the calling
+user, and the kernel gives a cgroup's files to the user that created it. Left
+to itself, the command could lift its limits by writing the files that hold
+them, or leave the tree by writing its process id to the parent's
+`cgroup.procs`. It could also start a process in another cgroup with `clone3`
+and `CLONE_INTO_CGROUP`, which names the cgroup by a descriptor that may be
+opened with `O_PATH`, an open Landlock does not check. A restriction with a
+cgroup parent or a limit therefore builds only where its confinement closes
+both reaches:
+
+- Its Landlock domain governs file writes, which any filesystem grant gives
+  it, and no grant carrying write access lies at, above, or beneath a mount of
+  the cgroup v2 hierarchy in the caller's mount table. A grant is judged
+  through its links, as the launch resolves it.
+- Its seccomp policy answers `clone3` with an errno. The curated policy
+  answers it with `ENOSYS`, which the C library reads as a kernel without
+  `clone3`, falling back to `clone`. A precompiled program is not read, so it
+  does not count.
+
+Otherwise the build fails with [`ConfigError::RestrictionCgroupReachable`], and
+a [`CgroupReach`] naming the reach left open. Limits that are not required are
+refused the same way, since what is refused is a cgroup the command could
+escape rather than a missing parent. On the command line, a restriction that
+meets both:
+
+```console
+$ fcage --restrict \
+    --landlock-ro /usr --landlock-ro /lib --landlock-ro /etc \
+    --landlock-rw /work \
+    --seccomp curated \
+    --cgroup-parent "$parent" --cgroup pids-max=64 --cgroup memory-max=536870912 \
+    -- /usr/bin/sort /work/input
+```
+
 ## Host support
 
 Landlock enforcement follows the running kernel's ABI, best-effort downward,
@@ -260,6 +295,8 @@ what the command consumes.
 [`cgroup_parent`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.cgroup_parent
 [`cgroup_limit`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.cgroup_limit
 [`cgroup_required`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.cgroup_required
+[`ConfigError::RestrictionCgroupReachable`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.ConfigError.html
+[`CgroupReach`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.CgroupReach.html
 [`ResourceUsage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.ResourceUsage.html
 [`Running::kill`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.kill
 [`Running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html

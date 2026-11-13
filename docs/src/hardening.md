@@ -556,7 +556,9 @@ hierarchy's root, with no limit in it, and nothing above it: neither the
 limits nor the parent's `cgroup.procs`, through which it could move itself out
 of the tree. That holds whatever the host mounts its cgroup filesystem with. A
 bind of the host's cgroup filesystem into the sandbox, writable, puts both back
-in reach.
+in reach. A [restriction](restriction-fallback.md#cgroups) shares the host's
+cgroup namespace, and builds with a cgroup only where its Landlock grants and
+its seccomp policy keep both out of reach.
 
 The cgroup does three things besides the limits:
 

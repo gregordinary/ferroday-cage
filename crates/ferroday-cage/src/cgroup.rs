@@ -18,9 +18,8 @@
 //! cgroup's files. In the leaf it can reach neither from its cgroup namespace:
 //! the namespace's root is the leaf, which holds no limit and whose parent is
 //! outside the namespace. A restriction shares the host's cgroup namespace,
-//! where what keeps its command from the files is the confinement it runs
-//! under; see
-//! [`RestrictionBuilder::cgroup_parent`](crate::RestrictionBuilder::cgroup_parent).
+//! where what keeps its command from the files is the confinement its build
+//! requires of a restriction with a cgroup; see [`CgroupReach`].
 //!
 //! The leaf enables no controller for children of its own, so a process in it,
 //! or in a cgroup the sandbox creates beneath it, is charged to the limits'
@@ -276,6 +275,72 @@ impl fmt::Display for CgroupRefusal {
                 "a launch cannot move from the cgroup this process runs in to one beneath it, \
                  since the nearest cgroup the two share is not this process's to write; run \
                  the caller in a leaf cgroup beside the sandbox's",
+            ),
+        }
+    }
+}
+
+/// What a restriction with a cgroup leaves its command, by which it could lift
+/// the cgroup's limits or leave the cgroup: why its build is refused with
+/// [`ConfigError::RestrictionCgroupReachable`](crate::ConfigError::RestrictionCgroupReachable).
+///
+/// A restriction's command runs as the caller's user in the host's cgroup
+/// namespace, and the kernel gives a cgroup's files to the user that created
+/// it, so the command owns the files that hold its limits and the parent's
+/// `cgroup.procs`, which moves a process between the parent's cgroups. It has
+/// two ways to them. One is writing such a file by its path, which a Landlock
+/// domain governing file writes refuses wherever it grants none. The other is
+/// `clone3` with `CLONE_INTO_CGROUP`, which starts a process in a cgroup named
+/// by a descriptor that may be opened with `O_PATH`, which Landlock does not
+/// check, and which a seccomp policy refuses by answering `clone3` with an
+/// errno. Each variant is one of those left open.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CgroupReach {
+    /// The restriction's Landlock domain does not govern writing files, which
+    /// takes a filesystem grant, so it refuses no write to the cgroup's files.
+    WritesUngoverned,
+    /// A filesystem grant carrying write access lies at, above, or beneath a
+    /// mount of the cgroup v2 hierarchy, so it grants writing the cgroup's
+    /// files.
+    #[non_exhaustive]
+    WriteGranted {
+        /// The grant's path, as the restriction names it.
+        grant: PathBuf,
+        /// Where the cgroup v2 hierarchy is mounted.
+        mount: PathBuf,
+    },
+    /// This process's mount table, which says where the cgroup v2 hierarchy
+    /// is mounted, cannot be read, so no grant can be judged against it.
+    MountTableUnread,
+    /// The restriction's seccomp policy does not answer `clone3` with an
+    /// errno: it has none, it is a precompiled program, which the build does
+    /// not read, or it lets some call of `clone3` run.
+    Clone3Allowed,
+}
+
+impl fmt::Display for CgroupReach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CgroupReach::WritesUngoverned => f.write_str(
+                "its Landlock domain does not govern writing files, so the cgroup's files are \
+                 the command's to write; a filesystem grant governs them",
+            ),
+            CgroupReach::WriteGranted { grant, mount } => write!(
+                f,
+                "the Landlock grant on {} allows writing at, above, or beneath {}, where the \
+                 cgroup v2 hierarchy is mounted",
+                grant.display(),
+                mount.display(),
+            ),
+            CgroupReach::MountTableUnread => f.write_str(
+                "this process's mount table, which says where the cgroup v2 hierarchy is \
+                 mounted, cannot be read",
+            ),
+            CgroupReach::Clone3Allowed => f.write_str(
+                "its seccomp policy does not answer clone3 with an errno, and clone3 starts a \
+                 process in any cgroup the command can name; the curated policy answers it \
+                 with ENOSYS",
             ),
         }
     }
@@ -1250,6 +1315,28 @@ mod tests {
             join_refusal(Errno::ACCESS),
             Some(CgroupRefusal::CallerOutside)
         );
+    }
+
+    #[test]
+    fn each_reach_reads_as_one_clause_of_the_refusal() {
+        for reach in [
+            CgroupReach::WritesUngoverned,
+            CgroupReach::WriteGranted {
+                grant: PathBuf::from("/"),
+                mount: PathBuf::from("/sys/fs/cgroup"),
+            },
+            CgroupReach::MountTableUnread,
+            CgroupReach::Clone3Allowed,
+        ] {
+            let refusal = crate::ConfigError::RestrictionCgroupReachable {
+                reach: reach.clone(),
+            }
+            .to_string();
+            assert!(
+                !refusal.contains("  ") && refusal.ends_with(&reach.to_string()),
+                "{refusal}"
+            );
+        }
     }
 
     #[test]
