@@ -35,7 +35,7 @@ format without the others' dependency weight.
 What keeps the decision cheap is that the layers already sit on
 a seam -- `Provisioner`, `Fetch`, `ProvisionError`, `BuildLayer`, and the shared
 tar, compress, extract, digest, document and OpenPGP machinery -- and reach
-around it in thirty-eight places, ten of which are internal. `tools/seam.toml`
+around it in forty places, twelve of which are internal. `tools/seam.toml`
 records every one with what it would cost, `tools/check-seam.py` fails on any
 difference, and a layer naming another layer is refused outright. A split, when
 it comes, is that list plus the mechanical work.
@@ -226,8 +226,10 @@ release, including a patch.
 - **The curated seccomp roster's exact contents.** The roster grows, and a
   syscall it comes to deny is a syscall some command needs. Roster additions
   land in minor releases, never patches — but the precise set is not a
-  contract, and a consumer that depends on one should pin an explicit
-  `SeccompPolicy` instead.
+  contract. `SeccompRules::curated()` follows the roster wherever it is used,
+  extended or not, so a consumer that depends on an exact set names it:
+  `SeccompPolicy::Rules(SeccompRules::denying([...]))` with every syscall it
+  refuses.
 - **The default mount profile.** The six `/dev` device nodes, the five `/dev`
   symlinks, the tmpfs `/tmp`, and the fresh `/proc` are defaults, not
   guarantees. A consumer that needs an exact set should turn the managed
