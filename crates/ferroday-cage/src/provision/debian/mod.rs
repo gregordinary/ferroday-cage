@@ -3007,15 +3007,8 @@ fn decompress_index(url: &str, bytes: &[u8], limit: u64) -> Result<String, Debia
         reason: reason.to_string(),
         source,
     };
-    let mut cursor = io::Cursor::new(bytes);
-    let head = super::compress::sniff_head(&mut cursor)
+    let (_, reader) = super::compress::decoder(bytes)
         .map_err(|err| unusable("its header cannot be read", Some(err)))?;
-    let reader = super::compress::decompress(&head, cursor).map_err(|err| {
-        unusable(
-            "it is not a stream this library decompresses",
-            Some(io::Error::other(err)),
-        )
-    })?;
     let mut text = Vec::new();
     io::Read::read_to_end(
         &mut io::Read::take(reader, limit.saturating_add(1)),

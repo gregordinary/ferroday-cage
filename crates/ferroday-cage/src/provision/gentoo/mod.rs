@@ -1526,9 +1526,7 @@ fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooEr
     let unreadable = |err: &(dyn std::error::Error + 'static)| {
         GentooError::index(&url, format!("could not be read: {}", ErrorChain::new(err)))
     };
-    let mut body = served.as_slice();
-    let head = compress::sniff_head(&mut body).map_err(|err| unreadable(&err))?;
-    let refused = match compress::Codec::of(&head) {
+    let refused = match compress::Codec::of(&served) {
         compress::Codec::Gzip | compress::Codec::Plain => None,
         compress::Codec::Xz => Some("xz"),
         compress::Codec::Zstd => Some("zstd"),
@@ -1544,7 +1542,8 @@ fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooEr
     }
     let mut bytes = Vec::new();
     {
-        let mut reader = compress::decompress(&head, body).map_err(|err| unreadable(&err))?;
+        let (_, mut reader) =
+            compress::decoder(served.as_slice()).map_err(|err| unreadable(&err))?;
         io::copy(&mut reader, &mut LimitedWriter::new(&mut bytes, limit))
             .map_err(|err| unreadable(&err))?;
     }

@@ -247,13 +247,12 @@ impl Provisioner for Tarball {
             done: 0,
             reported: 0,
         };
-        let mut source = BufReader::with_capacity(64 * 1024, counted);
+        let source = BufReader::with_capacity(64 * 1024, counted);
 
-        // Sniff the compression from the leading magic bytes, then hand the
-        // full stream (head included) to the chosen decoder.
-        let head = compress::sniff_head(&mut source)
+        // The compression is named by the stream's leading bytes, never by a
+        // file name.
+        let (_, decoded) = compress::decoder(source)
             .map_err(|err| ProvisionError::io("reading", &subject, err))?;
-        let decoded = compress::decompress(&head, source)?;
 
         let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded));
         let outcome = extract_archive(&mut archive, request.staging(), &mut |_, components| {

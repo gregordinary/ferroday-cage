@@ -486,7 +486,7 @@ report name a package and its version bare.
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
 | Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
-| Which compression does a stream begin with? | `provision::compress::Codec::of` |
+| Which compression does a stream begin with, and what does it decode to? | `provision::compress::decoder`, or `compress::Codec::of` for a document already in memory |
 | Fill a buffer from a reader, short only at the end of its input | `provision::compress::read_fully` |
 | Which standard stream did a provisioner's in-sandbox output come from? | `provision::Stream` |
 | Take the first mirror that serves a resource, past those that do not | `provision::walk_mirrors` |

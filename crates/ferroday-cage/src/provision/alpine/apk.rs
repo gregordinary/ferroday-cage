@@ -11,7 +11,7 @@
 //!
 //! The boundaries are exact, so a reader can walk the members in turn and hand
 //! each one to the tar reader without buffering the file. What it must *not* do
-//! is reach for the shared `compress::decompress`, which selects a multi-member
+//! is reach for the shared `compress::decoder`, which selects a multi-member
 //! decoder on purpose so that a concatenated `.tar.gz` decodes as one stream.
 //! That is precisely the behaviour that would fuse an apk's segments into a
 //! single tar and lose every boundary the format hangs its digests from.
@@ -561,7 +561,7 @@ pub(super) fn read_package<R: Read>(
 /// already been digested, so neither the tee nor the boundary bookkeeping
 /// [`Segments`] exists for is needed here — only the discipline that makes this
 /// *one* member rather than however many follow it, which is why this is not
-/// `compress::decompress`.
+/// `compress::decoder`.
 pub(super) fn data_reader<R: Read>(inner: R) -> GzDecoder<BufReader<R>> {
     GzDecoder::new(BufReader::new(inner))
 }

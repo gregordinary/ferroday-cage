@@ -16,7 +16,7 @@
 //! write. So installing or publishing a 90 MB kernel package costs what a shell
 //! script costs.
 
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::super::ProvisionError;
@@ -69,10 +69,9 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     })?;
     // Bounded by the member's declared size, so the tar stream ends where the
     // member ends instead of running on into the container's next header.
-    let mut member = deb.take(size);
-    let head = compress::sniff_head(&mut member)
+    let member = deb.take(size);
+    let (_, decoded) = compress::decoder(member)
         .map_err(|err| ProvisionError::io("reading the data member of", Path::new(package), err))?;
-    let decoded = compress::decompress(&head, member)?;
     let mut archive = TarReader::new(decoded);
     extraction.extract(&mut archive, on_entry)
 }
@@ -201,15 +200,13 @@ pub(crate) fn read_control_from<R: Read + Seek>(deb: &mut R) -> Result<String, P
 
 /// Reads the `control` entry out of a `.deb`'s `control.tar` member.
 fn control_from_tar(member: &[u8]) -> Result<String, ProvisionError> {
-    let mut cursor = Cursor::new(member);
-    let head = compress::sniff_head(&mut cursor).map_err(|err| {
+    let (_, decoded) = compress::decoder(member).map_err(|err| {
         ProvisionError::io(
             "reading the control member of the package",
             Path::new("control.tar"),
             err,
         )
     })?;
-    let decoded = compress::decompress(&head, cursor)?;
     let mut archive = TarReader::new(decoded.take(CONTROL_MEMBER_LIMIT));
     while let Some(entry) = archive.next_entry()? {
         // The control file is `./control` in a conforming `.deb`; tolerate a
@@ -255,6 +252,8 @@ fn deb_error(package: &str, reason: &str) -> ProvisionError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use crate::ErrorChain;
 

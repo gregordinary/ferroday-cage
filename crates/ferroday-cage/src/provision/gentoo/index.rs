@@ -593,7 +593,7 @@ fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
 ///
 /// The compressed form first: it is a tenth of the bytes for identical content,
 /// and reading it costs nothing to implement because
-/// [`compress::decompress`](super::super::compress::decompress) selects a
+/// [`compress::decoder`](super::super::compress::decoder) selects a
 /// decoder by magic rather than by file name. No other compression is
 /// published, on any architecture: `.xz`, `.bz2` and `.zst` are all 404. The
 /// reader holds a body to that, refusing any other compression it finds.

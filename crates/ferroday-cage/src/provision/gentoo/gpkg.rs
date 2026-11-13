@@ -334,15 +334,13 @@ impl Package {
             if !is_image {
                 continue;
             }
-            let mut member = Member {
+            let member = Member {
                 archive,
                 left: entry.size,
             };
             // As in the first pass, a failure under the member is the tar
             // reader's, and says the container is cut short or unreadable.
-            let head = compress::sniff_head(&mut member)
-                .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
-            let inner = compress::decompress(&head, member)
+            let (_, inner) = compress::decoder(member)
                 .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
             return Ok(TarReader::new(inner));
         }
@@ -716,10 +714,7 @@ impl Manifest {
 /// not before.
 fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, GentooError> {
     let mut files = BTreeMap::new();
-    let mut compressed = scan.metadata.as_slice();
-    let head = compress::sniff_head(&mut compressed)
-        .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
-    let inner = compress::decompress(&head, compressed)
+    let (_, inner) = compress::decoder(scan.metadata.as_slice())
         .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
     let mut inner = TarReader::new(inner);
     // What the entries may hold between them, which is what each is read

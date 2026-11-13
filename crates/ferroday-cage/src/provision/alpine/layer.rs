@@ -417,8 +417,8 @@ fn read_scripts(tree: &Rooted, base: &Path) -> Result<Vec<u8>, AlpineError> {
     }
     let mut scripts = Vec::new();
     let at = base.join(DB_DIR).join(SCRIPTS_GZ);
-    let mut reader =
-        crate::provision::compress::decompress(&compressed, io::empty()).map_err(|err| {
+    let (_, mut reader) =
+        crate::provision::compress::decoder(compressed.as_slice()).map_err(|err| {
             AlpineError::Config {
                 reason: format!(
                     "the base layer at {}: its {SCRIPTS_GZ} is not readable: {}",
