@@ -319,6 +319,11 @@ ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = ["hex", 
 toml = "1.1"
 # The hardening tests name syscalls and signals by their libc constants.
 libc = "0.2"
+# The seccomp filters' tests read the syscall table of every architecture a
+# filter checks. The library's own `syscalls` dependency carries the host's
+# table alone; these features add the others to a test build, as data the
+# library never reads.
+syscalls = { version = "0.8", default-features = false, features = ["x86", "x86_64", "arm", "aarch64", "riscv32", "riscv64"] }
 # The provisioning tests generate compressed fixtures.
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz", "encoder"] }
 # The signature tests generate throwaway signing keys and sign documents with

@@ -588,47 +588,92 @@ mod tests {
     use super::eval::{Call, run};
     use super::*;
 
-    /// Every entry point each family's kernel presents: its audit
-    /// architecture, the `socket` number under it, and, where it has one, the
-    /// `socketcall` number.
-    fn entry_points(family: Family) -> Vec<(u32, u32, Option<u32>)> {
+    /// A syscall table of the `syscalls` crate: one per architecture a
+    /// family's kernel numbers calls by.
+    #[derive(Debug, Clone, Copy)]
+    enum Table {
+        X86_64,
+        I386,
+        Aarch64,
+        Arm,
+        Riscv64,
+        Riscv32,
+    }
+
+    /// One entry point a family's kernel presents: the audit architecture its
+    /// calls carry, the table that numbers them, and the bits every number
+    /// carries beyond the table's, which is [`X32_SYSCALL_BIT`] on x32 and none
+    /// elsewhere.
+    #[derive(Debug, Clone, Copy)]
+    struct EntryPoint {
+        arch: u32,
+        table: Table,
+        tag: u32,
+    }
+
+    impl EntryPoint {
+        /// The number `name` is called by at this entry point, or `None` where
+        /// the entry point has no such call.
+        ///
+        /// Read from the `syscalls` crate's table for the architecture rather
+        /// than from the constants the programs are written with, so each
+        /// program is held to numbers it did not state, every family's on
+        /// every host.
+        fn number(self, name: &str) -> Option<u32> {
+            use std::str::FromStr;
+            let id = match self.table {
+                Table::X86_64 => syscalls::x86_64::Sysno::from_str(name).map(|call| call.id()),
+                Table::I386 => syscalls::x86::Sysno::from_str(name).map(|call| call.id()),
+                Table::Aarch64 => syscalls::aarch64::Sysno::from_str(name).map(|call| call.id()),
+                Table::Arm => syscalls::arm::Sysno::from_str(name).map(|call| call.id()),
+                Table::Riscv64 => syscalls::riscv64::Sysno::from_str(name).map(|call| call.id()),
+                Table::Riscv32 => syscalls::riscv32::Sysno::from_str(name).map(|call| call.id()),
+            };
+            let id = u32::try_from(id.ok()?).expect("a syscall number is not negative");
+            Some(id | self.tag)
+        }
+
+        /// The number of `name`, a call every entry point the tests name has.
+        fn call(self, name: &str) -> u32 {
+            self.number(name)
+                .unwrap_or_else(|| panic!("{self:?} has no {name}"))
+        }
+    }
+
+    /// Every entry point each family's kernel presents.
+    fn entry_points(family: Family) -> Vec<EntryPoint> {
+        let entry = |arch, table, tag| EntryPoint { arch, table, tag };
         match family {
             Family::X86 => vec![
-                (AUDIT_ARCH_X86_64, X86_64_SOCKET, None),
-                (AUDIT_ARCH_X86_64, X86_64_SOCKET | X32_SYSCALL_BIT, None),
-                (AUDIT_ARCH_I386, I386_SOCKET, Some(I386_SOCKETCALL)),
+                entry(AUDIT_ARCH_X86_64, Table::X86_64, 0),
+                entry(AUDIT_ARCH_X86_64, Table::X86_64, X32_SYSCALL_BIT),
+                entry(AUDIT_ARCH_I386, Table::I386, 0),
             ],
             Family::Arm => vec![
-                (AUDIT_ARCH_AARCH64, GENERIC_SOCKET, None),
-                (AUDIT_ARCH_ARM, ARM_SOCKET, None),
+                entry(AUDIT_ARCH_AARCH64, Table::Aarch64, 0),
+                entry(AUDIT_ARCH_ARM, Table::Arm, 0),
             ],
             Family::RiscV => vec![
-                (AUDIT_ARCH_RISCV64, GENERIC_SOCKET, None),
-                (AUDIT_ARCH_RISCV32, GENERIC_SOCKET, None),
+                entry(AUDIT_ARCH_RISCV64, Table::Riscv64, 0),
+                entry(AUDIT_ARCH_RISCV32, Table::Riscv32, 0),
             ],
         }
     }
 
     const FAMILIES: [Family; 3] = [Family::X86, Family::Arm, Family::RiscV];
 
-    /// The `io_uring_setup` number at the entry point whose `socket` number is
-    /// `socket`: the x32 alias carries the x32 bit, and every other entry point
-    /// uses the shared number.
-    fn io_uring_setup_beside(socket: u32) -> u32 {
-        IO_URING_SETUP | (socket & X32_SYSCALL_BIT)
-    }
-
     #[test]
     fn every_entry_point_refuses_a_vsock_socket() {
         for family in FAMILIES {
             let program = program_for(family);
-            for (arch, socket, _) in entry_points(family) {
+            for entry in entry_points(family) {
+                let socket = entry.call("socket");
                 for kind in [1, 2, 5] {
-                    let call = Call::new(arch, socket, &[u64::from(AF_VSOCK), kind, 0]);
+                    let call = Call::new(entry.arch, socket, &[u64::from(AF_VSOCK), kind, 0]);
                     assert_eq!(
                         run(program, &call),
                         ret_errno(EAFNOSUPPORT),
-                        "{family:?}, arch {arch:#x}, socket {socket:#x}, type {kind}"
+                        "{entry:?}, socket {socket:#x}, type {kind}"
                     );
                 }
             }
@@ -640,13 +685,13 @@ mod tests {
         // The kernel reads the family as an int, so these are all AF_VSOCK.
         for family in FAMILIES {
             let program = program_for(family);
-            for (arch, socket, _) in entry_points(family) {
+            for entry in entry_points(family) {
                 for domain in [1 << 32 | 40, u64::MAX << 32 | 40] {
-                    let call = Call::new(arch, socket, &[domain, 1, 0]);
+                    let call = Call::new(entry.arch, entry.call("socket"), &[domain, 1, 0]);
                     assert_eq!(
                         run(program, &call),
                         ret_errno(EAFNOSUPPORT),
-                        "{family:?}, arch {arch:#x}, domain {domain:#x}"
+                        "{entry:?}, domain {domain:#x}"
                     );
                 }
             }
@@ -659,14 +704,10 @@ mod tests {
         // either side of AF_VSOCK.
         for family in FAMILIES {
             let program = program_for(family);
-            for (arch, socket, _) in entry_points(family) {
+            for entry in entry_points(family) {
                 for domain in [1, 2, 10, 16, 17, 39, 41] {
-                    let call = Call::new(arch, socket, &[domain, 1, 0]);
-                    assert_eq!(
-                        run(program, &call),
-                        RET_ALLOW,
-                        "{family:?}, arch {arch:#x}, domain {domain}"
-                    );
+                    let call = Call::new(entry.arch, entry.call("socket"), &[domain, 1, 0]);
+                    assert_eq!(run(program, &call), RET_ALLOW, "{entry:?}, domain {domain}");
                 }
             }
         }
@@ -676,19 +717,19 @@ mod tests {
     fn every_entry_point_refuses_io_uring_setup() {
         for family in FAMILIES {
             let program = program_for(family);
-            for (arch, socket, _) in entry_points(family) {
-                let nr = io_uring_setup_beside(socket);
-                let call = Call::new(arch, nr, &[1, 0x1000]);
+            for entry in entry_points(family) {
+                let nr = entry.call("io_uring_setup");
+                let call = Call::new(entry.arch, nr, &[1, 0x1000]);
                 assert_eq!(
                     run(program, &call),
                     ret_errno(ENOSYS),
-                    "{family:?}, arch {arch:#x}, nr {nr:#x}"
+                    "{entry:?}, nr {nr:#x}"
                 );
                 // io_uring_enter and io_uring_register act on a ring only
                 // io_uring_setup creates.
-                for other in [nr + 1, nr + 2] {
-                    let call = Call::new(arch, other, &[3, 1, 1, 0]);
-                    assert_eq!(run(program, &call), RET_ALLOW, "nr {other:#x}");
+                for other in ["io_uring_enter", "io_uring_register"] {
+                    let call = Call::new(entry.arch, entry.call(other), &[3, 1, 1, 0]);
+                    assert_eq!(run(program, &call), RET_ALLOW, "{entry:?}, {other}");
                 }
             }
         }
@@ -701,10 +742,11 @@ mod tests {
         // the kernel does not offer; the other calls socketcall carries run.
         for family in FAMILIES {
             let program = program_for(family);
-            for (arch, _, socketcall) in entry_points(family) {
-                let Some(socketcall) = socketcall else {
+            for entry in entry_points(family) {
+                let Some(socketcall) = entry.number("socketcall") else {
                     continue;
                 };
+                let arch = entry.arch;
                 for pointer in [0, 0x0804_8000] {
                     let call = Call::new(arch, socketcall, &[u64::from(SYS_SOCKET), pointer]);
                     assert_eq!(
@@ -721,18 +763,6 @@ mod tests {
                     assert_eq!(run(program, &call), RET_ALLOW, "call {call_number}");
                 }
             }
-        }
-    }
-
-    /// The number `refusal`'s syscall has at the entry point whose `socket`
-    /// and `socketcall` numbers are given, or `None` where it has no such
-    /// call.
-    fn number_at(refusal: &Refusal, socket: u32, socketcall: Option<u32>) -> Option<u32> {
-        match refusal.syscall {
-            "socket" => Some(socket),
-            "io_uring_setup" => Some(io_uring_setup_beside(socket)),
-            "socketcall" => socketcall,
-            other => panic!("the tests know no number for {other}"),
         }
     }
 
@@ -753,31 +783,27 @@ mod tests {
                 assert!(
                     entry_points(family)
                         .into_iter()
-                        .any(
-                            |(_, socket, socketcall)| number_at(refusal, socket, socketcall)
-                                .is_some()
-                        ),
+                        .any(|entry| entry.number(refusal.syscall).is_some()),
                     "{family:?} states a refusal of a call it has no entry point for: {refusal:?}"
                 );
             }
-            for (arch, socket, socketcall) in entry_points(family) {
-                let tag = socket & X32_SYSCALL_BIT;
-                for nr in (0..1024).map(|base| base | tag) {
+            for entry in entry_points(family) {
+                for nr in (0..1024).map(|base| base | entry.tag) {
                     for &first in &firsts {
                         // The low 32 bits, as the filter compares them.
                         let low = first as u32;
                         let expected = refusals
                             .iter()
                             .find(|refusal| {
-                                number_at(refusal, socket, socketcall) == Some(nr)
+                                entry.number(refusal.syscall) == Some(nr)
                                     && refusal.first_argument.is_none_or(|value| value == low)
                             })
                             .map_or(RET_ALLOW, |refusal| ret_errno(refusal.errno));
-                        let call = Call::new(arch, nr, &[first, 0x0804_8000, 0]);
+                        let call = Call::new(entry.arch, nr, &[first, 0x0804_8000, 0]);
                         assert_eq!(
                             run(program, &call),
                             expected,
-                            "{family:?}, arch {arch:#x}, nr {nr:#x}, first argument {first:#x}"
+                            "{entry:?}, nr {nr:#x}, first argument {first:#x}"
                         );
                     }
                 }
