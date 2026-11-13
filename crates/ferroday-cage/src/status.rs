@@ -265,6 +265,21 @@ pub struct ResourceUsage {
 }
 
 impl ResourceUsage {
+    /// No figure at all, from either source.
+    ///
+    /// A struct expression rather than a derived `Default`, so a field added
+    /// to the type is a compile error here until it is given its absence.
+    const NONE: ResourceUsage = ResourceUsage {
+        user_time: None,
+        system_time: None,
+        peak_rss_bytes: None,
+        cgroup_user_time: None,
+        cgroup_system_time: None,
+        cgroup_peak_memory_bytes: None,
+        cgroup_peak_processes: None,
+        cgroup_oom_kills: None,
+    };
+
     /// What the supervisor read for the processes it collected, before
     /// anything is read from a cgroup.
     pub(crate) fn of_processes(
@@ -276,11 +291,7 @@ impl ResourceUsage {
             user_time: Some(user_time),
             system_time: Some(system_time),
             peak_rss_bytes: Some(peak_rss_bytes),
-            cgroup_user_time: None,
-            cgroup_system_time: None,
-            cgroup_peak_memory_bytes: None,
-            cgroup_peak_processes: None,
-            cgroup_oom_kills: None,
+            ..ResourceUsage::NONE
         }
     }
 
@@ -290,45 +301,44 @@ impl ResourceUsage {
     ///
     /// A killed sandbox under a PID namespace has no report from its
     /// supervisor, and its cgroup's figures are then the whole account.
+    ///
+    /// Both sides are destructured without `..`, and the result is built
+    /// without it, so a field added to either type fails to compile here until
+    /// it is joined.
     pub(crate) fn joined(
         processes: Option<ResourceUsage>,
         tree: crate::cgroup::CgroupUsage,
     ) -> Option<ResourceUsage> {
         let crate::cgroup::CgroupUsage {
+            user_time: cgroup_user_time,
+            system_time: cgroup_system_time,
+            peak_memory_bytes: cgroup_peak_memory_bytes,
+            peak_processes: cgroup_peak_processes,
+            oom_kills: cgroup_oom_kills,
+        } = tree;
+        // The supervisor reads no cgroup, so its report carries none of the
+        // tree's figures.
+        let ResourceUsage {
             user_time,
             system_time,
-            peak_memory_bytes,
-            peak_processes,
-            oom_kills,
-        } = tree;
+            peak_rss_bytes,
+            cgroup_user_time: _,
+            cgroup_system_time: _,
+            cgroup_peak_memory_bytes: _,
+            cgroup_peak_processes: _,
+            cgroup_oom_kills: _,
+        } = processes.unwrap_or(ResourceUsage::NONE);
         let joined = ResourceUsage {
-            cgroup_user_time: user_time,
-            cgroup_system_time: system_time,
-            cgroup_peak_memory_bytes: peak_memory_bytes,
-            cgroup_peak_processes: peak_processes,
-            cgroup_oom_kills: oom_kills,
-            ..processes.unwrap_or(ResourceUsage {
-                user_time: None,
-                system_time: None,
-                peak_rss_bytes: None,
-                cgroup_user_time: None,
-                cgroup_system_time: None,
-                cgroup_peak_memory_bytes: None,
-                cgroup_peak_processes: None,
-                cgroup_oom_kills: None,
-            })
+            user_time,
+            system_time,
+            peak_rss_bytes,
+            cgroup_user_time,
+            cgroup_system_time,
+            cgroup_peak_memory_bytes,
+            cgroup_peak_processes,
+            cgroup_oom_kills,
         };
-        let figures = [
-            joined.user_time.is_some(),
-            joined.system_time.is_some(),
-            joined.peak_rss_bytes.is_some(),
-            joined.cgroup_user_time.is_some(),
-            joined.cgroup_system_time.is_some(),
-            joined.cgroup_peak_memory_bytes.is_some(),
-            joined.cgroup_peak_processes.is_some(),
-            joined.cgroup_oom_kills.is_some(),
-        ];
-        figures.contains(&true).then_some(joined)
+        (joined != ResourceUsage::NONE).then_some(joined)
     }
 }
 
