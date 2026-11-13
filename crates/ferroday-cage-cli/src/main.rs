@@ -1305,12 +1305,10 @@ const FLAGS: &[Flag] = &[
             "Load a TOML profile from an untrusted source: like",
             "--profile, but the operations that map host resources",
             "into the sandbox, write to the host, or share a host",
-            "namespace (binds, raw mounts, symlinks, host",
-            "networking, the host PID namespace, an overlay root)",
-            "are refused, and so are the Landlock grants and the",
-            "kept capabilities the hardening flags would add to.",
-            "The rootfs it names still grants access to that host",
-            "subtree, so pass a rootfs you control",
+            "namespace are refused, and so is the hardening the",
+            "flags would add to; the library's RestrictedProfile",
+            "lists each. The rootfs it names still grants access",
+            "to that host subtree, so pass a rootfs you control",
         ],
         take: Take::One(|options, _flag, value| {
             let path = PathBuf::from(value);

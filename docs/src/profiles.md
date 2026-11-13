@@ -103,7 +103,7 @@ the way the layers were built. `upper` is where the sandbox's writes land, and
 discarding it reverts them. The upper and the work directory lie outside every
 lower, and no lower lies inside another. `build` refuses an overlap before it
 creates anything on the host. Note that a `RestrictedProfile` refuses an overlay
-root outright, for the reason [below](#untrusted-profiles).
+root outright, as [Untrusted profiles](#untrusted-profiles) describes.
 
 `empty-rootfs = true` roots the sandbox on an [empty
 root](how-the-sandbox-is-built.md#an-empty-root) instead, which the `[[mount]]`
@@ -462,49 +462,14 @@ let builder = restricted.into_builder();      // extend with the consumer's own 
 # }
 ```
 
-The restricted policy refuses the operations that map host resources into the
-sandbox, write to the host outside it, or share a host namespace:
-
-- a bind mount or a raw mount
-- a symbolic link, a `[[mount]]` entry with `kind = "symlink"`
-- host networking
-- an overlay root
-- the host's own root, `host-rootfs`, and a path it hides taken back, `reveal`
-- sharing the host PID namespace
-
-A hidden path and a path made read-only only take away, so the policy admits
-both. The host's own root maps the host's whole tree in, and a path the
-profile takes back from its hides would be shown by a consumer's own
-`host_rootfs` after loading.
-
-An overlay root is refused because, unlike the root filesystem, its upper layer
-is created rather than required to exist. The profile would choose a host path
-for the library to create directories at. A trusted consumer configures one with
-`overlay` after loading.
-
-A symbolic link is refused because the setup makes it before any confinement
-applies. In a plain root filesystem it stays on the host after the sandbox
-exits. A link at `/etc/ld.so.preload` there, pointing at a path the command can
-write, reaches every later sandbox on that tree. A restricted profile binds
-nothing, so an empty root gains nothing from a link either.
-
-The policy also refuses the parts of `[hardening]` that would widen whatever the
-consumer configures after loading:
-
-- `landlock-fs` and `landlock-net`, the Landlock grants. Grants are an
-  allow-list the builder only appends to, so the profile's grants would be
-  added to the consumer's.
-- `keep-caps`, a kept capability set. It survives the switch to a non-root
-  `run_as` identity the consumer adds, which otherwise clears every capability.
-- `resolve-unix = false`, the unix-socket restriction turned off. It would take
-  the restriction away from the host's own root, which applies it by default,
-  should the consumer root the sandbox there.
-
-The rest of `[hardening]` only removes, and a restricted profile can carry it. A
-seccomp policy refuses syscalls, `drop-caps` drops every capability, a Landlock
-scope denies a reach outside the sandbox, and `resolve-unix = true` refuses
-connections to unix sockets. A consumer's own call for any of them replaces the
-profile's.
+The restricted policy refuses what would let a profile reach past the sandbox,
+or past what the consumer configures after loading: the operations that map
+host resources into the sandbox, write to the host outside it, or share a host
+namespace, and the parts of `[hardening]` a consumer's own calls add to rather
+than replace. [`RestrictedProfile`] lists each, with the key that spells it and
+the reason it is refused. Everything else is admitted, so a restricted profile
+still names its root filesystem, command, environment, hidden paths, limits,
+identity, and the hardening that only removes.
 
 Deserializing a `RestrictedProfile` reports a refusal through the format's own
 error, as text. A consumer that matches on the refusal deserializes a
@@ -571,8 +536,8 @@ fcage --profile build.toml --isolate-net
 `--profile` trusts the file like a script: it can bind any host path, issue
 raw mounts, share the host network, and share the host PID namespace. Load only
 a profile you trust. `--restricted-profile FILE` loads under the restricted
-policy instead, refusing what [Untrusted profiles](#untrusted-profiles) lists
-for a profile from an untrusted source. The root filesystem it names still
+policy instead, refusing what [Untrusted profiles](#untrusted-profiles)
+describes for a profile from an untrusted source. The root filesystem it names still
 grants access to that host subtree, so pass one you control.
 
 A profile is plain data: loading one performs no filesystem access and
@@ -585,3 +550,5 @@ The same composition is available to any consumer, because a profile is a
 `clear_args` before `command` replaces a profile's command as a unit.
 [Building an orchestrator](building-an-orchestrator.md) works this into a
 group-based launcher.
+
+[`RestrictedProfile`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictedProfile.html

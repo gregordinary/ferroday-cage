@@ -500,18 +500,16 @@ pub enum ConfigError {
     ///
     /// Deserializing a profile straight into a `CageBuilder` trusts it as
     /// code-equivalent configuration. A profile from an untrusted source is
-    /// loaded under the restricted policy instead, which forbids the
-    /// operations that map host resources into the sandbox, write to the host,
-    /// or share a host namespace: bind mounts, raw mounts, symbolic links, an
-    /// overlay root, host networking, and sharing the host PID namespace. It
-    /// also forbids the hardening a consumer's own calls add to rather than
-    /// replace: Landlock grants and a kept capability set.
+    /// loaded under the restricted policy instead.
     // The paragraph links a feature-gated item, so its doc text is gated on the
     // feature: present in the canonical all-features build, absent — link and
     // all — from a build without `serde`, where no profile is loaded at all.
     #[cfg_attr(
         feature = "serde",
         doc = "
+[`RestrictedProfile`](crate::RestrictedProfile) lists what the policy refuses,
+in the words `operation` names it by.
+
 Returned by [`RestrictedProfile::try_from`](crate::RestrictedProfile) on a
 [`CageBuilder`](crate::CageBuilder). Deserializing a `RestrictedProfile`
 directly reports the same refusal through the serde format's own error,

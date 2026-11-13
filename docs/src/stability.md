@@ -292,5 +292,5 @@ Policy that only lives in a document decays. These are enforced:
 | The MSRV holds | A CI build at the declared `rust-version` |
 | The profile and record key sets are deliberate | `rename_all` on every container, a census of the field-level renames in `tools/idioms.toml`, and tests pinning the key sets of the profile format, of the resolved provenance record, and of `NetStackBuilder` |
 | Every public enum and every struct variant is `#[non_exhaustive]` | `tests/stability.rs`, reading the committed API snapshot |
-| The untrusted-profile surface cannot widen silently | `check_restricted` destructures `CageBuilder` and its hardening request exhaustively, and matches every `Mount` and `Network` variant. A new field or variant fails to compile until it is classified |
+| The untrusted-profile surface cannot widen silently | `check_restricted` destructures `CageBuilder` and its hardening request exhaustively, and matches every `Mount` and `Network` variant. A new field or variant fails to compile until it is classified. A test drives each refusal `RestrictedProfile` lists, and holds every key of the profile format to a profile the policy refuses or one it admits |
 | A userland reaching past the provisioning seam is a decision | `tools/check-seam.py` against the record in `tools/seam.toml` |

@@ -2029,28 +2029,11 @@ impl Request {
     /// [`ConfigError::ProfileOperationForbidden`] names it, or `None` where the
     /// policy admits the whole request.
     ///
-    /// A restricted profile is loaded for a consumer to extend with its own
-    /// trusted calls, so what matters is how a part composes with those calls:
-    ///
-    /// - **Refused: the Landlock grants**, `landlock-fs` and `landlock-net`.
-    ///   Grants are an allow-list the builder appends to and offers no call to
-    ///   clear, so a profile's grants are unioned with the consumer's and open
-    ///   whatever the consumer's own grants meant to keep closed. Under a later
-    ///   [`Network::Host`](crate::Network::Host), a network grant is the
-    ///   sandbox's only network boundary.
-    /// - **Refused: a kept capability set**, `keep-caps`. It survives the switch
-    ///   to a non-root identity, so it would hand a consumer's
-    ///   [`run_as`](crate::CageBuilder::run_as) command the capabilities that
-    ///   switch exists to clear.
-    /// - **Refused: the unix-socket restriction turned off**, `resolve-unix =
-    ///   false`. It would take the restriction away from a root that applies
-    ///   it by default, should the consumer root the sandbox there.
-    /// - **Allowed: everything else**, because each part only removes. A seccomp
-    ///   policy refuses syscalls, a full capability drop (`drop-caps`) takes
-    ///   every capability away, and a Landlock scope and the unix-socket
-    ///   restriction turned on deny a reach outside the sandbox. Any of them
-    ///   also sets no-new-privileges. A consumer's own call for any of them
-    ///   replaces the profile's rather than adding to it.
+    /// The hardening half of the policy
+    /// [`RestrictedProfile`](crate::RestrictedProfile) lists. A restricted
+    /// profile is loaded for a consumer to extend with its own trusted calls,
+    /// so what decides is how a part composes with those calls: one they add to
+    /// is refused, and one they replace, which only removes, is admitted.
     ///
     /// Destructured without `..`, so a field added to the request fails to
     /// compile here until it is classified, as the builder's own fields are in
@@ -2062,20 +2045,32 @@ impl Request {
         let Request {
             landlock,
             landlock_net,
+            // A scope denies a reach outside the sandbox, and a seccomp policy
+            // refuses syscalls; a consumer's own call replaces either.
             scope: _,
             resolve_unix,
             seccomp: _,
             capabilities,
         } = self;
+        // Grants are an allow-list the builder appends to and offers no call
+        // to clear, so a profile's grants would open whatever the consumer's
+        // own meant to keep closed. Under a later `Network::Host`, a network
+        // grant is the sandbox's only network boundary.
         if !landlock.is_empty() {
             return Some("a Landlock filesystem grant (landlock-fs)");
         }
+        // Turned off, it would take the restriction away from a root that
+        // applies it by default, should the consumer root the sandbox there.
+        // Turned on, it only denies.
         if *resolve_unix == Some(false) {
             return Some("the unix-socket restriction turned off (resolve-unix = false)");
         }
         if !landlock_net.is_empty() {
             return Some("a Landlock network grant (landlock-net)");
         }
+        // A kept set survives the switch to a non-root identity, so it would
+        // hand a consumer's `run_as` command the capabilities that switch
+        // exists to clear. Dropping every capability only removes.
         match capabilities {
             CapabilityPosture::Reduce(kept) if !kept.is_empty() => {
                 Some("a kept capability set (keep-caps)")

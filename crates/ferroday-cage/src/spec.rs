@@ -1275,13 +1275,19 @@ impl Overlay {
 /// source (a repository, a download, a multi-tenant store) hands that source
 /// the full sandbox surface.
 ///
-/// Load a profile from an untrusted source through `RestrictedProfile`
-/// instead. It forbids the operations that map host resources into the
-/// sandbox, write to the host, or share a host namespace: bind mounts, raw
-/// mounts, symbolic links, an overlay root, host networking, and the host PID
-/// namespace. It also forbids the hardening a consumer's own calls add to
-/// rather than replace: Landlock grants and a kept capability set. What it
-/// yields is a builder the consumer extends with its own trusted calls.
+// The paragraph links a feature-gated item, so it is gated on the feature: a
+// build without `serde` loads no profile at all.
+#[cfg_attr(
+    feature = "serde",
+    doc = "
+Load a profile from an untrusted source through
+[`RestrictedProfile`](crate::RestrictedProfile) instead, whose documentation
+lists what it refuses: the operations that map host resources into the
+sandbox, write to the host, or share a host namespace, and the hardening a
+consumer's own calls add to rather than replace. What it yields is a builder
+the consumer extends with its own trusted calls.
+"
+)]
 ///
 /// # Inspection
 ///
@@ -3214,40 +3220,60 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// CARGO_HOME = "/cache/cargo"
 /// ```
 ///
-/// The restricted policy forbids the operations that map host resources into
-/// the sandbox, write to the host outside it, or share a host namespace:
+/// # What the restricted policy refuses
 ///
-/// - a bind mount or a raw mount;
-/// - a symbolic link (`kind = "symlink"`), which the setup makes before any
-///   confinement applies, and which stays on the host in a plain rootfs;
-/// - host networking;
-/// - an overlay root (`[overlay]`, whose upper creates host directories at a
-///   path the profile picks);
+/// This list is the policy: the refusals the code makes are held to it, and
+/// every other description of the policy refers here. A profile using any entry
+/// is refused, and the refusal names the entry in the words it has here.
+///
+/// The operations that map host resources into the sandbox, write to the host
+/// outside it, or share a host namespace:
+///
+/// - a bind mount, and a raw mount (`kind = "bind"`, `kind = "raw"`). Each maps
+///   a host resource in: a host path, or whatever a raw mount's source, type,
+///   and data reach.
+/// - a symbolic link (`kind = "symlink"`). The setup makes it before any
+///   confinement applies, and in a plain rootfs it stays on the host after the
+///   sandbox exits: a link at `/etc/ld.so.preload`, pointing at a path a
+///   confined command can write, reaches every later sandbox on that tree.
+/// - host networking (`network = "host"`).
+/// - an overlay root (`[overlay]`). Its upper, with a work directory beside
+///   it, is created at whatever host path the profile names, where a rootfs
+///   must already exist.
 /// - the host's own root (`host-rootfs`), which maps the host's whole tree in,
-///   and a path it hides taken back (`reveal`), which a consumer's later
-///   `host_rootfs` would honor;
-/// - sharing the host PID namespace (`pid-namespace = false`, which would bind
-///   the host's `/proc` into the sandbox).
+///   and a path the host's root hides taken back (`reveal`), which a
+///   consumer's own [`host_rootfs`](CageBuilder::host_rootfs) after loading
+///   would honor.
+/// - the host PID namespace (`pid-namespace = false`). The managed `/proc` is
+///   then the host's own, bound in read-write, through which the command can
+///   read and signal every host process of its user.
+/// - a cgroup parent (`parent` in `[cgroup]`), a host directory each launch
+///   creates a cgroup in and enables controllers on for every cgroup beneath
+///   it.
 ///
-/// It also forbids the hardening that a consumer's own trusted calls add to
-/// rather than replace, since the profile's part would then widen the
-/// consumer's confinement:
+/// The hardening that a consumer's own trusted calls add to rather than
+/// replace, since the profile's part would then widen the consumer's
+/// confinement:
 ///
-/// - a Landlock grant (`landlock-fs`, `landlock-net`). Grants are an
-///   allow-list the builder only appends to, so the profile's would be unioned
-///   with the consumer's.
+/// - a Landlock filesystem grant (`landlock-fs`), and a Landlock network grant
+///   (`landlock-net`). Grants are an allow-list the builder only appends to,
+///   so the profile's would be added to the consumer's.
 /// - a kept capability set (`keep-caps`), which survives the switch to a
 ///   consumer's non-root [`run_as`](CageBuilder::run_as) identity.
+/// - the unix-socket restriction turned off (`resolve-unix = false`), which
+///   would take the restriction away from the host's own root, which applies
+///   it by default, should the consumer root the sandbox there.
 ///
-/// A profile using any of them is refused. Everything else is accepted, so a
-/// restricted profile still shapes the sandbox: the rootfs (never the host
-/// root, which [`CageBuilder::build`] rejects for every profile), an empty
-/// root, a hidden path or one made read-only, command, arguments, environment,
-/// working directory, hostname, resource
-/// limits, the identity map, the run-as and presented identities, and the
-/// remaining mount toggles. So is the hardening that only removes: a seccomp
-/// policy, a full capability drop (`drop-caps`), and the Landlock scopes, each
-/// of which a consumer's own call replaces.
+/// Everything else is admitted, so a restricted profile still shapes the
+/// sandbox: the rootfs (never the host root, which [`CageBuilder::build`]
+/// rejects for every profile), an empty root, a hidden path or one made
+/// read-only, the command, its arguments, environment, and working directory,
+/// path lookup, the hostname, the stream dispositions, the tie to the caller's
+/// lifetime, the resource limits and the cgroup limits, the identity map, the
+/// run-as and presented identities, the base environment, and the remaining
+/// mount toggles. So is the hardening that only removes: a seccomp policy, a
+/// full capability drop (`drop-caps`), the Landlock scopes, and the unix-socket
+/// restriction turned on, each of which a consumer's own call replaces.
 ///
 /// # What the restricted policy does not constrain
 ///
@@ -3338,11 +3364,9 @@ impl<'de> serde::Deserialize<'de> for RestrictedProfile {
 #[cfg(feature = "serde")]
 impl CageBuilder {
     /// Rejects the profile operations the restricted policy reserves for a
-    /// trusted profile: every kind of mount that maps something in or creates
-    /// something, host networking, an overlay root, the host's own root and a
-    /// path it hides taken back, sharing the host PID namespace, Landlock
-    /// grants, and a kept capability set. Backs [`RestrictedProfile`]'s conversion from a builder, and
-    /// through it its deserialization.
+    /// trusted profile, which [`RestrictedProfile`] lists, naming the first one
+    /// the builder uses. Backs [`RestrictedProfile`]'s conversion from a
+    /// builder, and through it its deserialization.
     fn check_restricted(&self) -> Result<(), ConfigError> {
         // Destructured exhaustively, with no `..`: a new builder field fails to
         // compile here until someone classifies it, so the untrusted-profile
@@ -8954,6 +8978,177 @@ target = "/work/.git/hooks"
         );
     }
 
+    /// Every operation the restricted policy refuses, in the order
+    /// [`RestrictedProfile`]'s list names them: a profile that uses it, and the
+    /// words the refusal names it in.
+    const RESTRICTED_REFUSALS: &[(&str, &str)] = &[
+        (
+            "[[mount]]\nkind = \"bind\"\nsource = \"/etc\"\ntarget = \"/host-etc\"\n",
+            "a bind mount",
+        ),
+        (
+            "[[mount]]\nkind = \"raw\"\ntarget = \"/raw\"\nsource = \"/dev/shm\"\n\
+             fstype = \"tmpfs\"\nflags = 6\ndata = \"mode=0777\"\n",
+            "a raw mount",
+        ),
+        (
+            "[[mount]]\nkind = \"symlink\"\ntarget = \"/var/tmp/x.so\"\n\
+             path = \"/etc/ld.so.preload\"\n",
+            "a symbolic link",
+        ),
+        ("network = \"host\"\n", "host networking"),
+        (
+            "[overlay]\nlower = [\"/srv/base\"]\nupper = \"/var/tmp/upper\"\n\
+             work = \"/var/tmp/work\"\n",
+            "an overlay root",
+        ),
+        ("host-rootfs = true\n", "the host's own root (host-rootfs)"),
+        (
+            "rootfs = \"/srv/rootfs\"\nreveal = [\"/run\"]\n",
+            "a path the host's root hides taken back (reveal)",
+        ),
+        ("pid-namespace = false\n", "the host PID namespace"),
+        (
+            "[cgroup]\nparent = \"/sys/fs/cgroup/delegated\"\n",
+            "a cgroup parent",
+        ),
+        #[cfg(feature = "hardening")]
+        (
+            "[[hardening.landlock-fs]]\npath = \"/\"\naccess = \"rwx\"\n",
+            "a Landlock filesystem grant (landlock-fs)",
+        ),
+        #[cfg(feature = "hardening")]
+        (
+            "[[hardening.landlock-net]]\nport = 443\naccess = \"c\"\n",
+            "a Landlock network grant (landlock-net)",
+        ),
+        #[cfg(feature = "hardening")]
+        (
+            "[hardening]\nkeep-caps = [\"dac-override\"]\n",
+            "a kept capability set (keep-caps)",
+        ),
+        #[cfg(feature = "hardening")]
+        (
+            "[hardening]\nresolve-unix = false\n",
+            "the unix-socket restriction turned off (resolve-unix = false)",
+        ),
+    ];
+
+    /// The restricted policy refuses each operation its list names, both where
+    /// a `RestrictedProfile` is deserialized and where a builder is converted,
+    /// and names it in the list's words.
+    #[test]
+    fn a_restricted_profile_refuses_each_operation_its_list_names() {
+        for (profile, operation) in RESTRICTED_REFUSALS {
+            let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
+            assert!(err.to_string().contains(operation), "{profile}\ngot: {err}");
+            let builder: CageBuilder = toml::from_str(profile).expect("a trusted load accepts it");
+            match RestrictedProfile::try_from(builder) {
+                Err(ConfigError::ProfileOperationForbidden { operation: named }) => {
+                    assert_eq!(named, *operation, "{profile}");
+                }
+                other => panic!("{profile}: expected the refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// Profiles that between them carry every key of the profile format at a
+    /// value the restricted policy admits, where it admits one. Only the keys
+    /// the list refuses outright are missing.
+    #[cfg(feature = "hardening")]
+    const RESTRICTED_ADMITTED: [&str; 2] = [
+        r#"
+rootfs = "/srv/rootfs"
+command = "/bin/sh"
+args = ["-c", "true"]
+network = "none"
+hostname = "builder"
+workdir = "/build"
+stdin = "null"
+stdout = "inherit"
+stderr = "null"
+managed-mounts = true
+mount-proc = true
+mount-dev = false
+mount-tmp = true
+resolv-conf = false
+base-env = false
+stop-with-caller = true
+path-lookup = true
+present-as = "1000:1000"
+run-as = { uid = 1000, gid = 1000, groups = [10, 20] }
+
+[identity-map.ranges]
+uid = [{ inside = 0, outside = 100000, count = 65536 }]
+gid = [{ inside = 0, outside = 100000, count = 65536 }]
+
+[cgroup]
+required = false
+memory-max = 536870912
+memory-swap-max = 0
+pids-max = 64
+cpu-max = { quota = 50000, period = 100000 }
+cpu-weight = 100
+
+[rlimit]
+address-space = "unlimited"
+core-dump = 0
+cpu-time = { soft = 10, hard = "unlimited" }
+data = "unlimited"
+file-size = "unlimited"
+locked-memory = 65536
+open-files = 1024
+pending-signals = 64
+processes = 64
+stack = 8388608
+
+[env]
+PATH = "/usr/bin"
+
+[[mount]]
+kind = "hide"
+target = "/home/user/.ssh"
+
+[[mount]]
+kind = "read-only"
+target = "/work/.git/hooks"
+
+[hardening]
+seccomp = "curated"
+landlock-scope = ["signal"]
+resolve-unix = true
+"#,
+        "empty-rootfs = true\n",
+    ];
+
+    /// Every key of the profile format is either one a profile the restricted
+    /// policy refuses carries or one a profile it admits carries, so a key
+    /// added to the format is classified here as the policy classifies it,
+    /// and a refusal the list does not name fails an admitted profile.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn every_profile_key_is_one_the_restricted_policy_refuses_or_admits() {
+        let admitted = RESTRICTED_ADMITTED
+            .into_iter()
+            .chain(OTHER_FORM_PROFILES[..2].iter().copied());
+        for profile in admitted.clone() {
+            toml::from_str::<RestrictedProfile>(profile)
+                .unwrap_or_else(|err| panic!("{profile}\nrefused: {err}"));
+        }
+        let mut keys: Vec<String> = RESTRICTED_REFUSALS
+            .iter()
+            .map(|(profile, _)| *profile)
+            .chain(admitted)
+            .flat_map(|profile| {
+                let builder: CageBuilder = toml::from_str(profile).expect("the profile parses");
+                profile_keys(&toml::to_string(&builder).expect("the builder serializes"))
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys, EXPECTED_PROFILE_KEYS);
+    }
+
     const FULL_PROFILE: &str = r#"
 rootfs = "/srv/rootfs/alpine"
 command = "/usr/bin/make"
@@ -9368,66 +9563,6 @@ read-only = true
         );
     }
 
-    /// The conversion from a builder applies the policy deserialization does,
-    /// and hands the refusal back as the documented variant rather than as
-    /// the serde format's text.
-    #[test]
-    fn a_builder_converts_to_a_restricted_profile_or_names_what_it_forbids() {
-        let cases = [
-            (
-                "[[mount]]\nkind = \"bind\"\nsource = \"/etc\"\ntarget = \"/e\"\n",
-                "a bind mount",
-            ),
-            (
-                "[[mount]]\nkind = \"raw\"\ntarget = \"/raw\"\nfstype = \"tmpfs\"\n",
-                "a raw mount",
-            ),
-            ("network = \"host\"\n", "host networking"),
-            (
-                "[overlay]\nlower = [\"/srv/base\"]\nupper = \"/var/tmp/upper\"\n",
-                "an overlay root",
-            ),
-            ("pid-namespace = false\n", "the host PID namespace"),
-            (
-                "[cgroup]\nparent = \"/sys/fs/cgroup/delegated\"\n",
-                "a cgroup parent",
-            ),
-        ];
-        for (profile, forbidden) in cases {
-            let builder: CageBuilder = toml::from_str(profile).expect("a trusted load accepts it");
-            match RestrictedProfile::try_from(builder) {
-                Err(ConfigError::ProfileOperationForbidden { operation }) => {
-                    assert_eq!(operation, forbidden, "{profile}");
-                }
-                other => panic!("{profile}: expected the refusal, got {other:?}"),
-            }
-            let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
-            assert!(err.to_string().contains(forbidden), "{err}");
-        }
-
-        let allowed: CageBuilder =
-            toml::from_str("rootfs = \"/srv/rootfs\"\ncommand = \"/bin/sh\"\n").unwrap();
-        let restricted = RestrictedProfile::try_from(allowed).expect("nothing here is forbidden");
-        assert_eq!(
-            restricted.into_builder().get_command(),
-            Some(Path::new("/bin/sh"))
-        );
-    }
-
-    #[test]
-    fn a_restricted_profile_rejects_a_bind_mount() {
-        let profile = "[[mount]]\nkind = \"bind\"\nsource = \"/etc\"\ntarget = \"/host-etc\"\n";
-        let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
-        assert!(err.to_string().contains("bind mount"), "{err}");
-    }
-
-    #[test]
-    fn a_restricted_profile_rejects_a_raw_mount() {
-        let profile = "[[mount]]\nkind = \"raw\"\ntarget = \"/raw\"\nfstype = \"tmpfs\"\n";
-        let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
-        assert!(err.to_string().contains("raw mount"), "{err}");
-    }
-
     #[test]
     fn the_profile_key_set_is_pinned() {
         // A deliberate second answer to `the_profile_format_keys_are_what_they_are`,
@@ -9594,24 +9729,6 @@ read-only = true
         // never written into one profile.
         assert!(table.contains_key("rootfs") && !table.contains_key("empty-rootfs"));
         assert!(!empty_table.contains_key("rootfs") && !empty_table.contains_key("overlay"));
-    }
-
-    #[test]
-    fn a_restricted_profile_rejects_host_networking() {
-        let err = toml::from_str::<RestrictedProfile>("network = \"host\"\n").unwrap_err();
-        assert!(err.to_string().contains("host networking"), "{err}");
-    }
-
-    #[test]
-    fn a_restricted_profile_rejects_an_overlay_root() {
-        // An overlay upper is created, not required to exist, so honoring one
-        // would have the profile choose a host path for the library to make
-        // directories at — and to run the overlay preflight probe in.
-        let profile = "command = \"/bin/sh\"\n\
-                       [overlay]\nlower = [\"/srv/base\"]\n\
-                       upper = \"/tmp/profile-chosen-upper\"\n";
-        let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
-        assert!(err.to_string().contains("an overlay root"), "{err}");
     }
 
     #[test]
@@ -9789,54 +9906,6 @@ read-only = true
                 })
             ));
         }
-    }
-
-    /// Holds `profile` to the restricted policy both ways, and checks it is
-    /// refused naming `operation`.
-    #[cfg(feature = "hardening")]
-    fn assert_restricted_refuses(profile: &str, operation: &str) {
-        let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
-        assert!(err.to_string().contains(operation), "{profile}\ngot: {err}");
-        let builder: CageBuilder = toml::from_str(profile).expect("a trusted load accepts it");
-        match RestrictedProfile::try_from(builder) {
-            Err(ConfigError::ProfileOperationForbidden { operation: named }) => {
-                assert_eq!(named, operation, "{profile}");
-            }
-            other => panic!("{profile}: expected the refusal, got {other:?}"),
-        }
-    }
-
-    /// A consumer's own grants are added to a profile's rather than replacing
-    /// them, so a profile's grant would open what the consumer meant to close.
-    #[cfg(feature = "hardening")]
-    #[test]
-    fn a_restricted_profile_rejects_a_landlock_filesystem_grant() {
-        assert_restricted_refuses(
-            "rootfs = \"/srv/rootfs\"\n\
-             [[hardening.landlock-fs]]\naccess = \"rwx\"\npath = \"/\"\n",
-            "a Landlock filesystem grant (landlock-fs)",
-        );
-    }
-
-    #[cfg(feature = "hardening")]
-    #[test]
-    fn a_restricted_profile_rejects_a_landlock_network_grant() {
-        assert_restricted_refuses(
-            "rootfs = \"/srv/rootfs\"\n\
-             [[hardening.landlock-net]]\naccess = \"c\"\nport = 443\n",
-            "a Landlock network grant (landlock-net)",
-        );
-    }
-
-    /// A kept set survives a consumer's switch to a non-root identity, which
-    /// would otherwise clear every capability.
-    #[cfg(feature = "hardening")]
-    #[test]
-    fn a_restricted_profile_rejects_a_kept_capability_set() {
-        assert_restricted_refuses(
-            "rootfs = \"/srv/rootfs\"\n[hardening]\nkeep-caps = [\"dac-override\"]\n",
-            "a kept capability set (keep-caps)",
-        );
     }
 
     /// What only removes stays allowed: a seccomp policy, a full capability
@@ -10208,17 +10277,6 @@ read-only = true
             builder.rootfs.as_deref(),
             Some(Path::new("/srv/rootfs/alpine"))
         );
-    }
-
-    #[test]
-    fn a_restricted_profile_rejects_the_host_pid_namespace() {
-        // `pid-namespace = false` binds the host's /proc read-write into the
-        // sandbox, the same host-resource mapping an explicit `[[mount]]` bind
-        // of /proc would perform; the restricted policy reserves it.
-        let profile = "rootfs = \"/srv/rootfs/alpine\"\ncommand = \"/bin/sh\"\n\
-                       pid-namespace = false\n";
-        let err = toml::from_str::<RestrictedProfile>(profile).unwrap_err();
-        assert!(err.to_string().contains("host PID namespace"), "{err}");
     }
 
     #[test]
