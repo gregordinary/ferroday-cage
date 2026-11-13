@@ -602,7 +602,7 @@ command is running.
 ### Reading an `ENOENT` from the exec step
 
 ```console
-sandbox setup failed while executing the command (/usr/bin/build): \
+sandbox setup failed while executing the command ("/usr/bin/build"): \
     No such file or directory (os error 2)
 ```
 

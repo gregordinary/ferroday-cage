@@ -160,7 +160,7 @@ fn a_missing_command_is_a_typed_exec_error() {
             assert_eq!(source.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
             // The command that could not be executed is named, so a typo in
             // the path appears in the message reporting it.
-            assert_eq!(detail.as_deref(), Some("/does/not/exist"));
+            assert_eq!(detail.as_deref(), Some("\"/does/not/exist\""));
             assert!(err.to_string().contains("/does/not/exist"), "{err}");
         }
         other => panic!("expected a Setup error at the exec step, got {other:?}"),
@@ -216,7 +216,7 @@ fn path_lookup_of_an_unresolvable_command_is_a_typed_exec_error() {
             // the message shows which PATH directories were consulted.
             let detail = detail.as_deref().expect("the exec step names its subject");
             assert!(
-                detail.starts_with("not-a-real-command-xyz, searched "),
+                detail.starts_with("\"not-a-real-command-xyz\", searched "),
                 "{detail}"
             );
             assert!(detail.contains("/bin/not-a-real-command-xyz"), "{detail}");
@@ -730,7 +730,7 @@ fn a_refused_raw_mount_names_the_mount() {
             ..
         } => {
             assert_eq!(step, SetupStep::MountRaw);
-            assert!(detail.contains("raw mount at /raw"), "{detail}");
+            assert!(detail.contains("raw mount at \"/raw\""), "{detail}");
         }
         other => panic!("expected a detailed raw-mount error, got {other:?}"),
     }

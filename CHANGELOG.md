@@ -884,6 +884,13 @@ consumer upgrading can skip it.
   refused as a gzip stream that does not decode. Zeros a member or anything
   else follows, and other bytes after the last member, are refused as before,
   as `gzip` complains of them.
+- A `ConfigError` names every path and value it carries with `{:?}`, and so
+  does the subject of a setup error that names a mount or the command: the
+  mount's paths, the command, and the candidates a path lookup searched. A
+  control character in a `RestrictedProfile`'s rootfs, command, working
+  directory, hidden or read-only path, or `PATH` reached the terminal raw when
+  the error was printed, so a profile from an untrusted source could carry an
+  escape sequence onto it.
 
 ### Internal
 

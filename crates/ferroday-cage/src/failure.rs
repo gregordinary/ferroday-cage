@@ -23,17 +23,19 @@
 //! or one of its consumers turns an error into text.
 //!
 //! A message names a string that nothing vouches for with `{:?}`: what a
-//! mirror, an unsigned index, a package's container or a sandbox's own output
-//! supplied, read before or without a signature over it. `{:?}` writes a
-//! control character as an escape, so an error printed on a terminal cannot
-//! carry an escape sequence onto it that rewrites the screen or sets the
-//! clipboard. A value an alphabet without control characters has already
-//! admitted, such as a package name an index reader checked, is named bare.
+//! mirror, an unsigned index or a package's container supplied, read before or
+//! without a signature over it, what a sandbox's own output carried, and what a
+//! profile from an untrusted source states. `{:?}` writes a control character
+//! as an escape, so an error printed on a terminal cannot carry an escape
+//! sequence onto it that rewrites the screen or sets the clipboard. A value an
+//! alphabet without control characters has already admitted, such as a package
+//! name an index reader checked, is named bare.
 //!
 //! A progress report reaches the same terminal and follows the same rule.
 //! `fcage` quotes the dependency a refusal names and names a package bare: each
-//! layer's index and plan readers hold a package's name to its format's
-//! alphabet before anything reports it, and none of the three holds a control
+//! layer's index and plan readers, and the Gentoo layer's reader of a root's
+//! package database, hold a package's name to its format's alphabet before
+//! anything reports it, and none of the three alphabets holds a control
 //! character.
 
 use std::error::Error as StdError;
@@ -159,9 +161,13 @@ pub(crate) use path_io_error;
 /// What a hostile source could write into a string an error names, and the
 /// check that the error renders it inert. Such a string reaches an error
 /// through a provisioner, an archive's entry names through the tarball one that
-/// every userland layer builds on, or through the network stack, which names an
-/// interface the kernel refused, so the module is built where either is.
-#[cfg(all(test, any(feature = "tarball", feature = "netstack")))]
+/// every userland layer builds on, the network stack, which names an interface
+/// the kernel refused, or a profile loaded from an untrusted source, so the
+/// module is built where any of those is.
+#[cfg(all(
+    test,
+    any(feature = "tarball", feature = "netstack", feature = "serde")
+))]
 pub(crate) mod hostile {
     /// OSC 52, which sets the terminal's clipboard, then a screen clear.
     pub(crate) const TEXT: &str = "\u{1b}]52;c;cm0gLXJmIH4K\u{7}\u{1b}[2J";

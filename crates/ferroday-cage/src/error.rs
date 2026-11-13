@@ -910,6 +910,11 @@ rendered as text.
 }
 
 impl fmt::Display for ConfigError {
+    // Every path and value named here is configuration, and configuration can
+    // come from a profile nothing vouches for: a `RestrictedProfile`'s rootfs,
+    // command, working directory, and hidden paths, or whatever a consumer
+    // composes one with. Each is named with `{:?}`, as the `failure` module
+    // states, so a control character in one reaches a terminal as an escape.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::RootfsMissing => {
@@ -920,7 +925,7 @@ impl fmt::Display for ConfigError {
                  root is configured, but exactly one root is in force; keep one",
             ),
             ConfigError::RootfsUnusable { path, .. } => {
-                write!(f, "cannot use {} as the rootfs", path.display())
+                write!(f, "cannot use {path:?} as the rootfs")
             }
             ConfigError::RootfsIsHostRoot => {
                 f.write_str("the host root directory cannot be the rootfs")
@@ -935,21 +940,19 @@ impl fmt::Display for ConfigError {
                 lookup_offered: true,
             } if is_command_name(command) => write!(
                 f,
-                "the command path {} is not absolute; give an absolute path, or enable \
+                "the command path {command:?} is not absolute; give an absolute path, or enable \
                  path lookup to resolve a bare command name against the sandbox's PATH",
-                command.display(),
             ),
             ConfigError::CommandNotAbsolute {
                 command,
                 lookup_offered: false,
             } if is_command_name(command) => write!(
                 f,
-                "the command path {} is not absolute; a restriction never searches PATH for \
-                 a bare command name, so give an absolute path",
-                command.display(),
+                "the command path {command:?} is not absolute; a restriction never searches PATH \
+                 for a bare command name, so give an absolute path",
             ),
             ConfigError::CommandNotAbsolute { command, .. } => {
-                write!(f, "the command path {} is not absolute", command.display())
+                write!(f, "the command path {command:?} is not absolute")
             }
             ConfigError::ManagedMountsContradiction { toggle } => write!(
                 f,
@@ -961,29 +964,25 @@ impl fmt::Display for ConfigError {
                 "path lookup has nothing to search: PATH {path:?} holds no absolute directory",
             ),
             ConfigError::BindSourceUnusable { path, .. } => {
-                write!(f, "cannot use {} as a bind-mount source", path.display())
+                write!(f, "cannot use {path:?} as a bind-mount source")
             }
             ConfigError::MountTargetInvalid { path } => write!(
                 f,
-                "the mount target {} is not a normal absolute path inside the rootfs",
-                path.display(),
+                "the mount target {path:?} is not a normal absolute path inside the rootfs",
             ),
             ConfigError::SymlinkTargetInvalid { path, target } => write!(
                 f,
-                "the symlink at {} has an empty target, or one too long for a path: {}",
-                path.display(),
-                target.display(),
+                "the symlink at {path:?} has an empty target, or one too long for a path: \
+                 {target:?}",
             ),
             ConfigError::MountFlagsInvalid { target, flags } => write!(
                 f,
-                "the flags {flags:#x} of the raw mount at {} do not fit the kernel's mount-flags \
-                 word",
-                target.display(),
+                "the flags {flags:#x} of the raw mount at {target:?} do not fit the kernel's \
+                 mount-flags word",
             ),
             ConfigError::WorkdirNotAbsolute { path } => write!(
                 f,
-                "the working directory {} is not a normal absolute path",
-                path.display(),
+                "the working directory {path:?} is not a normal absolute path",
             ),
             ConfigError::HostnameInvalid { name } => write!(
                 f,
@@ -1018,8 +1017,7 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::LandlockPathInvalid { path } => write!(
                 f,
-                "the Landlock grant path {} is not a normal absolute path",
-                path.display(),
+                "the Landlock grant path {path:?} is not a normal absolute path",
             ),
             ConfigError::RestrictionLandlockUnenforceable { abi } => match abi {
                 Some(abi) => write!(
@@ -1139,9 +1137,8 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::OverlayPathInvalid { path } => write!(
                 f,
-                "the overlay-root path {} contains a ',', which the overlay mount options \
+                "the overlay-root path {path:?} contains a ',', which the overlay mount options \
                  cannot carry",
-                path.display(),
             ),
             ConfigError::OverlayOptionsTooLong { length } => write!(
                 f,
@@ -1154,18 +1151,15 @@ impl fmt::Display for ConfigError {
             ConfigError::OverlayUpperMissing => {
                 f.write_str("the overlay root names no upper layer for its writes")
             }
-            ConfigError::OverlayDirUnusable { layer, path, .. } => write!(
-                f,
-                "cannot use {} as the overlay {layer} directory",
-                path.display(),
-            ),
+            ConfigError::OverlayDirUnusable { layer, path, .. } => {
+                write!(f, "cannot use {path:?} as the overlay {layer} directory")
+            }
             ConfigError::OverlayDirUnowned { layer, path } => write!(
                 f,
-                "cannot use {} as the overlay {layer} directory: something is already there that \
-                 is not a directory the calling user owns; the layer directories are created \
+                "cannot use {path:?} as the overlay {layer} directory: something is already there \
+                 that is not a directory the calling user owns; the layer directories are created \
                  fresh, and adopting an entry another user could have planted would send the \
                  sandbox's writes wherever it pointed",
-                path.display(),
             ),
             ConfigError::OverlayLayersOverlap {
                 layer,
@@ -1175,31 +1169,23 @@ impl fmt::Display for ConfigError {
             } => {
                 match (path == within_path, layer == within) {
                     (true, true) => {
-                        write!(
-                            f,
-                            "the overlay names {} as two of its {layer}s",
-                            path.display()
-                        )
+                        write!(f, "the overlay names {path:?} as two of its {layer}s")
                     }
                     (true, false) => write!(
                         f,
-                        "the overlay names {} as both its {within} and its {layer}",
-                        path.display(),
+                        "the overlay names {path:?} as both its {within} and its {layer}",
                     ),
                     (false, _) => write!(
                         f,
-                        "the overlay's {layer} {} lies inside its {within} {}",
-                        path.display(),
-                        within_path.display(),
+                        "the overlay's {layer} {path:?} lies inside its {within} {within_path:?}",
                     ),
                 }?;
                 f.write_str("; an overlay's layers must be disjoint")
             }
             ConfigError::OverlayLayerIsRoot { layer, path } => write!(
                 f,
-                "cannot use {} as the overlay {layer} directory: it names no directory inside a \
-                 parent, and the {layer} is created in one",
-                path.display(),
+                "cannot use {path:?} as the overlay {layer} directory: it names no directory \
+                 inside a parent, and the {layer} is created in one",
             ),
             ConfigError::OverlayUnavailable { blocker } => {
                 write!(f, "an overlay-rooted cage cannot be established: {blocker}")
@@ -1214,10 +1200,9 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::MountTargetMissing { target, .. } => write!(
                 f,
-                "the mount target {} is not in the host's root, where a launch creates \
+                "the mount target {target:?} is not in the host's root, where a launch creates \
                  nothing (mount over a path that exists, or beneath a filesystem the sandbox \
                  mounts, such as a hidden directory or /tmp)",
-                target.display()
             ),
             ConfigError::LandlockResolveUnixUnenforceable { abi } => match abi {
                 Some(abi) => write!(
@@ -1236,9 +1221,8 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::RevealUnhidden { path } => write!(
                 f,
-                "{} is not a path the root hides by default, so revealing it is a mistake (the \
-                 host's own root hides /home, /root, /run, /var/run, and /var/tmp)",
-                path.display()
+                "{path:?} is not a path the root hides by default, so revealing it is a mistake \
+                 (the host's own root hides /home, /root, /run, /var/run, and /var/tmp)",
             ),
             ConfigError::CgroupLimitInvalid { reason } => {
                 write!(f, "the cgroup settings cannot be carried out: {reason}")
@@ -1250,10 +1234,9 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::NestedUsernsProcfsReadOnly { target } => write!(
                 f,
-                "the procfs at {} is read-only, and the nested user namespace that locks the \
-                 sandbox's mount flags writes its identity map through it; mount it writable, \
+                "the procfs at {target:?} is read-only, and the nested user namespace that locks \
+                 the sandbox's mount flags writes its identity map through it; mount it writable, \
                  or leave the managed profile's own procfs in place",
-                target.display(),
             ),
         }
     }
@@ -1812,7 +1795,7 @@ mod tests {
         };
         let message = err.to_string();
         assert!(
-            message.contains("the command path sh is not absolute"),
+            message.contains("the command path \"sh\" is not absolute"),
             "{message}"
         );
         assert!(message.contains("enable path lookup"), "{message}");
@@ -1828,7 +1811,7 @@ mod tests {
         };
         let message = err.to_string();
         assert!(
-            message.contains("the command path sh is not absolute"),
+            message.contains("the command path \"sh\" is not absolute"),
             "{message}"
         );
         assert!(message.contains("never searches PATH"), "{message}");
@@ -1845,7 +1828,7 @@ mod tests {
                 lookup_offered,
             };
             let message = err.to_string();
-            assert_eq!(message, "the command path ./bin/sh is not absolute");
+            assert_eq!(message, "the command path \"./bin/sh\" is not absolute");
         }
     }
 

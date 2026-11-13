@@ -4677,7 +4677,9 @@ fn overlay_errno(layer: OverlayLayer, path: &Path, errno: Errno) -> Error {
 /// Each op carries every path it needs as a rootfs-relative `CString`, with
 /// mount-target directory chains precomputed as [`MountDir`]s, so the child
 /// process performs no path manipulation. The label list is parallel to the ops
-/// and caller-side only: it names the mount in a setup error.
+/// and caller-side only: it names the mount in a setup error. A configured path
+/// is named there with `{:?}`, since a profile nothing vouches for can supply a
+/// hidden path or one made read-only, and every kind is named the same way.
 #[derive(Default)]
 struct Lowering {
     ops: Vec<MountOp>,
@@ -4852,9 +4854,8 @@ impl Lowering {
         };
 
         let label = format!(
-            "{} at {}{}",
-            source.display(),
-            bind.target.display(),
+            "{source:?} at {:?}{}",
+            bind.target,
             if bind.read_only { ", read-only" } else { "" },
         );
         self.push(
@@ -4902,7 +4903,7 @@ impl Lowering {
                     data,
                 },
             },
-            format!("raw mount at {}", raw.target.display()),
+            format!("raw mount at {:?}", raw.target),
         );
         Ok(())
     }
@@ -4918,7 +4919,7 @@ impl Lowering {
                     target: sandbox_target(&hide.target)?,
                 },
             },
-            format!("hiding {}", hide.target.display()),
+            format!("hiding {:?}", hide.target),
         );
         Ok(())
     }
@@ -4934,7 +4935,7 @@ impl Lowering {
                     target: sandbox_target(&read_only.target)?,
                 },
             },
-            format!("{} made read-only", read_only.target.display()),
+            format!("{:?} made read-only", read_only.target),
         );
         Ok(())
     }
@@ -4968,11 +4969,7 @@ impl Lowering {
                     content: cstring(target)?,
                 },
             },
-            format!(
-                "symlink at {} to {}",
-                symlink.path.display(),
-                symlink.target.display()
-            ),
+            format!("symlink at {:?} to {:?}", symlink.path, symlink.target),
         );
         Ok(())
     }
@@ -5481,20 +5478,19 @@ pub(crate) fn lower_rlimits(
 /// For an ordinary command it is the path that was executed. For a path lookup
 /// it is the bare name followed by every candidate the search tried, since the
 /// reported errno is the search's verdict rather than any one candidate's.
+///
+/// Each is named with `{:?}`, as every configured path a setup error names is:
+/// a profile nothing vouches for can supply the command and the `PATH` the
+/// candidates come from.
 pub(crate) fn exec_label(command: &Path, search: &[CString]) -> String {
-    let command = command.display();
     if search.is_empty() {
-        return command.to_string();
+        return format!("{command:?}");
     }
     let candidates: Vec<String> = search
         .iter()
-        .map(|candidate| {
-            Path::new(OsStr::from_bytes(candidate.as_bytes()))
-                .display()
-                .to_string()
-        })
+        .map(|candidate| format!("{:?}", Path::new(OsStr::from_bytes(candidate.as_bytes()))))
         .collect();
-    format!("{command}, searched {}", candidates.join(", "))
+    format!("{command:?}, searched {}", candidates.join(", "))
 }
 
 /// A command validated for execution.
@@ -6534,7 +6530,7 @@ mod tests {
             .plan
             .op_labels
             .iter()
-            .position(|label| label == "raw mount at /raw")
+            .position(|label| label == "raw mount at \"/raw\"")
             .unwrap();
         let bind_index = cage
             .plan
@@ -6617,7 +6613,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(cage.plan.op_labels.len(), 1, "{:?}", cage.plan.op_labels);
-        assert!(cage.plan.op_labels[0].starts_with("/proc at /proc"));
+        assert!(cage.plan.op_labels[0].starts_with("\"/proc\" at \"/proc\""));
     }
 
     #[test]
@@ -8597,7 +8593,7 @@ mod tests {
             .ops
             .iter()
             .zip(&cage.plan.op_labels)
-            .find(|(_, label)| label.ends_with("at /a/b/hostname"))
+            .find(|(_, label)| label.ends_with("at \"/a/b/hostname\""))
             .expect("the bind op");
         assert_eq!(op.dirs.len(), 2, "both /a and /a/b are created");
         assert!(op.dirs.iter().all(|dir| dir.mode == 0o755));
@@ -9277,6 +9273,71 @@ read-only = true
         assert_eq!(builder.command.as_deref(), Some(Path::new("/bin/sh")));
     }
 
+    /// What a restricted profile states reaches an error, and the label a setup
+    /// error names its subject by, with its control characters escaped: the
+    /// profile is loaded under the policy because nothing vouches for it.
+    #[test]
+    fn a_restricted_profile_s_values_are_named_escaped() {
+        use crate::failure::hostile::{TEXT, assert_escaped};
+
+        // TOML carries a control character only as an escape, which the
+        // value's own rendering writes.
+        let quoted = |value: String| toml::Value::String(value).to_string();
+        let load = |profile: String| -> CageBuilder {
+            toml::from_str::<RestrictedProfile>(&profile)
+                .expect("the restricted policy admits it")
+                .into_builder()
+        };
+        let refused = |profile: String| {
+            let err = load(profile).build().expect_err("the build refuses it");
+            assert_escaped(&crate::ErrorChain::new(&err).to_string());
+        };
+
+        let sandbox = "rootfs = \"/tmp\"\ncommand = \"/bin/sh\"\n";
+        refused(format!(
+            "{sandbox}workdir = {}\n",
+            quoted(format!("work{TEXT}"))
+        ));
+        refused(format!(
+            "{sandbox}[[mount]]\nkind = \"hide\"\ntarget = {}\n",
+            quoted(format!("home{TEXT}")),
+        ));
+        refused(format!(
+            "command = \"/bin/sh\"\nrootfs = {}\n",
+            quoted(format!("/nonexistent/{TEXT}")),
+        ));
+        refused(format!(
+            "rootfs = \"/tmp\"\ncommand = {}\n",
+            quoted(format!("bin/{TEXT}")),
+        ));
+
+        // A path the build accepts is named in the label of the step it fails.
+        let cage = load(format!(
+            "{sandbox}[[mount]]\nkind = \"hide\"\ntarget = {}\n\n\
+             [[mount]]\nkind = \"read-only\"\ntarget = {}\n",
+            quoted(format!("/home/{TEXT}")),
+            quoted(format!("/work/{TEXT}")),
+        ))
+        .build()
+        .expect("both are paths a launch can act on");
+        let labels = &cage.plan.op_labels;
+        let named: Vec<&String> = labels
+            .iter()
+            .filter(|label| label.starts_with("hiding") || label.ends_with("made read-only"))
+            .collect();
+        assert_eq!(named.len(), 2, "{labels:?}");
+        for label in named {
+            assert_escaped(label);
+        }
+        let searched = load(format!(
+            "rootfs = \"/tmp\"\ncommand = \"sh\"\npath-lookup = true\n[env]\nPATH = {}\n",
+            quoted(format!("/bin/{TEXT}")),
+        ))
+        .build()
+        .expect("a PATH with an absolute entry");
+        assert_escaped(&searched.plan.exec_label);
+    }
+
     /// The `[cgroup]` table reads back as the limits it states, and a value the
     /// kernel would refuse is refused at build.
     #[test]
@@ -9696,7 +9757,7 @@ read-only = true
             &cage.plan.ops[at]
         };
         // The link's directory is made inside the managed /tmp.
-        let link = op("symlink at /tmp/links/env");
+        let link = op("symlink at \"/tmp/links/env\"");
         assert_eq!(link.dirs.len(), 1, "{:?}", link.dirs);
         assert_eq!(link.dirs[0].leaf.as_bytes(), b"links");
         // The file target is made inside the hidden /home, its directory too.
@@ -9704,7 +9765,7 @@ read-only = true
         assert_eq!(file.dirs.len(), 1, "{:?}", file.dirs);
         assert_eq!(file.create_file.as_deref(), Some(c"home/user/passwd"));
         // The host's own /usr is the target, and nothing is made for it.
-        let usr = op("/usr at /usr");
+        let usr = op("\"/usr\" at \"/usr\"");
         assert!(usr.dirs.is_empty() && usr.create_file.is_none());
     }
 
