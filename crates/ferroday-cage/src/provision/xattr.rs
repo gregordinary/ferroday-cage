@@ -166,6 +166,11 @@ pub(super) fn narrowed_mode(fd: BorrowedFd<'_>, mode: u32) -> Result<u32, Errno>
 /// The length can change between the asking and the reading, which the read
 /// answers with `ERANGE`; it is asked again a few times before that is
 /// reported. A filesystem without extended attributes has none to read.
+///
+/// The buffer is never empty, even where the length asked was zero: the kernel
+/// takes a read into an empty buffer for another question about the length,
+/// and answers it rather than refusing it, so something that grew in between
+/// would read as nothing at all.
 pub(super) fn read_sized(
     mut query: impl FnMut() -> Result<usize, Errno>,
     mut read: impl FnMut(&mut [u8]) -> Result<usize, Errno>,
@@ -176,7 +181,7 @@ pub(super) fn read_sized(
             Err(Errno::NOTSUP) => return Ok(Vec::new()),
             Err(errno) => return Err(errno),
         };
-        let mut buffer = vec![0u8; size];
+        let mut buffer = vec![0u8; size.max(1)];
         match read(&mut buffer) {
             Ok(read) => {
                 buffer.truncate(read);
@@ -479,5 +484,31 @@ mod tests {
             capability_mapped(&rooted[..22], unmapped),
             Restated::Malformed
         );
+    }
+
+    #[test]
+    fn a_value_that_grew_after_a_zero_length_answer_is_read_whole() {
+        // The kernel answers a read into an empty buffer with the length, as
+        // it answers the query, so an attribute empty when its length was
+        // asked and longer when it was read reads as nothing.
+        let value = b"grown";
+        let mut asked = 0;
+        let read = read_sized(
+            || {
+                asked += 1;
+                Ok(if asked == 1 { 0 } else { value.len() })
+            },
+            |buffer| {
+                if buffer.is_empty() {
+                    return Ok(value.len());
+                }
+                if buffer.len() < value.len() {
+                    return Err(Errno::RANGE);
+                }
+                buffer[..value.len()].copy_from_slice(value);
+                Ok(value.len())
+            },
+        );
+        assert_eq!(read, Ok(value.to_vec()));
     }
 }

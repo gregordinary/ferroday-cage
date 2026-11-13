@@ -935,6 +935,9 @@ consumer upgrading can skip it.
 - A directory a host-side write carries up from a layered build's base keeps
   the base directory's modification time, as an extraction's carry and the
   overlay's own copy-up keep it. It was given the time of the write.
+- An extended attribute that was empty when its length was asked, and held a
+  value by the time it was read, is read with that value by a copy into a root
+  filesystem and by a layered build's carry, where it read as empty.
 
 ### Internal
 
