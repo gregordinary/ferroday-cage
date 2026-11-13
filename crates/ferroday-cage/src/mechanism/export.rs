@@ -395,6 +395,16 @@ impl Walker<'_> {
     /// over a slice, which allocates nothing. A directory's names are unique,
     /// so the order is total. The cost is a directory's size times its
     /// logarithm, however large it is, until the arena runs out.
+    ///
+    /// The walk recurses once per level, through this and
+    /// [`visit_entry`](Self::visit_entry), and refuses a tree deeper than
+    /// [`MAX_DEPTH`]. That bounds the stack it takes, since nothing larger than
+    /// the directory-iteration buffer is in either frame: the helpers holding
+    /// the large buffers, the attributes' two of `XATTR_SIZE_MAX`, a link
+    /// target's and a file's data, are kept out of line, so their buffers are
+    /// on the stack only while one runs and never once per level. At
+    /// [`MAX_DEPTH`] levels of a few kilobytes each, the walk stays well inside
+    /// the stack of the thread that forked it.
     fn walk_dir(
         &self,
         dir: BorrowedFd<'_>,
@@ -543,6 +553,10 @@ impl Walker<'_> {
     /// list and each value into bounded stack buffers, the kernel's 64 KiB cap
     /// on both keeping them finite. A filesystem or entry with no xattr support
     /// emits an empty block.
+    ///
+    /// Kept out of line, so its buffers are never in a level of the walk's
+    /// frame; see [`walk_dir`](Self::walk_dir).
+    #[inline(never)]
     fn emit_xattrs(&self, fd: BorrowedFd<'_>) -> Result<(), (ExportStep, Errno)> {
         let stream = self.stream;
         let mut names = [0u8; XATTR_SIZE_MAX];
@@ -592,6 +606,9 @@ impl Walker<'_> {
     /// them would also mean an `O_PATH` descriptor and a `/proc/self/fd` detour,
     /// since `flistxattr` refuses one; the frame format leaves the door open by
     /// simply having no block here.
+    ///
+    /// Kept out of line for the reason [`emit_xattrs`](Self::emit_xattrs) is.
+    #[inline(never)]
     fn emit_symlink(
         &self,
         dir: BorrowedFd<'_>,
