@@ -603,6 +603,10 @@ consumer upgrading can skip it.
   closed in the caller through the launch.
 - `fcage --help` names `--no-stop-with-caller` among the counterpart toggles,
   where it named `--stop-with-caller`.
+- `fcage --seccomp-allow` and `--seccomp-deny` refuse a value that names no
+  syscall, such as the empty value an unset variable expands to, as a usage
+  error. Such a value launched with no seccomp filter from the flag, or under a
+  profile's policy beside a profile.
 
 ### Internal
 

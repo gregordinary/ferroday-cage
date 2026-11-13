@@ -4790,12 +4790,24 @@ fn parse_seccomp(value: &str, curated: &mut bool) -> Result<(), String> {
 
 /// Appends the comma-separated syscall names in `value` to `target`, resolved
 /// to their numbers for the host architecture.
+///
+/// A value that names no syscall is refused, as `--seccomp-allow-rule ""` is.
+/// It is almost always a variable that was never set, as in
+/// `--seccomp-allow "$SYSCALLS"`, and reading it as an empty list would launch
+/// without the filter the flag asked for, or under a profile's in its place.
 fn parse_seccomp_names(flag: &str, value: &str, target: &mut Vec<i64>) -> Result<(), String> {
-    for name in value
+    let names: Vec<&str> = value
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
-    {
+        .collect();
+    if names.is_empty() {
+        return Err(format!(
+            "{flag} requires at least one syscall name, and {value:?} names none; an empty \
+             value is what an unset variable expands to"
+        ));
+    }
+    for name in names {
         target.push(resolve_syscall_name(flag, name)?);
     }
     Ok(())
@@ -9307,6 +9319,22 @@ mod tests {
         );
         parse_seccomp_names("--seccomp-allow", "ioctl", &mut target).unwrap();
         assert_eq!(target.last(), Some(&sysno("ioctl")));
+    }
+
+    #[test]
+    fn a_syscall_list_naming_none_is_refused() {
+        // What an unset variable expands to asks for a policy and names
+        // nothing in it, so it is refused rather than read as no flag at all,
+        // which would launch without the filter or under a profile's instead.
+        for flag in ["--seccomp-allow", "--seccomp-deny"] {
+            for value in ["", ",", " , "] {
+                let error = parse_error(&["--empty-rootfs", flag, value, "/bin/true"]);
+                assert!(
+                    error.contains("requires at least one syscall name"),
+                    "{flag} {value:?}: {error}",
+                );
+            }
+        }
     }
 
     #[test]
