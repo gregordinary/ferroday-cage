@@ -1351,8 +1351,13 @@ impl<'obs> Pending<'obs> {
     /// [`Network::None`](crate::Network::None) it names the sandbox's private
     /// network namespace; under [`Network::Host`](crate::Network::Host) there
     /// is no private namespace and this is the host's, where attaching a stack
-    /// is not meaningful. The process is alive until this handle is consumed
-    /// by [`proceed`](Self::proceed) or dropped.
+    /// is not meaningful.
+    ///
+    /// The process is one the launch holds at its gate until this handle is
+    /// consumed by [`proceed`](Self::proceed) or dropped, and a kill from
+    /// outside the library can end it sooner. A pid can then name another
+    /// process, so a caller opens `/proc/<pid>/ns/net` once and keeps that
+    /// descriptor, rather than resolving the path again later.
     pub fn netns_pid(&self) -> u32 {
         self.inner
             .as_ref()

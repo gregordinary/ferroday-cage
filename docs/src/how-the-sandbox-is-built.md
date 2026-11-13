@@ -129,12 +129,14 @@ model](process-model.md) describes.
     host; the mount syscalls then reach the resolved target through its
     `/proc/self/fd` path. Missing mount targets are created; a directory
     stays afterwards, a file does not (see [What a launch leaves in the
-    root](#what-a-launch-leaves-in-the-root)). A read-only bind is made read-only
-    after binding with `mount_setattr` and `AT_RECURSIVE`, so the bind and
-    every mount beneath it become read-only in one step; on a kernel before
-    5.12, which lacks `mount_setattr`, only the top mount is made read-only
-    (carrying along the flags the user namespace holds locked) and any
-    submounts of the source keep their own flags. The restriction becomes a
+    root](#what-a-launch-leaves-in-the-root)). A read-only bind is cloned
+    detached, made read-only with `mount_setattr` and `AT_RECURSIVE` while
+    still detached, and only then attached, so the bind and every mount beneath
+    it are read-only from the moment a path can reach them. On a kernel before
+    5.12, which lacks `mount_setattr`, the bind is attached first and its top
+    mount then remounted read-only through the clone's descriptor (carrying
+    along the flags the user namespace holds locked): it is writable for that
+    moment, and any submounts of the source keep their own flags. The restriction becomes a
     boundary at step 15, where the command enters a nested user namespace and
     the kernel locks it — see [A read-only bind is a
     boundary](#a-read-only-bind-is-a-boundary). An empty root is made read-only
