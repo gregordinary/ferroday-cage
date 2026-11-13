@@ -281,11 +281,13 @@ outside 1 through 4095, whether given here or as a `SeccompAction::Errno`. Zero
 reports a success the syscall never performed, and the C library reads a larger
 number as the value the syscall returned.
 
-The filter binds the command and its descendants. The `hardening` feature
-builds for the `x86_64`, `aarch64`, and `riscv64` architectures. A `Rules`
-policy is compiled for the host's own syscall ABI, and kills a process that
-makes a syscall under any other audit architecture, as a natively run 32-bit
-userland does at its first syscall. [Host
+The filter binds the command and its descendants. A `Rules` policy compiles
+for a 64-bit host: `x86_64`, `aarch64`, or `riscv64`. The `hardening` feature
+builds for x86 and 32-bit arm as well, where the build refuses a `Rules` policy
+with `ConfigError::SeccompUnsupportedArch` and the Landlock rules and capability
+drops apply as anywhere. A `Rules` policy is compiled for the host's own
+syscall ABI, and kills a process that makes a syscall under any other audit
+architecture, as a natively run 32-bit userland does at its first syscall. [Host
 requirements](host-requirements.md#architecture) describes that case. A
 `Program` is installed as given, and a syscall made under another architecture
 gets whatever the program answers. A program written by hand therefore checks

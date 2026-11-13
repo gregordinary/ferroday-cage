@@ -46,6 +46,10 @@ fn probing() -> bool {
 }
 
 /// Prints a route's outcome on the line the outer test reads.
+///
+/// `allow` rather than `expect`: a long is an int on a 32-bit target, where the
+/// narrowing cannot fail and the pattern is irrefutable, and on no other.
+#[allow(irrefutable_let_patterns)]
 fn report(route: &str, result: libc::c_long) {
     if result < 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -67,7 +71,10 @@ fn socket(domain: libc::c_long) -> libc::c_long {
     unsafe { libc::syscall(libc::SYS_socket, domain, libc::SOCK_STREAM, 0) }
 }
 
+// `allow` rather than `expect`: widening an int to a long is the identity on a
+// 32-bit target, where the conversion lint fires, and on no other.
 #[test]
+#[allow(clippy::useless_conversion)]
 fn probe_native() {
     if !probing() {
         return;
@@ -427,7 +434,7 @@ fn an_isolated_network_closes_the_32_bit_entry_points() {
 /// Runs the probe test `test` in a sandbox under `policy`, or under no policy
 /// of its own where `None`, and returns what it reported on its line starting
 /// with `key`.
-#[cfg(feature = "hardening")]
+#[cfg(all(feature = "hardening", target_pointer_width = "64"))]
 fn report_under(test: &str, key: &str, policy: Option<ferroday_cage::SeccompPolicy>) -> String {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let mut builder = common::host_userland()
@@ -460,14 +467,18 @@ fn report_under(test: &str, key: &str, policy: Option<ferroday_cage::SeccompPoli
 
 /// A policy refusing the `seccomp` syscall, as a container runtime's profile
 /// can.
-#[cfg(feature = "hardening")]
+///
+/// It and the tests that launch under it build for a 64-bit target alone:
+/// libc's syscall numbers are the `i64` a rule takes only there, and a policy
+/// compiles for a 64-bit host alone.
+#[cfg(all(feature = "hardening", target_pointer_width = "64"))]
 fn refusing_seccomp() -> Option<ferroday_cage::SeccompPolicy> {
     let rules = ferroday_cage::SeccompRules::denying([libc::SYS_seccomp]);
     Some(ferroday_cage::SeccompPolicy::Rules(rules))
 }
 
 /// What the host probe answers inside a sandbox under `policy`.
-#[cfg(feature = "hardening")]
+#[cfg(all(feature = "hardening", target_pointer_width = "64"))]
 fn seccomp_available_under(policy: Option<ferroday_cage::SeccompPolicy>) -> bool {
     report_under("probe_seccomp_available", "seccomp-available", policy)
         .parse()
@@ -479,7 +490,7 @@ fn seccomp_available_under(policy: Option<ferroday_cage::SeccompPolicy>) -> bool
 /// syscall, as a container runtime's profile can, no filter can be installed,
 /// and the probe says so.
 #[test]
-#[cfg(feature = "hardening")]
+#[cfg(all(feature = "hardening", target_pointer_width = "64"))]
 fn the_seccomp_probe_reports_a_policy_that_refuses_the_install() {
     if !host_runs_the_filter() {
         return;
@@ -499,7 +510,12 @@ fn the_seccomp_probe_reports_a_policy_that_refuses_the_install() {
 /// download, naming the filter. Where the filter installs, the same bootstrap
 /// reaches the download, which is what makes the refusal the preflight's.
 #[test]
-#[cfg(all(feature = "hardening", feature = "debian", feature = "alpine"))]
+#[cfg(all(
+    feature = "hardening",
+    feature = "debian",
+    feature = "alpine",
+    target_pointer_width = "64"
+))]
 fn a_bootstrap_refuses_a_host_without_seccomp_before_downloading() {
     if !host_runs_the_filter() {
         return;

@@ -6,6 +6,10 @@
 //! exercise on hosts where every cage test skips. Tests skip explicitly when
 //! the kernel lacks the facility they use, Landlock or seccomp, rather than
 //! passing silently.
+//!
+//! A test that names a syscall by libc's number builds for a 64-bit target
+//! alone. libc's numbers are the `i64` a rule takes only there, and a seccomp
+//! policy compiles for a 64-bit host alone.
 
 use std::path::Path;
 use std::time::Duration;
@@ -14,9 +18,11 @@ mod common;
 
 use common::scratch_dir as scratch;
 use ferroday_cage::{
-    Error, FsAccess, LandlockScope, NetAccess, Restriction, RestrictionBuilder, SeccompAction,
-    SeccompArg, SeccompPolicy, SeccompRules, SetupStep, Stdio, Terminal,
+    Error, FsAccess, LandlockScope, NetAccess, Restriction, RestrictionBuilder, SeccompPolicy,
+    SeccompRules, SetupStep, Stdio, Terminal,
 };
+#[cfg(target_pointer_width = "64")]
+use ferroday_cage::{SeccompAction, SeccompArg};
 
 /// Adds the grants that make a dynamically linked host binary runnable:
 /// read and execute beneath the standard system trees, granting only the
@@ -268,6 +274,7 @@ fn curated_seccomp_allows_an_ordinary_command() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn a_denied_syscall_kills_the_command() {
     if !common::require::seccomp() {
         return;
@@ -291,6 +298,7 @@ fn a_denied_syscall_kills_the_command() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn an_argument_condition_kills_only_a_matching_call() {
     if !common::require::seccomp() {
         return;
@@ -316,6 +324,7 @@ fn an_argument_condition_kills_only_a_matching_call() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn an_argument_condition_spares_a_nonmatching_call() {
     if !common::require::seccomp() {
         return;
@@ -705,6 +714,7 @@ fn a_scoped_restriction_cannot_read_an_outside_process_environment() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn a_syscall_answered_with_its_own_errno_reports_it() {
     if !common::require::seccomp() {
         return;
@@ -752,6 +762,7 @@ fn a_syscall_answered_with_its_own_errno_reports_it() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn the_curated_policy_denies_a_namespace_and_starts_threads_and_processes() {
     if !common::require::seccomp() {
         return;

@@ -1408,6 +1408,9 @@ fn curated_denylist() -> Vec<i64> {
         Sysno::swapoff,
         Sysno::reboot,
         Sysno::kexec_load,
+        // i386 never gained `kexec_file_load`. No policy compiles for a 32-bit
+        // host, but the roster is still built there, so the name is left out.
+        #[cfg(not(target_arch = "x86"))]
         Sysno::kexec_file_load,
         Sysno::init_module,
         Sysno::finit_module,
@@ -3003,16 +3006,32 @@ pub(crate) mod serde_request {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_pointer_width = "64")]
     use crate::mechanism::seccomp::eval::{self, Call};
+
+    // A test that compiles a `Rules` policy for the host, or names a syscall by
+    // libc's number, carries `#[cfg(target_pointer_width = "64")]`. A policy
+    // compiles for a 64-bit host alone, and libc's numbers are the `i64` a
+    // rule takes only on a 64-bit target, so such a test has nothing to run on
+    // a 32-bit one. The test below holds the gate to `host_target_arch`.
 
     /// A call of `syscall` on the host's architecture, with `args` and then
     /// zeroes.
+    #[cfg(target_pointer_width = "64")]
     fn host_call(syscall: i64, args: &[u64]) -> Call {
         Call::new(
             audit_arch(host_target_arch().unwrap()),
             u32::try_from(syscall).unwrap(),
             args,
         )
+    }
+
+    #[test]
+    fn a_policy_compiles_for_the_host_exactly_where_pointers_are_64_bits() {
+        assert_eq!(
+            host_target_arch().is_ok(),
+            cfg!(target_pointer_width = "64")
+        );
     }
 
     #[test]
@@ -3277,6 +3296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn curated_profile_compiles() {
         let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated())).unwrap();
         assert!(!program.is_empty());
@@ -3407,6 +3427,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn the_curated_roster_extended_refuses_its_own_entries_and_the_added_ones() {
         const AF_INET: u64 = libc::AF_INET as u64;
         let rules = SeccompRules::curated()
@@ -3436,6 +3457,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn a_syscall_the_caller_lists_and_answers_is_refused_over_the_roster_too() {
         // The roster yields to the caller's errno, but the caller's own listing
         // and errno for one syscall still contradict each other.
@@ -3449,6 +3471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn the_curated_policy_denies_creating_a_namespace() {
         let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated())).unwrap();
         let eperm = ret_value(SeccompAction::Errno(EPERM));
@@ -3532,6 +3555,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn seccomp_policies_report_whether_they_restrict() {
         assert!(SeccompPolicy::Rules(SeccompRules::curated()).restricts());
         assert!(SeccompPolicy::Rules(SeccompRules::denying([libc::SYS_ptrace])).restricts());
@@ -3573,6 +3597,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn argument_conditioned_rules_compile() {
         // An allowlist that permits ioctl only for a specific request, plus a
         // masked-eq condition, compiles to a non-empty program.
@@ -3587,6 +3612,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn an_unconditional_listing_dominates_a_condition() {
         // A syscall listed both unconditionally and with a condition matches
         // unconditionally: the compiled program equals the one from the plain
@@ -3604,6 +3630,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn an_out_of_range_argument_index_is_rejected() {
         // A syscall has six argument registers (indices 0 through 5); an index
         // past them is rejected when the condition is lowered.
@@ -3685,6 +3712,7 @@ mod tests {
     /// so it is pinned here instead — where the type is, rather than in the
     /// snapshot the change moved it out of.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn a_seccomp_policy_clones() {
         let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated()))
             .expect("the curated policy compiles");
@@ -3974,6 +4002,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn a_syscall_number_no_filter_can_name_is_refused() {
         // Below zero, past the 32 bits a comparison holds, and at the x32 bit
         // where x86_64's aliases begin: refused, where the compiler backend
@@ -4003,6 +4032,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn a_dword_operand_wider_than_32_bits_is_refused() {
         // A mask of `1 << 32` would truncate to zero and match every call.
         for arg in [
@@ -4066,6 +4096,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn an_errno_prologue_sits_between_the_x32_guard_and_the_filter() {
         let rules = SeccompRules::denying([libc::SYS_acct]).errno_for(libc::SYS_clone3, 38);
         let program = compile_seccomp(&SeccompPolicy::Rules(rules)).unwrap();
@@ -4081,6 +4112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn a_syscall_both_listed_and_given_an_errno_is_refused() {
         for rules in [
             SeccompRules::denying([libc::SYS_clone3]).errno_for(libc::SYS_clone3, 38),
@@ -4096,6 +4128,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn an_errno_no_failed_syscall_reports_is_refused() {
         // Zero answers a call with a success it never performed: `getpid`
         // reports pid 0, and a `clone3` caller takes itself for the child.
@@ -4208,6 +4241,7 @@ errno = { clone3 = "enosys" }
 
     /// The seccomp policy a profile's `[hardening.seccomp]` value reads as, and
     /// the profile it writes back.
+    #[cfg(target_pointer_width = "64")]
     fn seccomp_round_trip(value: &str) -> (crate::SeccompPolicy, String) {
         let profile =
             format!("rootfs = \"/r\"\ncommand = \"/c\"\n[hardening]\nseccomp = {value}\n");
@@ -4217,7 +4251,10 @@ errno = { clone3 = "enosys" }
         (policy, written)
     }
 
+    // Names its syscalls by libc's numbers, the `i64` a rule takes on a 64-bit
+    // target alone.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn the_curated_roster_reads_and_writes_by_name() {
         use crate::{SeccompPolicy, SeccompRules};
 

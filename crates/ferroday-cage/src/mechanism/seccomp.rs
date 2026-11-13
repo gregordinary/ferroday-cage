@@ -850,19 +850,21 @@ mod tests {
 
     #[test]
     fn the_native_numbers_are_the_c_librarys() {
-        assert_eq!(i64::from(IO_URING_SETUP), libc::SYS_io_uring_setup);
+        // libc spells a syscall number as a `c_long`, whose width is the
+        // target's, so each is read into the filter's own type to compare.
+        assert_eq!(Ok(IO_URING_SETUP), u32::try_from(libc::SYS_io_uring_setup));
         assert_eq!(AF_VSOCK, libc::AF_VSOCK as u32);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(i64::from(X86_64_SOCKET), libc::SYS_socket);
+        assert_eq!(Ok(X86_64_SOCKET), u32::try_from(libc::SYS_socket));
         #[cfg(target_arch = "x86")]
         {
-            assert_eq!(i64::from(I386_SOCKET), libc::SYS_socket);
-            assert_eq!(i64::from(I386_SOCKETCALL), libc::SYS_socketcall);
+            assert_eq!(Ok(I386_SOCKET), u32::try_from(libc::SYS_socket));
+            assert_eq!(Ok(I386_SOCKETCALL), u32::try_from(libc::SYS_socketcall));
         }
         #[cfg(target_arch = "arm")]
-        assert_eq!(i64::from(ARM_SOCKET), libc::SYS_socket);
+        assert_eq!(Ok(ARM_SOCKET), u32::try_from(libc::SYS_socket));
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        assert_eq!(i64::from(GENERIC_SOCKET), libc::SYS_socket);
+        assert_eq!(Ok(GENERIC_SOCKET), u32::try_from(libc::SYS_socket));
     }
 
     #[test]

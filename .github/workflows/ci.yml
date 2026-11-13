@@ -346,6 +346,40 @@ jobs:
       - name: Check
         run: cargo +1.91 check --workspace --all-targets --all-features
 
+  targets:
+    name: Architectures (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Each architecture reports on its own, so one break does not hide
+      # another's.
+      fail-fast: false
+      matrix:
+        target:
+          - i686-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-unknown-linux-gnu
+          - riscv64gc-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (pinned, plus the target's standard library)
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - name: Clippy
+        # The library builds for every architecture its launch states its raw
+        # syscalls for, and every other job builds for the runner's alone. A
+        # name can be one architecture's and not another's, such as a syscall
+        # i386 never gained, and so can a lint, where a C type's width is the
+        # target's. Checking needs only the target's standard library and no
+        # linker, so nothing here runs.
+        run: cargo clippy --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+
   book:
     name: Guide
     runs-on: ubuntu-latest

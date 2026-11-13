@@ -5,15 +5,21 @@
 //! taking effect. Tests skip explicitly when the host lacks the facility they
 //! exercise — unprivileged user namespaces, the Landlock LSM, or seccomp —
 //! rather than passing silently.
+//!
+//! A test that names a syscall by libc's number builds for a 64-bit target
+//! alone. libc's numbers are the `i64` a rule takes only there, and a seccomp
+//! policy compiles for a 64-bit host alone.
 
 mod common;
 
 use std::path::Path;
 
 use ferroday_cage::{
-    Cage, Capability, ConfigError, Error, FsAccess, LandlockScope, NetAccess, Network, Restriction,
-    SeccompAction, SeccompPolicy, SeccompRules,
+    Cage, Capability, ConfigError, Error, FsAccess, LandlockScope, NetAccess, Network,
+    SeccompPolicy, SeccompRules,
 };
+#[cfg(target_pointer_width = "64")]
+use ferroday_cage::{Restriction, SeccompAction};
 
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
 fn rootfs() -> Option<&'static Path> {
@@ -476,6 +482,7 @@ fn curated_seccomp_allows_an_ordinary_command() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn a_rule_added_to_the_curated_roster_refuses_its_syscall_beside_the_roster() {
     let Some(rootfs) = rootfs() else {
         return;
@@ -599,6 +606,7 @@ fn curated_seccomp_denies_creating_a_namespace() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn an_errno_no_failed_syscall_reports_is_refused_at_build() {
     // A build alone, so this needs neither the fixture nor seccomp in the
     // kernel. Zero would hand `getpid` a pid of 0 and tell a `clone3` caller it
@@ -647,6 +655,7 @@ fn an_errno_no_failed_syscall_reports_is_refused_at_build() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn a_denied_syscall_kills_the_command() {
     let Some(rootfs) = rootfs() else { return };
     if !common::require::seccomp() {
