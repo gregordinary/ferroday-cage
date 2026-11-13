@@ -44,9 +44,11 @@ from pathlib import Path
 
 # The reading `tools/check-idioms.py` takes, and for the same reason: a doc
 # link naming another layer is prose about it rather than a use of it, and a
-# test may reach for whatever it needs to build a fixture. A run leaves no
-# bytecode beside the shared reader.
+# test may reach for whatever it needs to build a fixture. The reader is found
+# beside this script, which names its own directory since `python3 -I` does
+# not, and a run leaves no bytecode beside it.
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rust_source import code  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent

@@ -43,8 +43,11 @@ import sys
 import tomllib
 from pathlib import Path
 
-# The shared reader sits beside this script; a run leaves no bytecode behind it.
+# The shared reader sits beside this script, which names its own directory
+# rather than relying on the interpreter to, since `python3 -I` does not. A run
+# leaves no bytecode behind it.
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rust_source import code  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
