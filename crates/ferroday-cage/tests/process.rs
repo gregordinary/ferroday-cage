@@ -203,13 +203,8 @@ fn the_launch_stage_outside_the_sandbox_outlives_the_signals_sent_to_its_group()
         rustix::process::kill_process(launch_stage, signal)
             .expect("the launch stage is alive to be signalled");
     }
-    match running.wait_timeout(Duration::from_secs(30)) {
-        Ok(Some(status)) => assert_eq!(status.code(), Some(7)),
-        other => {
-            let _ = running.kill();
-            panic!("the outcome was not collected: {other:?}");
-        }
-    }
+    let status = common::outcome_within(&mut running, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(7));
 }
 
 /// The parent of the host process `pid`.
@@ -541,13 +536,8 @@ fn a_tracer_holding_the_commands_exit_does_not_hold_the_outcome() {
     let mut running = traced_exit(true, Duration::from_secs(60))
         .spawn()
         .expect("the sandbox launches");
-    match running.wait_timeout(Duration::from_secs(30)) {
-        Ok(Some(status)) => assert_eq!(status.code(), Some(TRACED_EXIT), "{status}"),
-        other => {
-            let _ = running.kill();
-            panic!("the traced command's outcome was not reported: {other:?}");
-        }
-    }
+    let status = common::outcome_within(&mut running, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(TRACED_EXIT), "{status}");
 }
 
 /// How many clock ticks the launch stage may use over the second it is watched
@@ -587,13 +577,8 @@ fn without_a_pid_namespace_the_launch_stage_sleeps_while_a_tracer_holds_the_exit
         "the launch stage spun: {} ticks while the tracer held the exit",
         after - before,
     );
-    match running.wait_timeout(Duration::from_secs(30)) {
-        Ok(Some(status)) => assert_eq!(status.code(), Some(TRACED_EXIT), "{status}"),
-        other => {
-            let _ = running.kill();
-            panic!("the outcome was not reported once the tracer let go: {other:?}");
-        }
-    }
+    let status = common::outcome_within(&mut running, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(TRACED_EXIT), "{status}");
 }
 
 /// Whether the host process `pid` is a zombie: exited, and not yet collected.

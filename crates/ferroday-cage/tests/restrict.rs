@@ -512,13 +512,8 @@ fn the_restrictions_supervisor_outlives_the_signals_sent_to_its_group() {
         rustix::process::kill_process(launch_stage, signal)
             .expect("the launch stage is alive to be signalled");
     }
-    match running.wait_timeout(Duration::from_secs(30)) {
-        Ok(Some(status)) => assert_eq!(status.code(), Some(7)),
-        other => {
-            let _ = running.kill();
-            panic!("the outcome was not collected: {other:?}");
-        }
-    }
+    let status = common::outcome_within(&mut running, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(7));
 }
 
 #[test]

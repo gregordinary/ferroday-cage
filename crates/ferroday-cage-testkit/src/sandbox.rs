@@ -2,8 +2,9 @@
 //! they read a sandbox's output with.
 
 use std::path::Path;
+use std::time::Duration;
 
-use ferroday_cage::{Cage, Observer};
+use ferroday_cage::{Cage, ExitStatus, Observer, Running};
 
 /// A sandbox running `/bin/sh -c script` in `rootfs`, with every other setting
 /// the builder's own.
@@ -26,6 +27,23 @@ pub fn sleeper(rootfs: &Path) -> Cage {
         .arg("86399")
         .build()
         .expect("a valid sandbox configuration")
+}
+
+/// The outcome of `running`, waited for up to `patience`.
+///
+/// Fails the test past it, or where the wait itself fails. A sandbox still
+/// running then is killed and collected first, so a failing test leaves none
+/// behind it.
+#[track_caller]
+pub fn outcome_within(running: &mut Running<'_>, patience: Duration) -> ExitStatus {
+    match running.wait_timeout(patience) {
+        Ok(Some(status)) => status,
+        other => {
+            let _ = running.kill();
+            let _ = running.wait_timeout(patience);
+            panic!("the sandbox's outcome was not collected within {patience:?}: {other:?}");
+        }
+    }
 }
 
 /// An observer that keeps everything the sandbox writes to standard output.

@@ -22,7 +22,7 @@ pub use ferroday_cage_testkit::process::{
 };
 pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;
-pub use ferroday_cage_testkit::sandbox::{Collect, shell, sleeper};
+pub use ferroday_cage_testkit::sandbox::{Collect, outcome_within, shell, sleeper};
 pub use ferroday_cage_testkit::scratch::{
     RangedScratch, download_cache, entries, force_remove_dir_all, ranged_scratch, scratch_dir,
 };

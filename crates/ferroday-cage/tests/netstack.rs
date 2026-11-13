@@ -290,10 +290,7 @@ fn tcp_connects_to_a_host_listener_through_the_stack() {
         .attach(&pending)
         .expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
-    let status = running
-        .wait_timeout(Duration::from_secs(10))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    let status = common::outcome_within(&mut running, Duration::from_secs(10));
     handle.stop().expect("the stack stops cleanly");
 
     assert!(status.success(), "nc connected and exchanged data");
@@ -368,10 +365,7 @@ fn tcp_delivers_a_bulk_transfer_that_ends_in_a_prompt_close() {
         .attach(&pending)
         .expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
-    let status = running
-        .wait_timeout(Duration::from_secs(60))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    let status = common::outcome_within(&mut running, Duration::from_secs(60));
     handle.stop().expect("the stack stops cleanly");
 
     assert!(status.success(), "the guest read the transfer to its end");
@@ -465,10 +459,7 @@ fn back_to_back_connections_are_not_capped_by_finished_ones() {
         .attach(&pending)
         .expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
-    let status = running
-        .wait_timeout(Duration::from_secs(120))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    let status = common::outcome_within(&mut running, Duration::from_secs(120));
     handle.stop().expect("the stack stops cleanly");
 
     assert!(status.success(), "the guest's loop ran to completion");
@@ -509,10 +500,7 @@ fn the_default_policy_blocks_a_host_local_service() {
         .attach(&pending)
         .expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
-    let status = running
-        .wait_timeout(Duration::from_secs(10))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    let status = common::outcome_within(&mut running, Duration::from_secs(10));
     handle.stop().expect("the stack stops cleanly");
 
     assert!(
@@ -662,10 +650,7 @@ fn the_stack_resolves_only_for_the_gateway() {
         .attach(&pending)
         .expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
-    running
-        .wait_timeout(Duration::from_secs(30))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    common::outcome_within(&mut running, Duration::from_secs(30));
     handle.stop().expect("the stack stops cleanly");
 
     // A completed ARP entry carries flags 0x2; one the guest asked after and
@@ -772,10 +757,7 @@ fn a_named_loopback_port_is_the_only_one_mapped() {
         .attach(&pending)
         .expect("the stack attaches");
     let mut running = pending.proceed().expect("the command is released");
-    running
-        .wait_timeout(Duration::from_secs(15))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    common::outcome_within(&mut running, Duration::from_secs(15));
     handle.stop().expect("the stack stops cleanly");
 
     let stdout = String::from_utf8_lossy(&observer.stdout);
@@ -864,10 +846,7 @@ fn a_published_port_reaches_a_server_in_the_guest() {
     stream
         .shutdown(std::net::Shutdown::Write)
         .expect("the host half-closes");
-    let status = running
-        .wait_timeout(Duration::from_secs(10))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    let status = common::outcome_within(&mut running, Duration::from_secs(10));
     handle.stop().expect("the stack stops cleanly");
 
     assert!(status.success(), "the guest's server ran to completion");
@@ -978,10 +957,7 @@ fn a_published_port_reaches_a_server_in_the_guest_over_ipv6() {
     stream
         .shutdown(std::net::Shutdown::Write)
         .expect("the host half-closes");
-    let status = running
-        .wait_timeout(Duration::from_secs(10))
-        .expect("the wait completes")
-        .expect("the command exits before the deadline");
+    let status = common::outcome_within(&mut running, Duration::from_secs(10));
     handle.stop().expect("the stack stops cleanly");
 
     assert!(status.success(), "the guest's server ran to completion");

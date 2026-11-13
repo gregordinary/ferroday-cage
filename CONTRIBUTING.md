@@ -596,7 +596,7 @@ report name a package and its version bare.
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
 | Hand a provisioner a transport standing in for a mirror, in a unit test | `provision::fetch::fixture`: `Canned`, `Uniform`, `Unreachable` |
 | Skip a test the host cannot run, or fail it where a `REQUIRE` variable says it must run | `ferroday_cage_testkit::require` |
-| A sandbox running a shell script in a test, with nothing else set, or one that keeps running, and an observer that keeps what it writes | `ferroday_cage_testkit::sandbox::shell`, `sandbox::sleeper`, `sandbox::Collect` |
+| A sandbox running a shell script in a test, with nothing else set, or one that keeps running, an observer that keeps what it writes, and its outcome within a patience, killed past it | `ferroday_cage_testkit::sandbox::shell`, `sandbox::sleeper`, `sandbox::Collect`, `sandbox::outcome_within` |
 | Play the user at a pseudoterminal in a test | `ferroday_cage_testkit::pty` |
 | Wait in a test until a descriptor is readable or a deadline passes | `ferroday_cage_testkit::fd::readable_by`, which answers whether it became readable, for the caller to assert |
 | Run a probe with its standard descriptors closed, and put them back | `ferroday_cage_testkit::fd::with_standard_streams_closed`, and `fd::is_open` to ask of one without opening another |
