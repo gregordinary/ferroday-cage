@@ -23,6 +23,8 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal};
 use syscalls::Sysno;
 
+use super::Forked;
+
 /// Which side of a [`fork`] a process is on.
 #[derive(Debug)]
 pub(crate) enum Fork {
@@ -37,9 +39,9 @@ pub(crate) enum Fork {
 pub(crate) enum PidfdFork {
     /// The new process.
     Child,
-    /// The process that called [`fork_with_pidfd`]: the new process's pid, and
-    /// a pidfd for it.
-    ParentOf(Pid, OwnedFd),
+    /// The process that called [`fork_with_pidfd`], and the new process, named
+    /// by its pid and the pidfd the fork opened for it.
+    ParentOf(Forked),
 }
 
 /// `CLONE_PIDFD`: the kernel opens a pidfd for the new process as it creates
@@ -107,9 +109,12 @@ pub(crate) unsafe fn fork_with_pidfd() -> Result<PidfdFork, Errno> {
     // process only, and the caller's contract is this function's.
     let pid = unsafe { clone_process(CLONE_PIDFD, &raw mut pidfd) }?;
     Ok(match pid {
-        // SAFETY: the kernel stored a fresh descriptor, owned by this process
-        // and by nothing else, where `CLONE_PIDFD` asked it to.
-        Some(child) => PidfdFork::ParentOf(child, unsafe { OwnedFd::from_raw_fd(pidfd) }),
+        Some(child) => {
+            // SAFETY: the kernel stored a fresh descriptor, owned by this
+            // process and by nothing else, where `CLONE_PIDFD` asked it to.
+            let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+            PidfdFork::ParentOf(Forked::new(child, pidfd))
+        }
         None => PidfdFork::Child,
     })
 }
@@ -711,29 +716,48 @@ mod tests {
 
     #[test]
     fn a_forks_pidfd_names_the_child_after_another_wait_collects_it() {
-        use std::os::fd::AsFd as _;
-
-        use rustix::process::{WaitId, WaitIdOptions};
-
         // SAFETY: the child calls only `exit_group`.
         match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
             PidfdFork::Child => exit_group(42),
-            PidfdFork::ParentOf(child, pidfd) => {
+            PidfdFork::ParentOf(forked) => {
                 // A wait elsewhere in the caller collects the child first, by
                 // pid, as an application-wide reaper would.
-                let status =
-                    rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty())
-                        .expect("the child is collected")
-                        .expect("the child reported a status")
-                        .1;
+                let status = rustix::process::waitpid(
+                    Some(forked.pid()),
+                    rustix::process::WaitOptions::empty(),
+                )
+                .expect("the child is collected")
+                .expect("the child reported a status")
+                .1;
                 assert_eq!(status.exit_status(), Some(42));
                 // The pidfd still names that child, exited and collected,
                 // rather than whatever takes its pid next.
-                assert!(super::super::has_exited(pidfd.as_fd()));
+                assert!(super::super::has_exited(forked.pidfd()));
+                assert_eq!(forked.reap(), Err(Errno::CHILD));
+                // A kill reaches nothing: not that child, which is gone, nor a
+                // process that has taken its pid since.
+                // SAFETY: the bystander only sleeps, through one raw syscall,
+                // and exits.
+                let bystander = match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
+                    PidfdFork::Child => {
+                        let _ = rustix::thread::nanosleep(&rustix::thread::Timespec {
+                            tv_sec: 5,
+                            tv_nsec: 0,
+                        });
+                        exit_group(0)
+                    }
+                    PidfdFork::ParentOf(bystander) => bystander,
+                };
+                forked.kill();
+                assert!(
+                    !super::super::has_exited(bystander.pidfd()),
+                    "the kill reached a process that was not its target"
+                );
+                bystander.kill();
                 assert_eq!(
-                    rustix::process::waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED)
-                        .err(),
-                    Some(Errno::CHILD),
+                    bystander.reap(),
+                    Ok(None),
+                    "the bystander ends by its own kill"
                 );
             }
         }

@@ -54,13 +54,12 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
-use rustix::process::{Pid, Signal};
 
-use super::ChildMap;
 use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_SIZE_MAX};
 use super::child::MapFailure;
 use super::frame;
-use super::sys::{self, Fork};
+use super::sys::{self, PidfdFork};
+use super::{ChildMap, Forked};
 use crate::idmap::IdMapError;
 use crate::provision::containment;
 use crate::wire::wire_enum;
@@ -143,7 +142,7 @@ pub(crate) enum StartError {
 /// completion, then calls [`finish`](Self::finish) to reap it.
 pub(crate) struct ExportChild {
     /// The child process.
-    pid: Pid,
+    child: Forked,
     /// The read end of the frame stream.
     stream: OwnedFd,
 }
@@ -167,7 +166,7 @@ impl ExportChild {
     /// reader that ran into the end of it.
     pub(crate) fn finish(self) -> Result<(), Errno> {
         drop(self.stream);
-        super::wait_for_exit(self.pid).map(|_| ())
+        self.child.reap().map(|_| ())
     }
 }
 
@@ -206,9 +205,9 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
     // SAFETY: the child branch runs `export_child`, which performs raw rustix
     // syscalls over the frozen paths and descriptors — no allocation, no
     // locking, no panic — and never returns: every path ends in `exit_group`.
-    match unsafe { sys::fork() } {
+    match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(StartError::Spawn(errno)),
-        Ok(Fork::Child) => {
+        Ok(PidfdFork::Child) => {
             // The fork duplicated the caller's ends into this process; close
             // what this child does not use, so it pins nothing of the caller's.
             // The read end of its own frame pipe matters most: holding it would
@@ -229,13 +228,13 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
             };
             export_child(stream_write.as_fd(), gate_child, rootfs, &map, arena)
         }
-        Ok(Fork::ParentOf(pid)) => {
+        Ok(PidfdFork::ParentOf(child)) => {
             drop(stream_write);
             // The child has its own copy of the arenas; this side's is unused.
             drop((names, order));
             if let (Some((caller, child_end)), ChildMap::Delegated { mapper, map }) = (gate, &map) {
                 drop(child_end);
-                let driven = super::drive_map_gate(caller.as_fd(), pid, *mapper, map);
+                let driven = super::drive_map_gate(caller.as_fd(), child.pid(), *mapper, map);
                 // Anything but a released child leaves one blocked at the gate
                 // in an unmapped namespace, having read nothing and written
                 // nothing the caller will read.
@@ -252,7 +251,7 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
                 };
                 if let Some(err) = failure {
                     drop(caller);
-                    super::abandon_gated_child(pid);
+                    super::abandon_gated_child(&child);
                     // A child that failed on its way to the gate reported on
                     // the stream, as it reports every other failure — and this
                     // caller was blocked on the gate, so it has not read it.
@@ -263,7 +262,7 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
                 }
             }
             Ok(ExportChild {
-                pid,
+                child,
                 stream: stream_read,
             })
         }
@@ -741,8 +740,8 @@ fn emit_error(stream: BorrowedFd<'_>, step: ExportStep, errno: Errno) {
 
 /// Sends a signal to the export child, used to tear it down when the parent
 /// abandons the archive early.
-pub(crate) fn kill_export(child: &ExportChild) {
-    let _ = rustix::process::kill_process(child.pid, Signal::KILL);
+pub(crate) fn kill_export(export: &ExportChild) {
+    export.child.kill();
 }
 
 #[cfg(test)]

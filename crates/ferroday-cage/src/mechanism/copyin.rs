@@ -104,13 +104,12 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{self, AtFlags, Mode, OFlags, ResolveFlags, Timestamps};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, SocketFlags, SocketType};
-use rustix::process::{Pid, Signal};
 
-use super::ChildMap;
 use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_NAME_MAX, XATTR_SIZE_MAX};
 use super::child::MapFailure;
 use super::frame;
-use super::sys::{self, Fork};
+use super::sys::{self, PidfdFork};
+use super::{ChildMap, Forked};
 use crate::idmap::IdMapError;
 use crate::path;
 use crate::provision::containment;
@@ -214,7 +213,7 @@ pub(crate) enum CopyFailure {
 /// arrives on.
 pub(crate) struct CopyChild {
     /// The child process.
-    pid: Pid,
+    child: Forked,
     /// The write end of the frame stream.
     stream: OwnedFd,
     /// The caller's end of the control socket.
@@ -234,20 +233,24 @@ impl CopyChild {
     /// outcome is read: the child is reading frames until end of input, so a
     /// held-open stream would deadlock both sides.
     pub(crate) fn finish(self) -> Result<(), CopyFailure> {
-        let CopyChild { pid, stream, gate } = self;
+        let CopyChild {
+            child,
+            stream,
+            gate,
+        } = self;
         drop(stream);
 
         let read = match frame::read_record(gate.as_fd()) {
             Ok(read) => read,
             Err(errno) => {
-                let _ = super::wait_for_exit(pid);
+                let _ = child.reap();
                 return Err(CopyFailure::Step {
                     step: CopyStep::Spawn,
                     errno: errno.raw_os_error(),
                 });
             }
         };
-        let outcome = super::wait_for_exit(pid);
+        let outcome = child.reap();
         let Some(record) = read else {
             // The child died without reporting, or reported something that is
             // not a record. Its exit status is all there is to go on either
@@ -281,12 +284,16 @@ impl CopyChild {
     ///
     /// The read below tells them apart without waiting on either.
     pub(crate) fn abandon(self) -> Option<CopyFailure> {
-        let CopyChild { pid, stream, gate } = self;
+        let CopyChild {
+            child,
+            stream,
+            gate,
+        } = self;
         let reported = reported_outcome(gate.as_fd());
-        let _ = rustix::process::kill_process(pid, Signal::KILL);
+        child.kill();
         drop(stream);
         drop(gate);
-        let _ = super::wait_for_exit(pid);
+        let _ = child.reap();
         reported
     }
 }
@@ -359,9 +366,9 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
     // SAFETY: the child branch runs `copy_child`, which performs raw rustix
     // syscalls over the frozen paths and descriptors — no allocation, no
     // locking, no panic — and never returns: every path ends in `exit_group`.
-    match unsafe { sys::fork() } {
+    match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(spawn_failure(errno)),
-        Ok(Fork::Child) => {
+        Ok(PidfdFork::Child) => {
             // The fork duplicated the caller's ends into this process. Closing
             // the write end of its own frame pipe is what lets the child see
             // end of input when the parent is done; holding it would make the
@@ -372,11 +379,11 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
             drop(gate_caller);
             copy_child(stream_read.as_fd(), gate_child.as_fd(), rootfs, &map)
         }
-        Ok(Fork::ParentOf(pid)) => {
+        Ok(PidfdFork::ParentOf(child)) => {
             drop(stream_read);
             drop(gate_child);
             if let ChildMap::Delegated { mapper, map } = &map {
-                let driven = super::drive_map_gate(gate_caller.as_fd(), pid, *mapper, map);
+                let driven = super::drive_map_gate(gate_caller.as_fd(), child.pid(), *mapper, map);
                 // Anything but a released child leaves one blocked at the gate
                 // in an unmapped namespace, having created nothing.
                 let failure = match driven {
@@ -408,12 +415,12 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
                 if let Some(err) = failure {
                     drop(gate_caller);
                     drop(stream_write);
-                    super::abandon_gated_child(pid);
+                    super::abandon_gated_child(&child);
                     return Err(err);
                 }
             }
             Ok(CopyChild {
-                pid,
+                child,
                 stream: stream_write,
                 gate: gate_caller,
             })

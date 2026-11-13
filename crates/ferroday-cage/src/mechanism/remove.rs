@@ -43,12 +43,11 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{self, AtFlags, Mode, OFlags, RawDir, SeekFrom};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
-use rustix::process::Pid;
 
-use super::ChildMap;
 use super::child::{MapDuty, MapFailure};
 use super::frame;
-use super::sys::{self, Fork};
+use super::sys::{self, PidfdFork};
+use super::{ChildMap, Forked};
 use crate::idmap::IdMapError;
 use crate::wire::wire_enum;
 
@@ -130,9 +129,9 @@ pub(crate) fn remove_tree_mapped(
     // rustix syscalls over the frozen paths and descriptors — no
     // allocation, no locking, no panic — and never returns: every path
     // ends in `exit_group`.
-    match unsafe { sys::fork() } {
+    match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(spawn_failure(errno)),
-        Ok(Fork::Child) => {
+        Ok(PidfdFork::Child) => {
             // The fork duplicated the caller's end of the gate into this
             // process; close it, so this child pins nothing it does not use.
             // Closing an owned descriptor is a bare `close`, which the
@@ -140,15 +139,13 @@ pub(crate) fn remove_tree_mapped(
             drop(caller);
             removal_child(child_end.as_fd(), parent, leaf, map.duty())
         }
-        Ok(Fork::ParentOf(child)) => {
+        Ok(PidfdFork::ParentOf(child)) => {
             drop(child_end);
             // `drive_removal` owns the gate, so returning closes the caller's
-            // end before the wait below, and it signals the child before
-            // giving up on it. The wait is therefore always reachable — and it
-            // is this child's only one, on every path through `drive_removal`,
-            // which is why the one that gives up kills without reaping.
-            let result = drive_removal(caller, child, &map);
-            let _ = super::wait_for_exit(child);
+            // end before the reap below, and it ends the child before giving
+            // up on it. The reap is therefore always reachable.
+            let result = drive_removal(caller, &child, &map);
+            let _ = child.reap();
             result
         }
     }
@@ -169,16 +166,16 @@ pub(crate) fn remove_tree_mapped(
 ///
 /// The result record that follows the go byte is this removal's own: past the
 /// gate the child is deleting rather than waiting, and it exits when it is done
-/// either way, so a failure reading it needs no signal — the wait still
+/// either way, so a failure reading it needs no signal: the reap still
 /// returns.
-fn drive_removal(gate: OwnedFd, child: Pid, map: &ChildMap<'_>) -> Result<(), RemoveFailure> {
+fn drive_removal(gate: OwnedFd, child: &Forked, map: &ChildMap<'_>) -> Result<(), RemoveFailure> {
     let io_failure = |step: RemoveStep, errno: Errno| RemoveFailure::Step {
         step,
         errno: errno.raw_os_error(),
     };
 
     if let ChildMap::Delegated { mapper, map } = map {
-        let failure = match super::drive_map_gate(gate.as_fd(), child, *mapper, map) {
+        let failure = match super::drive_map_gate(gate.as_fd(), child.pid(), *mapper, map) {
             Ok(super::Gated::Released) => None,
             // A record before ready is the failure the child hit on the way to
             // the gate: it names the step it reached, and no kill is owed to a
@@ -189,11 +186,7 @@ fn drive_removal(gate: OwnedFd, child: Pid, map: &ChildMap<'_>) -> Result<(), Re
             Err(super::GateFailure::Map(err)) => Some(RemoveFailure::Map(err)),
         };
         if let Some(failure) = failure {
-            // Killed but not reaped: the caller waits on this child whatever
-            // this function returns, and that wait is its one reap. Collecting
-            // the status here as well would leave the caller's wait blocking on
-            // a pid the kernel is free to have given to something else.
-            super::kill_gated_child(child);
+            super::abandon_gated_child(child);
             return Err(failure);
         }
     }
@@ -437,8 +430,8 @@ mod tests {
     /// long as the bystander lives.
     #[derive(Debug, Default)]
     struct ForksThenRefuses {
-        /// The bystander's pid, for the test to collect.
-        bystander: Mutex<Option<Pid>>,
+        /// The bystander, for the test to collect.
+        bystander: Mutex<Option<Forked>>,
     }
 
     impl IdMapper for ForksThenRefuses {
@@ -463,8 +456,8 @@ mod tests {
             // SAFETY: the child branch sleeps through one rustix syscall and
             // then exits — no allocation, no locking, no panic — and never
             // returns.
-            match unsafe { sys::fork() } {
-                Ok(Fork::Child) => {
+            match unsafe { sys::fork_with_pidfd() } {
+                Ok(PidfdFork::Child) => {
                     // Outlast the caller's abandonment; the test collects this
                     // process rather than waiting the sleep out.
                     let _ = rustix::thread::nanosleep(&rustix::thread::Timespec {
@@ -473,11 +466,11 @@ mod tests {
                     });
                     sys::exit_group(0)
                 }
-                Ok(Fork::ParentOf(pid)) => {
+                Ok(PidfdFork::ParentOf(bystander)) => {
                     *self
                         .bystander
                         .lock()
-                        .expect("the test holds no poisoned lock") = Some(pid);
+                        .expect("the test holds no poisoned lock") = Some(bystander);
                 }
                 Err(_) => {}
             }
@@ -490,13 +483,14 @@ mod tests {
     impl ForksThenRefuses {
         /// Collects the bystander, so the test leaves no process behind.
         fn collect(&self) {
-            if let Some(pid) = *self
+            if let Some(bystander) = self
                 .bystander
                 .lock()
                 .expect("the test holds no poisoned lock")
+                .take()
             {
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-                let _ = super::super::wait_for_exit(pid);
+                bystander.kill();
+                let _ = bystander.reap();
             }
         }
     }

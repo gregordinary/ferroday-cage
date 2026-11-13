@@ -137,7 +137,7 @@ use rustix::mount::{MountFlags, MountPropagationFlags};
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::pipe::{self, PipeFlags};
 use rustix::process::Signal;
-use rustix::process::{self, Pid, WaitId, WaitIdOptions, WaitOptions, WaitStatus};
+use rustix::process::{self, Pid, WaitId, WaitIdOptions};
 use rustix::thread::UnshareFlags;
 
 use crate::error::{Error, SetupStep};
@@ -1375,33 +1375,65 @@ pub(crate) struct Launched {
     pub(crate) foreground: Option<Foreground>,
 }
 
-/// The launch stage as the caller holds it.
+/// A process this caller forked, named by the pidfd its fork opened.
 ///
-/// The pidfd is opened by the fork itself, so it refers to the stage from the
-/// stage's first instant, whatever else in the caller waits for children. Every
-/// signal and reap goes through it, so neither can reach a process that took
-/// the pid after an application-wide reaper collected the stage first. The pid
-/// is kept beside it for the identity-map delegate, which names the process it
-/// maps by number and runs while the stage is blocked at the map gate, alive,
-/// so the number names the stage while the delegate uses it.
-struct LaunchStage {
-    /// The stage's pid, for the delegate.
+/// The pidfd comes from the fork itself
+/// ([`sys::fork_with_pidfd`](sys::fork_with_pidfd)), so it refers to the
+/// process from its first instant, whatever else in the caller waits for
+/// children. Every signal and reap goes through it, so neither can reach a
+/// process that took the pid after an application-wide reaper collected this
+/// one first: a signal then answers `ESRCH`, and a reap `ECHILD`.
+///
+/// The pid is kept beside it for an identity-map delegate, which names the
+/// process it maps by number. The delegate runs while the process is blocked at
+/// its map gate, alive, so the number names this process while the delegate
+/// uses it.
+///
+/// Every child the caller side forks is held as one of these: the launch stage,
+/// and the export, copy-in, removal, overlay-probe, seccomp-probe and network
+/// stack helpers.
+#[derive(Debug)]
+pub(crate) struct Forked {
+    /// The process's pid, for a delegate.
     pid: Pid,
-    /// The stage's pidfd, for everything else.
+    /// The process's pidfd, for everything else.
     pidfd: OwnedFd,
 }
 
-impl LaunchStage {
-    /// Sends the stage `SIGKILL`. A stage that has already exited is not an
-    /// error.
-    fn kill(&self) {
+impl Forked {
+    /// The process `pid` names, through the pidfd its fork opened.
+    pub(crate) fn new(pid: Pid, pidfd: OwnedFd) -> Forked {
+        Forked { pid, pidfd }
+    }
+
+    /// The process's pid, for a delegate that names it by number while it is
+    /// alive.
+    pub(crate) fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    /// Sends the process `SIGKILL`. A process that has already exited is not
+    /// an error.
+    pub(crate) fn kill(&self) {
         let _ = process::pidfd_send_signal(&self.pidfd, Signal::KILL);
     }
 
-    /// Reaps the stage, blocking until it exits. A stage something else
-    /// already reaped is not an error.
-    fn reap(&self) {
-        let _ = reap_via_pidfd(self.pidfd.as_fd());
+    /// Reaps the process, blocking until it exits, and returns its exit code:
+    /// `None` where a signal ended it. A process something else already reaped
+    /// answers `ECHILD`.
+    pub(crate) fn reap(&self) -> Result<Option<i32>, Errno> {
+        reap_via_pidfd(self.pidfd.as_fd())
+    }
+
+    /// The process's pidfd, to poll for its exit.
+    #[cfg(test)]
+    pub(crate) fn pidfd(&self) -> BorrowedFd<'_> {
+        self.pidfd.as_fd()
+    }
+
+    /// The pidfd, for a holder that reaps the process later.
+    fn into_pidfd(self) -> OwnedFd {
+        self.pidfd
     }
 }
 
@@ -1409,7 +1441,7 @@ impl LaunchStage {
 /// channel the caller keeps, returned by [`fork_launch`] in the parent.
 struct ParentSide {
     /// The launch stage (stage A), forked directly from the caller.
-    stage: LaunchStage,
+    stage: Forked,
     /// Caller end of the control socket.
     host_sock: OwnedFd,
     /// Read end of the report pipe.
@@ -1544,7 +1576,8 @@ pub(super) enum GateFailure {
 ///
 /// Nothing is killed or reaped here. A caller that gets anything but
 /// [`Gated::Released`] has a child blocked in an unmapped namespace, and
-/// [`abandon_gated_child`] is how it ends it.
+/// [`abandon_gated_child`] is how it ends it. The child is named by its pid
+/// because the delegate names it that way; see [`Forked`].
 ///
 /// The fork that produces the child stays in each helper's own module even
 /// though the three read alike. The child branch runs a different
@@ -1577,11 +1610,11 @@ pub(super) fn drive_map_gate(
     Ok(Gated::Released)
 }
 
-/// Ends a child left blocked at its map gate, leaving it to be reaped.
+/// Ends a child left blocked at its map gate, and reaps it.
 ///
 /// A child whose map the delegate could not establish is waiting for a go byte
 /// that will never come. It holds nothing but its own descriptors and has
-/// touched no tree, so killing it is a clean end — and it is the only end
+/// touched no tree, so killing it is a clean end, and it is the only end
 /// available.
 ///
 /// Killed rather than released by closing the gate. A fork copies the
@@ -1593,23 +1626,12 @@ pub(super) fn drive_map_gate(
 /// blocked child is waiting for is therefore not something this caller can make
 /// arrive, and a reap would block on it forever.
 ///
-/// The reap is separate because it is the caller's, and exactly one caller may
-/// perform it: a pid is the kernel's to reuse the moment its status is
-/// collected, so a second wait on the same number can collect an unrelated
-/// child of this process instead. A caller whose own path already waits calls
-/// this; one that returns without waiting calls
-/// [`abandon_gated_child`] and has the reap done here.
-pub(super) fn kill_gated_child(child: Pid) {
-    let _ = process::kill_process(child, Signal::KILL);
-}
-
-/// [`kill_gated_child`], and reaps it.
-///
-/// For a caller that gives up on a child by returning, so nothing further in
-/// its own path would collect the status.
-pub(super) fn abandon_gated_child(child: Pid) {
-    kill_gated_child(child);
-    let _ = wait_for_exit(child);
+/// The kill and the reap both go through the child's pidfd, so a caller whose
+/// own path reaps again afterwards meets `ECHILD` rather than collecting
+/// another child of this process.
+pub(super) fn abandon_gated_child(child: &Forked) {
+    child.kill();
+    let _ = child.reap();
 }
 
 /// Marshals the launch data, creates the launch channels, and forks the
@@ -1753,7 +1775,7 @@ fn fork_launch(
             };
             child::stage_a(&context)
         }
-        Ok(PidfdFork::ParentOf(stage_a, pidfd)) => {
+        Ok(PidfdFork::ParentOf(stage_a)) => {
             // Close the caller's copies of the sandbox-side ends: from here
             // on, end-of-file on each read side means the sandbox's copies
             // are gone.
@@ -1782,10 +1804,7 @@ fn fork_launch(
                 caller
             });
             Ok(ParentSide {
-                stage: LaunchStage {
-                    pid: stage_a,
-                    pidfd,
-                },
+                stage: stage_a,
                 host_sock,
                 report_read,
                 status_read,
@@ -1853,7 +1872,7 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
         // creates one had been forked.
         Ok(_) => {
             let report = read_report(&parent.report_read, &mut Vec::new(), 0);
-            parent.stage.reap();
+            let _ = parent.stage.reap();
             return Err(match report {
                 Ok(Report::SetupFailed {
                     step,
@@ -1866,14 +1885,14 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
         }
         Err(errno) => {
             parent.stage.kill();
-            parent.stage.reap();
+            let _ = parent.stage.reap();
             return Err(wait_syscall_error(errno));
         }
     }
 
     // The map is written against stage A: the process that unshared, so the
     // process whose /proc map files name the new namespace.
-    let pid = parent.stage.pid.as_raw_nonzero().get() as u32;
+    let pid = parent.stage.pid().as_raw_nonzero().get() as u32;
     match mapper.apply(pid, map) {
         Ok(()) => {
             // Release the stage. A failed write means it died; the caller's
@@ -1900,7 +1919,7 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
             // arrive, and the reap below would block on it.
             parent.stage.kill();
             parent.map_gate = None;
-            parent.stage.reap();
+            let _ = parent.stage.reap();
             Err(Error::IdentityMap(err))
         }
     }
@@ -1912,22 +1931,25 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &mut ParentSide) -> Result<
 /// parent and is reaped by the handle once the status arrives, so its pidfd is
 /// returned; with one it has already exited and is reaped here, best-effort in
 /// case the application reaps child processes of its own.
-fn reap_after(pid_namespace: bool, stage: LaunchStage) -> Option<OwnedFd> {
+fn reap_after(pid_namespace: bool, stage: Forked) -> Option<OwnedFd> {
     if pid_namespace {
-        stage.reap();
+        let _ = stage.reap();
         None
     } else {
-        Some(stage.pidfd)
+        Some(stage.into_pidfd())
     }
 }
 
-/// Reaps the process a pidfd refers to, blocking until it exits.
+/// Reaps the process a pidfd refers to, blocking until it exits, and returns
+/// its exit code: `None` where a signal ended it.
 ///
 /// Immune to pid reuse: the pidfd names the exact process, so unlike a raw
 /// `waitpid` this cannot alias a pid a concurrent reaper freed and the OS
-/// recycled for another same-parent child.
-pub(crate) fn reap_via_pidfd(pidfd: BorrowedFd<'_>) -> Result<(), Errno> {
-    frame::retry_on_intr!(process::waitid(WaitId::PidFd(pidfd), WaitIdOptions::EXITED)).map(|_| ())
+/// recycled for another same-parent child. A process already reaped answers
+/// `ECHILD`.
+pub(crate) fn reap_via_pidfd(pidfd: BorrowedFd<'_>) -> Result<Option<i32>, Errno> {
+    frame::retry_on_intr!(process::waitid(WaitId::PidFd(pidfd), WaitIdOptions::EXITED))
+        .map(|status| status.and_then(|status| status.exit_status()))
 }
 
 /// Blocks until the process a pidfd refers to has exited, retrying `EINTR`.
@@ -1965,10 +1987,10 @@ pub(crate) fn has_exited(pidfd: BorrowedFd<'_>) -> bool {
 /// process of the sandbox with it; without one it is the command process. Once
 /// this returns, the targets the setup reported creating are bound by no
 /// process of this launch, which is what lets the caller remove them.
-fn abort_launch(stage: &LaunchStage, supervisor: &OwnedFd) {
+fn abort_launch(stage: &Forked, supervisor: &OwnedFd) {
     let _ = process::pidfd_send_signal(supervisor, Signal::KILL);
     stage.kill();
-    stage.reap();
+    let _ = stage.reap();
     let _ = await_exit(supervisor.as_fd());
 }
 
@@ -2055,7 +2077,7 @@ pub(crate) fn spawn(
             }),
             received,
         ) => {
-            parent.stage.reap();
+            let _ = parent.stage.reap();
             // Unpublished, the supervisor is the launch stage's to have ended,
             // which it does before reporting its own failure.
             if let Ok((pidfd, _)) = &received {
@@ -2067,7 +2089,7 @@ pub(crate) fn spawn(
         // but the supervisor was never published: the launch stage exited
         // before sending it, leaving whatever it forked to run on.
         (Ok(Report::ExecSucceeded), Err(err)) => {
-            parent.stage.reap();
+            let _ = parent.stage.reap();
             created.clear();
             Err(err)
         }
@@ -2091,16 +2113,12 @@ pub(crate) fn spawn(
 /// With the supervisor published, [`abort_launch`] ends the whole launch.
 /// Without it, only the launch stage can be reached, and a process it forked
 /// may run on.
-fn give_up(
-    stage: &LaunchStage,
-    supervisor: Option<&(OwnedFd, u32)>,
-    created: &mut Vec<CreatedTarget>,
-) {
+fn give_up(stage: &Forked, supervisor: Option<&(OwnedFd, u32)>, created: &mut Vec<CreatedTarget>) {
     match supervisor {
         Some((pidfd, _)) => abort_launch(stage, pidfd),
         None => {
             stage.kill();
-            stage.reap();
+            let _ = stage.reap();
             created.clear();
         }
     }
@@ -2120,7 +2138,7 @@ fn give_up(
 /// [`abandon`]: PendingLaunch::abandon
 pub(crate) struct PendingLaunch {
     /// The launch stage, reaped at proceed or abandon.
-    stage: LaunchStage,
+    stage: Forked,
     /// Pidfd of the supervisor: the kill handle, and the process whose
     /// network namespace a stack attaches to.
     pidfd: OwnedFd,
@@ -2206,7 +2224,7 @@ pub(crate) fn spawn_pending(
         // precise cause, then reap the launch stage.
         Err(err) => {
             let report = read_report(&parent.report_read, created, plan.ops.len());
-            parent.stage.reap();
+            let _ = parent.stage.reap();
             return match report {
                 Ok(Report::SetupFailed {
                     step,
@@ -2234,7 +2252,7 @@ pub(crate) fn spawn_pending(
             errno,
             detail,
         }) => {
-            parent.stage.reap();
+            let _ = parent.stage.reap();
             let _ = await_exit(pidfd.as_fd());
             return Err(setup_error(step, errno, detail, Labels::of(plan)));
         }
@@ -2343,7 +2361,7 @@ impl PendingLaunch {
                 errno,
                 detail,
             }) => {
-                self.stage.reap();
+                let _ = self.stage.reap();
                 let _ = await_exit(self.pidfd.as_fd());
                 // Assembled field by field rather than from `&self`: the
                 // proceed pipe was moved out of `self` above, so `self` as a
@@ -2589,15 +2607,6 @@ fn read_report(
                 });
             }
         }
-    }
-}
-
-/// Waits for a direct child process to terminate, retrying on signal
-/// interruption.
-pub(crate) fn wait_for_exit(pid: Pid) -> Result<WaitStatus, Errno> {
-    match frame::retry_on_intr!(process::waitpid(Some(pid), WaitOptions::empty()))? {
-        Some((_, status)) => Ok(status),
-        None => unreachable!("ferroday-cage: waitpid without WNOHANG returned no status"),
     }
 }
 

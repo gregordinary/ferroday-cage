@@ -54,7 +54,7 @@ use rustix::thread::LinkNameSpaceType;
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
 use crate::mechanism::frame;
 use crate::mechanism::sweep_fds_keeping;
-use crate::mechanism::sys::{self, Fork};
+use crate::mechanism::sys::{self, PidfdFork};
 use crate::wire::wire_enum;
 
 /// `TUNSETIFF`: create or attach to a tun/tap interface (`_IOW('T', 202, int)`).
@@ -331,17 +331,17 @@ pub(super) fn create(
     // allocation, takes no locks, and ends in `exit_group` — the post-fork
     // constraints documented in `crate::mechanism::child` — and all its
     // inputs were marshaled above.
-    match unsafe { sys::fork() } {
+    match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(NetStackError::Spawn {
             source: errno.into(),
         }),
-        Ok(Fork::Child) => helper(&context),
-        Ok(Fork::ParentOf(child)) => {
+        Ok(PidfdFork::Child) => helper(&context),
+        Ok(PidfdFork::ParentOf(child)) => {
             // Close this process's copy of the helper's end so the helper's
             // exit hangs the socket up, then collect the result and reap.
             drop(child_sock);
             let outcome = receive_tap(&parent_sock, plan);
-            let _ = crate::mechanism::wait_for_exit(child);
+            let _ = child.reap();
             outcome
         }
     }

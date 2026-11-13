@@ -472,6 +472,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Fill a buffer from the kernel's randomness | `host::fill_random` |
 | Fork, exec, exit, change signal state, or read signals from a descriptor, without libc | `mechanism::sys` |
 | Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
+| Fork a helper child and signal or reap it whatever else in the caller reaps | `mechanism::sys::fork_with_pidfd`, which hands back a `mechanism::Forked` |
 | Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |

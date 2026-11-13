@@ -23,10 +23,9 @@ use std::path::{Path, PathBuf};
 
 use rustix::io::Errno;
 use rustix::mount::{self, MountFlags, MountPropagationFlags};
-use rustix::process::WaitStatus;
 use rustix::thread::{self, UnshareFlags};
 
-use super::sys::{self, Fork};
+use super::sys::{self, PidfdFork};
 
 /// The outcome of the overlay mount probe.
 pub(crate) enum OverlayProbe {
@@ -62,24 +61,25 @@ pub(crate) fn probe_overlay_mount(merged: &CStr, options: &CStr) -> OverlayProbe
 
     // SAFETY: the child branch runs only raw syscalls over the data frozen
     // above — no allocation, no locking, no libc — and never returns: it
-    // always ends in `exit_group`. `sys::fork` is the launch's own fork
-    // primitive.
-    match unsafe { sys::fork() } {
+    // always ends in `exit_group`. `sys::fork_with_pidfd` is the launch's own
+    // fork primitive.
+    match unsafe { sys::fork_with_pidfd() } {
         Err(_) => OverlayProbe::Inconclusive,
-        Ok(Fork::Child) => {
+        Ok(PidfdFork::Child) => {
             let code = probe_child(merged, options, &uid_line, &gid_line);
             sys::exit_group(code)
         }
-        Ok(Fork::ParentOf(child)) => match super::wait_for_exit(child) {
-            Ok(status) => classify(status),
+        Ok(PidfdFork::ParentOf(child)) => match child.reap() {
+            Ok(code) => classify(code),
             Err(_) => OverlayProbe::Inconclusive,
         },
     }
 }
 
-/// Maps the child's wait status onto the probe outcome.
-fn classify(status: WaitStatus) -> OverlayProbe {
-    match status.exit_status() {
+/// Maps the child's exit code, `None` where a signal ended it, onto the probe
+/// outcome.
+fn classify(code: Option<i32>) -> OverlayProbe {
+    match code {
         Some(EXIT_MOUNTED) => OverlayProbe::Mounted,
         Some(EXIT_MOUNT_FAILED) => OverlayProbe::MountFailed,
         // EXIT_SETUP_FAILED, a signal, or anything else: the test never reached

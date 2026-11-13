@@ -664,11 +664,10 @@ fn stage_init(context: &Context<'_>, launch_stage: Option<OwnedFd>) -> ! {
 /// anything of the caller's, so nothing is lost by ending it here.
 ///
 /// The caller side's [`abandon_gated_child`](super::abandon_gated_child) does
-/// the same for its own children, and is not reached for from here because its
-/// reap goes through [`wait_for_exit`](super::wait_for_exit), whose
-/// `unreachable!` is a panic path this process must not have. The pid needs no
-/// pidfd: the command is this process's unreaped child process until the wait
-/// below, so the number names nothing else.
+/// the same for its own children, through the pidfds their forks opened,
+/// because the caller may run a reaper of its own. The command needs none: it
+/// is this process's unreaped child process until the wait below, and nothing
+/// else in this process reaps, so the number names nothing else.
 fn abandon_command(command: Pid) {
     let _ = process::kill_process(command, Signal::KILL);
     let _ = frame::retry_on_intr!(process::waitpid(Some(command), WaitOptions::empty()));

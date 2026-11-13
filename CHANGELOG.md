@@ -292,9 +292,11 @@ consumer upgrading can skip it.
   `run` and `wait`; without one the launch stage waits until the tracer lets
   go.
 - A launch takes its launch stage's pidfd from the fork that creates the stage,
-  so a caller that reaps its children elsewhere, with `waitpid(-1)`, can no
-  longer have a launch signal or wait for an unrelated process that took the
-  stage's pid.
+  and so does every helper process the library forks: an export's, a copy-in's,
+  and a removal's, the overlay and seccomp probes, and the network stack's tap
+  helper. Each is signalled and reaped through that pidfd, so a caller that
+  reaps its children elsewhere, with `waitpid(-1)`, can no longer have the
+  library signal or wait for an unrelated process that took one's pid.
 - A capability drop removes every capability the running kernel defines from
   the bounding set. A capability past the last one rustix names, as a later
   kernel adds, stayed in it.

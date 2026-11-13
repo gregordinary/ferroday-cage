@@ -14,7 +14,7 @@ use rustix::io::Errno;
 use rustix::thread::UnshareFlags;
 use syscalls::Sysno;
 
-use super::sys::{self, Fork, errno};
+use super::sys::{self, PidfdFork, errno};
 use super::{LaunchPlan, SockFilter};
 
 /// Classic-BPF opcodes and `seccomp_data` field offsets.
@@ -490,12 +490,10 @@ pub(crate) fn installable() -> bool {
     // allocation, no lock, no libc, no panic — and always ends in
     // `exit_group`. It leaves every signal blocked, as the fork hands it, so
     // no inherited handler can run before it exits.
-    match unsafe { sys::fork() } {
+    match unsafe { sys::fork_with_pidfd() } {
         Err(_) => false,
-        Ok(Fork::Child) => sys::exit_group(install_in_probe()),
-        Ok(Fork::ParentOf(child)) => {
-            super::wait_for_exit(child).is_ok_and(|status| status.exit_status() == Some(0))
-        }
+        Ok(PidfdFork::Child) => sys::exit_group(install_in_probe()),
+        Ok(PidfdFork::ParentOf(child)) => child.reap() == Ok(Some(0)),
     }
 }
 
