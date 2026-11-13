@@ -1,14 +1,15 @@
 //! The seccomp filters the launch installs, and the classic-BPF vocabulary
 //! they are written in.
 //!
-//! Two kinds of program reach the kernel through [`install`]: a caller's
-//! hardening policy, compiled at build time by the `hardening` layer, and
+//! Three kinds of program reach the kernel through [`install`]: a caller's
+//! hardening policy, compiled at build time by the `hardening` layer;
 //! [`NETWORK_FILTER`], which every sandbox with a network namespace of its own
-//! carries and which this module states outright. The opcodes, the
-//! `seccomp_data` offsets, the audit architectures, and the answers below are
-//! the one vocabulary both are written in. They are named here rather than
-//! taken from a binding, so the crate's raw BPF is self-contained and
-//! reviewable.
+//! carries; and [`KEYRING_FILTER`], which a launch carries where it cannot give
+//! the sandbox a session keyring of its own. This module states the last two
+//! outright. The opcodes, the `seccomp_data` offsets, the audit architectures,
+//! and the answers below are the one vocabulary all three are written in. They
+//! are named here rather than taken from a binding, so the crate's raw BPF is
+//! self-contained and reviewable.
 
 use rustix::io::Errno;
 use rustix::thread::UnshareFlags;
@@ -92,8 +93,8 @@ pub(crate) const RET_KILL_PROCESS: u32 = 0x8000_0000;
 ///
 /// The hardening layer encodes a policy's actions through seccompiler's own
 /// conversion instead, which covers actions no filter here returns. This
-/// encoding is the network filter's, which cannot depend on seccompiler: that
-/// ships only with the `hardening` feature.
+/// encoding is the network and keyring filters', which cannot depend on
+/// seccompiler: that ships only with the `hardening` feature.
 pub(crate) const fn ret_errno(errno: u16) -> u32 {
     0x0005_0000 | errno as u32
 }
@@ -128,6 +129,43 @@ const I386_SOCKETCALL: u32 = 102;
 const ARM_SOCKET: u32 = 281;
 /// `socket` in the generic syscall table aarch64 and RISC-V share.
 const GENERIC_SOCKET: u32 = 198;
+
+/// The three key-management calls, by the numbers one syscall table gives
+/// them.
+struct KeyCalls {
+    /// `add_key`.
+    add_key: u32,
+    /// `request_key`.
+    request_key: u32,
+    /// `keyctl`.
+    keyctl: u32,
+}
+
+/// The key calls on x86_64, and through the x32 ABI with [`X32_SYSCALL_BIT`]
+/// set.
+const X86_64_KEY_CALLS: KeyCalls = KeyCalls {
+    add_key: 248,
+    request_key: 249,
+    keyctl: 250,
+};
+/// The key calls on 32-bit x86.
+const I386_KEY_CALLS: KeyCalls = KeyCalls {
+    add_key: 286,
+    request_key: 287,
+    keyctl: 288,
+};
+/// The key calls on 32-bit arm, under the EABI.
+const ARM_KEY_CALLS: KeyCalls = KeyCalls {
+    add_key: 309,
+    request_key: 310,
+    keyctl: 311,
+};
+/// The key calls in the generic syscall table aarch64 and RISC-V share.
+const GENERIC_KEY_CALLS: KeyCalls = KeyCalls {
+    add_key: 217,
+    request_key: 218,
+    keyctl: 219,
+};
 
 /// One instruction that takes no branch.
 const fn stmt(code: u16, k: u32) -> SockFilter {
@@ -171,7 +209,7 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 ///   [20] return EAFNOSUPPORT
 ///   [21] return ENOSYS
 /// ```
-const X86_FILTER: [SockFilter; 22] = [
+const X86_NETWORK_FILTER: [SockFilter; 22] = [
     stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_X86_64, 2, 0),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_I386, 6, 0),
@@ -223,7 +261,7 @@ const X86_FILTER: [SockFilter; 22] = [
 ///   [15] return EAFNOSUPPORT
 ///   [16] return ENOSYS
 /// ```
-const ARM_FILTER: [SockFilter; 17] = [
+const ARM_NETWORK_FILTER: [SockFilter; 17] = [
     stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_AARCH64, 2, 0),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_ARM, 5, 0),
@@ -261,7 +299,7 @@ const ARM_FILTER: [SockFilter; 17] = [
 ///   [11] return EAFNOSUPPORT
 ///   [12] return ENOSYS
 /// ```
-const RISCV_FILTER: [SockFilter; 13] = [
+const RISCV_NETWORK_FILTER: [SockFilter; 13] = [
     stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV64, 2, 0),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV32, 1, 0),
@@ -304,11 +342,11 @@ const HOST: Family = if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
 };
 
 /// The network filter for `family`.
-const fn program_for(family: Family) -> &'static [SockFilter] {
+const fn network_program_for(family: Family) -> &'static [SockFilter] {
     match family {
-        Family::X86 => &X86_FILTER,
-        Family::Arm => &ARM_FILTER,
-        Family::RiscV => &RISCV_FILTER,
+        Family::X86 => &X86_NETWORK_FILTER,
+        Family::Arm => &ARM_NETWORK_FILTER,
+        Family::RiscV => &RISCV_NETWORK_FILTER,
     }
 }
 
@@ -343,8 +381,8 @@ const fn program_for(family: Family) -> &'static [SockFilter] {
 ///   glibc program creates every socket through `socketcall`, so it creates
 ///   none in such a sandbox. musl tries the direct call first and is
 ///   unaffected, as is every 64-bit program. 32-bit arm's `socketcall` is out
-///   of reach, as [`ARM_FILTER`] states, and no other architecture has the
-///   call.
+///   of reach, as [`ARM_NETWORK_FILTER`] states, and no other architecture has
+///   the call.
 ///
 /// Every entry point a kernel of the build's family presents is checked: the
 /// 64-bit ABI, x32 under x86_64's audit architecture, and the 32-bit compat
@@ -353,9 +391,9 @@ const fn program_for(family: Family) -> &'static [SockFilter] {
 /// build runs on. Everything else is allowed.
 ///
 /// [`NETWORK_FILTER_REFUSALS`] states the same refusals as data.
-pub(crate) const NETWORK_FILTER: &[SockFilter] = program_for(HOST);
+pub(crate) const NETWORK_FILTER: &[SockFilter] = network_program_for(HOST);
 
-/// One syscall the network filter refuses: the call, the value its first
+/// One syscall a filter of this module refuses: the call, the value its first
 /// argument holds where the refusal depends on one, and the errno it answers
 /// in place of running the call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,7 +428,7 @@ const SOCKETCALL_SOCKET: Refusal = Refusal {
 };
 
 /// What `family`'s network filter refuses.
-const fn refusals_for(family: Family) -> &'static [Refusal] {
+const fn network_refusals_for(family: Family) -> &'static [Refusal] {
     match family {
         Family::X86 => &[VSOCK_SOCKET, RING_SETUP, SOCKETCALL_SOCKET],
         Family::Arm | Family::RiscV => &[VSOCK_SOCKET, RING_SETUP],
@@ -402,7 +440,7 @@ const fn refusals_for(family: Family) -> &'static [Refusal] {
 ///
 /// The provenance record reports these. The unit tests hold the list to the
 /// programs, every family's: each refusal is made, and nothing else is.
-pub(crate) const NETWORK_FILTER_REFUSALS: &[Refusal] = refusals_for(HOST);
+pub(crate) const NETWORK_FILTER_REFUSALS: &[Refusal] = network_refusals_for(HOST);
 
 /// Whether a launch of `plan` installs [`NETWORK_FILTER`]: wherever its
 /// sandbox has a network namespace of its own.
@@ -412,6 +450,168 @@ pub(crate) const NETWORK_FILTER_REFUSALS: &[Refusal] = refusals_for(HOST);
 pub(crate) fn installs_network_filter(plan: &LaunchPlan) -> bool {
     plan.unshare.contains(UnshareFlags::NEWNET)
 }
+
+/// The keyring filter for an x86 kernel: x86_64, x32, and 32-bit x86.
+///
+/// ```text
+///   [0]  A = arch
+///   [1]  x86_64 or x32: to [4]
+///   [2]  32-bit x86: to [10]
+///   [3]  any other architecture: kill
+///   [4]  A = nr
+///   [5]  A &= !__X32_SYSCALL_BIT        an x32 call reads as its 64-bit twin
+///   [6]  add_key: to [15]
+///   [7]  request_key: to [15]
+///   [8]  keyctl: to [15]
+///   [9]  allow
+///   [10] A = nr
+///   [11] add_key: to [15]
+///   [12] request_key: to [15]
+///   [13] keyctl: to [15]
+///   [14] allow
+///   [15] return ENOSYS
+/// ```
+const X86_KEYRING_FILTER: [SockFilter; 16] = [
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_X86_64, 2, 0),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_I386, 7, 0),
+    stmt(bpf::RET_K, RET_KILL_PROCESS),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    stmt(bpf::ALU_AND_K, !X32_SYSCALL_BIT),
+    jump(bpf::JMP_JEQ_K, X86_64_KEY_CALLS.add_key, 8, 0),
+    jump(bpf::JMP_JEQ_K, X86_64_KEY_CALLS.request_key, 7, 0),
+    jump(bpf::JMP_JEQ_K, X86_64_KEY_CALLS.keyctl, 6, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, I386_KEY_CALLS.add_key, 3, 0),
+    jump(bpf::JMP_JEQ_K, I386_KEY_CALLS.request_key, 2, 0),
+    jump(bpf::JMP_JEQ_K, I386_KEY_CALLS.keyctl, 1, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::RET_K, ret_errno(ENOSYS)),
+];
+
+/// The keyring filter for an arm kernel: aarch64, and 32-bit arm natively or
+/// through an arm64 kernel's compat layer.
+///
+/// ```text
+///   [0]  A = arch
+///   [1]  aarch64: to [4]
+///   [2]  32-bit arm: to [9]
+///   [3]  any other architecture: kill
+///   [4]  A = nr
+///   [5]  add_key: to [14]
+///   [6]  request_key: to [14]
+///   [7]  keyctl: to [14]
+///   [8]  allow
+///   [9]  A = nr
+///   [10] add_key: to [14]
+///   [11] request_key: to [14]
+///   [12] keyctl: to [14]
+///   [13] allow
+///   [14] return ENOSYS
+/// ```
+const ARM_KEYRING_FILTER: [SockFilter; 15] = [
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_AARCH64, 2, 0),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_ARM, 6, 0),
+    stmt(bpf::RET_K, RET_KILL_PROCESS),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, GENERIC_KEY_CALLS.add_key, 8, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_KEY_CALLS.request_key, 7, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_KEY_CALLS.keyctl, 6, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, ARM_KEY_CALLS.add_key, 3, 0),
+    jump(bpf::JMP_JEQ_K, ARM_KEY_CALLS.request_key, 2, 0),
+    jump(bpf::JMP_JEQ_K, ARM_KEY_CALLS.keyctl, 1, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::RET_K, ret_errno(ENOSYS)),
+];
+
+/// The keyring filter for a RISC-V kernel: 64-bit, and 32-bit through its
+/// compat layer, both on the generic syscall table.
+///
+/// ```text
+///   [0]  A = arch
+///   [1]  64-bit: to [4]
+///   [2]  32-bit: to [4]
+///   [3]  any other architecture: kill
+///   [4]  A = nr
+///   [5]  add_key: to [9]
+///   [6]  request_key: to [9]
+///   [7]  keyctl: to [9]
+///   [8]  allow
+///   [9]  return ENOSYS
+/// ```
+const RISCV_KEYRING_FILTER: [SockFilter; 10] = [
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV64, 2, 0),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV32, 1, 0),
+    stmt(bpf::RET_K, RET_KILL_PROCESS),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, GENERIC_KEY_CALLS.add_key, 3, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_KEY_CALLS.request_key, 2, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_KEY_CALLS.keyctl, 1, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::RET_K, ret_errno(ENOSYS)),
+];
+
+/// The keyring filter for `family`.
+const fn keyring_program_for(family: Family) -> &'static [SockFilter] {
+    match family {
+        Family::X86 => &X86_KEYRING_FILTER,
+        Family::Arm => &ARM_KEYRING_FILTER,
+        Family::RiscV => &RISCV_KEYRING_FILTER,
+    }
+}
+
+/// The filter a launch carries where it cannot give the sandbox a session
+/// keyring of its own: `add_key`, `request_key`, and `keyctl` answer `ENOSYS`.
+///
+/// A launch joins a fresh session keyring before it forks anything, which ends
+/// the sandbox's possession of the keys the caller's session holds. Where the
+/// join is refused, the caller's keyring stays, and with it the possession. This filter then keeps the keys out of the sandbox's reach: with
+/// the three calls refused whole, no process of the sandbox reads, links,
+/// searches, or adds a key through any operation, whichever operations a
+/// policy the launch runs under allows. The launch stage's
+/// `replace_session_keyring` says when it is installed and what it leaves.
+///
+/// `ENOSYS` is what a kernel built without key support answers, so a program
+/// that probes for the keyring reads it as absent. Every entry point a kernel
+/// of the build's family presents is checked, as [`NETWORK_FILTER`] checks
+/// them, and a syscall under any other audit architecture kills the process.
+/// Everything else is allowed.
+///
+/// The curated seccomp denylist refuses the same three calls, with `EPERM`,
+/// where a caller asks for it. That is a policy of the `hardening` layer,
+/// compiled for the host's architecture alone; this filter is the launch's
+/// own, in every build, which is why it states the calls itself.
+pub(crate) const KEYRING_FILTER: &[SockFilter] = keyring_program_for(HOST);
+
+/// What [`KEYRING_FILTER`] refuses, at every entry point of every family.
+///
+/// Stated for the unit tests, which hold every family's program to it: each
+/// refusal is made, and nothing else is. No provenance record reports it,
+/// since whether a launch installs the filter is settled only by what the
+/// kernel answers the launch's join.
+#[cfg(test)]
+const KEYRING_FILTER_REFUSALS: &[Refusal] = &[
+    Refusal {
+        syscall: "add_key",
+        first_argument: None,
+        errno: ENOSYS,
+    },
+    Refusal {
+        syscall: "request_key",
+        first_argument: None,
+        errno: ENOSYS,
+    },
+    Refusal {
+        syscall: "keyctl",
+        first_argument: None,
+        errno: ENOSYS,
+    },
+];
 
 /// `SECCOMP_SET_MODE_FILTER`: install a classic BPF filter.
 const SECCOMP_SET_MODE_FILTER: usize = 1;
@@ -445,9 +645,9 @@ const _: () = {
 /// kernel runs the newest first and keeps the most severe action, and between
 /// two that fail a syscall with an errno, the newer one's errno.
 ///
-/// The length of every program that reaches here fits a `u16`. The network
-/// filter's is fixed, and the hardening layer refuses anything longer than
-/// `BPF_MAXINSNS` (4096) at build time, so the narrowing cannot wrap.
+/// The length of every program that reaches here fits a `u16`. The network and
+/// keyring filters' are fixed, and the hardening layer refuses anything longer
+/// than `BPF_MAXINSNS` (4096) at build time, so the narrowing cannot wrap.
 pub(crate) fn install(program: &[SockFilter]) -> Result<(), Errno> {
     let fprog = SockFprog {
         len: program.len() as u16,
@@ -665,7 +865,7 @@ mod tests {
     #[test]
     fn every_entry_point_refuses_a_vsock_socket() {
         for family in FAMILIES {
-            let program = program_for(family);
+            let program = network_program_for(family);
             for entry in entry_points(family) {
                 let socket = entry.call("socket");
                 for kind in [1, 2, 5] {
@@ -684,7 +884,7 @@ mod tests {
     fn high_bits_do_not_hide_the_vsock_family() {
         // The kernel reads the family as an int, so these are all AF_VSOCK.
         for family in FAMILIES {
-            let program = program_for(family);
+            let program = network_program_for(family);
             for entry in entry_points(family) {
                 for domain in [1 << 32 | 40, u64::MAX << 32 | 40] {
                     let call = Call::new(entry.arch, entry.call("socket"), &[domain, 1, 0]);
@@ -703,7 +903,7 @@ mod tests {
         // AF_UNIX, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, and the families
         // either side of AF_VSOCK.
         for family in FAMILIES {
-            let program = program_for(family);
+            let program = network_program_for(family);
             for entry in entry_points(family) {
                 for domain in [1, 2, 10, 16, 17, 39, 41] {
                     let call = Call::new(entry.arch, entry.call("socket"), &[domain, 1, 0]);
@@ -716,7 +916,7 @@ mod tests {
     #[test]
     fn every_entry_point_refuses_io_uring_setup() {
         for family in FAMILIES {
-            let program = program_for(family);
+            let program = network_program_for(family);
             for entry in entry_points(family) {
                 let nr = entry.call("io_uring_setup");
                 let call = Call::new(entry.arch, nr, &[1, 0x1000]);
@@ -741,7 +941,7 @@ mod tests {
         // creation is refused, with the answer `socket` gives for a family
         // the kernel does not offer; the other calls socketcall carries run.
         for family in FAMILIES {
-            let program = program_for(family);
+            let program = network_program_for(family);
             for entry in entry_points(family) {
                 let Some(socketcall) = entry.number("socketcall") else {
                     continue;
@@ -766,44 +966,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn each_program_refuses_exactly_what_its_refusals_state() {
-        // Every number an entry point's syscall table reaches, each over first
-        // arguments that cover every address family and every socketcall call
-        // number, with and without high bits set. Whatever no stated refusal
-        // covers is allowed, so a refusal the list omits fails here as surely
-        // as one the program does not make.
+    /// Holds `program`, `family`'s, to `refusals`: every number an entry
+    /// point's syscall table reaches, each over first arguments that cover
+    /// every address family and every socketcall call number, with and without
+    /// high bits set, is refused where a stated refusal covers it and allowed
+    /// everywhere else. A refusal the list omits therefore fails as surely as
+    /// one the program does not make.
+    fn assert_refuses_exactly(family: Family, program: &[SockFilter], refusals: &[Refusal]) {
+        for refusal in refusals {
+            assert!(
+                entry_points(family)
+                    .into_iter()
+                    .any(|entry| entry.number(refusal.syscall).is_some()),
+                "{family:?} states a refusal of a call it has no entry point for: {refusal:?}"
+            );
+        }
         let firsts: Vec<u64> = (0..=64)
             .chain([1 << 32 | 1, 1 << 32 | 40, u64::MAX << 32 | 40, u64::MAX])
             .collect();
-        for family in FAMILIES {
-            let program = program_for(family);
-            let refusals = refusals_for(family);
-            for refusal in refusals {
-                assert!(
-                    entry_points(family)
-                        .into_iter()
-                        .any(|entry| entry.number(refusal.syscall).is_some()),
-                    "{family:?} states a refusal of a call it has no entry point for: {refusal:?}"
-                );
+        for entry in entry_points(family) {
+            for nr in (0..1024).map(|base| base | entry.tag) {
+                for &first in &firsts {
+                    // The low 32 bits, as the filter compares them.
+                    let low = first as u32;
+                    let expected = refusals
+                        .iter()
+                        .find(|refusal| {
+                            entry.number(refusal.syscall) == Some(nr)
+                                && refusal.first_argument.is_none_or(|value| value == low)
+                        })
+                        .map_or(RET_ALLOW, |refusal| ret_errno(refusal.errno));
+                    let call = Call::new(entry.arch, nr, &[first, 0x0804_8000, 0]);
+                    assert_eq!(
+                        run(program, &call),
+                        expected,
+                        "{entry:?}, nr {nr:#x}, first argument {first:#x}"
+                    );
+                }
             }
+        }
+    }
+
+    #[test]
+    fn each_program_refuses_exactly_what_its_refusals_state() {
+        for family in FAMILIES {
+            assert_refuses_exactly(
+                family,
+                network_program_for(family),
+                network_refusals_for(family),
+            );
+            assert_refuses_exactly(family, keyring_program_for(family), KEYRING_FILTER_REFUSALS);
+        }
+    }
+
+    #[test]
+    fn every_entry_point_refuses_the_key_calls() {
+        // Whatever the operation or the key a call names, as a policy that
+        // allowed some operations would not.
+        for family in FAMILIES {
+            let program = keyring_program_for(family);
             for entry in entry_points(family) {
-                for nr in (0..1024).map(|base| base | entry.tag) {
-                    for &first in &firsts {
-                        // The low 32 bits, as the filter compares them.
-                        let low = first as u32;
-                        let expected = refusals
-                            .iter()
-                            .find(|refusal| {
-                                entry.number(refusal.syscall) == Some(nr)
-                                    && refusal.first_argument.is_none_or(|value| value == low)
-                            })
-                            .map_or(RET_ALLOW, |refusal| ret_errno(refusal.errno));
+                for name in ["add_key", "request_key", "keyctl"] {
+                    let nr = entry.call(name);
+                    for first in [0, 1, 11, 0xffff_fffd, u64::MAX] {
                         let call = Call::new(entry.arch, nr, &[first, 0x0804_8000, 0]);
                         assert_eq!(
                             run(program, &call),
-                            expected,
-                            "{entry:?}, nr {nr:#x}, first argument {first:#x}"
+                            ret_errno(ENOSYS),
+                            "{entry:?}, {name}, first argument {first:#x}"
                         );
                     }
                 }
@@ -813,7 +1043,7 @@ mod tests {
 
     #[test]
     fn the_host_reports_its_own_familys_refusals() {
-        assert_eq!(NETWORK_FILTER_REFUSALS, refusals_for(HOST));
+        assert_eq!(NETWORK_FILTER_REFUSALS, network_refusals_for(HOST));
     }
 
     #[test]
@@ -834,7 +1064,7 @@ mod tests {
         for (family, arch, nr) in cases {
             let call = Call::new(arch, nr, &[u64::from(AF_VSOCK), u64::from(SYS_SOCKET)]);
             assert_eq!(
-                run(program_for(family), &call),
+                run(network_program_for(family), &call),
                 RET_ALLOW,
                 "{family:?}, arch {arch:#x}, nr {nr}"
             );
@@ -851,16 +1081,14 @@ mod tests {
         ];
         for (family, arch) in foreign {
             let call = Call::new(arch, 39, &[]);
-            assert_eq!(
-                run(program_for(family), &call),
-                RET_KILL_PROCESS,
-                "{family:?}"
-            );
+            for program in [network_program_for(family), keyring_program_for(family)] {
+                assert_eq!(run(program, &call), RET_KILL_PROCESS, "{family:?}");
+            }
         }
     }
 
     #[test]
-    fn the_host_runs_its_own_familys_filter() {
+    fn the_host_runs_its_own_familys_filters() {
         let expected = if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
             Family::X86
         } else if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
@@ -869,7 +1097,8 @@ mod tests {
             Family::RiscV
         };
         assert_eq!(HOST, expected);
-        assert_eq!(NETWORK_FILTER, program_for(expected));
+        assert_eq!(NETWORK_FILTER, network_program_for(expected));
+        assert_eq!(KEYRING_FILTER, keyring_program_for(expected));
     }
 
     #[test]

@@ -176,7 +176,8 @@ wire_enum! {
         /// Mark the sandbox's root mount `nosuid`.
         NosuidRootfs = 54 => "marking the root mount nosuid",
         /// Give the sandbox a session keyring of its own, in place of the one
-        /// the caller's session carries.
+        /// the caller's session carries, or, where the kernel refuses that,
+        /// install the filter that refuses the sandbox the key syscalls.
         ReplaceSessionKeyring = 55 => "replacing the inherited session keyring",
         /// Allocate the sandbox's pseudoterminal from the `/dev/ptmx` the
         /// sandbox sees, and establish its size and line discipline.

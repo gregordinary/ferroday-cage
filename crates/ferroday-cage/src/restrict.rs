@@ -54,7 +54,9 @@
 //!   ends possession of the caller's session keys, but the user keyring, the
 //!   user session keyring, and the persistent keyring belong to the user rather
 //!   than the session. The command is that user, so it can link them into its
-//!   own keyring and read every key they hold. See [The session
+//!   own keyring and read every key they hold. A launch the kernel refuses the
+//!   fresh keyring refuses the command every key syscall instead, which closes
+//!   this too. See [The session
 //!   keyring](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#the-session-keyring).
 //! - **The caller's terminal.** A command holding a descriptor onto the
 //!   caller's terminal can read what is typed at it, change its settings, and —

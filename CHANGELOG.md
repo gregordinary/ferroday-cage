@@ -155,6 +155,16 @@ consumer upgrading can skip it.
   outside policy's alphabet is, and a base's status entry stating one is read as
   stating no version. A version reached a pin's refusals, and `fcage`'s report
   of them, as written.
+- A launch whose session keyring join is refused with `EPERM` or `ENOSYS`, as a
+  seccomp policy the launch runs under can refuse it, installs a seccomp filter
+  of its own before it forks anything, which answers `add_key`, `request_key`,
+  and `keyctl` with `ENOSYS` for every process of the sandbox or restriction.
+  The launch previously proceeded wherever `KEYCTL_GET_KEYRING_ID` was refused
+  the same way, so a policy that refused those two operations and allowed
+  `KEYCTL_READ` left the command possessing the caller's session keyring and
+  able to read its keys. A policy that refuses the join alone no longer fails
+  the launch. A launch that cannot install the filter fails at
+  `SetupStep::ReplaceSessionKeyring`.
 
 ### Added
 

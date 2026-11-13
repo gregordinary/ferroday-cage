@@ -130,13 +130,14 @@ queue.
 
 Every launch of a sandbox or a restriction gives the command a fresh session
 keyring in place of the one it inherited. The command therefore does not possess
-the keys the caller's login session holds. A restriction leaves more of the
-user's keys in reach than a sandbox does, though. The user keyring, the user
-session keyring, and the persistent keyring belong to the user rather than to the
-session. A restricted command runs as that user, so it can link them into its own
-keyring and read every key they hold. That includes a Kerberos ticket cache kept
-in the persistent keyring. The curated seccomp policy denies `keyctl`, which
-closes this. See [The session
+the keys the caller's login session holds. Where the kernel refuses the launch
+that keyring, the launch refuses the command every key syscall instead. A
+restriction leaves more of the user's keys in reach than a sandbox does, though.
+The user keyring, the user session keyring, and the persistent keyring belong to
+the user rather than to the session. A restricted command runs as that user, so
+it can link them into its own keyring and read every key they hold. That
+includes a Kerberos ticket cache kept in the persistent keyring. The curated
+seccomp policy denies `keyctl`, which closes this. See [The session
 keyring](how-the-sandbox-is-built.md#the-session-keyring).
 
 ## Falling back from a cage

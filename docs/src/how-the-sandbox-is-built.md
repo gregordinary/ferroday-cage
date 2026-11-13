@@ -43,8 +43,9 @@ sequence itself.
 4. **Replace the session keyring.** The launch joins a fresh, anonymous session
    keyring in place of the one it inherited from the caller. A keyring is a
    credential rather than a descriptor, so the sweep does not reach it. No
-   namespace partitions it either. See [The session
-   keyring](#the-session-keyring).
+   namespace partitions it either. Where the kernel refuses the join, the launch
+   installs a seccomp filter that refuses the sandbox the key syscalls instead.
+   See [The session keyring](#the-session-keyring).
 5. **Identity map.** The launch stage establishes the map of its freshly
    created user namespace, per the configured
    [identity map](identity-maps.md). The default single-identity map is
@@ -288,13 +289,51 @@ the sandbox runs. The quota is `kernel.keys.maxkeys` keys and
 holds counts against it too. A launch that finds the quota spent reports
 `Error::KeyQuotaExhausted`, which names both sysctls.
 
-A process that cannot call `keyctl` at all has no keyring to replace. Neither
-has anything it forks, because a seccomp filter is inherited, and so is a kernel
-built without key support. Container runtimes' default seccomp profiles deny the
-call in exactly this way, and a launch under one proceeds. Before it proceeds,
-the launch confirms that reading the inherited keyring is refused the same way.
-A policy that refuses only the join therefore fails the launch, rather than
-leaving the caller's keyring in place.
+### When the join is refused
+
+A kernel built without key support refuses the join with `ENOSYS`. A seccomp
+policy the launch runs under can refuse it too: moby's default profile, the one
+Docker applies, refuses every `keyctl` call with `EPERM`. Either way the
+caller's session keyring stays, and the sandbox possesses every key it reaches.
+
+A refusal of the join says nothing about the rest of `keyctl`. A policy can
+refuse the join and allow `KEYCTL_READ`. So where the join is refused with
+`EPERM` or `ENOSYS`, the launch stage installs a seccomp filter of its own
+before it forks anything:
+
+| Call | Answer |
+| --- | --- |
+| `add_key` | `ENOSYS` |
+| `request_key` | `ENOSYS` |
+| `keyctl`, every operation | `ENOSYS` |
+
+Each answer is the one a kernel without key support gives, so a program that
+probes for the keyring reads it as absent. Every process of the sandbox
+inherits the filter. None can read, link, search, or add a key through any
+operation, whatever the policy allows. The filter checks every entry point the
+host's kernel presents, as [the network filter](#the-network-filter) does, and
+a syscall under any other architecture kills the process.
+
+The kernel accepts the install from a process holding no-new-privileges, or
+holding `CAP_SYS_ADMIN` in its user namespace. A sandbox's launch stage holds
+the capability in the user namespace it has just created, so the filter changes
+nothing about whether the sandbox runs under no-new-privileges. A restriction
+always runs under no-new-privileges, and its launch stage sets the flag before
+the install. A launch that cannot install the filter fails at
+`SetupStep::ReplaceSessionKeyring`. So does a join refused with any other
+errno.
+
+Under the filter, the sandbox still possesses the caller's session keyring, and
+two things follow from possession alone. `/proc/keys` lists every key that
+keyring reaches whose permissions let a possessor view it, which the default
+permissions do. A kernel service that uses the caller's keys on the sandbox's
+behalf still finds them, as a network filesystem finds the credentials it
+authenticates with. No syscall reaches a key's payload.
+
+A [seccomp policy](hardening.md#seccomp-syscall-filters) is installed after the
+filter. Where both refuse a call with an errno, the command sees the policy's.
+`Cage::resolved_inputs` does not report the filter, since whether a launch
+installs it depends on what the kernel answers the launch.
 
 ## The mount profile
 
@@ -600,7 +639,9 @@ disclosure warrants.
 `/proc/keys` is a disclosure of the same kind. It lists the description of every
 key the calling user owns, wherever the key's permissions let its owner view it.
 The command possesses none of those keys. It reads the contents only of one whose
-permissions grant its owner reading. See [The session
+permissions grant its owner reading. A launch the kernel refuses a keyring of its
+own leaves the command possessing the caller's session keys, and listing them,
+and refuses it every key syscall instead. See [The session
 keyring](#the-session-keyring).
 
 The init is a third. It is a fork of the calling process that runs no program

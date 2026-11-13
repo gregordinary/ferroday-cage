@@ -57,6 +57,8 @@
 //! unmodeled mounts expressed through the [`RawMount`] escape hatch. One
 //! property is not configurable: the command starts with a session keyring
 //! of its own, so it possesses none of the keys the caller's session holds.
+//! Where the kernel refuses the launch that keyring, the command can make no
+//! key syscall at all.
 //!
 //! The isolation bounds what the command can reach, not what it can learn. Its
 //! own mount table — `/proc/self/mountinfo` — names the host path of the rootfs

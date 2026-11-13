@@ -4,8 +4,9 @@
 //! A launch runs across a small tree of forked processes. Stage A is forked
 //! from the caller and is short-lived: it scrubs the inherited signal state,
 //! unshares the namespaces, sweeps the inherited descriptor table, replaces the
-//! inherited session keyring, forks the next stage, and publishes that stage's
-//! pidfd back to the caller over the control socket.
+//! inherited session keyring or, where it cannot, refuses the key syscalls to
+//! everything it forks, forks the next stage, and publishes that stage's pidfd
+//! back to the caller over the control socket.
 //!
 //! With a PID namespace (the default), the process A forks is the sandbox
 //! init — PID 1 inside the namespace. It leaves the caller's session or
@@ -241,8 +242,9 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // The session keyring, the one piece of the caller's session the sweep
     // cannot reach because it is a credential rather than a descriptor. Every
     // sandbox stage is forked from this process, so replacing it here replaces
-    // it for all of them, in a restriction as in a container.
-    replace_session_keyring().map_err(|errno| (SetupStep::ReplaceSessionKeyring, errno, 0))?;
+    // it for all of them, in a restriction as in a container, and so does the
+    // filter installed where it cannot be replaced.
+    replace_session_keyring(plan).map_err(|errno| (SetupStep::ReplaceSessionKeyring, errno, 0))?;
 
     // Establish the identity map, after the sweep so the map gate survives
     // it, and before any further fork so every sandbox stage runs in a
@@ -2281,17 +2283,13 @@ fn parse_fd(name: &CStr) -> Option<RawFd> {
     Some(value)
 }
 
-/// `KEYCTL_GET_KEYRING_ID`: report the serial of a special keyring, creating
-/// nothing when the third argument is zero.
-const KEYCTL_GET_KEYRING_ID: usize = 0;
 /// `KEYCTL_JOIN_SESSION_KEYRING`: replace the session keyring, with a fresh
 /// anonymous one when the name argument is null.
 const KEYCTL_JOIN_SESSION_KEYRING: usize = 1;
-/// `KEY_SPEC_SESSION_KEYRING`: the calling process's session keyring.
-const KEY_SPEC_SESSION_KEYRING: i32 = -3;
 
 /// Gives this process, and every process it forks, a session keyring of its
-/// own in place of the one it inherited.
+/// own in place of the one it inherited, or, where the kernel refuses that,
+/// refuses them the key syscalls.
 ///
 /// The session keyring is not partitioned by any namespace a launch creates.
 /// A forked process inherits its parent's, and a process *possesses* every key
@@ -2312,40 +2310,62 @@ const KEY_SPEC_SESSION_KEYRING: i32 = -3;
 /// caller's and can link them back in. The curated seccomp denylist, which
 /// denies `keyctl`, closes what this does not.
 ///
-/// A process that cannot call `keyctl` at all has nothing to replace, and
-/// neither has anything it forks: a seccomp filter is inherited, and so is a
-/// kernel built without key support. Container runtimes' default seccomp
-/// profiles deny the call exactly so, and a launch under one proceeds. That is
-/// established by asking rather than read into the errno: a refused join is
-/// excused only when a read-only query of the inherited keyring is refused the
-/// same way, so a refusal aimed at the join alone, which would leave the old
-/// keyring in place and readable, still fails the launch. The query stands in
-/// for every `keyctl` operation. A filter that refused the join and the query
-/// while allowing `KEYCTL_READ` would be excused all the same; a filter written
-/// to deny the call does not discriminate between its operations that way.
+/// # Where the join is refused
 ///
-/// Post-fork safe: raw syscalls only.
-fn replace_session_keyring() -> Result<(), Errno> {
-    match keyctl(KEYCTL_JOIN_SESSION_KEYRING, 0) {
+/// A kernel built without key support refuses the join with `ENOSYS`, and a
+/// seccomp policy the launch runs under can refuse it too, with `EPERM` where
+/// the policy was written to deny the call, as moby's default profile denies
+/// `keyctl`. The inherited keyring then stays, and with it the possession of
+/// every key it reaches. What else the policy refuses cannot be
+/// read from the refusal: one can refuse the join and allow `KEYCTL_READ`, and
+/// asking another operation answers for that operation alone. So nothing is
+/// asked. Where the join is refused with either errno, this installs
+/// [`seccomp::KEYRING_FILTER`], which refuses `add_key`, `request_key`, and
+/// `keyctl` whole, before anything is forked. Every process of the sandbox
+/// inherits it, so none reads, links, or searches a key through any
+/// operation, whatever the policy allows.
+///
+/// The install needs no-new-privileges, or `CAP_SYS_ADMIN` in the calling
+/// process's user namespace. A container's launch stage holds the capability
+/// here, in the user namespace it has just created, so the flag is left as the
+/// launch would otherwise leave it: unset, unless a hardening control, a
+/// run-as identity, or a presented identity sets it later. A restriction
+/// creates no namespace, and always runs under no-new-privileges, which its
+/// hardening sets before the exec; setting it here, before the install, changes
+/// nothing the command sees. A filter that cannot be installed fails the
+/// launch at this step, and so does a join refused with any other errno.
+/// `EDQUOT`, the calling user's key quota spent, is reported as
+/// [`Error::KeyQuotaExhausted`](crate::Error::KeyQuotaExhausted).
+///
+/// Under the filter the sandbox still possesses the inherited keyring, and two
+/// things follow from possession without a syscall. `/proc/keys` lists every
+/// key it reaches whose permissions let a possessor view it, as the default
+/// permissions do. And a kernel service that acts on the caller's keys on the
+/// sandbox's behalf still finds them, as a network filesystem finds the
+/// credentials it authenticates with. No syscall reaches a key's payload.
+///
+/// Post-fork safe: raw syscalls only, over a static program.
+fn replace_session_keyring(plan: &LaunchPlan) -> Result<(), Errno> {
+    match join_anonymous_session_keyring() {
         Ok(()) => Ok(()),
-        Err(refused @ (Errno::PERM | Errno::NOSYS)) => {
-            match keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING as usize) {
-                Err(Errno::PERM | Errno::NOSYS) => Ok(()),
-                _ => Err(refused),
+        Err(Errno::PERM | Errno::NOSYS) => {
+            match plan.confinement {
+                super::Confinement::Container => {}
+                #[cfg(feature = "hardening")]
+                super::Confinement::Restriction => thread::set_no_new_privs(true)?,
             }
+            seccomp::install(seccomp::KEYRING_FILTER)
         }
         Err(errno) => Err(errno),
     }
 }
 
-/// Issues one two-argument `keyctl` operation, discarding its result value.
-fn keyctl(operation: usize, argument: usize) -> Result<(), Errno> {
-    // SAFETY: both operations used here take integer arguments only; a zero
-    // second argument to `KEYCTL_JOIN_SESSION_KEYRING` is the null name the
-    // kernel reads as "anonymous", so no pointer is passed and none is read.
-    // The third argument is zero, which `KEYCTL_GET_KEYRING_ID` reads as "do
-    // not create".
-    unsafe { syscalls::syscall!(Sysno::keyctl, operation, argument, 0usize) }
+/// Joins a fresh anonymous session keyring, in place of the calling process's.
+fn join_anonymous_session_keyring() -> Result<(), Errno> {
+    // SAFETY: the operation takes a name pointer, and zero is the null name
+    // the kernel reads as "anonymous", so no pointer is passed and none is
+    // read.
+    unsafe { syscalls::syscall!(Sysno::keyctl, KEYCTL_JOIN_SESSION_KEYRING, 0usize) }
         .map(|_| ())
         .map_err(sys::errno)
 }

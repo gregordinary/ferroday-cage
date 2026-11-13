@@ -19,7 +19,14 @@ profile refuses the `seccomp` syscall.
 reports whether this process can install a filter. It installs one in a
 short-lived child, so it answers for both cases. A Debian or Alpine bootstrap
 runs its packages' scripts in such sandboxes, and asks the same before it
-downloads anything. `Network::Host` installs no filter and needs none.
+downloads anything. `Network::Host` installs no network filter.
+
+Any launch, a restriction's included, installs a second filter where the kernel
+refuses it a session keyring of its own: on a kernel built without key support,
+and under a seccomp policy that refuses `keyctl`. [When the join is
+refused](how-the-sandbox-is-built.md#when-the-join-is-refused) describes it.
+Such a launch on a host that cannot install a filter fails at
+`SetupStep::ReplaceSessionKeyring`.
 
 Three opt-in capabilities have host requirements of their own. A [uid/gid range
 map](identity-maps.md) requested by an unprivileged caller needs the shadow
