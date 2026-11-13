@@ -49,7 +49,7 @@ use rustix::io::Errno;
 
 use super::atom::{self, Atom, Candidate, Dependency};
 use super::version;
-use super::{DB_DIR, GentooError, MAX_METADATA_BYTES};
+use super::{COUNTER_FILE, DB_DIR, GentooError, MAX_METADATA_BYTES};
 use crate::provision::containment;
 use crate::provision::rooted::Rooted;
 
@@ -82,9 +82,6 @@ const CHOST_FILE: &str = "CHOST";
 /// USE-evaluated, as the index publishes them, so they are read with the same
 /// grammar.
 const RUNTIME_DEPENDENCY_FILES: [&str; 2] = ["RDEPEND", "PDEPEND"];
-
-/// The file inside an entry holding the ordinal its merge was stamped with.
-const COUNTER_FILE: &str = "COUNTER";
 
 /// The prefix portage gives an entry it is part way through merging.
 ///
@@ -567,7 +564,11 @@ impl InstalledPackage {
 
 /// One file of an entry or of a container's metadata, as the value it holds:
 /// its text, with the surrounding whitespace and the trailing newline dropped.
-fn field_text(bytes: &[u8]) -> String {
+///
+/// The one reading of such a file. The merge writes a container's metadata
+/// out as the entry, so a container's reader (`gpkg`) and this module's read
+/// the same files, and both read them through this.
+pub(super) fn field_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
 }
 

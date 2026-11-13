@@ -99,7 +99,7 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use super::plan::PlannedPackage;
-use super::{GentooError, MAX_METADATA_BYTES, atom};
+use super::{GentooError, MAX_METADATA_BYTES, atom, installed};
 use crate::ErrorChain;
 use crate::path;
 use crate::provision::compress;
@@ -802,12 +802,10 @@ fn check_identity(
     Ok(())
 }
 
-/// One metadata file's value, as its single line, or `None` where the
-/// container carries no such file.
+/// One metadata file's value, read as [`installed::field_text`] reads one, or
+/// `None` where the container carries no such file.
 fn field(metadata: &BTreeMap<String, Vec<u8>>, name: &str) -> Option<String> {
-    metadata
-        .get(name)
-        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+    metadata.get(name).map(|bytes| installed::field_text(bytes))
 }
 
 /// Holds the container's signed `CHOST` to the targets the root's packages were

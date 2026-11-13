@@ -191,6 +191,15 @@ const PACKAGE_CACHE: &str = ".fcage-binpkgs";
 /// empty and install every dependency it already had.
 pub(super) const DB_DIR: &str = "var/db/pkg";
 
+/// The file inside a database entry holding the ordinal the package's merge
+/// was stamped with.
+///
+/// Here for the reason [`DB_DIR`] is: [`vdb`] writes it and [`installed`]
+/// reads it back, and the merge ordinal continues from the greatest one the
+/// entries record. A spelling that moved in one alone would have a merge
+/// reissue an ordinal an entry already carries.
+pub(super) const COUNTER_FILE: &str = "COUNTER";
+
 /// The ceiling on a stage3 tarball where nothing declares its size.
 ///
 /// A fetch is normally bounded by the exact size the signed enumeration

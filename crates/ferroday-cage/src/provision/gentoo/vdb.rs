@@ -64,26 +64,28 @@ use std::path::Path;
 
 use super::gpkg::{IMAGE_DIR, Package};
 use super::plan::PlannedPackage;
-use super::{DB_DIR, GentooError, MAX_CONTENTS_ENTRIES};
+use super::{COUNTER_FILE, DB_DIR, GentooError, MAX_CONTENTS_ENTRIES};
 use crate::path;
 use crate::provision::ProvisionError;
 use crate::provision::digest::{self, Algorithm};
 use crate::provision::extract::{Extraction, Placement};
 use crate::provision::rooted::Rooted;
 
-/// Where portage keeps the ordinal it stamps each merge with.
-const COUNTER_FILE: &str = "var/cache/edb/counter";
+/// Where portage keeps the ordinal it stamped the last merge into a root with:
+/// one number for the whole root, beside the one each entry records in its
+/// [`COUNTER_FILE`].
+const ROOT_COUNTER: &str = "var/cache/edb/counter";
 
-/// The most of [`COUNTER_FILE`] this reads.
+/// The most of [`ROOT_COUNTER`] this reads.
 ///
 /// The ordinal is a `u64`, twenty digits at most; a file longer than this is
 /// not a counter, and a root whose counter has been grown without being
 /// written to is refused here rather than read into memory.
 const MAX_COUNTER_BYTES: u64 = 64;
 
-/// The three files a merge writes that the container does not carry.
+/// Two of the three files a merge writes that the container does not carry.
+/// The third is [`COUNTER_FILE`], which a root's reader reads back.
 const CONTENTS_FILE: &str = "CONTENTS";
-const COUNTER_ENTRY: &str = "COUNTER";
 const BINPKGMD5_FILE: &str = "BINPKGMD5";
 
 /// One installed path, as the merge laid it down.
@@ -180,7 +182,7 @@ pub(super) fn merge(
     // one-line file it writes carries one.
     rooted
         .write(
-            format!("{entry}/{COUNTER_ENTRY}"),
+            format!("{entry}/{COUNTER_FILE}"),
             counter.to_string().as_bytes(),
         )
         .map_err(|err| GentooError::io("writing a package database entry", root, err))?;
@@ -188,7 +190,7 @@ pub(super) fn merge(
     // layer's or portage's own, inside the finished sandbox -- takes the next
     // ordinal rather than reissuing this one.
     rooted
-        .write(COUNTER_FILE, counter.to_string().as_bytes())
+        .write(ROOT_COUNTER, counter.to_string().as_bytes())
         .map_err(|err| GentooError::io("writing the merge counter", root, err))?;
     Ok(())
 }
@@ -349,7 +351,7 @@ fn render_contents(root: &Path, rooted: &Rooted, laid: &[Laid]) -> Result<String
 /// where the sequence continues. A file past [`MAX_COUNTER_BYTES`] is refused,
 /// since that is not a value at all.
 pub(super) fn counter_of(root: &Path, rooted: &Rooted) -> Result<u64, GentooError> {
-    match rooted.read_if_present(COUNTER_FILE, MAX_COUNTER_BYTES) {
+    match rooted.read_if_present(ROOT_COUNTER, MAX_COUNTER_BYTES) {
         Ok(Some(bytes)) => Ok(String::from_utf8_lossy(&bytes).trim().parse().unwrap_or(0)),
         Ok(None) => Ok(0),
         Err(err) => Err(GentooError::io("reading the merge counter", root, err)),
@@ -473,7 +475,7 @@ mod tests {
         // this layer's or portage's inside the finished sandbox -- takes the
         // next ordinal rather than reissuing this one.
         assert_eq!(
-            std::fs::read_to_string(dir.join("root").join(COUNTER_FILE)).expect("the counter"),
+            std::fs::read_to_string(dir.join("root").join(ROOT_COUNTER)).expect("the counter"),
             "42",
         );
     }
@@ -629,11 +631,11 @@ mod tests {
         // takes one.
         assert_eq!(counter_of(&root, &rooted).expect("an absent counter"), 0);
         // A stage3 arrives with its own, and an increment continues it.
-        std::fs::write(root.join(COUNTER_FILE), b"391").expect("the counter is written");
+        std::fs::write(root.join(ROOT_COUNTER), b"391").expect("the counter is written");
         assert_eq!(counter_of(&root, &rooted).expect("a counter"), 391);
         // A value a caller has damaged is continued from rather than refused:
         // it is a bookkeeping ordinal, not a trust decision.
-        std::fs::write(root.join(COUNTER_FILE), b"not a number").expect("written");
+        std::fs::write(root.join(ROOT_COUNTER), b"not a number").expect("written");
         assert_eq!(counter_of(&root, &rooted).expect("a damaged counter"), 0);
     }
 }
