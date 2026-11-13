@@ -1,9 +1,9 @@
 //! The default fetcher: a minimal HTTP/1.1 client plus `file://`.
 //!
 //! It speaks just enough HTTP to retrieve static files from a distribution
-//! mirror over plain `http://` — a single `GET`, content-length or chunked
-//! bodies, capped redirects, connect and read timeouts — with no dependency
-//! beyond `std::net`. Authenticity of what it fetches comes from the archive
+//! mirror over plain `http://` — a single `GET` for the resource's own bytes,
+//! content-length or chunked bodies, capped redirects, connect and read
+//! timeouts — with no dependency beyond `std::net`. Authenticity of what it fetches comes from the archive
 //! signature, verified above this layer, not from the transport; a consumer
 //! who needs HTTPS or a proxy supplies their own [`Fetch`]. `file://` URLs
 //! read a local path, which serves local mirrors and the test suite.
@@ -21,15 +21,20 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustix::fs::{FileType, Mode, OFlags};
+
 use super::fetch::{Fetch, FetchError, FetchJob, FetchRequest};
 
-/// The ceiling on a single response body, for a request that states no size of
-/// its own. The body streams to the caller's sink, which may be memory or a
-/// staging file, and its digest is checked only once the bytes are spent. It
-/// sits far above any Debian index or `.deb`, so it never bites a legitimate
-/// fetch, and bounds what a hostile mirror can make a caller write by
-/// announcing a huge framing or never closing the stream. A consumer that must
-/// fetch something larger supplies their own [`Fetch`].
+/// The ceiling on a single response body, whatever the request states.
+///
+/// A request that states a size is held to that size, and to this where it
+/// states more; one that states none is held to this alone. The body streams to
+/// the caller's sink, which may be memory or a staging file, and its digest is
+/// checked only once the bytes are spent. It sits far above any Debian index or
+/// `.deb`, so it never bites a legitimate fetch, and bounds what a hostile
+/// mirror can make a caller write by announcing a huge framing or never closing
+/// the stream. A consumer that must fetch something larger supplies their own
+/// [`Fetch`].
 const MAX_BODY: u64 = 2 * 1024 * 1024 * 1024;
 
 /// How many interim (`1xx`) responses are read past before the peer is treated
@@ -171,9 +176,14 @@ impl HttpFetch {
     /// One fetch means one call, whatever it takes to answer: a redirect chain,
     /// the retry a connection reused from an earlier fetch is allowed, and the
     /// walk over the addresses a host resolves to all come out of this budget
-    /// rather than starting a fresh one. The one step it cannot bound is the
-    /// address resolution itself, which the platform's resolver answers on a
-    /// timeout of its own.
+    /// rather than starting a fresh one. The one step of an `http://` fetch it
+    /// cannot bound is the address resolution itself, which the platform's
+    /// resolver answers on a timeout of its own.
+    ///
+    /// A `file://` fetch is held to it as well. Its open never waits on what
+    /// holds the path, and the deadline is checked before the open and before
+    /// each read of the file. A single read the filesystem itself holds up, as a
+    /// stalled network filesystem can, is the one wait it cannot cut short.
     ///
     /// A timeout beyond what the clock can express removes the bound as well:
     /// there is no faithful deadline for one, and asking to wait that long is
@@ -224,14 +234,11 @@ impl Fetch for HttpFetch {
         // not serving the resource that was asked for, and the digest check
         // that catches the substitution runs only after the bytes are spent.
         let cap = request.size().map_or(MAX_BODY, |size| size.min(MAX_BODY));
-        if let Some(path) = strip_scheme(url, "file://") {
-            return fetch_file(url, path, sink, cap);
-        }
         // Bound the whole fetch rather than each request inside it: the
         // deadline covers the redirect chain and the one retry a reused
         // connection is allowed, so `request_timeout` is the ceiling its
         // documentation states rather than a per-attempt budget that a chain
-        // multiplies by the hops it takes.
+        // multiplies by the hops it takes. A `file://` fetch is held to it too.
         //
         // A timeout the clock cannot express is a fetch without a deadline,
         // which is what a caller asking to wait some hundreds of billions of
@@ -239,6 +246,9 @@ impl Fetch for HttpFetch {
         let deadline = self
             .request_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
+        if let Some(path) = strip_scheme(url, "file://") {
+            return fetch_file(url, path, sink, cap, deadline);
+        }
         let mut current = url.to_string();
         for _ in 0..=self.max_redirects {
             match self.request(&current, sink, cap, deadline)? {
@@ -503,9 +513,16 @@ impl HttpFetch {
         // No `Connection:` header at all, which is HTTP/1.1's own default of
         // keeping the connection open. A peer that will not is required to say
         // so, and `Headers::close` is what reads that back.
+        //
+        // `Accept-Encoding: identity` asks for the resource's own bytes, which
+        // are what its digest is computed over. A server or a CDN left to its
+        // own defaults may compress a response on the way out, and a body
+        // compressed on the fly is a different sequence of bytes from the
+        // resource however faithfully it decodes. A response that applies a
+        // content coding regardless is refused below.
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: ferroday-cage\r\n\
-             Accept: */*\r\n\r\n",
+             Accept: */*\r\nAccept-Encoding: identity\r\n\r\n",
             parsed.path,
         );
         (&reader.get_ref().inner)
@@ -572,6 +589,30 @@ impl HttpFetch {
         };
 
         match status.code {
+            // A content coding this client asked not to receive and does not
+            // decode: the body is not the resource's own bytes, and handed on
+            // it would fail the digest check above this layer as a corrupt
+            // resource, which no other mirror is asked about. It is this
+            // mirror's answer instead, a transport failure a walk advances
+            // past. The coding is the server's string, named with `{:?}` as
+            // every server-supplied string in an error is.
+            200 if headers.content_coding.is_some() => {
+                let coding = headers.content_coding.take().unwrap_or_default();
+                if persistent && set_aside(&mut reader, status.code, &headers) {
+                    keep(reader);
+                }
+                return Err(Exchange::AfterBody(FetchError::io(
+                    "reading the response",
+                    url,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "the response applied the content coding {coding:?}, which this \
+                             client asked not to receive and does not decode"
+                        ),
+                    ),
+                )));
+            }
             200 => {}
             301 | 302 | 303 | 307 | 308 => {
                 let location = headers
@@ -686,21 +727,33 @@ impl HttpFetch {
     /// mirror redirecting to `https://`, or to a CDN, would otherwise abort the
     /// whole walk. The target is judged here rather than by the request that
     /// would follow it, which would report it as a URL the caller spelled.
+    ///
+    /// A refusal names `from`, the URL that was fetched, since the target never
+    /// was. The target is the mirror's own string, and anyone on a plain-HTTP
+    /// path can write it, so it is named the way every string a server supplies
+    /// is named in an error: rendered with `{:?}`, which writes a control
+    /// character as an escape rather than handing it to the terminal the error
+    /// is printed on. An escape sequence there could rewrite the screen or set
+    /// the clipboard.
     fn check_redirect(&self, from: &str, to: &str) -> Result<(), FetchError> {
         let refuse = |reason: String| {
             FetchError::io(
                 "following a redirect",
-                to,
+                from,
                 io::Error::new(io::ErrorKind::InvalidData, reason),
             )
         };
         if strip_scheme(to, "http://").is_none() {
             return Err(refuse(format!(
-                "a redirect is followed only to another http:// URL; {TLS_REMEDY}"
+                "the redirect leads to {to:?}, and a redirect is followed only to another \
+                 http:// URL; {TLS_REMEDY}"
             )));
         }
-        let to_url = parse_http_url(to)
-            .map_err(|reason| refuse(format!("the redirect target cannot be fetched: {reason}")))?;
+        let to_url = parse_http_url(to).map_err(|reason| {
+            refuse(format!(
+                "the redirect target {to:?} cannot be fetched: {reason}"
+            ))
+        })?;
         if self.cross_host_redirects {
             return Ok(());
         }
@@ -712,8 +765,8 @@ impl HttpFetch {
             Ok(())
         } else {
             Err(refuse(format!(
-                "redirect to a different host ({}:{}) than {}:{}; enable cross-host redirects to \
-                 follow it",
+                "the redirect to {to:?} leaves for a different host ({}:{}) than {}:{}; enable \
+                 cross-host redirects to follow it",
                 to_url.host, to_url.port, from_url.host, from_url.port
             )))
         }
@@ -772,10 +825,19 @@ pub fn file_url(path: &Path) -> Result<String, FetchError> {
 }
 
 /// Reads a local file for a `file://` URL, refusing one that runs past `cap`
-/// bytes.
-fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write, cap: u64) -> Result<(), FetchError> {
+/// bytes, and holding the open and every read to the fetch's `deadline`.
+fn fetch_file(
+    url: &str,
+    rest: &str,
+    sink: &mut dyn Write,
+    cap: u64,
+    deadline: Option<Instant>,
+) -> Result<(), FetchError> {
     let path = decode_file_path(url, local_file_path(url, rest)?)?;
-    let mut file = File::open(path).map_err(|source| {
+    if expired(deadline) {
+        return Err(deadline_elapsed("opening the file", url));
+    }
+    let file = open_local_file(&path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             FetchError::not_found(url)
         } else {
@@ -783,8 +845,65 @@ fn fetch_file(url: &str, rest: &str, sink: &mut dyn Write, cap: u64) -> Result<(
         }
     })?;
     let mut sink = super::LimitedWriter::new(sink, cap);
-    io::copy(&mut file, &mut sink).map_err(FetchError::at("reading the file", url))?;
+    io::copy(&mut LocalReader { file, deadline }, &mut sink)
+        .map_err(FetchError::at("reading the file", url))?;
     Ok(())
+}
+
+/// Opens the regular file at `path` for a `file://` fetch, without waiting on
+/// anything else that holds the path.
+///
+/// A local mirror is a tree an `rsync` from an upstream fills, and nothing stops
+/// that upstream from leaving a named pipe where a file belongs. An ordinary open
+/// of one waits until something opens its other end, and no deadline reaches a
+/// wait inside `open`. So the open does not wait (`O_NONBLOCK`, with `O_NOCTTY`
+/// keeping a terminal from becoming the caller's), and the descriptor is then
+/// held to being a regular file. A pipe, a directory, a device, or a socket is
+/// refused. `O_NONBLOCK` is cleared again once the descriptor is known to be a
+/// regular file, as [`Rooted`](super::rooted::Rooted) clears it, so a filesystem
+/// that does not ignore it on a file reads normally.
+///
+/// This is a second answer beside [`cache::open_entry`](super::cache::open_entry),
+/// which refuses a symbolic link at the final component as well. A URL's path
+/// is resolved as a server resolves it, links and all, and a local mirror is
+/// entitled to hold a link where a file is served: a suite named by its
+/// codename and by its alias, or a file shared between two of its paths. What
+/// is held here is the descriptor the path reached, which is what decides
+/// whether the read can wait.
+fn open_local_file(path: &Path) -> io::Result<File> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path names something other than a regular file",
+        ));
+    }
+    rustix::fs::fcntl_setfl(&fd, rustix::fs::fcntl_getfl(&fd)? - OFlags::NONBLOCK)?;
+    Ok(File::from(fd))
+}
+
+/// A local file's reader, holding each read to the fetch's deadline.
+///
+/// The counterpart of [`DeadlineReader`] for a `file://` fetch. A read of a
+/// regular file cannot be given a timeout, so the deadline is checked before
+/// each one, and a fetch that reaches it fails at the next read rather than
+/// copying on to the end of the file.
+struct LocalReader {
+    file: File,
+    deadline: Option<Instant>,
+}
+
+impl Read for LocalReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if expired(self.deadline) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED));
+        }
+        self.file.read(buf)
+    }
 }
 
 /// The local path a `file://` URL's path spells, its percent escapes decoded.
@@ -1002,6 +1121,9 @@ struct Headers {
     content_length: Option<u64>,
     chunked: bool,
     location: Option<String>,
+    /// The first content coding the response applied other than `identity`,
+    /// as the server spelled it, where it applied one.
+    content_coding: Option<String>,
     /// Whether the peer said it will close the connection after this response.
     ///
     /// HTTP/1.1 keeps a connection open unless a response says otherwise, so
@@ -1195,6 +1317,19 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
                 }
             } else if name.eq_ignore_ascii_case("location") {
                 headers.location = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("content-encoding") {
+                // A list of codings, which repeated field lines extend. Only the
+                // first one that is not `identity` is kept: one is enough to
+                // say the body is not the resource's own bytes.
+                if headers.content_coding.is_none() {
+                    headers.content_coding = value
+                        .split(',')
+                        .map(str::trim)
+                        .find(|coding| {
+                            !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")
+                        })
+                        .map(str::to_string);
+                }
             } else if name.eq_ignore_ascii_case("connection")
                 && value
                     .split(',')
@@ -2569,6 +2704,119 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_target_reaches_an_error_with_its_control_characters_escaped() {
+        // The target is the mirror's string, and anyone on a plain-HTTP path can
+        // write it. An escape sequence carried into the operator's terminal
+        // through an error chain could rewrite the screen or, as OSC 52 does,
+        // set the clipboard, so a refusal renders it as `{:?}` renders it.
+        let hostile = "\u{1b}]52;c;cm0gLXJmIH4K\u{7}\u{1b}[2J";
+        let fetch = HttpFetch::new();
+        for target in [
+            format!("https://mirror.example/{hostile}"),
+            format!("http://mirror.example/{hostile}"),
+            format!("http://elsewhere.example{hostile}"),
+        ] {
+            let refused = fetch
+                .check_redirect("http://mirror.example/x", &target)
+                .expect_err("the target is refused");
+            let rendered = ErrorChain::new(&refused).to_string();
+            assert!(
+                !rendered.contains(['\u{1b}', '\u{7}']),
+                "a control character reached the error: {rendered:?}",
+            );
+            assert!(rendered.contains("\\u{1b}"), "{rendered:?}");
+            assert!(
+                rendered.starts_with("fetching http://mirror.example/x failed"),
+                "the refusal names the URL fetched: {rendered:?}",
+            );
+        }
+
+        // And end to end, from the header a server sent.
+        let moved = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: /{hostile}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let (url, served) = serving(1, moved.into_bytes());
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut Vec::new())
+            .expect_err("the target cannot be fetched");
+        let rendered = ErrorChain::new(&err).to_string();
+        assert!(
+            !rendered.contains(['\u{1b}', '\u{7}']),
+            "a control character reached the error: {rendered:?}",
+        );
+        assert!(err.is_failover(), "{err}");
+        served.join().expect("the server thread ends");
+    }
+
+    /// Serves one response to one request, and hands back the request's header
+    /// lines.
+    fn serving_and_recording(response: Vec<u8>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback listener binds");
+        let url = format!(
+            "http://{}/x",
+            listener.local_addr().expect("the listener is bound"),
+        );
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the client connects");
+            let mut request = BufReader::new(stream.try_clone().expect("the stream clones"));
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                if request.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                lines.push(line.trim_end().to_string());
+            }
+            let _ = stream.write_all(&response);
+            lines
+        });
+        (url, served)
+    }
+
+    #[test]
+    fn a_content_coded_body_is_refused_as_this_mirrors_failure() {
+        // The request asks for the resource's own bytes, which are what its
+        // digest covers. A response that compresses the body regardless is
+        // refused before a byte reaches the sink, as a failure a walk over
+        // mirrors advances past, rather than handed on to fail the digest.
+        let coded = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\
+                      Connection: close\r\n\r\nabcd";
+        let (url, served) = serving_and_recording(coded.to_vec());
+        let mut sink = Vec::new();
+        let err = HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut sink)
+            .expect_err("a content-coded body is not the resource");
+        let request = served.join().expect("the server thread ends");
+        assert!(
+            request
+                .iter()
+                .any(|line| line == "Accept-Encoding: identity"),
+            "the request asked for no particular coding: {request:?}",
+        );
+        assert!(matches!(err, FetchError::Io { .. }), "{err:?}");
+        assert!(err.is_failover(), "{err}");
+        assert!(sink.is_empty(), "the coded body reached the sink");
+        assert!(
+            ErrorChain::new(&err).to_string().contains("\"gzip\""),
+            "{}",
+            ErrorChain::new(&err),
+        );
+
+        // `identity` is the resource's own bytes, however it is spelled.
+        let plain = b"HTTP/1.1 200 OK\r\nContent-Encoding: Identity\r\nContent-Length: 4\r\n\
+                      Connection: close\r\n\r\nabcd";
+        let (url, served) = serving_and_recording(plain.to_vec());
+        let mut sink = Vec::new();
+        HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut sink)
+            .expect("an identity body is the resource");
+        served.join().expect("the server thread ends");
+        assert_eq!(sink, b"abcd");
+    }
+
+    #[test]
     fn chunked_bodies_decode() {
         let body = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
         let mut reader = BufReader::new(body.as_bytes());
@@ -2650,6 +2898,94 @@ mod tests {
             .fetch(&FetchRequest::new(&localhost), &mut out)
             .unwrap();
         assert_eq!(out, b"contents");
+    }
+
+    #[test]
+    fn a_file_url_naming_anything_but_a_regular_file_is_refused_without_waiting() {
+        // A local mirror is a tree an rsync from an upstream fills, and a named
+        // pipe left where a file belongs would hold an ordinary open until
+        // something opened its other end, outside any deadline. The open does
+        // not wait, and the descriptor is refused for not being a file.
+        use std::sync::mpsc;
+
+        let dir = Scratch::new("http-file-fifo");
+        let pipe = dir.join("Release");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &pipe,
+            FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .expect("a named pipe is creatable");
+        std::fs::create_dir(dir.join("a-directory")).unwrap();
+
+        for name in ["Release", "a-directory"] {
+            let url = format!("file://{}", dir.join(name).display());
+            let (sent, received) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ =
+                    sent.send(HttpFetch::new().fetch(&FetchRequest::new(&url), &mut Vec::new()));
+            });
+            let outcome = received
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("the fetch of {name} waited on what holds the path"));
+            let err = outcome.expect_err("only a regular file is read");
+            assert!(matches!(err, FetchError::Io { .. }), "{name}: {err:?}");
+            assert!(
+                ErrorChain::new(&err)
+                    .to_string()
+                    .contains("not a regular file")
+                    || ErrorChain::new(&err)
+                        .to_string()
+                        .contains("other than a regular file"),
+                "{name}: {}",
+                ErrorChain::new(&err),
+            );
+        }
+
+        // A link to a file is followed, as a server follows one: a local mirror
+        // may name one file by two paths.
+        std::fs::write(dir.join("InRelease"), b"signed").unwrap();
+        std::os::unix::fs::symlink("InRelease", dir.join("alias")).unwrap();
+        let mut out = Vec::new();
+        HttpFetch::new()
+            .fetch(
+                &FetchRequest::new(&format!("file://{}", dir.join("alias").display())),
+                &mut out,
+            )
+            .expect("a link to a file is read through");
+        assert_eq!(out, b"signed");
+    }
+
+    #[test]
+    fn a_file_fetch_is_held_to_the_request_deadline() {
+        // `request_timeout` bounds one fetch whatever its scheme. A deadline
+        // already reached fails the open, and one reached part way through
+        // fails the next read rather than copying on.
+        let dir = Scratch::new("http-file-deadline");
+        let path = dir.join("resource");
+        std::fs::write(&path, b"contents").unwrap();
+        let url = format!("file://{}", path.display());
+        let err = HttpFetch::new()
+            .request_timeout(Some(Duration::ZERO))
+            .fetch(&FetchRequest::new(&url), &mut Vec::new())
+            .expect_err("a reached deadline ends the fetch");
+        assert!(
+            ErrorChain::new(&err).to_string().contains(DEADLINE_ELAPSED),
+            "{}",
+            ErrorChain::new(&err),
+        );
+        assert!(err.is_failover(), "{err}");
+
+        let mut reader = LocalReader {
+            file: File::open(&path).unwrap(),
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        let err = reader
+            .read(&mut [0u8; 8])
+            .expect_err("a read past the deadline fails");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
