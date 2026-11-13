@@ -1815,6 +1815,7 @@ pub ferroday_cage::Error::Spawn::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::StreamIsDirectory
 pub ferroday_cage::Error::StreamIsDirectory::stream: &'static str
 pub ferroday_cage::Error::SupervisorLost
+pub ferroday_cage::Error::SupervisorUnreceived
 #[non_exhaustive] pub ferroday_cage::Error::Terminal
 pub ferroday_cage::Error::Terminal::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::TerminalsExhausted

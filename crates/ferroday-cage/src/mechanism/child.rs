@@ -1836,8 +1836,9 @@ const SUPERVISOR_MASK: SigSet = SigSet::of(&[Signal::CHILD]);
 /// never reported.
 ///
 /// The library itself never signals this process to make it act. A termination
-/// request and the caller's exit reach it over the control socket, and a kill
-/// goes to the command through the command's pidfd. Only the teardown of a
+/// request, a request to end the sandbox, and the caller's exit reach it over
+/// the control socket, and a kill goes to the command through the command's
+/// pidfd. Only the teardown of a
 /// launch being given up on ends it, with `SIGKILL`, which no disposition
 /// stops.
 ///
@@ -1938,9 +1939,10 @@ enum Watch {
 ///
 /// Sleeps in one poll over the children's signal descriptor, the supervised
 /// process's pidfd, and the control socket. Control traffic is a termination
-/// request (SIGTERM to the command) or a hangup — the caller exited or dropped
-/// the last handle — which stops the sandbox when `stop_with_caller` is set and
-/// is otherwise ignored. When the supervised process exits, its wait status
+/// request (SIGTERM to the command), a request to end the sandbox, or a hangup
+/// — the caller exited or dropped the last handle — which ends the sandbox the
+/// same way when `stop_with_caller` is set and is otherwise ignored; see
+/// [`end_sandbox`]. When the supervised process exits, its wait status
 /// goes out over the status pipe and the supervisor exits; as namespace init,
 /// that exit makes the kernel kill every remaining namespace member.
 ///
@@ -2028,34 +2030,25 @@ fn supervise(
         if ready(Watch::Control) {
             let mut byte = [0u8; 1];
             match rustix::io::read(context.control_fd, &mut byte) {
-                // Hangup: every caller-side handle is gone.
+                // Hangup: every caller-side handle is gone. A hangup stays
+                // readable, so the socket is not polled again.
                 Ok(0) => {
                     if context.plan.stop_with_caller {
-                        match role {
-                            // Init's exit has the kernel kill the whole
-                            // namespace; no status is reported, and there
-                            // is no one to report to.
-                            Role::Init => sys::exit_group(1),
-                            // From outside, kill the command and keep
-                            // supervising: its exit is still collected.
-                            Role::Outside => {
-                                let _ = process::kill_process(child, Signal::KILL);
-                                watch_control = false;
-                            }
-                        }
-                    } else {
-                        watch_control = false;
+                        end_sandbox(role, child);
                     }
+                    watch_control = false;
                 }
-                Ok(_) => {
-                    if byte[0] == CONTROL_TERMINATE {
-                        // Termination is a request to the command, not the
-                        // namespace: SIGTERM is deliverable and trappable
-                        // there, docker-stop style. ESRCH means it already
-                        // exited; the wait below handles the rest.
+                Ok(_) => match byte[0] {
+                    // Termination is a request to the command, not the
+                    // namespace: SIGTERM is deliverable and trappable there,
+                    // docker-stop style. ESRCH means it already exited; the
+                    // wait below handles the rest.
+                    CONTROL_TERMINATE => {
                         let _ = process::kill_process(child, Signal::TERM);
                     }
-                }
+                    CONTROL_END => end_sandbox(role, child),
+                    _ => {}
+                },
                 Err(Errno::INTR) => {}
                 Err(_) => watch_control = false,
             }
@@ -2112,6 +2105,31 @@ fn supervise(
 
 /// The control-socket request byte for graceful termination.
 pub(crate) const CONTROL_TERMINATE: u8 = b'T';
+
+/// The control-socket request byte that ends the sandbox, as a hangup does
+/// under [`stop_with_caller`](crate::CageBuilder::stop_with_caller).
+///
+/// The caller sends it where it holds the control socket but not the
+/// supervisor's pidfd, which is the one other way to end a launch: a launch
+/// whose pidfd did not arrive; see `mechanism::end_unreceived`.
+pub(super) const CONTROL_END: u8 = b'E';
+
+/// Ends the sandbox from its supervisor, without waiting for the command.
+///
+/// As the init, the supervisor exits, and its exit has the kernel kill every
+/// process of the namespace; no status is reported, since whoever asked has
+/// let go of the sandbox. From outside, it kills the command and keeps
+/// supervising, so the command's exit is still collected and reported.
+fn end_sandbox(role: Role, child: Pid) {
+    match role {
+        Role::Init => sys::exit_group(1),
+        // The command is this process's unreaped child until the wait in the
+        // supervisor loop collects it, so its pid names nothing else.
+        Role::Outside => {
+            let _ = process::kill_process(child, Signal::KILL);
+        }
+    }
+}
 
 /// Collects every child process that has already exited, without waiting for
 /// one that has not.

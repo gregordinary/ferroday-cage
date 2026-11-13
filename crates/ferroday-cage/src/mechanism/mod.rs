@@ -136,7 +136,7 @@ use rustix::event::{PollFd, PollFlags};
 use rustix::fs::RawMode;
 use rustix::io::Errno;
 use rustix::mount::{MountFlags, MountPropagationFlags};
-use rustix::net::{AddressFamily, SocketFlags, SocketType};
+use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 use rustix::pipe::{self, PipeFlags};
 use rustix::process::Signal;
 use rustix::process::{self, Pid, WaitId, WaitIdOptions};
@@ -2107,7 +2107,8 @@ fn abort_launch(stage: &Forked, supervisor: &OwnedFd) {
 /// After an error it holds them only where the supervisor is known to have
 /// exited, so what it holds then is free at once: a launch whose supervisor was
 /// never published may have left a process running that this side cannot name,
-/// and its targets are left where they are.
+/// and one whose init's pidfd did not arrive has an end this side cannot wait
+/// for, and the targets of either are left where they are.
 pub(crate) fn spawn(
     plan: &LaunchPlan,
     observe: bool,
@@ -2122,10 +2123,12 @@ pub(crate) fn spawn(
     // published sandbox always has a fully mapped user namespace.
     establish_identity_map(plan, &mut parent)?;
     let received = receive_supervisor(&parent.host_sock);
-    if let Ok((_, pid)) = &received {
-        if let Some(foreground) = &mut parent.foreground {
-            foreground.lent_to(*pid);
-        }
+    if let Ok(publication) = &received
+        && let Some(foreground) = &mut parent.foreground
+    {
+        foreground.lent_to(publication.pid());
+    }
+    if let Ok(Publication::Received(..)) = &received {
         progress(Progress::Supervised);
     }
     let report = read_report(&parent.report_read, created, plan.ops.len());
@@ -2134,7 +2137,7 @@ pub(crate) fn spawn(
         // The command is running and the supervisor is published. A terminal
         // launch's primary was sent before the command was forked, so it is
         // already waiting on the channel.
-        (Ok(Report::ExecSucceeded), Ok((pidfd, pid))) => {
+        (Ok(Report::ExecSucceeded), Ok(Publication::Received(pidfd, pid))) => {
             let primary = match &parent.terminal {
                 Some(channel) => match receive_primary(channel) {
                     Ok(Some(primary)) => Some(primary),
@@ -2178,50 +2181,108 @@ pub(crate) fn spawn(
             }),
             received,
         ) => {
-            let _ = parent.stage.reap();
-            // Unpublished, the supervisor is the launch stage's to have ended,
-            // which it does before reporting its own failure.
-            if let Ok((pidfd, _)) = &received {
-                let _ = await_exit(pidfd.as_fd());
+            match &received {
+                Ok(Publication::Received(pidfd, _)) => {
+                    let _ = parent.stage.reap();
+                    let _ = await_exit(pidfd.as_fd());
+                }
+                // A supervisor this process cannot wait for is asked to end
+                // too, in case it has not observed the failure yet.
+                Ok(Publication::Unreceived(_)) => {
+                    end_unreceived(&parent.stage, &parent.host_sock, plan, created);
+                }
+                // Unpublished, the supervisor is the launch stage's to have
+                // ended, which it does before reporting its own failure, so
+                // every process of the launch is gone.
+                Err(_) => {
+                    parent.stage.kill();
+                    let _ = parent.stage.reap();
+                }
             }
             Err(setup_error(step, errno, detail, Labels::of(plan)))
         }
-        // The report pipe reached end-of-file — every setup step succeeded —
-        // but the supervisor was never published: the launch stage exited
-        // before sending it, leaving whatever it forked to run on.
-        (Ok(Report::ExecSucceeded), Err(err)) => {
-            let _ = parent.stage.reap();
-            created.clear();
-            Err(err)
+        // The report pipe reached end-of-file, so every setup step succeeded,
+        // but the supervisor is not in hand. Either the launch stage exited
+        // before sending it, leaving whatever it forked to run on, or this
+        // process could not receive it, and the launch is ended.
+        (Ok(Report::ExecSucceeded), received) => {
+            give_up(&parent.stage, &parent.host_sock, &received, plan, created);
+            Err(match received {
+                Err(err) => err,
+                Ok(_) => Error::SupervisorUnreceived,
+            })
         }
         // An ungated launch holds no command at a gate, so a held record is a
         // broken protocol, as an unreadable report is. Unsupervisable; tear the
         // launch down rather than leave it running blind.
         (Ok(Report::Held), received) => {
-            give_up(&parent.stage, received.as_ref().ok(), created);
+            give_up(&parent.stage, &parent.host_sock, &received, plan, created);
             Err(wait_syscall_error(Errno::PROTO))
         }
         (Err(err), received) => {
-            give_up(&parent.stage, received.as_ref().ok(), created);
+            give_up(&parent.stage, &parent.host_sock, &received, plan, created);
             Err(err)
         }
     }
 }
 
-/// Tears down a launch whose report could not be trusted, keeping in
-/// `created` only what is free once it is gone.
+/// Tears down a launch that will not be handed out, keeping in `created` only
+/// what is free once it is gone.
 ///
-/// With the supervisor published, [`abort_launch`] ends the whole launch.
-/// Without it, only the launch stage can be reached, and a process it forked
-/// may run on.
-fn give_up(stage: &Forked, supervisor: Option<&(OwnedFd, u32)>, created: &mut Vec<CreatedTarget>) {
-    match supervisor {
-        Some((pidfd, _)) => abort_launch(stage, pidfd),
-        None => {
+/// With the supervisor's pidfd in hand, [`abort_launch`] ends the whole launch.
+/// With only the control socket, [`end_unreceived`] does. With neither, only
+/// the launch stage can be reached, and a process it forked may run on.
+///
+/// A gated launch's caller drops its proceed pipe first, so that a command held
+/// at the gate is released into failing rather than left waiting there.
+fn give_up(
+    stage: &Forked,
+    control: &OwnedFd,
+    received: &Result<Publication, Error>,
+    plan: &LaunchPlan,
+    created: &mut Vec<CreatedTarget>,
+) {
+    match received {
+        Ok(Publication::Received(pidfd, _)) => abort_launch(stage, pidfd),
+        Ok(Publication::Unreceived(_)) => end_unreceived(stage, control, plan, created),
+        Err(_) => {
             stage.kill();
             let _ = stage.reap();
             created.clear();
         }
+    }
+}
+
+/// Ends a launch whose supervisor was published but whose pidfd this process
+/// could not receive, keeping in `created` only what is free once it returns.
+///
+/// The supervisor runs and supervises, and the control socket is the one
+/// channel to it left, so [`CONTROL_END`](child::CONTROL_END) asks it to end
+/// the sandbox, as a hangup does under
+/// [`stop_with_caller`](crate::CageBuilder::stop_with_caller). The init exits,
+/// and its exit ends every process of the namespace. Without a PID namespace
+/// the supervisor is the launch stage itself, which kills the command,
+/// collects it and exits, and so is not killed here: killed, it would leave
+/// the command running with no supervisor at all. A supervisor still busy
+/// with the launch acts on the request once it supervises, and a gated
+/// command reaches that point only once its proceed pipe has closed, which is
+/// why the gated caller drops it first.
+///
+/// The launch stage is then reaped. Without a PID namespace that is the
+/// supervisor's exit, so every target is free; with one, the init's exit
+/// cannot be awaited without its pidfd, and the targets are left where they
+/// are.
+fn end_unreceived(
+    stage: &Forked,
+    control: &OwnedFd,
+    plan: &LaunchPlan,
+    created: &mut Vec<CreatedTarget>,
+) {
+    // A supervisor already gone answers `EPIPE`, which ends nothing more.
+    let _ = rustix::net::send(control, &[child::CONTROL_END], SendFlags::NOSIGNAL);
+    let _ = stage.reap();
+    if plan.pid_namespace {
+        created.clear();
     }
 }
 
@@ -2322,25 +2383,42 @@ pub(crate) fn spawn_pending(
         .expect("a gated launch carries a proceed pipe");
 
     let (pidfd, pid) = match receive_supervisor(&parent.host_sock) {
-        Ok(supervisor) => supervisor,
-        // The supervisor was never published: a setup step failed before the
-        // command was forked, or the launch stage failed to publish it and
-        // ended what it had forked before saying so. Read the record for the
-        // precise cause, then reap the launch stage.
-        Err(err) => {
-            let report = read_report(&parent.report_read, created, plan.ops.len());
-            let _ = parent.stage.reap();
-            return match report {
+        Ok(Publication::Received(pidfd, pid)) => (pidfd, pid),
+        // Not in hand. The record says why where a setup step failed, and the
+        // launch is torn down either way. The proceed pipe goes first, so a
+        // command held at its gate, or on its way there, fails at it rather
+        // than waiting on a pipe whose only write end is this function's.
+        received => {
+            drop(proceed_write);
+            if let Ok(publication) = &received
+                && let Some(foreground) = &mut parent.foreground
+            {
+                foreground.lent_to(publication.pid());
+            }
+            let failed = match read_report(&parent.report_read, created, plan.ops.len()) {
                 Ok(Report::SetupFailed {
                     step,
                     errno,
                     detail,
-                }) => Err(setup_error(step, errno, detail, Labels::of(plan))),
-                _ => {
-                    created.clear();
-                    Err(err)
-                }
+                }) => Some(setup_error(step, errno, detail, Labels::of(plan))),
+                _ => None,
             };
+            match &received {
+                // The supervisor was never published because a setup step
+                // failed before the command was forked, or because the launch
+                // stage failed to publish it and ended what it had forked
+                // before saying so. Every process of the launch is gone, and
+                // with them whatever held its targets.
+                Err(_) if failed.is_some() => {
+                    parent.stage.kill();
+                    let _ = parent.stage.reap();
+                }
+                _ => give_up(&parent.stage, &parent.host_sock, &received, plan, created),
+            }
+            return Err(match (failed, received) {
+                (Some(err), _) | (None, Err(err)) => err,
+                (None, Ok(_)) => Error::SupervisorUnreceived,
+            });
         }
     };
     if let Some(foreground) = &mut parent.foreground {
@@ -2642,26 +2720,58 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
     }
 }
 
+/// What the launch stage's publication of the supervisor delivered to this
+/// process.
+enum Publication {
+    /// The supervisor's pidfd and its host pid.
+    Received(OwnedFd, u32),
+    /// The supervisor's host pid alone. The stage published the supervisor,
+    /// which runs and supervises, but its pidfd did not arrive: the kernel
+    /// installs a descriptor passed over a socket only where the receiver has
+    /// a number free for it under `RLIMIT_NOFILE` and the system's file limit,
+    /// and where no security module refuses it, and otherwise delivers the
+    /// message without it. The control socket is then the one way left to
+    /// reach the supervisor; see [`end_unreceived`].
+    Unreceived(u32),
+}
+
+impl Publication {
+    /// The supervisor's host pid.
+    fn pid(&self) -> u32 {
+        match self {
+            Publication::Received(_, pid) | Publication::Unreceived(pid) => *pid,
+        }
+    }
+}
+
 /// Receives the supervisor's pidfd and host pid from the launch stage.
 ///
 /// The stage sends one seqpacket message: the pid as four little-endian
 /// bytes, with the pidfd attached as `SCM_RIGHTS` ancillary data. A closed
-/// socket without the message means the stage exited before publishing.
-fn receive_supervisor(sock: &OwnedFd) -> Result<(OwnedFd, u32), Error> {
+/// socket without the message means the stage exited before publishing, and
+/// is [`Error::SupervisorLost`]. A whole message without the pidfd means the
+/// stage published it and this process could not receive it, which is
+/// [`Publication::Unreceived`].
+fn receive_supervisor(sock: &OwnedFd) -> Result<Publication, Error> {
     let mut payload = [0u8; 4];
     let (bytes, pidfd) =
         frame::recv_with_fd(sock.as_fd(), &mut payload).map_err(wait_syscall_error)?;
-    // A short message means the stage died before publishing the supervisor.
-    // A descriptor a truncated message still carried is dropped with it here.
-    match pidfd {
-        Some(mut pidfd) if bytes == payload.len() => {
+    if bytes != payload.len() {
+        // A short message means the stage died before publishing the
+        // supervisor. A descriptor a truncated message still carried is
+        // dropped with it here.
+        return Err(Error::SupervisorLost);
+    }
+    let pid = u32::from_le_bytes(payload);
+    Ok(match pidfd {
+        Some(mut pidfd) => {
             // Kept off a standard number where a number above them is free;
             // see `above_stdio`.
             let _ = above_stdio(&mut pidfd);
-            Ok((pidfd, u32::from_le_bytes(payload)))
+            Publication::Received(pidfd, pid)
         }
-        _ => Err(Error::SupervisorLost),
-    }
+        None => Publication::Unreceived(pid),
+    })
 }
 
 /// What the report pipe has said when its reader stops.

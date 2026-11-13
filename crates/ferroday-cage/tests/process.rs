@@ -1054,3 +1054,213 @@ impl Launchers {
         findings
     }
 }
+
+/// The launch [`probe_unreceived_supervisor`] makes, as `<entry> <pid
+/// namespace>`: `spawn` or `pending`, then `true` or `false`.
+const UNRECEIVED: &str = "FERRODAY_CAGE_TEST_PROCESS_UNRECEIVED";
+
+/// A launch whose supervisor's pidfd cannot reach the caller ends with
+/// `Error::SupervisorUnreceived`, promptly, and leaves no process running.
+///
+/// The kernel delivers a message without the descriptor it carries where the
+/// receiver has no descriptor number free. The probe takes every free number
+/// in the window between the identity map and the receive, from inside the
+/// delegate that applies the map, which is the one point a caller's code runs
+/// there. Each launch shape is a process apart, since a full descriptor table
+/// is process-wide, and each is bounded twice: the launch by the probe, and the
+/// probe by this test.
+#[test]
+fn a_supervisor_whose_pidfd_cannot_be_received_ends_the_launch() {
+    if !common::require::userns() {
+        return;
+    }
+    let mut cases = vec![("spawn", false), ("pending", false)];
+    match ferroday_cage::host::procfs_blocker() {
+        None => cases.extend([("spawn", true), ("pending", true)]),
+        Some(blocker) => common::require::premise_unmet(format!(
+            "this host cannot mount a PID namespace's procfs: {blocker}"
+        )),
+    }
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    for (entry, pid_namespace) in cases {
+        let output = common::run_bounded(
+            std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "probe_unreceived_supervisor",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(UNRECEIVED, format!("{entry} {pid_namespace}"))
+                .stdin(HostStdio::null())
+                .stdout(HostStdio::piped())
+                .stderr(HostStdio::piped()),
+            Duration::from_secs(120),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("probe done"),
+            "{entry}, pid_namespace = {pid_namespace}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+/// The probe [`a_supervisor_whose_pidfd_cannot_be_received_ends_the_launch`]
+/// starts: launches as [`UNRECEIVED`] says with no descriptor number free at the
+/// receive, holds the error to `SupervisorUnreceived`, and waits for every
+/// process the launch started to be gone.
+#[test]
+fn probe_unreceived_supervisor() {
+    use std::os::fd::OwnedFd;
+    use std::sync::mpsc;
+
+    let Ok(spec) = std::env::var(UNRECEIVED) else {
+        return;
+    };
+    let (entry, pid_namespace) = spec.split_once(' ').expect("an entry and a flag");
+    let pid_namespace: bool = pid_namespace.parse().expect("a flag");
+
+    // Every process the launch leaves behind reparents here, where the wait
+    // below finds it, rather than to the host's init.
+    rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+        .expect("the probe becomes a subreaper");
+    // A small table, so filling it is quick.
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let soft = limit.current.map_or(256, |current| current.min(256));
+    rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        rustix::process::Rlimit {
+            current: Some(soft),
+            maximum: limit.maximum,
+        },
+    )
+    .expect("the soft limit comes down");
+
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let map = |outside| {
+        vec![ferroday_cage::IdRange {
+            inside: 0,
+            outside,
+            count: 1,
+        }]
+    };
+    let taken = std::sync::Arc::new(std::sync::Mutex::new(Vec::<OwnedFd>::new()));
+    let cage = common::host_userland()
+        .command("/bin/sleep")
+        .args(["60"])
+        .pid_namespace(pid_namespace)
+        .resolv_conf(false)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .identity_map(ferroday_cage::IdentityMap::ranges(map(uid), map(gid)))
+        .id_mapper(TakesEveryNumber {
+            taken: std::sync::Arc::clone(&taken),
+        })
+        .build()
+        .expect("a valid sandbox configuration");
+
+    // The launch runs on a thread of its own, so a launch that does not return
+    // fails here rather than holding the probe until its bound.
+    let (sent, outcome) = mpsc::channel();
+    let launch = std::thread::spawn({
+        let entry = entry.to_string();
+        move || {
+            let err = match entry.as_str() {
+                "spawn" => cage.spawn().map(drop).err(),
+                _ => cage.spawn_pending().map(drop).err(),
+            };
+            let _ = sent.send(err);
+        }
+    });
+    let err = outcome
+        .recv_timeout(PATIENCE)
+        .expect("the launch returns promptly");
+    launch.join().expect("the launch thread ends");
+    taken.lock().expect("the taken numbers").clear();
+    assert!(
+        matches!(err, Some(Error::SupervisorUnreceived)),
+        "the launch ends with SupervisorUnreceived: {err:?}",
+    );
+
+    // Every process of the launch is this probe's child or reparented to it,
+    // so its end is no child left.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match rustix::process::waitid(
+            rustix::process::WaitId::All,
+            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOHANG,
+        ) {
+            Err(rustix::io::Errno::CHILD) => break,
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "a process of the launch is still running"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(errno) => panic!("the wait failed: {errno}"),
+        }
+    }
+    println!("probe done");
+}
+
+/// A delegate that writes the single-identity map from outside, as a range
+/// map's delegate writes any map, and then takes every descriptor number free
+/// in the caller, keeping them in `taken`.
+#[derive(Debug)]
+struct TakesEveryNumber {
+    taken: std::sync::Arc<std::sync::Mutex<Vec<std::os::fd::OwnedFd>>>,
+}
+
+impl ferroday_cage::IdMapper for TakesEveryNumber {
+    fn resolve(
+        &self,
+        request: &ferroday_cage::IdentityMap,
+    ) -> Result<ferroday_cage::ResolvedMap, ferroday_cage::IdMapError> {
+        match request {
+            ferroday_cage::IdentityMap::Ranges { uid, gid, .. } => {
+                Ok(ferroday_cage::ResolvedMap::new(uid.clone(), gid.clone()))
+            }
+            _ => Err(ferroday_cage::IdMapError::unsatisfiable(
+                "only an explicit map",
+            )),
+        }
+    }
+
+    fn apply(
+        &self,
+        pid: u32,
+        _map: &ferroday_cage::ResolvedMap,
+    ) -> Result<(), ferroday_cage::IdMapError> {
+        let write = |which: &'static str, line: String| {
+            std::fs::write(format!("/proc/{pid}/{which}"), line)
+                .map_err(|err| ferroday_cage::IdMapError::map_write(which, err))
+        };
+        write("setgroups", "deny".to_string())?;
+        write(
+            "gid_map",
+            format!("0 {} 1", rustix::process::getgid().as_raw()),
+        )?;
+        write(
+            "uid_map",
+            format!("0 {} 1", rustix::process::getuid().as_raw()),
+        )?;
+        let mut taken = self.taken.lock().expect("the taken numbers");
+        loop {
+            match rustix::io::fcntl_dupfd_cloexec(rustix::stdio::stderr(), 0) {
+                Ok(fd) => taken.push(fd),
+                Err(rustix::io::Errno::MFILE) => return Ok(()),
+                Err(errno) => {
+                    return Err(ferroday_cage::IdMapError::map_write(
+                        "a descriptor",
+                        errno.into(),
+                    ));
+                }
+            }
+        }
+    }
+}

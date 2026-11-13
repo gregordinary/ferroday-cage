@@ -607,6 +607,15 @@ consumer upgrading can skip it.
   syscall, such as the empty value an unset variable expands to, as a usage
   error. Such a value launched with no seccomp filter from the flag, or under a
   profile's policy beside a profile.
+- A launch whose supervisor's pidfd does not reach the caller ends with the
+  new `Error::SupervisorUnreceived`. The kernel delivers the launch stage's
+  message without the descriptor where the caller has no descriptor number
+  free, or a security module refuses it. Such a launch was handled as one
+  whose supervisor was never published: `Cage::spawn_pending` without a PID
+  namespace never returned, `Cage::spawn` without one returned only once the
+  command had run to completion, and with a PID namespace the sandbox ran on
+  with no handle. The launch now asks the supervisor to end the sandbox over
+  the control socket, and returns once the launch stage has exited.
 
 ### Internal
 

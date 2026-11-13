@@ -1504,6 +1504,19 @@ pub enum Error {
         /// The error the step failed with.
         source: io::Error,
     },
+    /// The launch stage published the sandbox's supervisor, and the descriptor
+    /// naming it did not reach this process, so the launch was ended.
+    ///
+    /// The kernel installs a descriptor sent over a socket only where the
+    /// receiving process has a descriptor number free under `RLIMIT_NOFILE`
+    /// and the system's file limit, and where no security module refuses it;
+    /// otherwise the message arrives without it. A sandbox whose supervisor
+    /// this process holds no handle to could be neither waited for nor killed,
+    /// so the launch asks the supervisor to end it, over the channel the
+    /// launch still holds, before this is returned. Without a PID namespace
+    /// every process of the launch has exited by then; with one, the
+    /// namespace is ending.
+    SupervisorUnreceived,
 }
 
 /// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
@@ -1679,6 +1692,11 @@ impl fmt::Display for Error {
                 "the sandbox's cgroup could not be prepared while {op} {}",
                 path.display(),
             ),
+            Error::SupervisorUnreceived => f.write_str(
+                "the launch was ended because this process could not receive the descriptor \
+                 naming the sandbox's supervisor (no descriptor number was free under \
+                 RLIMIT_NOFILE, or a security module refused it)",
+            ),
         }
     }
 }
@@ -1689,8 +1707,9 @@ impl std::error::Error for Error {
     /// Every OS failure this type carries is an [`io::Error`], so every one of
     /// them is returned here, including the syscall a recognized exhaustion
     /// came from. The variants that answer `None` carry nothing, since no
-    /// syscall failed: [`SupervisorLost`](Self::SupervisorLost) is an absence
-    /// the library noticed, [`StreamIsDirectory`](Self::StreamIsDirectory) and
+    /// syscall failed: [`SupervisorLost`](Self::SupervisorLost) and
+    /// [`SupervisorUnreceived`](Self::SupervisorUnreceived) are absences the
+    /// library noticed, [`StreamIsDirectory`](Self::StreamIsDirectory) and
     /// [`ListenRefused`](Self::ListenRefused) are refusals it made before it
     /// made any, and [`Listen`](Self::Listen) answers `None` where its helper
     /// ended without saying why.
@@ -1714,6 +1733,7 @@ impl std::error::Error for Error {
                 .as_ref()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
             Error::SupervisorLost
+            | Error::SupervisorUnreceived
             | Error::StreamIsDirectory { .. }
             | Error::ListenRefused { .. }
             | Error::CgroupRefused { .. } => None,
