@@ -1683,7 +1683,8 @@ const FLAGS: &[Flag] = &[
         placeholder: "NAME",
         help: &[
             "Name the stack's interface inside the sandbox (default",
-            "tap0; 1 to 15 bytes, free of '/', ':', and whitespace)",
+            "tap0; 1 to 15 bytes, free of '/', ':', '%', and",
+            "whitespace)",
         ],
         take: Take::One(|options, flag, value| {
             options.netstack_interface = Some(into_string(flag, value)?);

@@ -653,7 +653,10 @@ impl NetStackBuilder {
     /// The name must satisfy the kernel's interface-name rules: 1 to 15
     /// bytes, not `.` or `..`, and free of `/`, `:`, and whitespace as the
     /// kernel reads it, which includes the vertical tab and the byte `0xA0`.
-    /// Validated by [`build`](Self::build).
+    /// It must be free of `%` too. The kernel reads a name holding one, such as
+    /// `tap%d`, as a template for a name of its own choosing, while the stack
+    /// configures the interface by the name given here. Validated by
+    /// [`build`](Self::build).
     pub fn interface(mut self, name: impl Into<String>) -> Self {
         self.interface = name.into();
         self
@@ -835,14 +838,19 @@ impl NetStackBuilder {
 /// the terminator), not `.` or `..`, and free of `/`, `:`, and every byte the
 /// kernel's `isspace` accepts. NUL is additionally rejected so the name embeds
 /// cleanly in the NUL-terminated kernel requests.
+///
+/// `%` is refused as well, though `dev_valid_name` accepts it. Creating the
+/// tap expands a name holding one as a template, `tap%d` to `tap0`, and the
+/// configuration requests that follow name the interface as configured, a name
+/// no interface has. A valid name is therefore the interface's exact name.
 fn interface_name_valid(name: &str) -> bool {
     !name.is_empty()
         && name.len() < 16
         && name != "."
         && name != ".."
-        && !name
-            .bytes()
-            .any(|byte| byte == b'/' || byte == b':' || byte == 0 || kernel_isspace(byte))
+        && !name.bytes().any(|byte| {
+            byte == b'/' || byte == b':' || byte == b'%' || byte == 0 || kernel_isspace(byte)
+        })
 }
 
 /// The kernel's `isspace`, which its `_ctype` table defines over bytes: tab,
@@ -1344,6 +1352,10 @@ mod tests {
             "a\u{b}b",
             "a\u{a0}b",
             "\u{e0}",
+            // Valid to the kernel, which reads it as a template and names the
+            // interface itself.
+            "tap%d",
+            "a%b",
         ] {
             let err = NetStack::builder()
                 .interface(name)
