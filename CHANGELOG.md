@@ -894,6 +894,10 @@ consumer upgrading can skip it.
 - A NUL byte in the `PATH` a path lookup searches is reported as
   `ConfigError::EmbeddedNul` naming that `PATH`. It named a search candidate
   built from it instead.
+- `CopyIn` copies a sparse file sparse. A hole in a source file is found with
+  `SEEK_DATA` and `SEEK_HOLE` and left a hole in the copy, where it was written
+  as the zeros it reads as, so a file a sandbox made long with
+  `truncate -s 16T` filled the destination's disk.
 
 ### Internal
 

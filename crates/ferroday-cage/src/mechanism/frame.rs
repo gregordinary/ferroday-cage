@@ -113,14 +113,47 @@ pub(crate) fn read_full_or_short(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<u
     Ok(read)
 }
 
-/// Which end of [`stream_exact`] failed.
+/// Which end of [`stream_exact`] or [`receive_runs`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamFailure {
-    /// The file could not be read.
+    /// The file could not be read, or written.
     File(Errno),
-    /// The stream could not be written, which is a peer that has gone.
+    /// The stream could not be written, which is a peer that has gone; or read,
+    /// which is a peer that stopped part-way or sent runs that do not add up.
     Stream(Errno),
 }
+
+/// How [`stream_exact`] sends a file's holes.
+///
+/// A hole is a range of a sparse file that holds no data and reads as zeros. A
+/// file costs its writer nothing to make long that way: `truncate -s 16T`
+/// writes no data and takes no space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Holes {
+    /// As the zeros they read as, so the stream is exactly the file's bytes.
+    #[cfg_attr(
+        not(feature = "tarball"),
+        allow(
+            dead_code,
+            reason = "only an export streams holes as zeros, and only a build with the tarball \
+                      feature exports"
+        )
+    )]
+    Zeros,
+    /// As runs, which [`receive_runs`] writes back: each a tag, [`RUN_DATA`]
+    /// or [`RUN_HOLE`], then its length as a little-endian `u64`, and a data
+    /// run's bytes after that. A hole costs the stream nine bytes whatever its
+    /// length. The file's data is found with `SEEK_DATA` and `SEEK_HOLE`, and
+    /// a filesystem that cannot report where a file's holes are has the whole
+    /// file sent as data.
+    Runs,
+}
+
+/// Run tag: that many bytes of the file's data follow.
+pub(crate) const RUN_DATA: u8 = 1;
+
+/// Run tag: a hole that many bytes long, which carries no bytes.
+pub(crate) const RUN_HOLE: u8 = 2;
 
 /// Streams exactly `size` bytes of the regular file `file`, from its start, to
 /// `stream`, and answers whether the file held a different number of bytes.
@@ -132,10 +165,13 @@ pub(crate) enum StreamFailure {
 /// since a file padded or cut to fit its frame is not a copy of the file; the
 /// framing is kept so that the report can be made at all, rather than by a
 /// peer reading the next frame out of the middle of this one. The file's
-/// length once its bytes are sent is what notices one that grew.
+/// length once its bytes are sent is what notices one that grew, or one that
+/// shrank into what was sent as a hole.
 ///
-/// The reads are positioned, so the file's own offset is neither used nor
-/// moved. `EINTR` is retried on both ends.
+/// `holes` says whether a hole goes as zeros or as a run the peer skips.
+///
+/// The reads are positioned, so the file's offset is not what is read from.
+/// `EINTR` is retried on both ends.
 ///
 /// Kept out of line, so its buffer is on the stack only while a file streams
 /// rather than in the frame of every level of the walk that calls it.
@@ -144,13 +180,75 @@ pub(crate) fn stream_exact(
     file: BorrowedFd<'_>,
     stream: BorrowedFd<'_>,
     size: u64,
+    holes: Holes,
 ) -> Result<bool, StreamFailure> {
     let mut buf = [0u8; DATA_BUF];
-    let short = send_range(file, stream, 0, size, &mut buf)?;
+    let short = match holes {
+        Holes::Zeros => send_range(file, stream, 0, size, &mut buf)?,
+        Holes::Runs => send_runs(file, stream, size, &mut buf)?,
+    };
     let length = rustix::fs::fstat(file)
         .map_err(StreamFailure::File)?
         .st_size;
     Ok(short || u64::try_from(length).ok() != Some(size))
+}
+
+/// Sends the first `size` bytes of `file` as runs, and answers whether a data
+/// run read short.
+fn send_runs(
+    file: BorrowedFd<'_>,
+    stream: BorrowedFd<'_>,
+    size: u64,
+    buf: &mut [u8],
+) -> Result<bool, StreamFailure> {
+    let mut short = false;
+    let mut at = 0;
+    while at < size {
+        let (start, end) = data_extent(file, at, size)?;
+        if start > at {
+            send_run(stream, RUN_HOLE, start - at)?;
+        }
+        if end > start {
+            send_run(stream, RUN_DATA, end - start)?;
+            short |= send_range(file, stream, start, end - start, buf)?;
+        }
+        at = end;
+    }
+    Ok(short)
+}
+
+/// The next extent of data in the first `size` bytes of `file`, at or after
+/// `at`: where it starts and where the hole after it does, both held to
+/// `size`. A start at `size` is no data left, and the rest a hole.
+///
+/// An extent is never empty unless it is that one, so a walk over them always
+/// moves on. A file that changed between the two seeks has what is left sent
+/// as data, which [`send_range`] pads where the file has since ended.
+fn data_extent(file: BorrowedFd<'_>, at: u64, size: u64) -> Result<(u64, u64), StreamFailure> {
+    let start = match rustix::fs::seek(file, rustix::fs::SeekFrom::Data(at)) {
+        Ok(start) => start.min(size),
+        // No data at or past `at`: a hole runs to the end, or the file ended.
+        Err(Errno::NXIO) => size,
+        // A filesystem that cannot report its holes: all of it is data.
+        Err(Errno::INVAL) => return Ok((at, size)),
+        Err(errno) => return Err(StreamFailure::File(errno)),
+    };
+    if start == size {
+        return Ok((size, size));
+    }
+    let end = match rustix::fs::seek(file, rustix::fs::SeekFrom::Hole(start)) {
+        Ok(end) if end > start => end.min(size),
+        Ok(_) | Err(Errno::NXIO) => size,
+        Err(errno) => return Err(StreamFailure::File(errno)),
+    };
+    Ok((start, end))
+}
+
+/// Writes a run's tag and length.
+fn send_run(stream: BorrowedFd<'_>, tag: u8, len: u64) -> Result<(), StreamFailure> {
+    let mut run = [tag; 9];
+    run[1..].copy_from_slice(&len.to_le_bytes());
+    write_full(stream, &run).map_err(StreamFailure::Stream)
 }
 
 /// Sends `len` bytes of `file` from the offset `at`, padding with zeros where
@@ -189,6 +287,53 @@ fn send_range(
         sent += want as u64;
     }
     Ok(true)
+}
+
+/// Reads the runs [`stream_exact`] sends with [`Holes::Runs`] from `stream`
+/// into `file`, a file just created and empty, until they make up `size`
+/// bytes.
+///
+/// A data run's bytes are written where the run begins, and a hole is passed
+/// over, so the file holds no blocks for it. The length is set to `size` at
+/// the end, which is what makes a hole at the end of the file. A run that is
+/// empty, that reaches past `size`, or whose tag is neither is a stream this
+/// does not understand, `EINVAL` on the stream's side.
+///
+/// Kept out of line for the reason [`stream_exact`] is.
+#[inline(never)]
+pub(crate) fn receive_runs(
+    stream: BorrowedFd<'_>,
+    file: BorrowedFd<'_>,
+    size: u64,
+) -> Result<(), StreamFailure> {
+    let mut buf = [0u8; DATA_BUF];
+    let mut at = 0;
+    while at < size {
+        let mut run = [0u8; 9];
+        read_full(stream, &mut run).map_err(StreamFailure::Stream)?;
+        let [tag, len @ ..] = run;
+        let len = u64::from_le_bytes(len);
+        if len == 0 || len > size - at {
+            return Err(StreamFailure::Stream(Errno::INVAL));
+        }
+        match tag {
+            RUN_DATA => {
+                rustix::fs::seek(file, rustix::fs::SeekFrom::Start(at))
+                    .map_err(StreamFailure::File)?;
+                let mut left = len;
+                while left > 0 {
+                    let want = usize::try_from(left).map_or(buf.len(), |left| left.min(buf.len()));
+                    read_full(stream, &mut buf[..want]).map_err(StreamFailure::Stream)?;
+                    write_full(file, &buf[..want]).map_err(StreamFailure::File)?;
+                    left -= want as u64;
+                }
+            }
+            RUN_HOLE => {}
+            _ => return Err(StreamFailure::Stream(Errno::INVAL)),
+        }
+        at += len;
+    }
+    rustix::fs::ftruncate(file, size).map_err(StreamFailure::File)
 }
 
 /// The length of a helper child's outcome record: a step's wire value then an
@@ -357,4 +502,166 @@ pub(crate) fn recv_with_fd(
         }
     }
     Ok((received.bytes, fd))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+
+    use super::*;
+    use crate::scratch::Scratch;
+
+    /// A sparse file `size` bytes long holding `data` at each offset given.
+    fn sparse(path: &std::path::Path, size: u64, data: &[(u64, &[u8])]) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("the file is creatable");
+        file.set_len(size).expect("the file is extendable");
+        for (at, bytes) in data {
+            file.write_all_at(bytes, *at).expect("the data is writable");
+        }
+        file
+    }
+
+    /// Whether `file` reports a hole at its start, which is what a filesystem
+    /// that keeps sparse files does for one whose data starts later.
+    fn reports_holes(file: &std::fs::File) -> bool {
+        rustix::fs::seek(file, rustix::fs::SeekFrom::Data(0)).is_ok_and(|data| data > 0)
+    }
+
+    /// What `stream_exact` sends of `file` at a declared `size`, and whether
+    /// it reports the file changed, through a scratch file no reader drains.
+    fn streamed(dir: &Scratch, file: &std::fs::File, size: u64, holes: Holes) -> (Vec<u8>, bool) {
+        let stream = std::fs::File::create(dir.join("stream")).expect("the stream file opens");
+        let changed =
+            stream_exact(file.as_fd(), stream.as_fd(), size, holes).expect("the file streams");
+        (
+            std::fs::read(dir.join("stream")).expect("the stream reads"),
+            changed,
+        )
+    }
+
+    /// A run's tag and length.
+    fn run(tag: u8, len: u64) -> Vec<u8> {
+        let mut run = vec![tag];
+        run.extend_from_slice(&len.to_le_bytes());
+        run
+    }
+
+    /// A sparse file goes as runs whose holes carry no bytes, and comes back
+    /// as a file of the same length, holding the same bytes, and as sparse.
+    #[test]
+    fn a_sparse_file_crosses_the_stream_as_runs_and_lands_sparse() {
+        let dir = Scratch::new("frame-runs");
+        // A tebibyte: streamed as its zeros, it would not fit the disk.
+        const SIZE: u64 = 1 << 40;
+        let source = sparse(
+            &dir.join("source"),
+            SIZE,
+            &[(1 << 30, b"middle"), (SIZE - 4, b"tail")],
+        );
+        if !reports_holes(&source) {
+            ferroday_cage_testkit::require::premise_unmet(
+                "this filesystem reports no holes in a sparse file",
+            );
+            return;
+        }
+
+        let (runs, changed) = streamed(&dir, &source, SIZE, Holes::Runs);
+        assert!(!changed, "an unchanged file was reported changed");
+        assert!(
+            runs.len() < 64 * 1024,
+            "the holes cost the stream {} bytes",
+            runs.len()
+        );
+        assert_eq!(&runs[..9], run(RUN_HOLE, 1 << 30).as_slice());
+
+        let landed = sparse(&dir.join("landed"), 0, &[]);
+        let stream = std::fs::File::open(dir.join("stream")).expect("the stream opens");
+        receive_runs(stream.as_fd(), landed.as_fd(), SIZE).expect("the runs land");
+        let meta = landed.metadata().expect("the copy stats");
+        assert_eq!(meta.len(), SIZE);
+        assert!(
+            meta.blocks() < 1024,
+            "the copy holds {} blocks for its holes",
+            meta.blocks()
+        );
+        for (at, len) in [(0, 16), ((1 << 30) - 8, 32), (SIZE - 16, 16)] {
+            let (mut want, mut got) = (vec![0u8; len], vec![0u8; len]);
+            source.read_exact_at(&mut want, at).unwrap();
+            landed.read_exact_at(&mut got, at).unwrap();
+            assert_eq!(got, want, "the bytes at {at} differ");
+        }
+    }
+
+    /// A file streamed as runs keeps its framing and reports the change where
+    /// it shrank into what was sent as a hole, or grew past what was declared;
+    /// one with no holes goes as a single data run, exactly as zeros would.
+    #[test]
+    fn runs_keep_their_framing_and_report_a_changed_file() {
+        let dir = Scratch::new("frame-runs-changed");
+        let plain = sparse(&dir.join("plain"), 0, &[(0, b"12345")]);
+
+        let (runs, changed) = streamed(&dir, &plain, 5, Holes::Runs);
+        let mut expected = run(RUN_DATA, 5);
+        expected.extend_from_slice(b"12345");
+        assert_eq!((runs, changed), (expected, false));
+        assert_eq!(
+            streamed(&dir, &plain, 5, Holes::Zeros),
+            (b"12345".to_vec(), false)
+        );
+
+        // Declared longer than the file: the rest goes as a hole, and the
+        // length says the file is not what was declared.
+        let (runs, changed) = streamed(&dir, &plain, 8, Holes::Runs);
+        let mut expected = run(RUN_DATA, 5);
+        expected.extend_from_slice(b"12345");
+        expected.extend(run(RUN_HOLE, 3));
+        assert_eq!((runs, changed), (expected, true));
+
+        // Declared shorter: cut at the declared length.
+        let (runs, changed) = streamed(&dir, &plain, 3, Holes::Runs);
+        let mut expected = run(RUN_DATA, 3);
+        expected.extend_from_slice(b"123");
+        assert_eq!((runs, changed), (expected, true));
+
+        // An empty file is no runs at all.
+        let empty = sparse(&dir.join("empty"), 0, &[]);
+        assert_eq!(streamed(&dir, &empty, 0, Holes::Runs), (Vec::new(), false));
+    }
+
+    /// Runs that do not add up to the declared size, or that name no kind of
+    /// run, are a stream the reader does not understand.
+    #[test]
+    fn runs_that_do_not_add_up_are_refused() {
+        let dir = Scratch::new("frame-runs-malformed");
+        let mut past = run(RUN_DATA, 4);
+        past.extend_from_slice(b"1234");
+        for (tag, runs) in [
+            ("empty", run(RUN_HOLE, 0)),
+            ("past", past),
+            ("unknown", run(9, 1)),
+        ] {
+            std::fs::write(dir.join("stream"), &runs).unwrap();
+            let stream = std::fs::File::open(dir.join("stream")).unwrap();
+            let landed = sparse(&dir.join(tag), 0, &[]);
+            assert_eq!(
+                receive_runs(stream.as_fd(), landed.as_fd(), 2),
+                Err(StreamFailure::Stream(Errno::INVAL)),
+                "{tag}",
+            );
+        }
+        // A stream that ends inside a run is a peer that stopped part-way.
+        std::fs::write(dir.join("stream"), run(RUN_DATA, 2)).unwrap();
+        let stream = std::fs::File::open(dir.join("stream")).unwrap();
+        let landed = sparse(&dir.join("cut"), 0, &[]);
+        assert_eq!(
+            receive_runs(stream.as_fd(), landed.as_fd(), 2),
+            Err(StreamFailure::Stream(Errno::PIPE)),
+        );
+    }
 }

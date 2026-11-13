@@ -568,6 +568,13 @@ their modes and modification times. A symbolic link's modification time is its
 own rather than its target's. Its mode is the one thing not carried, the kernel
 fixing every symbolic link's at `0777`.
 
+A sparse file is copied sparse. The copy finds a file's data with `SEEK_DATA`
+and `SEEK_HOLE` and leaves each hole a hole. A file can cost the command that
+wrote it nothing: `truncate -s 16T` writes no data and takes no space. Its copy
+costs its data rather than its length, where writing what it reads as would fill
+the destination's disk with zeros. A source filesystem that cannot report where
+a file's holes are has the file copied as the zeros it reads as.
+
 Several names for one file are copied as hard links onto the first name. A tree
 therefore keeps the sharing it was written with, and its data is streamed once.
 That is what lets a tree exported by `Export`, which coalesces hard links of its

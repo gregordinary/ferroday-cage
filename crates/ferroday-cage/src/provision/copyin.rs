@@ -38,7 +38,7 @@ use crate::IdentityMap;
 use crate::failure::ErrorChain;
 use crate::idmap::{IdMapper, IdRange};
 use crate::mechanism::bounds::{LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_NAME_MAX, XATTR_SIZE_MAX};
-use crate::mechanism::frame::{self, StreamFailure};
+use crate::mechanism::frame::{self, Holes, StreamFailure};
 use crate::mechanism::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_OWN, COPY_SYMLINK,
     ChildMap, CopyFailure, start_copy_in,
@@ -92,6 +92,14 @@ everything it can create — a named pipe included — and names the rest.
 /// sharing it was written with. Character and block devices and sockets cannot
 /// be copied and are named in the [`CopyReport`] the run returns; see
 /// [`SkippedKind`] for why each is left out.
+///
+/// A sparse file is copied sparse. Its data is found with `SEEK_DATA` and
+/// `SEEK_HOLE`, and each hole is left a hole in the copy, so a file that cost
+/// whoever wrote it nothing to make long costs the copy its data rather than
+/// its length: `truncate -s 16T` writes no data, and a copy that wrote what such
+/// a file reads as would fill the destination's disk with zeros. A source
+/// filesystem that cannot report where a file's holes are has the file copied
+/// as the zeros it reads as.
 ///
 /// Extended attributes are copied where the sandbox's root can set them:
 /// `user.` attributes, POSIX access control lists, and a file's capabilities.
@@ -1294,9 +1302,11 @@ fn stream_file(
     size: u64,
 ) -> Result<(), ProvisionError> {
     let changed =
-        frame::stream_exact(file.as_fd(), stream, size).map_err(|failure| match failure {
-            StreamFailure::File(errno) => ProvisionError::io("reading", path, errno.into()),
-            StreamFailure::Stream(errno) => ProvisionError::io("copying", path, errno.into()),
+        frame::stream_exact(file.as_fd(), stream, size, Holes::Runs).map_err(|failure| {
+            match failure {
+                StreamFailure::File(errno) => ProvisionError::io("reading", path, errno.into()),
+                StreamFailure::Stream(errno) => ProvisionError::io("copying", path, errno.into()),
+            }
         })?;
     if changed {
         return Err(ProvisionError::SourceChanged {
@@ -1778,6 +1788,8 @@ mod tests {
         frames.extend_from_slice(&0u32.to_le_bytes());
         frames.extend_from_slice(&0i64.to_le_bytes());
         frames.extend_from_slice(&3u64.to_le_bytes());
+        frames.push(frame::RUN_DATA);
+        frames.extend_from_slice(&3u64.to_le_bytes());
         frames.extend_from_slice(b"elf");
         let plain = capability(2, None);
         frames.extend_from_slice(&1u16.to_le_bytes());
@@ -1812,6 +1824,66 @@ mod tests {
             .expect("the copy succeeds");
         assert_eq!(report, CopyReport::default());
         assert_eq!(held(&rootfs.join("ping")), staged_capability);
+    }
+
+    #[test]
+    fn a_sparse_file_is_copied_sparse() {
+        // A sandbox makes a file eight tebibytes long with `truncate -s 8T`
+        // and no data; ext4 holds a file up to a block short of sixteen.
+        // Copied as the zeros it reads as, it would fill the destination's
+        // disk; copied as runs, it costs its data.
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        const SIZE: u64 = 8 << 40;
+        let dir = Scratch::new("copyin-sparse");
+        let (source, rootfs) = (dir.join("source"), dir.join("rootfs"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let file = std::fs::File::create(source.join("big")).unwrap();
+        file.set_len(SIZE).unwrap();
+        for (at, data) in [(0, &b"head"[..]), (1 << 30, b"middle"), (SIZE - 4, b"tail")] {
+            file.write_all_at(data, at).unwrap();
+        }
+        drop(file);
+        let held = std::fs::metadata(source.join("big")).unwrap();
+        if held.blocks() * 512 >= 1 << 30 {
+            ferroday_cage_testkit::require::premise_unmet(
+                "this filesystem keeps no holes in a sparse file",
+            );
+            return;
+        }
+
+        let report = CopyIn::new(&source, &rootfs)
+            .run()
+            .expect("the sparse file copies");
+        assert_eq!(report, CopyReport::default());
+        let copied = std::fs::File::open(rootfs.join("big")).unwrap();
+        let meta = copied.metadata().unwrap();
+        assert_eq!(meta.len(), SIZE);
+        assert!(
+            meta.blocks() <= held.blocks() * 2,
+            "the copy holds {} blocks where the source holds {}",
+            meta.blocks(),
+            held.blocks(),
+        );
+        // Whatever either file holds as data, both read the same there; the
+        // rest of each is a hole, and reads as zeros.
+        let source = std::fs::File::open(source.join("big")).unwrap();
+        for file in [&source, &copied] {
+            let mut at = 0;
+            while let Ok(start) = rustix::fs::seek(file, rustix::fs::SeekFrom::Data(at)) {
+                let end = rustix::fs::seek(file, rustix::fs::SeekFrom::Hole(start)).unwrap();
+                let len = usize::try_from(end - start).unwrap();
+                let (mut want, mut got) = (vec![0u8; len], vec![0u8; len]);
+                source.read_exact_at(&mut want, start).unwrap();
+                copied.read_exact_at(&mut got, start).unwrap();
+                assert!(got == want, "the bytes from {start} to {end} differ");
+                at = end;
+            }
+        }
     }
 
     #[test]

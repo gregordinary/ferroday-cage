@@ -57,7 +57,7 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
 use super::bounds::{LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_SIZE_MAX};
 use super::child::MapFailure;
-use super::frame::{self, StreamFailure};
+use super::frame::{self, Holes, StreamFailure};
 use super::sys::{self, PidfdFork};
 use super::{ChildMap, Forked};
 use crate::idmap::IdMapError;
@@ -635,9 +635,11 @@ impl Walker<'_> {
     /// as the `Export` documentation says.
     fn stream_data(&self, fd: BorrowedFd<'_>, size: u64) -> Result<(), (ExportStep, Errno)> {
         let changed =
-            frame::stream_exact(fd, self.stream, size).map_err(|failure| match failure {
-                StreamFailure::File(errno) => (ExportStep::ReadData, errno),
-                StreamFailure::Stream(errno) => (ExportStep::Stream, errno),
+            frame::stream_exact(fd, self.stream, size, Holes::Zeros).map_err(|failure| {
+                match failure {
+                    StreamFailure::File(errno) => (ExportStep::ReadData, errno),
+                    StreamFailure::Stream(errno) => (ExportStep::Stream, errno),
+                }
             })?;
         put(self.stream, &[u8::from(changed)])
     }

@@ -39,8 +39,11 @@
 //!   follows. The child applies the deferred ownership, mode, and modification
 //!   time, and then the attributes, if it created the directory; it reads the
 //!   block past for one it adopted. Then it closes the directory.
-//! - [`COPY_FILE`]: a regular file. Its name, metadata, exactly `size` bytes of
-//!   data, and its attribute block follow.
+//! - [`COPY_FILE`]: a regular file. Its name, metadata, its size, its data as
+//!   the runs [`frame::receive_runs`] reads, and its attribute block follow. A
+//!   hole in the source is a run of its own that carries no bytes, and the
+//!   child leaves it a hole, so a sparse file costs the copy its data rather
+//!   than its length.
 //! - [`COPY_SYMLINK`]: a symbolic link. Its name, metadata, and target follow.
 //!   The child applies the ownership and the modification time; the mode goes
 //!   unused, since the kernel fixes a symlink's own at 0777.
@@ -105,9 +108,9 @@ use rustix::fs::{self, AtFlags, Mode, OFlags, ResolveFlags, Timestamps};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, SocketFlags, SocketType};
 
-use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_NAME_MAX, XATTR_SIZE_MAX};
+use super::bounds::{LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_NAME_MAX, XATTR_SIZE_MAX};
 use super::child::MapFailure;
-use super::frame;
+use super::frame::{self, StreamFailure};
 use super::sys::{self, PidfdFork};
 use super::{ChildMap, Forked};
 use crate::idmap::IdMapError;
@@ -568,7 +571,12 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                     )
                 })
                 .map_err(|errno| (CopyStep::Create, errno))?;
-                copy_data(stream, file.as_fd(), size)?;
+                frame::receive_runs(stream, file.as_fd(), size).map_err(
+                    |failure| match failure {
+                        StreamFailure::Stream(errno) => (CopyStep::ReadFrame, errno),
+                        StreamFailure::File(errno) => (CopyStep::Write, errno),
+                    },
+                )?;
                 apply_meta(file.as_fd(), &meta)?;
                 apply_xattrs(stream, Some(file.as_fd()))?;
             }
@@ -1159,23 +1167,6 @@ fn contained_path(bytes: &[u8]) -> Result<&CStr, (CopyStep, Errno)> {
     CStr::from_bytes_with_nul(bytes).map_err(|_| (CopyStep::BadName, Errno::INVAL))
 }
 
-/// Copies exactly `size` bytes from the frame stream into `file`.
-fn copy_data(
-    stream: BorrowedFd<'_>,
-    file: BorrowedFd<'_>,
-    size: u64,
-) -> Result<(), (CopyStep, Errno)> {
-    let mut buf = [0u8; DATA_BUF];
-    let mut left = size;
-    while left > 0 {
-        let want = usize::try_from(left.min(DATA_BUF as u64)).unwrap_or(DATA_BUF);
-        read_full(stream, &mut buf[..want])?;
-        frame::write_full(file, &buf[..want]).map_err(|errno| (CopyStep::Write, errno))?;
-        left -= want as u64;
-    }
-    Ok(())
-}
-
 /// Fills `buf` completely, treating a short stream as a truncated frame.
 fn read_full(stream: BorrowedFd<'_>, buf: &mut [u8]) -> Result<(), (CopyStep, Errno)> {
     frame::read_full(stream, buf).map_err(|errno| (CopyStep::ReadFrame, errno))
@@ -1336,7 +1327,11 @@ mod tests {
         frame.extend_from_slice(&rustix::process::getgid().as_raw().to_le_bytes());
         frame.extend_from_slice(&0i64.to_le_bytes());
         frame.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        frame.extend_from_slice(data);
+        if !data.is_empty() {
+            frame.push(frame::RUN_DATA);
+            frame.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            frame.extend_from_slice(data);
+        }
         frame.extend(attribute_block(xattrs));
         frame
     }
