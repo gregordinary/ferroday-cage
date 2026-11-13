@@ -2322,7 +2322,7 @@ fn lay_down(
         held.file
             .seek(std::io::SeekFrom::Start(held.package.data_at))
             .map_err(|err| ProvisionError::io("reading the package", &held.path, err))?;
-        let mut archive = TarReader::new(apk::data_reader(&mut held.file));
+        let mut archive = TarReader::new(apk::data_reader(&mut held.file), &held.path);
         lay_package(
             &mut extraction,
             &tree,
@@ -5176,7 +5176,7 @@ mod tests {
         let mut database = Database::default();
         for (name, extra, archive) in packages {
             let at = database.add(record_of(name, extra));
-            let mut reader = TarReader::new(&archive[..]);
+            let mut reader = TarReader::in_memory(&archive[..]);
             if let Err(err) = lay_package(
                 &mut extraction,
                 &tree,

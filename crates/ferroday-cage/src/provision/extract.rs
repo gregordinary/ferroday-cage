@@ -1975,7 +1975,7 @@ mod prefix_tests {
             .expect("the root opens")
             .under(b"image");
         extraction
-            .extract(&mut TarReader::new(&archive[..]), &mut |_, _| {
+            .extract(&mut TarReader::in_memory(&archive[..]), &mut |_, _| {
                 Ok(Placement::Write)
             })
             .expect("the image extracts");
@@ -2032,7 +2032,7 @@ mod mode_tests {
         tar.entry("write-only", b'6', 0o220, 0, 0, "", b"")
             .entry("shared", b'6', 0o666, 0, 0, "", b"");
         extract_archive(
-            &mut TarReader::new(&tar.finish()[..]),
+            &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
         )
@@ -2078,7 +2078,7 @@ mod naming_tests {
         ] {
             let root = Scratch::for_test("extract", "hostile-name");
             let err = extract_archive(
-                &mut TarReader::new(&archive.finish()[..]),
+                &mut TarReader::in_memory(&archive.finish()[..]),
                 &root,
                 &mut |_, _| Ok(Placement::Write),
             )
@@ -2224,7 +2224,7 @@ mod list_tests {
         );
         tar.dir("dir", 0o770).file("dir/inside", 0o644, b"plain\n");
         extract_archive(
-            &mut TarReader::new(&tar.finish()[..]),
+            &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
         )
@@ -2270,7 +2270,7 @@ mod list_tests {
         );
         tar.file("file", 0o640, b"x");
         let err = extract_archive(
-            &mut TarReader::new(&tar.finish()[..]),
+            &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
         )
@@ -2299,7 +2299,7 @@ mod layered_tests {
     ) -> Result<Vec<String>, crate::provision::ProvisionError> {
         let mut seen = Vec::new();
         let mut extraction = Extraction::new(upper)?.over(Some(base))?;
-        extraction.extract(&mut TarReader::new(archive), &mut |_, components| {
+        extraction.extract(&mut TarReader::in_memory(archive), &mut |_, components| {
             seen.push(String::from_utf8(components.join(&b'/')).unwrap());
             Ok(Placement::Write)
         })?;
@@ -2924,7 +2924,7 @@ mod layered_tests {
             .unwrap()
             .owned_through(ownership.clone());
         extraction
-            .extract(&mut TarReader::new(&tar.finish()[..]), &mut |_, _| {
+            .extract(&mut TarReader::in_memory(&tar.finish()[..]), &mut |_, _| {
                 Ok(Placement::Write)
             })
             .unwrap();

@@ -22,7 +22,7 @@ use std::path::Path;
 use super::super::ProvisionError;
 use super::super::compress;
 use super::super::extract::{Extraction, OnEntry};
-use super::super::tar::TarReader;
+use super::super::tar::{self, TarReader};
 
 /// The 8-byte `ar` global header.
 const AR_MAGIC: &[u8] = b"!<arch>\n";
@@ -47,9 +47,10 @@ const AR_HEADER: usize = 60;
 /// too, and a `./control` declaring more than it is refused before it is read.
 const CONTROL_MEMBER_LIMIT: u64 = 16 * 1024 * 1024;
 
-/// Extracts a `.deb`'s `data.tar` member into an ongoing extraction.
+/// Extracts the `data.tar` member of the `.deb` at `path`, which `deb` reads,
+/// into an ongoing extraction.
 ///
-/// `on_entry` is forwarded to the extractor for every extracted entry, so
+/// `path` names the package in a failure and is not opened. `on_entry` is forwarded to the extractor for every extracted entry, so
 /// the caller can record ownership for the dpkg statoverride. Extraction
 /// shares the caller's [`Extraction`], so directory metadata is applied once
 /// across every package rather than per package.
@@ -59,20 +60,19 @@ const CONTROL_MEMBER_LIMIT: u64 = 16 * 1024 * 1024;
 /// unpacking a package costs the extractor's own buffers whatever the package
 /// weighs, which is the property the whole module keeps.
 pub(crate) fn extract_deb<R: Read + Seek>(
-    package: &str,
+    path: &Path,
     deb: &mut R,
     extraction: &mut Extraction,
     on_entry: &mut OnEntry<'_>,
 ) -> Result<(), ProvisionError> {
     let size = seek_to_member(deb, "data.tar", None, &|reason: String| {
-        deb_error(package, &reason)
+        deb_error(path, &reason)
     })?;
     // Bounded by the member's declared size, so the tar stream ends where the
     // member ends instead of running on into the container's next header.
     let member = deb.take(size);
-    let (_, decoded) = compress::decoder(member)
-        .map_err(|err| ProvisionError::io("reading the data member of", Path::new(package), err))?;
-    let mut archive = TarReader::new(decoded);
+    let (_, decoded) = compress::decoder(member).map_err(|err| tar::read_failure(path, 0, err))?;
+    let mut archive = TarReader::new(decoded, path);
     extraction.extract(&mut archive, on_entry)
 }
 
@@ -180,7 +180,13 @@ fn seek_to_member<R: Read + Seek>(
 /// costs: reaching it is proportional to the members before it — a few hundred
 /// bytes — rather than to the `.deb`, which for a kernel package is four orders
 /// of magnitude larger.
-pub(crate) fn read_control_from<R: Read + Seek>(deb: &mut R) -> Result<String, ProvisionError> {
+///
+/// `deb` reads the `.deb` at `path`, which names it in a failure and is not
+/// opened.
+pub(crate) fn read_control_from<R: Read + Seek>(
+    path: &Path,
+    deb: &mut R,
+) -> Result<String, ProvisionError> {
     let size = seek_to_member(
         deb,
         "control.tar",
@@ -195,19 +201,14 @@ pub(crate) fn read_control_from<R: Read + Seek>(deb: &mut R) -> Result<String, P
             err,
         )
     })?;
-    control_from_tar(&member)
+    control_from_tar(path, &member)
 }
 
-/// Reads the `control` entry out of a `.deb`'s `control.tar` member.
-fn control_from_tar(member: &[u8]) -> Result<String, ProvisionError> {
-    let (_, decoded) = compress::decoder(member).map_err(|err| {
-        ProvisionError::io(
-            "reading the control member of the package",
-            Path::new("control.tar"),
-            err,
-        )
-    })?;
-    let mut archive = TarReader::new(decoded.take(CONTROL_MEMBER_LIMIT));
+/// Reads the `control` entry out of the `control.tar` member of the `.deb` at
+/// `path`, held in memory.
+fn control_from_tar(path: &Path, member: &[u8]) -> Result<String, ProvisionError> {
+    let (_, decoded) = compress::decoder(member).map_err(|err| tar::read_failure(path, 0, err))?;
+    let mut archive = TarReader::new(decoded.take(CONTROL_MEMBER_LIMIT), path);
     while let Some(entry) = archive.next_entry()? {
         // The control file is `./control` in a conforming `.deb`; tolerate a
         // bare `control` as well.
@@ -246,8 +247,8 @@ fn ascii_field(field: &[u8]) -> String {
 }
 
 /// Builds a package-scoped extraction error.
-fn deb_error(package: &str, reason: &str) -> ProvisionError {
-    ProvisionError::other(format!("the .deb for {package} is malformed: {reason}"))
+fn deb_error(path: &Path, reason: &str) -> ProvisionError {
+    ProvisionError::other(format!("the .deb {path:?} is malformed: {reason}"))
 }
 
 #[cfg(test)]
@@ -374,7 +375,8 @@ mod tests {
             read: 0,
         };
 
-        let control = read_control_from(&mut counting).expect("the control member is read");
+        let control = read_control_from(Path::new("tool.deb"), &mut counting)
+            .expect("the control member is read");
         assert_eq!(control, String::from_utf8_lossy(stanza));
         assert!(
             counting.read < 64 * 1024,
@@ -392,8 +394,8 @@ mod tests {
         // have paid for the payload to get there.
         let stanza = b"Package: tool\nVersion: 2.0\nArchitecture: all\n";
         let archive = deb(stanza, 8192, true);
-        let control =
-            read_control_from(&mut Cursor::new(&archive)).expect("the control member is read");
+        let control = read_control_from(Path::new("tool.deb"), &mut Cursor::new(&archive))
+            .expect("the control member is read");
         assert_eq!(control, String::from_utf8_lossy(stanza));
     }
 
@@ -403,7 +405,7 @@ mod tests {
             ("debian-binary", b"2.0\n"),
             ("data.tar", b"payload!"),
         ]);
-        let err = read_control_from(&mut Cursor::new(&archive))
+        let err = read_control_from(Path::new("tool.deb"), &mut Cursor::new(&archive))
             .expect_err("a .deb with no control member is rejected");
         assert!(
             ErrorChain::new(&err)
@@ -442,7 +444,7 @@ mod tests {
         // package is authenticated, so it is refused rather than accumulated,
         // on the length its header declares.
         let archive = gzipped_control(&control_tar(&vec![b'x'; CONTROL_MEMBER_LIMIT as usize + 1]));
-        let err = read_control_from(&mut Cursor::new(&archive))
+        let err = read_control_from(Path::new("tool.deb"), &mut Cursor::new(&archive))
             .expect_err("a control file past the ceiling is refused");
         assert!(err.to_string().contains("more than the"), "{err}");
 
@@ -456,8 +458,11 @@ mod tests {
             )
             .file("./control", 0o644, b"Package: tool\n")
             .finish();
-        let err = read_control_from(&mut Cursor::new(&gzipped_control(&skipped)))
-            .expect_err("a control archive past the ceiling is refused");
+        let err = read_control_from(
+            Path::new("tool.deb"),
+            &mut Cursor::new(&gzipped_control(&skipped)),
+        )
+        .expect_err("a control archive past the ceiling is refused");
         assert!(err.to_string().contains("ends inside an entry"), "{err}",);
     }
 
@@ -475,7 +480,7 @@ mod tests {
         header[59] = b'\n';
         archive.extend_from_slice(&header);
 
-        let err = read_control_from(&mut Cursor::new(&archive))
+        let err = read_control_from(Path::new("tool.deb"), &mut Cursor::new(&archive))
             .expect_err("an implausible control member is refused");
         assert!(
             ErrorChain::new(&err)

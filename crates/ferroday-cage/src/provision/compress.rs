@@ -19,8 +19,19 @@
 //! [`MAX_ZSTD_WINDOW`] and [`MAX_XZ_DICTIONARY`]. Each decoder is given its
 //! bound at construction and checks it against the header before allocating
 //! anything.
+//!
+//! A decoder fails for one of two reasons, and they are not one failure. It
+//! refuses the stream, which is malformed or truncated, and that is the
+//! stream's; or the source it reads from fails, an OS error or a transport's,
+//! and that is the host's, which a caller may retry. `Read` carries both as an
+//! `io::Error`, so every decoder here marks a refusal of its own as a
+//! [`Refusal`] and passes a failure of its source through as the source
+//! returned it.
 
+use std::cell::Cell;
+use std::fmt;
 use std::io::{self, Read};
+use std::rc::Rc;
 
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 
@@ -158,21 +169,161 @@ pub(crate) fn decoder<'r>(mut source: impl Read + 'r) -> io::Result<(Codec, Box<
         // single-member decoder stops silently at the first member's end. A tar
         // reader tolerates a missing terminator at end of input, so a truncated
         // read there provisions an incomplete rootfs without an error.
-        Codec::Gzip => Box::new(flate2::read::MultiGzDecoder::new(stream)),
+        Codec::Gzip => Box::new(guard(
+            "the gzip stream does not decode",
+            stream,
+            flate2::read::MultiGzDecoder::new,
+        )),
         // Every block of every stream declares its own dictionary and every one
         // is allocated, so the decode runs under a memory budget the decoder
         // checks against each block header before it allocates. Multiple
         // concatenated xz streams are legal in one file and some producers emit
         // them; the reader decodes them as one.
-        Codec::Xz => Box::new(XzReader::new(stream)),
+        Codec::Xz => Box::new(guard(
+            "the xz stream does not decode",
+            stream,
+            XzReader::new,
+        )),
         // zstd is framed, and a producer such as `pzstd` emits several frames
         // (often behind a leading skippable frame). Decode every frame, each
         // under the window cap: an uncapped decoder would buffer a hostile
         // window into an OOM.
-        Codec::Zstd => Box::new(ZstdReader::new(Box::new(stream))),
+        Codec::Zstd => Box::new(guard("the zstd stream does not decode", stream, |source| {
+            ZstdReader::new(Box::new(source))
+        })),
         Codec::Plain => Box::new(stream),
     };
     Ok((codec, decoded))
+}
+
+/// A decoder's refusal of the stream it was given, carried through `Read`.
+///
+/// A decoder can report a refusal only as an `io::Error`, the type its
+/// source's own failures arrive as, so the refusal is marked with this as it
+/// leaves the decoder ([`guard`]) and an error that arrives unmarked is the
+/// source's. [`tar::read_failure`](super::tar::read_failure) is where an archive
+/// reader tells the two apart again.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    /// What refused, as a reason states it.
+    what: &'static str,
+    /// The decoder's own failure.
+    cause: io::Error,
+}
+
+impl Refusal {
+    /// `cause`, marked as `what`'s refusal of its input, of the kind `cause` is.
+    pub(crate) fn mark(what: &'static str, cause: io::Error) -> io::Error {
+        io::Error::new(cause.kind(), Refusal { what, cause })
+    }
+
+    /// The refusal `err` was marked as, or `err` as it stands where it is not
+    /// one.
+    pub(crate) fn of(err: io::Error) -> Result<Refusal, io::Error> {
+        if !err.get_ref().is_some_and(|inner| inner.is::<Refusal>()) {
+            return Err(err);
+        }
+        let inner = err
+            .into_inner()
+            .expect("a marked error carries its refusal");
+        Ok(*inner
+            .downcast::<Refusal>()
+            .expect("the refusal was checked for"))
+    }
+
+    /// What refused, as a reason states it: `the gzip stream does not decode`.
+    pub(crate) fn what(&self) -> &'static str {
+        self.what
+    }
+
+    /// The decoder's own failure.
+    pub(crate) fn into_cause(self) -> io::Error {
+        self.cause
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.what)
+    }
+}
+
+impl std::error::Error for Refusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// `build`'s decoder over `source`, with its refusals marked as [`Refusal`]s of
+/// `what` and a failure of `source` passed through as `source` returned it.
+///
+/// What the decoder returns cannot say which of the two it is: one passes its
+/// source's error up as it arrived, another wraps it in an error of its own. So
+/// the source is watched instead ([`Watched`]): a failure there is held aside,
+/// and handed on in place of whatever the decoder made of it. Any other failure
+/// is the decoder's. An interrupted read is neither, and is passed through to
+/// be retried.
+///
+/// Every decoder [`decoder`] selects is one of these. A layer that needs a
+/// decoder of its own builds it here, so the same two failures arrive the same
+/// way whoever chose the decoder.
+pub(crate) fn guard<R: Read, D: Read>(
+    what: &'static str,
+    source: R,
+    build: impl FnOnce(Watched<R>) -> D,
+) -> Guarded<D> {
+    let failed = Rc::new(Cell::new(None));
+    Guarded {
+        decoder: build(Watched {
+            source,
+            failed: Rc::clone(&failed),
+        }),
+        failed,
+        what,
+    }
+}
+
+/// A decoder [`guard`] watches the source of.
+pub(crate) struct Guarded<D> {
+    decoder: D,
+    /// The failure the source last returned, held for the read it ends.
+    failed: Rc<Cell<Option<io::Error>>>,
+    what: &'static str,
+}
+
+impl<D: Read> Read for Guarded<D> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.decoder.read(buf).map_err(|err| {
+            if let Some(failure) = self.failed.take() {
+                return failure;
+            }
+            if err.kind() == io::ErrorKind::Interrupted {
+                return err;
+            }
+            Refusal::mark(self.what, err)
+        })
+    }
+}
+
+/// The source of a [`Guarded`] decoder, holding aside a failure to read it.
+pub(crate) struct Watched<R> {
+    source: R,
+    failed: Rc<Cell<Option<io::Error>>>,
+}
+
+impl<R: Read> Read for Watched<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.source.read(buf).map_err(|err| {
+            if err.kind() == io::ErrorKind::Interrupted {
+                return err;
+            }
+            // The decoder is told what kind of failure it met, and the failure
+            // itself waits for the read the decoder fails in turn.
+            let stand_in = io::Error::new(err.kind(), "the stream beneath the decoder failed");
+            self.failed.set(Some(err));
+            stand_in
+        })
+    }
 }
 
 /// The four-byte zstd frame magic, little-endian.
@@ -1059,8 +1210,17 @@ mod tests {
     fn decode_one_byte_at_a_time(bytes: &[u8]) -> Result<Vec<u8>, io::Error> {
         let (_, mut reader) = decoder(OneByte(bytes))?;
         let mut out = Vec::new();
-        reader.read_to_end(&mut out)?;
+        reader.read_to_end(&mut out).map_err(refused)?;
         Ok(out)
+    }
+
+    /// The decoder's own failure, from a read whose source cannot fail: every
+    /// failure there is a refusal, and arrives marked as one.
+    fn refused(err: io::Error) -> io::Error {
+        match Refusal::of(err) {
+            Ok(refusal) => refusal.into_cause(),
+            Err(err) => panic!("a source held in memory failed: {err}"),
+        }
     }
 
     #[test]
@@ -1159,12 +1319,66 @@ mod tests {
         frame
     }
 
-    /// Fully decodes `bytes` through [`decoder`].
+    /// Fully decodes `bytes` through [`decoder`], answering a refusal with the
+    /// decoder's own failure.
     fn decode_all(bytes: &[u8]) -> Result<Vec<u8>, io::Error> {
         let (_, mut reader) = decoder(bytes)?;
         let mut out = Vec::new();
-        reader.read_to_end(&mut out)?;
+        reader.read_to_end(&mut out).map_err(refused)?;
         Ok(out)
+    }
+
+    /// A source that serves `bytes` and then fails as a reset connection does.
+    struct Reset<'a>(&'a [u8]);
+
+    impl Read for Reset<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(io::ErrorKind::ConnectionReset.into());
+            }
+            self.0.read(buf)
+        }
+    }
+
+    #[test]
+    fn a_failing_source_reaches_the_reader_as_itself() {
+        // Each decoder fails the read its source failed, and what arrives is
+        // the source's failure, unmarked: a caller that retries a transport
+        // failure has to be able to see one, and not a corrupt stream.
+        let gzip = {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&[7u8; 4096]).unwrap();
+            encoder.finish().unwrap()
+        };
+        let xz = xz_stream(Check::Crc32, &[Block::new(4096, b"payload")]);
+        let zstd = zstd_frame(&[7u8; 4096]);
+        for (codec, stream) in [("gzip", gzip), ("xz", xz), ("zstd", zstd)] {
+            // Cut short of its end, so the decoder needs a read past the cut.
+            let (_, mut reader) =
+                decoder(Reset(&stream[..stream.len() / 2])).expect("the head reads");
+            let err = reader
+                .read_to_end(&mut Vec::new())
+                .expect_err("the source fails");
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{codec}: {err}");
+            let err = Refusal::of(err).expect_err("a source's failure is not a refusal");
+            assert!(err.get_ref().is_none(), "{codec}: {err:?} is the OS's own");
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_marked_as_the_decoders() {
+        let mut corrupt = zstd_frame(b"a frame that states its checksum");
+        *corrupt.last_mut().unwrap() ^= 0x01;
+        let (_, mut reader) = decoder(&corrupt[..]).expect("the head reads");
+        let err = reader.read_to_end(&mut Vec::new()).expect_err("refused");
+        let refusal = Refusal::of(err).expect("the decoder's own refusal");
+        assert_eq!(refusal.what(), "the zstd stream does not decode");
+        assert!(
+            refusal.into_cause().to_string().contains("checksum"),
+            "the decoder's reason is the cause",
+        );
     }
 
     #[test]

@@ -432,6 +432,12 @@ pub enum ProvisionError {
         path: PathBuf,
     },
     /// A host I/O operation failed.
+    ///
+    /// That includes reading an archive: a source that fails to deliver what
+    /// it holds, a file's read error or a stream's reset connection, is this,
+    /// naming the archive, rather than [`Archive`](Self::Archive). It is the
+    /// host's failure, and a retry may succeed where one of the archive's
+    /// would not.
     #[non_exhaustive]
     Io {
         /// What the operation was doing.
@@ -442,6 +448,10 @@ pub enum ProvisionError {
         source: io::Error,
     },
     /// The archive is malformed or truncated.
+    ///
+    /// What it declares is refused, or the compression it is wrapped in does
+    /// not decode. The second carries the decoder's own failure as its
+    /// [`source`](std::error::Error::source).
     #[non_exhaustive]
     Archive {
         /// The archive offset of the offending block, in bytes of the
@@ -449,6 +459,9 @@ pub enum ProvisionError {
         offset: u64,
         /// What was wrong.
         reason: String,
+        /// The decoder's refusal of the compressed stream, where that is what
+        /// was wrong.
+        source: Option<io::Error>,
     },
     /// An archive entry attempted to reach outside the extraction root.
     ///
@@ -694,7 +707,7 @@ impl fmt::Display for ProvisionError {
             ProvisionError::Io { op, path, .. } => {
                 write!(f, "provisioning failed while {op} {path:?}")
             }
-            ProvisionError::Archive { offset, reason } => {
+            ProvisionError::Archive { offset, reason, .. } => {
                 write!(f, "malformed archive at offset {offset}: {reason}")
             }
             ProvisionError::EntryUnsafe { path, reason } => write!(
@@ -767,6 +780,10 @@ impl std::error::Error for ProvisionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ProvisionError::Io { source, .. } => Some(source),
+            ProvisionError::Archive {
+                source: Some(source),
+                ..
+            } => Some(source),
             ProvisionError::Other { source } => Some(source.as_ref()),
             ProvisionError::RemoveUnprivileged { source, .. } => Some(source),
             _ => None,

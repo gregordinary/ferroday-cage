@@ -2843,7 +2843,7 @@ fn extract_packages(
         )
         .map_err(wrap)?;
         deb::extract_deb(
-            &installable.name,
+            &path,
             &mut file,
             &mut extraction,
             &mut |entry, components| {

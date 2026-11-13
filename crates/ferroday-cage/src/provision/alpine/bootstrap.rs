@@ -1467,7 +1467,7 @@ mod tests {
         let mut archive = Vec::new();
         crate::provision::export_tar(&*staging, &mut archive, IdentityMap::Subordinate)
             .expect("the tree exports");
-        let mut reader = crate::provision::tar::TarReader::new(&archive[..]);
+        let mut reader = crate::provision::tar::TarReader::in_memory(&archive[..]);
         let mut owners = HashMap::new();
         while let Some(entry) = reader.next_entry().expect("the archive reads") {
             owners.insert(entry.path.clone(), (entry.uid, entry.gid, entry.mode));

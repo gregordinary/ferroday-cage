@@ -784,6 +784,88 @@ fn truncation_is_reported_as_malformed() {
 }
 
 #[test]
+fn a_stream_that_fails_is_the_hosts_failure_wherever_it_fails() {
+    // A source that stops delivering, a reset connection under a streamed
+    // download, is not a malformed archive: a caller that retries a transport
+    // failure has to be able to tell the two apart. Where the failure comes
+    // makes no difference, in the leading bytes the compression is read from
+    // or in a later read, and neither does whether the stream is compressed.
+    use std::io::{Read, Write};
+
+    /// Serves its bytes, then fails as a reset connection does.
+    struct Resetting(std::io::Cursor<Vec<u8>>);
+
+    impl Read for Resetting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::ErrorKind::ConnectionReset.into()),
+                read => Ok(read),
+            }
+        }
+    }
+
+    let mut tar = archive();
+    tar.file("f", 0o644, &[b'x'; 8192]);
+    let plain = tar.finish();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&plain).unwrap();
+    let gz = gz.finish().unwrap();
+
+    let dir = common::scratch_dir("extract-failing-stream");
+    for (name, bytes, cut) in [
+        ("plain-first", &plain, 0),
+        ("plain-later", &plain, 2048),
+        ("gz-first", &gz, 0),
+        ("gz-later", &gz, gz.len() / 2),
+    ] {
+        let dest = dir.join(name);
+        let source = Resetting(std::io::Cursor::new(bytes[..cut].to_vec()));
+        match ensure(&dest, &mut Tarball::from_reader(source)) {
+            Err(ProvisionError::Io { path, source, .. }) => {
+                assert_eq!(path, Path::new("<reader>"), "{name}");
+                assert_eq!(source.kind(), std::io::ErrorKind::ConnectionReset, "{name}");
+            }
+            other => panic!("{name}: expected the host's failure, got {other:?}"),
+        }
+        assert!(!dest.exists(), "{name}: nothing is published");
+    }
+}
+
+#[test]
+fn a_compressed_stream_its_decoder_refuses_carries_the_decoders_reason() {
+    use std::error::Error as _;
+    use std::io::Write;
+
+    let mut tar = archive();
+    tar.file("f", 0o644, &[b'x'; 8192]);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&tar.finish()).unwrap();
+    let mut gz = gz.finish().unwrap();
+    // The deflate data begins after the ten-byte header; a run of ones there
+    // is a block the decoder refuses.
+    gz[12..20].fill(0xff);
+    let err = provision_err("extract-undecodable-gzip", &gz);
+    assert!(
+        matches!(
+            &err,
+            ProvisionError::Archive {
+                source: Some(_),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("the gzip stream does not decode"),
+        "{err}"
+    );
+    assert!(
+        err.source().is_some(),
+        "the decoder's own failure is the cause"
+    );
+}
+
+#[test]
 fn sparse_entries_are_unsupported() {
     let mut tar = archive();
     tar.header(b"sparse-file", b'S', 0o644, 0, 0, b"");

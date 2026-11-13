@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::extract::{Placement, extract_archive};
-use super::tar::TarReader;
+use super::tar::{self, TarReader};
 use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, compress};
 
 /// How often the byte counter reports progress: once per mebibyte consumed.
@@ -60,6 +60,12 @@ enum Source {
 /// [`ProvisionError::Archive`] instead, naming what is wrong with it. A
 /// *missing final terminator* is tolerated, as GNU tar tolerates it, but only
 /// once at least one entry has been read.
+///
+/// A source that fails to deliver what it holds, a file that cannot be read or
+/// a stream whose connection resets, is [`ProvisionError::Io`] naming the
+/// archive, wherever in the stream the failure comes. A compressed stream its
+/// decoder refuses is [`ProvisionError::Archive`], with the decoder's own
+/// failure as its cause.
 ///
 /// A compressed stream is read to its end, past the archive's end-of-archive
 /// marker, so the integrity check each format carries is compared for every
@@ -251,10 +257,10 @@ impl Provisioner for Tarball {
 
         // The compression is named by the stream's leading bytes, never by a
         // file name.
-        let (_, decoded) = compress::decoder(source)
-            .map_err(|err| ProvisionError::io("reading", &subject, err))?;
+        let (_, decoded) =
+            compress::decoder(source).map_err(|err| tar::read_failure(&subject, 0, err))?;
 
-        let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded));
+        let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded), &subject);
         let outcome = extract_archive(&mut archive, request.staging(), &mut |_, components| {
             // An entry boundary: what has been written is complete, and
             // `ensure` discards the staging tree wholesale, so stopping here

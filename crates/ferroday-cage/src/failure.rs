@@ -313,6 +313,11 @@ mod tests {
                 "/srv/rootfs.tar",
                 os_error(),
             ))),
+            Box::new(ProvisionError::Archive {
+                offset: 512,
+                reason: "the gzip stream does not decode".to_string(),
+                source: Some(os_error()),
+            }),
             Box::new(ProvisionError::RemoveUnprivileged {
                 path: PathBuf::from("/srv/rootfs"),
                 source: os_error(),

@@ -561,9 +561,13 @@ pub(super) fn read_package<R: Read>(
 /// already been digested, so neither the tee nor the boundary bookkeeping
 /// [`Segments`] exists for is needed here — only the discipline that makes this
 /// *one* member rather than however many follow it, which is why this is not
-/// `compress::decoder`.
-pub(super) fn data_reader<R: Read>(inner: R) -> GzDecoder<BufReader<R>> {
-    GzDecoder::new(BufReader::new(inner))
+/// `compress::decoder`. The decoder is guarded as that one's are, so a refusal
+/// of the segment and a failure to read the file reach the tar reader as the
+/// two different failures they are.
+pub(super) fn data_reader<R: Read>(inner: R) -> impl Read {
+    crate::provision::compress::guard("the data segment does not decode", inner, |inner| {
+        GzDecoder::new(BufReader::new(inner))
+    })
 }
 
 /// Reads every member of a decompressed metadata segment into memory.
@@ -586,7 +590,7 @@ pub(super) fn members(subject: &str, segment: &[u8]) -> Result<Vec<Member>, Alpi
 /// so no member can hold more than the whole does. That is the ceiling each is
 /// read under: a header announcing more is refused before it is read.
 pub(super) fn read_members(tar: &[u8]) -> Result<Vec<Member>, ProvisionError> {
-    let mut reader = TarReader::new(tar);
+    let mut reader = TarReader::in_memory(tar);
     let mut members = Vec::new();
     while let Some(entry) = reader.next_entry()? {
         let name = String::from_utf8_lossy(&entry.path).into_owned();

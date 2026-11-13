@@ -1195,7 +1195,7 @@ mod tests {
 
         // Read back through this crate's own tar reader, which is the reader
         // apk's is symmetric with.
-        let mut reader = crate::provision::tar::TarReader::new(&archive[..]);
+        let mut reader = crate::provision::tar::TarReader::in_memory(&archive[..]);
         let mut names = Vec::new();
         while let Some(entry) = reader.next_entry().expect("the archive parses") {
             assert_eq!(entry.mode, 0o755, "a script is executable");

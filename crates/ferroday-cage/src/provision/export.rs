@@ -1234,7 +1234,7 @@ mod tests {
             tar.leave_dir();
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         let dir = reader.next_entry().unwrap().unwrap();
         assert_eq!(dir.path, b"etc/");
         assert_eq!(dir.typeflag, b'5');
@@ -1264,7 +1264,7 @@ mod tests {
             tar.file(&g, &mut &b""[..]).unwrap();
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         let file = reader.next_entry().unwrap().unwrap();
         assert_eq!((file.uid, file.gid), (large, u32::MAX));
         let within = reader.next_entry().unwrap().unwrap();
@@ -1287,7 +1287,7 @@ mod tests {
             tar.symlink(&m).unwrap();
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         let link = reader.next_entry().unwrap().unwrap();
         assert_eq!(link.path, b"sh");
         assert_eq!(link.typeflag, b'2');
@@ -1313,7 +1313,7 @@ mod tests {
             tar.file(&b, &mut &b"abc"[..]).unwrap();
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         let first = reader.next_entry().unwrap().unwrap();
         assert_eq!(first.path, b"a");
         assert_eq!(first.typeflag, b'0');
@@ -1338,7 +1338,7 @@ mod tests {
                 .unwrap();
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         let entry = reader.next_entry().unwrap().unwrap();
         assert_eq!(entry.path, long.as_bytes());
     }
@@ -1388,7 +1388,7 @@ mod tests {
                 tar.file(&f, &mut &b""[..]).unwrap();
                 tar.finish().unwrap();
             }
-            TarReader::new(&buf[..])
+            TarReader::in_memory(&buf[..])
                 .next_entry()
                 .unwrap()
                 .unwrap()
@@ -1415,7 +1415,7 @@ mod tests {
                 tar.file(&f, &mut &b""[..]).unwrap();
                 tar.finish().unwrap();
             }
-            TarReader::new(&buf[..])
+            TarReader::in_memory(&buf[..])
                 .next_entry()
                 .unwrap()
                 .unwrap()
@@ -1507,7 +1507,7 @@ mod tests {
             tar.leave_dir();
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/");
         let file = reader.next_entry().unwrap().unwrap();
         assert_eq!(file.path, b"etc/hostname");
@@ -1554,7 +1554,7 @@ mod tests {
             ["/var", "/var/cache", "/var/lib"],
             "descendants of an excluded directory must not be offered"
         );
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         let paths: Vec<Vec<u8>> = std::iter::from_fn(|| reader.next_entry().unwrap())
             .map(|e| e.path)
             .collect();
@@ -1580,7 +1580,7 @@ mod tests {
             }
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         let first = reader.next_entry().unwrap().unwrap();
         assert_eq!(first.path, b"b");
         assert_eq!(first.typeflag, b'0', "the first kept name carries the data");
@@ -1677,7 +1677,7 @@ mod tests {
             tar.leave_dir();
             tar.finish().unwrap();
         }
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/");
         assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/hostname");
         assert!(reader.next_entry().unwrap().is_none());
@@ -1706,7 +1706,7 @@ mod tests {
             tar.finish().unwrap();
         }
         assert_eq!(*seen.lock().unwrap(), ["/", "/etc"]);
-        let mut reader = TarReader::new(&buf[..]);
+        let mut reader = TarReader::in_memory(&buf[..]);
         assert_eq!(reader.next_entry().unwrap().unwrap().path, b"./");
         assert_eq!(reader.next_entry().unwrap().unwrap().path, b"./etc/");
     }
@@ -1729,7 +1729,12 @@ mod tests {
             tar.leave_dir();
             tar.finish().unwrap();
         }
-        assert!(TarReader::new(&buf[..]).next_entry().unwrap().is_none());
+        assert!(
+            TarReader::in_memory(&buf[..])
+                .next_entry()
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A metadata frame for a regular file named `name` holding `data`,

@@ -478,6 +478,13 @@ consumer upgrading can skip it.
   meet, where nothing else answers it, fails the resolution with
   `AlpineError::Pin` and `UnheldReason::Requirement`, naming the requirement, as
   the Debian layer reports it. It failed with `AlpineError::Resolve`.
+- **Breaking.** A failure to read an archive's source, a file's read error or a
+  streamed body's reset connection, is `ProvisionError::Io` naming the archive,
+  wherever in the stream it comes. Past the stream's first bytes it was
+  `ProvisionError::Archive`, the OS error flattened into its reason. A
+  compressed stream its decoder refuses is still `ProvisionError::Archive`, and
+  carries the decoder's own failure as its `source`, in the variant's new
+  `source` field.
 
 ### Fixed
 

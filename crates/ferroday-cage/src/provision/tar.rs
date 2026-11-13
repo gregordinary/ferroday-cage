@@ -22,10 +22,12 @@
 //! produces: an upstream release tarball was produced by whoever released the
 //! software, on whatever machine, in whatever year.
 
+use std::fmt;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use super::ProvisionError;
-use super::compress::read_fully;
+use super::compress::{Refusal, read_fully};
 
 /// The size of a tar block, and of a tar header.
 pub(crate) const BLOCK: u64 = 512;
@@ -191,8 +193,16 @@ impl HeaderFlaw {
 }
 
 /// A streaming tar reader over any byte source.
+///
+/// A read of the source that fails is reported as what it is
+/// ([`read_failure`]): the source failing, an OS error or a transport's, as
+/// [`ProvisionError::Io`] naming the archive, and a decoder beneath refusing
+/// the stream as [`ProvisionError::Archive`] with the decoder's failure as its
+/// cause. Every other failure is the archive's, a refusal of what it declares.
 pub(crate) struct TarReader<R: Read> {
     inner: R,
+    /// The archive, as a failure to read it names it.
+    path: PathBuf,
     /// Whether the stream turned out not to be a tar archive at all. Read by
     /// [`not_a_tar`](Self::not_a_tar).
     not_a_tar: bool,
@@ -206,10 +216,25 @@ pub(crate) struct TarReader<R: Read> {
     finished: bool,
 }
 
+impl<'a> TarReader<&'a [u8]> {
+    /// A reader over an archive held in memory.
+    ///
+    /// No read of a slice fails, so nothing names the archive.
+    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+    pub(crate) fn in_memory(archive: &'a [u8]) -> Self {
+        TarReader::new(archive, PathBuf::new())
+    }
+}
+
 impl<R: Read> TarReader<R> {
-    pub fn new(inner: R) -> Self {
+    /// A reader over `inner`, which holds the archive at `path`.
+    ///
+    /// `path` is what a failure to read `inner` names: the file, or, for a
+    /// stream that has none, what the caller calls it.
+    pub(crate) fn new(inner: R, path: impl Into<PathBuf>) -> Self {
         TarReader {
             inner,
+            path: path.into(),
             not_a_tar: false,
             offset: 0,
             data_remaining: 0,
@@ -231,11 +256,11 @@ impl<R: Read> TarReader<R> {
     /// Every other failure keeps its own reason, however early it came. A first
     /// block carrying the magic with a checksum that does not match is a
     /// corrupt tar header, and one the reader refuses for what it declares is a
-    /// malformed archive. A read that *failed* is the reader underneath: a
-    /// decompressor, whose refusal (a dictionary over the bound, a truncated
-    /// stream, a frame it will not decode) is a diagnostic with a reason in it.
-    /// Calling any of these "not a tar archive" would replace the reason with a
-    /// guess about the format.
+    /// malformed archive. A read that *failed* is the reader underneath: the
+    /// source, or a decompressor whose refusal (a dictionary over the bound, a
+    /// truncated stream, a frame it will not decode) is a diagnostic with a
+    /// reason in it. Calling any of these "not a tar archive" would replace the
+    /// reason with a guess about the format.
     pub fn not_a_tar(&self) -> bool {
         self.not_a_tar
     }
@@ -446,15 +471,7 @@ impl<R: Read> TarReader<R> {
         let want = buf
             .len()
             .min(usize::try_from(self.data_remaining).unwrap_or(usize::MAX));
-        let got = match read_fully(&mut self.inner, &mut buf[..want]) {
-            Ok(got) => got,
-            Err(err) => {
-                return Err(malformed(
-                    self.offset,
-                    &format!("cannot read entry data: {err}"),
-                ));
-            }
-        };
+        let got = read_fully(&mut self.inner, &mut buf[..want]).map_err(|err| self.failure(err))?;
         self.offset += got as u64;
         self.data_remaining -= got as u64;
         if got < want {
@@ -494,15 +511,8 @@ impl<R: Read> TarReader<R> {
             let want = scratch
                 .len()
                 .min(usize::try_from(skip).unwrap_or(usize::MAX));
-            let got = match read_fully(&mut self.inner, &mut scratch[..want]) {
-                Ok(got) => got,
-                Err(err) => {
-                    return Err(malformed(
-                        self.offset,
-                        &format!("cannot read the archive: {err}"),
-                    ));
-                }
-            };
+            let got = read_fully(&mut self.inner, &mut scratch[..want])
+                .map_err(|err| self.failure(err))?;
             self.offset += got as u64;
             if got < want {
                 return Err(malformed(self.offset, "the archive ends inside an entry"));
@@ -516,15 +526,7 @@ impl<R: Read> TarReader<R> {
     /// boundary; a partial block is an error.
     fn read_block(&mut self, block: &mut [u8; BLOCK as usize]) -> Result<bool, ProvisionError> {
         let first = self.offset == 0;
-        let filled = match read_fully(&mut self.inner, block) {
-            Ok(filled) => filled,
-            Err(err) => {
-                return Err(malformed(
-                    self.offset,
-                    &format!("cannot read the archive: {err}"),
-                ));
-            }
-        };
+        let filled = read_fully(&mut self.inner, block).map_err(|err| self.failure(err))?;
         self.offset += filled as u64;
         match filled {
             0 => Ok(false),
@@ -568,12 +570,7 @@ impl<R: Read> TarReader<R> {
                 Ok(0) => return Ok(()),
                 Ok(got) => got as u64,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => {
-                    return Err(malformed(
-                        self.offset,
-                        &format!("cannot read the stream past the archive's end: {err}"),
-                    ));
-                }
+                Err(err) => return Err(self.failure(err)),
             };
             self.offset += got;
             remaining = remaining.checked_sub(got).ok_or_else(|| {
@@ -627,6 +624,77 @@ impl<R: Read> TarReader<R> {
         self.drain_current()?;
         Ok(data)
     }
+
+    /// `err`, a failed read of the source, as this archive reports it.
+    fn failure(&self, err: io::Error) -> ProvisionError {
+        read_failure(&self.path, self.offset, err)
+    }
+}
+
+/// A failed read beneath the archive at `path`, `offset` bytes into it, as the
+/// failure it is.
+///
+/// A decoder's [`Refusal`] is the archive's: [`ProvisionError::Archive`], the
+/// decoder's own failure its cause. A failure [`into_io`] carried through a
+/// `Read` is the reader's that failed, returned as it was. Anything else is the
+/// source failing to deliver what it holds, an OS error or a transport's, and
+/// is [`ProvisionError::Io`] naming the archive: a caller that retries such a
+/// failure can tell it from a malformed archive, which a retry will not mend.
+pub(crate) fn read_failure(path: &Path, offset: u64, err: io::Error) -> ProvisionError {
+    if err.get_ref().is_some_and(|inner| inner.is::<Carried>()) {
+        let carried = err
+            .into_inner()
+            .expect("a carried error carries its failure");
+        return carried
+            .downcast::<Carried>()
+            .expect("the carried failure was checked for")
+            .0;
+    }
+    match Refusal::of(err) {
+        Ok(refusal) => ProvisionError::Archive {
+            offset,
+            reason: refusal.what().to_string(),
+            source: Some(refusal.into_cause()),
+        },
+        Err(err) => ProvisionError::io("reading", path, err),
+    }
+}
+
+/// `err`, a failure of a [`TarReader`], as the `io::Error` a `Read` over an
+/// entry's data returns, so a reader of that data reports it as
+/// [`read_failure`] does.
+///
+/// An OS failure is returned as the OS returned it, which is what a reader above
+/// takes it for; it names the archive again by its own path, the archive that
+/// holds the entry. Any other failure is carried whole, and a reader above
+/// returns it as it stands rather than as a failure of its own.
+#[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+pub(crate) fn into_io(err: ProvisionError) -> io::Error {
+    match err {
+        ProvisionError::Io { source, .. } => source,
+        other => io::Error::new(io::ErrorKind::InvalidData, Carried(other)),
+    }
+}
+
+/// A [`TarReader`]'s failure carried through `Read` by [`into_io`].
+///
+/// [`read_failure`] unwraps one, so this is rendered only where a carried
+/// failure reaches something other than a reader of the archive, as the layer
+/// above the reader's own failure.
+#[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+#[derive(Debug)]
+struct Carried(ProvisionError);
+
+impl fmt::Display for Carried {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the archive the data is read from failed")
+    }
+}
+
+impl std::error::Error for Carried {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
 }
 
 /// The most [`TarReader::read_entry`] reserves before an entry's data arrives.
@@ -635,11 +703,13 @@ impl<R: Read> TarReader<R> {
 /// real ones in one allocation, and a larger one grows past it as it is read.
 const RESERVE: usize = 64 * 1024;
 
-/// Builds [`ProvisionError::Archive`].
+/// Builds [`ProvisionError::Archive`] for a refusal of what the archive
+/// declares, which nothing beneath it caused.
 fn malformed(offset: u64, reason: &str) -> ProvisionError {
     ProvisionError::Archive {
         offset,
         reason: reason.to_string(),
+        source: None,
     }
 }
 
@@ -1243,7 +1313,7 @@ mod tests {
         archive.entry("PaxHeaders/next", b'x', 0o644, 0, 0, "", record.as_bytes());
         archive.entry("next", b'0', 0o644, 0, 0, "", b"y");
         let tar = archive.finish();
-        let mut reader = TarReader::new(&tar[..]);
+        let mut reader = TarReader::in_memory(&tar[..]);
         let helper = reader.next_entry().unwrap().expect("an entry");
         assert_eq!(
             (&helper.uname[..], &helper.gname[..], helper.gid),
@@ -1256,7 +1326,7 @@ mod tests {
         let mut v7 = ferroday_cage_testkit::tar::Tar::new().v7();
         v7.file("old", 0o644, b"z");
         let tar = v7.finish();
-        let old = TarReader::new(&tar[..])
+        let old = TarReader::in_memory(&tar[..])
             .next_entry()
             .unwrap()
             .expect("an entry");
@@ -1464,7 +1534,7 @@ mod tests {
         archive.extend_from_slice(&sized_header(b"after.txt", 0, b'0'));
         archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
 
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         let entry = reader.next_entry().unwrap().expect("the long-named entry");
         assert_eq!(entry.path, long_name.as_bytes());
         assert_eq!(entry.typeflag, b'0', "a regular file, not a directory");
@@ -1497,7 +1567,7 @@ mod tests {
         archive.extend_from_slice(&sized_header(b"after.txt", 0, b'0'));
         archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
 
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         let err = reader
             .next_entry()
             .expect_err("the entry contradicts itself");
@@ -1512,7 +1582,7 @@ mod tests {
         let mut plain = Vec::new();
         plain.extend_from_slice(&sized_header(b"dir/", 0, b'0'));
         plain.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let entry = TarReader::new(&plain[..])
+        let entry = TarReader::in_memory(&plain[..])
             .next_entry()
             .unwrap()
             .expect("the directory entry");
@@ -1584,6 +1654,15 @@ mod tests {
         out
     }
 
+    /// A source that fails every read with `err`.
+    struct Failing(fn() -> std::io::Error);
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err((self.0)())
+        }
+    }
+
     #[test]
     fn a_reader_that_fails_is_not_a_file_of_another_format() {
         // The reader under the parser is a decompressor, and its refusals carry
@@ -1591,20 +1670,33 @@ mod tests {
         // Reported as "not a tar archive" those reasons are gone, replaced by a
         // guess about the format, and the guard that produced them exists for
         // nothing.
-        struct Refusing;
-        impl Read for Refusing {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the dictionary is larger than the bound",
-                ))
-            }
-        }
-        let mut reader = TarReader::new(Refusing);
-        let err = reader.next_entry().expect_err("the reader refuses");
+        let mut reader = TarReader::new(
+            Failing(|| {
+                Refusal::mark(
+                    "the xz stream does not decode",
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "the dictionary is larger than the bound",
+                    ),
+                )
+            }),
+            "/srv/rootfs.tar.xz",
+        );
+        let err = reader.next_entry().expect_err("the decoder refuses");
         assert!(
-            err.to_string().contains("larger than the bound"),
-            "{err}, expected the reader's own reason",
+            matches!(
+                &err,
+                ProvisionError::Archive {
+                    source: Some(_),
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+        assert_eq!(
+            crate::ErrorChain::new(&err).to_string(),
+            "malformed archive at offset 0: the xz stream does not decode: the dictionary is \
+             larger than the bound",
         );
         assert!(
             !reader.not_a_tar(),
@@ -1613,12 +1705,67 @@ mod tests {
 
         // What the classification is for: bytes that arrived and are not a tar
         // header, however few of them there were.
-        let mut reader = TarReader::new(&b"not a tar archive at all"[..]);
+        let mut reader = TarReader::in_memory(&b"not a tar archive at all"[..]);
         assert!(reader.next_entry().is_err());
         assert!(reader.not_a_tar());
-        let mut reader = TarReader::new(&[b'X'; BLOCK as usize][..]);
+        let mut reader = TarReader::in_memory(&[b'X'; BLOCK as usize][..]);
         assert!(reader.next_entry().is_err());
         assert!(reader.not_a_tar());
+    }
+
+    #[test]
+    fn a_source_that_fails_is_the_hosts_failure_naming_the_archive() {
+        // A read the source itself failed, a file's error or a stream's reset,
+        // is no refusal of the archive: a caller that retries a transport
+        // failure has to be able to see one. It names the archive, and the
+        // OS's failure is its cause, whether it comes at the first block or
+        // part way through an entry.
+        let reset = || std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let mut reader = TarReader::new(Failing(reset), "/srv/rootfs.tar");
+        let err = reader.next_entry().expect_err("the source fails");
+        assert!(!reader.not_a_tar());
+
+        let archive = one_file(3000, &[b'x'; 3000]);
+        let mut reader =
+            TarReader::new((&archive[..1024]).chain(Failing(reset)), "/srv/rootfs.tar");
+        reader
+            .next_entry()
+            .unwrap()
+            .expect("the first header reads");
+        let later = reader
+            .read_entry(1 << 20)
+            .expect_err("the source fails inside the entry");
+
+        for err in [err, later] {
+            match &err {
+                ProvisionError::Io { path, source, .. } => {
+                    assert_eq!(path, Path::new("/srv/rootfs.tar"));
+                    assert_eq!(source.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+                other => panic!("expected the host's failure, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failure_carried_through_a_read_returns_as_it_was() {
+        // A member of one archive read as the source of another: the outer
+        // reader's refusal is the outer archive's, and a reader above reports it
+        // as such rather than as a source of its own that failed.
+        let outer = || {
+            into_io(ProvisionError::Archive {
+                offset: 9216,
+                reason: "the archive ends inside an entry's data".to_string(),
+                source: None,
+            })
+        };
+        let err = TarReader::new(Failing(outer), "/srv/package.gpkg.tar")
+            .next_entry()
+            .expect_err("the outer archive fails");
+        assert!(
+            matches!(err, ProvisionError::Archive { offset: 9216, .. }),
+            "{err:?}",
+        );
     }
 
     #[test]
@@ -1629,7 +1776,7 @@ mod tests {
         let mut corrupt = ustar_header(b"file.txt", b"").to_vec();
         corrupt[0] = b'X';
         corrupt.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let mut reader = TarReader::new(&corrupt[..]);
+        let mut reader = TarReader::in_memory(&corrupt[..]);
         let err = reader
             .next_entry()
             .expect_err("the checksum does not match");
@@ -1645,7 +1792,7 @@ mod tests {
         let mut contradictory = sized_header(b"dir/", 512, b'0').to_vec();
         contradictory.extend_from_slice(&[b'x'; BLOCK as usize]);
         contradictory.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let mut reader = TarReader::new(&contradictory[..]);
+        let mut reader = TarReader::in_memory(&contradictory[..]);
         reader
             .next_entry()
             .expect_err("the entry contradicts itself");
@@ -1669,7 +1816,7 @@ mod tests {
         archive.extend_from_slice(&data);
         archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
 
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         let entry = reader.next_entry().unwrap().expect("the file entry");
         assert_eq!(
             entry.path,
@@ -1702,7 +1849,7 @@ mod tests {
         // applied to it would take a truncated regular file for a directory.
         let mut archive = v7_header(b"olddir/").to_vec();
         archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         let entry = reader.next_entry().unwrap().expect("the directory");
         assert_eq!(entry.typeflag, b'5');
     }
@@ -1734,7 +1881,7 @@ mod tests {
         // complete archive of nothing -- which a publication then publishes as
         // a finished, empty rootfs that every later run trusts without
         // reconsulting the source.
-        let mut reader = TarReader::new(&b""[..]);
+        let mut reader = TarReader::in_memory(&b""[..]);
         let err = reader
             .next_entry()
             .expect_err("an empty stream is no archive");
@@ -1750,7 +1897,7 @@ mod tests {
         // writes, and it is a valid archive of nothing -- the case the rejection
         // above must not take with it.
         let archive = [0u8; 2 * BLOCK as usize];
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         assert!(reader.next_entry().unwrap().is_none());
     }
 
@@ -1759,7 +1906,7 @@ mod tests {
         // GNU tar tolerates a truncated two-block terminator and so does this
         // reader, once at least one header has been consumed.
         let archive = v7_header(b"file.txt").to_vec();
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         let entry = reader.next_entry().unwrap().expect("the file");
         assert_eq!(entry.path, b"file.txt");
         assert!(reader.next_entry().unwrap().is_none());
@@ -1783,7 +1930,7 @@ mod tests {
                 if terminated {
                     archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
                 }
-                let err = TarReader::new(&archive[..])
+                let err = TarReader::in_memory(&archive[..])
                     .next_entry()
                     .expect_err("metadata describing nothing is refused");
                 assert!(
@@ -1811,14 +1958,14 @@ mod tests {
         // At the ceiling exactly, the entry is the whole of it, and the reader
         // goes on to the next entry from where it ends.
         let archive = one_file(body.len() as u64, &body);
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         reader.next_entry().unwrap().expect("the file");
         assert_eq!(reader.read_entry(body.len() as u64).unwrap(), body);
         assert!(reader.next_entry().unwrap().is_none());
 
         // One byte under it, the entry is refused on its declared length rather
         // than read as far as the ceiling and handed back cut short.
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         reader.next_entry().unwrap().expect("the file");
         let err = reader
             .read_entry(body.len() as u64 - 1)
@@ -1837,7 +1984,7 @@ mod tests {
         // entry or nothing.
         let mut archive = sized_header(b"entry", 1 << 20, b'0').to_vec();
         archive.extend_from_slice(&[b'x'; 700]);
-        let mut reader = TarReader::new(&archive[..]);
+        let mut reader = TarReader::in_memory(&archive[..]);
         reader.next_entry().unwrap().expect("the file");
         let err = reader
             .read_entry(1 << 30)
@@ -1881,10 +2028,13 @@ mod tests {
         archive.resize(archive.len().next_multiple_of(BLOCK as usize), 0);
         archive.extend_from_slice(&terminator);
 
-        let mut reader = TarReader::new(Interrupting {
-            inner: &archive[..],
-            interrupt: false,
-        });
+        let mut reader = TarReader::new(
+            Interrupting {
+                inner: &archive[..],
+                interrupt: false,
+            },
+            "archive.tar",
+        );
         reader.next_entry().unwrap().expect("the first file");
         let mut read = Vec::new();
         let mut chunk = [0u8; 1000];
@@ -1915,7 +2065,7 @@ mod tests {
         // read every whole-entry reader in the crate goes through.
         let mut archive = sized_header(b"././@LongLink", METADATA_LIMIT + 1, b'L').to_vec();
         archive.extend_from_slice(&[0u8; BLOCK as usize]);
-        let err = TarReader::new(&archive[..])
+        let err = TarReader::in_memory(&archive[..])
             .next_entry()
             .expect_err("a long name past the ceiling is refused");
         assert!(err.to_string().contains("more than the"), "{err}");

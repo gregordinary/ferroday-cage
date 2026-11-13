@@ -105,7 +105,7 @@ use crate::path;
 use crate::provision::compress;
 use crate::provision::digest::{self, Algorithm, Digest};
 use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
-use crate::provision::tar::TarReader;
+use crate::provision::tar::{self, TarReader};
 
 /// The member every container must carry, and the marker that says which format
 /// it is.
@@ -322,7 +322,7 @@ impl Package {
     pub(super) fn image(&self, path: &Path) -> Result<TarReader<Box<dyn Read + '_>>, GentooError> {
         let mut file = &self.container;
         io::Seek::rewind(&mut file).map_err(GentooError::at("rewinding the container", path))?;
-        let mut archive = TarReader::new(io::BufReader::new(file));
+        let mut archive = TarReader::new(io::BufReader::new(file), path);
         while let Some(entry) = archive
             .next_entry()
             .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?
@@ -340,9 +340,11 @@ impl Package {
             };
             // As in the first pass, a failure under the member is the tar
             // reader's, and says the container is cut short or unreadable.
-            let (_, inner) = compress::decoder(member)
-                .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
-            return Ok(TarReader::new(inner));
+            let (_, inner) = compress::decoder(member).map_err(|err| {
+                let err = tar::read_failure(path, 0, err);
+                GentooError::container(path, ErrorChain::new(&err).to_string())
+            })?;
+            return Ok(TarReader::new(inner, path));
         }
         Err(GentooError::container(
             path,
@@ -400,7 +402,7 @@ const MAX_ENTRIES: usize = 16;
 /// 78 says a conforming writer may mismatch it, so what it is used for is
 /// stripping, and what a member *is* comes from its own name below the prefix.
 fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
-    let mut archive = TarReader::new(io::BufReader::new(file));
+    let mut archive = TarReader::new(io::BufReader::new(file), path);
     let mut scan = Scan {
         members: BTreeMap::new(),
         manifest: Vec::new(),
@@ -572,7 +574,9 @@ fn split_member(path: &[u8]) -> Option<(&[u8], &[u8])> {
 ///
 /// The tar reader yields a member's bytes through `read_data` and skips the
 /// rest at the next entry, so this is what lets a digest and a decompressor see
-/// one member as an ordinary stream.
+/// one member as an ordinary stream. A failure of the reader is carried through
+/// [`tar::into_io`], so a tar reader over a member reports the container's
+/// failure as the container's.
 struct Member<R: Read> {
     archive: TarReader<R>,
     left: u64,
@@ -589,7 +593,7 @@ impl<R: Read> Read for Member<R> {
         let got = self
             .archive
             .read_data(&mut buf[..want])
-            .map_err(io::Error::other)?;
+            .map_err(tar::into_io)?;
         self.left -= got as u64;
         Ok(got)
     }
@@ -716,7 +720,7 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
     let mut files = BTreeMap::new();
     let (_, inner) = compress::decoder(scan.metadata.as_slice())
         .map_err(|err| GentooError::container(path, ErrorChain::new(&err).to_string()))?;
-    let mut inner = TarReader::new(inner);
+    let mut inner = TarReader::new(inner, path);
     // What the entries may hold between them, which is what each is read
     // under: the metadata is one budget, however the archive divides it. An
     // entry the layer does not keep is read under it too, since decompressing
