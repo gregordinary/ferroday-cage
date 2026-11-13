@@ -55,9 +55,9 @@ use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
-use super::bounds::{DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_SIZE_MAX};
+use super::bounds::{LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_SIZE_MAX};
 use super::child::MapFailure;
-use super::frame;
+use super::frame::{self, StreamFailure};
 use super::sys::{self, PidfdFork};
 use super::{ChildMap, Forked};
 use crate::idmap::IdMapError;
@@ -624,42 +624,22 @@ impl Walker<'_> {
     /// Streams exactly `size` bytes of a file's data, then the status byte
     /// saying whether the file still held exactly that many.
     ///
-    /// A file that reads short — a race against a live writer, which a
-    /// quiesced rootfs is not — is zero-padded to the declared size, and one
-    /// that grew is cut at it, so the parent's framing stays in step either
-    /// way. The status is what keeps the parent from calling the result an
-    /// archive of the file: it reports the change for an entry it keeps, as a
-    /// copy into a rootfs does. One byte read past the declared size is how a
-    /// grown file is noticed; nothing of it is sent.
+    /// [`frame::stream_exact`] keeps the parent's framing in step with a file
+    /// that a live writer grew or shrank, which a quiesced rootfs does not.
+    /// The status is what keeps the parent from calling the result an archive
+    /// of the file: it reports the change for an entry it keeps, as a copy into
+    /// a rootfs does.
     ///
     /// A sparse file's holes read as zeros and are streamed as data. Nothing
     /// here bounds a file's length, so the bound on an archive is its sink's,
     /// as the `Export` documentation says.
     fn stream_data(&self, fd: BorrowedFd<'_>, size: u64) -> Result<(), (ExportStep, Errno)> {
-        let stream = self.stream;
-        let mut buf = [0u8; DATA_BUF];
-        let mut remaining = size;
-        let read = |buf: &mut [u8]| {
-            frame::retry_on_intr!(rustix::io::read(fd, &mut *buf))
-                .map_err(|e| (ExportStep::ReadData, e))
-        };
-        while remaining > 0 {
-            let want = remaining.min(DATA_BUF as u64) as usize;
-            let got = read(&mut buf[..want])?;
-            if got == 0 {
-                break;
-            }
-            put(stream, &buf[..got])?;
-            remaining -= got as u64;
-        }
-        let changed = remaining > 0 || read(&mut buf[..1])? != 0;
-        let zeros = [0u8; DATA_BUF];
-        while remaining > 0 {
-            let want = remaining.min(DATA_BUF as u64) as usize;
-            put(stream, &zeros[..want])?;
-            remaining -= want as u64;
-        }
-        put(stream, &[u8::from(changed)])
+        let changed =
+            frame::stream_exact(fd, self.stream, size).map_err(|failure| match failure {
+                StreamFailure::File(errno) => (ExportStep::ReadData, errno),
+                StreamFailure::Stream(errno) => (ExportStep::Stream, errno),
+            })?;
+        put(self.stream, &[u8::from(changed)])
     }
 }
 

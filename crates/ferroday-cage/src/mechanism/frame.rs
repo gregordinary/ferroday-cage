@@ -1,10 +1,10 @@
 //! The framed byte protocol the helper children speak.
 //!
 //! The copy-in and export children each hold one conversation with the caller
-//! over a pipe: little-endian scalars, `u16`-length-prefixed byte strings, and
-//! tag bytes. Producer and consumer of each are in different modules — one runs
-//! post-fork, one on the host — so the primitives live here and both ends read
-//! them from one place.
+//! over a pipe: little-endian scalars, `u16`-length-prefixed byte strings, tag
+//! bytes, and the bytes of a file. Producer and consumer of each are in
+//! different modules — one runs post-fork, one on the host — so the primitives
+//! live here and both ends read them from one place.
 //!
 //! Everything here returns [`Errno`] and nothing here names a step. The step
 //! vocabulary belongs to the caller, which adds it at the edge:
@@ -35,6 +35,8 @@ use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
 };
+
+use super::bounds::DATA_BUF;
 
 /// Writes `data` in full, looping over short writes and retrying `EINTR`.
 ///
@@ -109,6 +111,84 @@ pub(crate) fn read_full_or_short(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<u
         }
     }
     Ok(read)
+}
+
+/// Which end of [`stream_exact`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamFailure {
+    /// The file could not be read.
+    File(Errno),
+    /// The stream could not be written, which is a peer that has gone.
+    Stream(Errno),
+}
+
+/// Streams exactly `size` bytes of the regular file `file`, from its start, to
+/// `stream`, and answers whether the file held a different number of bytes.
+///
+/// `size` is what a frame declared before any byte was read, and the peer is
+/// counting on it, so the stream carries exactly that many whatever the file
+/// does: one that ends early is padded with zeros, and one that grew is cut.
+/// `true` says the file changed while it was read. The caller reports that,
+/// since a file padded or cut to fit its frame is not a copy of the file; the
+/// framing is kept so that the report can be made at all, rather than by a
+/// peer reading the next frame out of the middle of this one. The file's
+/// length once its bytes are sent is what notices one that grew.
+///
+/// The reads are positioned, so the file's own offset is neither used nor
+/// moved. `EINTR` is retried on both ends.
+///
+/// Kept out of line, so its buffer is on the stack only while a file streams
+/// rather than in the frame of every level of the walk that calls it.
+#[inline(never)]
+pub(crate) fn stream_exact(
+    file: BorrowedFd<'_>,
+    stream: BorrowedFd<'_>,
+    size: u64,
+) -> Result<bool, StreamFailure> {
+    let mut buf = [0u8; DATA_BUF];
+    let short = send_range(file, stream, 0, size, &mut buf)?;
+    let length = rustix::fs::fstat(file)
+        .map_err(StreamFailure::File)?
+        .st_size;
+    Ok(short || u64::try_from(length).ok() != Some(size))
+}
+
+/// Sends `len` bytes of `file` from the offset `at`, padding with zeros where
+/// the file ends first, and answers whether it did.
+fn send_range(
+    file: BorrowedFd<'_>,
+    stream: BorrowedFd<'_>,
+    at: u64,
+    len: u64,
+    buf: &mut [u8],
+) -> Result<bool, StreamFailure> {
+    let cap = buf.len();
+    let chunk = |sent: u64| usize::try_from(len - sent).map_or(cap, |left| left.min(cap));
+    let mut sent = 0;
+    while sent < len {
+        let want = chunk(sent);
+        let read = retry_on_intr!(rustix::io::pread(
+            file,
+            &mut buf[..want],
+            at.saturating_add(sent)
+        ))
+        .map_err(StreamFailure::File)?;
+        if read == 0 {
+            break;
+        }
+        write_full(stream, &buf[..read]).map_err(StreamFailure::Stream)?;
+        sent += read as u64;
+    }
+    if sent == len {
+        return Ok(false);
+    }
+    buf.fill(0);
+    while sent < len {
+        let want = chunk(sent);
+        write_full(stream, &buf[..want]).map_err(StreamFailure::Stream)?;
+        sent += want as u64;
+    }
+    Ok(true)
 }
 
 /// The length of a helper child's outcome record: a step's wire value then an

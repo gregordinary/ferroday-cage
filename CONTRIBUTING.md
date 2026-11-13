@@ -517,6 +517,7 @@ report name a package and its version bare.
 | Report a `syscalls` errno as the rustix one the crate speaks | `mechanism::sys::errno` |
 | Move framed bytes between a helper child and its caller | `mechanism::frame` |
 | Write all of these bytes to a descriptor, retrying `EINTR` | `mechanism::frame::write_full` |
+| Stream exactly as many bytes of a file as a frame declared, padding or cutting one that changed while it was read | `mechanism::frame::stream_exact` |
 | Write a file that takes its content in one write, such as an identity map | `mechanism::frame::write_whole` |
 | Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending, and `read_full_or_short` where how much arrived matters |
 | Retry one call a signal interrupted | `mechanism::frame::retry_on_intr!` |

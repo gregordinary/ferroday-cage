@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -37,10 +37,8 @@ use super::{Delegate, ProvisionError};
 use crate::IdentityMap;
 use crate::failure::ErrorChain;
 use crate::idmap::{IdMapper, IdRange};
-use crate::mechanism::bounds::{
-    DATA_BUF, LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_NAME_MAX, XATTR_SIZE_MAX,
-};
-use crate::mechanism::frame;
+use crate::mechanism::bounds::{LINK_BUF, MAX_DEPTH, NAME_MAX, XATTR_NAME_MAX, XATTR_SIZE_MAX};
+use crate::mechanism::frame::{self, StreamFailure};
 use crate::mechanism::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_OWN, COPY_SYMLINK,
     ChildMap, CopyFailure, start_copy_in,
@@ -1281,11 +1279,9 @@ fn leaf_cstring(name: &[u8], subject: &Path) -> Result<CString, ProvisionError> 
 /// file that changed underneath it copied.
 ///
 /// The frame's declared length is committed before any data is read, so a file
-/// that grew or shrank in between cannot be sent faithfully: the child is
-/// counting bytes, and a frame that lied about its length would leave every
-/// later frame misaligned. So the frame is finished either way — a short file
-/// padded with zeroes, a grown one cut at the declared length — and only then
-/// is the mismatch reported.
+/// that grew or shrank in between cannot be sent faithfully. The frame is
+/// finished either way, by [`frame::stream_exact`], and only then is the
+/// mismatch reported.
 ///
 /// The frame is honored and the copy still fails, because those are answers to
 /// different questions. Keeping the stream in step is what lets the failure be
@@ -1297,36 +1293,11 @@ fn stream_file(
     path: &Path,
     size: u64,
 ) -> Result<(), ProvisionError> {
-    let mut file = std::fs::File::from(file);
-    let mut buf = [0u8; DATA_BUF];
-    let mut left = size;
-    let mut changed = false;
-    while left > 0 {
-        let want = usize::try_from(left.min(DATA_BUF as u64)).unwrap_or(DATA_BUF);
-        let read = file
-            .read(&mut buf[..want])
-            .map_err(|err| ProvisionError::io("reading", path, err))?;
-        if read == 0 {
-            // The file is shorter than its stat said.
-            changed = true;
-            buf[..want].fill(0);
-            put(stream, &buf[..want], path)?;
-            left -= want as u64;
-            continue;
-        }
-        put(stream, &buf[..read], path)?;
-        left -= read as u64;
-    }
-
-    // One byte past the declared length says whether the file grew. Nothing is
-    // sent: the frame is complete, and this only decides what to report.
-    if !changed {
-        let mut past = [0u8; 1];
-        changed = file
-            .read(&mut past)
-            .map_err(|err| ProvisionError::io("reading", path, err))?
-            != 0;
-    }
+    let changed =
+        frame::stream_exact(file.as_fd(), stream, size).map_err(|failure| match failure {
+            StreamFailure::File(errno) => ProvisionError::io("reading", path, errno.into()),
+            StreamFailure::Stream(errno) => ProvisionError::io("copying", path, errno.into()),
+        })?;
     if changed {
         return Err(ProvisionError::SourceChanged {
             path: path.to_path_buf(),
