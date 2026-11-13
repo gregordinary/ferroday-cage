@@ -124,10 +124,12 @@ pub fn spawn_grouped(command: &mut Command) -> Child {
 /// Waits for `child` to end and returns what it wrote to its piped streams,
 /// failing the test if the whole of that outlasts `patience`.
 ///
-/// For a test that writes to the child's input first. `child` leads a process
-/// group of its own, as [`spawn_grouped`] starts one. The piped streams are
-/// read on threads of their own while the wait runs, so a child whose output
-/// fills its pipe is collected rather than mistaken for a hang.
+/// For a test that writes to the child's input first. Its input, where it is
+/// piped and the test still holds it, is closed before the wait, so a child
+/// reading its input to the end reaches it. `child` leads a process group of
+/// its own, as [`spawn_grouped`] starts one. The piped streams are read on
+/// threads of their own while the wait runs, so a child whose output fills its
+/// pipe is collected rather than mistaken for a hang.
 ///
 /// The patience covers the streams as well as the exit. A stream ends only when
 /// every process holding it has gone, and a process the child left behind can
@@ -144,6 +146,7 @@ pub fn finish_bounded(mut child: Child, patience: Duration) -> Output {
         "a bounded run is ended by its process group, so the child must lead one; start it \
          with spawn_grouped",
     );
+    drop(child.stdin.take());
     let stdout = child.stdout.take().map(collect);
     let stderr = child.stderr.take().map(collect);
     let deadline = Instant::now().checked_add(patience);
@@ -260,6 +263,23 @@ mod tests {
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(output.stdout, b"out\n");
         assert_eq!(output.stderr, b"err\n");
+    }
+
+    #[test]
+    fn a_child_reading_its_input_to_the_end_is_handed_the_end() {
+        // The input is piped and still held here: a child that reads it to the
+        // end would wait forever on a test that forgot to close it.
+        let mut command = shell("cat; echo read");
+        command.stdin(std::process::Stdio::piped());
+        let mut child = spawn_grouped(&mut command);
+        std::io::Write::write_all(
+            child.stdin.as_mut().expect("the input is piped"),
+            b"typed\n",
+        )
+        .expect("the input takes a line");
+        let output = finish_bounded(child, Duration::from_secs(30));
+        assert!(output.status.success(), "{:?}", output.status);
+        assert_eq!(output.stdout, b"typed\nread\n");
     }
 
     #[test]
