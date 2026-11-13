@@ -52,9 +52,9 @@ rustix = { version = "1.1.4", features = ["stdio", "termios", "event", "fs", "pi
 ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = ["pty"] }
 # The relay's integration tests drive the built binary through a pseudoterminal
 # of the testkit's, and read the terminal's settings and signal the binary
-# themselves. The forward's make targets whose accept queue they fill, and wait
-# on a connection to one. Declared here for the tests' own sake, whatever the
-# binary's dependency line enables.
+# themselves. The forward's tests make targets whose accept queue they fill, and
+# wait on a connection to one. Declared here for the tests' own sake, whatever
+# the binary's dependency line enables.
 rustix = { version = "1.1.4", features = ["process", "termios", "net", "event"] }
 
 [lints]
