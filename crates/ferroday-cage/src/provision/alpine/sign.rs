@@ -113,20 +113,8 @@ pub(super) fn control_identity_hex(payload: &[u8]) -> String {
 /// is how `apk` itself finds the record an archived script belongs to.
 pub(super) fn identity_of_hex(spelled: &str) -> Option<String> {
     let hex = spelled.strip_prefix(IDENTITY_HEX_PREFIX)?.as_bytes();
-    if hex.len() != 2 * size_of::<<Sha1 as HashFunction>::Output>() {
-        return None;
-    }
-    let nibble = |byte: u8| match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    };
-    let digest = hex
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&[high, low]| Some((nibble(high)? << 4) | nibble(low)?))
-        .collect::<Option<Vec<u8>>>()?;
+    const SHA1_LEN: usize = size_of::<<Sha1 as HashFunction>::Output>();
+    let digest: [u8; SHA1_LEN] = crate::provision::digest::unhex(hex)?;
     Some(identity(&digest))
 }
 

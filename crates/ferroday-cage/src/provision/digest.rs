@@ -417,10 +417,37 @@ pub(crate) mod md5 {
 /// Whether `digest` is exactly `len` lowercase hex characters: the shape every
 /// digest this crate compares is held to, whatever its algorithm.
 fn is_lowercase_hex(digest: &str, len: usize) -> bool {
-    digest.len() == len
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    digest.len() == len && digest.bytes().all(|byte| nibble(byte).is_some())
+}
+
+/// The value of one lowercase hex digit, or `None` for any other byte.
+///
+/// The alphabet [`is_lowercase_hex`] and [`unhex`] both read, so a digest that
+/// passes the one decodes through the other.
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// The `N` bytes `text` spells as lowercase hex, the inverse of [`hex`], or
+/// `None` where `text` is anything else.
+///
+/// Held to the shape every digest here is held to: exactly `2 * N` lowercase
+/// hex digits. An uppercase digit, a sign, or another length is refused rather
+/// than read, as a digest spelled two ways would be two digests.
+#[cfg_attr(not(feature = "alpine"), allow(dead_code))]
+pub(crate) fn unhex<const N: usize>(text: &[u8]) -> Option<[u8; N]> {
+    if text.len() != 2 * N {
+        return None;
+    }
+    let mut bytes = [0u8; N];
+    for (byte, [high, low]) in bytes.iter_mut().zip(text.as_chunks::<2>().0) {
+        *byte = (nibble(*high)? << 4) | nibble(*low)?;
+    }
+    Some(bytes)
 }
 
 /// Formats a digest as lowercase hex.
@@ -434,6 +461,19 @@ pub(crate) fn hex(digest: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unhex_reads_back_what_hex_writes_and_nothing_else() {
+        let bytes = [0x00, 0x9f, 0xa0, 0xff];
+        assert_eq!(
+            super::unhex::<4>(super::hex(&bytes).as_bytes()),
+            Some(bytes)
+        );
+        // Another case, a sign Rust's own parsers take, another length.
+        for refused in [&b"009FA0FF"[..], b"+f9fa0ff", b"009fa0f", b"009fa0ff00"] {
+            assert_eq!(super::unhex::<4>(refused), None, "{refused:?}");
+        }
+    }
+
     use std::io::Cursor;
 
     use super::*;

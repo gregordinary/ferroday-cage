@@ -94,7 +94,8 @@ pub(crate) struct Entry {
     /// — over the contents of a file, over the target of a link — and it is
     /// what an installed-database record carries as its `Z:` field, so the
     /// Alpine layer reads it here rather than digesting a tree it has just
-    /// written.
+    /// written. A build without that layer passes the record over, as it does
+    /// any vendor keyword, and this is `None`.
     #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub checksum_sha1: Option<[u8; 20]>,
     /// The POSIX access control list a `SCHILY.xattr.system.posix_acl_access`
@@ -989,20 +990,15 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             // not an error: the key is namespaced to a vendor, and a reader
             // that refused an unfamiliar one would refuse an archive apk
             // itself reads.
+            //
+            // Read only where the Alpine layer is built, the one reader of it.
+            // Elsewhere it is a vendor keyword like any other, and passed over.
+            #[cfg(feature = "alpine")]
             b"APK-TOOLS.checksum.SHA1" => {
-                let mut digest = [0u8; 20];
-                if value.len() != 2 * digest.len() {
-                    return Err("an apk file checksum record is not a SHA-1");
-                }
-                // The length check above is what leaves no remainder to drop.
-                let (pairs, _) = value.as_chunks::<2>();
-                for (byte, pair) in digest.iter_mut().zip(pairs) {
-                    *byte = std::str::from_utf8(pair)
-                        .ok()
-                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                        .ok_or("an apk file checksum record is not hexadecimal")?;
-                }
-                records.checksum_sha1 = Some(digest);
+                records.checksum_sha1 = Some(
+                    super::digest::unhex(value)
+                        .ok_or("an apk file checksum record is not a SHA-1 in lowercase hex")?,
+                );
             }
             b"mtime" => {
                 // Pax times may carry fractional seconds; whole seconds are
@@ -1419,6 +1415,7 @@ mod tests {
         assert!(parse_pax(b"12 gid=zzzz\n").is_err());
     }
 
+    #[cfg(feature = "alpine")]
     #[test]
     fn an_apk_file_checksum_record_decodes_to_the_digest_it_states() {
         // apk writes one of these for every file and symbolic link, and the
@@ -1443,10 +1440,19 @@ mod tests {
         short.push(b'\n');
         assert!(parse_pax(&short).is_err());
 
-        let mut not_hex = Vec::from(&b"68 APK-TOOLS.checksum.SHA1="[..]);
-        not_hex.extend_from_slice(b"g00102030405060708090a0b0c0d0e0f10111213");
-        not_hex.push(b'\n');
-        assert!(parse_pax(&not_hex).is_err());
+        // Nor is one spelled otherwise than apk spells it: a digit that is not
+        // hexadecimal, an uppercase one, or a sign that Rust's integer parsers
+        // would read as part of a number.
+        for spelled in [
+            &b"g00102030405060708090a0b0c0d0e0f10111213"[..],
+            b"000102030405060708090A0B0C0D0E0F10111213",
+            b"+f0102030405060708090a0b0c0d0e0f10111213",
+        ] {
+            let mut record = Vec::from(&b"68 APK-TOOLS.checksum.SHA1="[..]);
+            record.extend_from_slice(spelled);
+            record.push(b'\n');
+            assert!(parse_pax(&record).is_err(), "{spelled:?}");
+        }
     }
 
     #[test]

@@ -637,6 +637,10 @@ pub(crate) fn percent_decode(text: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The value of one hexadecimal digit, either case.
+///
+/// A second answer beside [`digest::unhex`](super::digest::unhex), which reads
+/// lowercase alone: a digest this crate compares has one spelling, and a
+/// percent escape has two, since RFC 3986 makes `%2f` and `%2F` the same octet.
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),

@@ -500,6 +500,10 @@ consumer upgrading can skip it.
 - **Breaking.** A Gentoo binary package whose container cannot be read is
   reported as `GentooError::Io`, the OS error its cause, as the layer documents.
   It was `GentooError::Container` with the error flattened into the reason.
+- An `APK-TOOLS.checksum.SHA1` record in an archive is read as apk writes it,
+  forty lowercase hex digits. One with an uppercase digit or a leading `+` was
+  read as the digest it resembled. A build without the `alpine` feature, which
+  is the record's one reader, passes it over as it does any vendor keyword.
 - A Debian or Alpine bootstrap for a foreign architecture whose binfmt handler
   is registered and cannot be read, under a restrictive mount or a security
   module, fails with the layer's `Io` error naming the registration file, the
