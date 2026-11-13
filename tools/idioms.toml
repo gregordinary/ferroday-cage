@@ -358,8 +358,8 @@ answer = """\
 `provision::walk_mirrors`, with the layer's error answering \
 `provision::Failover`. Which failure moves on to the next mirror and which ends \
 the walk has cases a copy gets subtly wrong, such as an oversized body, which \
-ends the walk whatever transfer encoding carried it. A single walk is a single \
-place to get that right."""
+moves on to the next mirror whatever framing carried it. A single walk is a \
+single place to get that right."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/fetch.rs"

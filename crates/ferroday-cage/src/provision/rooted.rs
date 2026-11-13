@@ -298,6 +298,12 @@ impl Rooted {
     /// set, which a replacement written by the calling user would lose. The
     /// file must exist, and anything that is not a regular file is refused as
     /// [`reader`](Self::reader) refuses it, before anything is truncated.
+    ///
+    /// What the kernel takes from any file a process unprivileged over it
+    /// writes or truncates, this does not keep: the set-user-ID bit, the
+    /// set-group-ID bit where the group may execute, and a file capability.
+    /// The files the host-side steps rewrite, an account database and an
+    /// identifier, hold none of them.
     #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub(crate) fn overwrite(&self, relative: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
         let relative = relative.as_ref();
@@ -319,8 +325,9 @@ impl Rooted {
     /// build's whiteout is never emptied through.
     ///
     /// In place, as [`overwrite`](Self::overwrite) rewrites: the inode, owner,
-    /// group, and mode stay the ones a script gave the file. An absent leaf,
-    /// or an absent parent, is already done.
+    /// group, and mode stay the ones a script gave the file, but for what the
+    /// kernel clears on a truncation, as that method says. An absent leaf, or
+    /// an absent parent, is already done.
     ///
     /// What is emptied is the file the predicate approved. The open is held to
     /// that `stat`, so a file renamed onto the name after the look, regular or

@@ -187,10 +187,12 @@ pub enum ProvisionEvent<'a> {
 
 /// A standard stream of a command a provisioner runs in a cage.
 ///
-/// Every userland layer's own event carries this in its `CommandOutput` variant,
-/// which is why it is here rather than in one of them: a provisioner that runs a
-/// command in a cage has output to attribute to a stream whichever archive it
-/// provisions from, and the attribution says nothing about the archive. The
+/// The Debian and Alpine layers' own events carry this in their `CommandOutput`
+/// variants, which is why it is here rather than in either of them: a
+/// provisioner that runs a command in a cage has output to attribute to a
+/// stream whichever archive it provisions from, and the attribution says
+/// nothing about the archive. The Gentoo layer runs no command in a cage, and
+/// its events carry none. The
 /// events themselves stay with their layers, nested in [`ProvisionEvent`] — they
 /// speak each archive's own vocabulary, and this does not.
 #[cfg(any(feature = "debian", feature = "alpine"))]
@@ -1957,8 +1959,8 @@ fn is_staging_name(name: &[u8]) -> bool {
 /// published before. A by-hash index copy is never rewritten once its name
 /// exists, so a short one would never be repaired.
 ///
-/// Errors name the staging file only when the failure is the staging file's
-/// own; the caller wraps them against the destination it asked for.
+/// Its errors are bare `io::Error`s, naming no path, for the caller to wrap
+/// against the destination it asked for.
 #[cfg(any(feature = "debian", feature = "gentoo"))]
 pub(crate) fn write_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;

@@ -189,12 +189,13 @@ pub(super) fn last_change_day(epoch: i64) -> String {
 /// increment's scripts never touched, is left to the base, and one they
 /// removed is left removed.
 ///
-/// The files are rewritten in place, keeping the owner, group, and mode the
-/// scripts gave them. The host side writes them as the calling user, which is
-/// the owner a file created by the sandbox's root has under every identity map.
-/// So each must leave its owner write permission, as the `0640` the
-/// distributions ship does. One a script made read-only, or gave to another
-/// account, fails the bootstrap rather than going undated.
+/// The files are rewritten in place through [`Rooted::overwrite`], keeping the
+/// owner, group, and mode the scripts gave them. The host side writes them as
+/// the calling user, which is the owner a file created by the sandbox's root
+/// has under every identity map. A file a script made read-only is still the
+/// calling user's to rewrite, and is given owner write only for as long as the
+/// open takes. One a script gave to another account fails the bootstrap rather
+/// than going undated.
 pub(super) fn redate(
     tree: &Rooted,
     found: &Dates,

@@ -57,8 +57,9 @@ const MAX_SET_ASIDE_BODY: u64 = 64 * 1024;
 /// which the body cap alone does not cover.
 const MAX_LINE: usize = 16 * 1024;
 
-/// The most header lines read before the blank separator. Bounds a slowloris
-/// mirror that dribbles endless headers within the per-read timeout.
+/// The most lines a field section is read for, the blank line that ends it
+/// included, so at most 255 field lines. Bounds a slowloris mirror that
+/// dribbles endless headers within the per-read timeout.
 const MAX_HEADERS: usize = 256;
 
 /// How to fetch from an `https://` mirror, which this client cannot.
