@@ -178,7 +178,12 @@ consumer upgrading can skip it.
   `Error::Listen`.
 - `fcage --forward-loopback PORT TARGET` listens on the sandbox's loopback at
   `PORT` and carries each connection the command makes there to `TARGET` on the
-  host, a unix socket's absolute path or an `ADDRESS:PORT` (`ferroday-cage-cli`).
+  host, a unix socket's absolute path or an `ADDRESS:PORT`. A forward is one
+  thread however many connections the command makes, and holds at most 128 at
+  once; a connection past that is closed at once, and the first such is
+  reported. A connection the target refuses, or does not take within 30
+  seconds, is reported and closed. The run's end closes every forwarded
+  connection (`ferroday-cage-cli`).
 - `CageBuilder::host_rootfs` roots a sandbox on the host's own filesystem,
   read-only: the launch clones the host's mount tree inside the sandbox's mount
   namespace and makes every mount of it read-only and `nosuid`. It hides

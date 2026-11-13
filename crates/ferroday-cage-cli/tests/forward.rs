@@ -7,11 +7,17 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::os::unix::net::UnixListener;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
 /// The built binary under test.
 const FCAGE: &str = env!("CARGO_BIN_EXE_fcage");
@@ -19,6 +25,18 @@ const FCAGE: &str = env!("CARGO_BIN_EXE_fcage");
 /// How long one run may take before its test fails. Far beyond what any run
 /// here needs; it exists so a launch that never finishes is a failure.
 const PATIENCE: Duration = Duration::from_secs(60);
+
+/// How long a run may take to end once its command has, while its forward
+/// holds a connection the target never takes.
+///
+/// Shorter than the 30 seconds a forward gives a connection to the target, so a
+/// run that waited for that connection fails here, and far beyond what ending a
+/// run needs.
+const PROMPTLY: Duration = Duration::from_secs(20);
+
+/// The most connections a forward holds at once, as `--forward-loopback`
+/// documents it.
+const BUDGET: usize = 128;
 
 /// Answers one connection on a thread of its own: reads a line, and replies
 /// with that line uppercased. Returns the line it read.
@@ -76,6 +94,245 @@ fn run_forward(rootfs: &std::path::Path, target: &str) -> std::process::Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     common::run_bounded(&mut command, PATIENCE)
+}
+
+/// A unix socket listening at `path` whose accept queue is full, and the
+/// connection that fills it.
+///
+/// A backlog of 0 queues one connection. A further non-blocking connect then
+/// fails with `EAGAIN` at once, which is checked here, since it is what the
+/// forward meets.
+fn full_unix_target(path: &str) -> (OwnedFd, UnixStream) {
+    let address = SocketAddrUnix::new(path).expect("the path fits a socket address");
+    let listener = stream_socket(AddressFamily::UNIX, SocketFlags::CLOEXEC);
+    rustix::net::bind(&listener, &address).expect("the target socket binds");
+    rustix::net::listen(&listener, 0).expect("the target socket listens");
+    let filler = UnixStream::connect(path).expect("the first connection is queued");
+    let probe = stream_socket(
+        AddressFamily::UNIX,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+    );
+    assert_eq!(
+        rustix::net::connect(&probe, &address),
+        Err(Errno::AGAIN),
+        "a connection past a full queue is refused for now"
+    );
+    (listener, filler)
+}
+
+/// A TCP listener on the loopback whose accept queue is full, the connection
+/// that fills it, and its address.
+///
+/// With a backlog of 0, the first connection fills the queue, and the kernel
+/// drops the SYN of any further one, SYN cookies or not, so a connect to it
+/// stays in progress until the queue has room. That is checked here: a further
+/// connect is still in progress after a wait a refusal or an acceptance would
+/// have ended, since either arrives within microseconds on the loopback.
+fn full_tcp_target() -> (OwnedFd, TcpStream, SocketAddr) {
+    let listener = stream_socket(AddressFamily::INET, SocketFlags::CLOEXEC);
+    let any: SocketAddr = "127.0.0.1:0".parse().expect("a socket address");
+    rustix::net::bind(&listener, &any).expect("the target listener binds");
+    rustix::net::listen(&listener, 0).expect("the target listener listens");
+    let address = match rustix::net::getsockname(&listener).map(SocketAddr::try_from) {
+        Ok(Ok(address)) => address,
+        other => panic!("the target listener has no address: {other:?}"),
+    };
+    let filler = TcpStream::connect(address).expect("the first connection is made");
+    let probe = stream_socket(
+        AddressFamily::INET,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+    );
+    assert_eq!(
+        rustix::net::connect(&probe, &address),
+        Err(Errno::INPROGRESS)
+    );
+    let quarter = Timespec {
+        tv_sec: 0,
+        tv_nsec: 250_000_000,
+    };
+    let mut fds = [PollFd::new(&probe, PollFlags::OUT)];
+    let answered = loop {
+        match rustix::event::poll(&mut fds, Some(&quarter)) {
+            Err(Errno::INTR) => {}
+            other => break other.expect("the probe can be polled"),
+        }
+    };
+    assert_eq!(
+        answered,
+        0,
+        "a connection past a full TCP queue stays in progress, here {:?}",
+        fds[0].revents()
+    );
+    (listener, filler, address)
+}
+
+/// A new stream socket of `family`.
+fn stream_socket(family: AddressFamily, flags: SocketFlags) -> OwnedFd {
+    rustix::net::socket_with(family, SocketType::STREAM, flags, None).expect("a socket opens")
+}
+
+/// A run of `fcage` with one forward from the sandbox's loopback port 4100,
+/// whose command the test talks to: it reads the lines the command prints and
+/// writes lines to its input.
+///
+/// A test that fails partway kills the run's process group rather than leaving
+/// a sandbox behind.
+struct Session {
+    /// The run, until it is finished.
+    child: Option<Child>,
+    /// The command's input, until the run is finished.
+    input: Option<ChildStdin>,
+    /// The lines the command prints, as they arrive.
+    lines: Receiver<String>,
+    /// The run's process id.
+    pid: u32,
+}
+
+impl Session {
+    /// Starts `fcage` with `flags`, a forward to `target`, and `script` as the
+    /// command's shell script.
+    fn start(rootfs: &std::path::Path, flags: &[&str], target: &str, script: &str) -> Session {
+        let mut command = Command::new(FCAGE);
+        command
+            .args(["--rootfs", rootfs.to_str().expect("a UTF-8 fixture path")])
+            .args(flags)
+            .args(["--forward-loopback", "4100", target])
+            .args(["--", "/bin/sh", "-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = common::spawn_grouped(&mut command);
+        let input = child.stdin.take();
+        let output = child.stdout.take().expect("the output is piped");
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let Ok(line) = line else { return };
+                if sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Session {
+            pid: child.id(),
+            child: Some(child),
+            input,
+            lines,
+        }
+    }
+
+    /// Waits for the command's next line, and checks that it is `wanted`.
+    fn expect_line(&self, wanted: &str) {
+        match self.lines.recv_timeout(PATIENCE) {
+            Ok(line) => assert_eq!(line, wanted),
+            Err(error) => panic!("the command never printed {wanted:?}: {error}"),
+        }
+    }
+
+    /// Writes `line` to the command's input.
+    fn send(&mut self, line: &str) {
+        let input = self.input.as_mut().expect("the run is not finished");
+        writeln!(input, "{line}").expect("the command's input takes a line");
+    }
+
+    /// How many entries `fcage`'s `/proc/<pid>/<what>` directory holds: its
+    /// threads for `task`, its descriptors for `fd`.
+    fn count(&self, what: &str) -> usize {
+        std::fs::read_dir(format!("/proc/{}/{what}", self.pid))
+            .expect("the run's process can be read")
+            .count()
+    }
+
+    /// Whether `fcage` has exited. It is not reaped until the run is
+    /// finished, so its process stays readable.
+    fn exited(&self) -> bool {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid))
+            .expect("the run's process can be read");
+        let state = stat[stat.rfind(')').expect("a stat record names its process") + 1..]
+            .split_whitespace()
+            .next();
+        state == Some("Z")
+    }
+
+    /// Waits until `fcage` holds at least `wanted` descriptors, failing the
+    /// test past [`PATIENCE`]; or, with `or_exit`, until it has exited.
+    fn await_descriptors(&self, wanted: usize, or_exit: bool) {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            if or_exit && self.exited() {
+                return;
+            }
+            let held = self.count("fd");
+            if held >= wanted {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fcage held {held} descriptors, not {wanted}, after {PATIENCE:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Closes the command's input, waits for the run to end within
+    /// `patience`, and returns what it did. Its output is what the command
+    /// printed past the lines already read.
+    fn finish(mut self, patience: Duration) -> Output {
+        drop(self.input.take());
+        let child = self.child.take().expect("the run is finished once");
+        let mut output = common::finish_bounded(child, patience);
+        let deadline = Instant::now() + patience;
+        loop {
+            match self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) => {
+                    output.stdout.extend_from_slice(line.as_bytes());
+                    output.stdout.push(b'\n');
+                }
+                Err(RecvTimeoutError::Disconnected) => return output,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("the run's output was still open {patience:?} after it ended")
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let pid = i32::try_from(self.pid).expect("a pid fits an i32");
+            if let Some(group) = rustix::process::Pid::from_raw(pid) {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Runs a command that connects to the forward, holds its connection until the
+/// forward has accepted it and opened a socket toward `target`, and then ends.
+/// Returns what the run did, failing the test if the run outlasts
+/// [`PROMPTLY`] from the command's end.
+///
+/// `fcage` holds two descriptors more once the forward has accepted the
+/// connection and opened the socket that connects to the target, which it does
+/// in the same step, before it next waits.
+fn connect_and_end(rootfs: &std::path::Path, target: &str) -> Output {
+    let mut session = Session::start(
+        rootfs,
+        &[],
+        target,
+        "echo ready; read go; nc 127.0.0.1 4100 </dev/null & read end; echo marker",
+    );
+    session.expect_line("ready");
+    let held = session.count("fd");
+    session.send("go");
+    session.await_descriptors(held + 2, false);
+    session.send("end");
+    session.finish(PROMPTLY)
 }
 
 #[test]
@@ -141,4 +398,241 @@ fn a_target_that_refuses_is_reported_and_the_run_still_ends() {
         stderr.contains("connecting to the target"),
         "the refused target is reported: {stderr}"
     );
+}
+
+#[test]
+fn a_forward_carries_a_megabyte_each_way_and_passes_each_end_on() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The target reads to the end of what the command sends before it answers
+    // a byte, then sends it all back and closes. So the command's end has to
+    // reach the target while the other direction stays open, and the target's
+    // end has to reach the command, whose `nc` ends only then. A megabyte is
+    // many times what the forward holds of either direction at once.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("the target listener binds");
+    let target = listener
+        .local_addr()
+        .expect("the target has an address")
+        .to_string();
+    let echoed = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().expect("the forward connects");
+        let mut received = Vec::new();
+        connection
+            .read_to_end(&mut received)
+            .expect("the command's bytes arrive, then its end");
+        connection
+            .write_all(&received)
+            .expect("the bytes go back while the command still reads");
+        received.len()
+    });
+
+    let mut command = Command::new(FCAGE);
+    command
+        .args(["--rootfs", rootfs.to_str().expect("a UTF-8 fixture path")])
+        .args(["--forward-loopback", "4100", &target])
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "head -c 1048576 /dev/urandom > /tmp/sent && \
+             nc 127.0.0.1 4100 < /tmp/sent > /tmp/received && \
+             cmp /tmp/sent /tmp/received && echo identical",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = common::run_bounded(&mut command, PATIENCE);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "identical\n");
+    assert_eq!(
+        echoed.join().expect("the target thread finishes"),
+        1_048_576
+    );
+}
+
+#[test]
+fn a_run_ends_while_a_unix_target_s_queue_stays_full() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("fcage-forward-full-unix");
+    let (_dir, socket) = short_socket_path(&dir, "full.sock");
+    let _target = full_unix_target(&socket);
+
+    let output = connect_and_end(rootfs, &socket);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "marker\n");
+}
+
+#[test]
+fn a_run_ends_while_a_tcp_target_never_answers() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let (_target, _filler, address) = full_tcp_target();
+
+    let output = connect_and_end(rootfs, &address.to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "marker\n");
+}
+
+#[test]
+fn a_run_its_timeout_ends_does_not_wait_for_a_target_with_a_full_queue() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("fcage-forward-full-timeout");
+    let (_dir, socket) = short_socket_path(&dir, "full.sock");
+    let _target = full_unix_target(&socket);
+
+    let mut session = Session::start(
+        rootfs,
+        &["--timeout", "3", "--kill-after", "1"],
+        &socket,
+        "echo ready; read go; nc 127.0.0.1 4100 </dev/null & exec sleep 60",
+    );
+    session.expect_line("ready");
+    let held = session.count("fd");
+    session.send("go");
+    // The timeout counts from the launch and does not wait for this test, so
+    // a run it has already ended is as good as a forward that has accepted.
+    session.await_descriptors(held + 2, true);
+    let output = session.finish(PROMPTLY);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "{}: {stderr}",
+        output.status
+    );
+}
+
+#[test]
+fn a_unix_target_whose_queue_was_full_takes_the_connection_once_it_has_room() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("fcage-forward-room");
+    let (_dir, socket) = short_socket_path(&dir, "room.sock");
+    let (target, filler) = full_unix_target(&socket);
+
+    let mut session = Session::start(
+        rootfs,
+        &[],
+        &socket,
+        "echo ready; read go; echo from-the-sandbox | nc 127.0.0.1 4100",
+    );
+    session.expect_line("ready");
+    let held = session.count("fd");
+    session.send("go");
+    // The forward has accepted the command's connection and met the full
+    // queue. Taking the connection that fills it makes room, and the forward's
+    // next attempt is queued behind it.
+    session.await_descriptors(held + 2, false);
+    let queued = rustix::net::accept_with(&target, SocketFlags::CLOEXEC)
+        .expect("the filling connection is accepted");
+    drop((queued, filler));
+    let listener = UnixListener::from(target);
+    let answered = answer_one(move || listener.accept().map(|(connection, _)| connection));
+
+    let output = session.finish(PATIENCE);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert_eq!(
+        answered.join().expect("the target thread finishes"),
+        "from-the-sandbox\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "FROM-THE-SANDBOX\n"
+    );
+}
+
+#[test]
+fn a_forward_holds_its_budget_on_one_thread_and_closes_what_is_past_it() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("fcage-forward-budget");
+    let (_dir, socket) = short_socket_path(&dir, "budget.sock");
+    let listener = UnixListener::bind(&socket).expect("the target socket binds");
+    listener
+        .set_nonblocking(true)
+        .expect("the target socket is non-blocking");
+
+    // One connection past the budget, each held open: `nc` sends its end at
+    // once and then waits for the connection's, which the target never sends.
+    // The one the forward closes is the one whose `nc` ends, and it records
+    // its number.
+    let script = format!(
+        "echo ready; read go; i=0; \
+         while [ $i -lt {} ]; do \
+           i=$((i + 1)); \
+           (nc 127.0.0.1 4100 </dev/null >/dev/null 2>&1; echo $i >> /tmp/closed) & \
+         done; \
+         while [ ! -s /tmp/closed ]; do sleep 0.05; done; echo refused; \
+         read end; wc -l < /tmp/closed",
+        BUDGET + 1
+    );
+    let mut session = Session::start(rootfs, &[], &socket, &script);
+    session.expect_line("ready");
+    let (threads, descriptors) = (session.count("task"), session.count("fd"));
+    session.send("go");
+
+    // The target takes every connection the forward makes and holds it,
+    // neither reading nor closing it.
+    let deadline = Instant::now() + PATIENCE;
+    let mut held = Vec::new();
+    while held.len() < BUDGET {
+        assert!(
+            ferroday_cage_testkit::fd::readable_by(&listener, deadline),
+            "the target had {} of the forward's connections after {PATIENCE:?}",
+            held.len()
+        );
+        match listener.accept() {
+            Ok((connection, _)) => held.push(connection),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("the target cannot accept: {error}"),
+        }
+    }
+    session.expect_line("refused");
+    // A unix connect is queued at the target when it is made, so one the
+    // forward made past its budget would be waiting there by now.
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the target was sent a connection past the budget: {other:?}"),
+    }
+
+    // Measured while every connection is held: one thread whatever the
+    // count, and two descriptors for each connection the forward carries.
+    assert_eq!(
+        session.count("task"),
+        threads,
+        "the forward's threads grew with its connections"
+    );
+    let now_held = session.count("fd");
+    assert!(
+        now_held <= descriptors + 2 * BUDGET,
+        "fcage holds {now_held} descriptors for {BUDGET} connections, from {descriptors}"
+    );
+
+    session.send("end");
+    let output = session.finish(PROMPTLY);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "1",
+        "one connection is closed past the budget"
+    );
+    assert_eq!(
+        stderr.matches("past the budget of 128").count(),
+        1,
+        "the budget is reported once: {stderr}"
+    );
+    drop(held);
 }

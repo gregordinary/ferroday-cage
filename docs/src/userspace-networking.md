@@ -93,11 +93,27 @@ port, or the command's connection is refused.
 
 `fcage --forward-loopback PORT TARGET` is the command-line form, over the same
 call. `PORT` is an `ADDRESS:PORT` or a bare port on `127.0.0.1`, and `TARGET` is
-an absolute path naming a unix socket or an `ADDRESS:PORT` on the host. `fcage`
-accepts each connection the command makes and copies it to the target on threads
-of its own. A target that refuses a connection is reported on standard error and
-the command's connection closed. The flag is repeatable, needs the isolated
-network, and composes with `--netstack`.
+an absolute path naming a unix socket or an `ADDRESS:PORT` on the host. The flag
+is repeatable, needs the isolated network, and composes with `--netstack`.
+
+Each forward is one thread of `fcage`'s, however many connections the command
+makes. It accepts each connection and carries it to the target, each direction
+ending on its own: a command that shuts down its sending half still receives the
+reply. Its bounds are the network stack's for a published port:
+
+- A forward holds at most 128 connections at once, counting those whose
+  connection to the target is still being made. A connection past that is
+  closed at once. The first is reported on standard error, and later ones are
+  not.
+- A connection the target refuses, or does not take within 30 seconds, is
+  reported on standard error and the command's connection closed. A unix
+  socket whose accept queue is full is tried again until then.
+- Each direction holds at most 64 KiB on its way across, so a peer that stops
+  reading stalls only the direction toward it.
+
+The run's end closes every forwarded connection, whatever its peers are doing,
+along with the listener. A connection still being made is abandoned, and what a
+connection holds that its peer has not taken is dropped.
 
 ## The native stack
 

@@ -39,10 +39,11 @@ serde = "1.0"
 # started from: whether it is one, and what size it reports. The relay itself is
 # the library's, and needs nothing here. The rest serve the relay for a standard
 # stream that is a file: `fs` judges a stream's kind and `stdio` names the
-# streams, `event` is the poll the relays wait in, `pipe` bounds the input
-# relay's read-ahead, and `process` makes `fcage` non-dumpable for a restricted
-# launch. The library enables every one of them, so none adds to the build.
-rustix = { version = "1.1.4", features = ["stdio", "termios", "event", "fs", "pipe", "process"] }
+# streams, `event` is the poll the relays and the forwards wait in, `pipe` bounds
+# the input relay's read-ahead, `net` is the forwards' non-blocking sockets, and
+# `process` makes `fcage` non-dumpable for a restricted launch. The library
+# enables every one of them, so none adds to the build.
+rustix = { version = "1.1.4", features = ["stdio", "termios", "event", "fs", "pipe", "net", "process"] }
 
 [dev-dependencies]
 # The workspace's shared test fixtures and harnesses. The relay's tests need the
@@ -51,9 +52,10 @@ rustix = { version = "1.1.4", features = ["stdio", "termios", "event", "fs", "pi
 ferroday-cage-testkit = { path = "../ferroday-cage-testkit", features = ["pty"] }
 # The relay's integration tests drive the built binary through a pseudoterminal
 # of the testkit's, and read the terminal's settings and signal the binary
-# themselves. Declared here for the tests' own sake, whatever the binary's
-# dependency line enables.
-rustix = { version = "1.1.4", features = ["process", "termios"] }
+# themselves. The forward's make targets whose accept queue they fill, and wait
+# on a connection to one. Declared here for the tests' own sake, whatever the
+# binary's dependency line enables.
+rustix = { version = "1.1.4", features = ["process", "termios", "net", "event"] }
 
 [lints]
 workspace = true

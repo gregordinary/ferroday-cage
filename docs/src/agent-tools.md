@@ -315,8 +315,13 @@ fcage --profile crates/ferroday-cage/examples/agent-tools.toml \
     --timeout 600 -- git status
 ```
 
-`--forward-loopback` copies each connection to the target the service listens
-at on the host, a TCP address or a unix socket.
+`--forward-loopback` carries each connection to the target the service listens
+at on the host, a TCP address or a unix socket. It holds at most 128
+connections at once, gives the service 30 seconds to take each one, and closes
+every one it holds when the command ends, so a connection the service keeps
+open does not outlast the run. [A listener on the sandbox's
+loopback](userspace-networking.md#a-listener-on-the-sandboxs-loopback) sets out
+its bounds.
 
 The profile carries both sets of limits, the cgroup's with `required = false`.
 With a delegated parent, `--cgroup-parent DIR` applies the limits on the whole
