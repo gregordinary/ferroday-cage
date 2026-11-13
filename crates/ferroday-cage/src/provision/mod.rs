@@ -1441,6 +1441,11 @@ const LOCK_ATTEMPTS: u32 = 16;
 ///   descriptor. A `flock` belongs to the open file description, so an
 ///   inherited copy keeps the lock held until that process exits as well,
 ///   whenever the holder itself lets go.
+/// - `O_NONBLOCK`, and only a regular file kept, so a named pipe planted at
+///   the path cannot hold the open waiting for a reader that never comes, as
+///   the crate's other opens of names it does not control refuse to wait. The
+///   descriptor does nothing but hold the lock, which the flag leaves alone,
+///   so it is kept.
 /// - Once the lock is granted, the path is checked to still name the file that
 ///   was locked. A removal deletes a lock file while it holds it, and a caller
 ///   that had opened the file before the deletion is granted a lock no later
@@ -1452,15 +1457,26 @@ pub(crate) fn lock_exclusive(path: &Path) -> io::Result<std::os::fd::OwnedFd> {
     for _ in 0..LOCK_ATTEMPTS {
         let lock = rustix::fs::open(
             path,
-            OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::CREATE
+                | OFlags::WRONLY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::NOCTTY
+                | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
         )?;
+        let held = rustix::fs::fstat(&lock)?;
+        if rustix::fs::FileType::from_raw_mode(held.st_mode) != rustix::fs::FileType::RegularFile {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the lock file is not a regular file",
+            ));
+        }
         // The call `clippy.toml` sends every other site here for: this is
         // that answer.
         #[expect(clippy::disallowed_methods)]
         let locked = frame::retry_on_intr!(rustix::fs::flock(&lock, FlockOperation::LockExclusive));
         locked?;
-        let held = rustix::fs::fstat(&lock)?;
         match rustix::fs::lstat(path) {
             Ok(named) if named.st_dev == held.st_dev && named.st_ino == held.st_ino => {
                 return Ok(lock);
@@ -2195,6 +2211,48 @@ mod tests {
             !held_by_child,
             "the spawned process holds the lock file open"
         );
+    }
+
+    #[test]
+    fn a_lock_path_holding_a_named_pipe_is_refused_without_waiting() {
+        // Something that can write the directory a lock sits in can leave a
+        // named pipe at its name. A blocking open of a pipe for writing waits
+        // for a reader, so the lock would never be taken nor refused.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = Scratch::for_test("provision", "lock-fifo");
+        let path = dir.join("rootfs.lock");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .expect("a named pipe can be made");
+        let attempt = |path: PathBuf| {
+            let (sent, received) = mpsc::channel();
+            std::thread::spawn(move || sent.send(lock_exclusive(&path).map(drop)));
+            received
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the lock returned rather than waiting on the pipe")
+        };
+        assert!(
+            attempt(path.clone()).is_err(),
+            "a pipe was taken for a lock"
+        );
+
+        // With a reader at its other end the open succeeds, and the pipe is
+        // refused as what it is.
+        let _reader = rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("the pipe opens for reading");
+        let err = attempt(path).expect_err("a pipe was taken for a lock");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     #[test]

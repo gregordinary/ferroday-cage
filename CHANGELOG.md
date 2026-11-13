@@ -914,6 +914,9 @@ consumer upgrading can skip it.
   tree it builds however the tree's path is spelled. A tree named with a
   trailing slash, as `/srv/upper/`, had its downloads placed inside the tree,
   within reach of the packages extracted there.
+- A publication, a removal or a pool publish refuses a lock path that holds
+  anything but a regular file. A named pipe left at the path held the call
+  waiting forever for a reader.
 
 ### Internal
 
