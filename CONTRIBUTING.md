@@ -532,6 +532,7 @@ report name a package and its version bare.
 | Declare an enum together with the roster of its own variants | `roster::roster_enum!` |
 | State a `poll` deadline | `poll::timeout` |
 | Stop watching a channel a `poll` loop has finished with | leave it out of the polled slice, as the `poll` module states |
+| Stop watching a channel the running handle's readiness set holds | `running::Readiness::close`, which takes it out of the epoll set before closing it, since a fork's copy of the descriptor would keep the registration |
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
 | Name, in an error or a progress report, a string a mirror, an index, a package, or a sandbox supplied | `{:?}`, which escapes a control character, as the `failure` module states, unless an alphabet without control characters already admitted the value |
 | Render an error with every cause beneath it | `ErrorChain` |

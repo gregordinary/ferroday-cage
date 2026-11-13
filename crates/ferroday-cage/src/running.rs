@@ -143,9 +143,7 @@ pub struct Running<'obs> {
     foreground: Option<mechanism::Foreground>,
     /// The readiness descriptor: an epoll set over the channels the pump
     /// would poll. See [`sync_readiness`](Self::sync_readiness).
-    ready: OwnedFd,
-    /// Which channels the readiness set holds, one bit per [`Watch`].
-    registered: u8,
+    ready: Readiness,
     /// The sandbox's cgroup, where the launch has one: read for the tree's
     /// usage and removed once the outcome is known.
     cgroup: Option<Cgroup>,
@@ -182,12 +180,74 @@ enum Pass {
     Served,
 }
 
-/// Creates the readiness descriptor a handle owns, before the launch it will
-/// serve, so a failure leaves nothing running.
-fn readiness() -> Result<OwnedFd, Error> {
-    epoll::create(epoll::CreateFlags::CLOEXEC).map_err(|errno| Error::Spawn {
-        source: errno.into(),
-    })
+/// A handle's readiness descriptor: an epoll set over the channels its pump
+/// polls, and which of them it holds.
+///
+/// An epoll registration belongs to the channel's open file description rather
+/// than to the descriptor the handle registered it through, and a close ends it
+/// only once no descriptor refers to that description. A fork copies the
+/// caller's whole descriptor table, so a process the caller forks while the
+/// sandbox runs holds every channel open after the handle has closed its own:
+/// another launch's stage until it sweeps its inherited descriptors, a child of
+/// the caller's own until it executes. A channel left to its close stays in the
+/// set for that long, hung up and so always ready, and an event loop waiting on
+/// the set spins. So a channel leaves the set through [`close`](Self::close),
+/// which takes it out before closing it, and the supervisor's pidfd, which the
+/// handle holds for its whole life, through [`remove`](Self::remove).
+struct Readiness {
+    /// The epoll set.
+    set: OwnedFd,
+    /// Which channels the set holds, one bit per [`Watch`].
+    registered: u8,
+}
+
+impl Readiness {
+    /// Creates the set a handle owns, before the launch it will serve, so a
+    /// failure leaves nothing running.
+    fn new() -> Result<Readiness, Error> {
+        let set = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(|errno| Error::Spawn {
+            source: errno.into(),
+        })?;
+        Ok(Readiness { set, registered: 0 })
+    }
+
+    /// The bit [`registered`](Self::registered) keeps for `watch`.
+    fn bit(watch: Watch) -> u8 {
+        1 << watch as u8
+    }
+
+    /// Whether the set holds `watch`'s channel.
+    fn holds(&self, watch: Watch) -> bool {
+        self.registered & Readiness::bit(watch) != 0
+    }
+
+    /// Adds `fd`, the channel `watch` names, to the set.
+    fn add(&mut self, watch: Watch, fd: BorrowedFd<'_>) -> Result<(), Error> {
+        let data = epoll::EventData::new_u64(watch as u64);
+        epoll::add(&self.set, fd, data, epoll::EventFlags::IN).map_err(wait_syscall_error)?;
+        self.registered |= Readiness::bit(watch);
+        Ok(())
+    }
+
+    /// Takes `fd`, the channel `watch` names, out of the set, leaving it open.
+    fn remove(&mut self, watch: Watch, fd: BorrowedFd<'_>) -> Result<(), Error> {
+        epoll::delete(&self.set, fd).map_err(wait_syscall_error)?;
+        self.registered &= !Readiness::bit(watch);
+        Ok(())
+    }
+
+    /// Closes the channel `slot` holds, if any, taking it out of the set first.
+    ///
+    /// The descriptor is closed whether or not the removal succeeds.
+    fn close(&mut self, watch: Watch, slot: &mut Option<OwnedFd>) -> Result<(), Error> {
+        let Some(fd) = slot.take() else {
+            return Ok(());
+        };
+        match self.holds(watch) {
+            true => self.remove(watch, fd.as_fd()),
+            false => Ok(()),
+        }
+    }
 }
 
 /// Which captured stream a read belongs to.
@@ -213,7 +273,7 @@ impl<'obs> Running<'obs> {
         if observe {
             check_capture_composes(plan)?;
         }
-        let ready = readiness()?;
+        let ready = Readiness::new()?;
         let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
         // The progress sink borrows the observer only for the launch; the
         // borrow ends with the statement, leaving the observer to move into
@@ -267,7 +327,7 @@ impl<'obs> Running<'obs> {
         terminal: &Terminal,
     ) -> Result<(Running<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
-        let ready = readiness()?;
+        let ready = Readiness::new()?;
         let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
         let mut created = Vec::new();
         let spawned = mechanism::spawn(
@@ -288,11 +348,11 @@ impl<'obs> Running<'obs> {
     }
 
     /// Wraps the caller-side channels of an already-launched sandbox.
-    pub(crate) fn from_launched(
+    fn from_launched(
         launched: mechanism::Launched,
         observer: Option<&'obs mut dyn Observer>,
         placeholders: PlaceholderGuard,
-        ready: OwnedFd,
+        ready: Readiness,
         cgroup: Option<Cgroup>,
     ) -> Running<'obs> {
         let buf = if observer.is_some() {
@@ -319,7 +379,6 @@ impl<'obs> Running<'obs> {
             _placeholders: placeholders,
             foreground: launched.foreground,
             ready,
-            registered: 0,
             cgroup_kill: cgroup.as_ref().and_then(Cgroup::kill_switch),
             cgroup,
         }
@@ -722,46 +781,36 @@ impl<'obs> Running<'obs> {
     /// supervisor has not been seen to exit. A pidfd stays readable once its
     /// process is gone, so the pump watches it only until it is first seen
     /// ready, and the set drops it then too. A stream and the status pipe
-    /// leave the set by being closed, which removes them.
+    /// leave the set as the pump closes them, through [`Readiness::close`].
     ///
     /// Run after every pass and by [`try_wait`](Self::try_wait), so the set
     /// follows the handle however it is driven.
     fn sync_readiness(&mut self) -> Result<(), Error> {
-        let mut registered = self.registered;
-        let awaiting = self.awaiting_supervisor();
         for (watch, fd) in [
-            (Watch::Stdout, self.stdout.as_ref().map(AsFd::as_fd)),
-            (Watch::Stderr, self.stderr.as_ref().map(AsFd::as_fd)),
-            (Watch::Status, self.status.as_ref().map(AsFd::as_fd)),
-            (Watch::Supervisor, awaiting.then(|| self.pidfd.as_fd())),
+            (Watch::Stdout, &self.stdout),
+            (Watch::Stderr, &self.stderr),
+            (Watch::Status, &self.status),
         ] {
-            let bit = 1u8 << watch as u8;
-            match (fd, registered & bit != 0) {
-                (Some(fd), false) => {
-                    let data = epoll::EventData::new_u64(watch as u64);
-                    epoll::add(&self.ready, fd, data, epoll::EventFlags::IN)
-                        .map_err(wait_syscall_error)?;
-                    registered |= bit;
-                }
-                (None, true) => {
-                    if watch == Watch::Supervisor {
-                        epoll::delete(&self.ready, &self.pidfd).map_err(wait_syscall_error)?;
-                    }
-                    registered &= !bit;
-                }
-                _ => {}
+            if let Some(fd) = fd
+                && !self.ready.holds(watch)
+            {
+                self.ready.add(watch, fd.as_fd())?;
             }
         }
-        self.registered = registered;
-        Ok(())
+        let supervisor = Watch::Supervisor;
+        match (self.awaiting_supervisor(), self.ready.holds(supervisor)) {
+            (true, false) => self.ready.add(supervisor, self.pidfd.as_fd()),
+            (false, true) => self.ready.remove(supervisor, self.pidfd.as_fd()),
+            _ => Ok(()),
+        }
     }
 
     /// Reads one chunk from a captured stream and delivers it; end-of-file
     /// retires the stream.
     fn drain_stream(&mut self, channel: Channel) -> Result<(), Error> {
-        let slot = match channel {
-            Channel::Stdout => &mut self.stdout,
-            Channel::Stderr => &mut self.stderr,
+        let (slot, watch) = match channel {
+            Channel::Stdout => (&mut self.stdout, Watch::Stdout),
+            Channel::Stderr => (&mut self.stderr, Watch::Stderr),
         };
         let Some(fd) = slot else {
             return Ok(());
@@ -778,9 +827,7 @@ impl<'obs> Running<'obs> {
             return Err(wait_syscall_error(Errno::PROTO));
         };
         match rustix::io::read(&*fd, &mut self.buf) {
-            Ok(0) => {
-                *slot = None;
-            }
+            Ok(0) => return self.ready.close(watch, slot),
             Ok(n) => {
                 let chunk = &self.buf[..n];
                 match channel {
@@ -797,38 +844,30 @@ impl<'obs> Running<'obs> {
     /// Accumulates the status record; the full record or end-of-file
     /// retires the pipe.
     fn drain_status(&mut self) -> Result<(), Error> {
-        // The descriptor comes out of its slot for the read so the record can be
-        // filled in place — the two are fields of the same struct, and the read
-        // borrows one immutably and the other mutably. Every path that leaves
-        // the pipe live puts it back; the two that retire it (end of file, and a
-        // complete record) simply do not.
-        let Some(fd) = self.status.take() else {
+        let Some(fd) = &self.status else {
             return Ok(());
         };
-        match rustix::io::read(&fd, &mut self.record[self.record_len..]) {
-            Ok(0) => {}
+        match rustix::io::read(fd, &mut self.record[self.record_len..]) {
+            Ok(0) => self.ready.close(Watch::Status, &mut self.status),
             Ok(n) => {
                 self.record_len += n;
-                if self.record_len == self.record.len() {
-                    // A record this build never writes is a defect in the
-                    // library, not a caller error, but the decode still must
-                    // not panic: EPROTO retires the pipe and fails the wait.
-                    let Some((status, usage)) = mechanism::decode_status(self.record) else {
-                        return Err(wait_syscall_error(Errno::PROTO));
-                    };
-                    self.outcome = Some(status);
-                    self.usage = usage;
-                } else {
-                    self.status = Some(fd);
+                if self.record_len < self.record.len() {
+                    return Ok(());
                 }
+                let closed = self.ready.close(Watch::Status, &mut self.status);
+                // A record this build never writes is a defect in the library,
+                // not a caller error, but the decode still must not panic:
+                // EPROTO fails the wait, with the pipe retired.
+                let Some((status, usage)) = mechanism::decode_status(self.record) else {
+                    return Err(wait_syscall_error(Errno::PROTO));
+                };
+                self.outcome = Some(status);
+                self.usage = usage;
+                closed
             }
-            Err(Errno::INTR) => self.status = Some(fd),
-            Err(errno) => {
-                self.status = Some(fd);
-                return Err(wait_syscall_error(errno));
-            }
+            Err(Errno::INTR) => Ok(()),
+            Err(errno) => Err(wait_syscall_error(errno)),
         }
-        Ok(())
     }
 }
 
@@ -845,7 +884,7 @@ impl AsFd for Running<'_> {
     /// again. A duplicate, such as one an event loop that owns its descriptors
     /// takes, watches the same set.
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.ready.as_fd()
+        self.ready.set.as_fd()
     }
 }
 
@@ -1356,7 +1395,7 @@ impl<'obs> Pending<'obs> {
     pub fn proceed(mut self) -> Result<Running<'obs>, Error> {
         // Before the gate opens: a failure here drops the pending launch,
         // which tears it down.
-        let ready = readiness()?;
+        let ready = Readiness::new()?;
         let inner = self
             .inner
             .take()
@@ -1495,6 +1534,7 @@ fn signal_error(errno: Errno) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use ferroday_cage_testkit::fd::readable_by;
     use rustix::pipe::{PipeFlags, pipe_with};
     use rustix::process::{Pid, PidfdFlags};
 
@@ -1653,7 +1693,7 @@ mod tests {
             },
             Some(&mut observer),
             PlaceholderGuard::default(),
-            readiness().expect("an epoll set"),
+            Readiness::new().expect("an epoll set"),
             None,
         );
 
@@ -1673,5 +1713,91 @@ mod tests {
             used < IDLE_TICKS,
             "the wait spun: {used} ticks while the stream was held open"
         );
+    }
+
+    /// A fork copies the descriptor table, so a process the caller forks while
+    /// a sandbox runs, another launch's stage before its sweep among them,
+    /// holds the sandbox's channels open after the handle has closed them. A
+    /// channel the handle has finished with leaves the readiness set all the
+    /// same, or the set reports it, hung up, for as long as the copy lives,
+    /// and an event loop waiting on the set spins.
+    #[test]
+    fn a_closed_channel_leaves_the_readiness_set_while_a_copy_of_it_lives() {
+        // The supervisor: a process that exits and is reaped before the wait.
+        let mut supervisor = std::process::Command::new("true")
+            .spawn()
+            .expect("a process to stand for the supervisor");
+        let pidfd = pidfd_of(&supervisor);
+        supervisor.wait().expect("the stand-in is reaped");
+
+        let (status, status_write) = pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        let (stdout, stdout_write) = pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        // What a concurrent fork holds: the channels' own open file
+        // descriptions, under descriptors of its own.
+        let copies = [&status, &stdout].map(|fd| fd.try_clone().expect("a duplicate"));
+
+        let (control, _peer) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket pair stands in for the control channel");
+        let mut collect = Collect::default();
+        let mut running = Running::from_launched(
+            mechanism::Launched {
+                pidfd,
+                pid: supervisor.id(),
+                control,
+                status,
+                stdout: Some(stdout),
+                stderr: None,
+                reap: None,
+                foreground: None,
+            },
+            Some(&mut collect),
+            PlaceholderGuard::default(),
+            Readiness::new().expect("an epoll set"),
+            None,
+        );
+        let quiet = |running: &Running<'_>| {
+            !readable_by(running, Instant::now() + Duration::from_millis(100))
+        };
+
+        // The command writes its output and closes it; its outcome is still
+        // to come.
+        rustix::io::write(&stdout_write, b"out").expect("the output fits the pipe");
+        drop(stdout_write);
+        for _ in 0..10 {
+            if running.stdout.is_none() {
+                break;
+            }
+            assert_eq!(running.try_wait().expect("the stream is served"), None);
+        }
+        assert!(running.stdout.is_none(), "the stream was never closed");
+        assert!(quiet(&running), "the set reports the closed stream");
+
+        // The outcome arrives, and the supervisor that sent it is gone.
+        let record = mechanism::encode_status(mechanism::STATUS_EXITED, 0, None);
+        rustix::io::write(&status_write, &record).expect("the record fits the pipe");
+        drop(status_write);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let outcome = loop {
+            if let Some(outcome) = running.try_wait().expect("the outcome is collected") {
+                break outcome;
+            }
+            assert!(
+                readable_by(&running, deadline),
+                "the outcome went unreported"
+            );
+        };
+        assert_eq!(outcome.code(), Some(0));
+        assert!(
+            quiet(&running),
+            "the set reports a channel once the outcome is known"
+        );
+        drop(running);
+        drop(copies);
+        assert_eq!(collect.into_output(outcome, None).stdout, b"out");
     }
 }
