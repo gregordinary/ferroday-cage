@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
@@ -235,12 +236,28 @@ impl Session {
         writeln!(input, "{line}").expect("the command's input takes a line");
     }
 
-    /// How many entries `fcage`'s `/proc/<pid>/<what>` directory holds: its
-    /// threads for `task`, its descriptors for `fd`.
-    fn count(&self, what: &str) -> usize {
-        std::fs::read_dir(format!("/proc/{}/{what}", self.pid))
+    /// How many threads `fcage` runs.
+    fn threads(&self) -> usize {
+        std::fs::read_dir(format!("/proc/{}/task", self.pid))
             .expect("the run's process can be read")
             .count()
+    }
+
+    /// The sockets `fcage` holds, each named as `/proc/<pid>/fd` links it, by
+    /// its inode.
+    ///
+    /// A socket keeps its name for as long as it is open and no other takes it,
+    /// so one in this set and not in an earlier one was opened in between,
+    /// whatever else was closed meanwhile. That is what a count of every
+    /// descriptor cannot tell: the command can run before the launch has closed
+    /// all of its own, and those it closes later would hide those the forward
+    /// opens.
+    fn sockets(&self) -> BTreeSet<String> {
+        std::fs::read_dir(format!("/proc/{}/fd", self.pid))
+            .expect("the run's process can be read")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter_map(|link| link.to_str()?.strip_prefix("socket:").map(str::to_owned))
+            .collect()
     }
 
     /// Whether `fcage` has exited. It is not reaped until the run is
@@ -254,21 +271,22 @@ impl Session {
         state == Some("Z")
     }
 
-    /// Waits until `fcage` holds at least `wanted` descriptors, failing the
-    /// test past [`PATIENCE`]; or, with `or_exit`, until it has exited.
-    fn await_descriptors(&self, wanted: usize, or_exit: bool) {
+    /// Waits until `fcage` holds at least `wanted` sockets that are not among
+    /// `before`, failing the test past [`PATIENCE`]; or, with `or_exit`, until
+    /// it has exited.
+    fn await_new_sockets(&self, before: &BTreeSet<String>, wanted: usize, or_exit: bool) {
         let deadline = Instant::now() + PATIENCE;
         loop {
             if or_exit && self.exited() {
                 return;
             }
-            let held = self.count("fd");
-            if held >= wanted {
+            let new = self.sockets().difference(before).count();
+            if new >= wanted {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "fcage held {held} descriptors, not {wanted}, after {PATIENCE:?}"
+                "fcage opened {new} sockets, not {wanted}, in {PATIENCE:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -317,7 +335,7 @@ impl Drop for Session {
 /// Returns what the run did, failing the test if the run outlasts
 /// [`PROMPTLY`] from the command's end.
 ///
-/// `fcage` holds two descriptors more once the forward has accepted the
+/// `fcage` holds two sockets more once the forward has accepted the
 /// connection and opened the socket that connects to the target, which it does
 /// in the same step, before it next waits.
 fn connect_and_end(rootfs: &std::path::Path, target: &str) -> Output {
@@ -328,9 +346,9 @@ fn connect_and_end(rootfs: &std::path::Path, target: &str) -> Output {
         "echo ready; read go; nc 127.0.0.1 4100 </dev/null & read end; echo marker",
     );
     session.expect_line("ready");
-    let held = session.count("fd");
+    let before = session.sockets();
     session.send("go");
-    session.await_descriptors(held + 2, false);
+    session.await_new_sockets(&before, 2, false);
     session.send("end");
     session.finish(PROMPTLY)
 }
@@ -583,11 +601,11 @@ fn a_run_its_timeout_ends_does_not_wait_for_a_target_with_a_full_queue() {
         "echo ready; read go; nc 127.0.0.1 4100 </dev/null & exec sleep 60",
     );
     session.expect_line("ready");
-    let held = session.count("fd");
+    let before = session.sockets();
     session.send("go");
     // The timeout counts from the launch and does not wait for this test, so
     // a run it has already ended is as good as a forward that has accepted.
-    session.await_descriptors(held + 2, true);
+    session.await_new_sockets(&before, 2, true);
     let output = session.finish(PROMPTLY);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -614,12 +632,12 @@ fn a_unix_target_whose_queue_was_full_takes_the_connection_once_it_has_room() {
         "echo ready; read go; echo from-the-sandbox | nc 127.0.0.1 4100",
     );
     session.expect_line("ready");
-    let held = session.count("fd");
+    let before = session.sockets();
     session.send("go");
     // The forward has accepted the command's connection and met the full
     // queue. Taking the connection that fills it makes room, and the forward's
     // next attempt is queued behind it.
-    session.await_descriptors(held + 2, false);
+    session.await_new_sockets(&before, 2, false);
     let queued = rustix::net::accept_with(&target, SocketFlags::CLOEXEC)
         .expect("the filling connection is accepted");
     drop((queued, filler));
@@ -667,7 +685,7 @@ fn a_forward_holds_its_budget_on_one_thread_and_closes_what_is_past_it() {
     );
     let mut session = Session::start(rootfs, &[], &socket, &script);
     session.expect_line("ready");
-    let (threads, descriptors) = (session.count("task"), session.count("fd"));
+    let (threads, before) = (session.threads(), session.sockets());
     session.send("go");
 
     // The target takes every connection the forward makes and holds it,
@@ -695,16 +713,19 @@ fn a_forward_holds_its_budget_on_one_thread_and_closes_what_is_past_it() {
     }
 
     // Measured while every connection is held: one thread whatever the
-    // count, and two descriptors for each connection the forward carries.
-    assert_eq!(
-        session.count("task"),
-        threads,
-        "the forward's threads grew with its connections"
-    );
-    let now_held = session.count("fd");
+    // count, and two sockets for each connection the forward carries. The
+    // threads are bounded rather than matched, for the reason the sockets are
+    // counted by name: the launch may still have been ending one of its own
+    // when the command said it was ready.
+    let now = session.threads();
     assert!(
-        now_held <= descriptors + 2 * BUDGET,
-        "fcage holds {now_held} descriptors for {BUDGET} connections, from {descriptors}"
+        now <= threads,
+        "the forward's threads grew with its connections, from {threads} to {now}"
+    );
+    let opened = session.sockets().difference(&before).count();
+    assert!(
+        opened <= 2 * BUDGET,
+        "fcage opened {opened} sockets for {BUDGET} connections"
     );
 
     session.send("end");
