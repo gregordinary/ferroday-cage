@@ -1,6 +1,7 @@
-//! The exit status of a sandboxed command.
+//! The exit status of a sandboxed command, and what it used.
 
 use std::fmt;
+use std::time::Duration;
 
 /// How the sandboxed command terminated.
 ///
@@ -114,6 +115,44 @@ impl fmt::Display for ExitStatus {
             Kind::Signaled(signal) => write!(f, "terminated by signal {signal}"),
         }
     }
+}
+
+/// What a sandboxed command and its descendants used of the processor and of
+/// memory.
+///
+/// Reported by [`Running::usage`] and carried on [`Output::usage`] once the
+/// command's exit has been collected. The supervisor reads it from the kernel
+/// (`getrusage` over its reaped children) right after it collects that exit,
+/// so it covers the command and every descendant that had exited and been
+/// collected by then:
+///
+/// - Under a PID namespace, the default, the sandbox's init collects every
+///   process of the namespace that exits, so a descendant counts whether the
+///   command waited for it or it was orphaned to the init.
+/// - Without one, a descendant counts only through the process that waited for
+///   it. An orphan is collected outside the sandbox and is not counted.
+///
+/// A process still running when the command exits is not counted: under a PID
+/// namespace the teardown ends it, and without one it runs on outside the
+/// sandbox.
+///
+/// [`Running::usage`]: crate::Running::usage
+/// [`Output::usage`]: crate::Output::usage
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ResourceUsage {
+    /// Processor time the processes spent in user mode, summed over them.
+    pub user_time: Duration,
+    /// Processor time the kernel spent on the processes' behalf, summed over
+    /// them.
+    pub system_time: Duration,
+    /// The largest resident set size any one of the processes reached, in
+    /// bytes.
+    ///
+    /// The peak of the largest process, not a sum: two processes that each
+    /// held 100 MiB report 100 MiB, whether or not they ran at once. The
+    /// kernel counts it in kibibytes, so it is a multiple of 1024.
+    pub peak_rss_bytes: u64,
 }
 
 #[cfg(test)]

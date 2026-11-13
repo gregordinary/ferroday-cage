@@ -49,6 +49,8 @@ const _: () = assert_send_sync::<ferroday_cage::Stdio>();
 const _: () = assert_send_sync::<ferroday_cage::Terminal>();
 const _: () = assert_send_sync::<ferroday_cage::Pty>();
 const _: () = assert_send_sync::<ferroday_cage::ExitStatus>();
+const _: () = assert_send_sync::<ferroday_cage::ResourceUsage>();
+const _: () = assert_send_sync::<ferroday_cage::Output>();
 const _: () = assert_send_sync::<ferroday_cage::KillHandle>();
 
 // Errors cross thread boundaries constantly — a worker returning one to a

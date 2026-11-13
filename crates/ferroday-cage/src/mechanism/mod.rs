@@ -128,6 +128,7 @@ use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::RawMode;
@@ -143,7 +144,7 @@ use crate::error::{Error, SetupStep};
 use crate::host;
 use crate::idmap::{IdMapper, ResolvedMap};
 use crate::observer::Progress;
-use crate::status::ExitStatus;
+use crate::status::{ExitStatus, ResourceUsage};
 use crate::terminal::Terminal;
 use sys::Fork;
 
@@ -1031,19 +1032,70 @@ pub(crate) const STATUS_EXITED: u32 = 1;
 /// signal.
 pub(crate) const STATUS_SIGNALED: u32 = 2;
 
-/// Decodes the 8-byte status record the supervisor writes.
+/// The length of the status record the supervisor writes once it has collected
+/// the command's exit, little-endian throughout:
 ///
-/// `None` for a kind this build never writes, which is a defect in this
-/// library: the reader reports it as a broken protocol rather than panicking,
-/// the same posture the report decoder takes.
-pub(crate) fn decode_status(record: [u8; 8]) -> Option<ExitStatus> {
-    let kind = u32::from_le_bytes(record[0..4].try_into().expect("slice length is 4"));
-    let value = i32::from_le_bytes(record[4..8].try_into().expect("slice length is 4"));
-    match kind {
-        STATUS_EXITED => Some(ExitStatus::exited(value)),
-        STATUS_SIGNALED => Some(ExitStatus::signaled(value)),
-        _ => None,
+/// | Bytes | Field |
+/// | --- | --- |
+/// | 0..4 | The kind, [`STATUS_EXITED`] or [`STATUS_SIGNALED`] |
+/// | 4..8 | The exit code, or the signal number |
+/// | 8..12 | 1 when the three fields below hold what `getrusage` reported, 0 when it failed |
+/// | 12..20 | User processor time, in microseconds |
+/// | 20..28 | System processor time, in microseconds |
+/// | 28..36 | The peak resident set size, in kibibytes |
+///
+/// Short of `PIPE_BUF`, so the one write that carries it is atomic.
+pub(crate) const STATUS_RECORD_LEN: usize = 36;
+
+/// Encodes the status record [`STATUS_RECORD_LEN`] lays out.
+///
+/// Copies and integer arithmetic only, since the supervisor calls it after a
+/// fork.
+pub(crate) fn encode_status(
+    kind: u32,
+    value: i32,
+    usage: Option<&sys::Rusage>,
+) -> [u8; STATUS_RECORD_LEN] {
+    let mut record = [0u8; STATUS_RECORD_LEN];
+    record[0..4].copy_from_slice(&kind.to_le_bytes());
+    record[4..8].copy_from_slice(&value.to_le_bytes());
+    if let Some(usage) = usage {
+        let rss = u64::try_from(usage.maxrss).unwrap_or(0);
+        record[8..12].copy_from_slice(&1u32.to_le_bytes());
+        record[12..20].copy_from_slice(&usage.utime.micros().to_le_bytes());
+        record[20..28].copy_from_slice(&usage.stime.micros().to_le_bytes());
+        record[28..36].copy_from_slice(&rss.to_le_bytes());
     }
+    record
+}
+
+/// Decodes the status record [`encode_status`] writes, into the command's exit
+/// status and, where the supervisor could read it, what the command used.
+///
+/// `None` for a kind or a usage flag this build never writes, which is a defect
+/// in this library: the reader reports it as a broken protocol rather than
+/// panicking, the same posture the report decoder takes.
+pub(crate) fn decode_status(
+    record: [u8; STATUS_RECORD_LEN],
+) -> Option<(ExitStatus, Option<ResourceUsage>)> {
+    let word = |at: usize| u32::from_le_bytes(record[at..at + 4].try_into().expect("four bytes"));
+    let wide = |at: usize| u64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"));
+    let value = word(4) as i32;
+    let status = match word(0) {
+        STATUS_EXITED => ExitStatus::exited(value),
+        STATUS_SIGNALED => ExitStatus::signaled(value),
+        _ => return None,
+    };
+    let usage = match word(8) {
+        0 => None,
+        1 => Some(ResourceUsage {
+            user_time: Duration::from_micros(wide(12)),
+            system_time: Duration::from_micros(wide(20)),
+            peak_rss_bytes: wide(28).saturating_mul(1024),
+        }),
+        _ => return None,
+    };
+    Some((status, usage))
 }
 
 /// The tag of a report record saying the setup created a file-bind target:
@@ -2320,23 +2372,51 @@ pub(crate) fn wait_syscall_error(errno: Errno) -> Error {
 mod tests {
     use super::*;
 
-    /// Builds a status record from its two little-endian words.
-    fn record(kind: u32, value: i32) -> [u8; 8] {
-        let mut record = [0u8; 8];
-        record[0..4].copy_from_slice(&kind.to_le_bytes());
-        record[4..8].copy_from_slice(&value.to_le_bytes());
-        record
+    /// Builds a status record carrying no usage.
+    fn record(kind: u32, value: i32) -> [u8; STATUS_RECORD_LEN] {
+        encode_status(kind, value, None)
     }
 
     #[test]
     fn a_status_record_decodes_both_kinds() {
-        let exited = decode_status(record(STATUS_EXITED, 42)).expect("a written kind decodes");
+        let (exited, usage) =
+            decode_status(record(STATUS_EXITED, 42)).expect("a written kind decodes");
         assert_eq!(exited.code(), Some(42));
         assert_eq!(exited.signal(), None);
+        assert_eq!(usage, None);
 
-        let signaled = decode_status(record(STATUS_SIGNALED, 9)).expect("a written kind decodes");
+        let (signaled, _) =
+            decode_status(record(STATUS_SIGNALED, 9)).expect("a written kind decodes");
         assert_eq!(signaled.code(), None);
         assert_eq!(signaled.signal(), Some(9));
+    }
+
+    #[test]
+    fn a_status_record_carries_the_usage_through() {
+        let usage = sys::children_usage().expect("the usage is read");
+        let (status, decoded) = decode_status(encode_status(STATUS_EXITED, 0, Some(&usage)))
+            .expect("a written record decodes");
+        assert!(status.success());
+        let decoded = decoded.expect("the usage was written");
+        assert_eq!(
+            decoded.user_time,
+            Duration::from_micros(usage.utime.micros())
+        );
+        assert_eq!(
+            decoded.system_time,
+            Duration::from_micros(usage.stime.micros())
+        );
+        assert_eq!(
+            decoded.peak_rss_bytes,
+            u64::try_from(usage.maxrss).expect("a size is not negative") * 1024
+        );
+    }
+
+    #[test]
+    fn an_unknown_usage_flag_decodes_to_nothing() {
+        let mut written = record(STATUS_EXITED, 0);
+        written[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_status(written).is_none());
     }
 
     /// Labels with nothing in them but the Landlock rules given.

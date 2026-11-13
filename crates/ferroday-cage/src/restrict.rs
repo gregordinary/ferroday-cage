@@ -146,7 +146,7 @@ use crate::limits::{Limit, Resource};
 use crate::mechanism::{
     Confinement, HardeningPlan, IdentityPlan, LaunchPlan, ManagedPlaceholders, StdioPlan,
 };
-use crate::observer::{Collect, Observer, Output};
+use crate::observer::{Observer, Output};
 use crate::running::Running;
 use crate::spec::{self, Stdio};
 use crate::status::ExitStatus;
@@ -248,9 +248,7 @@ impl Restriction {
     /// volume the caller does not control, stream through an [`Observer`] that
     /// caps what it keeps instead.
     pub fn output(&self) -> Result<Output, Error> {
-        let mut collect = Collect::default();
-        let status = self.run_with(&mut collect)?;
-        Ok(collect.into_output(status))
+        Running::output(&self.plan)
     }
 
     /// Starts the command under the restriction and returns a handle to it.

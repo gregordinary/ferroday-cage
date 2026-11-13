@@ -77,6 +77,10 @@ fn landlock_allows_a_granted_path_and_denies_the_rest() {
         "reading a granted path must succeed"
     );
     assert_eq!(output.stdout, b"granted contents\n");
+    assert!(
+        output.usage.is_some(),
+        "the supervisor outside a restriction reports the usage"
+    );
 
     // The same command against the ungranted directory is denied by the
     // ruleset, so cat exits non-zero.

@@ -82,6 +82,9 @@ means the command is executing.
   namespace with it. Nothing inside survives.
 - **`kill_handle()`** returns a detached handle that can terminate or kill
   from another thread while one blocks in a wait.
+- **`usage()`** reports, once a wait has returned the outcome, the processor
+  time and peak memory the command and its descendants used. See
+  [Resource usage](#resource-usage).
 
 The bounded-stop recipe composes them:
 
@@ -166,8 +169,31 @@ short-lived launch stage is collected during `spawn` (or by `wait`, without a
 PID namespace), and the in-namespace init is not the caller's child process
 at all.
 
+## Resource usage
+
+The library does the waiting, so it also reports what the wait would have told
+the caller. [`Running::usage`] returns a [`ResourceUsage`]: user and system
+processor time, and the largest peak resident set size any one process reached.
+[`Output`] carries the same value.
+
+The supervisor reads the figures from the kernel right after it collects the
+command's exit. They cover every process collected by then:
+
+- **Under a PID namespace**, every process of the sandbox that had exited. The
+  init collects the orphans as well as the command, so a descendant counts
+  whether or not the command waited for it.
+- **Without one**, a descendant counts only through the process that waited for
+  it. An orphan reparents outside the sandbox and is not counted.
+
+A process still running when the command exits is not counted. A kill under a
+PID namespace ends the init before it reports, so a killed sandbox has an
+outcome and no usage.
+
 [`run`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.run
 [`spawn`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.spawn
 [`terminate`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.terminate
 [`kill`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.kill
+[`Running::usage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.usage
+[`ResourceUsage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.ResourceUsage.html
+[`Output`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Output.html
 [`pid_namespace(false)`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.pid_namespace

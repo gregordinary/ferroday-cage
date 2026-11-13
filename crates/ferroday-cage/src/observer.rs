@@ -1,7 +1,7 @@
 //! Live output streaming to a caller-supplied observer, and the collected
 //! whole-run form built on it.
 
-use crate::status::ExitStatus;
+use crate::status::{ExitStatus, ResourceUsage};
 
 /// A milestone in a sandbox launch, reported to [`Observer::progress`].
 ///
@@ -150,6 +150,9 @@ pub struct Output {
     /// The command's exit status. As everywhere in this library, a non-zero
     /// exit is data rather than an error.
     pub status: ExitStatus,
+    /// What the command and its descendants used of the processor and of
+    /// memory, as [`Running::usage`](crate::Running::usage) reports it.
+    pub usage: Option<ResourceUsage>,
     /// Everything the command wrote to standard output, concatenated in
     /// order. Raw bytes: not lines, and not guaranteed to be UTF-8.
     pub stdout: Vec<u8>,
@@ -169,10 +172,11 @@ pub(crate) struct Collect {
 }
 
 impl Collect {
-    /// Pairs what was collected with the command's outcome.
-    pub(crate) fn into_output(self, status: ExitStatus) -> Output {
+    /// Pairs what was collected with the command's outcome and usage.
+    pub(crate) fn into_output(self, status: ExitStatus, usage: Option<ResourceUsage>) -> Output {
         Output {
             status,
+            usage,
             stdout: self.stdout,
             stderr: self.stderr,
         }

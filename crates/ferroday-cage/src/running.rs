@@ -19,12 +19,12 @@ use rustix::process::Signal;
 use crate::error::Error;
 use crate::mechanism::{
     self, CONTROL_TERMINATE, CreatedTarget, LaunchPlan, ManagedPlaceholders, MountOp,
-    wait_syscall_error,
+    STATUS_RECORD_LEN, wait_syscall_error,
 };
-use crate::observer::Observer;
+use crate::observer::{Collect, Observer, Output};
 use crate::poll;
 use crate::provision::rooted::Rooted;
-use crate::status::ExitStatus;
+use crate::status::{ExitStatus, ResourceUsage};
 use crate::terminal::{Pty, Terminal};
 
 /// The pump's read buffer size: one read per poll wake per stream.
@@ -93,11 +93,13 @@ pub struct Running<'obs> {
     stderr: Option<OwnedFd>,
     /// The observer receiving captured output, when capturing.
     observer: Option<&'obs mut dyn Observer>,
-    /// Accumulates the 8-byte status record across partial reads.
-    record: [u8; 8],
+    /// Accumulates the status record across partial reads.
+    record: [u8; STATUS_RECORD_LEN],
     record_len: usize,
     /// The command's outcome, once known — the fuse for repeated waits.
     outcome: Option<ExitStatus>,
+    /// What the command used, once its status record has arrived carrying it.
+    usage: Option<ResourceUsage>,
     /// Whether a kill was requested through this handle or a [`KillHandle`];
     /// decides how a status pipe that closes without a record is read.
     kill_sent: Arc<AtomicBool>,
@@ -179,6 +181,20 @@ impl<'obs> Running<'obs> {
         Ok(Running::from_launched(launched, observer, placeholders))
     }
 
+    /// Launches the plan capturing both streams whole, waits for it, and
+    /// returns the outcome with everything the command wrote: what
+    /// [`Cage::output`](crate::Cage::output) and its restriction counterpart
+    /// return.
+    pub(crate) fn output(plan: &LaunchPlan) -> Result<Output, Error> {
+        let mut collect = Collect::default();
+        let (status, usage) = {
+            let mut running = Running::launch(plan, Some(&mut collect))?;
+            let status = running.wait()?;
+            (status, running.usage())
+        };
+        Ok(collect.into_output(status, usage))
+    }
+
     /// Launches the plan on a pseudoterminal of its own, returning the handle
     /// and the caller's end of the terminal.
     ///
@@ -219,9 +235,10 @@ impl<'obs> Running<'obs> {
             stdout: launched.stdout,
             stderr: launched.stderr,
             observer,
-            record: [0; 8],
+            record: [0; STATUS_RECORD_LEN],
             record_len: 0,
             outcome: None,
+            usage: None,
             kill_sent: Arc::new(AtomicBool::new(false)),
             reap: launched.reap,
             supervisor_exited: false,
@@ -324,6 +341,19 @@ impl<'obs> Running<'obs> {
     /// outlives the command can hold open without a PID namespace.
     pub(crate) fn status_pipe(&self) -> Option<BorrowedFd<'_>> {
         self.status.as_ref().map(AsFd::as_fd)
+    }
+
+    /// What the command and its descendants used of the processor and of
+    /// memory, once a wait has returned the command's outcome.
+    ///
+    /// [`ResourceUsage`] says which processes it covers. `None` before the
+    /// outcome is known, and for an outcome the supervisor did not report:
+    /// under a PID namespace a [`kill`](Self::kill) ends the init that would
+    /// have reported it, so a killed sandbox has an outcome and no usage.
+    /// Without one the kill ends only the command, and its usage is reported
+    /// as for any other exit.
+    pub fn usage(&self) -> Option<ResourceUsage> {
+        self.usage
     }
 
     /// Requests graceful termination: SIGTERM to the command.
@@ -584,10 +614,11 @@ impl<'obs> Running<'obs> {
                     // A record this build never writes is a defect in the
                     // library, not a caller error, but the decode still must
                     // not panic: EPROTO retires the pipe and fails the wait.
-                    let Some(status) = mechanism::decode_status(self.record) else {
+                    let Some((status, usage)) = mechanism::decode_status(self.record) else {
                         return Err(wait_syscall_error(Errno::PROTO));
                     };
                     self.outcome = Some(status);
+                    self.usage = usage;
                 } else {
                     self.status = Some(fd);
                 }
@@ -607,6 +638,7 @@ impl fmt::Debug for Running<'_> {
         f.debug_struct("Running")
             .field("pid", &self.pid)
             .field("outcome", &self.outcome)
+            .field("usage", &self.usage)
             .finish_non_exhaustive()
     }
 }
@@ -1213,8 +1245,7 @@ mod tests {
 
         // The outcome is already waiting in the status pipe.
         let (status, status_write) = pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
-        let mut record = [0u8; 8];
-        record[..4].copy_from_slice(&mechanism::STATUS_EXITED.to_le_bytes());
+        let record = mechanism::encode_status(mechanism::STATUS_EXITED, 0, None);
         rustix::io::write(&status_write, &record).expect("the record fits the pipe");
         drop(status_write);
 

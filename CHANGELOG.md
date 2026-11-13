@@ -51,6 +51,13 @@ consumer upgrading can skip it.
   set. It is a presentation, not a boundary: on the host the command is still
   the caller. `fcage --present-as UID:GID|own` and the profile key `present-as`
   reach it, and `ResolvedInputs::present_as` reports it. A range map refuses it.
+- `Running::usage` reports what the command and its descendants used once a
+  wait has returned the outcome, as a `ResourceUsage`: user and system processor
+  time, and the largest peak resident set size one process reached. `Output`
+  carries it as `usage`. The supervisor reads it after collecting the command's
+  exit, so it covers every process collected by then, which under a PID
+  namespace includes the orphans the init collected. A kill under a PID
+  namespace reports no usage.
 
 ### Changed
 

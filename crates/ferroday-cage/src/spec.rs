@@ -20,7 +20,7 @@ use crate::mechanism::{
     MountDir, MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, PresentPlan,
     RlimitPlan, RunAsPlan, StdioPlan,
 };
-use crate::observer::{Collect, Observer, Output};
+use crate::observer::{Observer, Output};
 use crate::path;
 use crate::provision::rooted::Rooted;
 use crate::resolved::ResolvedInputs;
@@ -615,9 +615,7 @@ impl Cage {
     /// of the wait; see [`Running::wait`](crate::Running::wait) for the case
     /// where the command leaves descendants behind.
     pub fn output(&self) -> Result<Output, Error> {
-        let mut collect = Collect::default();
-        let status = self.run_with(&mut collect)?;
-        Ok(collect.into_output(status))
+        Running::output(&self.plan)
     }
 
     /// Starts the command inside the sandbox and returns a handle to it.

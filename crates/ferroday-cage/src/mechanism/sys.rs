@@ -1,5 +1,6 @@
 //! The process-level system calls the launch path makes itself: fork, exec,
-//! exit, a signal's disposition, and the signal mask.
+//! exit, a signal's disposition, the signal mask, and what reaped children
+//! used.
 //!
 //! rustix keeps these in a module reserved for libc-like runtimes, whose name
 //! it does not hold stable for anyone else, so they are issued here through the
@@ -14,7 +15,7 @@
 //! between them, riscv64 having no restorer field, is spelled out where it
 //! applies. An architecture outside the gate does not build.
 
-use std::ffi::{CStr, c_ulong};
+use std::ffi::{CStr, c_long, c_ulong};
 
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal};
@@ -305,6 +306,63 @@ pub(crate) unsafe fn tkill(tid: Pid, signal: Signal) -> Result<(), Errno> {
         .map_err(errno)
 }
 
+/// The kernel's `struct timeval` as `struct rusage` carries it: seconds and
+/// microseconds, each a `long`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Timeval {
+    sec: c_long,
+    usec: c_long,
+}
+
+impl Timeval {
+    /// The time in microseconds.
+    ///
+    /// Saturating rather than wrapping, and a negative field read as zero,
+    /// which the kernel never reports: the supervisor calls this after a fork,
+    /// where an overflow must not panic.
+    pub(crate) fn micros(self) -> u64 {
+        let sec = u64::try_from(self.sec).unwrap_or(0);
+        let usec = u64::try_from(self.usec).unwrap_or(0);
+        sec.saturating_mul(1_000_000).saturating_add(usec)
+    }
+}
+
+/// The kernel's `struct rusage`, as `getrusage` writes it: two `timeval`s and
+/// fourteen `long`s on every architecture.
+///
+/// Only the fields the crate reads are named. The rest are counters this crate
+/// does not report, and several of them Linux leaves at zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Rusage {
+    /// The processor time spent in user mode.
+    pub(crate) utime: Timeval,
+    /// The processor time spent in the kernel.
+    pub(crate) stime: Timeval,
+    /// The peak resident set size, in kibibytes.
+    pub(crate) maxrss: c_long,
+    rest: [c_long; 13],
+}
+
+/// `getrusage`'s selector for the calling process's children.
+const RUSAGE_CHILDREN: isize = -1;
+
+/// What the calling process's children have used: every child that has exited
+/// and been waited for, with each of the descendants that child waited for in
+/// turn.
+///
+/// The times are sums over those processes. The peak resident set size is the
+/// largest any one of them reached, not a sum.
+pub(crate) fn children_usage() -> Result<Rusage, Errno> {
+    let mut usage = Rusage::default();
+    // SAFETY: `usage` is a live, writable `struct rusage` of the kernel's
+    // layout for the duration of the call, and nothing else refers to it.
+    unsafe { syscalls::syscall!(Sysno::getrusage, RUSAGE_CHILDREN, &raw mut usage as usize) }
+        .map(|_| usage)
+        .map_err(errno)
+}
+
 /// A `syscalls` errno as the rustix errno the rest of the crate speaks.
 pub(crate) fn errno(err: syscalls::Errno) -> Errno {
     Errno::from_raw_os_error(err.into_raw())
@@ -479,6 +537,35 @@ mod tests {
             set_disposition(Signal::KILL, Disposition::Ignore),
             Err(Errno::INVAL),
         );
+    }
+
+    #[test]
+    fn a_reaped_child_s_processor_time_is_counted() {
+        // Other tests reap children of this process concurrently, so the
+        // counters only grow past what this test adds; the assertion is a floor.
+        let before = children_usage().expect("the usage is read");
+        let spin = std::time::Duration::from_millis(200);
+        // SAFETY: the child reads the monotonic clock, which takes no lock and
+        // allocates nothing, and calls `exit_group`.
+        match unsafe { fork() }.expect("the fork succeeds") {
+            Fork::Child => {
+                let started = std::time::Instant::now();
+                while started.elapsed() < spin {
+                    std::hint::spin_loop();
+                }
+                exit_group(0)
+            }
+            Fork::ParentOf(child) => {
+                rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty())
+                    .expect("the child is collected");
+            }
+        }
+        let after = children_usage().expect("the usage is read");
+        let used = (after.utime.micros() + after.stime.micros())
+            .saturating_sub(before.utime.micros() + before.stime.micros());
+        // A tenth of the spin, so a loaded host's preemption does not fail it.
+        assert!(used >= 20_000, "the child's spin counted {used} µs");
+        assert!(after.maxrss > 0, "a reaped child has a resident set");
     }
 
     #[test]

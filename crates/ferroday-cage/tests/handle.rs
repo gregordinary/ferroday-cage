@@ -34,6 +34,7 @@ fn a_deadline_expires_and_a_kill_ends_the_sandbox() {
         .wait_timeout(Duration::ZERO)
         .expect("the wait survives an expired deadline");
     assert_eq!(expired, None);
+    assert_eq!(running.usage(), None, "no usage before the outcome");
     let outcome = running
         .wait_timeout(Duration::from_millis(200))
         .expect("the deadline wait completes");
@@ -41,6 +42,8 @@ fn a_deadline_expires_and_a_kill_ends_the_sandbox() {
     running.kill().expect("the kill is delivered");
     let status = running.wait().expect("the wait completes after a kill");
     assert_eq!(status.signal(), Some(9), "expected termination by SIGKILL");
+    // The kill ended the init, which would have reported it.
+    assert_eq!(running.usage(), None, "a killed namespace reports no usage");
 }
 
 #[test]
@@ -60,6 +63,86 @@ fn a_kill_without_a_pid_namespace_reports_the_observed_status() {
     running.kill().expect("the kill is delivered");
     let status = running.wait().expect("the wait completes after a kill");
     assert_eq!(status.signal(), Some(9), "expected termination by SIGKILL");
+    // The kill ended only the command; the launch stage collected it.
+    assert!(running.usage().is_some(), "the observed kill carries usage");
+}
+
+/// A busybox shell loop costing a third of a second of processor time on an
+/// ordinary host, and never less than [`LOOP_FLOOR`].
+const CPU_LOOP: &str = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
+
+/// The processor time [`CPU_LOOP`] is held to: well under what it costs, so a
+/// loaded host still passes, and well over what the rest of a script costs.
+const LOOP_FLOOR: Duration = Duration::from_millis(150);
+
+/// The processor time a process's usage reports, user and system together.
+fn cpu(usage: ferroday_cage::ResourceUsage) -> Duration {
+    usage.user_time + usage.system_time
+}
+
+#[test]
+fn the_usage_reports_processor_time_and_peak_memory() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // `dd` reads into a buffer of its block size, so the whole buffer is
+    // resident; it runs as a child the shell waits for.
+    let script = format!("{CPU_LOOP}; dd if=/dev/zero of=/dev/null bs=64M count=1 2>/dev/null");
+    let output = sh(rootfs, &script)
+        .output()
+        .expect("the sandbox runs to completion");
+    assert!(output.status.success(), "{output:?}");
+    let usage = output.usage.expect("the init reports the usage");
+    assert!(cpu(usage) >= LOOP_FLOOR, "{usage:?}");
+    assert!(usage.peak_rss_bytes >= 64 << 20, "{usage:?}");
+    assert_eq!(usage.peak_rss_bytes % 1024, 0, "{usage:?}");
+
+    // The handle reports the same figure once its wait has returned.
+    let mut running = sh(rootfs, CPU_LOOP).spawn().expect("the sandbox launches");
+    let status = running.wait().expect("the wait completes");
+    assert!(status.success());
+    let usage = running.usage().expect("the init reports the usage");
+    assert!(cpu(usage) >= LOOP_FLOOR, "{usage:?}");
+}
+
+/// A script whose processor time is spent in an orphan: the loop runs in a
+/// process whose parent exits at once, and the command waits for the loop's
+/// marker without waiting for the process.
+const ORPHAN: &str = "(sh -c 'LOOP; touch /tmp/done' &); \
+     while [ ! -e /tmp/done ]; do sleep 0.1; done; sleep 0.2";
+
+#[test]
+fn an_orphan_counts_under_a_pid_namespace_and_not_without_one() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let script = ORPHAN.replace("LOOP", CPU_LOOP);
+
+    // The orphan reparents to the init, which collects it.
+    let output = sh(rootfs, &script)
+        .output()
+        .expect("the sandbox runs to completion");
+    assert!(output.status.success(), "{output:?}");
+    let usage = output.usage.expect("the init reports the usage");
+    assert!(
+        cpu(usage) >= LOOP_FLOOR,
+        "the orphan was not counted: {usage:?}"
+    );
+
+    // Without a PID namespace the orphan reparents outside the sandbox, so
+    // only the command's own polling counts.
+    let output = Cage::builder()
+        .rootfs(rootfs)
+        .pid_namespace(false)
+        .command("/bin/sh")
+        .args(["-c", &script])
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox runs to completion");
+    assert!(output.status.success(), "{output:?}");
+    let usage = output.usage.expect("the launch stage reports the usage");
+    assert!(cpu(usage) < LOOP_FLOOR, "the orphan was counted: {usage:?}");
 }
 
 #[test]

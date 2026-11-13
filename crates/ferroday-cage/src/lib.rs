@@ -315,7 +315,7 @@ pub use running::{KillHandle, Pending, Running};
 #[cfg(feature = "serde")]
 pub use spec::RestrictedProfile;
 pub use spec::{Bind, Cage, CageBuilder, Mount, Network, Overlay, RawMount, Stdio};
-pub use status::ExitStatus;
+pub use status::{ExitStatus, ResourceUsage};
 pub use terminal::{Pty, Terminal};
 
 /// Shorthand for a result whose error is [`Error`].

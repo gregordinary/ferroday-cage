@@ -478,6 +478,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Fill this buffer from a descriptor, retrying `EINTR` | `mechanism::frame::read_full`, or `read_full_or_eof` where end of input is an ending, and `read_full_or_short` where how much arrived matters |
 | Retry one call a signal interrupted | `mechanism::frame::retry_on_intr!` |
 | Encode, decode, or read a helper child's outcome record | `mechanism::frame::encode_record`, `decode_record`, `read_record` |
+| Encode or decode the supervisor's status record, the command's outcome and what it used | `mechanism::encode_status`, `mechanism::decode_status`, with the usage read by `mechanism::sys::children_usage` |
 | Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd` |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Resolve a range identity map into the extents a delegate writes, validated | `idmap::resolve_delegate`, through the configured delegate or the bundled chain |

@@ -83,6 +83,7 @@ use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
     IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdioPlan,
+    encode_status,
 };
 use crate::error::SetupStep;
 
@@ -1791,6 +1792,7 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
         loop {
             match process::wait(WaitOptions::NOHANG) {
                 Ok(Some((pid, status))) if pid == child => {
+                    collect_exited();
                     report_status(context.status_fd, status);
                     sys::exit_group(0)
                 }
@@ -1810,10 +1812,29 @@ fn supervise(context: &Context<'_>, pidfd: BorrowedFd<'_>, child: Pid, role: Rol
 /// The control-socket request byte for graceful termination.
 pub(crate) const CONTROL_TERMINATE: u8 = b'T';
 
-/// Writes the 8-byte status record: the kind discriminant and the value,
-/// little-endian. At 8 bytes the write is atomic under `PIPE_BUF`. A failed
-/// write means the caller dropped the handle; with SIGPIPE ignored it is
-/// an `EPIPE` to swallow, since there is no one left to report to.
+/// Collects every child process that has already exited, without waiting for
+/// one that has not.
+///
+/// Called once the command's own exit is collected, so the usage the status
+/// record reports includes what the rest of the sandbox finished before then.
+/// As the init, those are the orphans that reparented to it since its last
+/// wake; outside the sandbox the command was the only child, and nothing is
+/// left.
+fn collect_exited() {
+    loop {
+        match process::wait(WaitOptions::NOHANG) {
+            Ok(Some(_)) | Err(Errno::INTR) => {}
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+/// Writes the status record: the command's outcome, and what the command and
+/// the descendants this process collected used, as
+/// [`STATUS_RECORD_LEN`](super::STATUS_RECORD_LEN) lays it out.
+///
+/// A failed write means the caller dropped the handle; with SIGPIPE ignored it
+/// is an `EPIPE` to swallow, since there is no one left to report to.
 fn report_status(fd: BorrowedFd<'_>, status: WaitStatus) {
     let (kind, value) = if let Some(code) = status.exit_status() {
         (STATUS_EXITED, code)
@@ -1824,9 +1845,9 @@ fn report_status(fd: BorrowedFd<'_>, status: WaitStatus) {
         // exit without a record rather than invent one.
         sys::exit_group(127)
     };
-    let mut record = [0u8; 8];
-    record[0..4].copy_from_slice(&kind.to_le_bytes());
-    record[4..8].copy_from_slice(&value.to_le_bytes());
+    // A failure reports the outcome without usage rather than losing it.
+    let usage = sys::children_usage().ok();
+    let record = encode_status(kind, value, usage.as_ref());
     let _ = rustix::io::write(fd, &record);
 }
 
