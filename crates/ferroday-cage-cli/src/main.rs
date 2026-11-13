@@ -6040,67 +6040,14 @@ fn names_a_forwarded_nameserver(contents: &str, stack: &NetStack) -> bool {
 
 /// Builds and runs a restriction — the --restrict mode — mapping the outcome
 /// onto the exit status exactly as the sandbox path does.
-fn run_restricted(options: Options) -> ExitCode {
+fn run_restricted(mut options: Options) -> ExitCode {
     if let Err(code) = withhold_from_restricted_command() {
         return code;
     }
-    // The seccomp flags have no profile beneath them here, so an errno joins
-    // the policy the flags assembled, the curated roster among them, or with
-    // none denies only what it names.
-    let seccomp = match compose_seccomp(options.seccomp, options.seccomp_errno, None) {
-        Ok(seccomp) => seccomp,
+    let builder = match restriction_builder(&mut options) {
+        Ok(builder) => builder,
         Err(message) => return usage_error(format_args!("{message}")),
     };
-    let mut builder = Restriction::builder();
-    let mut command_line = options.command_line.into_iter();
-    if let Some(command) = command_line.next() {
-        builder = builder.command(PathBuf::from(command)).args(command_line);
-    }
-    if let Some(base) = options.base_env {
-        builder = builder.base_env(base);
-    }
-    // Set first, so a --setenv TERM overrides it.
-    let mut env = options.setenv;
-    if let Some(term) = passed_term(builder.get_base_env(), false, std::env::var_os("TERM")) {
-        env.insert(0, (OsString::from("TERM"), term));
-    }
-    builder = builder.envs(env);
-    if let Some(chdir) = options.chdir {
-        builder = builder.current_dir(chdir);
-    }
-    if let Some(stdin) = options.stdin {
-        builder = builder.stdin(stdin);
-    }
-    for (resource, soft, hard) in options.rlimits {
-        builder = builder.rlimit(resource, soft, hard);
-    }
-    if let Some(parent) = options.cgroup_parent {
-        builder = builder.cgroup_parent(parent);
-    }
-    for limit in options.cgroup_limits {
-        builder = builder.cgroup_limit(limit);
-    }
-    if let Some(required) = options.cgroup_required {
-        builder = builder.cgroup_required(required);
-    }
-    if let Some(tie) = stop_with_caller_default(options.stop_with_caller, false) {
-        builder = builder.stop_with_caller(tie);
-    }
-    for (path, access) in options.landlock {
-        builder = builder.landlock_fs(access, path);
-    }
-    for (port, access) in options.landlock_net {
-        builder = builder.landlock_net(access, port);
-    }
-    if let Some(scopes) = options.landlock_scope {
-        builder = builder.landlock_scope(scopes);
-    }
-    if let Some(restrict) = options.landlock_resolve_unix {
-        builder = builder.landlock_resolve_unix(restrict);
-    }
-    if let Some(policy) = seccomp {
-        builder = builder.seccomp(policy);
-    }
 
     if options.terminal {
         // The restriction's terminal comes from the host's own /dev/ptmx, the
@@ -6139,6 +6086,75 @@ fn run_restricted(options: Options) -> ExitCode {
         )?)
     });
     finish(relay, outcome)
+}
+
+/// The restriction a `--restrict` launch runs: what the restriction's flags set
+/// in `options`, taken out of it and given to a builder.
+///
+/// What the launch applies around the restriction rather than to it stays in
+/// `options`: the terminal, the timeout and the delay before a kill. Split from
+/// [`run_restricted`] so a test holds every flag a restriction takes to what
+/// reaches its builder.
+fn restriction_builder(options: &mut Options) -> Result<RestrictionBuilder, String> {
+    // The seccomp flags have no profile beneath them here, so an errno joins
+    // the policy the flags assembled, the curated roster among them, or with
+    // none denies only what it names.
+    let seccomp = compose_seccomp(
+        options.seccomp.take(),
+        std::mem::take(&mut options.seccomp_errno),
+        None,
+    )?;
+    let mut builder = Restriction::builder();
+    let mut command_line = std::mem::take(&mut options.command_line).into_iter();
+    if let Some(command) = command_line.next() {
+        builder = builder.command(PathBuf::from(command)).args(command_line);
+    }
+    if let Some(base) = options.base_env {
+        builder = builder.base_env(base);
+    }
+    // Set first, so a --setenv TERM overrides it.
+    let mut env = std::mem::take(&mut options.setenv);
+    if let Some(term) = passed_term(builder.get_base_env(), false, std::env::var_os("TERM")) {
+        env.insert(0, (OsString::from("TERM"), term));
+    }
+    builder = builder.envs(env);
+    if let Some(chdir) = options.chdir.take() {
+        builder = builder.current_dir(chdir);
+    }
+    if let Some(stdin) = options.stdin.take() {
+        builder = builder.stdin(stdin);
+    }
+    for (resource, soft, hard) in std::mem::take(&mut options.rlimits) {
+        builder = builder.rlimit(resource, soft, hard);
+    }
+    if let Some(parent) = options.cgroup_parent.take() {
+        builder = builder.cgroup_parent(parent);
+    }
+    for limit in std::mem::take(&mut options.cgroup_limits) {
+        builder = builder.cgroup_limit(limit);
+    }
+    if let Some(required) = options.cgroup_required {
+        builder = builder.cgroup_required(required);
+    }
+    if let Some(tie) = stop_with_caller_default(options.stop_with_caller, false) {
+        builder = builder.stop_with_caller(tie);
+    }
+    for (path, access) in std::mem::take(&mut options.landlock) {
+        builder = builder.landlock_fs(access, path);
+    }
+    for (port, access) in std::mem::take(&mut options.landlock_net) {
+        builder = builder.landlock_net(access, port);
+    }
+    if let Some(scopes) = options.landlock_scope.take() {
+        builder = builder.landlock_scope(scopes);
+    }
+    if let Some(restrict) = options.landlock_resolve_unix {
+        builder = builder.landlock_resolve_unix(restrict);
+    }
+    if let Some(policy) = seccomp {
+        builder = builder.seccomp(policy);
+    }
+    Ok(builder)
 }
 
 /// Says on standard error that the cgroup limits are not applied, where the
@@ -10178,6 +10194,55 @@ mod tests {
         assert!(
             usage().contains(&wrapped(&restriction_flags())),
             "--restrict's entry does not list the flags it takes",
+        );
+    }
+
+    #[test]
+    fn a_restriction_applies_every_flag_it_takes() {
+        // The table marks the flags a restriction takes, and the test above
+        // holds the parser to it; this holds the launch to the same list. Each
+        // flag, given with a value it accepts, changes the restriction the
+        // launch builds from the one it builds without it. A flag that states
+        // the default changes nothing alone, so it is held to overriding its
+        // `--no-` form instead. The three the launch applies around the
+        // restriction stay in the options for it.
+        let built = |flags: &[&str]| {
+            let mut args = vec!["--restrict", "--landlock-ro", "/usr"];
+            args.extend(flags);
+            args.push("/bin/true");
+            let mut options = parse_run(&args).expect("the flags parse");
+            let builder = restriction_builder(&mut options).expect("the restriction composes");
+            (format!("{builder:?}"), options)
+        };
+        let (without, _) = built(&[]);
+        let mut unseen = Vec::new();
+        for flag in FLAGS
+            .iter()
+            .filter(|flag| flag.restriction && flag.long != "--restrict")
+        {
+            let (with, options) = built(&given(flag));
+            let seen = match flag.long {
+                "--terminal" => options.terminal,
+                "--timeout" => options.timeout.is_some(),
+                "--kill-after" => options.kill_after == Duration::from_secs(1),
+                _ if with != without => true,
+                long => {
+                    let negated = format!("--no-{}", &long[2..]);
+                    FLAGS.iter().any(|flag| flag.long == negated) && {
+                        let (negated_alone, _) = built(&[&negated]);
+                        let (overridden, _) = built(&[&negated, long]);
+                        negated_alone != without && overridden == without
+                    }
+                }
+            };
+            if !seen {
+                unseen.push(flag.long);
+            }
+        }
+        assert_eq!(
+            unseen,
+            Vec::<&str>::new(),
+            "flags the restriction never sees"
         );
     }
 
