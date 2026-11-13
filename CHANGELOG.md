@@ -198,6 +198,10 @@ consumer upgrading can skip it.
 
 ### Added
 
+- The Debian layer reads a `.deb` whose `data.tar` member is compressed with
+  LZMA, `data.tar.lzma`, as dpkg-deb does, with the dictionary its header
+  declares held to the 128 MiB an xz block's is. A `control.tar.lzma`, which
+  dpkg-deb refuses, and a `data.tar.bz2` are refused as before.
 - `Pending::listen` makes a TCP listener on the sandbox's loopback and hands it
   to the caller, which accepts the connections the command makes there. A
   helper process makes it inside the sandbox's user and network namespaces, so

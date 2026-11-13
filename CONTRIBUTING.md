@@ -509,7 +509,7 @@ report name a package and its version bare.
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
 | Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
 | Write a tar header block, or one pax extended-header record | `provision::tar::ustar_block`, `tar::pax_record` |
-| Which compression does a stream begin with, and what does it decode to? | `provision::compress::decoder`, or `compress::Codec::of` for a document already in memory |
+| Which compression does a stream begin with, and what does it decode to? | `provision::compress::decoder`, or `compress::Codec::of` for a document already in memory, and `compress::lzma` for a stream its container names as LZMA, which carries no magic |
 | Decompress a document held in memory, bounded, telling a stream the decoder refuses from one that decodes past the bound | `provision::compress::inflate` |
 | Fill a buffer from a reader, short only at the end of its input | `provision::compress::read_fully` |
 | Which standard stream did a provisioner's in-sandbox output come from? | `provision::Stream` |
@@ -611,7 +611,7 @@ report name a package and its version bare.
 | Read a field of the `status` record a command in a sandbox printed | `ferroday_cage_testkit::process::status_field` |
 | Encode a POSIX access control list, set or read an extended attribute, or ask whether a filesystem holds one, in a test | `ferroday_cage_testkit::xattr` |
 | Lay an overlay whiteout into an upper by hand in a test | `ferroday_cage_testkit::overlay::whiteout` |
-| Compress a document whole with gzip, xz or zstd in a test | `ferroday_cage_testkit::compress`, or an explicit level where a test asserts the size |
+| Compress a document whole with gzip, xz, LZMA or zstd in a test | `ferroday_cage_testkit::compress`, or an explicit level where a test asserts the size |
 
 Two guards hold the table to the code, and each covers what the other cannot:
 

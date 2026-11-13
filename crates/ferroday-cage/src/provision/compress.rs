@@ -14,11 +14,15 @@
 //! [`GzipReader`] walks gzip's members itself, so the zero padding a writer
 //! leaves after the last one reads as `gzip` reads it.
 //!
-//! Two of the three formats let a hostile archive name its own memory cost, in
+//! A `.deb`'s `data.tar` may also be LZMA, the `.lzma` format `xz` replaced.
+//! It carries no magic, so it is never sniffed: [`lzma`] decodes a stream that
+//! the container holding it names as one.
+//!
+//! Every format but gzip lets a hostile archive name its own memory cost, in
 //! a header far smaller than the allocation it asks for. A zstd frame declares
-//! the window the decoder buffers, and an xz block declares the dictionary the
-//! decoder allocates and zeroes; both are bounded here, at
-//! [`MAX_ZSTD_WINDOW`] and [`MAX_XZ_DICTIONARY`]. Each decoder is given its
+//! the window the decoder buffers, and an xz block and an LZMA stream declare
+//! the dictionary the decoder fills; both are bounded here, at
+//! [`MAX_ZSTD_WINDOW`] and [`MAX_LZMA_DICTIONARY`]. Each decoder is given its
 //! bound at construction and checks it against the header before allocating
 //! anything.
 //!
@@ -56,19 +60,21 @@ const MAGIC_LEN: usize = 6;
 /// `ruzstd`'s own 100 MiB default, so it is set explicitly on the decoder.
 const MAX_ZSTD_WINDOW: u64 = 128 * 1024 * 1024;
 
-/// The largest LZMA2 dictionary this provisioner decodes, bounding the memory
-/// one xz block costs before any of it is decompressed.
+/// The largest LZMA dictionary this provisioner decodes, bounding the memory
+/// one xz block or one LZMA stream costs.
 ///
 /// Every block of an xz stream declares the dictionary its LZMA2 filter wants,
-/// in a single header byte that can ask for anything from 4 KiB to 4 GiB. The
-/// decoder allocates it when it starts the block and zeroes the whole
-/// allocation, so the cost is resident memory rather than an address-space
-/// reservation. Unbounded, a 69-byte input whose one block declares 2 GiB takes
-/// 2 GiB of it — and so does a valid multi-block archive whose *hundred and
-/// seventy-third* block declares it, which then decodes successfully and reports
-/// nothing, the cost having been paid on the way. Every block is therefore
-/// bounded, not the first: the decoder is given [`MAX_XZ_MEMORY_KB`] and checks
-/// each block header against it as it parses one.
+/// in a single header byte that can ask for anything from 4 KiB to 4 GiB, and
+/// an LZMA stream's header declares one in four bytes. The decoder fills the
+/// dictionary as output arrives, growing it zero-filled by doublings up to the
+/// size declared, so the cost is resident memory and is paid by any input that
+/// decodes to a long enough run. Measured with `lzma-rust2` 0.25: a 151 KB
+/// `.lzma` declaring 2 GiB and decoding to 1 GiB of zeros held 2 GiB resident.
+/// A valid multi-block xz archive whose *hundred and seventy-third* block
+/// declares such a dictionary pays the same, and then decodes successfully and
+/// reports nothing. Every block is therefore bounded, not the first: the
+/// decoder is given [`MAX_LZMA_MEMORY_KB`] and checks each header against it as
+/// it parses one.
 ///
 /// 128 MiB is twice the largest dictionary observed in the archives this crate
 /// reads. Measured 2026-08-22 over the Debian trixie amd64 pool — including its
@@ -78,7 +84,7 @@ const MAX_ZSTD_WINDOW: u64 = 128 * 1024 * 1024;
 /// sample use. Sharing [`MAX_ZSTD_WINDOW`]'s value is deliberate; the two
 /// constants bound the same kind of hazard and there is no reason for a reader
 /// to hold two numbers.
-const MAX_XZ_DICTIONARY: u64 = MAX_ZSTD_WINDOW;
+const MAX_LZMA_DICTIONARY: u64 = MAX_ZSTD_WINDOW;
 
 /// The most bytes of a zstd frame this provisioner buffers before deciding what
 /// the frame is: the four-byte magic plus the largest possible frame header (a
@@ -794,21 +800,21 @@ impl Read for Source<'_> {
 /// The six-byte signature every xz stream begins with.
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 
-/// The memory budget an xz decode runs under, in kibibytes.
+/// The memory budget an xz or LZMA decode runs under, in kibibytes.
 ///
-/// `lzma-rust2` checks a *memory* figure against this -- the block's dictionary
-/// rounded up, plus the decoder's own tables and the buffer it reads a
-/// compressed chunk into -- as it parses each block header, before allocating
-/// anything. The budget is therefore the dictionary cap plus slack for those:
+/// `lzma-rust2` checks a *memory* figure against this -- the dictionary
+/// rounded up, plus the decoder's own tables and, for xz, the buffer it reads
+/// a compressed chunk into -- as it parses each block header or stream header,
+/// before allocating anything. The budget is therefore the dictionary cap plus slack for those:
 /// sized at the cap alone it would refuse a dictionary of exactly
-/// [`MAX_XZ_DICTIONARY`], which they push over.
+/// [`MAX_LZMA_DICTIONARY`], which they push over.
 ///
 /// One mebibyte of slack admits nothing a tighter figure would not. Dictionary
 /// sizes step in halvings and doublings, so the next one up from 128 MiB is
 /// 192 MiB, and the slack would have to be sixty-four times this to reach it.
 /// Stating it as slack rather than as the decoder's exact constant also means
 /// an upstream change to that constant moves nothing here.
-const MAX_XZ_MEMORY_KB: u32 = (MAX_XZ_DICTIONARY / 1024) as u32 + 1024;
+const MAX_LZMA_MEMORY_KB: u32 = (MAX_LZMA_DICTIONARY / 1024) as u32 + 1024;
 
 /// The buffer compressed input is read through.
 ///
@@ -817,9 +823,9 @@ const MAX_XZ_MEMORY_KB: u32 = (MAX_XZ_DICTIONARY / 1024) as u32 + 1024;
 /// becoming a read of the source each.
 const XZ_CHUNK: usize = 64 * 1024;
 
-/// An xz decoder bounded by [`MAX_XZ_DICTIONARY`].
+/// An xz decoder bounded by [`MAX_LZMA_DICTIONARY`].
 ///
-/// `lzma-rust2`'s own reader, given [`MAX_XZ_MEMORY_KB`] at construction. It
+/// `lzma-rust2`'s own reader, given [`MAX_LZMA_MEMORY_KB`] at construction. It
 /// checks each block header against the budget as it parses one, which is both
 /// before the allocation and inside the parser that decides what to allocate --
 /// the two properties a bound applied from outside could not have. Concatenated
@@ -840,7 +846,7 @@ impl<R: Read> XzReader<R> {
             io::BufReader::with_capacity(XZ_CHUNK, source),
             // Several concatenated xz streams are one legal file.
             true,
-            MAX_XZ_MEMORY_KB,
+            MAX_LZMA_MEMORY_KB,
         ))
     }
 }
@@ -850,31 +856,191 @@ impl<R: Read> Read for XzReader<R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.0.read(buf).map_err(refused_memory)
+        self.0.read(buf).map_err(|err| refused_memory("xz", err))
     }
 }
 
-/// Rewrites the decoder's memory refusal to name the bound in force.
+/// Rewrites the memory refusal of `codec`'s decoder to name the bound in force.
 ///
-/// `lzma-rust2` reports both a block over the budget and a host that would not
+/// `lzma-rust2` reports both a header over the budget and a host that would not
 /// give it an allocation within the budget as [`io::ErrorKind::OutOfMemory`],
 /// and its own words for the first -- "needed memory too big for mem_limit_kb"
 /// -- name a parameter the caller never set and cannot see. The rewrite states
 /// the cap as the bound in force rather than as the cause, which is true of
 /// both, and keeps the decoder's reason after it for whoever needs to tell them
 /// apart. Every other failure passes through as it arrives.
-fn refused_memory(err: io::Error) -> io::Error {
+fn refused_memory(codec: &str, err: io::Error) -> io::Error {
     if err.kind() != io::ErrorKind::OutOfMemory {
         return err;
     }
     io::Error::new(
         io::ErrorKind::OutOfMemory,
         format!(
-            "an xz decode is capped at {} MiB of memory here and this stream's could not be \
-             satisfied: {err}",
-            MAX_XZ_DICTIONARY / (1024 * 1024),
+            "an {codec} decode is capped at {} MiB of memory here and this stream's could not \
+             be satisfied: {err}",
+            MAX_LZMA_DICTIONARY / (1024 * 1024),
         ),
     )
+}
+
+/// The length of an LZMA stream's header: the properties byte, the
+/// dictionary size, and the uncompressed size.
+const LZMA_HEADER: usize = 1 + 4 + 8;
+
+/// The most literal context and literal position bits together that an LZMA
+/// stream may state.
+///
+/// The properties byte encodes up to 8 and 4, and `lzma-rust2` decodes them,
+/// but liblzma refuses a header whose two sum past this, as `xz` 5.8.4 and
+/// dpkg-deb 1.22.6 were measured to: "File format not recognized". The stream
+/// is refused here too, so a `.deb` this reads is one dpkg would.
+const MAX_LZMA_LC_LP: u8 = 4;
+
+/// An LZMA stream's decoder over `source`, the stream its container names as
+/// one: the `.lzma` format `xz --format=lzma` writes, a header and one stream.
+///
+/// The format carries no magic, so nothing sniffs it: [`decoder`] reads such a
+/// stream as plain bytes, and a caller that knows it holds one asks for this.
+/// It is bounded at [`MAX_LZMA_DICTIONARY`], as an xz block is, and guarded as
+/// [`decoder`]'s decoders are, so its refusals arrive as [`Refusal`]s of `the
+/// lzma stream does not decode` and a failure of `source` as itself.
+///
+/// The Debian layer is the one caller, a `.deb` being the one container that
+/// names an LZMA member, and a build without it has none.
+#[cfg_attr(not(feature = "debian"), allow(dead_code))]
+pub(crate) fn lzma<'r>(source: impl Read + 'r) -> Box<dyn Read + 'r> {
+    Box::new(guard("the lzma stream does not decode", source, |source| {
+        LzmaReader {
+            state: Lzma::Header(source),
+        }
+    }))
+}
+
+/// An LZMA decoder bounded by [`MAX_LZMA_DICTIONARY`], holding the stream to
+/// end where its source ends.
+///
+/// The header is read by the first read rather than at construction, so
+/// whatever is wrong with it is reported where whatever is wrong with the
+/// stream is: as a read's failure. `lzma-rust2`'s reader then checks the
+/// dictionary the header declares against [`MAX_LZMA_MEMORY_KB`] before it
+/// allocates anything.
+///
+/// What is accepted is what `xz --format=lzma -d` 5.8.4 accepts, as measured.
+/// A stream of unknown size ends at its end marker, and one of known size ends
+/// at that size, its end marker read where it has one and the range coder held
+/// to its final state where it has none. Any byte after the end, a second
+/// stream included, is refused: the format has no concatenation, and a reader
+/// that stopped there would hand the tar reader a short archive, which it can
+/// accept without a terminator. dpkg-deb 1.22.6 reads only up to the end and
+/// passes over what follows, so of a member holding two streams it extracts
+/// the first stream's entries and reports nothing.
+struct LzmaReader<R: Read> {
+    state: Lzma<R>,
+}
+
+/// The source an LZMA stream decodes from once its header is read: the
+/// header, put back for the decoder to parse, then the rest.
+type LzmaSource<R> = io::Chain<io::Cursor<[u8; LZMA_HEADER]>, R>;
+
+/// Where an [`LzmaReader`] is in its stream.
+enum Lzma<R: Read> {
+    /// Before the header.
+    Header(R),
+    /// Inside the stream. The decoder is far larger than the other states, so
+    /// it is boxed rather than sizing every state by it.
+    Stream(Box<lzma_rust2::LzmaReader<LzmaSource<R>>>),
+    /// The stream has ended, and nothing followed it.
+    Done,
+    /// A failure ended the stream. A read after one fails again rather than
+    /// answering the end of input that the stream did not reach.
+    Failed,
+}
+
+impl<R: Read> LzmaReader<R> {
+    /// Reads `source`'s header and starts the decoder on the stream it begins.
+    fn start(mut source: R) -> io::Result<lzma_rust2::LzmaReader<LzmaSource<R>>> {
+        let mut header = [0u8; LZMA_HEADER];
+        if read_fully(&mut source, &mut header)? < LZMA_HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the lzma stream ends inside its header",
+            ));
+        }
+        // The properties byte is `(pb * 5 + lp) * 9 + lc`. A byte past the
+        // largest that spells is left for the decoder to refuse.
+        let properties = header[0] % (9 * 5);
+        if properties % 9 + properties / 9 > MAX_LZMA_LC_LP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the lzma stream's header states more than {MAX_LZMA_LC_LP} literal context \
+                     and position bits together"
+                ),
+            ));
+        }
+        let mut decoder = lzma_rust2::LzmaReader::new_mem_limit(
+            io::Cursor::new(header).chain(source),
+            MAX_LZMA_MEMORY_KB,
+            None,
+        )
+        .map_err(|err| refused_memory("lzma", err))?;
+        // A stream of known size is held to the range coder's final state at
+        // that size, and its end marker is read where it carries one, as
+        // liblzma does. Relaxed, the decoder stops at the size and leaves a
+        // marker unread, which the check for trailing bytes then refuses.
+        decoder.set_relaxed_end_condition(false);
+        Ok(decoder)
+    }
+
+    /// Refuses the stream `decoder` has just ended where its source holds
+    /// anything after the end, which the decoder may already have read ahead.
+    fn finish(decoder: lzma_rust2::LzmaReader<LzmaSource<R>>) -> io::Result<()> {
+        let (mut source, unused) = decoder.into_parts();
+        if unused.is_empty() && read_fully(&mut source, &mut [0u8; 1])? == 0 {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bytes follow the end of the lzma stream",
+        ))
+    }
+}
+
+impl<R: Read> Read for LzmaReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A zero-length request is not end of stream, and the end check below
+        // reads a zero-byte decoder read as one.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match &mut self.state {
+                Lzma::Done => return Ok(0),
+                Lzma::Failed => {
+                    return Err(io::Error::other(
+                        "the lzma stream ended at an earlier failure",
+                    ));
+                }
+                // The decoder holds a failure and reports it again, so a
+                // failed read leaves it in place.
+                Lzma::Stream(decoder) => {
+                    let read = decoder.read(buf)?;
+                    if read > 0 {
+                        return Ok(read);
+                    }
+                }
+                Lzma::Header(_) => {}
+            }
+            self.state = match std::mem::replace(&mut self.state, Lzma::Failed) {
+                Lzma::Header(source) => Lzma::Stream(Box::new(LzmaReader::start(source)?)),
+                Lzma::Stream(decoder) => {
+                    LzmaReader::finish(*decoder)?;
+                    Lzma::Done
+                }
+                Lzma::Done | Lzma::Failed => unreachable!("only a header or a stream advances"),
+            };
+        }
+    }
 }
 
 /// Reads `size` little-endian bytes of `header` at `offset` as a `u64`, or
@@ -1357,16 +1523,12 @@ mod tests {
     #[test]
     fn a_dictionary_of_exactly_the_cap_is_admitted() {
         // The boundary is inclusive, which is what the budget's slack over
-        // [`MAX_XZ_DICTIONARY`] buys: the decoder counts its own tables against
+        // [`MAX_LZMA_DICTIONARY`] buys: the decoder counts its own tables against
         // the budget as well as the dictionary, so a budget of the cap exactly
         // would refuse a block declaring the cap exactly. 64 MiB -- what `xz -9`
         // writes, and the largest observed in the archives this crate reads --
         // is well inside it.
-        //
-        // Decoding the second of these really does allocate 128 MiB for as long
-        // as the block lasts. That is the cost of proving the boundary through
-        // the decoder rather than against a comparison of this crate's own.
-        for dictionary in [64 * MIB, MAX_XZ_DICTIONARY] {
+        for dictionary in [64 * MIB, MAX_LZMA_DICTIONARY] {
             let bytes = xz_stream(Check::Crc32, &[Block::new(dictionary, b"payload")]);
             assert_eq!(
                 decode_all(&bytes).expect("a dictionary at or under the cap is admitted"),
@@ -1774,5 +1936,181 @@ mod tests {
         // data frame is refused at its first read rather than read as empty.
         let err = decode_all(&skippable_frame(b"metadata")).expect_err("no frame");
         assert!(err.to_string().contains("no frame"), "{err}");
+    }
+
+    /// Fully decodes `bytes` as an LZMA stream through [`lzma`], answering a
+    /// refusal with the decoder's own failure.
+    fn decode_lzma(bytes: &[u8]) -> Result<Vec<u8>, io::Error> {
+        let mut out = Vec::new();
+        lzma(bytes).read_to_end(&mut out).map_err(refused)?;
+        Ok(out)
+    }
+
+    /// `stream`, an LZMA stream, with its header declaring `dictionary` bytes.
+    ///
+    /// The decoder sizes its dictionary from the header alone, and a stream
+    /// written with a smaller one decodes the same under a larger, so this is
+    /// a real stream declaring whatever a test needs.
+    fn declaring_dictionary(mut stream: Vec<u8>, dictionary: u32) -> Vec<u8> {
+        stream[1..5].copy_from_slice(&dictionary.to_le_bytes());
+        stream
+    }
+
+    #[test]
+    fn an_lzma_stream_decodes_and_is_never_sniffed() {
+        // The shape `xz --format=lzma` writes: unknown size, closed by the end
+        // marker. Through `decoder` the same bytes are no compression it
+        // recognizes, since the format has no magic.
+        let data = tar_of("file", b"one\n");
+        let stream = ferroday_cage_testkit::compress::lzma(&data);
+        assert_eq!(decode_lzma(&stream).expect("the stream decodes"), data);
+        assert_eq!(Codec::of(&stream), Codec::Plain);
+        assert_eq!(
+            decode_lzma_one_byte_at_a_time(&stream).expect("a byte at a time"),
+            data,
+        );
+    }
+
+    /// Fully decodes `bytes` as an LZMA stream, read from a source that
+    /// answers one byte at a time.
+    fn decode_lzma_one_byte_at_a_time(bytes: &[u8]) -> Result<Vec<u8>, io::Error> {
+        let mut out = Vec::new();
+        lzma(OneByte(bytes))
+            .read_to_end(&mut out)
+            .map_err(refused)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn an_lzma_stream_of_known_size_decodes_with_or_without_its_end_marker() {
+        // As `xz` 5.8.4 reads both: a header stating the size over a stream
+        // that stops there, and over one that carries the end marker too.
+        let data = tar_of("file", b"one\n");
+        let mut sized = Vec::new();
+        let mut writer = lzma_rust2::LzmaWriter::new_use_header(
+            &mut sized,
+            &lzma_rust2::LzmaOptions::with_preset(1),
+            Some(data.len() as u64),
+        )
+        .expect("an lzma writer");
+        std::io::Write::write_all(&mut writer, &data).expect("the stream is written");
+        writer.finish().expect("the stream closes");
+        assert_eq!(decode_lzma(&sized).expect("no end marker"), data);
+
+        let mut marked = ferroday_cage_testkit::compress::lzma(&data);
+        marked[5..13].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        assert_eq!(decode_lzma(&marked).expect("an end marker"), data);
+
+        // A size the stream does not reach, or passes, is refused.
+        for stated in [data.len() as u64 / 2, data.len() as u64 * 2] {
+            let mut wrong = ferroday_cage_testkit::compress::lzma(&data);
+            wrong[5..13].copy_from_slice(&stated.to_le_bytes());
+            decode_lzma(&wrong).expect_err("the size is not the stream's");
+        }
+    }
+
+    #[test]
+    fn bytes_after_an_lzma_stream_are_refused() {
+        // Each makes `xz --format=lzma -d` 5.8.4 report the data as corrupt.
+        // A second stream is the case that matters: a reader that stopped at
+        // the first would hand on a prefix of the archive, which the tar
+        // reader can accept without a terminator.
+        let first = ferroday_cage_testkit::compress::lzma(&tar_of("first", b"one\n"));
+        let second = ferroday_cage_testkit::compress::lzma(&tar_of("second", b"two\n"));
+        let mut sized = Vec::new();
+        let mut writer = lzma_rust2::LzmaWriter::new_use_header(
+            &mut sized,
+            &lzma_rust2::LzmaOptions::with_preset(1),
+            Some(4),
+        )
+        .expect("an lzma writer");
+        std::io::Write::write_all(&mut writer, b"four").expect("the stream is written");
+        writer.finish().expect("the stream closes");
+        for (case, stream) in [
+            ("a second stream", [&first[..], &second].concat()),
+            ("junk", [&first[..], b"JUNK"].concat()),
+            ("zeros", [&first[..], &[0u8; 16]].concat()),
+            ("one byte after a sized stream", [&sized[..], &[0]].concat()),
+        ] {
+            let err = decode_lzma(&stream).expect_err(case);
+            assert!(err.to_string().contains("bytes follow"), "{case}: {err}");
+            let err = decode_lzma_one_byte_at_a_time(&stream).expect_err(case);
+            assert!(err.to_string().contains("bytes follow"), "{case}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_lzma_dictionary_is_capped_as_an_xz_one_is() {
+        // Refused from the header, before anything is decoded or allocated.
+        // At the cap the stream decodes, which is what the budget's slack over
+        // [`MAX_LZMA_DICTIONARY`] buys for this decoder's own tables too.
+        let stream = ferroday_cage_testkit::compress::lzma(b"payload");
+        for dictionary in [256 * MIB as u32, u32::MAX - 15] {
+            let err = decode_lzma(&declaring_dictionary(stream.clone(), dictionary))
+                .expect_err("an over-budget dictionary is refused");
+            assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
+            assert!(
+                err.to_string()
+                    .contains("an lzma decode is capped at 128 MiB"),
+                "{err}"
+            );
+            assert!(err.to_string().contains("mem_limit_kb"), "{err}");
+        }
+        let at_cap = declaring_dictionary(stream, MAX_LZMA_DICTIONARY as u32);
+        assert_eq!(
+            decode_lzma(&at_cap).expect("the cap is admitted"),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn an_lzma_header_liblzma_refuses_is_refused() {
+        // `lc` 4 and `lp` 1, which the properties byte spells and liblzma
+        // refuses as a format it does not recognize.
+        let mut stream = ferroday_cage_testkit::compress::lzma(b"payload");
+        stream[0] = (2 * 5 + 1) * 9 + 4;
+        let err = decode_lzma(&stream).expect_err("lc + lp past 4 is refused");
+        assert!(err.to_string().contains("literal context"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_lzma_stream_is_refused_rather_than_decoded_short() {
+        // Every prefix, the header's own included, and the empty stream.
+        let stream = ferroday_cage_testkit::compress::lzma(&tar_of("file", b"one\n"));
+        for cut in 0..stream.len() {
+            match decode_lzma(&stream[..cut]) {
+                Ok(decoded) => panic!("cut at {cut}: decoded {} bytes", decoded.len()),
+                Err(err) => assert_ne!(err.kind(), io::ErrorKind::OutOfMemory, "cut at {cut}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_lzma_stream_answers_an_empty_read_and_its_source_failure_as_the_others_do() {
+        let data = tar_of("file", b"one\n");
+        let stream = ferroday_cage_testkit::compress::lzma(&data);
+        let mut reader = lzma(&stream[..]);
+        assert_eq!(reader.read(&mut []).expect("an empty read first"), 0);
+        let mut first = [0u8; 4];
+        reader.read_exact(&mut first).expect("the stream starts");
+        assert_eq!(reader.read(&mut []).expect("an empty read mid-stream"), 0);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).expect("the stream continues");
+        assert_eq!([&first[..], &rest].concat(), data);
+
+        for cut in [4, stream.len() / 2] {
+            let err = lzma(Reset(&stream[..cut]))
+                .read_to_end(&mut Vec::new())
+                .expect_err("the source fails");
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{cut}: {err}");
+            let err = Refusal::of(err).expect_err("a source's failure is not a refusal");
+            assert!(err.get_ref().is_none(), "{cut}: {err:?} is the OS's own");
+        }
+
+        let err = lzma(&b"not lzma at all, nor anything else"[..])
+            .read_to_end(&mut Vec::new())
+            .expect_err("refused");
+        let refusal = Refusal::of(err).expect("the decoder's own refusal");
+        assert_eq!(refusal.what(), "the lzma stream does not decode");
     }
 }

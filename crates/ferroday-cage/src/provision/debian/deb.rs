@@ -66,11 +66,19 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     extraction: &mut Extraction,
     on_entry: &mut OnEntry<'_>,
 ) -> Result<(), ProvisionError> {
-    let (_, size) = seek_to_member(path, deb, Member::Data, None)?;
+    let (_, size, suffix) = seek_to_member(path, deb, Member::Data, None)?;
     // Bounded by the member's declared size, so the tar stream ends where the
     // member ends instead of running on into the container's next header.
     let member = deb.take(size);
-    let (_, decoded) = compress::decoder(member).map_err(|err| tar::read_failure(path, 0, err))?;
+    // An LZMA stream carries no magic, so the member's name is what says it is
+    // one, as it is what dpkg-deb reads every member's compression from.
+    let decoded = if suffix == LZMA_SUFFIX {
+        compress::lzma(member)
+    } else {
+        compress::decoder(member)
+            .map_err(|err| tar::read_failure(path, 0, err))?
+            .1
+    };
     let mut archive = TarReader::new(decoded, path);
     extraction.extract(&mut archive, on_entry)
 }
@@ -92,11 +100,27 @@ impl Member {
             Member::Data => "data.tar",
         }
     }
+
+    /// The compression suffixes the member's name may carry, as dpkg-deb
+    /// 1.22.6 was measured to read them, less bzip2's.
+    ///
+    /// None, and gzip's, xz's and zstd's, for either member. A `data.tar` may
+    /// also be LZMA, which dpkg-deb reads and has not written since 1.18.11; a
+    /// `control.tar` may not, and dpkg-deb refuses one as using an unknown
+    /// compression. dpkg-deb also reads a `data.tar` compressed with bzip2,
+    /// which Debian's archive still admits though no dpkg-deb since 1.18.11
+    /// writes one, and which this reader refuses by name.
+    fn suffixes(self) -> &'static [&'static str] {
+        match self {
+            Member::Control => &["", ".gz", ".xz", ".zst"],
+            Member::Data => &["", ".gz", ".xz", ".zst", LZMA_SUFFIX],
+        }
+    }
 }
 
-/// The compression suffixes a `control.tar` or `data.tar` member's name may
-/// carry: none, and the three this reader decodes.
-const SUFFIXES: [&str; 4] = ["", ".gz", ".xz", ".zst"];
+/// The suffix of a member compressed with LZMA, which [`compress::lzma`]
+/// decodes, since the format has no magic to sniff it by.
+const LZMA_SUFFIX: &str = ".lzma";
 
 /// The most of the `debian-binary` member read for its format version line.
 ///
@@ -105,20 +129,19 @@ const SUFFIXES: [&str; 4] = ["", ".gz", ".xz", ".zst"];
 const VERSION_LINE: u64 = 64;
 
 /// Positions `deb`, which reads the `.deb` at `path`, at the data of `wanted`,
-/// and returns where in the `.deb` that data begins and the size the member
-/// declares.
+/// and returns where in the `.deb` that data begins, the size the member
+/// declares, and the compression suffix its name carries.
 ///
 /// The members are held to the order dpkg-deb holds them to, as measured
 /// against dpkg-deb 1.22: `debian-binary` first, stating format 2; then
 /// `control.tar`, then `data.tar`, each named with no suffix or with that of a
-/// compression this reader decodes. A member whose name begins with `_` is
-/// passed over between them, which the format reserves for that, and anything
-/// else where the next one belongs is refused. What follows the member wanted
-/// is never read, so members after `data.tar` are passed over as dpkg-deb
-/// passes over them. A layout dpkg-deb refuses is refused here too, so the
-/// members this reader takes from a `.deb` are the ones dpkg would. dpkg-deb
-/// also reads a `data.tar` compressed with bzip2 or lzma, which no archive this
-/// crate reads publishes and which this reader refuses by name.
+/// compression this reader decodes there ([`Member::suffixes`]). A member whose
+/// name begins with `_` is passed over between them, which the format reserves
+/// for that, and anything else where the next one belongs is refused. What
+/// follows the member wanted is never read, so members after `data.tar` are
+/// passed over as dpkg-deb passes over them. A layout dpkg-deb refuses is
+/// refused here too, so the members this reader takes from a `.deb` are the
+/// ones dpkg would.
 ///
 /// The `ar` container records each member's size in its header, so the members
 /// before the one wanted are seeked over rather than read, and the members after
@@ -137,7 +160,7 @@ fn seek_to_member<R: Read + Seek>(
     deb: &mut R,
     wanted: Member,
     limit: Option<u64>,
-) -> Result<(u64, u64), ProvisionError> {
+) -> Result<(u64, u64, &'static str), ProvisionError> {
     let io = |err: io::Error| ProvisionError::io("reading", path, err);
 
     // The end offset bounds every member size, so a header claiming more than
@@ -198,8 +221,9 @@ fn seek_to_member<R: Read + Seek>(
             )
         })?;
 
-        let is_wanted = match next {
-            None if name == "debian-binary" => false,
+        // The suffix of the member wanted, where this is it.
+        let found = match next {
+            None if name == "debian-binary" => None,
             None => {
                 return Err(refused(
                     path,
@@ -211,7 +235,7 @@ fn seek_to_member<R: Read + Seek>(
                 ));
             }
             // Reserved for members a reader passes over.
-            Some(_) if name.starts_with('_') => false,
+            Some(_) if name.starts_with('_') => None,
             Some(member) => {
                 let suffix = name.strip_prefix(member.stem()).ok_or_else(|| {
                     refused(
@@ -223,7 +247,7 @@ fn seek_to_member<R: Read + Seek>(
                         ),
                     )
                 })?;
-                if !SUFFIXES.contains(&suffix) {
+                let Some(suffix) = member.suffixes().iter().find(|known| **known == suffix) else {
                     return Err(refused(
                         path,
                         offset,
@@ -232,11 +256,11 @@ fn seek_to_member<R: Read + Seek>(
                              not decode"
                         ),
                     ));
-                }
-                member == wanted
+                };
+                (member == wanted).then_some(*suffix)
             }
         };
-        if let Some(limit) = limit.filter(|limit| is_wanted && size > *limit) {
+        if let Some(limit) = limit.filter(|limit| found.is_some() && size > *limit) {
             return Err(refused(
                 path,
                 offset,
@@ -259,8 +283,8 @@ fn seek_to_member<R: Read + Seek>(
                 )
             })?;
 
-        if is_wanted {
-            return Ok((data, size));
+        if let Some(suffix) = found {
+            return Ok((data, size, suffix));
         }
         next = match next {
             None => {
@@ -357,7 +381,7 @@ pub(crate) fn read_control_from<R: Read + Seek>(
     path: &Path,
     deb: &mut R,
 ) -> Result<String, ProvisionError> {
-    let (at, size) = seek_to_member(path, deb, Member::Control, Some(CONTROL_MEMBER_LIMIT))?;
+    let (at, size, _) = seek_to_member(path, deb, Member::Control, Some(CONTROL_MEMBER_LIMIT))?;
     let mut member = vec![0u8; size as usize];
     deb.read_exact(&mut member)
         .map_err(|err| ProvisionError::io("reading", path, err))?;
@@ -416,7 +440,7 @@ mod tests {
     /// returns it with the bytes the member holds.
     fn member_of(archive: &[u8], member: Member) -> Result<Vec<u8>, String> {
         let mut cursor = Cursor::new(archive);
-        let (_, size) = seek_to_member(Path::new("tool.deb"), &mut cursor, member, None)
+        let (_, size, _) = seek_to_member(Path::new("tool.deb"), &mut cursor, member, None)
             .map_err(|err| ErrorChain::new(&err).to_string())?;
         let mut bytes = vec![0u8; size as usize];
         cursor
@@ -664,13 +688,86 @@ mod tests {
             ("data.tar", b"payload!"),
         ]);
         assert!(reason.contains("where its data.tar belongs"), "{reason}");
-        // A compression this reader does not decode.
-        let reason = refused(&[
+        // A compression this reader does not decode: one nothing names, a
+        // `data.tar` compressed with bzip2, which dpkg-deb reads, and a
+        // `control.tar` compressed with LZMA, which it refuses.
+        for (control_name, data_name) in [
+            ("control.tar", "data.tar.bz9"),
+            ("control.tar", "data.tar.bz2"),
+            ("control.tar.lzma", "data.tar"),
+        ] {
+            let reason = refused(&[
+                ("debian-binary", b"2.0\n"),
+                (control_name, &control),
+                (data_name, b"payload!"),
+            ]);
+            assert!(reason.contains("names a compression"), "{reason}");
+        }
+    }
+
+    /// Extracts the `.deb` `archive` into a fresh tree, returning the tree or
+    /// the refusal's rendered chain.
+    fn extracted(archive: &[u8], name: &str) -> Result<crate::scratch::Scratch, String> {
+        let root = crate::scratch::Scratch::for_test("deb", name);
+        let mut extraction = Extraction::new(&root).expect("the root opens");
+        extract_deb(
+            Path::new("tool.deb"),
+            &mut Cursor::new(archive),
+            &mut extraction,
+            &mut |_, _| Ok(crate::provision::extract::Placement::Write),
+        )
+        .map_err(|err| ErrorChain::new(&err).to_string())?;
+        Ok(root)
+    }
+
+    #[test]
+    fn an_lzma_data_member_is_extracted_as_dpkg_deb_extracts_it() {
+        // dpkg-deb 1.22.6 reads a `data.tar.lzma` it no longer writes, and
+        // extracts the tree this does: a directory, a file and a link to it.
+        let data = ferroday_cage_testkit::tar::Tar::new()
+            .dir("./usr/share/doc/tool/", 0o755)
+            .file("./usr/share/doc/tool/file", 0o644, b"hello\n")
+            .symlink("./usr/share/doc/tool/link", "file")
+            .finish();
+        let archive = ferroday_cage_testkit::deb::ar(&[
             ("debian-binary", b"2.0\n"),
-            ("control.tar", &control),
-            ("data.tar.bz9", b"payload!"),
+            ("control.tar", &control_tar(b"Package: tool\n")),
+            (
+                "data.tar.lzma",
+                &ferroday_cage_testkit::compress::lzma(&data),
+            ),
         ]);
-        assert!(reason.contains("names a compression"), "{reason}");
+        let root = extracted(&archive, "lzma-data").expect("the lzma member extracts");
+        let doc = root.join("usr/share/doc/tool");
+        assert_eq!(std::fs::read(doc.join("file")).unwrap(), b"hello\n");
+        assert_eq!(
+            std::fs::read_link(doc.join("link")).unwrap(),
+            Path::new("file")
+        );
+    }
+
+    #[test]
+    fn a_data_member_named_lzma_is_decoded_as_lzma_alone() {
+        // The name decides, as it does for dpkg-deb, which refuses an xz stream
+        // or a plain tar named `data.tar.lzma` rather than sniffing either.
+        let data = ferroday_cage_testkit::tar::Tar::new()
+            .file("./file", 0o644, b"hello\n")
+            .finish();
+        for (case, member) in [
+            ("xz", ferroday_cage_testkit::compress::xz(&data)),
+            ("plain", data.clone()),
+        ] {
+            let archive = ferroday_cage_testkit::deb::ar(&[
+                ("debian-binary", b"2.0\n"),
+                ("control.tar", &control_tar(b"Package: tool\n")),
+                ("data.tar.lzma", &member),
+            ]);
+            let reason = extracted(&archive, "lzma-misnamed").expect_err(case);
+            assert!(
+                reason.contains("the lzma stream does not decode"),
+                "{case}: {reason}"
+            );
+        }
     }
 
     #[test]

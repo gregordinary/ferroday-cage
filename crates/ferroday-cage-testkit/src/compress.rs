@@ -21,6 +21,19 @@ pub fn xz(data: &[u8]) -> Vec<u8> {
     writer.finish().expect("the xz stream closes")
 }
 
+/// `data` as one LZMA stream of unknown size, closed by its end marker, the
+/// shape `xz --format=lzma` writes.
+pub fn lzma(data: &[u8]) -> Vec<u8> {
+    let mut writer = lzma_rust2::LzmaWriter::new_use_header(
+        Vec::new(),
+        &lzma_rust2::LzmaOptions::with_preset(1),
+        None,
+    )
+    .expect("an lzma writer");
+    writer.write_all(data).expect("a vector takes the stream");
+    writer.finish().expect("the lzma stream closes")
+}
+
 /// `data` as one zstd frame.
 pub fn zstd(data: &[u8]) -> Vec<u8> {
     ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
