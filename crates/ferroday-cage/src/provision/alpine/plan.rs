@@ -322,11 +322,16 @@ impl PlannedPackage {
     /// becomes the package's `A:` in the installed database verbatim, so any
     /// other would record a package the root cannot hold.
     ///
+    /// The refusal quotes both architectures, since `architecture` is the one a
+    /// plan document states where its reader asks this, which nothing has held
+    /// to an alphabet. It names the package bare, and is asked only once
+    /// [`unaddressable`](Self::unaddressable) has admitted the name.
+    ///
     /// [`Index::merge`]: super::index::Index::merge
     pub(super) fn foreign_to(&self, architecture: &str) -> Option<String> {
         (self.architecture != architecture && self.architecture != NOARCH).then(|| {
             format!(
-                "the plan states {} for architecture {:?}, in a plan for {architecture}, and a \
+                "the plan states {} for architecture {:?}, in a plan for {architecture:?}, and a \
                  package is the plan's architecture or {NOARCH}",
                 self.name, self.architecture,
             )
@@ -463,13 +468,14 @@ impl Plan {
 
         for stanza in rest {
             if let Some(name) = stanza.get("Package") {
-                let at_package = format!("the package {name}");
+                // Quoted until `unaddressable` below has admitted the name.
+                let at_package = format!("the package {name:?}");
                 let at = number::<usize>(stanza.get("Index"), "Index", &at_package)?
-                    .ok_or_else(|| plan_document(format!("the package {name} names no index")))?;
+                    .ok_or_else(|| plan_document(format!("{at_package} names no index")))?;
                 if at >= plan.indexes.len() {
                     return Err(plan_document(format!(
-                        "the package {name} names index {at}, which the document does not carry \
-                         — index stanzas must precede the packages that refer to them",
+                        "{at_package} names index {at}, which the document does not carry — \
+                         index stanzas must precede the packages that refer to them",
                     )));
                 }
                 let package = PlannedPackage {
@@ -881,6 +887,35 @@ Origin: postmarketos-base
                 assert!(reason.contains("index 7"), "{reason}");
             }
             other => panic!("expected an index refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn what_a_document_states_reaches_a_refusal_with_its_control_characters_escaped() {
+        // Nothing holds a document's header to an alphabet, and nothing holds a
+        // package's name to one until the reader has asked, so each refusal
+        // naming either before then quotes it.
+        let hostile = crate::failure::hostile::TEXT;
+        let document = sample().to_document().unwrap();
+        let misnamed = document
+            .replace("Package: busybox", &format!("Package: {hostile}"))
+            .replace(
+                "Control-Identity: Q18TR4AbuWsapA0X+CI3w/T/AqRyU=\nIndex: 0",
+                "Control-Identity: Q18TR4AbuWsapA0X+CI3w/T/AqRyU=\nIndex: 7",
+            );
+        let foreign = document.replacen(
+            "Architecture: x86_64",
+            &format!("Architecture: {hostile}"),
+            1,
+        );
+        for (refused, says) in [(misnamed, "index 7"), (foreign, "in a plan for")] {
+            match Plan::parse_document(&refused) {
+                Err(AlpineError::PlanDocument { reason }) => {
+                    assert!(reason.contains(says), "{reason}");
+                    crate::failure::hostile::assert_escaped(&reason);
+                }
+                other => panic!("expected a refusal saying {says:?}, got {other:?}"),
+            }
         }
     }
 

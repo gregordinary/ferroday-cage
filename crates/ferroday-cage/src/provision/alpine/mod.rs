@@ -1159,11 +1159,15 @@ fn index_slots<'a>(repositories: &'a [Repository], architecture: &str) -> Vec<In
 /// grammar can compare, because a version it cannot parse compares equal to
 /// nothing and would be reported as a repository that had published past the pin
 /// rather than as the malformed entry it is.
+///
+/// A refusal quotes the architecture the pin states, as [`validate_plan`] quotes
+/// a plan's.
 fn validate_pin(pin: &Plan, architecture: &str) -> Result<(), AlpineError> {
     let contradiction = |reason: String| Err(AlpineError::Config { reason });
     if pin.architecture != architecture {
         return contradiction(format!(
-            "the pin resolves architecture {} but the bootstrap is configured for {architecture}",
+            "the pin resolves architecture {:?} but the bootstrap is configured for \
+             {architecture}",
             pin.architecture,
         ));
     }
@@ -1188,6 +1192,14 @@ fn validate_pin(pin: &Plan, architecture: &str) -> Result<(), AlpineError> {
 ///
 /// The counterpart of the Debian layer's `validate_plan`, and it answers the
 /// same questions in the same order.
+///
+/// A refusal quotes the architecture, the release and the component the plan
+/// states with `{:?}`: a document is a file the caller may have taken from
+/// elsewhere, and nothing holds its header or its index stanzas to an alphabet.
+/// The configured architecture, releases and components have passed
+/// [`check_coordinate`], and are named bare. A package is named bare once
+/// [`PlannedPackage::unaddressable`] has admitted its name, which is the first
+/// thing asked of it.
 fn validate_plan(
     plan: &Plan,
     architecture: &str,
@@ -1220,7 +1232,8 @@ fn validate_plan(
     }
     if plan.architecture != architecture {
         return contradiction(format!(
-            "the plan resolves architecture {} but the bootstrap is configured for {architecture}",
+            "the plan resolves architecture {:?} but the bootstrap is configured for \
+             {architecture}",
             plan.architecture,
         ));
     }
@@ -1251,14 +1264,24 @@ fn validate_plan(
         };
         if index.release != slot.release || index.component.as_deref() != slot.component {
             return contradiction(format!(
-                "the plan's index {at} is {} and the configured repository publishes {} there, so \
-                 its packages would be fetched from a directory that repository does not serve",
+                "the plan's index {at} is {:?} and the configured repository publishes {} there, \
+                 so its packages would be fetched from a directory that repository does not serve",
                 describe(&index.release, index.component.as_deref()),
                 describe(slot.release, slot.component),
             ));
         }
     }
     for package in &plan.packages {
+        // A document is held to this as it is read; a `Plan` is public and
+        // `Clone`, so one taken from `resolve()` and edited reaches here having
+        // passed nothing. First, because it is what admits the name the
+        // refusal below names.
+        if let Some(reason) = package
+            .unaddressable()
+            .or_else(|| package.foreign_to(&plan.architecture))
+        {
+            return contradiction(reason);
+        }
         if package.index >= plan.indexes.len() {
             return contradiction(format!(
                 "the plan's package {} names index {} but the plan records {}, so it names no \
@@ -1267,15 +1290,6 @@ fn validate_plan(
                 package.index,
                 plan.indexes.len(),
             ));
-        }
-        // A document is held to this as it is read; a `Plan` is public and
-        // `Clone`, so one taken from `resolve()` and edited reaches here having
-        // passed nothing.
-        if let Some(reason) = package
-            .unaddressable()
-            .or_else(|| package.foreign_to(&plan.architecture))
-        {
-            return contradiction(reason);
         }
     }
     // Installed twice, a package would be recorded twice and its scripts run
@@ -5462,6 +5476,52 @@ mod tests {
         let reason = refuses_plan(plan, |builder| builder);
         assert!(reason.contains("aarch64"), "{reason}");
         assert!(reason.contains("x86_64"), "{reason}");
+    }
+
+    #[test]
+    fn what_a_plan_or_a_pin_states_reaches_a_refusal_with_its_control_characters_escaped() {
+        // A plan document is a file the caller may have taken from elsewhere,
+        // and nothing holds its header or its index stanzas to an alphabet.
+        use crate::failure::hostile::{TEXT as HOSTILE, assert_escaped};
+        let mut plan = resolved_plan();
+        plan.architecture = HOSTILE.to_string();
+        let reason = refuses_plan(plan.clone(), |builder| builder);
+        assert!(
+            reason.contains("the plan resolves architecture"),
+            "{reason}"
+        );
+        assert_escaped(&reason);
+        let pinned = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror("http://mirror.invalid/alpine")
+            .fetcher(canned())
+            .pin(plan)
+            .build();
+        match pinned {
+            Err(AlpineError::Config { reason }) => {
+                assert!(reason.contains("the pin resolves architecture"), "{reason}");
+                assert_escaped(&reason);
+            }
+            other => panic!("expected the pin refused, got {other:?}"),
+        }
+
+        for (release, component) in [(HOSTILE, Some("main")), ("v3.23", Some(HOSTILE))] {
+            let mut plan = resolved_plan();
+            plan.indexes[0].release = release.to_string();
+            plan.indexes[0].component = component.map(str::to_string);
+            let reason = refuses_plan(plan, |builder| builder);
+            assert!(reason.contains("the plan's index 0"), "{reason}");
+            assert_escaped(&reason);
+        }
+
+        // A package's name is admitted before a refusal names it bare, so one
+        // that names no index the plan records is refused for its name first.
+        let mut plan = resolved_plan();
+        plan.packages[0].name = HOSTILE.to_string();
+        plan.packages[0].index = plan.indexes.len();
+        let reason = refuses_plan(plan, |builder| builder);
+        assert!(reason.contains("addressed by"), "{reason}");
+        assert_escaped(&reason);
     }
 
     #[test]

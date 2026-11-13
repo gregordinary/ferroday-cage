@@ -140,6 +140,13 @@ consumer upgrading can skip it.
   bootstrap's is refused quoting what it states, with its control characters
   escaped. A plan document is a file the caller may have taken from elsewhere,
   and nothing holds its header to an alphabet.
+- The Alpine layer's plan and pin refusals quote what the plan states, with its
+  control characters escaped, as the Debian layer's do: the architecture of a
+  plan or a pin the bootstrap is not configured for, the release and component
+  of a plan's index, and a plan document's architecture where a package's
+  differs. The document reader quotes a package's name until it has held the
+  name to apk's alphabet, and `build` holds a plan's package names to that
+  alphabet before any refusal names one.
 - The Debian layer holds the version of a package an index, a plan, or a base
   layer's status database states to the alphabet Debian policy gives a version:
   alphanumerics and `.`, `+`, `-`, `:`, `~`, which dpkg also holds a package to.
