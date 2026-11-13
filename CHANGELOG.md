@@ -726,6 +726,13 @@ consumer upgrading can skip it.
   paragraph naming no package, so the package was published and missing from
   the index. The pool now carries the control file's one stanza, and reads the
   index it extends a stanza at a time as every other reader of it does.
+- A signed Debian repository's `ResolvedArchive::release_sha256`, a plan's
+  `Release-SHA256`, is the SHA-256 of the `InRelease` file as the mirror served
+  it, signature included, so `sha256sum` over the file gives it. It was the
+  digest of the signed text as the verifier normalized it, with CR LF line
+  endings and no final newline, which matched no file the mirror serves and
+  differed from what the same release recorded unsigned. A repository trusted
+  unsigned records the digest of its `Release` file, as before.
 
 ### Internal
 

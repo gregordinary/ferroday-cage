@@ -124,12 +124,14 @@ pub struct ResolvedArchive {
     pub suite: String,
     /// The components resolved from this repository.
     pub components: Vec<String>,
-    /// The SHA-256 of the release body that was verified.
+    /// The SHA-256 of the release file the mirror served.
     ///
-    /// For a signed repository this is the digest of the cleartext the
-    /// signature covers, so it identifies the exact archive state the
-    /// signature vouched for. Always a SHA-256, whichever digests the release
-    /// itself records for its indexes: this one is taken of the release.
+    /// For a signed repository that is the `InRelease` as fetched, signature
+    /// included, and for one trusted unsigned the `Release`. It is the digest
+    /// of a file the mirror publishes, so `sha256sum` over that file, fetched
+    /// from [`mirror`](Self::mirror) while the archive still serves the state,
+    /// gives it. Always a SHA-256, whichever digests the release itself records
+    /// for its indexes: this one is taken of the release.
     pub release_sha256: Digest,
     /// The release's `Date` field, as written, when it carries one.
     pub date: Option<String>,

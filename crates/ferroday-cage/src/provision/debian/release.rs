@@ -12,7 +12,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::digests::{Digests, RECORDED};
-use crate::provision::digest::{Algorithm, Digest};
 use crate::provision::{document, now_epoch};
 
 /// Why a release cannot be used: it is malformed, expired, or does not offer
@@ -77,13 +76,6 @@ pub(crate) struct Release {
     suite: Option<String>,
     /// The release's own `Codename:` field (for example `trixie`), if present.
     codename: Option<String>,
-    /// The SHA-256 of the body this was parsed from, lowercase hex.
-    ///
-    /// Computed here rather than by the caller so it is unambiguously the
-    /// digest of the bytes that were verified: for a signed repository that is
-    /// the cleartext the signature covers, not the `InRelease` armor around it
-    /// and not a re-fetch.
-    sha256: Digest,
 }
 
 impl Release {
@@ -167,7 +159,6 @@ impl Release {
             date: stanza.get("Date").map(|value| value.trim().to_string()),
             suite: stanza.get("Suite").map(|value| value.trim().to_string()),
             codename: stanza.get("Codename").map(|value| value.trim().to_string()),
-            sha256: Digest::of(Algorithm::Sha256, body.as_bytes()),
         })
     }
 
@@ -179,11 +170,6 @@ impl Release {
     /// The release's `Valid-Until` field, as written.
     pub(crate) fn valid_until(&self) -> Option<&str> {
         self.valid_until.as_deref()
-    }
-
-    /// The SHA-256 of the verified body, lowercase hex.
-    pub(crate) fn sha256(&self) -> &Digest {
-        &self.sha256
     }
 
     /// How the release ranks its versions against another release's.

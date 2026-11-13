@@ -795,10 +795,10 @@ repository with a [`mirror_fallback`] snapshot backstop resolves against
 whichever URL served. Recording the list would describe a choice rather than the
 choice made.
 
-The **release digest** is of the body that was verified. For a signed
-repository, that is the cleartext the signature covers, not the `InRelease` armor
-around it and not a re-fetch. It therefore identifies the exact archive state
-the signature vouched for.
+The **release digest** is of the release file the mirror served: the
+`InRelease` as fetched, signature included, for a signed repository, and the
+`Release` for one trusted unsigned. It names a file the archive publishes, so
+`sha256sum` over that file gives it while the archive still serves that state.
 
 Two fingerprints record **who vouched for it**, both in the uppercase hex the
 OpenPGP tools print. Both are empty for a repository configured as

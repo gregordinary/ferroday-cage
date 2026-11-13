@@ -79,7 +79,7 @@ use super::{
     Staged, Stream, mirror_url, walk_mirrors,
 };
 use crate::failure::path_io_error;
-use crate::provision::digest::Digest;
+use crate::provision::digest::{Algorithm, Digest};
 use crate::status::ExitStatus;
 use crate::{ErrorChain, IdMapper, IdentityMap};
 use bootstrap::{Installable, StatOverride};
@@ -2017,6 +2017,7 @@ fn merged_index(
         )?;
         let Served {
             mirror,
+            sha256,
             signed_by,
             signing_key,
             ..
@@ -2025,7 +2026,7 @@ fn merged_index(
             mirror,
             suite: repository.suite.clone(),
             components: repository.components.clone(),
-            release_sha256: release.sha256().clone(),
+            release_sha256: sha256,
             date: release.date().map(str::to_string),
             valid_until: release.valid_until().map(str::to_string),
             signed_by,
@@ -2100,6 +2101,7 @@ fn fetch_release(
             let (bytes, mirror) =
                 fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, observer)?;
             let url = mirror_url(&mirror, &suffix);
+            let sha256 = Digest::of(Algorithm::Sha256, &bytes);
             let Ok(body) = String::from_utf8(bytes) else {
                 return Err(DebianError::Release {
                     subject: url,
@@ -2113,6 +2115,7 @@ fn fetch_release(
                 Served {
                     url,
                     mirror,
+                    sha256,
                     signed_by: Vec::new(),
                     signing_key: Vec::new(),
                 },
@@ -2123,6 +2126,7 @@ fn fetch_release(
             let (bytes, mirror) =
                 fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, observer)?;
             let url = mirror_url(&mirror, &suffix);
+            let sha256 = Digest::of(Algorithm::Sha256, &bytes);
             // The keyring parsed when the repository was built, so this is a
             // second parse of the same bytes rather than a new question; a
             // refusal is reported against the release it was to verify.
@@ -2137,6 +2141,7 @@ fn fetch_release(
                 Served {
                     url,
                     mirror,
+                    sha256,
                     signed_by: vec![verified.certificate],
                     signing_key: vec![verified.signing_key],
                 },
@@ -2168,6 +2173,10 @@ struct Served {
     /// deciding a later one. It reaches a caller as
     /// [`ResolvedArchive::mirror`].
     mirror: String,
+    /// The SHA-256 of the release file as the mirror served it: the
+    /// `InRelease`, signature and all, or the `Release` of a repository trusted
+    /// unsigned. It reaches a caller as [`ResolvedArchive::release_sha256`].
+    sha256: Digest,
     /// The verifying certificate's primary-key fingerprint, or empty for a
     /// trusted-unsigned repository.
     signed_by: Vec<String>,
@@ -3557,7 +3566,6 @@ impl From<crate::Error> for DebianError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provision::digest::Algorithm;
     use crate::scratch::Scratch;
 
     #[test]
@@ -4673,22 +4681,9 @@ mod tests {
         assert_eq!(served.signed_by.len(), 1, "{:?}", served.signed_by);
         assert_eq!(served.signed_by[0].len(), 40, "{:?}", served.signed_by);
 
-        // The digest is over the bytes the signature covered, which is not the
-        // InRelease the transport delivered: the armor and the signature are
-        // around what was verified rather than part of it.
-        let (message, _) = pgp::composed::CleartextSignedMessage::from_armor(INRELEASE)
-            .expect("the fixture is a cleartext-signed document");
-        assert_eq!(
-            release.sha256().hex(),
-            Algorithm::Sha256.hex_of(message.signed_text().as_bytes()),
-        );
-        assert_ne!(release.sha256().hex(), Algorithm::Sha256.hex_of(INRELEASE));
-
-        // And it is a property of those bytes rather than of the fetch, so a
-        // second pass over the same release records the same digest.
-        let (again, _) = fetch_release(&mut Canned(INRELEASE), &repository, &mut Silent)
-            .expect("the same release verifies again");
-        assert_eq!(release.sha256(), again.sha256());
+        // The digest is of the file the mirror served, signature included, so
+        // `sha256sum` over the InRelease gives it.
+        assert_eq!(served.sha256.hex(), Algorithm::Sha256.hex_of(INRELEASE));
 
         assert_eq!(release.date(), Some("Tue, 21 Jul 2026 14:11:47 UTC"));
         assert_eq!(release.valid_until(), Some("Tue, 28 Jul 2026 14:11:47 UTC"));
