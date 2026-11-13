@@ -30,7 +30,10 @@
 //!
 //! [`open_entry`] opens what the cache holds at a name without following a
 //! symbolic link there and without waiting on a named pipe, and refuses anything
-//! that is not a regular file. A cache is a tree that is not fully trusted, so
+//! that is not a regular file. An entry held below directories of the cache's
+//! own has that chain made by `create_within`, which refuses a link at any
+//! directory of it, so a link planted at one is refused rather than followed out
+//! of the cache too. A cache is a tree that is not fully trusted, so
 //! its entries are opened as [`Rooted`] opens any such tree's files.
 //!
 //! # Failing
@@ -177,6 +180,66 @@ pub(crate) fn create(path: &Path) -> Result<(), ProvisionError> {
     fs::create_dir_all(path)
         .map_err(|err| ProvisionError::io("creating the package cache", path, err))?;
     Staged::sweep(path);
+    Ok(())
+}
+
+/// The mode a directory [`create_within`] makes is left at, stated rather than
+/// left to the umask, as a tree's own directories are.
+#[cfg(feature = "gentoo")]
+const DIR_MODE: u32 = 0o755;
+
+/// Creates the directory `dir` below the package cache `cache`, and every
+/// directory between them that is missing, refusing a symbolic link at any of
+/// them; and sweeps `dir` as [`create`] sweeps a cache. The cache itself is
+/// created where it is missing, as [`create`] creates it.
+///
+/// For an entry a cache holds below directories of its own: a Gentoo binary
+/// package, under the binhost's path. The cache is the caller's, and may be
+/// reached through a link. Nothing below it is, so a link at a directory of
+/// the chain fails the call, rather than being followed out of the cache by
+/// the download into it and the read back out of it. The chain is resolved
+/// from a descriptor of the cache, with every link refused.
+///
+/// # Errors
+///
+/// Returns [`ProvisionError::Io`] naming `dir`: for a link in the chain,
+/// `ELOOP`, and for a `dir` that is not below `cache`, `EINVAL`.
+#[cfg(feature = "gentoo")]
+pub(crate) fn create_within(cache: &Path, dir: &Path) -> Result<(), ProvisionError> {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    use rustix::io::Errno;
+
+    let fail = |errno: Errno| ProvisionError::io("creating the package cache", dir, errno.into());
+    let components = dir
+        .strip_prefix(cache)
+        .ok()
+        .and_then(|below| {
+            crate::path::tree_components(
+                below.as_os_str().as_bytes(),
+                crate::path::LeadingSlash::Refused,
+            )
+            .ok()
+        })
+        .ok_or_else(|| fail(Errno::INVAL))?;
+    fs::create_dir_all(cache)
+        .map_err(|err| ProvisionError::io("creating the package cache", cache, err))?;
+    let root = rustix::fs::open(
+        cache,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(fail)?;
+    super::containment::create_dirs(
+        root.as_fd(),
+        &components,
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        &mut |made| rustix::fs::fchmod(made.dir, Mode::from_raw_mode(DIR_MODE)),
+    )
+    .map_err(fail)?;
+    Staged::sweep(dir);
     Ok(())
 }
 
@@ -1225,5 +1288,37 @@ mod tests {
             PackageCache::derived(&dir.join("tree/sub/.."), ".cache"),
             fs::canonicalize(dir.path()).unwrap().join("tree.cache"),
         );
+    }
+
+    #[cfg(feature = "gentoo")]
+    #[test]
+    fn a_link_below_the_cache_is_refused_rather_than_followed() {
+        // A binary package sits below the binhost's path in the cache. A link
+        // planted at one of those directories would carry the download, and
+        // the read back, out of the cache.
+        let dir = Scratch::new("cache-within");
+        let (cache, outside) = (dir.join("cache"), dir.join("outside"));
+        std::fs::create_dir_all(&outside).unwrap();
+        create_within(&cache, &cache.join("binhost/app-misc/hello")).expect("the chain is created");
+        create_within(&cache, &cache.join("binhost/app-misc/hello"))
+            .expect("a chain already there is taken as it stands");
+        assert!(cache.join("binhost/app-misc/hello").is_dir());
+
+        std::os::unix::fs::symlink(&outside, cache.join("binhost/sys-apps")).unwrap();
+        let err = create_within(&cache, &cache.join("binhost/sys-apps/coreutils"))
+            .expect_err("a link in the chain is refused");
+        assert!(
+            matches!(&err, ProvisionError::Io { source, .. }
+                if source.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "the link was followed"
+        );
+
+        // A directory that is not below the cache is not one to create there.
+        assert!(create_within(&cache, &outside.join("x")).is_err());
     }
 }

@@ -924,6 +924,10 @@ consumer upgrading can skip it.
   that are not UTF-8, the obs-text RFC 9110 permits, where any such byte failed
   the fetch. A field the client acts on is still refused where one holds such a
   byte.
+- The Gentoo layer refuses a symbolic link at any directory between its
+  package cache and a binary package's entry, where it followed one, and a
+  download into the entry, and the read back out of it, went wherever the link
+  led.
 
 ### Internal
 

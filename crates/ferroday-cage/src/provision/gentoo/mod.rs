@@ -1941,7 +1941,7 @@ impl Gentoo {
         for planned in &plan.packages {
             let path = cache_entry(cache.path(), &directory, planned);
             if let Some(parent) = path.parent() {
-                cache::create(parent)?;
+                cache::create_within(cache.path(), parent)?;
             }
             cached.push(path);
         }
