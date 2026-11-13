@@ -727,8 +727,7 @@ impl Debian {
         // Preflights before any download, the same fail-early posture the full
         // bootstrap takes: the increment's configure wave runs the target's
         // binaries, and a range map must be establishable.
-        arch::preflight_foreign(&arch::host_architecture(), &self.architecture)
-            .map_err(|reason| wrap(DebianError::Config { reason }))?;
+        arch::preflight_foreign(&arch::host_architecture(), &self.architecture).map_err(wrap)?;
         crate::provision::layer::network_filter_preflight()
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
         crate::idmap::establishable(&self.identity_map, self.id_mapper.as_ref()).map_err(
@@ -1822,8 +1821,7 @@ fn bootstrap_suite(
     } = config;
     // A full bootstrap must be able to run the target's binaries.
     if !extract_only {
-        arch::preflight_foreign(&arch::host_architecture(), architecture)
-            .map_err(|reason| wrap(DebianError::Config { reason }))?;
+        arch::preflight_foreign(&arch::host_architecture(), architecture).map_err(wrap)?;
         crate::provision::layer::network_filter_preflight()
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
 

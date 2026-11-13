@@ -2535,8 +2535,9 @@ fn preflight_foreign(host: &str, target: &str) -> Result<(), AlpineError> {
     if host == target || (host == "x86_64" && target == "x86") {
         return Ok(());
     }
-    binfmt::preflight(host, target, qemu_interpreter(target))
-        .map_err(|reason| AlpineError::Config { reason })
+    binfmt::preflight(host, target, qemu_interpreter(target)).map_err(|refusal| {
+        refusal.into_error(|reason| AlpineError::Config { reason }, AlpineError::io)
+    })
 }
 
 /// The `qemu-user` interpreter that runs `architecture`'s binaries, by the name

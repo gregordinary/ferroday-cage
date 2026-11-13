@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::DebianError;
 use crate::provision::binfmt;
 
 /// The Debian architecture name for the host.
@@ -133,11 +134,13 @@ fn runs_natively(host: &str, target: &str) -> bool {
 /// path never touches the binfmt registration. The question and its message are
 /// [`binfmt::preflight`]'s, which the Alpine layer asks too; the architecture
 /// names are this layer's.
-pub(crate) fn preflight_foreign(host: &str, target: &str) -> Result<(), String> {
+pub(crate) fn preflight_foreign(host: &str, target: &str) -> Result<(), DebianError> {
     if runs_natively(host, target) {
         return Ok(());
     }
-    binfmt::preflight(host, target, qemu_interpreter(target))
+    binfmt::preflight(host, target, qemu_interpreter(target)).map_err(|refusal| {
+        refusal.into_error(|reason| DebianError::Config { reason }, DebianError::io)
+    })
 }
 
 /// The `qemu-user` interpreter the kernel will execute `architecture` binaries

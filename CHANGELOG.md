@@ -500,6 +500,11 @@ consumer upgrading can skip it.
 - **Breaking.** A Gentoo binary package whose container cannot be read is
   reported as `GentooError::Io`, the OS error its cause, as the layer documents.
   It was `GentooError::Container` with the error flattened into the reason.
+- A Debian or Alpine bootstrap for a foreign architecture whose binfmt handler
+  is registered and cannot be read, under a restrictive mount or a security
+  module, fails with the layer's `Io` error naming the registration file, the
+  read's own failure its cause. It failed with the layer's `Config` error,
+  saying only that the registration could not be read.
 
 ### Fixed
 

@@ -19,21 +19,59 @@
 //! foreign binaries through the host's handlers, so a missing mount is a
 //! question the preflight cannot answer rather than a missing handler.
 
+use std::io;
 use std::path::PathBuf;
 
 /// Where `binfmt_misc` keeps its host-wide switch.
 const STATUS: &str = "/proc/sys/fs/binfmt_misc/status";
 
 /// Why a handler cannot run a foreign binary.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Missing {
     /// The kernel has no handler for the interpreter at all.
     Unregistered,
     /// A handler is registered, and this is what is wrong with it.
     Unusable(&'static str),
+    /// A handler's registration is there and could not be read, for the
+    /// reason the read failed with.
+    Unreadable(io::Error),
     /// `binfmt_misc` is switched off host-wide, so no handler runs whatever is
     /// registered.
     Disabled,
+}
+
+/// Why a full bootstrap for a foreign architecture cannot run on this host.
+#[derive(Debug)]
+pub(crate) enum Unrunnable {
+    /// The host lacks what the bootstrap needs, as the message a caller is
+    /// shown: the remedy, and `extract_only` as the alternative.
+    Unmet(String),
+    /// The handler's registration could not be read: the host's failure,
+    /// rather than an answer about the handler.
+    Unreadable {
+        /// The registration file.
+        path: PathBuf,
+        /// Why the read failed.
+        source: io::Error,
+    },
+}
+
+impl Unrunnable {
+    /// This refusal as a layer's error: a host that lacks something as the
+    /// configuration error `config` builds, and a registration that could not be
+    /// read as the I/O error `io` builds, the read's failure its cause.
+    pub(crate) fn into_error<E>(
+        self,
+        config: impl FnOnce(String) -> E,
+        io: impl FnOnce(&'static str, PathBuf, io::Error) -> E,
+    ) -> E {
+        match self {
+            Unrunnable::Unmet(reason) => config(reason),
+            Unrunnable::Unreadable { path, source } => {
+                io("reading the binfmt_misc registration", path, source)
+            }
+        }
+    }
 }
 
 /// What `binfmt_misc`'s own status file says, where it could be read.
@@ -63,17 +101,32 @@ enum Interface {
 /// run proceeds. A handler the host lacks then fails the first foreign binary
 /// the bootstrap runs, with `ENOEXEC`, rather than this check refusing a run
 /// the host's registrations would carry.
-pub(crate) fn preflight(host: &str, target: &str, interpreter: Option<&str>) -> Result<(), String> {
+///
+/// A registration that is there and cannot be read, under a restrictive mount
+/// or a security module, is [`Unrunnable::Unreadable`], carrying the read's own
+/// failure: what the host refused is the answer, and no remedy for a missing
+/// handler applies to it.
+pub(crate) fn preflight(
+    host: &str,
+    target: &str,
+    interpreter: Option<&str>,
+) -> Result<(), Unrunnable> {
     let Some(interpreter) = interpreter else {
-        return Err(format!(
+        return Err(Unrunnable::Unmet(format!(
             "a full bootstrap for {target} on a {host} host needs a qemu-user binfmt handler, and \
              {target} is not a known qemu target; use extract_only instead"
-        ));
+        )));
     };
-    ready(interpreter).map_err(|missing| refusal(host, target, interpreter, missing))
+    ready(interpreter).map_err(|missing| match missing {
+        Missing::Unreadable(source) => Unrunnable::Unreadable {
+            path: registration(interpreter),
+            source,
+        },
+        missing => Unrunnable::Unmet(refusal(host, target, interpreter, missing)),
+    })
 }
 
-/// The message a caller is shown for `missing`.
+/// The message a caller is shown for `missing`, a handler the host lacks.
 fn refusal(host: &str, target: &str, interpreter: &str, missing: Missing) -> String {
     match missing {
         Missing::Unregistered => format!(
@@ -85,6 +138,9 @@ fn refusal(host: &str, target: &str, interpreter: &str, missing: Missing) -> Str
             "the qemu-{interpreter} binfmt handler is registered but {reason}; a foreign \
              bootstrap needs it enabled and registered with the fix-binary (F) flag"
         ),
+        Missing::Unreadable(err) => {
+            format!("the qemu-{interpreter} binfmt handler's registration could not be read: {err}")
+        }
         Missing::Disabled => format!(
             "a full bootstrap for {target} on a {host} host needs binfmt_misc enabled, and {STATUS} \
              reads disabled (writing 1 to it as root enables it); use extract_only to lay out the \
@@ -115,7 +171,7 @@ fn judge(
         Some(Interface::Enabled) | None => {}
     }
     let registration = registration
-        .map_err(|_| Missing::Unusable("its registration could not be read"))?
+        .map_err(Missing::Unreadable)?
         .ok_or(Missing::Unregistered)?;
     check(&parse(&registration)).map_err(Missing::Unusable)
 }
@@ -144,13 +200,19 @@ fn interface() -> Option<Interface> {
 /// answering `None` there advises a caller to register a handler the kernel
 /// already holds.
 pub(crate) fn read(name: &str) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(format!("/proc/sys/fs/binfmt_misc/qemu-{name}")) {
+    match std::fs::read_to_string(registration(name)) {
         Ok(registration) => Ok(Some(registration)),
         // Both the registration and the directory it would live in: neither
         // present is the same answer, since the filesystem is not mounted.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+/// The file the kernel's registration for the `qemu-<name>` handler is read
+/// from.
+fn registration(name: &str) -> PathBuf {
+    PathBuf::from(format!("/proc/sys/fs/binfmt_misc/qemu-{name}"))
 }
 
 /// What a `binfmt_misc` registration file says, as fields.
@@ -245,18 +307,53 @@ mod tests {
     #[test]
     fn an_interpreter_no_kernel_registers_is_unregistered() {
         let mounted = Some(Interface::Enabled);
-        assert_eq!(
+        assert!(matches!(
             judge(mounted, read("an-architecture-no-kernel-has")),
             Err(Missing::Unregistered),
-        );
+        ));
         // A name the read cannot even attempt is not "no handler is
         // registered": the preflight would advise registering one, and what is
         // true is that nothing here could look. A NUL makes the read fail for a
-        // reason that is not absence, whatever the host has mounted.
+        // reason that is not absence, whatever the host has mounted, and the
+        // read's own failure is what is kept.
         assert!(read("a\0name").is_err());
-        assert_eq!(
+        assert!(matches!(
             judge(Some(Interface::Enabled), read("a\0name")),
-            Err(Missing::Unusable("its registration could not be read")),
+            Err(Missing::Unreadable(err)) if err.kind() == std::io::ErrorKind::InvalidInput,
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_registration_reaches_a_layer_as_its_io_failure() {
+        // The host refused the read, which is not a missing handler: a layer
+        // reports it as a failure of its own host I/O, naming the file, with
+        // the read's failure as the cause, and no remedy for a handler the host
+        // lacks.
+        #[derive(Debug, PartialEq)]
+        enum Layer {
+            Config(String),
+            Io(&'static str, PathBuf, Option<i32>),
+        }
+        let unreadable = Unrunnable::Unreadable {
+            path: registration("aarch64"),
+            source: io::Error::from_raw_os_error(13),
+        };
+        assert_eq!(
+            unreadable.into_error(Layer::Config, |op, path, source| {
+                Layer::Io(op, path, source.raw_os_error())
+            }),
+            Layer::Io(
+                "reading the binfmt_misc registration",
+                PathBuf::from("/proc/sys/fs/binfmt_misc/qemu-aarch64"),
+                Some(13),
+            ),
+        );
+        let unmet = Unrunnable::Unmet("needs a handler".to_string());
+        assert_eq!(
+            unmet.into_error(Layer::Config, |op, path, source| {
+                Layer::Io(op, path, source.raw_os_error())
+            }),
+            Layer::Config("needs a handler".to_string()),
         );
     }
 
@@ -265,22 +362,24 @@ mod tests {
         let usable = || Ok(Some("enabled\ninterpreter /q\nflags: F\n".to_string()));
         // Unmounted, nothing is visible and nothing is refused: the host's
         // registrations still run foreign binaries for this process.
-        assert_eq!(judge(Some(Interface::Unmounted), Ok(None)), Ok(()));
+        assert!(judge(Some(Interface::Unmounted), Ok(None)).is_ok());
         // Switched off host-wide, even a usable handler runs nothing.
-        assert_eq!(
+        assert!(matches!(
             judge(Some(Interface::Disabled), usable()),
             Err(Missing::Disabled)
-        );
+        ));
         // A status that could not be read leaves the registration to decide.
-        assert_eq!(judge(None, usable()), Ok(()));
-        assert_eq!(judge(None, Ok(None)), Err(Missing::Unregistered));
+        assert!(judge(None, usable()).is_ok());
+        assert!(matches!(judge(None, Ok(None)), Err(Missing::Unregistered)));
     }
 
     #[test]
     fn a_foreign_bootstrap_is_refused_with_the_remedy_and_the_alternative() {
         // One message for every layer: the architectures are each layer's own
         // names, and what is wrong and what to do about it is the kernel's.
-        let unknown = preflight("x86_64", "vax", None).expect_err("qemu has no vax target");
+        let Err(Unrunnable::Unmet(unknown)) = preflight("x86_64", "vax", None) else {
+            panic!("qemu has no vax target");
+        };
         assert!(
             unknown.contains("vax is not a known qemu target") && unknown.contains("extract_only"),
             "{unknown}",
@@ -299,15 +398,15 @@ mod tests {
             "{unregistered}",
         );
 
-        let unreadable = refusal(
+        let unusable = refusal(
             "x86_64",
             "imaginary",
             "aarch64",
-            Missing::Unusable("its registration could not be read"),
+            Missing::Unusable("it is disabled"),
         );
         assert!(
-            unreadable.contains("registered but its registration could not be read"),
-            "{unreadable}",
+            unusable.contains("registered but it is disabled"),
+            "{unusable}",
         );
 
         let disabled = refusal("x86_64", "arm64", "aarch64", Missing::Disabled);
