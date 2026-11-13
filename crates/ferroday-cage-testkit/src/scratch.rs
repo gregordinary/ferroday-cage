@@ -18,12 +18,15 @@ pub fn cache_dir() -> PathBuf {
     // The fixture cache sits in the target directory, beside the profile
     // directories. Where the test binary lies beneath it depends on Cargo's
     // layout, `<profile>/deps/` before 1.100 and `<profile>/build/<package>/`
-    // from it, so the target directory is found by the `CACHEDIR.TAG` Cargo
-    // writes at its root, and at the root of each `<triple>/` a cross build
-    // uses, rather than by counting levels.
+    // from it, so the target directory is found by what Cargo writes there
+    // rather than by counting levels. `CACHEDIR.TAG` marks its root, and the
+    // root of each `<triple>/` a cross build uses, but only where Cargo made
+    // the directory: one that existed before Cargo first ran, as a
+    // `CARGO_TARGET_DIR` made ahead of time does, has none. `.rustc_info.json`
+    // is at the root either way.
     let exe = std::env::current_exe().expect("the test binary has a path");
     exe.ancestors()
-        .find(|dir| dir.join("CACHEDIR.TAG").is_file())
+        .find(|dir| dir.join("CACHEDIR.TAG").is_file() || dir.join(".rustc_info.json").is_file())
         .expect("the test binary lives under a target directory")
         .join("test-fixtures")
 }
