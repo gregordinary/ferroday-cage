@@ -6,7 +6,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use common::deb_repo::{Pkg, Tar, deb, deb_with_control, write_repo};
-use ferroday_cage::provision::debian::{Debian, DebianEvent, Plan, Pool, Repository};
+use ferroday_cage::provision::debian::{
+    Debian, DebianError, DebianEvent, Plan, Pool, Repository, UnheldReason,
+};
 use ferroday_cage::provision::{self, ProvisionError, Provisioned};
 
 /// The pool the pool tests publish into: a fixed suite, component, and
@@ -3856,4 +3858,220 @@ fn hermetic_a_pin_composes_with_the_selection_a_plan_contradicts() {
         .expect_err("a pin for another architecture is refused")
         .to_string();
     assert!(refusal.contains("riscv64"), "{refusal}");
+}
+
+/// Writes a repository for `suite` into `dir` that ranks itself as a backports
+/// suite does, `NotAutomatic` and `ButAutomaticUpgrades`, and declares it.
+fn backports_repository(dir: &Path, suite: &str, packages: &[Pkg]) -> Repository {
+    let mirror = write_repo(dir, suite, "amd64", packages);
+    let release = dir.join(format!("dists/{suite}/Release"));
+    let mut text = std::fs::read_to_string(&release).unwrap();
+    text.push_str("NotAutomatic: yes\nButAutomaticUpgrades: yes\n");
+    std::fs::write(&release, text).unwrap();
+    Repository::builder(suite)
+        .mirror(mirror)
+        .trust_unsigned(true)
+        .name("backports")
+        .build()
+        .expect("the backports repository validates")
+}
+
+#[test]
+fn hermetic_a_pin_refuses_a_release_that_does_not_offer_the_pinned_version() {
+    // The pin holds the kernel at the version trixie offers, and the install
+    // list asks for it from backports, which offers a newer one. Taking
+    // backports' version would resolve the kernel around its pin, and taking
+    // trixie's would ignore the release the entry names, so the pin refuses.
+    let dir = common::scratch_dir("debian-pin-release");
+    let archive = write_repo(
+        &dir.join("archive"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload_holding(b"base\n"), ""),
+            at_version("kernel", "6.12", payload_holding(b"6.12\n")),
+        ],
+    );
+    let backports = backports_repository(
+        &dir.join("backports"),
+        "trixie-backports",
+        &[at_version("kernel", "6.16~bpo", payload_holding(b"6.16\n"))],
+    );
+    let build = || {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(archive.clone())
+            .trust_unsigned(true)
+            .repository(backports.clone())
+    };
+    let pin = live_resolve(build().include(["kernel"]).build().unwrap());
+    let kernel = pin.packages.iter().find(|p| p.name == "kernel").unwrap();
+    assert_eq!((kernel.version.as_str(), kernel.archive), ("6.12", 0));
+
+    let mut debian = build()
+        .include(["kernel/trixie-backports"])
+        .pin(pin)
+        .build()
+        .expect("the pin validates against the configuration");
+    match debian.resolve() {
+        Err(DebianError::Pin { unheld, .. }) => {
+            assert_eq!(unheld.len(), 1, "{unheld:?}");
+            assert_eq!(
+                (unheld[0].package.as_str(), unheld[0].version.as_str()),
+                ("kernel", "6.12"),
+            );
+            assert!(
+                matches!(
+                    &unheld[0].reason,
+                    UnheldReason::Release { release, archive, .. }
+                        if release == "trixie-backports" && archive == "6.16~bpo"
+                ),
+                "{:?}",
+                unheld[0],
+            );
+        }
+        other => panic!("expected the pin refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn hermetic_a_pin_holds_a_dependency_a_release_switches() {
+    // `app/trixie-backports` needs a libfoo only backports offers, which the
+    // switch to the release would take. The pin holds libfoo at trixie's
+    // version, so the resolution refuses the pin, naming who needed what.
+    let dir = common::scratch_dir("debian-pin-switch");
+    let archive = write_repo(
+        &dir.join("archive"),
+        "trixie",
+        "amd64",
+        &[
+            Pkg::required("base", payload_holding(b"base\n"), ""),
+            at_version("libfoo", "1.0", payload_holding(b"libfoo 1\n")),
+            at_version("app", "1.0", payload_holding(b"app 1\n")).depending_on("libfoo"),
+        ],
+    );
+    let backports = backports_repository(
+        &dir.join("backports"),
+        "trixie-backports",
+        &[
+            at_version("libfoo", "2.0~bpo", payload_holding(b"libfoo 2\n")),
+            at_version("app", "2.0~bpo", payload_holding(b"app 2\n"))
+                .depending_on("libfoo (>= 2.0~bpo)"),
+        ],
+    );
+    let build = || {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(archive.clone())
+            .trust_unsigned(true)
+            .repository(backports.clone())
+    };
+    // The pin holds what trixie supplied, and leaves the entry's own name to
+    // float, so the only thing in the way is the dependency.
+    let mut pin = live_resolve(build().include(["app"]).build().unwrap());
+    pin.packages.retain(|package| package.name != "app");
+    let libfoo = pin.packages.iter().find(|p| p.name == "libfoo").unwrap();
+    assert_eq!(libfoo.version, "1.0");
+
+    let mut debian = build()
+        .include(["app/trixie-backports"])
+        .pin(pin)
+        .build()
+        .expect("the pin validates against the configuration");
+    match debian.resolve() {
+        Err(DebianError::Pin { unheld, .. }) => {
+            assert_eq!(unheld.len(), 1, "{unheld:?}");
+            assert_eq!(
+                (unheld[0].package.as_str(), unheld[0].version.as_str()),
+                ("libfoo", "1.0"),
+            );
+            assert!(
+                matches!(
+                    &unheld[0].reason,
+                    UnheldReason::Requirement { requirement, required_by, .. }
+                        if requirement == "libfoo (>= 2.0~bpo)" && required_by == "app"
+                ),
+                "{:?}",
+                unheld[0],
+            );
+        }
+        other => panic!("expected the pin refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn hermetic_a_pin_holds_what_a_layer_upgrades_over_its_base() {
+    // The base holds libfoo1 1.0-1, the pin holds trixie's 1.0-2, and a
+    // security release ranked like trixie offers 1.0-2+deb13u1. An increment
+    // needing 1.0-2 or newer upgrades libfoo1, and the upgrade is the pinned
+    // version rather than the newest one.
+    let dir = common::scratch_dir("debian-pin-layer");
+    let archive = write_repo(
+        &dir.join("archive"),
+        "trixie",
+        "amd64",
+        &[
+            at_version("libfoo1", "1.0-2", payload_holding(b"1.0-2\n")),
+            at_version("app", "1.0", payload_holding(b"app\n")).depending_on("libfoo1 (>= 1.0-2)"),
+        ],
+    );
+    let security_mirror = write_repo(
+        &dir.join("security"),
+        "trixie-security",
+        "amd64",
+        &[at_version(
+            "libfoo1",
+            "1.0-2+deb13u1",
+            payload_holding(b"1.0-2+deb13u1\n"),
+        )],
+    );
+    let security = Repository::builder("trixie-security")
+        .mirror(security_mirror)
+        .trust_unsigned(true)
+        .name("security")
+        .build()
+        .expect("the security repository validates");
+
+    let base_dir = dir.join("base");
+    let dpkg = base_dir.join("var/lib/dpkg");
+    std::fs::create_dir_all(&dpkg).unwrap();
+    std::fs::write(
+        dpkg.join("status"),
+        "Package: libfoo1\nStatus: install ok installed\nVersion: 1.0-1\n",
+    )
+    .unwrap();
+
+    let build = || {
+        Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror(archive.clone())
+            .trust_unsigned(true)
+    };
+    let pin = live_resolve(build().include(["libfoo1"]).build().unwrap());
+    assert_eq!(pin.packages.len(), 1, "{pin:?}");
+
+    let layered = || {
+        build()
+            .repository(security.clone())
+            .base_layer(&base_dir)
+            .include(["app"])
+    };
+    let upgrade = |plan: &Plan| {
+        let libfoo1 = plan.packages.iter().find(|p| p.name == "libfoo1").unwrap();
+        (libfoo1.version.clone(), libfoo1.archive)
+    };
+    let unpinned = layered()
+        .build()
+        .unwrap()
+        .resolve_layer()
+        .expect("the unpinned layer resolves");
+    assert_eq!(upgrade(&unpinned), ("1.0-2+deb13u1".to_string(), 1));
+
+    let pinned = layered()
+        .pin(pin)
+        .build()
+        .expect("the pin validates against the configuration")
+        .resolve_layer()
+        .expect("the pinned layer resolves");
+    assert_eq!(upgrade(&pinned), ("1.0-2".to_string(), 0));
 }

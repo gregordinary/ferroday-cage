@@ -202,11 +202,13 @@ an `include`.
 
 ### What a resolution refuses
 
-A dependency nothing can satisfy fails the resolution. Three cases reach it:
+A dependency nothing can satisfy fails the resolution. Four cases reach it:
 
 - A name no configured archive carries.
 - A name carried only at a version the declared constraint rules out.
 - One an exclusion removed that a hard dependency needed.
+- One a [pin](#holding-a-resolution-to-a-plans-versions) holds at a version the
+  declared constraint rules out.
 
 Installing anyway would succeed, since dpkg configures with `--force-depends`,
 and leave a root whose packages cannot work. The resolution refuses instead.
@@ -215,7 +217,8 @@ Every refusal is reported before the run fails, and the failure names all of
 them. A resolution reports each one as a `DebianEvent::Unsatisfiable` carrying
 what could not be supplied, who asked for it, and what the wall was. An install
 list with four mistakes in it is therefore corrected in one pass rather than in
-four bootstraps.
+four bootstraps. Where the pin is among the refusals, the failure is
+`DebianError::Pin`, naming every package the pin could not hold.
 
 The resolution keeps walking past a refusal to find the next. A group nothing
 satisfies contributes nothing to the selection, so the rest of the closure is
@@ -1108,6 +1111,27 @@ So is one whose entries fail the shape a plan document's do. A digest that is
 not 64 lowercase hex characters is refused as the malformed entry it is. It is
 not compared and reported as an archive that had published past the pin. Where
 the builder names no architecture the pin's is adopted, as a plan's is.
+
+### Every route to a version
+
+The candidate is not the only route to a version. An `include` entry written
+`name/release` takes the release's version, and a versioned dependency it needs
+is taken from the same release. A layered build upgrades a name its base holds
+where a dependency needs a newer one. A pinned name resolves to its pinned
+version by each of these routes.
+
+An entry naming a release that offers a pinned name only at another version
+fails the resolution with `DebianError::Pin`. Taking the release's version would
+resolve around the pin. Taking the pinned version from another release would
+ignore the release the entry names. A versioned dependency the pinned version
+does not meet fails it the same way, where no other alternative answers it. The
+pin or the install list has to change.
+
+A layered build upgrades a pinned name to its pinned version alone, where that
+is above the installed version. That holds whatever the rank of the release
+offering it, as it does for the candidate. A name the base holds and nothing
+upgrades keeps the base's version. The pin constrains what a resolution
+selects, and the base is not selected.
 
 ### When the archives have moved past it
 

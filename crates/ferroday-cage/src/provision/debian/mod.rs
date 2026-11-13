@@ -532,7 +532,9 @@ impl Debian {
     /// A resolution that cannot be satisfied reports every refusal it met as a
     /// [`DebianEvent::Unsatisfiable`] and then fails once with all of them
     /// named, so an install list with four mistakes in it is corrected in one
-    /// pass rather than four.
+    /// pass rather than four. Where the [`pin`](DebianBuilder::pin) is among
+    /// what it refused, the failure is [`DebianError::Pin`], naming every
+    /// package the pin could not be held to.
     pub fn resolve(&mut self) -> Result<Plan, DebianError> {
         self.observe(&mut Silent).resolve()
     }
@@ -1008,6 +1010,12 @@ impl DebianBuilder {
     /// An entry naming a release no repository is configured with is refused
     /// at [`build`](Self::build) with [`DebianError::Config`], and one naming a
     /// package the release does not carry fails the resolution.
+    ///
+    /// A name a [`pin`](Self::pin) holds is taken at its pinned version by
+    /// every route, a release's included. An entry naming a release that
+    /// offers the name only at another version, or a versioned dependency the
+    /// pinned version does not meet, fails the resolution with
+    /// [`DebianError::Pin`].
     pub fn include<I, S>(mut self, packages: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1084,6 +1092,15 @@ impl DebianBuilder {
     /// closure since, a dependency the pinned version pulls in, a repository
     /// the pin says nothing about — resolves normally.
     ///
+    /// The pinned version is the one selected by every route a resolution
+    /// takes to a version: the candidate, an [`include`](Self::include) entry
+    /// written `name/release`, a versioned dependency such an entry takes from
+    /// its release, and an upgrade of a name a [`base_layer`](Self::base_layer)
+    /// holds. An upgrade takes the pinned version wherever it is above the
+    /// installed one, whatever the rank of its release. A name the base layer
+    /// supplies and nothing upgrades keeps the base's version, since the pin
+    /// constrains what the resolution selects and the base is not selected.
+    ///
     /// # When this is the one that fits
     ///
     /// A plan covering a build whose inputs are not all archives. Where some
@@ -1124,6 +1141,14 @@ impl DebianBuilder {
     /// published past the pinned version, dropped the package, or record
     /// different bytes for it. A snapshot mirror is what holds a pin against an
     /// archive that keeps moving.
+    ///
+    /// A pin the resolution cannot be held to fails it the same way, after the
+    /// closure is computed, naming each package with what was asked of it. An
+    /// install list entry asks for a pinned name from a release that offers it
+    /// only at another version, or a selected package needs a version of a
+    /// pinned name that the pinned one does not meet. The resolution does not
+    /// take another version in either case, so the pin or the install list has
+    /// to change.
     ///
     /// ```no_run
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1853,6 +1878,11 @@ fn resolve_packages(
 /// see each refusal as its own item, which is what a list a user has to correct
 /// wants to be; the error carries the same set as one sentence, for the caller
 /// who only ever sees the failure. Neither is a summary of the other.
+///
+/// A resolution that refused the pin fails with [`DebianError::Pin`] instead,
+/// naming every package the pin could not be held to, as a pin the archives
+/// cannot supply fails before the resolution starts. Every refusal, the pin's
+/// and the rest, is still reported as an event.
 fn report_refusals(
     refusals: resolve::Refusals,
     observer: &mut dyn DebianObserver,
@@ -1866,6 +1896,10 @@ fn report_refusals(
             required_by: refusal.required_by(),
             reason: &refusal.reason(),
         });
+    }
+    let unheld = refusals.unheld();
+    if !unheld.is_empty() {
+        return Err(DebianError::Pin { unheld });
     }
     Err(DebianError::Resolve {
         reason: refusals.describe(),
@@ -3078,7 +3112,9 @@ pub enum DebianEvent<'a> {
     Resolving,
     /// A dependency the resolver could not satisfy: a name no configured
     /// archive carries, a name it carries only at a version the constraint
-    /// rules out, or one an exclusion removed that a hard dependency needed.
+    /// rules out, one an exclusion removed that a hard dependency needed, or
+    /// one a [`pin`](DebianBuilder::pin) holds at a version that cannot answer
+    /// what was asked of it.
     ///
     /// Reported for every such refusal before the run fails, so a caller fixing
     /// an install list sees the whole list rather than the first entry of it.
@@ -3093,8 +3129,8 @@ pub enum DebianEvent<'a> {
         /// the install list.
         required_by: &'a str,
         /// What the wall was, as the clause following "and": that the name is
-        /// absent, that it is excluded, or what is available instead of what
-        /// the constraint asked for.
+        /// absent, that it is excluded, what is available instead of what
+        /// the constraint asked for, or the version the pin holds it at.
         reason: &'a str,
     },
     /// The dependency closure has been resolved, carrying the plan the
@@ -3259,8 +3295,10 @@ pub enum DebianError {
         /// What was wrong with it.
         reason: String,
     },
-    /// The archives could not supply what a
-    /// [`pin`](DebianBuilder::pin) holds the resolution to.
+    /// The resolution could not be held to a [`pin`](DebianBuilder::pin): the
+    /// archives cannot supply a pinned package at its version and bytes, or the
+    /// resolution asks for one from a release, or at a version, the pinned
+    /// entry cannot answer. Each package's [`UnheldReason`] says which.
     #[non_exhaustive]
     Pin {
         /// Every package the pin could not be held to, in name order, each
@@ -3359,7 +3397,7 @@ impl fmt::Display for DebianError {
                     .map(UnheldPin::to_string)
                     .collect::<Vec<_>>()
                     .join("; ");
-                write!(f, "the archives cannot hold the pin: {held}")
+                write!(f, "the resolution cannot be held to the pin: {held}")
             }
             DebianError::PlanDocument { reason } => {
                 write!(f, "the install plan document is not usable: {reason}")

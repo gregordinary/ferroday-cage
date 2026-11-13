@@ -485,6 +485,12 @@ pub ferroday_cage::provision::debian::UnheldReason::Absent
 #[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Digest
 pub ferroday_cage::provision::debian::UnheldReason::Digest::archive: alloc::string::String
 pub ferroday_cage::provision::debian::UnheldReason::Digest::pin: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Release
+pub ferroday_cage::provision::debian::UnheldReason::Release::archive: alloc::string::String
+pub ferroday_cage::provision::debian::UnheldReason::Release::release: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Requirement
+pub ferroday_cage::provision::debian::UnheldReason::Requirement::required_by: alloc::string::String
+pub ferroday_cage::provision::debian::UnheldReason::Requirement::requirement: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Version
 pub ferroday_cage::provision::debian::UnheldReason::Version::archive: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::debian::UnheldReason

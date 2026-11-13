@@ -8,14 +8,24 @@
 //! does not name resolves normally.
 //!
 //! The constraint is applied where the index is built, in
-//! [`Index::merge`](super::index::Index::merge), because that is the one place
-//! a version is chosen. Where several repositories offer the pinned version,
-//! the one recording the pinned bytes is kept, so a repository that rebuilt the
-//! version cannot shadow one that still carries the original. A pinned name
-//! whose version no repository offers keeps the highest instead, so
+//! [`Index::merge`](super::index::Index::merge), which makes each pinned name's
+//! candidate its pinned version. Where several repositories offer the pinned
+//! version, the one recording the pinned bytes is kept, so a repository that
+//! rebuilt the version cannot shadow one that still carries the original. A
+//! pinned name whose version no repository offers keeps the highest instead, so
 //! [`Pins::check`] can report what the archives carry rather than only that
 //! something is missing; the check runs before the closure is computed, so the
 //! fallback is never resolved against.
+//!
+//! The candidate is not the only route to a version. An install list entry
+//! written `name/release` takes the release's version, the versioned
+//! dependencies it switches take that release's too, and a layered build
+//! upgrades what its base holds. The index keeps the pin it was merged under,
+//! so [`Index::in_release`](super::index::Index::in_release) and
+//! [`Index::upgrade_over`](super::index::Index::upgrade_over) answer a pinned
+//! name with its pinned version alone. Where that version cannot answer what
+//! the resolution asks of it, the resolution refuses the pin rather than
+//! resolving around it, and the [`UnheldReason`] says what was asked.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -23,7 +33,7 @@ use std::fmt;
 use super::DebianError;
 use super::index::{Index, Package};
 use super::plan::Plan;
-use super::version;
+use super::version::{self, Constraint};
 
 /// The versions and digests a pin holds a resolution to, keyed by package name.
 #[derive(Debug, Clone, Default)]
@@ -110,6 +120,61 @@ impl Pins {
         }
     }
 
+    /// Holds `offered`, the entry the release an install list entry names
+    /// offers closest to this pin, to the pin on its name.
+    ///
+    /// `None` where the entry answers the pin, at the pinned version with the
+    /// pinned bytes, and where the pin does not hold its name. Otherwise the
+    /// refusal names what the release offers instead: another version, as
+    /// [`UnheldReason::Release`], or the pinned version over other bytes, as
+    /// [`UnheldReason::Digest`].
+    pub(super) fn refuse_release(&self, offered: &Package, release: &str) -> Option<UnheldPin> {
+        let pinned = self.by_name.get(&offered.name)?;
+        let reason = match self.matching(offered) {
+            PinMatch::VersionAndBytes => return None,
+            PinMatch::Version => UnheldReason::Digest {
+                pin: pinned.sha256.clone(),
+                archive: offered.sha256.clone(),
+            },
+            PinMatch::Neither => UnheldReason::Release {
+                release: release.to_string(),
+                archive: offered.version.clone(),
+            },
+        };
+        Some(UnheldPin {
+            package: offered.name.clone(),
+            version: pinned.version.clone(),
+            reason,
+        })
+    }
+
+    /// Holds a dependency on `package` to the pin on its name.
+    ///
+    /// `None` where the pin does not hold `package`, or holds it at a version
+    /// that meets `constraint`; an unversioned dependency is met by every
+    /// version. Otherwise the refusal names the dependency group as
+    /// `required_by` declares it, as [`UnheldReason::Requirement`].
+    pub(super) fn refuse_requirement(
+        &self,
+        package: &str,
+        constraint: Option<&Constraint>,
+        requirement: &str,
+        required_by: &str,
+    ) -> Option<UnheldPin> {
+        let pinned = self.by_name.get(package)?;
+        if constraint.is_none_or(|constraint| constraint.satisfied_by(&pinned.version)) {
+            return None;
+        }
+        Some(UnheldPin {
+            package: package.to_string(),
+            version: pinned.version.clone(),
+            reason: UnheldReason::Requirement {
+                requirement: requirement.to_string(),
+                required_by: required_by.to_string(),
+            },
+        })
+    }
+
     /// Checks that the merged index can supply every pinned package at the
     /// version and with the bytes the pin records.
     ///
@@ -175,7 +240,8 @@ pub(super) enum PinMatch {
 /// One package a [`pin`](super::DebianBuilder::pin) could not be held to.
 ///
 /// Carried by [`DebianError::Pin`]. Every field describes the pin; what the
-/// archives offer instead is in [`reason`](Self::reason).
+/// archives offer instead, or what the resolution asked of the package, is in
+/// [`reason`](Self::reason).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UnheldPin {
@@ -189,12 +255,18 @@ pub struct UnheldPin {
 
 /// Why a pinned package could not be supplied at its pinned version.
 ///
-/// The three are worth telling apart. A [`Version`](Self::Version) is an
-/// archive that has published since the pin was taken, which a snapshot mirror
-/// resolves; an [`Absent`](Self::Absent) is a package the archives no longer
-/// carry at all; and a [`Digest`](Self::Digest) is one version of one package
-/// with two sets of bytes, which is the event a recorded digest exists to
-/// catch.
+/// The first three describe the archives, and are worth telling apart. A
+/// [`Version`](Self::Version) is an archive that has published since the pin
+/// was taken, which a snapshot mirror resolves; an [`Absent`](Self::Absent) is
+/// a package the archives no longer carry at all; and a
+/// [`Digest`](Self::Digest) is one version of one package with two sets of
+/// bytes, which is the event a recorded digest exists to catch.
+///
+/// The other two describe the resolution. The archives offer the pinned
+/// version, and the resolution asks for the package from a release that does
+/// not, as [`Release`](Self::Release), or needs a version the pinned one does
+/// not meet, as [`Requirement`](Self::Requirement). Either is resolved by
+/// changing the pin or the install list, not the mirror.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnheldReason {
@@ -213,6 +285,26 @@ pub enum UnheldReason {
         pin: String,
         /// The digest the archives record, lowercase hex.
         archive: String,
+    },
+    /// An install list entry written `name/release` asks for the package from
+    /// a release that offers it only at another version.
+    #[non_exhaustive]
+    Release {
+        /// The release the entry names.
+        release: String,
+        /// The version that release offers.
+        archive: String,
+    },
+    /// A package the resolution selects declares a dependency on the package
+    /// that the pinned version does not meet, and nothing else in the
+    /// dependency's alternatives answers it.
+    #[non_exhaustive]
+    Requirement {
+        /// The dependency as the requiring package declares it, alternatives
+        /// included.
+        requirement: String,
+        /// The package that declares it.
+        required_by: String,
     },
 }
 
@@ -234,7 +326,31 @@ impl fmt::Display for UnheldPin {
                 "{} {} is pinned to the digest {pin} and the archives record {archive}",
                 self.package, self.version,
             ),
+            UnheldReason::Release { release, archive } => write!(
+                f,
+                "{} is pinned to {} and the install list asks for it from {release}, which \
+                 offers {archive}",
+                self.package, self.version,
+            ),
+            UnheldReason::Requirement {
+                requirement,
+                required_by,
+            } => write!(
+                f,
+                "{} is pinned to {} and {required_by} requires {requirement}",
+                self.package, self.version,
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+impl Pins {
+    /// The pin a plan recording exactly `packages` makes, for a test that holds
+    /// entries an index offers.
+    pub(super) fn holding(packages: &[Package]) -> Pins {
+        Pins::of(&Plan::project("trixie", "amd64", packages, &[]))
+            .expect("the packages name no package twice")
     }
 }
 

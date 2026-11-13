@@ -37,12 +37,21 @@
 //! does. A layered resolve takes a name its base has installed at the
 //! installed version, and upgrades it only where a dependency needs a newer
 //! one and apt would take that newer one over the installed one.
+//!
+//! A name a [pin](super::DebianBuilder::pin) holds resolves to its pinned
+//! version by every one of those routes, since the [`Index`] answers each of
+//! them with the pinned version alone. Where the pinned version cannot answer
+//! what is asked of it, the resolution refuses the pin as
+//! [`Refusal::Pinned`] rather than resolving around it: an entry naming a
+//! release that does not offer the pinned version, or a dependency the pinned
+//! version does not meet.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use super::index::{DepAtom, Dependency, Index, Package};
 use super::layer::InstalledSet;
+use super::pin::{UnheldPin, UnheldReason};
 use super::version::Constraint;
 
 /// Who asked for something the resolver was not walking a dependency for: the
@@ -103,6 +112,22 @@ pub(crate) enum Refusal {
         /// evidence that separates "no such package" from "wrong version".
         available: Option<String>,
     },
+    /// The pin holds a name at a version that cannot answer what was asked of
+    /// it: an install list entry naming a release that does not offer the
+    /// pinned entry, or a dependency group nothing answers, one of whose
+    /// alternatives names a pinned package at a version the pinned one does
+    /// not meet.
+    ///
+    /// The resolution fails with [`DebianError::Pin`](super::DebianError::Pin)
+    /// where it refuses one of these, since what is in the way is the pin.
+    Pinned {
+        /// The install list's entry, or the dependency group as declared.
+        requirement: String,
+        /// The selected package whose dependency it was, or the install list.
+        required_by: String,
+        /// The pin, and what was asked of it.
+        unheld: UnheldPin,
+    },
 }
 
 impl Refusal {
@@ -113,7 +138,9 @@ impl Refusal {
             Refusal::PackageNotFound { name } | Refusal::ExcludedAndIncluded { name } => name,
             Refusal::NotInRelease { entry, .. } => entry,
             Refusal::ExcludedButRequired { package, .. } => package,
-            Refusal::Unsatisfiable { requirement, .. } => requirement,
+            Refusal::Unsatisfiable { requirement, .. } | Refusal::Pinned { requirement, .. } => {
+                requirement
+            }
         }
     }
 
@@ -125,7 +152,8 @@ impl Refusal {
             | Refusal::ExcludedAndIncluded { .. }
             | Refusal::NotInRelease { .. } => THE_INSTALL_LIST,
             Refusal::ExcludedButRequired { required_by, .. }
-            | Refusal::Unsatisfiable { required_by, .. } => required_by,
+            | Refusal::Unsatisfiable { required_by, .. }
+            | Refusal::Pinned { required_by, .. } => required_by,
         }
     }
 
@@ -143,6 +171,21 @@ impl Refusal {
                 Some(available) => format!("nothing satisfies it (available: {available})"),
                 None => "no configured archive offers it and no base layer supplies it".to_string(),
             },
+            Refusal::Pinned { unheld, .. } => {
+                let UnheldPin {
+                    package, version, ..
+                } = unheld;
+                match &unheld.reason {
+                    UnheldReason::Release { release, archive } => format!(
+                        "the pin holds {package} at {version}, where {release} offers {archive}"
+                    ),
+                    UnheldReason::Digest { pin, archive } => format!(
+                        "the pin holds {package} {version} at the digest {pin}, where that \
+                         release records {archive}"
+                    ),
+                    _ => format!("the pin holds {package} at {version}"),
+                }
+            }
         }
     }
 }
@@ -188,6 +231,25 @@ impl Refusals {
     /// Every refusal, in the order the resolution met them.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Refusal> {
         self.refused.iter()
+    }
+
+    /// Every package the pin could not be held to, in name order, and in the
+    /// order the resolution met them within one name.
+    ///
+    /// Empty where nothing the resolution refused is the pin's.
+    pub(crate) fn unheld(&self) -> Vec<UnheldPin> {
+        let mut unheld: Vec<UnheldPin> = self
+            .refused
+            .iter()
+            .filter_map(|refusal| match refusal {
+                Refusal::Pinned { unheld, .. } => Some(unheld.clone()),
+                _ => None,
+            })
+            .collect();
+        // The same order `Pins::check` reports in, so the pin's refusals read
+        // alike whichever of the two found them.
+        unheld.sort_by(|a, b| a.package.cmp(&b.package));
+        unheld
     }
 
     /// The whole refusal as one sentence a caller reads.
@@ -298,13 +360,25 @@ pub(crate) fn resolve_seeded(
             asked.push(Some(name));
             continue;
         };
-        let Some(package) = index.in_release(name, release) else {
-            refusals.push(Refusal::NotInRelease {
-                entry: entry.clone(),
-                release: release.to_string(),
-            });
-            asked.push(None);
-            continue;
+        let package = match index.in_release(name, release) {
+            Ok(Some(package)) => package,
+            Ok(None) => {
+                refusals.push(Refusal::NotInRelease {
+                    entry: entry.clone(),
+                    release: release.to_string(),
+                });
+                asked.push(None);
+                continue;
+            }
+            Err(unheld) => {
+                refusals.push(Refusal::Pinned {
+                    requirement: entry.clone(),
+                    required_by: THE_INSTALL_LIST.to_string(),
+                    unheld,
+                });
+                asked.push(None);
+                continue;
+            }
         };
         // The base holding that very version answers the entry already.
         if assume_installed
@@ -408,7 +482,9 @@ pub(super) fn split_release(entry: &str) -> (&str, Option<&str>) {
 /// The index's candidate, unless an install list entry named a release for the
 /// name or for something that needed it, or the base layer has the name
 /// installed, in which case only an upgrade apt would take is a version to
-/// select at all.
+/// select at all. Each of those answers comes from the [`Index`], which answers
+/// a name the pin holds with its pinned version alone, so no route selects a
+/// pinned name at another version.
 struct Candidates<'a> {
     index: &'a Index,
     installed: &'a InstalledSet,
@@ -452,6 +528,11 @@ impl<'a> Candidates<'a> {
     /// alternatives stops at the first unversioned one, as apt's does. A
     /// version already switched to is not walked again, which is what ends a
     /// cycle.
+    ///
+    /// A name the pin holds is switched only to its pinned version, where the
+    /// release offers that. One the release offers at another version is
+    /// passed over like an excluded one, so the group is left to a later
+    /// alternative, or to [`resolve_group`] to refuse as the pin's.
     fn target(&mut self, package: &'a Package, release: &str, excluded: &HashSet<&str>) {
         self.targeted.insert(package.name.clone(), package.clone());
         let groups: Vec<&Dependency> = package
@@ -481,7 +562,7 @@ impl<'a> Candidates<'a> {
                 if excluded.contains(atom.name.as_str()) {
                     continue;
                 }
-                let Some(version) = self.index.in_release(&atom.name, release) else {
+                let Ok(Some(version)) = self.index.in_release(&atom.name, release) else {
                     continue;
                 };
                 if !constraint.satisfied_by(&version.version) {
@@ -544,6 +625,13 @@ impl<'a> Candidates<'a> {
 /// base and pulls nothing, provided the base supplies it at a version the
 /// constraint accepts. Where it does not, the name is upgraded into the
 /// increment only as [`Candidates::of`] allows.
+///
+/// A name the pin holds answers only at its pinned version. A group left
+/// unsatisfied where an alternative names a pinned package at a version the
+/// pinned one does not meet is refused as [`Refusal::Pinned`], naming the
+/// first such alternative, since without the pin a version that does meet it
+/// may be there to take. An exclusion is reported ahead of a pin: it removes
+/// the name whatever version would have answered.
 fn resolve_group(
     candidates: &Candidates<'_>,
     group: &Dependency,
@@ -569,6 +657,7 @@ fn resolve_group(
     // that would otherwise have satisfied the group, so a group left
     // unsatisfied solely by exclusion can be reported against it.
     let mut blocked: Option<String> = None;
+    let mut pinned: Option<UnheldPin> = None;
     for atom in group {
         if excluded.contains(atom.name.as_str()) {
             // The real package is excluded. One name can be both a real
@@ -589,6 +678,14 @@ fn resolve_group(
                 return None;
             }
         }
+        if pinned.is_none() && !excluded.contains(atom.name.as_str()) {
+            pinned = index.pins().refuse_requirement(
+                &atom.name,
+                atom.constraint.as_ref(),
+                &render_group(group),
+                required_by,
+            );
+        }
         if let Some(provider) = first_available_provider(candidates, atom, excluded) {
             let package = candidates
                 .of(&provider)
@@ -607,16 +704,21 @@ fn resolve_group(
             blocked.get_or_insert_with(|| provider.clone());
         }
     }
-    match blocked {
-        Some(package) => Some(Refusal::ExcludedButRequired {
+    match (blocked, pinned) {
+        (Some(package), _) => Some(Refusal::ExcludedButRequired {
             package,
             required_by: required_by.to_string(),
         }),
-        // Nothing was excluded, and nothing satisfies the group: the archive
-        // offers none of these names, or offers them only at versions the
-        // constraint rules out. Either way the closure is incomplete, and
+        (None, Some(unheld)) => Some(Refusal::Pinned {
+            requirement: render_group(group),
+            required_by: required_by.to_string(),
+            unheld,
+        }),
+        // Nothing was excluded or pinned, and nothing satisfies the group: the
+        // archive offers none of these names, or offers them only at versions
+        // the constraint rules out. Either way the closure is incomplete, and
         // shipping it would produce a root whose packages cannot work.
-        None => Some(Refusal::Unsatisfiable {
+        (None, None) => Some(Refusal::Unsatisfiable {
             requirement: render_group(group),
             required_by: required_by.to_string(),
             available: describe_available(candidates, group),
@@ -772,6 +874,7 @@ fn add(selected: &mut BTreeMap<String, Package>, queue: &mut VecDeque<String>, p
 #[cfg(test)]
 mod tests {
     use super::super::index::Priority;
+    use super::super::pin::Pins;
     use super::*;
 
     /// What a test reads out of a resolution, so that every test states which
@@ -1370,6 +1473,11 @@ mod tests {
     /// An index over trixie (origin 0), its backports (origin 1), and
     /// experimental (origin 2), each ranked as its release marks it.
     fn ranked(primary: &str, backports: &str, experimental: &str) -> Index {
+        ranked_under(primary, backports, experimental, &Pins::none())
+    }
+
+    /// [`ranked`], merged under `pins`.
+    fn ranked_under(primary: &str, backports: &str, experimental: &str, pins: &Pins) -> Index {
         use super::super::index::Source;
         use super::super::release::ReleasePriority;
         Index::merge(
@@ -1394,8 +1502,25 @@ mod tests {
                 },
             ],
             "amd64",
-            &super::super::pin::Pins::none(),
+            pins,
         )
+    }
+
+    /// The pin holding each `(name, origin)` at the entry `index` offers the
+    /// name at from that origin, as a plan that resolved it would.
+    fn pin_of(index: &Index, held: &[(&str, usize)]) -> Pins {
+        let packages: Vec<Package> = held
+            .iter()
+            .map(|(name, origin)| {
+                index
+                    .offers(name)
+                    .iter()
+                    .find(|package| package.origin == *origin)
+                    .expect("the index offers the name from that origin")
+                    .clone()
+            })
+            .collect();
+        Pins::holding(&packages)
     }
 
     /// Each selected package's name, version, and origin.
@@ -1410,16 +1535,21 @@ mod tests {
     /// `libfoo` than trixie's, a `libc6` trixie's already satisfies, and an
     /// unversioned `helper`.
     fn experimental_app() -> Index {
-        ranked(
-            &format!(
+        let (primary, experimental) = experimental_app_texts();
+        ranked(&primary, "", &experimental)
+    }
+
+    /// The trixie and experimental indexes [`experimental_app`] merges.
+    fn experimental_app_texts() -> (String, String) {
+        (
+            format!(
                 "{}{}{}{}",
                 stanza_at("app", "1.0", "libfoo (>= 1.0)", ""),
                 stanza_at("libfoo", "1.0", "", ""),
                 stanza_at("libc6", "2.41", "", ""),
                 stanza_at("helper", "0.5", "", ""),
             ),
-            "",
-            &format!(
+            format!(
                 "{}{}{}{}{}",
                 stanza_at("app", "2.0", "libfoo (>= 2.0), libc6 (>= 2.30), helper", ""),
                 stanza_at("libfoo", "2.0", "", ""),
@@ -1637,6 +1767,219 @@ mod tests {
         );
         let refused: Vec<&str> = refusals.iter().map(Refusal::requirement).collect();
         assert_eq!(refused, ["from-main (>= 1.1~)", "old (<< 2.0)"]);
+    }
+
+    /// The pin a refusal could not hold, or a panic naming what came back.
+    fn unheld(refusal: Refusal) -> UnheldPin {
+        match refusal {
+            Refusal::Pinned { unheld, .. } => unheld,
+            other => panic!("expected the pin refused, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_release_named_for_a_pinned_name_answers_with_the_pinned_version_or_refuses() {
+        // The pin holds the kernel at trixie's version, and the install list
+        // asks for it from backports. Taking backports' would resolve the name
+        // around its pin; taking trixie's would ignore the release the entry
+        // names. Neither is an answer, so the pin is refused.
+        let primary = stanza_at("kernel", "6.12", "", "");
+        let backports = stanza_at("kernel", "6.16~bpo", "", "");
+        let unpinned = ranked(&primary, &backports, "");
+        let entry = "kernel/trixie-backports".to_string();
+
+        let index = ranked_under(
+            &primary,
+            &backports,
+            "",
+            &pin_of(&unpinned, &[("kernel", 0)]),
+        );
+        let refusal = resolve(&index, &[], std::slice::from_ref(&entry), &[]).into_refusal();
+        assert_eq!(refusal.requirement(), entry);
+        assert_eq!(refusal.required_by(), THE_INSTALL_LIST);
+        let held = unheld(refusal);
+        assert_eq!(
+            (held.package.as_str(), held.version.as_str()),
+            ("kernel", "6.12")
+        );
+        assert_eq!(
+            held.reason,
+            UnheldReason::Release {
+                release: "trixie-backports".to_string(),
+                archive: "6.16~bpo".to_string(),
+            },
+        );
+
+        // A pin taken from the backports version is answered by it.
+        let index = ranked_under(
+            &primary,
+            &backports,
+            "",
+            &pin_of(&unpinned, &[("kernel", 1)]),
+        );
+        let selected = resolve(&index, &[], &[entry], &[]).into_packages();
+        assert_eq!(chosen(&selected), [("kernel".into(), "6.16~bpo".into(), 1)]);
+    }
+
+    #[test]
+    fn a_dependency_a_release_switches_is_held_to_the_pin() {
+        // `app/experimental` needs libfoo 2.0, which only experimental offers,
+        // and the pin holds libfoo at trixie's 1.0. The switch would take
+        // experimental's; the pin refuses instead, naming who needed what.
+        let pins = pin_of(&experimental_app(), &[("libfoo", 0)]);
+        let (primary, experimental) = experimental_app_texts();
+        let index = ranked_under(&primary, "", &experimental, &pins);
+        let refusal = resolve(&index, &[], &["app/experimental".into()], &[]).into_refusal();
+        assert_eq!(refusal.requirement(), "libfoo (>= 2.0)");
+        assert_eq!(refusal.required_by(), "app");
+        let held = unheld(refusal);
+        assert_eq!(
+            (held.package.as_str(), held.version.as_str()),
+            ("libfoo", "1.0")
+        );
+        assert_eq!(
+            held.reason,
+            UnheldReason::Requirement {
+                requirement: "libfoo (>= 2.0)".to_string(),
+                required_by: "app".to_string(),
+            },
+        );
+
+        // A pin holding experimental's libfoo is what the switch takes.
+        let pins = pin_of(&experimental_app(), &[("libfoo", 2)]);
+        let index = ranked_under(&primary, "", &experimental, &pins);
+        let selected = resolve(&index, &[], &["app/experimental".into()], &[]).into_packages();
+        let libfoo = selected.iter().find(|p| p.name == "libfoo").unwrap();
+        assert_eq!((libfoo.version.as_str(), libfoo.origin), ("2.0", 2));
+    }
+
+    #[test]
+    fn a_layer_upgrades_a_pinned_name_to_its_pinned_version_alone() {
+        // The base holds libfoo1 1.0-1, the pin holds trixie's 1.0-2, and a
+        // security release of the same rank offers 1.0-2+deb13u1. An increment
+        // needing 1.0-2 or newer takes the pinned version, not the newest. One
+        // needing more than the pinned version refuses the pin.
+        use super::super::index::Source;
+        use super::super::release::ReleasePriority;
+        let primary = format!(
+            "{}{}{}",
+            stanza_at("libfoo1", "1.0-2", "", ""),
+            stanza_at("app", "1.0", "libfoo1 (>= 1.0-2)", ""),
+            stanza_at("fixed", "1.0", "libfoo1 (>= 1.0-2+deb13u1)", ""),
+        );
+        let security = stanza_at("libfoo1", "1.0-2+deb13u1", "", "");
+        let merged = |pins: &Pins| {
+            Index::merge(
+                [
+                    Source {
+                        origin: 0,
+                        suite: "trixie",
+                        priority: ReleasePriority::Default,
+                        text: primary.as_str(),
+                    },
+                    Source {
+                        origin: 1,
+                        suite: "trixie-security",
+                        priority: ReleasePriority::Default,
+                        text: security.as_str(),
+                    },
+                ],
+                "amd64",
+                pins,
+            )
+        };
+        let base = assumed_at(&[("libfoo1", "1.0-1")]);
+        let unpinned = merged(&Pins::none());
+        let selected = resolve_seeded(&unpinned, &[], &["app".into()], &[], &base).into_packages();
+        assert!(
+            chosen(&selected).contains(&("libfoo1".into(), "1.0-2+deb13u1".into(), 1)),
+            "{:?}",
+            chosen(&selected),
+        );
+
+        let index = merged(&pin_of(&unpinned, &[("libfoo1", 0)]));
+        let selected = resolve_seeded(&index, &[], &["app".into()], &[], &base).into_packages();
+        assert_eq!(
+            chosen(&selected),
+            [
+                ("app".into(), "1.0".into(), 0),
+                ("libfoo1".into(), "1.0-2".into(), 0)
+            ],
+        );
+
+        // The base holds the pinned version already, and an increment needs a
+        // newer one: the pin holds the name where it is.
+        let base = assumed_at(&[("libfoo1", "1.0-2")]);
+        let refusal = resolve_seeded(&index, &[], &["fixed".into()], &[], &base).into_refusal();
+        assert_eq!(refusal.required_by(), "fixed");
+        let held = unheld(refusal);
+        assert_eq!(
+            (held.package.as_str(), held.version.as_str()),
+            ("libfoo1", "1.0-2")
+        );
+    }
+
+    #[test]
+    fn a_candidate_dependency_the_pinned_version_does_not_meet_refuses_the_pin() {
+        // No release named and no base: the pinned candidate is simply too old
+        // for something selected, where an unpinned resolution takes the newer
+        // version another repository offers. The refusal is the pin's, since
+        // the pin is what is in the way. Another alternative that answers the
+        // group leaves the pin nothing to refuse.
+        let primary = format!(
+            "{}{}{}",
+            stanza_at("libfoo", "1.0", "", ""),
+            stanza_at("app", "1.0", "libfoo (>= 2.0)", ""),
+            stanza_at("either", "1.0", "libfoo (>= 2.0) | libbar", ""),
+        );
+        let pool = format!(
+            "{}{}",
+            stanza_at("libfoo", "2.0", "", ""),
+            stanza_at("libbar", "1.0", "", ""),
+        );
+        let merged = |pins: &Pins| {
+            Index::merge(
+                super::super::index::sources([(0, primary.as_str()), (1, pool.as_str())]),
+                "amd64",
+                pins,
+            )
+        };
+        let unpinned = merged(&Pins::none());
+        let selected = resolve(&unpinned, &[], &["app".into()], &[]).into_packages();
+        assert!(chosen(&selected).contains(&("libfoo".into(), "2.0".into(), 1)));
+
+        let index = merged(&pin_of(&unpinned, &[("libfoo", 0)]));
+        let rendered = resolve(&index, &[], &["app".into()], &[])
+            .into_refusal()
+            .to_string();
+        assert_eq!(
+            rendered,
+            "app requires `libfoo (>= 2.0)`, and the pin holds libfoo at 1.0",
+        );
+        let selected = resolve(&index, &[], &["either".into()], &[]).into_packages();
+        assert_eq!(names(&selected), ["either", "libbar"]);
+    }
+
+    #[test]
+    fn the_pins_refusals_are_listed_by_name_beside_the_rest() {
+        // A resolution refusing the pin and something else names both as
+        // refusals; the pin's are what `unheld` lists, in name order.
+        let primary = format!(
+            "{}{}{}",
+            stanza_at("zlib", "1.0", "", ""),
+            stanza_at("alib", "1.0", "", ""),
+            stanza_at("app", "1.0", "zlib (>= 2.0), alib (>= 2.0), absent", ""),
+        );
+        let unpinned = index(&primary);
+        let index = Index::merge(
+            super::super::index::sources([(0, primary.as_str())]),
+            "amd64",
+            &pin_of(&unpinned, &[("zlib", 0), ("alib", 0)]),
+        );
+        let (_, refusals) = resolve(&index, &[], &["app".into()], &[]);
+        assert_eq!(refusals.iter().count(), 3, "{}", refusals.describe());
+        let unheld: Vec<String> = refusals.unheld().into_iter().map(|u| u.package).collect();
+        assert_eq!(unheld, ["alib", "zlib"]);
     }
 
     #[test]

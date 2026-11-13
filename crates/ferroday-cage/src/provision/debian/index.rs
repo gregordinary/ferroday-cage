@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
-use super::pin::{PinMatch, Pins};
+use super::pin::{PinMatch, Pins, UnheldPin};
 use super::release::ReleasePriority;
 use super::version::{self, Constraint};
 use crate::provision::Available;
@@ -361,11 +361,18 @@ pub(crate) struct Source<'a> {
 /// because an install list may ask for a name from a particular release, and a
 /// layered build may upgrade a name its base has installed, and each of those
 /// can settle on a version other than the candidate.
+///
+/// The index keeps the pin it was merged under, and every version it answers
+/// with honours it: a name the pin holds is answered with its pinned version
+/// by [`get`](Self::get), [`in_release`](Self::in_release), and
+/// [`upgrade_over`](Self::upgrade_over) alike.
 pub(crate) struct Index {
     by_name: HashMap<String, Vec<Package>>,
     providers: HashMap<String, Vec<String>>,
     /// The suite and the rank of each repository, by origin.
     releases: HashMap<usize, (String, ReleasePriority)>,
+    /// The pin the index was merged under.
+    pins: Pins,
 }
 
 impl Index {
@@ -474,6 +481,7 @@ impl Index {
             by_name,
             providers,
             releases,
+            pins: pins.clone(),
         }
     }
 
@@ -501,16 +509,53 @@ impl Index {
             .map_or("", |(suite, _)| suite.as_str())
     }
 
-    /// The highest version of `name` that a repository publishing the suite
-    /// `release` offers, as apt's `name/release` selects it.
-    pub(crate) fn in_release(&self, name: &str, release: &str) -> Option<&Package> {
-        self.offers(name)
+    /// The pin the index was merged under, for the resolver to hold a
+    /// dependency nothing answers to.
+    pub(super) fn pins(&self) -> &Pins {
+        &self.pins
+    }
+
+    /// The version of `name` that a repository publishing the suite `release`
+    /// offers, as apt's `name/release` selects it: the highest, or for a name
+    /// the pin holds, the pinned version alone.
+    ///
+    /// `Ok(None)` where no repository publishing `release` offers the name at
+    /// all.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of the pin, for a name it holds that the release offers only
+    /// at another version or over other bytes. Taking the release's version
+    /// would resolve the name around its pin, and taking the pinned version
+    /// from another release would ignore the release the entry names, so
+    /// neither is an answer.
+    pub(crate) fn in_release(
+        &self,
+        name: &str,
+        release: &str,
+    ) -> Result<Option<&Package>, UnheldPin> {
+        // Ranked as a merge ranks one repository's entries: the closest to
+        // the pin, and otherwise the higher version.
+        let Some(offered) = self
+            .offers(name)
             .iter()
             .filter(|package| self.suite(package.origin) == release)
             .fold(None, |best: Option<&Package>, package| match best {
-                Some(held) if !higher(package, held) => Some(held),
+                Some(held)
+                    if !pin_closer(&self.pins, package, held)
+                        .unwrap_or_else(|| higher(package, held)) =>
+                {
+                    Some(held)
+                }
                 _ => Some(package),
             })
+        else {
+            return Ok(None);
+        };
+        match self.pins.refuse_release(offered, release) {
+            Some(unheld) => Err(unheld),
+            None => Ok(Some(offered)),
+        }
     }
 
     /// The version a name installed at `installed` is upgraded to, where a
@@ -525,8 +570,23 @@ impl Index {
     /// version therefore replaces it. A backports suite's replaces it only
     /// where no default release offers the installed version, which is a
     /// package backports supplied. An `experimental` version never does.
+    ///
+    /// A name the pin holds is upgraded to the pinned version alone, where it
+    /// is above the installed one, whatever the rank of the release offering
+    /// it: that is the version a pin selects for the name anywhere else, and
+    /// [`merge`](Self::merge) makes it the candidate the same way. A pinned
+    /// version at or below the installed one is no upgrade, so a dependency the
+    /// installed version does not meet is then the pin's to refuse.
     pub(crate) fn upgrade_over(&self, name: &str, installed: &str) -> Option<&Package> {
         let offers = self.offers(name);
+        if self.pins.names(name) {
+            return offers
+                .iter()
+                .find(|package| self.pins.matching(package) == PinMatch::VersionAndBytes)
+                .filter(|pinned| {
+                    version::compare(&pinned.version, installed) == Ordering::Greater
+                });
+        }
         let standing = offers
             .iter()
             .filter(|package| version::compare(&package.version, installed).is_eq())
@@ -907,6 +967,7 @@ fn os_and_cpu(architecture: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::pin::UnheldReason;
     use super::*;
 
     #[test]
@@ -1328,6 +1389,11 @@ SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
     /// An index over the primary trixie (origin 0) and, at origins 1 and 2, a
     /// backports suite and experimental, ranked as their releases mark them.
     fn ranked(primary: &str, backports: &str, experimental: &str) -> Index {
+        ranked_under(primary, backports, experimental, &Pins::none())
+    }
+
+    /// [`ranked`], merged under `pins`.
+    fn ranked_under(primary: &str, backports: &str, experimental: &str, pins: &Pins) -> Index {
         Index::merge(
             [
                 Source {
@@ -1350,8 +1416,18 @@ SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
                 },
             ],
             "amd64",
-            &Pins::none(),
+            pins,
         )
+    }
+
+    /// The pin holding `name` at the entry `index` offers it at from `origin`.
+    fn pin_of(index: &Index, name: &str, origin: usize) -> Pins {
+        let held = index
+            .offers(name)
+            .iter()
+            .find(|package| package.origin == origin)
+            .expect("the index offers the name from that origin");
+        Pins::holding(std::slice::from_ref(held))
     }
 
     #[test]
@@ -1383,10 +1459,19 @@ SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
         let gcc: Vec<_> = index.offers("gcc").iter().map(|p| p.origin).collect();
         assert_eq!(gcc, [0, 1, 2]);
         assert_eq!(
-            index.in_release("gcc", "experimental").unwrap().version,
+            index
+                .in_release("gcc", "experimental")
+                .unwrap()
+                .unwrap()
+                .version,
             "16.0-1"
         );
-        assert!(index.in_release("libc6", "trixie-backports").is_none());
+        assert!(
+            index
+                .in_release("libc6", "trixie-backports")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1462,6 +1547,124 @@ SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
         );
         // Nothing below the installed version is a candidate: no downgrade.
         assert!(index.upgrade_over("newer-in-main", "4.0").is_none());
+    }
+
+    #[test]
+    fn a_release_answers_a_pinned_name_with_its_pinned_version_alone() {
+        // `name/release` takes the release's highest version, unless the pin
+        // holds the name: then the release answers with the pinned version, or
+        // the pin refuses, naming what the release offers instead.
+        let (primary, backports) = (offer("kernel", "6.12", ""), offer("kernel", "6.16~bpo", ""));
+        let unpinned = ranked(&primary, &backports, "");
+        let at_trixie = pin_of(&unpinned, "kernel", 0);
+        let at_backports = pin_of(&unpinned, "kernel", 1);
+
+        let index = ranked_under(&primary, &backports, "", &at_backports);
+        let taken = index.in_release("kernel", "trixie-backports").unwrap();
+        assert_eq!(
+            taken.map(|p| (p.version.as_str(), p.origin)),
+            Some(("6.16~bpo", 1))
+        );
+
+        let index = ranked_under(&primary, &backports, "", &at_trixie);
+        match index.in_release("kernel", "trixie-backports") {
+            Err(unheld) => {
+                assert_eq!(unheld.package, "kernel");
+                assert_eq!(unheld.version, "6.12");
+                assert_eq!(
+                    unheld.reason,
+                    UnheldReason::Release {
+                        release: "trixie-backports".to_string(),
+                        archive: "6.16~bpo".to_string(),
+                    },
+                );
+            }
+            other => panic!("expected the pin refused, got {other:?}"),
+        }
+        // A release that does not carry the name at all is not the pin's to
+        // refuse: there is nothing there to resolve around it.
+        assert!(matches!(
+            index.in_release("kernel", "experimental"),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn a_release_offering_the_pinned_version_over_other_bytes_refuses_the_pin() {
+        // One version in two releases, rebuilt in the second. The release named
+        // offers the pinned version, but not the pinned bytes.
+        let primary = offer("tool", "1.0", "");
+        let rebuilt = primary.replace(
+            &format!(
+                "SHA256: {}",
+                &primary[primary.find("SHA256: ").unwrap() + 8..][..64]
+            ),
+            &format!("SHA256: {}", "f".repeat(64)),
+        );
+        assert_ne!(primary, rebuilt, "the rebuild records other bytes");
+        let pins = pin_of(&ranked(&primary, "", ""), "tool", 0);
+        let index = ranked_under(&primary, &rebuilt, "", &pins);
+        match index.in_release("tool", "trixie-backports") {
+            Err(unheld) => assert!(
+                matches!(&unheld.reason, UnheldReason::Digest { archive, .. } if *archive == "f".repeat(64)),
+                "{unheld:?}",
+            ),
+            other => panic!("expected the pin refused, got {other:?}"),
+        }
+        assert!(index.in_release("tool", "trixie").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_installed_pinned_name_is_upgraded_to_its_pinned_version_alone() {
+        // A base holds 1.0-1, the pin holds trixie's 1.0-2, and a release of
+        // the same rank offers a newer 1.0-2+deb13u1. Unpinned, the upgrade is
+        // the newer one; pinned, it is the pinned one, and nothing where the
+        // pin holds the installed version or one below it.
+        let primary = offer("libfoo1", "1.0-2", "");
+        let security = offer("libfoo1", "1.0-2+deb13u1", "");
+        let merged = |pins: &Pins| {
+            Index::merge(
+                [
+                    Source {
+                        origin: 0,
+                        suite: "trixie",
+                        priority: ReleasePriority::Default,
+                        text: primary.as_str(),
+                    },
+                    Source {
+                        origin: 1,
+                        suite: "trixie-security",
+                        priority: ReleasePriority::Default,
+                        text: security.as_str(),
+                    },
+                ],
+                "amd64",
+                pins,
+            )
+        };
+        let unpinned = merged(&Pins::none());
+        assert_eq!(
+            unpinned.upgrade_over("libfoo1", "1.0-1").unwrap().version,
+            "1.0-2+deb13u1",
+        );
+
+        let index = merged(&pin_of(&unpinned, "libfoo1", 0));
+        let upgrade = index.upgrade_over("libfoo1", "1.0-1").unwrap();
+        assert_eq!((upgrade.version.as_str(), upgrade.origin), ("1.0-2", 0));
+        assert!(index.upgrade_over("libfoo1", "1.0-2").is_none());
+        assert!(index.upgrade_over("libfoo1", "1.0-3").is_none());
+
+        // The pin decides over the rank, as it does for the candidate: a
+        // pinned backports version replaces what a default release supplied.
+        let primary = offer("tool", "1.0", "");
+        let backports = offer("tool", "1.1~bpo", "");
+        let unpinned = ranked(&primary, &backports, "");
+        assert!(unpinned.upgrade_over("tool", "1.0").is_none());
+        let index = ranked_under(&primary, &backports, "", &pin_of(&unpinned, "tool", 1));
+        assert_eq!(
+            index.upgrade_over("tool", "1.0").unwrap().version,
+            "1.1~bpo"
+        );
     }
 
     #[test]
