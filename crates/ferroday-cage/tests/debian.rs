@@ -1233,29 +1233,101 @@ fn hermetic_a_pool_file_another_index_names_keeps_its_bytes() {
     );
 }
 
-/// Makes a named pipe at `path`.
-fn make_fifo(path: &Path) {
-    use rustix::fs::{CWD, FileType, Mode, mknodat};
-    mknodat(CWD, path, FileType::Fifo, Mode::from_raw_mode(0o644), 0)
-        .unwrap_or_else(|errno| panic!("a named pipe at {}: {errno}", path.display()));
+/// A named pipe planted at a name a publish meets, which the publish must not
+/// open: an open for reading waits for a writer that never comes.
+///
+/// The test holds the pipe by a descriptor of its own, so it can still ask
+/// after the pipe once a publish has replaced the name it was planted at.
+struct Pipe {
+    /// The pipe itself, held without being opened for reading or writing.
+    held: std::os::fd::OwnedFd,
+    /// Where it was planted.
+    path: std::path::PathBuf,
+}
+
+impl Pipe {
+    /// Makes a named pipe at `path`.
+    fn plant(path: &Path) -> Pipe {
+        use rustix::fs::{CWD, FileType, Mode, OFlags, mknodat};
+        mknodat(CWD, path, FileType::Fifo, Mode::from_raw_mode(0o644), 0)
+            .unwrap_or_else(|errno| panic!("a named pipe at {}: {errno}", path.display()));
+        let held = rustix::fs::open(
+            path,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap_or_else(|errno| panic!("the named pipe at {}: {errno}", path.display()));
+        Pipe {
+            held,
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// Whether anything has the pipe open for reading, or is waiting in an
+    /// open to.
+    ///
+    /// An open for writing that does not wait fails with `ENXIO` exactly
+    /// where nothing reads, and a reader waiting in its open counts. One that
+    /// succeeds also releases that reader, and closing it at once hands the
+    /// reader an end of input, so a publish caught waiting goes on.
+    fn has_reader(&self) -> bool {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsRawFd as _;
+        let reopened = format!("/proc/self/fd/{}", self.held.as_raw_fd());
+        match rustix::fs::open(
+            reopened.as_str(),
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(_writer) => true,
+            Err(rustix::io::Errno::NXIO) => false,
+            Err(errno) => panic!("the named pipe at {}: {errno}", self.path.display()),
+        }
+    }
 }
 
 /// Publishes `debs` into `pool` on a thread of its own, failing the test if the
-/// publish has not returned within a deadline rather than waiting on it.
+/// publish opens one of `pipes`.
 ///
-/// An open of a named pipe waits for a writer that never comes, so a publish
-/// that opened one would never return. The thread is left behind if it does
-/// not, which ends with the test process.
-fn publish_within_deadline(
+/// Each pipe is asked after while the publish runs, so a publish that opens one
+/// fails the test as soon as it does, and a slow one does not. Past a deadline
+/// far beyond any publish, one that has neither returned nor opened a pipe
+/// fails the test as well, and its thread is left behind, which ends with the
+/// test process.
+fn publish_beside(
     pool: &Path,
     debs: Vec<std::path::PathBuf>,
+    pipes: &[&Pipe],
 ) -> Result<(), ferroday_cage::provision::debian::DebianError> {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+
+    const PATIENCE: Duration = Duration::from_secs(60);
     let pool = pool.to_path_buf();
     let (done, outcome) = std::sync::mpsc::channel();
     std::thread::spawn(move || done.send(trixie_pool(&pool).publish(debs)));
-    outcome
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the publish returned rather than waiting on a named pipe")
+    let deadline = Instant::now().checked_add(PATIENCE).expect("a deadline");
+    loop {
+        let returned = match outcome.recv_timeout(Duration::from_millis(20)) {
+            Ok(returned) => Some(returned),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => panic!("the publish's thread panicked"),
+        };
+        for pipe in pipes {
+            assert!(
+                !pipe.has_reader(),
+                "the publish opened the named pipe at {}",
+                pipe.path.display()
+            );
+        }
+        if let Some(returned) = returned {
+            return returned;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the publish neither returned nor opened a named pipe in {PATIENCE:?}"
+        );
+    }
 }
 
 #[test]
@@ -1295,11 +1367,12 @@ fn hermetic_a_pipe_or_link_at_a_pool_file_is_replaced_rather_than_read() {
 
     // A pipe at both names: the republish returns, and each name holds the file
     // the pool wrote.
-    for planted in [&published, &index_copy] {
+    let pipes = [&published, &index_copy].map(|planted| {
         std::fs::remove_file(planted).unwrap();
-        make_fifo(planted);
-    }
-    publish_within_deadline(&pool, vec![source.clone()]).expect("the republish succeeds");
+        Pipe::plant(planted)
+    });
+    publish_beside(&pool, vec![source.clone()], &[&pipes[0], &pipes[1]])
+        .expect("the republish succeeds");
     assert!(is_file(&published), "the pipe at the package was replaced");
     assert_eq!(std::fs::read(&published).unwrap(), bytes);
     assert!(
@@ -1314,7 +1387,7 @@ fn hermetic_a_pipe_or_link_at_a_pool_file_is_replaced_rather_than_read() {
     std::fs::write(&outside, &bytes).unwrap();
     std::fs::remove_file(&published).unwrap();
     std::os::unix::fs::symlink(&outside, &published).unwrap();
-    publish_within_deadline(&pool, vec![source]).expect("the republish succeeds");
+    publish_beside(&pool, vec![source], &[]).expect("the republish succeeds");
     assert!(is_file(&published), "the link at the package was replaced");
     assert_eq!(std::fs::read(&published).unwrap(), bytes);
 }
@@ -1330,9 +1403,9 @@ fn hermetic_a_pipe_at_the_index_a_publish_merges_into_fails_it_promptly() {
     trixie_pool(&pool).publish::<&Path>([]).unwrap();
     let index = pool.join("dists/trixie/main/binary-amd64/Packages");
     std::fs::remove_file(&index).unwrap();
-    make_fifo(&index);
+    let pipe = Pipe::plant(&index);
 
-    match publish_within_deadline(&pool, Vec::new()) {
+    match publish_beside(&pool, Vec::new(), &[&pipe]) {
         Err(ferroday_cage::provision::debian::DebianError::Io { path, .. }) => {
             assert_eq!(path, index, "the failure names the index");
         }
@@ -1354,7 +1427,7 @@ fn hermetic_a_pipe_or_link_offered_as_a_deb_is_refused_without_being_read() {
     std::fs::create_dir_all(&out).unwrap();
 
     let pipe = out.join("pipe.deb");
-    make_fifo(&pipe);
+    let planted_pipe = Pipe::plant(&pipe);
     let outside = dir.join("outside.deb");
     std::fs::write(
         &outside,
@@ -1368,7 +1441,7 @@ fn hermetic_a_pipe_or_link_offered_as_a_deb_is_refused_without_being_read() {
     std::os::unix::fs::symlink(&outside, &link).unwrap();
 
     for planted in [pipe, link] {
-        match publish_within_deadline(&pool, vec![planted.clone()]) {
+        match publish_beside(&pool, vec![planted.clone()], &[&planted_pipe]) {
             Err(ferroday_cage::provision::debian::DebianError::Io { path, .. }) => {
                 assert_eq!(path, planted, "the failure names the path offered");
             }
@@ -1398,9 +1471,9 @@ fn hermetic_a_link_at_another_components_index_is_not_named() {
     let outside = dir.join("Packages");
     std::fs::write(&outside, b"").unwrap();
     std::os::unix::fs::symlink(&outside, contrib.join("Packages")).unwrap();
-    make_fifo(&contrib.join("Packages.gz"));
+    let pipe = Pipe::plant(&contrib.join("Packages.gz"));
 
-    publish_within_deadline(&pool, Vec::new()).expect("the publish succeeds");
+    publish_beside(&pool, Vec::new(), &[&pipe]).expect("the publish succeeds");
     let release = std::fs::read_to_string(pool.join("dists/trixie/Release")).unwrap();
     assert!(
         !release.contains("contrib/"),
