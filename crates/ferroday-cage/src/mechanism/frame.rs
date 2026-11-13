@@ -389,10 +389,6 @@ pub(crate) fn read_record(gate: BorrowedFd<'_>) -> Result<Option<[u8; RECORD_LEN
 ///
 /// A byte string longer than a `u16` counts is `ERANGE`: the frame has no way
 /// to declare it, and truncating the length would declare a different string.
-///
-/// The export child is its only caller, so a build without the `tarball`
-/// feature has none.
-#[cfg_attr(not(feature = "tarball"), allow(dead_code))]
 pub(crate) fn write_bytes_u16(fd: BorrowedFd<'_>, data: &[u8]) -> Result<(), Errno> {
     let len = u16::try_from(data.len()).map_err(|_| Errno::RANGE)?;
     write_full(fd, &len.to_le_bytes())?;

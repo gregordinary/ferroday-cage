@@ -527,7 +527,7 @@ pub(crate) fn reown(
     let child_map = map_source.child_map();
     let translation = Translation::of(&child_map);
 
-    let mut frames = Vec::new();
+    let mut owing = Vec::new();
     for record in owed {
         let path = root.join(OsStr::from_bytes(&record.path));
         let (uid, gid) = match record.owner {
@@ -558,18 +558,11 @@ pub(crate) fn reown(
                 reason: "the path of an entry to own is longer than a frame can carry".to_string(),
             });
         }
-        frames.push(COPY_OWN);
-        frames.extend_from_slice(&(record.path.len() as u16).to_le_bytes());
-        frames.extend_from_slice(&record.path);
-        frames.extend_from_slice(&uid.to_le_bytes());
-        frames.extend_from_slice(&gid.to_le_bytes());
-        frames.extend_from_slice(&record.dev.to_le_bytes());
-        frames.extend_from_slice(&record.ino.to_le_bytes());
+        owing.push((record, uid, gid));
     }
-    if frames.is_empty() {
+    if owing.is_empty() {
         return Ok(());
     }
-    frames.push(COPY_END);
 
     let root_c = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
         ProvisionError::io(
@@ -579,7 +572,22 @@ pub(crate) fn reown(
         )
     })?;
     let child = start_copy_in(&root_c, child_map).map_err(|err| failure(err, root))?;
-    if let Err(err) = put(child.stream(), &frames, root) {
+    let stream = child.stream();
+    let sent = owing
+        .iter()
+        .try_for_each(|(record, uid, gid)| {
+            put(stream, &[COPY_OWN], root)?;
+            put_bytes_u16(stream, &record.path, root)?;
+            for field in [uid.to_le_bytes(), gid.to_le_bytes()] {
+                put(stream, &field, root)?;
+            }
+            for field in [record.dev.to_le_bytes(), record.ino.to_le_bytes()] {
+                put(stream, &field, root)?;
+            }
+            Ok(())
+        })
+        .and_then(|()| put(stream, &[COPY_END], root));
+    if let Err(err) = sent {
         return Err(match child.abandon() {
             Some(reported) => failure(reported, root),
             None => err,
@@ -765,8 +773,7 @@ impl Walk<'_> {
                 let path = by_path(dir, &name, &entry)?;
                 self.attributes(Holder::Path(&path), kind, &meta, &entry)?;
                 self.emit_named(stream, COPY_SYMLINK, &name, &meta, None, &entry)?;
-                put(stream, &(target.len() as u16).to_le_bytes(), &entry)?;
-                put(stream, target, &entry)?;
+                put_bytes_u16(stream, target, &entry)?;
             } else if kind == fs::FileType::Fifo {
                 // A named pipe is an ordinary unprivileged creation, so the
                 // copy makes one rather than dropping it: a tree that ships a
@@ -813,10 +820,8 @@ impl Walk<'_> {
         let key = (meta.st_dev as u64, meta.st_ino as u64);
         if let Some(anchor) = self.links.get(&key) {
             put(stream, &[COPY_LINK], path)?;
-            put(stream, &(name.len() as u16).to_le_bytes(), path)?;
-            put(stream, name, path)?;
-            put(stream, &(anchor.len() as u16).to_le_bytes(), path)?;
-            put(stream, anchor, path)?;
+            put_bytes_u16(stream, name, path)?;
+            put_bytes_u16(stream, anchor, path)?;
             return Ok(true);
         }
 
@@ -881,8 +886,7 @@ impl Walk<'_> {
     ) -> Result<(), ProvisionError> {
         let mode = mode.unwrap_or(meta.st_mode as u32);
         put(stream, &[tag], path)?;
-        put(stream, &(name.len() as u16).to_le_bytes(), path)?;
-        put(stream, name, path)?;
+        put_bytes_u16(stream, name, path)?;
         put(stream, &mode.to_le_bytes(), path)?;
         put(
             stream,
@@ -990,8 +994,7 @@ fn put_attributes(
     })?;
     put(stream, &count.to_le_bytes(), path)?;
     for (name, value) in attributes {
-        put(stream, &(name.len() as u16).to_le_bytes(), path)?;
-        put(stream, name, path)?;
+        put_bytes_u16(stream, name, path)?;
         put(stream, &(value.len() as u32).to_le_bytes(), path)?;
         put(stream, value, path)?;
     }
@@ -1254,12 +1257,12 @@ pub(super) fn read_names(
     dir: BorrowedFd<'_>,
     subject: &Path,
 ) -> Result<Vec<Vec<u8>>, ProvisionError> {
-    // A `Dir` takes a descriptor of its own and consumes its offset, so this
-    // opens `.` relative to the walk's: the caller goes on resolving every
+    // A `Dir` consumes its descriptor's offset, so it is handed one of its own,
+    // `.` opened relative to the walk's: the caller goes on resolving every
     // entry against the descriptor it already holds.
     let handle = openat_nofollow(dir, c".", OFlags::DIRECTORY, subject)?;
     let mut names = Vec::new();
-    for entry in fs::Dir::read_from(&handle)
+    for entry in fs::Dir::new(handle)
         .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))?
     {
         let entry = entry.map_err(|errno| ProvisionError::io("reading", subject, errno.into()))?;
@@ -1324,6 +1327,18 @@ fn stream_file(
 /// reason.
 fn put(stream: BorrowedFd<'_>, data: &[u8], path: &Path) -> Result<(), ProvisionError> {
     frame::write_full(stream, data)
+        .map_err(|errno| ProvisionError::io("copying", path, errno.into()))
+}
+
+/// Writes a `u16`-length-prefixed byte string to the child's stream, through
+/// [`frame::write_bytes_u16`], blaming `path` for a failure.
+///
+/// Every caller has refused already what a frame cannot carry, so a string too
+/// long for its prefix does not reach here. Were one to, it would be refused
+/// with `ERANGE` rather than sent under a length cut to fit, which would
+/// declare a different string and leave every later frame out of step.
+fn put_bytes_u16(stream: BorrowedFd<'_>, data: &[u8], path: &Path) -> Result<(), ProvisionError> {
+    frame::write_bytes_u16(stream, data)
         .map_err(|errno| ProvisionError::io("copying", path, errno.into()))
 }
 
