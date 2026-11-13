@@ -336,19 +336,7 @@ impl NetStack {
         let plan = self.plan.clone();
         let pump = std::thread::Builder::new()
             .name("fcage-netstack".to_string())
-            .spawn(move || {
-                // Panics are converted into a failed exit and the running
-                // flag is cleared on every path, so the handle's view of the
-                // pump is always truthful and stop() never rethrows.
-                let exit = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    pump::run(tap, polled, plan, listeners)
-                }));
-                running_pump.store(false, Ordering::SeqCst);
-                exit.unwrap_or(PumpExit::Failed {
-                    op: "recovering from a panic",
-                    source: None,
-                })
-            })
+            .spawn(move || run_caught(|| pump::run(tap, polled, plan, listeners), &running_pump))
             .map_err(|err| NetStackError::Spawn { source: err })?;
 
         Ok(NetStackHandle {
@@ -358,6 +346,15 @@ impl NetStack {
             published,
         })
     }
+}
+
+/// Runs a pump on its thread, catching a panic as [`PumpExit::Panicked`], and
+/// clears `running` however the pump ends, so the handle's view of the pump is
+/// always truthful and [`stop`](NetStackHandle::stop) never rethrows.
+fn run_caught(pump: impl FnOnce() -> PumpExit, running: &AtomicBool) -> PumpExit {
+    let exit = std::panic::catch_unwind(AssertUnwindSafe(pump));
+    running.store(false, Ordering::SeqCst);
+    exit.unwrap_or(PumpExit::Panicked)
 }
 
 /// Refuses an attachment that would carry the guest's connections past a
@@ -425,11 +422,13 @@ enum PumpExit {
     Clean,
     /// The pump stopped on an unrecoverable error of its own machinery. The
     /// error is absent where the pump stopped on something that was not a
-    /// syscall failure — a panic it recovered from.
+    /// syscall failure, such as a tap that read as ended.
     Failed {
         op: &'static str,
         source: Option<io::Error>,
     },
+    /// The pump panicked, and the thread that runs it caught the panic.
+    Panicked,
 }
 
 /// A handle to one attached network stack.
@@ -479,12 +478,10 @@ impl NetStackHandle {
         match pump.join() {
             Ok(PumpExit::Clean) => Ok(()),
             Ok(PumpExit::Failed { op, source }) => Err(NetStackError::Pump { op, source }),
-            // The pump converts its panics into a failed exit; a join error
-            // means that conversion itself was bypassed. Report, not rethrow.
-            Err(_) => Err(NetStackError::Pump {
-                op: "recovering from a panic",
-                source: None,
-            }),
+            // The pump's thread catches its panics; a join error means a panic
+            // escaped the catch, which is a panic all the same. Report, not
+            // rethrow.
+            Ok(PumpExit::Panicked) | Err(_) => Err(NetStackError::PumpPanicked),
         }
     }
 
@@ -968,6 +965,12 @@ pub enum NetStackError {
         /// that was not a syscall failure.
         source: Option<io::Error>,
     },
+    /// The pump panicked, reported by [`NetStackHandle::stop`].
+    ///
+    /// The panic is caught on the pump's own thread, so it ends the stack and
+    /// nothing else: the sandbox runs on without connectivity, and the caller's
+    /// process is unaffected.
+    PumpPanicked,
 }
 
 impl fmt::Display for NetStackError {
@@ -1043,6 +1046,10 @@ impl fmt::Display for NetStackError {
                 f.write_str("the network stack's tap helper exited without delivering a result")
             }
             NetStackError::Pump { op, .. } => write!(f, "the network stack pump failed while {op}"),
+            NetStackError::PumpPanicked => f.write_str(
+                "the network stack pump panicked; the stack caught the panic and stopped \
+                 serving the sandbox",
+            ),
         }
     }
 }
@@ -1055,7 +1062,8 @@ impl std::error::Error for NetStackError {
     /// publication, a shared namespace, an unenforceable network grant — carry
     /// no inner error: nothing failed, the request was refused.
     /// [`HelperLost`](Self::HelperLost) carries none either: the helper's
-    /// silence is the failure.
+    /// silence is the failure. Nor does [`PumpPanicked`](Self::PumpPanicked):
+    /// the panic is the failure, and its message went to the panic hook.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             NetStackError::NamespaceJoin { source, .. } | NetStackError::Pump { source, .. } => {
@@ -1339,6 +1347,29 @@ mod tests {
             .interface("\u{e9}th0")
             .build()
             .expect("a name the kernel accepts");
+    }
+
+    #[test]
+    fn a_pump_that_panics_is_reported_as_a_panic_the_stack_caught() {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_pump = Arc::clone(&running);
+        let (stop, _polled) = pump::Stop::new().expect("an eventfd");
+        let handle = NetStackHandle {
+            pump: Some(std::thread::spawn(move || {
+                run_caught(|| panic!("a pump that panics"), &running_pump)
+            })),
+            stop,
+            running,
+            published: Vec::new(),
+        };
+        let reported = handle.stop().expect_err("a panicked pump is reported");
+        assert!(
+            matches!(reported, NetStackError::PumpPanicked),
+            "{reported:?}"
+        );
+        let said = reported.to_string();
+        assert!(said.contains("panicked"), "{said}");
+        assert!(!said.contains("failed while"), "{said}");
     }
 
     #[test]

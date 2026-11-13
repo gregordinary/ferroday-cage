@@ -1976,6 +1976,7 @@ pub ferroday_cage::NetStackError::PublishInvalid::reason: &'static str
 #[non_exhaustive] pub ferroday_cage::NetStackError::Pump
 pub ferroday_cage::NetStackError::Pump::op: &'static str
 pub ferroday_cage::NetStackError::Pump::source: core::option::Option<core::io::error::Error>
+pub ferroday_cage::NetStackError::PumpPanicked
 pub ferroday_cage::NetStackError::SharedNamespace
 #[non_exhaustive] pub ferroday_cage::NetStackError::Spawn
 pub ferroday_cage::NetStackError::Spawn::source: core::io::error::Error

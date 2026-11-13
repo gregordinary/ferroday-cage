@@ -361,6 +361,10 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- `NetStackHandle::stop` reports a pump that panicked as the new
+  `NetStackError::PumpPanicked`, which says the pump panicked and the stack
+  caught the panic. It reported `NetStackError::Pump`, rendered as a failure
+  "while recovering from a panic", though the recovery had worked.
 - **Breaking.** The Debian layer reads a package's or an index's SHA-512 beside
   its SHA-256, in a release and in an index stanza, and holds an index and a
   download to every one the archive records, refusing the bytes where any

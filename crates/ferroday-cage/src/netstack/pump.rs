@@ -1455,7 +1455,9 @@ mod tests {
                     panic!("the pump failed {op} before it was stopped: {source:?}")
                 }
                 // The panic hook has already reported it, on the pump's thread.
-                Err(_) => panic!("the pump panicked before it was stopped"),
+                Ok(PumpExit::Panicked) | Err(_) => {
+                    panic!("the pump panicked before it was stopped")
+                }
             }
         }
     }
