@@ -59,8 +59,8 @@ use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, Error, ErrorChain, ExitStatus, FsAccess, IdRange,
     Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, Network, Overlay,
-    RawMount, Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg,
-    SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
+    PresentedIdentity, RawMount, Resource, RestrictedProfile, Restriction, RestrictionBuilder,
+    Running, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
 };
 use serde::Deserialize as _;
 
@@ -1376,6 +1376,26 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--present-as",
+        section: Section::Identity,
+        placeholder: "UID:GID|own",
+        help: &[
+            "Under the single identity map, show yourself to the",
+            "command as UID:GID rather than as root, or as your own",
+            "ids with 'own'. The command runs as that identity and",
+            "holds no capability, but on the host it is still you",
+        ],
+        take: Take::One(|options, flag, value| {
+            let text = into_string(flag, value)?;
+            options.present_as = Some(
+                text.parse::<PresentedIdentity>()
+                    .map_err(|error| format!("{flag}: {error}"))?,
+            );
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--rlimit",
         section: Section::Identity,
         placeholder: "RES=SOFT[:HARD]",
@@ -2303,6 +2323,7 @@ struct Options {
     overlay_work: Option<PathBuf>,
     identity_map: Option<IdentityMap>,
     run_as: Option<Identity>,
+    present_as: Option<PresentedIdentity>,
     rlimits: Vec<(Resource, Limit, Limit)>,
     setenv: Vec<(OsString, OsString)>,
     hostname: Option<OsString>,
@@ -2828,6 +2849,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         overlay_work: None,
         identity_map: None,
         run_as: None,
+        present_as: None,
         rlimits: Vec::new(),
         setenv: Vec::new(),
         hostname: None,
@@ -2985,6 +3007,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             ),
             (options.identity_map.is_some(), "--identity-map"),
             (options.run_as.is_some(), "--run-as"),
+            (options.present_as.is_some(), "--present-as"),
             (options.path_lookup.is_some(), "the path-lookup options"),
             (options.netstack, "--netstack"),
             (has_netstack_modifiers(&options), "the --netstack-* options"),
@@ -5110,6 +5133,9 @@ impl Launch {
         }
         if let Some(identity) = options.run_as {
             builder = builder.run_as(identity);
+        }
+        if let Some(identity) = options.present_as {
+            builder = builder.present_as(identity);
         }
         if let Some(enabled) = options.path_lookup {
             builder = builder.path_lookup(enabled);
@@ -8360,6 +8386,32 @@ mod tests {
         for bad in ["", "250", "250:", "x:1", "250:250:x"] {
             assert!(parse_run_as(bad).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn present_as_takes_ids_or_own() {
+        let presented = |value: &str| {
+            run_options(&["--rootfs", "/r", "--present-as", value, "--", "/bin/true"]).present_as
+        };
+        assert_eq!(
+            presented("1000:100"),
+            Some(PresentedIdentity::ids(1000, 100))
+        );
+        assert_eq!(presented("own"), Some(PresentedIdentity::Own));
+        let error = parse_error(&["--rootfs", "/r", "--present-as", "root", "--", "/bin/true"]);
+        assert!(
+            error.contains("--present-as") && error.contains("UID:GID"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn present_as_cannot_be_used_with_restrict() {
+        let error = parse_error(&["--restrict", "--present-as", "own", "--", "/bin/true"]);
+        assert!(
+            error.contains("--present-as cannot be used with --restrict"),
+            "{error}"
+        );
     }
 
     #[test]

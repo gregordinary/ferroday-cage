@@ -1583,6 +1583,7 @@ pub ferroday_cage::ConfigError::OverlayPathInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayUnavailable
 pub ferroday_cage::ConfigError::OverlayUnavailable::blocker: ferroday_cage::host::OverlayBlocker
 pub ferroday_cage::ConfigError::OverlayUpperMissing
+pub ferroday_cage::ConfigError::PresentAsWithRangeMap
 #[non_exhaustive] pub ferroday_cage::ConfigError::ProfileOperationForbidden
 pub ferroday_cage::ConfigError::ProfileOperationForbidden::operation: &'static str
 pub ferroday_cage::ConfigError::RestrictionEmpty
@@ -1599,6 +1600,10 @@ pub ferroday_cage::ConfigError::RootfsMissing
 pub ferroday_cage::ConfigError::RootfsUnusable::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::RootfsUnusable::source: core::io::error::Error
 pub ferroday_cage::ConfigError::RunAsGroupsWithSingleMap
+#[non_exhaustive] pub ferroday_cage::ConfigError::RunAsOutsideSingleMap
+pub ferroday_cage::ConfigError::RunAsOutsideSingleMap::id: u32
+pub ferroday_cage::ConfigError::RunAsOutsideSingleMap::presented: u32
+pub ferroday_cage::ConfigError::RunAsOutsideSingleMap::space: &'static str
 #[non_exhaustive] pub ferroday_cage::ConfigError::RunAsUnmapped
 pub ferroday_cage::ConfigError::RunAsUnmapped::id: u32
 pub ferroday_cage::ConfigError::RunAsUnmapped::space: &'static str
@@ -1825,6 +1830,29 @@ impl core::marker::Unpin for ferroday_cage::OverlayLayer
 impl core::marker::UnsafeUnpin for ferroday_cage::OverlayLayer
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::OverlayLayer
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::OverlayLayer
+#[non_exhaustive] pub enum ferroday_cage::PresentedIdentity
+#[non_exhaustive] pub ferroday_cage::PresentedIdentity::Ids
+pub ferroday_cage::PresentedIdentity::Ids::gid: u32
+pub ferroday_cage::PresentedIdentity::Ids::uid: u32
+pub ferroday_cage::PresentedIdentity::Own
+impl ferroday_cage::PresentedIdentity
+pub const fn ferroday_cage::PresentedIdentity::ids(u32, u32) -> ferroday_cage::PresentedIdentity
+impl core::fmt::Display for ferroday_cage::PresentedIdentity
+pub fn ferroday_cage::PresentedIdentity::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for ferroday_cage::PresentedIdentity
+pub type ferroday_cage::PresentedIdentity::Err = ferroday_cage::ParsePresentedIdentityError
+pub fn ferroday_cage::PresentedIdentity::from_str(&str) -> core::result::Result<ferroday_cage::PresentedIdentity, ferroday_cage::ParsePresentedIdentityError>
+impl serde_core::ser::Serialize for ferroday_cage::PresentedIdentity
+pub fn ferroday_cage::PresentedIdentity::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for ferroday_cage::PresentedIdentity
+pub fn ferroday_cage::PresentedIdentity::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for ferroday_cage::PresentedIdentity
+impl core::marker::Send for ferroday_cage::PresentedIdentity
+impl core::marker::Sync for ferroday_cage::PresentedIdentity
+impl core::marker::Unpin for ferroday_cage::PresentedIdentity
+impl core::marker::UnsafeUnpin for ferroday_cage::PresentedIdentity
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::PresentedIdentity
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::PresentedIdentity
 #[non_exhaustive] pub enum ferroday_cage::Progress
 pub ferroday_cage::Progress::Executing
 pub ferroday_cage::Progress::Launching
@@ -2146,6 +2174,7 @@ pub fn ferroday_cage::CageBuilder::get_network(&self) -> ferroday_cage::Network
 pub fn ferroday_cage::CageBuilder::get_overlay(&self) -> core::option::Option<&ferroday_cage::Overlay>
 pub fn ferroday_cage::CageBuilder::get_path_lookup(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_pid_namespace(&self) -> bool
+pub fn ferroday_cage::CageBuilder::get_present_as(&self) -> core::option::Option<ferroday_cage::PresentedIdentity>
 pub fn ferroday_cage::CageBuilder::get_raw_mounts(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferroday_cage::RawMount>
 pub fn ferroday_cage::CageBuilder::get_resolv_conf(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_rlimits(&self) -> impl core::iter::traits::iterator::Iterator<Item = (ferroday_cage::limits::Resource, ferroday_cage::limits::Limit, ferroday_cage::limits::Limit)>
@@ -2169,6 +2198,7 @@ pub fn ferroday_cage::CageBuilder::overlay(self, ferroday_cage::Overlay) -> Self
 pub fn ferroday_cage::CageBuilder::overlay_rootfs(self, impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::path_lookup(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::pid_namespace(self, bool) -> Self
+pub fn ferroday_cage::CageBuilder::present_as(self, ferroday_cage::PresentedIdentity) -> Self
 pub fn ferroday_cage::CageBuilder::raw_mount(self, ferroday_cage::RawMount) -> Self
 pub fn ferroday_cage::CageBuilder::resolv_conf(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::rlimit(self, ferroday_cage::limits::Resource, impl core::convert::Into<ferroday_cage::limits::Limit>, impl core::convert::Into<ferroday_cage::limits::Limit>) -> Self
@@ -2507,6 +2537,19 @@ impl core::marker::Unpin for ferroday_cage::ParseNetAccessError
 impl core::marker::UnsafeUnpin for ferroday_cage::ParseNetAccessError
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParseNetAccessError
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParseNetAccessError
+pub struct ferroday_cage::ParsePresentedIdentityError
+impl ferroday_cage::ParsePresentedIdentityError
+pub fn ferroday_cage::ParsePresentedIdentityError::text(&self) -> &str
+impl core::error::Error for ferroday_cage::ParsePresentedIdentityError
+impl core::fmt::Display for ferroday_cage::ParsePresentedIdentityError
+pub fn ferroday_cage::ParsePresentedIdentityError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::ParsePresentedIdentityError
+impl core::marker::Send for ferroday_cage::ParsePresentedIdentityError
+impl core::marker::Sync for ferroday_cage::ParsePresentedIdentityError
+impl core::marker::Unpin for ferroday_cage::ParsePresentedIdentityError
+impl core::marker::UnsafeUnpin for ferroday_cage::ParsePresentedIdentityError
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParsePresentedIdentityError
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParsePresentedIdentityError
 pub struct ferroday_cage::Pending<'obs>
 impl<'obs> ferroday_cage::Pending<'obs>
 pub fn ferroday_cage::Pending<'obs>::netns_pid(&self) -> u32
@@ -2575,6 +2618,7 @@ pub ferroday_cage::ResolvedInputs::mounts: alloc::vec::Vec<ferroday_cage::Resolv
 pub ferroday_cage::ResolvedInputs::network: ferroday_cage::Network
 pub ferroday_cage::ResolvedInputs::no_new_privileges: bool
 pub ferroday_cage::ResolvedInputs::pid_namespace: bool
+pub ferroday_cage::ResolvedInputs::present_as: core::option::Option<ferroday_cage::Identity>
 pub ferroday_cage::ResolvedInputs::rlimits: alloc::vec::Vec<ferroday_cage::ResolvedRlimit>
 pub ferroday_cage::ResolvedInputs::root: ferroday_cage::ResolvedRoot
 pub ferroday_cage::ResolvedInputs::run_as: core::option::Option<ferroday_cage::Identity>

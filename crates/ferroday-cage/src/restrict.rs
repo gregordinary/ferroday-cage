@@ -731,12 +731,14 @@ impl RestrictionBuilder {
             plan: LaunchPlan {
                 confinement: Confinement::Restriction,
                 // A restriction creates no user namespace: there is no map
-                // to establish, no identity to switch to, and nothing to nest
-                // inside — the mount flags a cage locks by nesting are the
-                // host's here, and no mount of its own is established.
+                // to establish, no identity to switch to or to present, and
+                // nothing to nest inside — the mount flags a cage locks by
+                // nesting are the host's here, and no mount of its own is
+                // established.
                 identity: IdentityPlan::Single,
                 nested: None,
                 run_as: None,
+                present_as: None,
                 program: command.program,
                 // A restriction keeps the absolute-command contract: no PATH
                 // search over the shared host filesystem.

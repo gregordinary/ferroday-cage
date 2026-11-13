@@ -232,6 +232,178 @@ impl Identity {
     }
 }
 
+/// The identity the single-identity map presents the caller to the command as.
+///
+/// Under [`IdentityMap::Single`] the sandbox holds one id, the caller, and the
+/// command sees it as uid and gid 0. A presented identity shows the caller to
+/// the command as another uid and gid instead. `id` reports them, files the
+/// caller owns read as theirs, and the command holds no capability across its
+/// `execve`. Configured with [`CageBuilder::present_as`].
+///
+/// It is a presentation, not a boundary. On the host the command is still the
+/// caller, so it owns every file the caller owns, a rootfs the caller
+/// provisioned among them. Nothing maps uid 0, so the command cannot become
+/// root inside. Separating the command from the rootfs by ownership needs a
+/// second id, which a range map provides, and
+/// [`run_as`](crate::CageBuilder::run_as) switches the command to it.
+///
+/// It renders and parses as `own` or `UID:GID`, the form a profile's
+/// `present-as` key and the command line take.
+///
+/// # Example
+///
+/// ```
+/// use ferroday_cage::PresentedIdentity;
+///
+/// let own: PresentedIdentity = "own".parse().unwrap();
+/// assert_eq!(own, PresentedIdentity::Own);
+/// let ids: PresentedIdentity = "1000:1000".parse().unwrap();
+/// assert_eq!(ids, PresentedIdentity::ids(1000, 1000));
+/// assert_eq!(ids.to_string(), "1000:1000");
+/// ```
+///
+/// [`CageBuilder::present_as`]: crate::CageBuilder::present_as
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PresentedIdentity {
+    /// The caller's own effective uid and gid, read when the sandbox is built.
+    ///
+    /// The command then sees the ids the host knows the caller by, so a
+    /// layout that binds the host's `/etc` finds the caller's account there.
+    Own,
+    /// The given uid and gid.
+    ///
+    /// Construct this variant with [`PresentedIdentity::ids`]. It is
+    /// `#[non_exhaustive]` so that a further field can be added without
+    /// breaking callers; match it with a trailing `..`.
+    #[non_exhaustive]
+    Ids {
+        /// The uid the command sees the caller as.
+        uid: u32,
+        /// The gid the command sees the caller as.
+        gid: u32,
+    },
+}
+
+impl PresentedIdentity {
+    /// Returns a presented identity of the given uid and gid.
+    ///
+    /// The constructor for [`PresentedIdentity::Ids`], which is
+    /// `#[non_exhaustive]`.
+    pub const fn ids(uid: u32, gid: u32) -> PresentedIdentity {
+        PresentedIdentity::Ids { uid, gid }
+    }
+
+    /// The uid and gid this presents the caller as, reading the caller's own
+    /// effective ids for [`Own`](Self::Own).
+    ///
+    /// Read from the process building the sandbox, which is the process whose
+    /// effective ids the single-identity map names: see
+    /// [`single_identity_lines`].
+    pub(crate) fn resolve(self) -> (u32, u32) {
+        match self {
+            PresentedIdentity::Own => (
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+            ),
+            PresentedIdentity::Ids { uid, gid } => (uid, gid),
+        }
+    }
+}
+
+impl fmt::Display for PresentedIdentity {
+    /// Writes `own`, or the ids as `UID:GID`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PresentedIdentity::Own => f.write_str(PRESENTED_OWN),
+            PresentedIdentity::Ids { uid, gid } => write!(f, "{uid}:{gid}"),
+        }
+    }
+}
+
+impl std::str::FromStr for PresentedIdentity {
+    type Err = ParsePresentedIdentityError;
+
+    /// Parses `own`, or a uid and a gid as `UID:GID`.
+    fn from_str(s: &str) -> Result<PresentedIdentity, ParsePresentedIdentityError> {
+        if s == PRESENTED_OWN {
+            return Ok(PresentedIdentity::Own);
+        }
+        let error = || ParsePresentedIdentityError {
+            text: s.to_string(),
+        };
+        let (uid, gid) = s.split_once(':').ok_or_else(error)?;
+        Ok(PresentedIdentity::Ids {
+            uid: uid.parse().map_err(|_| error())?,
+            gid: gid.parse().map_err(|_| error())?,
+        })
+    }
+}
+
+/// The spelling of [`PresentedIdentity::Own`].
+const PRESENTED_OWN: &str = "own";
+
+/// A presented identity renders as its string form.
+#[cfg(feature = "serde")]
+impl serde::Serialize for PresentedIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Accepts the string form a presented identity renders as.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for PresentedIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(PresentedIdentityVisitor)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct PresentedIdentityVisitor;
+
+#[cfg(feature = "serde")]
+impl serde::de::Visitor<'_> for PresentedIdentityVisitor {
+    type Value = PresentedIdentity;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{PRESENTED_OWN:?} or UID:GID")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<PresentedIdentity, E> {
+        text.parse().map_err(E::custom)
+    }
+}
+
+/// The error from parsing a [`PresentedIdentity`] that is neither `own` nor
+/// `UID:GID`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsePresentedIdentityError {
+    text: String,
+}
+
+impl ParsePresentedIdentityError {
+    /// The unparsed text, as it was given.
+    ///
+    /// Named `text` on every parse error in this crate, so a caller moving
+    /// between them does not have to check.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for ParsePresentedIdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "expected {PRESENTED_OWN:?} or UID:GID for a presented identity, not {:?}",
+            self.text
+        )
+    }
+}
+
+impl std::error::Error for ParsePresentedIdentityError {}
+
 /// A resolved identity map: the extents a delegate will establish, known at
 /// build time.
 ///

@@ -295,7 +295,10 @@ pub use hardening::{
 };
 #[cfg(feature = "subid")]
 pub use idmap::SubidMapper;
-pub use idmap::{DirectMapper, IdMapError, IdMapper, IdRange, Identity, IdentityMap, ResolvedMap};
+pub use idmap::{
+    DirectMapper, IdMapError, IdMapper, IdRange, Identity, IdentityMap,
+    ParsePresentedIdentityError, PresentedIdentity, ResolvedMap,
+};
 pub use limits::{Limit, Resource};
 #[cfg(feature = "hardening")]
 pub use mechanism::SockFilter;

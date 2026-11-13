@@ -73,7 +73,9 @@ before.
 
 The same kernel rules decide who writes it. Under the single-identity map the
 nested map is `0 0 1` — one line, of one id, naming the writer's own effective
-id — so the command writes it itself. Under a range map it cannot, and neither
+id — so the command writes it itself. A [presented
+identity](#presenting-the-caller-as-another-identity) changes only its inside
+id. Under a range map it cannot, and neither
 can the host caller, which owns the sandbox's user namespace but is not inside
 it: the writer has to be root of the namespace the nested one is a child of,
 which is the sandbox init (or, without a PID namespace, the launch stage). That
@@ -308,6 +310,51 @@ Capabilities interact with the switch in three ways:
   to the mapped uid 0 — an identity that is not a boundary at all — and is
   rejected at `build` by name.
 
+## Presenting the caller as another identity
+
+Some programs behave differently as root, and some refuse to run as root at
+all. Under the single-identity map the command sees its one id, the caller, as
+root. `present_as` shows the caller to the command as another uid and gid
+instead:
+
+```rust,no_run
+use ferroday_cage::{Cage, PresentedIdentity};
+
+# fn main() -> ferroday_cage::Result<()> {
+let cage = Cage::builder()
+    .rootfs("/srv/rootfs")
+    .command("/usr/bin/id")
+    .present_as(PresentedIdentity::ids(1000, 1000))
+    .build()?;
+# Ok(())
+# }
+```
+
+`PresentedIdentity::Own` presents the caller as the ids the host knows it by. A
+sandbox that binds the host's `/etc` then finds the caller's account there. On
+the command line the flag is `--present-as 1000:1000` or `--present-as own`.
+
+The sandbox is still built as root inside. Only the nested map changes: its one
+extent reads `1000 0 1` rather than `0 0 1`. The kernel admits the command's own
+write of it, because the one-id exception constrains only the outside id.
+
+The command runs as that identity from its first instruction, with no switch. `id`
+reports it, and files the caller owns read as its own. Nothing maps uid 0, so
+the command cannot become root inside. It holds no capability across its
+`execve` beyond a kept set, which the ambient set carries. A presented identity
+sets no-new-privileges, as a run-as identity does.
+
+This is a presentation, not a boundary. On the host the command is still the
+caller. It owns every file the caller owns, a root filesystem the caller
+provisioned among them, and what it writes belongs to the caller. A command that
+must not write the root filesystem needs it mounted read-only. Keeping the
+command out of it by ownership takes a second id, which only a range map
+provides, and `run_as` to switch to it.
+
+Under a presented identity, the one identity `run_as` accepts is that one,
+which the command already holds. A range map refuses a presented identity at
+`build`, since it has ids of its own to run as.
+
 ## Profiles
 
 With the `serde` feature the identity map and run-as identity are part of
@@ -336,6 +383,13 @@ gid = [
     { inside = 0, outside = 1000, count = 1 },
     { inside = 1, outside = 100000, count = 65536 },
 ]
+```
+
+A presented identity is a string, `own` or `UID:GID`, beside the
+single-identity map:
+
+```toml
+present-as = "own"
 ```
 
 Every form loads in every build of the library, and `build` decides whether a

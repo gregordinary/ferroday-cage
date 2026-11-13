@@ -13,12 +13,12 @@ use rustix::mount::MountFlags;
 use rustix::thread::UnshareFlags;
 
 use crate::error::{ConfigError, Error, OverlayLayer};
-use crate::idmap::{self, IdMapper, Identity, IdentityMap};
+use crate::idmap::{self, IdMapper, Identity, IdentityMap, PresentedIdentity};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
     self, Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction,
-    MountDir, MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, RlimitPlan,
-    RunAsPlan, StdioPlan,
+    MountDir, MountOp, NestedMap, NestedPlan, OverlayOptionsError, OverlayPlan, PresentPlan,
+    RlimitPlan, RunAsPlan, StdioPlan,
 };
 use crate::observer::{Collect, Observer, Output};
 use crate::path;
@@ -1121,10 +1121,13 @@ pub struct CageBuilder {
     base_env: Option<bool>,
     stop_with_caller: bool,
     path_lookup: bool,
-    // The identity fields sit between the scalars and the tables: the map
-    // serializes as a string for the unit forms and a table for ranges, and
-    // the run-as identity is always a table, so this position keeps the
-    // serialized profile valid TOML in field order either way.
+    // The identity fields sit between the scalars and the tables. The presented
+    // identity is always a string and the run-as identity always a table, and
+    // the map is a string for the unit forms and a table for ranges, so this
+    // order keeps the serialized profile valid TOML in field order whichever
+    // form the map takes.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    present_as: Option<PresentedIdentity>,
     #[cfg_attr(
         feature = "serde",
         serde(skip_serializing_if = "identity_map_is_default")
@@ -1240,6 +1243,7 @@ impl Default for CageBuilder {
             base_env: None,
             stop_with_caller: false,
             path_lookup: false,
+            present_as: None,
             identity_map: IdentityMap::Single,
             run_as: None,
             overlay: None,
@@ -1681,8 +1685,58 @@ impl CageBuilder {
     /// `/usr/bin/sudo` — and without the flag the non-root command executes
     /// them and is root inside again. The flag closes that path for the
     /// command and everything it starts.
+    ///
+    /// The single-identity map holds one id, the caller, which the command
+    /// sees as uid 0, or as the identity [`present_as`](Self::present_as)
+    /// names. A run-as identity there may name that id and no other, and
+    /// switches nothing. Running the command as a non-root id under that map
+    /// is a presentation, which `present_as` configures.
     pub fn run_as(mut self, identity: Identity) -> Self {
         self.run_as = Some(identity);
+        self
+    }
+
+    /// Presents the caller to the command as another identity, under the
+    /// single-identity map.
+    ///
+    /// That map holds one id, the caller, which the command otherwise sees as
+    /// uid and gid 0. With a presented identity the command sees the caller as
+    /// the given uid and gid, or, with [`PresentedIdentity::Own`], as the ids
+    /// the host knows the caller by. It runs as that identity from its first
+    /// instruction, without an identity switch: `id` reports it, files the
+    /// caller owns read as its own, and it holds no capability across its
+    /// `execve` beyond those a keep set carries. Nothing maps uid 0, so it
+    /// cannot become root inside. The sandbox is still built as root inside;
+    /// only the nested user namespace the command runs in changes its map.
+    ///
+    /// It is a presentation, not a boundary. On the host the command is still
+    /// the caller, so it owns every file the caller owns, a rootfs the caller
+    /// provisioned among them. A command that must not write the rootfs needs
+    /// it mounted read-only, or a range [`identity_map`](Self::identity_map)
+    /// and a [`run_as`](Self::run_as) identity, which is a second id.
+    ///
+    /// A presented identity sets no-new-privileges, as a run-as identity does.
+    /// A run-as identity may name the presented identity, which the command
+    /// already holds, and no other. A range map refuses a presented identity
+    /// at build time, and so does a uid or gid of `u32::MAX`, which no
+    /// identity map can carry.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use ferroday_cage::{Cage, PresentedIdentity};
+    ///
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// let cage = Cage::builder()
+    ///     .rootfs("/srv/rootfs")
+    ///     .command("/usr/bin/id")
+    ///     .present_as(PresentedIdentity::Own)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn present_as(mut self, identity: PresentedIdentity) -> Self {
+        self.present_as = Some(identity);
         self
     }
 
@@ -2084,6 +2138,12 @@ impl CageBuilder {
         self.run_as.as_ref()
     }
 
+    /// The identity the single-identity map presents the caller to the
+    /// command as, when one is set.
+    pub fn get_present_as(&self) -> Option<PresentedIdentity> {
+        self.present_as
+    }
+
     /// The configured resource limits, ordered by resource.
     pub fn get_rlimits(&self) -> impl Iterator<Item = (Resource, Limit, Limit)> {
         self.rlimits
@@ -2275,6 +2335,15 @@ impl CageBuilder {
             lowering.push_resolv_conf()?;
         }
 
+        // The presented identity: the single-identity map's one id as the
+        // command will see it. A range map refuses one before its delegate is
+        // consulted, since a range map has ids of its own to run as.
+        let present_as = match (self.present_as, &self.identity_map) {
+            (None, _) => None,
+            (Some(presented), IdentityMap::Single) => Some(validate_present_as(presented)?),
+            (Some(_), _) => return Err(ConfigError::PresentAsWithRangeMap.into()),
+        };
+
         // The identity plan: validate the requested map, resolve a range
         // request through the delegate seam, and validate the run-as
         // identity against the ranges that result — so an identity the map
@@ -2292,7 +2361,7 @@ impl CageBuilder {
         let run_as = self
             .run_as
             .as_ref()
-            .map(|identity_request| validate_run_as(identity_request, &identity))
+            .map(|identity_request| validate_run_as(identity_request, &identity, present_as))
             .transpose()?;
 
         // The nested user namespace the command enters before it hardens, which
@@ -2300,19 +2369,26 @@ impl CageBuilder {
         // map reflects the one resolved above, and the procfs it is written
         // through is the profile's, so both are settled here and the command
         // stage replays frozen bytes.
-        let nested = build_nested_plan(&identity, &lowering.ops, self.pid_namespace)?;
+        let nested = build_nested_plan(&identity, present_as, &lowering.ops, self.pid_namespace)?;
 
         // The hardening request, compiled and validated here so the command
         // stage only replays frozen data.
         #[cfg(feature = "hardening")]
         let hardening = {
             let mut hardening = self.hardening.lower()?;
+            // Whether the command switches from root inside to a non-root id.
+            // A presented identity is never root inside, and a run-as identity
+            // under one is the identity the command already holds, so there is
+            // no switch for the securebits to carry capabilities across and no
+            // mapped uid 0 for a kept set-id capability to return to.
+            let switches_from_root =
+                present_as.is_none() && matches!(&self.run_as, Some(identity) if identity.uid != 0);
             // A kept set-id capability would let a non-root command return
             // to the mapped uid 0 under the securebits below; refuse the
             // combination rather than ship an identity that is not a
             // boundary.
-            if let (Some(run_as_request), Some(keep)) = (&self.run_as, hardening.keep_caps)
-                && run_as_request.uid != 0
+            if let Some(keep) = hardening.keep_caps
+                && switches_from_root
             {
                 use rustix::thread::CapabilitySet;
                 for (capability, name) in [
@@ -2331,8 +2407,7 @@ impl CageBuilder {
             // identity switch. An explicitly empty keep set needs them too:
             // its bounding-set narrowing runs after the switch, which would
             // otherwise have cleared the CAP_SETPCAP it requires.
-            hardening.set_securebits = matches!(&self.run_as, Some(identity) if identity.uid != 0)
-                && hardening.keep_caps.is_some();
+            hardening.set_securebits = switches_from_root && hardening.keep_caps.is_some();
             // Where no namespace of the sandbox stands behind a reach (the host
             // network under host networking, the host's processes without a
             // PID namespace), a Landlock request is that reach's only boundary.
@@ -2386,6 +2461,7 @@ impl CageBuilder {
                 identity,
                 nested: Some(nested),
                 run_as,
+                present_as,
                 program: command.program,
                 program_search,
                 args,
@@ -2596,6 +2672,10 @@ impl CageBuilder {
             path_lookup: _,
             identity_map: _,
             run_as: _,
+            // Changes only which id the command sees the caller as. It maps no
+            // host id the single-identity map did not already, and the command
+            // it presents is less privileged inside, not more.
+            present_as: _,
             // A limit reaches nothing: it is set on the command process, and an
             // unprivileged `setrlimit` can only lower a hard limit or move a
             // soft one within the hard limit the caller already had. The worst
@@ -2653,26 +2733,59 @@ impl CageBuilder {
     }
 }
 
+/// Resolves a presented identity and checks that a map can carry it.
+///
+/// The ids become the inside ids of the command's nested map, and the kernel
+/// refuses the id `(u32)-1` in any map, so it is refused here, as the
+/// identity-map error it would otherwise surface as at launch.
+fn validate_present_as(presented: PresentedIdentity) -> Result<PresentPlan, Error> {
+    let (uid, gid) = presented.resolve();
+    for (id, space) in [(uid, "uid"), (gid, "gid")] {
+        if id == u32::MAX {
+            return Err(ConfigError::IdentityMapInvalid {
+                reason: format!("the presented {space} {id} is one no identity map can carry"),
+            }
+            .into());
+        }
+    }
+    Ok(PresentPlan { uid, gid })
+}
+
 /// Validates a run-as identity against the identity plan and freezes it.
 ///
-/// Every id must be contained in the map that will exist at launch, and
-/// supplementary groups require a gid map wider than the caller's own gid. The
+/// Every id must be contained in the map the command will see. Under the
+/// single-identity map that is one id, the caller, as uid and gid 0 or as the
+/// presented identity, so a run-as identity there names the identity the
+/// command already holds. Supplementary groups require a gid map wider than the
+/// caller's own gid. The
 /// single-identity map's gid map is that gid alone, and is established by
 /// denying `setgroups`, so no group list can ever be set inside it. A range
 /// map whose gid list is that one extent is held to the same rule, since the
 /// shadow helpers deny `setgroups` when they write it; see
 /// [`idmap::is_own_gid_alone`]. Under either, the plan carries no group list,
 /// and the command keeps the one it inherited.
-fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan, Error> {
+fn validate_run_as(
+    identity: &Identity,
+    plan: &IdentityPlan,
+    present_as: Option<PresentPlan>,
+) -> Result<RunAsPlan, Error> {
     let unmapped =
         |id: u32, space: &'static str| Error::from(ConfigError::RunAsUnmapped { id, space });
     let settable = match plan {
         IdentityPlan::Single => {
-            if identity.uid != 0 {
-                return Err(unmapped(identity.uid, "uid"));
+            let (uid, gid) = present_as.map_or((0, 0), |presented| (presented.uid, presented.gid));
+            let outside = |id: u32, space: &'static str, presented: u32| {
+                Error::from(ConfigError::RunAsOutsideSingleMap {
+                    id,
+                    space,
+                    presented,
+                })
+            };
+            if identity.uid != uid {
+                return Err(outside(identity.uid, "uid", uid));
             }
-            if identity.gid != 0 {
-                return Err(unmapped(identity.gid, "gid"));
+            if identity.gid != gid {
+                return Err(outside(identity.gid, "gid", gid));
             }
             false
         }
@@ -2716,7 +2829,9 @@ fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan
 /// The map is the identity reflection of the sandbox's own, so the command sees
 /// the same ids one namespace deeper; the tier follows the sandbox's, because
 /// the kernel's one-id exception is what lets a process write its own map and
-/// nothing richer.
+/// nothing richer. A presented identity is the one departure: the single
+/// tier's one extent then gives the sandbox's root the presented ids inside,
+/// which the same exception admits, since it constrains only the outside id.
 ///
 /// A procfs is required exactly where the chosen route reaches for one, and a
 /// profile that mounts none is then refused here rather than at launch, where
@@ -2728,6 +2843,7 @@ fn validate_run_as(identity: &Identity, plan: &IdentityPlan) -> Result<RunAsPlan
 /// the host's own `/proc`, and needs nothing of the profile.
 fn build_nested_plan(
     identity: &IdentityPlan,
+    present_as: Option<PresentPlan>,
     ops: &[MountOp],
     pid_namespace: bool,
 ) -> Result<NestedPlan, Error> {
@@ -2750,19 +2866,24 @@ fn build_nested_plan(
                 path.extend_from_slice(leaf.as_bytes());
                 CString::new(path).map_err(|err| embedded_nul(err.into_vec()))
             };
-            let root = [idmap::IdRange {
-                inside: 0,
-                outside: 0,
-                count: 1,
-            }];
+            // The one extent names the sandbox's root, the writer's own id,
+            // as the command is to see it: 0, or the presented identity.
+            let (uid, gid) = present_as.map_or((0, 0), |presented| (presented.uid, presented.gid));
+            let root = |inside| {
+                vec![idmap::IdRange {
+                    inside,
+                    outside: 0,
+                    count: 1,
+                }]
+            };
             (
                 NestedMap::SelfWritten {
                     setgroups_path: under_procfs("self/setgroups")?,
                     gid_map_path: under_procfs("self/gid_map")?,
                     uid_map_path: under_procfs("self/uid_map")?,
                 },
-                root.to_vec(),
-                root.to_vec(),
+                root(uid),
+                root(gid),
             )
         }
         IdentityPlan::Ranged { map, .. } => {
@@ -5733,15 +5854,183 @@ mod tests {
     }
 
     #[test]
-    fn run_as_nonroot_under_the_single_map_is_unmapped() {
+    fn run_as_nonroot_under_the_single_map_is_outside_it() {
         let err = sh_in("/tmp")
             .run_as(Identity::new(250, 250).groups([250]))
             .build()
             .unwrap_err();
         assert!(matches!(
             err,
-            Error::Config(ConfigError::RunAsUnmapped { id: 250, .. })
+            Error::Config(ConfigError::RunAsOutsideSingleMap {
+                id: 250,
+                space: "uid",
+                presented: 0,
+            })
         ));
+        // The message names the remedy, since the map has no other id to
+        // switch to.
+        let Error::Config(config) = &err else {
+            unreachable!("matched above")
+        };
+        assert!(
+            config.to_string().contains("present the caller as uid 250"),
+            "{config}"
+        );
+    }
+
+    /// The single-identity map's nested map gives the sandbox's root the
+    /// inside id the command sees: 0 by default.
+    #[test]
+    fn the_single_maps_nested_map_presents_root_by_default() {
+        let cage = sh_in("/tmp").build().unwrap();
+        let nested = cage.plan.nested.as_ref().unwrap();
+        assert_eq!(nested.uid_lines, b"0 0 1\n");
+        assert_eq!(nested.gid_lines, b"0 0 1\n");
+        assert!(cage.plan.present_as.is_none());
+    }
+
+    #[test]
+    fn a_presented_identity_is_the_nested_maps_inside_id() {
+        let cage = sh_in("/tmp")
+            .present_as(PresentedIdentity::Ids {
+                uid: 1000,
+                gid: 100,
+            })
+            .build()
+            .unwrap();
+        let nested = cage.plan.nested.as_ref().unwrap();
+        assert!(matches!(nested.map, NestedMap::SelfWritten { .. }));
+        assert_eq!(nested.uid_lines, b"1000 0 1\n");
+        assert_eq!(nested.gid_lines, b"100 0 1\n");
+        // The sandbox's own map is untouched: it is still built as root.
+        assert!(matches!(cage.plan.identity, IdentityPlan::Single));
+        assert!(cage.plan.run_as.is_none());
+        let presented = cage.plan.present_as.unwrap();
+        assert_eq!((presented.uid, presented.gid), (1000, 100));
+    }
+
+    #[test]
+    fn own_presents_the_callers_effective_ids() {
+        let cage = sh_in("/tmp")
+            .present_as(PresentedIdentity::Own)
+            .build()
+            .unwrap();
+        let presented = cage.plan.present_as.unwrap();
+        assert_eq!(
+            (presented.uid, presented.gid),
+            (
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+            ),
+        );
+    }
+
+    /// Under a presented identity the map's one id is that identity, so a
+    /// run-as identity may name it, which switches nothing, and nothing else.
+    #[test]
+    fn run_as_under_a_presented_identity_names_that_identity_or_nothing() {
+        let presented = || {
+            sh_in("/tmp").present_as(PresentedIdentity::Ids {
+                uid: 1000,
+                gid: 1000,
+            })
+        };
+        let same = presented()
+            .run_as(Identity::new(1000, 1000))
+            .build()
+            .unwrap();
+        assert_eq!(same.plan.run_as.as_ref().unwrap().uid.as_raw(), 1000);
+
+        let err = presented().run_as(Identity::new(0, 0)).build().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::RunAsOutsideSingleMap {
+                id: 0,
+                space: "uid",
+                presented: 1000,
+            })
+        ));
+        let err = presented()
+            .run_as(Identity::new(1000, 0))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::RunAsOutsideSingleMap {
+                id: 0,
+                space: "gid",
+                presented: 1000,
+            })
+        ));
+        let err = presented()
+            .run_as(Identity::new(1000, 1000).groups([1000]))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::RunAsGroupsWithSingleMap)
+        ));
+    }
+
+    /// A range map has ids of its own to run as, and refuses a presented
+    /// identity before its delegate is consulted.
+    #[test]
+    fn a_range_map_refuses_a_presented_identity() {
+        let err = subordinate_cage()
+            .present_as(PresentedIdentity::Own)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::PresentAsWithRangeMap)
+        ));
+    }
+
+    /// The kernel refuses the id `(u32)-1` in any map, so a presented identity
+    /// naming it is a configuration error rather than a launch failure.
+    #[test]
+    fn a_presented_identity_of_the_sentinel_id_is_refused() {
+        for (uid, gid) in [(u32::MAX, 1000), (1000, u32::MAX)] {
+            let err = sh_in("/tmp")
+                .present_as(PresentedIdentity::Ids { uid, gid })
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::IdentityMapInvalid { .. })),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_presented_identity_parses_and_renders_its_two_forms() {
+        for (text, presented) in [
+            ("own", PresentedIdentity::Own),
+            (
+                "1000:100",
+                PresentedIdentity::Ids {
+                    uid: 1000,
+                    gid: 100,
+                },
+            ),
+            ("0:0", PresentedIdentity::Ids { uid: 0, gid: 0 }),
+        ] {
+            assert_eq!(text.parse::<PresentedIdentity>(), Ok(presented));
+            assert_eq!(presented.to_string(), text);
+        }
+        for text in [
+            "",
+            "OWN",
+            "1000",
+            "1000:",
+            ":1000",
+            "1000:100:10",
+            "-1:0",
+            "a:b",
+        ] {
+            let err = text.parse::<PresentedIdentity>().unwrap_err();
+            assert_eq!(err.text(), text);
+        }
     }
 
     #[test]
@@ -5812,6 +6101,30 @@ mod tests {
             .build()
             .unwrap();
         assert!(!cage.plan.hardening.set_securebits);
+    }
+
+    /// A presented identity is never root inside, so there is no switch for the
+    /// securebits to carry capabilities across, and no mapped uid 0 for a kept
+    /// set-id capability to return to. A run-as identity naming it switches
+    /// nothing either.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_presented_identity_keeps_capabilities_without_a_switch() {
+        use crate::hardening::Capability;
+        for run_as in [None, Some(Identity::new(1000, 1000))] {
+            let builder = sh_in("/tmp")
+                .present_as(PresentedIdentity::Ids {
+                    uid: 1000,
+                    gid: 1000,
+                })
+                .keep_capabilities([Capability::NetBindService, Capability::Setuid]);
+            let builder = match run_as {
+                Some(identity) => builder.run_as(identity),
+                None => builder,
+            };
+            let cage = builder.build().unwrap();
+            assert!(!cage.plan.hardening.set_securebits);
+        }
     }
 
     /// Whether the plan holds the managed `resolv.conf` bind.
@@ -6559,6 +6872,7 @@ resolv-conf = false
 base-env = false
 stop-with-caller = true
 path-lookup = true
+present-as = "1000:1000"
 run-as = { uid = 1000, gid = 1000, groups = [10, 20] }
 
 [identity-map.ranges]
@@ -6672,7 +6986,7 @@ value = 268435456
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 89] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 90] = [
         "args",
         "base-env",
         "command",
@@ -6738,6 +7052,7 @@ value = 268435456
         "overlay.work",
         "path-lookup",
         "pid-namespace",
+        "present-as",
         "resolv-conf",
         "rlimit",
         "rlimit.address-space",
@@ -7802,6 +8117,36 @@ groups = [250, 100]
         let profile = "rootfs = \"/r\"\ncommand = \"/c\"\nidentity-map = \"everything\"\n";
         let err = toml::from_str::<CageBuilder>(profile).unwrap_err();
         assert!(err.to_string().contains("everything"), "{err}");
+    }
+
+    /// A profile spells a presented identity as `own` or `UID:GID`, the form
+    /// the type renders and parses, and reads back what it wrote.
+    #[test]
+    fn a_presented_identity_round_trips_through_a_profile() {
+        for (value, presented) in [
+            ("own", PresentedIdentity::Own),
+            (
+                "1000:100",
+                PresentedIdentity::Ids {
+                    uid: 1000,
+                    gid: 100,
+                },
+            ),
+        ] {
+            let profile = format!("rootfs = \"/r\"\ncommand = \"/c\"\npresent-as = \"{value}\"\n");
+            let builder: CageBuilder = toml::from_str(&profile).expect("the profile parses");
+            assert_eq!(builder.get_present_as(), Some(presented));
+            let rendered = toml::to_string(&builder).expect("the builder serializes");
+            assert!(
+                rendered.contains(&format!("present-as = \"{value}\"\n")),
+                "{rendered}"
+            );
+        }
+        let err = toml::from_str::<CageBuilder>(
+            "rootfs = \"/r\"\ncommand = \"/c\"\npresent-as = \"root\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UID:GID"), "{err}");
     }
 
     #[test]

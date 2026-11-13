@@ -1,9 +1,11 @@
-//! Integration tests for identity maps and the run-as identity.
+//! Integration tests for identity maps, the run-as identity, and the presented
+//! identity.
 //!
 //! The tests assert the observable consequence rather than the mechanism:
 //! under a range map, `chown` to a non-root id succeeds where the
-//! single-identity map answers `EINVAL`, and a run-as identity is what
-//! `id` reports from inside. Range-map tests skip explicitly on hosts where
+//! single-identity map answers `EINVAL`, a run-as identity is what `id`
+//! reports from inside, and a presented identity is what the command sees of
+//! itself while the host still sees the caller. Range-map tests skip explicitly on hosts where
 //! no delegate is available, as the network-stack tests do for
 //! `/dev/net/tun`; the nested direct-tier test additionally needs a host
 //! `unshare` that can establish a subordinate-backed namespace to nest in.
@@ -20,11 +22,11 @@ mod common;
 
 use std::path::Path;
 
-use ferroday_cage::{Cage, Output};
+use ferroday_cage::{Cage, Identity, Output, PresentedIdentity};
 // Identity maps and the run-as identity are exercised only by the range-map
 // tests, all of which are gated on the `subid` delegate.
 #[cfg(feature = "subid")]
-use ferroday_cage::{IdRange, Identity, IdentityMap};
+use ferroday_cage::{IdRange, IdentityMap};
 
 /// The fixture rootfs, or `None` when the sandbox tests should skip.
 fn rootfs() -> Option<&'static Path> {
@@ -74,6 +76,178 @@ fn run_script(cage: &Cage) -> Output {
 
 fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The whitespace-separated fields after `prefix`, on the first line of
+/// `stdout` that starts with it. `/proc/self/status` lines and the
+/// `label value...` lines a test script echoes both read this way.
+fn fields<'a>(stdout: &'a str, prefix: &str) -> Vec<&'a str> {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .map(|rest| rest.split_whitespace().collect())
+        .unwrap_or_default()
+}
+
+/// A presented identity, in the ids the tests below expect to read back. The
+/// uid and gid differ, so a swap between them shows.
+const PRESENTED: PresentedIdentity = PresentedIdentity::ids(1000, 100);
+
+/// A presented identity is what the command observes of itself, and the one
+/// extent its namespace maps is the caller as that identity. Nothing maps 0.
+#[test]
+fn a_presented_identity_is_what_the_command_observes() {
+    let Some(rootfs) = rootfs() else { return };
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "grep -E '^(Uid|Gid):' /proc/self/status; \
+             echo uid_map $(cat /proc/self/uid_map); \
+             echo gid_map $(cat /proc/self/gid_map)",
+        ])
+        .present_as(PRESENTED)
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(fields(&stdout, "Uid:"), ["1000"; 4], "{stdout}");
+    assert_eq!(fields(&stdout, "Gid:"), ["100"; 4], "{stdout}");
+    assert_eq!(fields(&stdout, "uid_map"), ["1000", "0", "1"], "{stdout}");
+    assert_eq!(fields(&stdout, "gid_map"), ["100", "0", "1"], "{stdout}");
+}
+
+/// The command holds no capability across its `execve`, with no-new-privileges
+/// set, though nothing but the presented identity was asked for.
+#[test]
+fn a_presented_identity_holds_no_capability() {
+    let Some(rootfs) = rootfs() else { return };
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "grep -E '^(CapEff|CapPrm|CapAmb|NoNewPrivs):' /proc/self/status",
+        ])
+        .present_as(PRESENTED)
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    for prefix in ["CapEff:", "CapPrm:", "CapAmb:"] {
+        let value = fields(&stdout, prefix).first().copied().unwrap_or("");
+        assert_eq!(
+            u64::from_str_radix(value, 16).unwrap_or(u64::MAX),
+            0,
+            "{prefix} should be empty: {stdout}"
+        );
+    }
+    assert_eq!(fields(&stdout, "NoNewPrivs:"), ["1"], "{stdout}");
+}
+
+/// The presentation changes the command's view, not who it is: a directory the
+/// caller owns reads as the presented identity's, and what the command writes
+/// there is the caller's on the host.
+#[test]
+fn a_presented_identity_owns_and_writes_as_the_caller() {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(rootfs) = rootfs() else { return };
+    let out = common::scratch_dir("identity-presented-out");
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .bind(&out, "/out")
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "echo owner $(stat -c '%u %g' /out); touch /out/written",
+        ])
+        .present_as(PRESENTED)
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(fields(&stdout, "owner"), ["1000", "100"], "{stdout}");
+    let written = std::fs::metadata(out.join("written")).expect("the command wrote the file");
+    assert_eq!(written.uid(), rustix::process::geteuid().as_raw());
+    assert_eq!(written.gid(), rustix::process::getegid().as_raw());
+}
+
+/// `own` presents the caller as the ids the host knows it by.
+#[test]
+fn own_presents_the_callers_host_ids() {
+    let Some(rootfs) = rootfs() else { return };
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "grep -E '^(Uid|Gid):' /proc/self/status"])
+        .present_as(PresentedIdentity::Own)
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    let uid = rustix::process::geteuid().as_raw().to_string();
+    let gid = rustix::process::getegid().as_raw().to_string();
+    assert_eq!(fields(&stdout, "Uid:"), [uid.as_str(); 4], "{stdout}");
+    assert_eq!(fields(&stdout, "Gid:"), [gid.as_str(); 4], "{stdout}");
+}
+
+/// A run-as identity naming the presented identity launches, and switches
+/// nothing: the command is that identity either way.
+#[test]
+fn run_as_the_presented_identity_launches() {
+    let Some(rootfs) = rootfs() else { return };
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "grep -E '^(Uid|Gid):' /proc/self/status"])
+        .present_as(PRESENTED)
+        .run_as(Identity::new(1000, 100))
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(fields(&stdout, "Uid:"), ["1000"; 4], "{stdout}");
+    assert_eq!(fields(&stdout, "Gid:"), ["100"; 4], "{stdout}");
+}
+
+/// A keep set carries its capabilities across the `execve` of a presented
+/// identity, which runs non-root with no switch for the securebits to span:
+/// the kept set is raised into the ambient set, which is what an exec of a
+/// non-root command keeps.
+#[cfg(feature = "hardening")]
+#[test]
+fn a_kept_capability_survives_a_presented_identitys_exec() {
+    use ferroday_cage::Capability;
+
+    let Some(rootfs) = rootfs() else { return };
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", "grep -E '^(Uid|CapEff|CapAmb):' /proc/self/status"])
+        .present_as(PRESENTED)
+        .keep_capabilities([Capability::NetRaw])
+        .build()
+        .expect("the sandbox should build");
+    let output = run_script(&cage);
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(fields(&stdout, "Uid:"), ["1000"; 4], "{stdout}");
+    // CAP_NET_RAW is capability 13.
+    for prefix in ["CapEff:", "CapAmb:"] {
+        let value = fields(&stdout, prefix).first().copied().unwrap_or("");
+        assert_eq!(
+            u64::from_str_radix(value, 16).unwrap_or(u64::MAX),
+            1 << 13,
+            "{prefix} should hold exactly CAP_NET_RAW: {stdout}"
+        );
+    }
 }
 
 /// The boundary the range map removes, asserted first: under the
@@ -496,12 +670,7 @@ fn run_as_alone_sets_no_new_privileges() {
     let output = run_script(&cage);
     let stdout = stdout_of(&output);
     assert!(output.status.success(), "{stdout}");
-    let flag = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
-        .map(str::trim)
-        .unwrap_or_default();
-    assert_eq!(flag, "1", "{stdout}");
+    assert_eq!(fields(&stdout, "NoNewPrivs:"), ["1"], "{stdout}");
 }
 
 /// Without a run-as identity the flag stays clear, so the assertion above is
@@ -518,12 +687,7 @@ fn a_launch_without_a_run_as_identity_leaves_no_new_privileges_clear() {
     let output = run_script(&cage);
     let stdout = stdout_of(&output);
     assert!(output.status.success(), "{stdout}");
-    let flag = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
-        .map(str::trim)
-        .unwrap_or_default();
-    assert_eq!(flag, "0", "{stdout}");
+    assert_eq!(fields(&stdout, "NoNewPrivs:"), ["0"], "{stdout}");
 }
 
 /// The securebits path, asserted through the command's own view: a kept
@@ -558,12 +722,10 @@ fn a_kept_capability_survives_the_identity_switch() {
     assert!(stdout.contains("uid=250"), "{stdout}");
     // CAP_NET_RAW is capability 13.
     let expected = 1u64 << 13;
-    for prefix in ["CapEff", "CapAmb"] {
-        let line = stdout
-            .lines()
-            .find(|line| line.starts_with(prefix))
+    for prefix in ["CapEff:", "CapAmb:"] {
+        let value = *fields(&stdout, prefix)
+            .first()
             .unwrap_or_else(|| panic!("missing {prefix}: {stdout}"));
-        let value = line.split_whitespace().nth(1).expect("a mask value");
         assert_eq!(
             u64::from_str_radix(value, 16).expect("a hex mask"),
             expected,

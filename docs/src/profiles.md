@@ -143,7 +143,9 @@ ranges are spelled as an `[identity-map.ranges]` table, shown in that
 chapter. Every identity form loads in every build, and `build` refuses one no
 delegate can establish: `subordinate` on a build without the `subid` feature
 needs a configured delegate that reports an allocation. The identity-map
-delegate itself is code, not configuration, and has no profile key.
+delegate itself is code, not configuration, and has no profile key. Under the
+single-identity map, `present-as` shows the caller to the command as another
+identity, `own` or `UID:GID`, as that chapter describes.
 
 ## Inspecting a loaded profile
 

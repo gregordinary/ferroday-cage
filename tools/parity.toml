@@ -158,6 +158,10 @@ name = "run_as"
 flags = ["--run-as"]
 
 [[builder.setting]]
+name = "present_as"
+flags = ["--present-as"]
+
+[[builder.setting]]
 name = "rlimit"
 flags = ["--rlimit"]
 

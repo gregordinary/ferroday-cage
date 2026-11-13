@@ -530,11 +530,12 @@ rendered as text.
         /// `reason` collects a refusal from each of its delegates.
         source: Option<crate::IdMapError>,
     },
-    /// A run-as id is not contained in the identity map.
+    /// A run-as id is not contained in a range identity map.
     ///
     /// Every id the command runs as must be representable in the sandbox's
-    /// user namespace. Under the single-identity map the only id is 0; a
-    /// range map contains what its extents say.
+    /// user namespace, and a range map contains what its extents say. The
+    /// single-identity map's case is
+    /// [`RunAsOutsideSingleMap`](Self::RunAsOutsideSingleMap).
     #[non_exhaustive]
     RunAsUnmapped {
         /// The unmapped id.
@@ -542,6 +543,28 @@ rendered as text.
         /// Which id it is: `"uid"`, `"gid"`, or `"supplementary group"`.
         space: &'static str,
     },
+    /// A run-as id is not the single-identity map's one id.
+    ///
+    /// That map holds one id, the caller, which the command sees as uid and
+    /// gid 0, or as the identity [`present_as`](crate::CageBuilder::present_as)
+    /// names. There is no other id to switch to. Presenting the caller as an
+    /// id is how the command runs as it under this map.
+    #[non_exhaustive]
+    RunAsOutsideSingleMap {
+        /// The run-as id.
+        id: u32,
+        /// Which id it is: `"uid"` or `"gid"`.
+        space: &'static str,
+        /// The id the command sees the caller as, in the same space.
+        presented: u32,
+    },
+    /// A presented identity is configured with a range identity map.
+    ///
+    /// [`present_as`](crate::CageBuilder::present_as) changes which id the
+    /// single-identity map's one id, the caller, appears as. A range map has
+    /// ids of its own, and [`run_as`](crate::CageBuilder::run_as) switches the
+    /// command to one of them.
+    PresentAsWithRangeMap,
     /// A run-as identity names supplementary groups under the
     /// single-identity map's gid map: the caller's own gid alone.
     ///
@@ -884,6 +907,20 @@ impl fmt::Display for ConfigError {
                     "the run-as {space} {id} is not contained in the identity map"
                 )
             }
+            ConfigError::RunAsOutsideSingleMap {
+                id,
+                space,
+                presented,
+            } => write!(
+                f,
+                "the single-identity map holds one id, the caller, which the command sees as \
+                 {space} {presented}, so the command cannot run as {space} {id}; present the \
+                 caller as {space} {id} instead",
+            ),
+            ConfigError::PresentAsWithRangeMap => f.write_str(
+                "a presented identity applies only to the single-identity map; under a range \
+                 map, run the command as one of the map's own ids instead",
+            ),
             ConfigError::RunAsGroupsWithSingleMap => f.write_str(
                 "run-as supplementary groups require a gid map wider than the caller's own gid; \
                  a gid map of that gid alone, the single-identity map's, denies setgroups",

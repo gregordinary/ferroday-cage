@@ -95,10 +95,11 @@ pub struct ResolvedInputs {
     /// the map in [`identity`](Self::identity) and does not change: every id
     /// is a sandbox-inside one, as that map holds it.
     ///
-    /// `None` runs the command as uid 0 of the sandbox's user namespace, or,
-    /// for a restriction, as the calling user. Whether a build sees uid 0 or
-    /// another id changes what it produces: a Debian build's
-    /// `Rules-Requires-Root` handling turns on exactly this.
+    /// `None` runs the command as uid 0 of the sandbox's user namespace, or as
+    /// the identity in [`present_as`](Self::present_as), or, for a
+    /// restriction, as the calling user. Whether a build sees uid 0 or another
+    /// id changes what it produces: a Debian build's `Rules-Requires-Root`
+    /// handling turns on exactly this.
     ///
     /// A switch to a non-root id clears the command's capabilities, unless a
     /// keep set carries some across it, which [`hardening`](Self::hardening)
@@ -109,11 +110,25 @@ pub struct ResolvedInputs {
     /// inherited, every entry of which the map does not hold presenting as the
     /// overflow gid.
     pub run_as: Option<Identity>,
+    /// The identity the single-identity map presents the caller to the
+    /// command as, when one is configured with
+    /// [`present_as`](crate::CageBuilder::present_as).
+    ///
+    /// [`PresentedIdentity::Own`](crate::PresentedIdentity::Own) is reported
+    /// as the ids it resolved to when the sandbox was built. It carries no
+    /// supplementary groups, and is never set alongside a range map. The
+    /// command runs as this identity without a switch, and holds no capability
+    /// across its `execve` beyond those [`hardening`](Self::hardening) records
+    /// a keep set carrying. It also sets
+    /// [`no_new_privileges`](Self::no_new_privileges). On the host the command
+    /// is still the caller.
+    pub present_as: Option<Identity>,
     /// Whether the command runs with the no-new-privileges flag set, so that a
     /// set-user-ID binary or a file capability grants nothing across
     /// `execve`.
     ///
-    /// A run-as identity sets it, and so does any hardening control. A build
+    /// A run-as identity sets it, so does a presented identity, and so does
+    /// any hardening control. A build
     /// whose packages reach for `sudo` or a capability-bearing helper behaves
     /// differently under it.
     pub no_new_privileges: bool,
@@ -239,6 +254,9 @@ pub enum ResolvedIdentity {
     Caller,
     /// The single-identity map: the calling user is root inside the sandbox
     /// and no other id is mapped.
+    ///
+    /// The command sees that one id as root too, unless
+    /// [`ResolvedInputs::present_as`] names the identity it is presented as.
     Single,
     /// A range map, written from outside the namespace by a delegate.
     #[non_exhaustive]
@@ -566,6 +584,9 @@ impl ResolvedInputs {
                 Identity::new(run_as.uid.as_raw(), run_as.gid.as_raw())
                     .groups(run_as.groups.iter().flatten().map(|gid| gid.as_raw()))
             }),
+            present_as: plan
+                .present_as
+                .map(|presented| Identity::new(presented.uid, presented.gid)),
             no_new_privileges: no_new_privileges(plan),
             network: plan.network,
             pid_namespace: plan.pid_namespace,
@@ -646,15 +667,15 @@ fn project_identity(plan: &LaunchPlan) -> ResolvedIdentity {
 /// Whether the launch sets the no-new-privileges flag on the command.
 ///
 /// The two places the launch sets it decide this: the identity switch sets it
-/// whenever a run-as identity is configured, and the hardening layer whenever
-/// its plan holds any control. A restriction's plan always does, since it drops
-/// every capability.
+/// whenever a run-as or a presented identity is configured, and the hardening
+/// layer whenever its plan holds any control. A restriction's plan always does,
+/// since it drops every capability.
 fn no_new_privileges(plan: &LaunchPlan) -> bool {
     #[cfg(feature = "hardening")]
     let hardened = !plan.hardening.is_empty();
     #[cfg(not(feature = "hardening"))]
     let hardened = false;
-    plan.run_as.is_some() || hardened
+    plan.run_as.is_some() || plan.present_as.is_some() || hardened
 }
 
 /// Projects one frozen resource limit.
@@ -888,7 +909,7 @@ mod serde_tests {
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 55] = [
+    const EXPECTED_RECORD_KEYS: [&str; 58] = [
         "env",
         "env.SOURCE_DATE_EPOCH",
         "hardening",
@@ -926,6 +947,9 @@ mod serde_tests {
         "network",
         "no-new-privileges",
         "pid-namespace",
+        "present-as",
+        "present-as.gid",
+        "present-as.uid",
         "rlimits",
         "rlimits[].hard",
         "rlimits[].resource",
@@ -1008,6 +1032,7 @@ mod serde_tests {
                 gid: vec![extent],
             },
             run_as: Some(Identity::new(1000, 1000).groups([1000, 27])),
+            present_as: None,
             no_new_privileges: true,
             network: Network::Host,
             pid_namespace: true,
@@ -1040,6 +1065,8 @@ mod serde_tests {
                 work: PathBuf::from("/srv/.upper.work"),
             },
             identity: ResolvedIdentity::Single,
+            run_as: None,
+            present_as: Some(Identity::new(1000, 1000)),
             hardening: ResolvedHardening::Unavailable,
             ..everything.clone()
         };
@@ -1395,6 +1422,46 @@ mod serde_tests {
         );
         assert!(
             rendered.contains("[run-as]\nuid = 1000\ngid = 1000\ngroups = [1000, 27]\n"),
+            "{rendered}"
+        );
+    }
+
+    /// A presented identity reaches the record as the ids the command sees, the
+    /// caller's own resolved for `own`, and sets no-new-privileges. The map
+    /// itself is still the single-identity one.
+    #[test]
+    fn a_presented_identity_reaches_the_record_with_its_no_new_privileges() {
+        let record = |presented: crate::PresentedIdentity| {
+            Cage::builder()
+                .rootfs("/tmp")
+                .command("/bin/sh")
+                .present_as(presented)
+                .build()
+                .expect("a valid sandbox configuration")
+                .resolved_inputs()
+        };
+
+        let ids = record(crate::PresentedIdentity::Ids {
+            uid: 1000,
+            gid: 100,
+        });
+        assert_eq!(ids.identity, ResolvedIdentity::Single);
+        assert_eq!(ids.present_as, Some(Identity::new(1000, 100)));
+        assert_eq!(ids.run_as, None);
+        assert!(ids.no_new_privileges);
+
+        let own = record(crate::PresentedIdentity::Own);
+        assert_eq!(
+            own.present_as,
+            Some(Identity::new(
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+            )),
+        );
+
+        let rendered = toml::to_string(&ids).expect("the record serializes");
+        assert!(
+            rendered.contains("[present-as]\nuid = 1000\ngid = 100\n"),
             "{rendered}"
         );
     }

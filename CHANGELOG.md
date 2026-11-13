@@ -40,9 +40,26 @@ consumer upgrading can skip it.
   launch at the new `SetupStep::InstallNetworkFilter`. `Network::Host` is
   unchanged.
 
+### Added
+
+- `CageBuilder::present_as` presents the caller to the command as another
+  identity under the single-identity map. The command sees the caller as the
+  given uid and gid rather than as root, or, with `PresentedIdentity::Own`, as
+  the ids the host knows the caller by. Only the nested user namespace's map
+  changes, so the command runs as that identity without a switch, holds no
+  capability across its `execve` beyond a kept set, and has no-new-privileges
+  set. It is a presentation, not a boundary: on the host the command is still
+  the caller. `fcage --present-as UID:GID|own` and the profile key `present-as`
+  reach it, and `ResolvedInputs::present_as` reports it. A range map refuses it.
+
 ### Changed
 
 - `host::seccomp_available` is available without the `hardening` feature.
+- A run-as identity naming another id than the single-identity map's one is
+  refused with the new `ConfigError::RunAsOutsideSingleMap`, which names
+  presenting the caller as that id as the remedy, rather than with
+  `ConfigError::RunAsUnmapped`. A run-as identity naming a presented identity
+  is accepted, and switches nothing.
 
 ### Internal
 

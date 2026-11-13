@@ -417,6 +417,21 @@ pub(crate) struct RunAsPlan {
     pub(crate) groups: Option<Vec<rustix::thread::Gid>>,
 }
 
+/// The identity the single-identity map presents the caller to the command as,
+/// resolved at build time.
+///
+/// The presentation itself is the nested map's inside ids, which
+/// [`NestedPlan`] already carries as formatted lines. This is what the rest of
+/// the launch asks about it: whether to set no-new-privileges, and what a
+/// resolved-inputs record reports.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PresentPlan {
+    /// The uid the command sees the caller as.
+    pub(crate) uid: u32,
+    /// The gid the command sees the caller as.
+    pub(crate) gid: u32,
+}
+
 /// The mount targets a launch has to create as empty files in the root, and the
 /// writable layer they are created in.
 ///
@@ -490,8 +505,13 @@ pub(crate) struct LaunchPlan {
     /// `None` in a restriction, which creates no namespace to nest inside.
     pub(crate) nested: Option<NestedPlan>,
     /// The identity the command switches to before `execve`; `None` leaves
-    /// it running as root inside. Always `None` in a restriction.
+    /// it running as root inside, or as its presented identity. Always `None`
+    /// in a restriction.
     pub(crate) run_as: Option<RunAsPlan>,
+    /// The identity the single-identity map presents the caller to the
+    /// command as, when one is configured. Always `None` under a range map and
+    /// in a restriction.
+    pub(crate) present_as: Option<PresentPlan>,
     /// The command path, executed after the root swap in a container and
     /// against the host filesystem in a restriction. When
     /// [`program_search`](Self::program_search) is non-empty this is the bare

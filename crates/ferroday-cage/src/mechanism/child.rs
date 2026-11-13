@@ -909,11 +909,19 @@ fn wire_stdio(context: &Context<'_>, terminal: Option<BorrowedFd<'_>>) -> Result
 /// and the seccomp install, which both require it; setting it twice is
 /// idempotent, and doing it here is what covers a build without that feature
 /// and a launch that asks for a non-root identity and nothing else.
+///
+/// A presented identity sets it too, and has no switch to make: the nested map
+/// already gave the command that identity. There is no uid 0 inside for it to
+/// return to, and the flag keeps a file capability from granting it anything
+/// across `execve` either.
 fn switch_identity(context: &Context<'_>) -> Result<(), (SetupStep, Errno)> {
+    if context.plan.run_as.is_none() && context.plan.present_as.is_none() {
+        return Ok(());
+    }
+    rustix::thread::set_no_new_privs(true).map_err(|errno| (SetupStep::SetNoNewPrivs, errno))?;
     let Some(run_as) = &context.plan.run_as else {
         return Ok(());
     };
-    rustix::thread::set_no_new_privs(true).map_err(|errno| (SetupStep::SetNoNewPrivs, errno))?;
     if let Some(groups) = &run_as.groups {
         rustix::thread::set_thread_groups(groups).map_err(|errno| (SetupStep::SetGroups, errno))?;
     }
