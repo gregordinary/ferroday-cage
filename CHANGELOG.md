@@ -747,6 +747,7 @@ consumer upgrading can skip it.
   `common::grant_system_trees`.
 - The network stack builds a flow's guest-facing TCP socket in one
   `tcp::guest_facing_socket`, which an outbound flow and a published one share.
+- Every TCP flow of the network stack starts through one `TcpFlow::new`.
 
 ## [0.5.2] - 2026-11-10
 

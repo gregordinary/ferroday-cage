@@ -31,7 +31,7 @@ without a bound rather than a panic."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/netstack/tcp.rs"
-count = 4
+count = 3
 why = """\
 A TCP flow's own deadlines: `ESTABLISH_DEADLINE` (30 seconds) and \
 `DRAIN_DEADLINE` (the stack's idle timeout, minutes) added to a reading of \

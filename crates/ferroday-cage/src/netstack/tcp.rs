@@ -245,29 +245,19 @@ impl TcpFlow {
             SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
             None,
         )?;
-        tune_keep_alive(&host);
         let connected = match rustix::net::connect(&host, &target) {
             Ok(()) => true,
             Err(Errno::INPROGRESS) => false,
             Err(errno) => return Err(errno),
         };
-        Ok(TcpFlow {
+        Ok(TcpFlow::new(
             handle,
-            guest,
-            destination,
-            host: Some(host),
+            (guest, destination),
+            host,
             connected,
-            events: PollFlags::empty(),
-            host_eof: false,
-            host_hangup: false,
-            host_shutdown: false,
-            guest_closed: false,
-            deadline: now + ESTABLISH_DEADLINE,
-            stalled_since: None,
-            unacknowledged: 0,
-            dead: false,
-            published: false,
-        })
+            false,
+            now,
+        ))
     }
 
     /// Starts a flow for a connection accepted on a published port: the host
@@ -284,13 +274,28 @@ impl TcpFlow {
         host: OwnedFd,
         now: Instant,
     ) -> TcpFlow {
+        TcpFlow::new(handle, (guest, local), host, true, true, now)
+    }
+
+    /// A flow at its start, either kind: the guest endpoint and the stack's
+    /// end of the guest connection, a host side whose keep-alive this tunes,
+    /// whether that side is connected yet, and whether the flow arrived
+    /// through a published port.
+    fn new(
+        handle: SocketHandle,
+        (guest, destination): (IpEndpoint, IpEndpoint),
+        host: OwnedFd,
+        connected: bool,
+        published: bool,
+        now: Instant,
+    ) -> TcpFlow {
         tune_keep_alive(&host);
         TcpFlow {
             handle,
             guest,
-            destination: local,
+            destination,
             host: Some(host),
-            connected: true,
+            connected,
             events: PollFlags::empty(),
             host_eof: false,
             host_hangup: false,
@@ -300,7 +305,7 @@ impl TcpFlow {
             stalled_since: None,
             unacknowledged: 0,
             dead: false,
-            published: true,
+            published,
         }
     }
 
@@ -768,26 +773,15 @@ mod tests {
         )
         .expect("a socket pair stands in for the host side");
         let endpoint = |port| IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), port);
-        (
-            TcpFlow {
-                handle,
-                guest: endpoint(40_000),
-                destination: endpoint(80),
-                host: Some(host),
-                connected: true,
-                events: PollFlags::empty(),
-                host_eof: false,
-                host_hangup: false,
-                host_shutdown: false,
-                guest_closed: false,
-                deadline: Instant::now() + ESTABLISH_DEADLINE,
-                stalled_since: None,
-                unacknowledged: 0,
-                dead: false,
-                published: false,
-            },
-            peer,
-        )
+        let flow = TcpFlow::new(
+            handle,
+            (endpoint(40_000), endpoint(80)),
+            host,
+            true,
+            false,
+            Instant::now(),
+        );
+        (flow, peer)
     }
 
     /// A socket set whose socket is listening, the state a flow's guest side
