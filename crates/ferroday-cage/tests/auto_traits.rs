@@ -312,6 +312,10 @@ const _: () = assert_send_sync::<ferroday_cage::RestrictedProfile>();
 //   that it renders any error at all, a caller's own included. It lives for the
 //   one `format!` that prints it.
 //
+// - `provision::Interrupt` holds `SIGINT` blocked on the thread that took it,
+//   and a signal mask is that thread's own: only the thread that blocked it can
+//   put it back, so the hold cannot move or be shared.
+//
 // The rule the crate follows is that a seam it *stores* carries thread bounds
 // and a seam it merely *borrows* for one call does not. `Fetch` and `IdMapper`
 // are stored, and are bounded; `Observer` and the progress sink are borrowed,

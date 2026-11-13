@@ -118,6 +118,8 @@ pub use layer::BuildLayer;
 #[cfg(feature = "tarball")]
 pub use tarball::Tarball;
 
+pub use crate::relay::signals::Interrupt;
+
 #[cfg(feature = "alpine")]
 pub mod alpine;
 #[cfg(feature = "debian")]

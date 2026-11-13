@@ -264,6 +264,34 @@ pub(crate) fn set_disposition(signal: Signal, disposition: Disposition) -> Resul
     .map_err(errno)
 }
 
+/// Whether the process ignores `signal`: whether its disposition is `SIG_IGN`.
+///
+/// A blocked signal is queued whatever its disposition, since the disposition
+/// may change before it is unblocked, so a caller reading a signal it blocked
+/// asks this first to tell one the process would have ignored.
+pub(crate) fn is_ignored(signal: Signal) -> Result<bool, Errno> {
+    let mut action = KernelSigaction {
+        handler: 0,
+        flags: 0,
+        #[cfg(not(target_arch = "riscv64"))]
+        restorer: 0,
+        mask: SigSet::empty(),
+    };
+    // SAFETY: no action is installed, the old one is written to a live local of
+    // the layout the kernel writes, and the size is that of the kernel's mask.
+    unsafe {
+        syscalls::syscall!(
+            Sysno::rt_sigaction,
+            signal.as_raw(),
+            0usize,
+            std::ptr::from_mut(&mut action),
+            size_of::<SigSet>()
+        )
+    }
+    .map_err(errno)?;
+    Ok(action.handler == Disposition::Ignore.handler())
+}
+
 /// The number of `unsigned long` words in the kernel's signal set: 64 signals
 /// on every architecture the build admits.
 const SIGSET_WORDS: usize = 64 / c_ulong::BITS as usize;
@@ -517,6 +545,17 @@ pub(crate) fn errno(err: syscalls::Errno) -> Errno {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ignored_signal_reads_as_ignored() {
+        // SIGURG, which nothing in a test binary handles, and whose default
+        // action is to do nothing, so a process-wide change to it is inert.
+        assert_eq!(is_ignored(Signal::URG), Ok(false));
+        set_disposition(Signal::URG, Disposition::Ignore).expect("SIGURG can be ignored");
+        assert_eq!(is_ignored(Signal::URG), Ok(true));
+        set_disposition(Signal::URG, Disposition::Default).expect("and put back");
+        assert_eq!(is_ignored(Signal::URG), Ok(false));
+    }
 
     #[test]
     fn a_signal_occupies_the_bit_below_its_number() {

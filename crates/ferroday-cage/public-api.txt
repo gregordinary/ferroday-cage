@@ -1380,6 +1380,19 @@ impl core::marker::Unpin for ferroday_cage::provision::HttpFetch
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::HttpFetch
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::HttpFetch
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::HttpFetch
+pub struct ferroday_cage::provision::Interrupt
+impl ferroday_cage::provision::Interrupt
+pub fn ferroday_cage::provision::Interrupt::hold() -> core::io::error::Result<ferroday_cage::provision::Interrupt>
+pub fn ferroday_cage::provision::Interrupt::requested(&self) -> bool
+impl core::ops::drop::Drop for ferroday_cage::provision::Interrupt
+pub fn ferroday_cage::provision::Interrupt::drop(&mut self)
+impl core::marker::Freeze for ferroday_cage::provision::Interrupt
+impl !core::marker::Send for ferroday_cage::provision::Interrupt
+impl !core::marker::Sync for ferroday_cage::provision::Interrupt
+impl core::marker::Unpin for ferroday_cage::provision::Interrupt
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::Interrupt
+impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Interrupt
+impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Interrupt
 pub struct ferroday_cage::provision::Provision<'obs>
 impl<'obs> ferroday_cage::provision::Provision<'obs>
 pub fn ferroday_cage::provision::Provision<'obs>::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Provision<'obs>

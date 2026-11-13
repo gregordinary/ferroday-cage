@@ -336,7 +336,8 @@ therefore replaces the crate page with that line's metadata.
 - **`unsafe` is confined** to three modules of shipped code, all in the
   library. They are the launch mechanism, the network stack's tap layer, and
   the terminal relay's signals. The relay's signals block the relayed set and
-  open the descriptor those signals arrive on. `fcage` has none. The only other
+  open the descriptor those signals arrive on, and a provisioning run's
+  `Interrupt` blocks `SIGINT` there the same way. `fcage` has none. The only other
   `unsafe` is in test code that drives the kernel directly: `tests/keyring.rs`,
   `tests/relay.rs`, `tests/network_filter.rs`, `tests/process.rs`, and the
   testkit's pseudoterminal harness and its closing of a probe's standard
@@ -526,6 +527,7 @@ report name a package and its version bare.
 | Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork and the launch stage joins through `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |
 | Would a launch beneath this parent be refused its cgroup, and why? | `host::cgroup_blocker`, which carries out `cgroup::Cgroup::create` and a join through `mechanism::probe_cgroup_join`, with every errno read by `cgroup::refusal` as the launch's own are |
 | Which cgroup does this process run in? | `host::own_cgroup`, over `host::MountEntry::parse` |
+| Stop a provisioning run on `SIGINT`, removing what it staged | `provision::Interrupt`, which an observer answers `ProvisionObserver::cancelled` from |
 | Which cgroup limit does `NAME=VALUE` spell? | `CgroupLimit`'s `FromStr`, whose names are the keys of a profile's `[cgroup]` table |
 | Read this process's mount table | `host::MountEntry::parse`, one line of the kernel's `mountinfo` at a time |
 | Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |

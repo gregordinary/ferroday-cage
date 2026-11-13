@@ -1,4 +1,5 @@
-//! The relay's signals: blocked process-wide, and read back as data.
+//! Signals blocked and read back as data: the relay's, blocked process-wide,
+//! and the `SIGINT` a provisioning run's [`Interrupt`] holds while it works.
 //!
 //! # `unsafe`
 //!
@@ -11,8 +12,13 @@
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::fd::OwnedFd;
+use std::marker::PhantomData;
+use std::os::fd::{AsFd as _, OwnedFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
+use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::io::Errno;
 use rustix::process::Signal;
 
@@ -65,8 +71,10 @@ pub(super) const RELAYED: [Signal; 8] = [
 /// blocking first is what keeps a process-directed `SIGINT` from being delivered
 /// to some other thread and killing the process behind the relay's back.
 ///
-/// The library starts threads in two places, and both inherit the mask of the
-/// thread that calls into it. `NetStack::attach`, with the `netstack` feature,
+/// The library starts threads in three places, and each inherits the mask of the
+/// thread that calls into it. A held [`Interrupt`] watches for `SIGINT` from a
+/// thread of its own until it drops, which a program holds before it installs
+/// this or after its relay is done. `NetStack::attach`, with the `netstack` feature,
 /// starts the native network stack's pump, which runs for as long as the stack
 /// is attached; a program composing a relay with a stack installs this before
 /// it attaches one. `HttpFetch::fetch_all`, which a provisioner's downloads
@@ -219,6 +227,223 @@ impl Signals {
             }
         }
     }
+}
+
+/// `SIGINT`, held back from ending the process while a provisioning run works,
+/// and read as a request to stop the run.
+///
+/// [`ProvisionObserver::cancelled`] is how a run is stopped, and a program that
+/// stops one on `^C` has to learn of the `SIGINT` without a handler of its own.
+/// While this is held, the thread that holds it blocks `SIGINT`, and a thread
+/// of the hold's own reads it from a descriptor instead of the kernel ending
+/// the process. [`requested`](Self::requested) then answers `true`, an
+/// observer answers `cancelled` from it, and the run stops at its next clean
+/// point, removing what it staged.
+///
+/// The first `SIGINT` is all the hold takes. The next one acts as `SIGINT` does,
+/// ending the process unless it has a handler of its own, so a second `^C` ends
+/// a run that a stalled download keeps from its next clean point. Dropping the
+/// hold puts the holding thread's mask back, and a `SIGINT` that arrived after
+/// the hold's thread last looked is then delivered as it would have been
+/// without the hold.
+///
+/// Where the process ignores `SIGINT`, as a shell leaves it for a command it
+/// runs in the background, nothing is held and `requested` answers `false`
+/// throughout: an ignored signal stops nothing.
+///
+/// # Hold it first
+///
+/// A signal mask is a thread's own, and the kernel delivers a `SIGINT` sent to
+/// the process to any thread that does not block it. Hold this on the thread
+/// that runs the provisioner, before the program creates any other thread. A
+/// thread created while it is held, as a batch of downloads creates its
+/// workers, inherits the block; one created before would take the signal and
+/// end the process. A thread that already blocks `SIGINT`, as one with
+/// [`Signals`] installed does, keeps it blocked when the hold ends, and the two
+/// descriptors then race for each `SIGINT`: hold one or the other.
+///
+/// Neither `Send` nor `Sync`, since the block is the holding thread's own.
+///
+/// ```no_run
+/// use ferroday_cage::provision::{Interrupt, Provision, ProvisionObserver};
+///
+/// struct StopOnInterrupt(Interrupt);
+///
+/// impl ProvisionObserver for StopOnInterrupt {
+///     fn cancelled(&mut self) -> bool {
+///         self.0.requested()
+///     }
+/// }
+///
+/// # #[cfg(feature = "tarball")]
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # use ferroday_cage::provision::Tarball;
+/// // Before the program starts any thread of its own.
+/// let mut observer = StopOnInterrupt(Interrupt::hold()?);
+/// Provision::new("/var/cache/myapp/alpine-rootfs")
+///     .observe(&mut observer)
+///     .run(&mut Tarball::new("alpine-minirootfs-3.24.1-x86_64.tar.gz"))?;
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "tarball"))]
+/// # fn main() {}
+/// ```
+///
+/// [`ProvisionObserver::cancelled`]: crate::provision::ProvisionObserver::cancelled
+#[derive(Debug)]
+pub struct Interrupt {
+    /// The hold, or `None` where the process ignores `SIGINT`.
+    held: Option<Held>,
+}
+
+/// A hold on `SIGINT`: the holding thread's block, and the thread that reads
+/// what the block queues.
+#[derive(Debug)]
+struct Held {
+    /// Whether a `SIGINT` has arrived, which the watching thread sets.
+    requested: Arc<AtomicBool>,
+    /// The eventfd that stops the watching thread when written.
+    stop: OwnedFd,
+    /// The watching thread, joined when the hold ends.
+    watcher: Option<JoinHandle<()>>,
+    /// Whether the holding thread blocked `SIGINT` before the hold, in which
+    /// case ending the hold leaves it blocked.
+    was_blocked: bool,
+    /// Neither `Send` nor `Sync`: the block is the holding thread's, and only
+    /// that thread can end it.
+    _thread: PhantomData<*const ()>,
+}
+
+impl Interrupt {
+    /// Holds `SIGINT` on the calling thread until this drops, or does nothing
+    /// where the process ignores it.
+    ///
+    /// # Errors
+    ///
+    /// The OS error where the disposition cannot be read, the mask cannot be
+    /// set, or the descriptor, the eventfd, or the watching thread cannot be
+    /// made: descriptor exhaustion, or a seccomp policy that refuses one of the
+    /// calls. A failed call leaves the thread's mask as it found it, and
+    /// `SIGINT` then acts as it did before.
+    pub fn hold() -> io::Result<Interrupt> {
+        if sys::is_ignored(Signal::INT)? {
+            return Ok(Interrupt { held: None });
+        }
+        let interrupt = SigSet::of(&[Signal::INT]);
+        // SAFETY: `interrupt` is a live local of exactly the type the call
+        // takes, and blocking a signal runs nothing.
+        let previous = unsafe { sys::sigprocmask(How::Block, Some(&interrupt)) }?;
+        let was_blocked = previous.without(&[Signal::INT]) != previous;
+        match Interrupt::watch(&interrupt, was_blocked) {
+            Ok(held) => Ok(Interrupt { held: Some(held) }),
+            Err(error) => {
+                if !was_blocked {
+                    unblock_interrupt();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether a `SIGINT` has arrived since the hold began.
+    pub fn requested(&self) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(|held| held.requested.load(Ordering::Acquire))
+    }
+
+    /// Opens the descriptor `interrupt` arrives on, and starts the thread that
+    /// reads it.
+    fn watch(interrupt: &SigSet, was_blocked: bool) -> io::Result<Held> {
+        let signals = sys::signalfd(interrupt)?;
+        let stop = rustix::event::eventfd(0, EventfdFlags::CLOEXEC)?;
+        let stopped = stop.try_clone()?;
+        let requested = Arc::new(AtomicBool::new(false));
+        let watcher = std::thread::Builder::new()
+            .name("interrupt".to_string())
+            .spawn({
+                let requested = Arc::clone(&requested);
+                move || watch_for_interrupt(&signals, &stopped, &requested, was_blocked)
+            })?;
+        Ok(Held {
+            requested,
+            stop,
+            watcher: Some(watcher),
+            was_blocked,
+            _thread: PhantomData,
+        })
+    }
+}
+
+impl Drop for Interrupt {
+    fn drop(&mut self) {
+        let Some(held) = &mut self.held else {
+            return;
+        };
+        // An eventfd write fails only on an overflow a single write cannot
+        // reach.
+        let _ = rustix::io::write(&held.stop, &1u64.to_ne_bytes());
+        if let Some(watcher) = held.watcher.take() {
+            let _ = watcher.join();
+        }
+        if !held.was_blocked {
+            unblock_interrupt();
+        }
+    }
+}
+
+/// The watching thread's body: waits for the first `SIGINT` on `signals`, or
+/// for `stop`, records the first in `requested`, and from then on leaves
+/// `SIGINT` unblocked on this thread so the next acts as `SIGINT` does.
+///
+/// Where the holding thread blocked `SIGINT` before the hold, this thread
+/// leaves it blocked as well: the block is the caller's own, and taking it
+/// away from the process would undo it.
+fn watch_for_interrupt(signals: &OwnedFd, stop: &OwnedFd, requested: &AtomicBool, keep: bool) {
+    loop {
+        let watching = !requested.load(Ordering::Relaxed);
+        let mut fds = [
+            PollFd::new(stop, PollFlags::IN),
+            PollFd::new(signals, PollFlags::IN),
+        ];
+        let polled = if watching {
+            &mut fds[..]
+        } else {
+            &mut fds[..1]
+        };
+        match rustix::event::poll(polled, None) {
+            Ok(_) | Err(Errno::INTR) => {}
+            Err(_) => return,
+        }
+        if !fds[0].revents().is_empty() {
+            return;
+        }
+        if watching && !fds[1].revents().is_empty() && read_one(signals) {
+            requested.store(true, Ordering::Release);
+            if !keep {
+                unblock_interrupt();
+            }
+        }
+    }
+}
+
+/// Reads one record from a signal descriptor, answering whether there was one.
+fn read_one(signals: &OwnedFd) -> bool {
+    let mut record = [0u8; sys::SIGINFO_LEN];
+    matches!(rustix::io::read(signals.as_fd(), &mut record), Ok(read) if read > 0)
+}
+
+/// Unblocks `SIGINT` on the calling thread, and nothing else.
+fn unblock_interrupt() {
+    // SAFETY: `None` asks only for the current mask, and nothing is set.
+    let Ok(current) = (unsafe { sys::sigprocmask(How::Block, None) }) else {
+        return;
+    };
+    // SAFETY: the set is a live local of exactly the type the call takes. Only
+    // `SIGINT` is unblocked, on a thread that blocked it for a hold alone, so
+    // it then does what the process's disposition for it says, as it would
+    // have without the hold.
+    let _ = unsafe { sys::sigprocmask(How::SetMask, Some(&current.without(&[Signal::INT]))) };
 }
 
 #[cfg(test)]

@@ -156,7 +156,7 @@
 
 mod escalation;
 mod raw;
-mod signals;
+pub(crate) mod signals;
 
 use std::io;
 use std::os::fd::BorrowedFd;

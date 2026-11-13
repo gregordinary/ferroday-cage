@@ -107,8 +107,37 @@ The check is consulted where stopping is clean, meaning an archive entry
 boundary or a package boundary. A run stopped there fails with
 `ProvisionError::Cancelled`. `ensure` then removes the staging tree exactly as
 it does for any other failure, so the destination is left absent rather than
-half-built. Setting the flag from a signal handler or a watchdog thread is the
-usual way to drive it. `Arc<AtomicBool>` is the shape that fits both.
+half-built. Setting the flag from a watchdog thread is one way to drive it, and
+`Arc<AtomicBool>` is the shape that fits.
+
+`Interrupt` is the way for `^C`. Held for the run, it blocks `SIGINT` on the
+thread that holds it, reads the signal from a thread of its own, and answers
+whether one arrived, so a program stops a run on `^C` without a signal handler.
+The first `SIGINT` asks the run to stop, the next acts as `SIGINT` does, and
+nothing is held where the process ignores `SIGINT`. Hold it before the program
+starts a thread of its own, since a thread started earlier would take the
+signal and end the process:
+
+```rust,no_run
+use ferroday_cage::provision::{Interrupt, Provision, ProvisionObserver, Tarball};
+
+struct StopOnInterrupt(Interrupt);
+
+impl ProvisionObserver for StopOnInterrupt {
+    fn cancelled(&mut self) -> bool {
+        self.0.requested()
+    }
+}
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut observer = StopOnInterrupt(Interrupt::hold()?);
+let outcome = Provision::new("/var/cache/myapp/trixie")
+    .observe(&mut observer)
+    .run(&mut Tarball::new("rootfs.tar.zst"));
+# let _ = outcome;
+# Ok(())
+# }
+```
 
 Every provisioner reports through this one channel, so a consumer wiring
 provisioning into a logging system writes one adapter. The `Tarball` provisioner

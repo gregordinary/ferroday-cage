@@ -349,6 +349,11 @@ consumer upgrading can skip it.
   stanzas it left out as ones the layer cannot act on, which it left out
   without a word before. `fcage` prints both, as it prints a Gentoo binhost
   index's (`ferroday-cage-cli`).
+- `provision::Interrupt` holds `SIGINT` back from ending the process while a
+  provisioning run works, and reads it as a request to stop the run, which an
+  observer answers `ProvisionObserver::cancelled` from. The first `SIGINT` is
+  all it takes, and the next acts as `SIGINT` does. Nothing is held where the
+  process ignores `SIGINT`.
 - `CgroupLimit` implements `FromStr`, reading `NAME=VALUE` with a limit named
   as a profile's `[cgroup]` table names it, and refusing other text with
   `ParseCgroupLimitError`. `fcage --cgroup` reads its value through it.
