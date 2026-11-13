@@ -12,10 +12,13 @@ containerd takes, since both keep their rules in one `syscalls` list.
 
 An addition the profile names in a rule of another action and no conditions,
 such as an explicit refusal, is taken out of that rule, since a profile naming
-one syscall under two unconditional actions is one a runtime will not load. A
-rule that grants an addition only to a container holding a capability is left as
-it is. Everything else the profile says is unchanged, so the result refuses
-whatever the runtime's default refuses, except these.
+one syscall under two unconditional actions is one a runtime will not load. That
+holds whatever the profile's default action: a profile that allows what it does
+not name can still refuse an addition by name, and once the refusal is gone the
+default allows it, so no rule is added. A rule that grants an addition only to a
+container holding a capability is left as it is. Everything else the profile
+says is unchanged, so the result refuses whatever the runtime's default refuses,
+except these.
 
 Usage:
 
@@ -50,10 +53,14 @@ def unconditional(rule: dict) -> bool:
 
 
 def extend(profile: dict, names: list[str]) -> dict:
-    """The profile, with `names` allowed outright."""
-    if profile.get("defaultAction") == ALLOW:
-        # A profile that allows what it does not name refuses none of them.
-        return profile
+    """The profile, with `names` allowed outright.
+
+    Each of `names` is taken out of every unconditional rule of another action.
+    Where the default action refuses, one rule more allows those no
+    unconditional rule already allows. Where it allows, they are allowed once
+    nothing names them otherwise, and no rule is added.
+    """
+    allowed_by_default = profile.get("defaultAction") == ALLOW
     rules = []
     allowed = set()
     for rule in profile.get("syscalls", []):
@@ -68,7 +75,7 @@ def extend(profile: dict, names: list[str]) -> dict:
                 rule = {**rule, "names": rule_names}
         rules.append(rule)
     missing = [name for name in names if name not in allowed]
-    if missing:
+    if missing and not allowed_by_default:
         rules.append(
             {
                 "names": missing,
