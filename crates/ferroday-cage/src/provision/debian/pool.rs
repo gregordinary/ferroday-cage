@@ -882,20 +882,17 @@ fn checked_name(name: &str) -> Result<(), String> {
 /// one component. The version is never a segment of its own, so the `.` and `..`
 /// cases the name has do not arise here.
 ///
-/// The grammar around the alphabet — where an epoch's colon and a revision's
-/// hyphen may fall — is dpkg's to enforce at install time and is not repeated.
+/// The alphabet is the one the index reader holds a stanza's version to,
+/// [`version::is_version`](super::version::is_version), so the pool publishes
+/// no version its own consumers would not read back.
 fn checked_version(version: &str) -> Result<(), String> {
-    if version.is_empty()
-        || !version
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | ':' | '~'))
-    {
-        return Err(format!(
-            "its version {version:?} is not one Debian policy permits: alphanumerics and `.`, \
-             `+`, `-`, `:`, `~`",
-        ));
+    if super::version::is_version(version) {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "its version {version:?} is not one Debian policy permits: alphanumerics and `.`, \
+         `+`, `-`, `:`, `~`",
+    ))
 }
 
 /// Stages one `.deb` for the pool and builds its `Packages` stanza.

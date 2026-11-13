@@ -1460,16 +1460,17 @@ mod tests {
         .into_refusal();
         crate::failure::hostile::assert_escaped(&refusal.to_string());
 
-        // A version is held to no alphabet either, and the evidence a refusal
-        // carries names the versions the archive offers.
+        // A version is held to policy's alphabet as the index is read, so a
+        // stanza stating one outside it offers nothing, and the evidence a
+        // refusal carries names no version of it.
         let text = format!(
             "{}\n{}",
             stanza("app", "lib (= 2)", ""),
             stanza_at("lib", hostile, "", ""),
         );
         let refusal = resolve(&index(&text), &[], &["app".into()], &[]).into_refusal();
-        assert!(refusal.reason().contains("available"), "{refusal}");
-        crate::failure::hostile::assert_escaped(&refusal.to_string());
+        assert!(!refusal.reason().contains("available"), "{refusal}");
+        assert!(!refusal.to_string().contains('\u{1b}'), "{refusal}");
     }
 
     #[test]

@@ -400,11 +400,11 @@ format's root boots differently. `systemd` generates a machine id from an empty
 file, while the D-Bus service that generates one on Alpine refuses an empty
 file. The Gentoo layer runs no package script, so it has nothing to clear.
 
-The sixth, what a package's name can contain, is split because each format's
-own rules define its names: Debian policy's, apk's, and the package manager
-specification's, which differ in case, in `_`, and in where a `.` may fall. None
-admits a control character, which is what lets an error or a progress report
-name a package bare.
+The sixth, what a package's name and version can contain, is split because each
+format's own rules define them: Debian policy's, apk's, and the package manager
+specification's, whose names differ in case, in `_`, and in where a `.` may fall.
+None admits a control character, which is what lets an error or a progress
+report name a package and its version bare.
 
 | The question | The answer |
 | --- | --- |
@@ -449,7 +449,7 @@ name a package bare.
 | Which id does a root's `/etc/passwd` or `/etc/group` give a name? | `provision::accounts::ids` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag`, `atom::use_flag` |
-| What can a package's name contain, as an index or a plan states it? | `provision::debian::index::is_package_name`, `alpine::index::is_package_name`, `gentoo::atom::is_package` |
+| What can a package's name and version contain, as an index or a plan states them? | `provision::debian::index::is_package_name` and `debian::version::is_version`, `alpine::index::is_package_name` and `alpine::version::parse`, `gentoo::atom::is_package` and `gentoo::version::parse` |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |

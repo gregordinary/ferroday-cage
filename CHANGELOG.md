@@ -140,6 +140,14 @@ consumer upgrading can skip it.
   bootstrap's is refused quoting what it states, with its control characters
   escaped. A plan document is a file the caller may have taken from elsewhere,
   and nothing holds its header to an alphabet.
+- The Debian layer holds the version of a package an index, a plan, or a base
+  layer's status database states to the alphabet Debian policy gives a version:
+  alphanumerics and `.`, `+`, `-`, `:`, `~`, which dpkg also holds a package to.
+  An index stanza stating one any other way is left out and counted in
+  `DebianEvent::Index`, a plan stating one is refused as one naming a package
+  outside policy's alphabet is, and a base's status entry stating one is read as
+  stating no version. A version reached a pin's refusals, and `fcage`'s report
+  of them, as written.
 
 ### Added
 

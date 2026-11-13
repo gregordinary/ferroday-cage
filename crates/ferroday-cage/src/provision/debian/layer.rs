@@ -46,10 +46,11 @@ pub(super) struct InstalledSet {
 
 impl InstalledSet {
     /// Records the real package `name` installed at `version`, which it also
-    /// supplies. A stanza with no `Version` is malformed rather than
-    /// versionless, and is recorded as a bare supply: it still satisfies
-    /// unversioned dependencies, no versioned one silently, and is no version
-    /// to upgrade from.
+    /// supplies. A stanza with no `Version`, or one outside the alphabet
+    /// [`version::is_version`](super::version::is_version) admits, is malformed
+    /// rather than versionless, and is recorded as a bare supply: it still
+    /// satisfies unversioned dependencies, no versioned one silently, and is no
+    /// version to upgrade from or to name in a refusal.
     pub(super) fn install(&mut self, name: &str, version: Option<&str>) {
         self.supply(name, version);
         if let Some(version) = version {
@@ -142,7 +143,15 @@ pub(super) fn read_installed_set(base: &Path) -> Result<InstalledSet, DebianErro
         if !super::bootstrap::is_configured(&status) {
             continue;
         }
-        installed.install(&name, stanza.get("Version").as_deref());
+        // A version dpkg would not have written is read as none: the database
+        // is the base's own text, which its scripts could write too.
+        let version = stanza.get("Version");
+        installed.install(
+            &name,
+            version
+                .as_deref()
+                .filter(|version| super::version::is_version(version)),
+        );
         // A package's provided virtuals satisfy dependencies named against them,
         // so folding them into the same map lets one lookup in the resolver
         // cover a base that satisfies a group either by real name or by virtual.
@@ -200,6 +209,20 @@ mod tests {
             !set.contains("half"),
             "a package not `install ok installed` is not assumed",
         );
+    }
+
+    #[test]
+    fn a_version_dpkg_would_not_have_written_is_read_as_none() {
+        // The database is the base's own text, which its scripts can write.
+        let dir = Scratch::for_test("layer", "unwritable-version");
+        let hostile = crate::failure::hostile::TEXT;
+        base_with_status(
+            &dir,
+            &format!("Package: libfoo1\nStatus: install ok installed\nVersion: {hostile}\n"),
+        );
+        let set = read_installed_set(&dir).expect("the status database reads");
+        assert_eq!(set.supplied("libfoo1").unwrap(), &[None]);
+        assert_eq!(set.installed("libfoo1"), None);
     }
 
     #[test]

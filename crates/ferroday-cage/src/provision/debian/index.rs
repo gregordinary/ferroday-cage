@@ -27,6 +27,7 @@ use crate::roster::roster_enum;
 pub(crate) struct Package {
     /// The package's name, one [`is_package_name`] admits.
     pub name: String,
+    /// The package's version, one [`version::is_version`] admits.
     pub version: String,
     pub architecture: String,
     /// The pool path (`Filename:`), relative to the mirror root.
@@ -198,7 +199,7 @@ impl std::error::Error for ParsePriorityError {}
 impl Package {
     /// Builds a package from a `Packages` stanza, or `None` when a required
     /// field is missing or malformed: among them a name [`is_package_name`]
-    /// does not admit.
+    /// does not admit, and a version [`version::is_version`] does not.
     fn from_stanza(stanza: &Stanza<'_>) -> Option<Package> {
         let [
             name,
@@ -234,6 +235,9 @@ impl Package {
             return None;
         }
         let version = version?.into_owned();
+        if !version::is_version(&version) {
+            return None;
+        }
         let architecture = architecture?.into_owned();
         // The digest becomes a cache filename and the fetch verifier's expected
         // value, and the pool path becomes a fetch URL and (for a `file://`
@@ -300,9 +304,9 @@ impl Package {
 /// software of Debian and of Ubuntu refuses an upload outside it, so every name
 /// their archives publish is within it.
 ///
-/// A name is held to it wherever one arrives. A stanza naming a package outside
-/// it is malformed and dropped as the index is read, a plan naming one is
-/// refused
+/// A name is held to it wherever one arrives to be reported. A stanza naming a
+/// package outside it is malformed and dropped as the index is read, a plan
+/// naming one is refused
 /// ([`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable)),
 /// and the pool refuses a `.deb` whose control file names one
 /// ([`checked_name`](super::pool::checked_name)). An admitted name reaches
@@ -1174,6 +1178,27 @@ mod tests {
                 "{name:?} dropped its neighbour"
             );
             assert!(!index.into_available().contains(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_stanza_stating_a_version_outside_policy_is_dropped() {
+        // A version reaches a pin's refusals as written, so it is held to
+        // policy's alphabet as the index is read. dpkg refuses each of these.
+        let stanza = |version: &str| {
+            format!(
+                "Package: held\nVersion: {version}\nArchitecture: amd64\nFilename: pool/p.deb\n\
+                 SHA256: {}\n\n",
+                "a".repeat(64),
+            )
+        };
+        let hostile = crate::failure::hostile::TEXT;
+        for version in [hostile, "1.0_1", "1.0/1", "1 0"] {
+            let index = Index::parse(&format!("{}{}", stanza(version), stanza("1.0")), "amd64");
+            let kept = index.get("held").expect("the well-formed stanza is kept");
+            assert_eq!(kept.version, "1.0", "{version:?}");
+            assert_eq!(index.offers("held").len(), 1, "{version:?}");
+            assert_eq!(index.skipped(), 1, "{version:?}");
         }
     }
 

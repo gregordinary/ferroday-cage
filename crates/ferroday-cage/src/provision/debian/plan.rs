@@ -241,8 +241,9 @@ impl PlannedPackage {
     /// Why this entry cannot be addressed, or `None` where it can.
     ///
     /// [`name`](Self::name) is what a bootstrap reports the package by, in its
-    /// progress and its errors, so it is held to the alphabet Debian policy
-    /// gives a package name, which holds no control character.
+    /// progress and its errors, and [`version`](Self::version) is what a pin's
+    /// refusals name, so each is held to the alphabet Debian policy gives it,
+    /// neither of which holds a control character.
     /// [`filename`](Self::filename) is interpolated verbatim into the URL the
     /// `.deb` is fetched from and, for a `file://` mirror, into a local path, so
     /// one holding a `..`, a leading slash, or a byte a request line ends on
@@ -253,17 +254,22 @@ impl PlannedPackage {
     ///
     /// A package resolved from an index passed
     /// [`index::is_package_name`](super::index::is_package_name),
+    /// [`version::is_version`](super::version::is_version),
     /// [`index::is_safe_pool_path`](super::index::is_safe_pool_path) and
     /// [`Algorithm::is_hex`](crate::provision::digest::Algorithm::is_hex) on the
     /// way in, so this is the same gate for the way a plan arrives instead: a
     /// document a caller kept and may have edited, or a [`Plan`] taken from
     /// [`resolve`](super::Debian::resolve) and modified, neither of which has an
-    /// index behind it. The version is not held to a shape, because it reaches
-    /// no URL or path: the pool path names the file, and the cache entry is
-    /// named from the digest.
+    /// index behind it.
     pub(super) fn unaddressable(&self) -> Option<String> {
         if let Some(reason) = unpermitted_name(&self.name) {
             return Some(reason);
+        }
+        if !super::version::is_version(&self.version) {
+            return Some(format!(
+                "the plan states {} at {:?}, which is not a version Debian policy permits",
+                self.name, self.version,
+            ));
         }
         if !super::index::is_safe_pool_path(&self.filename) {
             return Some(format!(
@@ -970,6 +976,20 @@ Source: local-suite
                 }
                 other => panic!("expected a name refusal for {name:?}, got {other:?}"),
             }
+        }
+
+        // A version reaches a pin's refusals, so a plan's is held to policy's
+        // alphabet too.
+        let document = sample()
+            .to_document()
+            .unwrap()
+            .replace("Version: 13.6", &format!("Version: {hostile}"));
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("base-files at"), "{reason}");
+                crate::failure::hostile::assert_escaped(&reason);
+            }
+            other => panic!("expected a version refusal, got {other:?}"),
         }
 
         // A plan held in memory reaches a bootstrap without a document, and is

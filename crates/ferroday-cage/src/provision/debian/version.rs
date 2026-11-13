@@ -25,6 +25,12 @@
 //! it is not a version to be ordered low — it is a version the mirror should
 //! not have published, which is what their `None` says.
 //!
+//! What this layer admits is narrower than what it can order. [`is_version`]
+//! holds the version an index, a plan, or a base layer's status database
+//! states to the alphabet Debian policy gives one, before anything reports it.
+//! That is a question of what a version may be spelled with, which dpkg also
+//! asks, rather than of how two compare.
+//!
 //! [`alpine::version`]: crate::provision::alpine::version
 //! [`alpine::version::compare`]: crate::provision::alpine::version::compare
 //! [`gentoo::version::compare`]: crate::provision::gentoo::version::compare
@@ -163,6 +169,32 @@ fn order(c: u8) -> i32 {
     }
 }
 
+/// Whether `version` is spelled in the alphabet Debian policy gives a version.
+///
+/// Policy 5.6.12's alphabet is alphanumerics and `.`, `+`, `-`, `:`, `~`, and
+/// dpkg refuses to install a package whose version holds anything else. It
+/// holds no separator, whitespace, or control character, so a version is one
+/// file name segment where the pool interpolates it, and carries no escape
+/// sequence onto the terminal a refusal naming it is printed on.
+///
+/// A stanza stating a version outside it is malformed and dropped as the index
+/// is read, a plan stating one is refused
+/// ([`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable)),
+/// a base layer's status database stating one is read as stating none
+/// ([`read_installed_set`](super::layer::read_installed_set)), and the pool
+/// refuses a `.deb` whose control file states one
+/// ([`checked_version`](super::pool::checked_version)).
+///
+/// The grammar around the alphabet, where an epoch's colon and a revision's
+/// hyphen may fall and that the version begins with a digit, is dpkg's to
+/// enforce at install time and is not repeated.
+pub(super) fn is_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | ':' | '~'))
+}
+
 /// A version constraint on a dependency: `(>= 2.43)` and its siblings.
 ///
 /// The constraint is kept rather than dropped at parse time because the
@@ -291,6 +323,23 @@ impl Relation {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn policy_admits_every_shape_an_archive_version_takes() {
+        for version in [
+            "1.0",
+            "1:2.41-12+deb13u1",
+            "1.0~rc1-1",
+            "0.14.0-1ubuntu1",
+            "20240101.1+dfsg-2~bpo13+1",
+            "2.4-1",
+        ] {
+            assert!(super::is_version(version), "{version:?}");
+        }
+        for version in ["", "1.0_1", "1.0/1", "1 0", "1.0\u{1b}"] {
+            assert!(!super::is_version(version), "{version:?}");
+        }
+    }
 
     #[test]
     fn a_constraint_reads_every_relation_dpkg_defines() {
