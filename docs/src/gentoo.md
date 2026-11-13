@@ -85,9 +85,9 @@ architecture could not reach the `x32` entries at all.
 
 The match is exact rather than by prefix, because `amd64-openrc-splitusr` sits
 beside `amd64-openrc` in that same document. A variant the architecture does not
-publish is refused before anything is downloaded, and the refusal names what is
-on offer. That list is what Gentoo publishes now rather than one compiled into
-this crate.
+publish is refused once that document is read, before a tarball or its digests
+are fetched. The refusal names what is on offer: what Gentoo publishes now
+rather than a list compiled into this crate.
 
 Each entry keeps its own build id: a sub-architecture is built on its own
 cadence, so one document routinely points different variants at different builds.
@@ -112,7 +112,9 @@ let mut gentoo = Gentoo::builder("amd64")
 
 A pin skips the enumeration entirely. It is the caller saying which build they
 want, and asking the archive which is current would not change the answer. The
-digest document beside that build is what vouches for the tarball.
+digest document beside that build is what vouches for the tarball. The variant
+is not matched against anything, so one the build does not hold fails as a
+digest document no mirror serves.
 
 **A pin is not indefinite.** The autobuilds tree holds about five weeks of
 builds and Gentoo publishes no equivalent of `snapshot.debian.org`. A build id
@@ -145,6 +147,10 @@ provision::ensure("/var/lib/machines/gentoo-2", &mut again)?;
 # Ok(())
 # }
 ```
+
+The builder has to agree with the answer it carries. `build()` refuses a
+`Stage3` resolved for another architecture, and one whose variant or build id
+differs from the one the builder names.
 
 There is no plan document to write. A single tarball does not need a versioned
 serialization. One would name a build the archive deletes in about five weeks,

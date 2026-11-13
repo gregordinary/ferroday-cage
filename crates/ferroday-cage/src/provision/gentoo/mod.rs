@@ -654,6 +654,10 @@ pub struct CertificateHorizon {
 /// [`GentooBuilder::stage3`] carries the whole answer over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stage3 {
+    /// The architecture it was resolved for, whose tree [`path`](Self::path)
+    /// is under. Kept so a builder for another refuses the record rather than
+    /// fetching this one's tarball for it.
+    architecture: String,
     build_id: String,
     variant: String,
     path: String,
@@ -1248,6 +1252,7 @@ impl Gentoo {
         let digested = self.read_digests(&path, to)?;
         Ok(Resolution {
             stage3: Stage3 {
+                architecture: self.architecture.clone(),
                 build_id,
                 variant,
                 path,
@@ -2558,9 +2563,15 @@ impl GentooBuilder {
     /// The spelling is the whole compound the archive publishes, not a variant
     /// relative to the architecture: amd64's own document lists `amd64-openrc`
     /// and `x32-openrc` as siblings, so a name relative to `amd64` could not
-    /// reach the second at all. It is matched exactly against the signed
-    /// enumeration, so an unknown one is refused before anything is fetched,
-    /// naming what the architecture does offer. [`Gentoo::variants`] lists them.
+    /// reach the second at all.
+    ///
+    /// It is matched exactly against the signed enumeration once the pointer
+    /// document is read. An unknown one is refused there, before the digest
+    /// document or the tarball is fetched, naming what the architecture does
+    /// offer; [`Gentoo::variants`] lists them. Under a
+    /// [`build_id`](Self::build_id) pin nothing is enumerated: the variant
+    /// names the tarball inside the pinned build, and one the build does not
+    /// hold is a digest document no mirror serves.
     pub fn variant(mut self, variant: impl Into<String>) -> GentooBuilder {
         self.variant = Some(variant.into());
         self
@@ -2725,6 +2736,12 @@ impl GentooBuilder {
     /// A [`Stage3`] carries everything a provision needs, digest included, so a
     /// caller who has resolved once can provision several roots from that one
     /// answer without fetching the pointer again.
+    ///
+    /// It is the answer for one architecture, variant and build, and the
+    /// builder has to agree with it. [`build`](Self::build) refuses one
+    /// resolved for another architecture than the builder's, and one whose
+    /// variant or build id is not the one the builder names, where it names
+    /// one.
     pub fn stage3(mut self, stage3: Stage3) -> GentooBuilder {
         self.stage3 = Some(stage3);
         self
@@ -2819,10 +2836,11 @@ impl GentooBuilder {
     ///
     /// Returns [`GentooError::Config`] for an architecture, a binhost or a build
     /// id a request line or a path cannot carry, for an install list or a
-    /// preference that does not parse, and for a [`plan`](Self::plan) the
-    /// configuration contradicts: one given with an install list or a
-    /// preference, or one the [`plan`](Self::plan) documentation says cannot be
-    /// installed. Returns [`GentooError::Signature`] if the keyring the crate
+    /// preference that does not parse, and for a [`plan`](Self::plan) or a
+    /// [`stage3`](Self::stage3) the configuration contradicts: a plan given
+    /// with an install list or a preference, or one the
+    /// [`plan`](Self::plan) documentation says cannot be installed, and a
+    /// stage3 resolved for another architecture, variant or build. Returns [`GentooError::Signature`] if the keyring the crate
     /// vendors does not parse — which is a defect in this crate rather than
     /// anything a caller did.
     pub fn build(self) -> Result<Gentoo, GentooError> {
@@ -2914,6 +2932,39 @@ impl GentooBuilder {
                      the containers it resolved, so the two cannot differ",
                     plan.binhost, binhost,
                 )));
+            }
+        }
+        if let Some(stage3) = &self.stage3 {
+            // A stage3 is a resolution already made, and a provision acts on
+            // it rather than on the builder's coordinates, so a builder naming
+            // others is a contradiction rather than a refinement. The tarball
+            // is fetched from under the builder's architecture by the
+            // stage3's path, so another's would be a 404 from a mirror that
+            // was spelled correctly -- or, from a cache holding the other
+            // architecture's tarball, a root silently built for it.
+            let disagree = |what: &str, carried: &str, named: &str| {
+                GentooError::config(format!(
+                    "the stage3 was resolved for the {what} {carried:?} and this builder names \
+                     {named:?}; resolve the stage3 with this builder, or name what it was \
+                     resolved for",
+                ))
+            };
+            if stage3.architecture != self.architecture {
+                return Err(disagree(
+                    "architecture",
+                    &stage3.architecture,
+                    &self.architecture,
+                ));
+            }
+            if let Some(variant) = &self.variant
+                && *variant != stage3.variant
+            {
+                return Err(disagree("variant", &stage3.variant, variant));
+            }
+            if let Some(build_id) = &self.build_id
+                && *build_id != stage3.build_id
+            {
+                return Err(disagree("build id", &stage3.build_id, build_id));
             }
         }
         let keyring = Keyring::parse(EMBEDDED_KEYRING)
@@ -3550,6 +3601,47 @@ mod tests {
         let mut carried = provisioner(&key, Box::new(Unreachable));
         carried.stage3 = Some(stage3.clone());
         assert_eq!(carried.resolve().expect("the answer is carried"), stage3);
+    }
+
+    #[test]
+    fn a_stage3_carried_into_a_builder_for_other_coordinates_is_refused_at_build() {
+        // A carried resolution names the build it acts on, and the tarball is
+        // fetched from under the builder's architecture by its path. A builder
+        // for another architecture would fetch from a tree that does not hold
+        // it, or take another architecture's tarball from a shared cache.
+        let (_, mut resolved) = current();
+        let stage3 = resolved.resolve().expect("the archive resolves");
+        Gentoo::builder(ARCH)
+            .stage3(stage3.clone())
+            .build()
+            .expect("a builder naming nothing else agrees");
+        Gentoo::builder(ARCH)
+            .variant(stage3.variant())
+            .build_id(stage3.build_id())
+            .stage3(stage3.clone())
+            .build()
+            .expect("a builder naming what it was resolved for agrees");
+        for (builder, what) in [
+            (Gentoo::builder("arm64"), "the architecture \"amd64\""),
+            (
+                Gentoo::builder(ARCH).variant("amd64-systemd"),
+                "the variant \"amd64-openrc\"",
+            ),
+            (
+                Gentoo::builder(ARCH).build_id("20990101T000000Z"),
+                "the build id",
+            ),
+        ] {
+            let err = builder
+                .stage3(stage3.clone())
+                .build()
+                .expect_err("the builder contradicts the stage3");
+            assert!(matches!(err, GentooError::Config { .. }), "{err:?}");
+            assert!(
+                err.to_string().contains(&format!("resolved for {what}")),
+                "{err}"
+            );
+        }
     }
 
     #[test]
