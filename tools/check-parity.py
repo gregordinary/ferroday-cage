@@ -25,6 +25,10 @@ The flag table records each flag's mode, and a flag a launch refuses -- a
 removal's, an export's, `--help` -- cannot be what reaches a launch builder's
 setting. A builder of another mode names that mode in the record.
 
+The check reads names and modes, not wiring. That a flag recorded against a
+setting reaches that setting is its applier's doing, written beside the flag in
+the CLI's table, and an entry that names the wrong setting passes here.
+
 It is not a demand that everything have a flag. Some settings genuinely cannot,
 for one of three reasons: the setting takes executable behavior an argument
 cannot carry, it is spelled somewhere other than a flag, or it belongs to a

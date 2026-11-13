@@ -531,9 +531,11 @@ it:
   something, so `stop-with-caller = false` holds — the flag still overrides
   either way.
 - Hardening flags compose with a profile's `[hardening]` table. `--landlock-ro`,
-  `--landlock-rw`, `--landlock-bind`, and `--landlock-connect` add grants to it.
-  `--landlock-scope`, `--drop-caps`, `--keep-caps`, and the seccomp flags that set
-  a posture replace its scopes, capability posture, or seccomp policy.
+  `--landlock-rw`, `--landlock-unix`, `--landlock-bind`, and `--landlock-connect`
+  add grants to it. `--landlock-scope`, `--landlock-resolve-unix` and
+  `--no-landlock-resolve-unix`, `--drop-caps`, `--keep-caps`, and the seccomp
+  flags that set a posture replace its scopes, unix-socket restriction,
+  capability posture, or seccomp policy.
   `--seccomp-errno` joins the policy that stands instead, the flags' or else the
   profile's. The seccomp flags mirror the profile's seccomp table, so a rule reads
   the same on a flag as in the table.

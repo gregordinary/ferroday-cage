@@ -2412,14 +2412,16 @@ Each toggle has a counterpart to override a profile in the other direction:
 --isolate-net, --pid-ns, --proc, --dev, --tmp, --resolv-conf,
 --managed-mounts, --base-env, --no-stop-with-caller, and --no-path-lookup.
 A profile's [hardening] table composes with the hardening flags:
---landlock-ro, --landlock-rw, --landlock-bind, and --landlock-connect add
-grants to it, while --landlock-scope, --drop-caps, --keep-caps, and the
-seccomp flags that set a posture replace its scopes, capability posture, or
-seccomp policy. Those seccomp flags are mutually constrained: an allow side
-(--seccomp-allow, --seccomp-allow-rule) cannot be mixed with a deny side
-(--seccomp-deny, --seccomp-deny-rule), and --seccomp curated is a deny side
-the deny flags extend. --seccomp-errno joins whichever policy stands, the
-flags' or else the profile's, and with neither denies only what it names.
+--landlock-ro, --landlock-rw, --landlock-unix, --landlock-bind, and
+--landlock-connect add grants to it, while --landlock-scope,
+--landlock-resolve-unix and --no-landlock-resolve-unix, --drop-caps,
+--keep-caps, and the seccomp flags that set a posture replace its scopes,
+unix-socket restriction, capability posture, or seccomp policy. Those
+seccomp flags are mutually constrained: an allow side (--seccomp-allow,
+--seccomp-allow-rule) cannot be mixed with a deny side (--seccomp-deny,
+--seccomp-deny-rule), and --seccomp curated is a deny side the deny flags
+extend. --seccomp-errno joins whichever policy stands, the flags' or else
+the profile's, and with neither denies only what it names.
 
 The command path is interpreted inside the sandbox (with --restrict, on the
 host) and must be absolute, unless --path-lookup resolves a name with no
@@ -2565,8 +2567,9 @@ struct Options {
     gentoo_max_pointer_age: Option<Option<u64>>,
     command_line: Vec<OsString>,
     path_lookup: Option<bool>,
-    /// Binds and raw mounts in one sequence, so `--bind` and `--raw-mount`
-    /// apply in the order they appear on the command line — the same
+    /// What the six mount flags spell, `--bind`, `--ro-bind`, `--raw-mount`,
+    /// `--symlink`, `--hide` and `--read-only`, in one sequence, so they apply
+    /// in the order they appear on the command line: the same
     /// declaration-order rule the library's `[[mount]]` array follows.
     mounts: Vec<Mount>,
     overlay_lowers: Vec<PathBuf>,
@@ -6281,7 +6284,6 @@ fn withhold_from_restricted_command() -> Result<(), ExitCode> {
     )
 }
 
-/// The Landlock access set a --landlock-ro or --landlock-rw grant confers.
 /// Waits a launch out under the optional deadline, escalating as
 /// [`Escalation`] says. `Ok(None)` means the deadline fired.
 ///
