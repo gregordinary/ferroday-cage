@@ -82,12 +82,12 @@
 //! number, because the index decides that too. The fields of a record are held
 //! to lengths as they are read (see [`index`](super::index)), and an atom to a
 //! `CPV`'s length and to 64 USE dependencies (see [`atom`](super::atom)), so
-//! one comparison reads at most about two MiB: a USE dependency is answered by
-//! scanning the candidate's flag lists. That is far from what a real one
-//! reads, so each comparison is also charged what it reads before it is made,
-//! and the one that would take the resolution past [`MAX_COMPARED_BYTES`] is
-//! not made. The same field lengths bound what a refusal copies out of a
-//! record.
+//! one comparison with a record reads at most about two MiB: a USE dependency
+//! is answered by scanning the candidate's flag lists. That is far from what a
+//! real one reads, so each comparison is also charged what it reads before it
+//! is made, and the one that would take the resolution past
+//! [`MAX_COMPARED_BYTES`] is not made. The same field lengths bound what a
+//! refusal copies out of a record.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -388,8 +388,9 @@ const MAX_DEPENDENCIES: usize = 256 * 1024;
 /// an index publishing many builds of one name, and many distinct atoms naming
 /// it, would cost their product. Counting each candidate bounds how many
 /// comparisons that shape can make, and [`MAX_COMPARED_BYTES`] what they read.
-/// Two versions compared to choose between builds, and a slot compared to
-/// find what holds one, count as comparisons too.
+/// Two versions compared to choose between builds, a build ranked among those
+/// of its version, and a slot compared to find what holds one count as
+/// comparisons too.
 ///
 /// Asking for every package name the live index publishes at once, over an
 /// empty root, makes 83,879 comparisons. This is fifty times that, and a
@@ -408,7 +409,7 @@ const MAX_COMPARISONS: usize = 4 * 1024 * 1024;
 /// have taken it past is the one not made.
 ///
 /// Asking for every package name the live index publishes at once, over an
-/// empty root, reads 7,491,768 bytes. This is seventeen times that, and a
+/// empty root, reads 7,491,768 bytes. This is nearly eighteen times that, and a
 /// fraction of a second of reading even the costliest bytes there are to read:
 /// versions as long as a `CPV` allows, each parsed again for every comparison.
 const MAX_COMPARED_BYTES: usize = 128 * 1024 * 1024;
@@ -417,8 +418,8 @@ const MAX_COMPARED_BYTES: usize = 128 * 1024 * 1024;
 ///
 /// Every refusal is recorded and reported rather than only the first, which is
 /// what a caller fixing an install list wants. A refusal costs what it names:
-/// the atom, the build, and the slot, each a copy of an index field held to a
-/// length. And how many there are is the index's to decide. One build can
+/// the atom, the build and the slot, copies of what a record states, each held
+/// to a length. And how many there are is the index's to decide. One build can
 /// state thousands of atoms nothing answers, and every blocker the chosen
 /// builds state is held against every build chosen under its name, so their
 /// conflicts grow with the product of the two. A resolution that meets more
@@ -641,9 +642,9 @@ enum Answer<'a> {
 impl<'a> Resolution<'a> {
     /// Whether the resolution has reached a [`Bound`].
     ///
-    /// The comparisons are counted wherever an atom meets a candidate, so
-    /// their bound is noticed here; the other two are recorded where they are
-    /// reached.
+    /// The comparisons are charged wherever an atom meets a candidate, so
+    /// their two bounds are noticed here; the others are recorded where they
+    /// are reached.
     fn stopped(&mut self) -> bool {
         if self.refusals.exceeded.is_none() {
             self.refusals.exceeded = self.compared.exceeded();
