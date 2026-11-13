@@ -17,14 +17,23 @@ use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, compr
 /// small archive reports a handful of times rather than thousands.
 const REPORT_EVERY: u64 = 1 << 20;
 
-/// The most of the decoded stream that may follow the end-of-archive marker.
+/// The most of a decompressed stream that may follow the end-of-archive marker.
 ///
-/// What legitimately follows it is the rest of the last record, zero-filled. A
-/// record is ten kibibytes at the blocking factor `tar` and `bsdtar` default
-/// to, and few archivers write records much larger, so a mebibyte covers any
-/// record size in use. What the stream holds beyond that is decoded only to be
-/// discarded, and this is what bounds it. See [`TarReader::finish`].
-const MAX_TRAILING_BYTES: u64 = 1 << 20;
+/// What legitimately follows it is the rest of the last record, zero-filled.
+/// GNU tar writes an archive in records of its blocking factor's worth of
+/// blocks, ten kibibytes by default, and pads the stream it compresses to a
+/// whole record, so `tar -b 4096 -czf` leaves two mebibytes after the marker. It
+/// takes any blocking factor it is given. bsdtar takes up to 8192 blocks, a
+/// four-mebibyte record, and pads its output after compressing it, leaving the
+/// decompressed stream unpadded. Sixteen mebibytes admits a record four times
+/// the largest bsdtar writes, a GNU tar blocking factor of 32768.
+///
+/// What follows the marker is decompressed only to be discarded, and this
+/// bounds how much of that a stream can ask for: a few kilobytes of compressed
+/// zeros decompress to the whole of it. A plain stream is not read past its
+/// marker at all, since no check follows one there and a stream from a reader
+/// need not end. See [`TarReader::finish`].
+const MAX_TRAILING_BYTES: u64 = 16 << 20;
 
 /// Where a [`Tarball`]'s archive comes from.
 enum Source {
@@ -71,8 +80,9 @@ enum Source {
 /// marker, so the integrity check each format carries is compared for every
 /// part of it: each gzip member's CRC, each xz block's check, and each zstd
 /// frame's content checksum. A damaged stream is refused rather than extracted.
-/// At most a mebibyte may follow the marker, which is more than the padding of
-/// any record size in use.
+/// At most sixteen mebibytes may follow the marker once decompressed, which
+/// admits the record padding of every blocking factor `bsdtar` accepts and of
+/// GNU `tar`'s up to 32768. A plain stream is read to its marker and no further.
 ///
 /// # Progress and cancellation
 ///
@@ -257,7 +267,7 @@ impl Provisioner for Tarball {
 
         // The compression is named by the stream's leading bytes, never by a
         // file name.
-        let (_, decoded) =
+        let (codec, decoded) =
             compress::decoder(source).map_err(|err| tar::read_failure(&subject, 0, err))?;
 
         let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded), &subject);
@@ -281,7 +291,8 @@ impl Provisioner for Tarball {
             // The archive is complete, but the stream it came from may still
             // hold the check over its last compressed block. An archive passed
             // in as a path or a stream is one nothing else vouches for, so that
-            // check is read too.
+            // check is read too. A plain stream carries none to read on for.
+            Ok(()) if codec == compress::Codec::Plain => Ok(()),
             Ok(()) => archive.finish(MAX_TRAILING_BYTES),
             // A stream too short to hold a header, or whose first block is
             // none, is not a tar archive at all. Every other failure, the

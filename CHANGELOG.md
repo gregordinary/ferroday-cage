@@ -819,6 +819,10 @@ consumer upgrading can skip it.
   modification time of the root it is merged into where it spells its wrapper
   directory `image/.` or `image/./`. The wrapper's own entry lands nowhere
   however it is spelled; only `image` and `image/` were recognized as it.
+- A compressed `Tarball` may hold sixteen mebibytes after its end-of-archive
+  marker once decompressed, where it was refused past one. GNU `tar -b 4096`
+  pads its archive to two-mebibyte records, which was refused. A plain archive
+  is read to its marker and no further, where it was read on for nothing.
 
 ### Internal
 

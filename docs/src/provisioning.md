@@ -712,8 +712,10 @@ always ends with a CRC. An xz block and a zstd frame carry a check where the
 encoder wrote one, as the `xz` and `zstd` tools do by default. The last check
 follows the end marker, and reading on is what compares it. A damaged final
 block that a check covers therefore fails the run rather than extracting. More
-than a mebibyte after the marker is refused, which leaves room for the record
-padding `tar` writes.
+than sixteen mebibytes after the marker, once decompressed, is refused. That
+leaves room for the record padding `tar` writes, up to a GNU `tar` blocking
+factor of 32768 and every one `bsdtar` takes. A plain archive has no check to
+read on for, and is read to its marker and no further.
 
 Extraction is unprivileged and designed for archives that describe a root
 filesystem:

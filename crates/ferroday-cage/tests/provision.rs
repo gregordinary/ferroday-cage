@@ -475,8 +475,8 @@ fn record_padding_after_the_archive_is_read_past_but_more_is_refused() {
     // `tar` pads an archive to whole records, ten kibibytes by default, so
     // zeros after the terminator are ordinary. The stream is read to its end
     // so that a compressed one's closing check is compared, and what follows
-    // the terminator is decoded only to be discarded: past a mebibyte of it,
-    // the stream is refused rather than decoded on.
+    // the terminator is decompressed only to be discarded: past sixteen
+    // mebibytes of it, the stream is refused rather than decompressed on.
     use std::io::Write;
 
     let gzip = |bytes: &[u8]| {
@@ -487,18 +487,28 @@ fn record_padding_after_the_archive_is_read_past_but_more_is_refused() {
     let mut tar = archive();
     tar.file("f", 0o644, b"content");
 
-    let mut padded = tar.finish();
-    padded.resize(10 * 1024, 0);
-    let rootfs = provision("extract-record-padding", &gzip(&padded));
-    assert_eq!(fs::read(rootfs.join("f")).unwrap(), b"content");
+    // The default record, and the two-mebibyte one `tar -b 4096` writes.
+    for record in [10 * 1024, 2 << 20] {
+        let mut padded = tar.finish();
+        padded.resize(record, 0);
+        let rootfs = provision(&format!("extract-record-padding-{record}"), &gzip(&padded));
+        assert_eq!(fs::read(rootfs.join("f")).unwrap(), b"content");
+    }
 
     let mut overlong = tar.finish();
-    overlong.resize(overlong.len() + (1 << 20) + 1, 0);
+    overlong.resize(overlong.len() + (16 << 20) + 1, 0);
     let err = provision_err("extract-overlong-trailer", &gzip(&overlong));
     assert!(
         matches!(&err, ProvisionError::Archive { reason, .. } if reason.contains("follow the end")),
         "{err}"
     );
+
+    // A plain archive is read to its marker. What follows is no check, and is
+    // not read, however much of it there is.
+    let mut plain = tar.finish();
+    plain.resize(plain.len() + (16 << 20) + 1, 0x55);
+    let rootfs = provision("extract-plain-trailer", &plain);
+    assert_eq!(fs::read(rootfs.join("f")).unwrap(), b"content");
 }
 
 /// The fixture the v7 tests extract, written into whichever builder is given.
