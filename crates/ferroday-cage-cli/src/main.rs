@@ -4982,19 +4982,6 @@ fn parse_seconds(name: &str, value: &OsStr) -> Result<Duration, String> {
     Ok(duration)
 }
 
-/// What the CLI needs to know about a loaded profile beyond the builder itself.
-struct ProfileMeta {
-    /// The profile sets a `TERM` variable, so the host `TERM` is not applied as
-    /// a fallback beneath it.
-    sets_term: bool,
-    /// The profile requests host networking, which `--netstack` cannot attach
-    /// a stack to.
-    network_host: bool,
-    /// The profile states `stop-with-caller`, so `fcage`'s own default for it
-    /// is not applied over the answer the profile gave.
-    sets_stop_with_caller: bool,
-}
-
 /// Whether to set the caller tie, and to what: the flag where one was given,
 /// `fcage`'s own default where neither the command line nor a profile said.
 ///
@@ -5025,14 +5012,20 @@ fn toml_diagnostic(error: &impl std::fmt::Display) -> String {
     error.to_string().trim_end().to_string()
 }
 
-/// Loads a profile into a builder, alongside the metadata the CLI reconciles
-/// against its own flags.
+/// Loads a profile into a builder, and says whether the profile states
+/// `stop-with-caller`.
+///
+/// Everything else `fcage` reconciles against its own flags it asks of the
+/// builder. Whether the tie was stated is the one answer the builder does not
+/// hold: it holds the tie's value, which reads the same whether the profile
+/// wrote `false` or said nothing, and only the first stops `fcage`'s own
+/// default from applying, as [`stop_with_caller_default`] describes.
 ///
 /// With `restricted`, the profile is deserialized under the library's
 /// [`RestrictedProfile`] policy, which refuses the operations that map host
 /// resources into the sandbox or share a host namespace; otherwise it is
 /// trusted as code-equivalent configuration.
-fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, ProfileMeta), String> {
+fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, bool), String> {
     let text = std::fs::read_to_string(path).map_err(|err| {
         format!(
             "cannot read profile {}: {}",
@@ -5047,14 +5040,7 @@ fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, ProfileMe
             toml_diagnostic(&err)
         )
     })?;
-    let meta = ProfileMeta {
-        sets_term: table
-            .get("env")
-            .and_then(|env| env.as_table())
-            .is_some_and(|env| env.contains_key("TERM")),
-        network_host: table.get("network").and_then(|value| value.as_str()) == Some("host"),
-        sets_stop_with_caller: table.contains_key("stop-with-caller"),
-    };
+    let states_stop_with_caller = table.contains_key("stop-with-caller");
     let builder = if restricted {
         let profile: RestrictedProfile = table.try_into().map_err(|err| {
             format!(
@@ -5073,7 +5059,7 @@ fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, ProfileMe
             )
         })?
     };
-    Ok((builder, meta))
+    Ok((builder, states_stop_with_caller))
 }
 
 /// Deletes the provisioned rootfs or the overlay upper at `dest`, under the
@@ -5290,20 +5276,13 @@ impl Launch {
             None
         };
 
-        let mut profile_sets_term = false;
-        let mut profile_network_host = false;
-        let mut profile_sets_stop_with_caller = false;
-        let mut builder = match &options.profile {
-            Some(path) => {
-                let (builder, meta) =
-                    load_profile(path, options.profile_restricted).map_err(fail)?;
-                profile_sets_term = meta.sets_term;
-                profile_network_host = meta.network_host;
-                profile_sets_stop_with_caller = meta.sets_stop_with_caller;
-                builder
-            }
-            None => Cage::builder(),
+        let (mut builder, profile_sets_stop_with_caller) = match &options.profile {
+            Some(path) => load_profile(path, options.profile_restricted).map_err(fail)?,
+            None => (Cage::builder(), false),
         };
+        // What the profile asked for, read before any flag is applied over it.
+        let profile_sets_term = builder.get_envs().any(|(name, _)| name == "TERM");
+        let profile_network_host = builder.get_network() == Network::Host;
 
         // The parse-time guard rejects --netstack with --share-net, but a
         // profile can request host networking without any CLI network flag,
@@ -7852,14 +7831,14 @@ mod tests {
             "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\nstop-with-caller = false\n",
         )
         .expect("the profile is written");
-        let (_, meta) = load_profile(&stated, false).expect("the profile loads");
-        assert!(meta.sets_stop_with_caller);
+        let (_, states) = load_profile(&stated, false).expect("the profile loads");
+        assert!(states);
 
         let silent = dir.join("silent.toml");
         std::fs::write(&silent, "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\n")
             .expect("the profile is written");
-        let (_, meta) = load_profile(&silent, false).expect("the profile loads");
-        assert!(!meta.sets_stop_with_caller);
+        let (_, states) = load_profile(&silent, false).expect("the profile loads");
+        assert!(!states);
     }
 
     #[test]
