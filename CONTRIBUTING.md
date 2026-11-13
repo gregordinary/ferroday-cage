@@ -493,6 +493,7 @@ report name a package and its version bare.
 | Fill a buffer from a reader, short only at the end of its input | `provision::compress::read_fully` |
 | Which standard stream did a provisioner's in-sandbox output come from? | `provision::Stream` |
 | Take the first mirror that serves a resource, past those that do not | `provision::walk_mirrors` |
+| Fetch a document into memory, held to the most it may hold, from one URL or from the first mirror that serves it | `provision::fetch_bounded`, `provision::fetch_first`, which state the bound through `FetchRequest::sized` as its rule says |
 | Fetch several resources at once, where the transport can | `provision::Fetch::fetch_all` |
 | Deliver one job of a batch: what it asked for, and where its body goes | `provision::FetchJob::parts` |
 | Join a mirror-relative path onto a mirror | `provision::mirror_url` |

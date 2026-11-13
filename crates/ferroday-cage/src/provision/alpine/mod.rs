@@ -81,9 +81,8 @@ use super::layer::{Rooting, Staging};
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::{
-    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, FetchRequest, HttpFetch,
-    LimitedWriter, PackageCache, ProvisionError, ProvisionRequest, Provisioner, Stream, mirror_url,
-    walk_mirrors,
+    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
+    ProvisionError, ProvisionRequest, Provisioner, Stream, fetch_first, mirror_url,
 };
 use crate::failure::path_io_error;
 use crate::{ErrorChain, IdMapper, IdentityMap};
@@ -99,9 +98,8 @@ const DEFAULT_MIRROR: &str = "http://dl-cdn.alpinelinux.org/alpine";
 ///
 /// Nothing in an apk repository declares an index's size — there is no signed
 /// release above it to record one — so this is the layer's own number rather
-/// than an archive's, and it is why it is not stated through
-/// [`FetchRequest::sized`], which is for a length a verified source declared.
-/// Alpine's largest published index is `edge/community/x86_64` at around 2.5 MB,
+/// than an archive's, stated through [`FetchRequest::sized`] as every bound on
+/// a fetch is. Alpine's largest published index is `edge/community/x86_64` at around 2.5 MB,
 /// so this is generous by a factor of twenty-five and still the reason a hostile
 /// mirror cannot stream forever.
 const MAX_INDEX_FETCH: u64 = 64 * 1024 * 1024;
@@ -1312,13 +1310,10 @@ fn validate_plan(
 
 /// Fetches, verifies and parses one repository index.
 ///
-/// `path` is mirror-relative. The mirror list is walked in order, advancing past
-/// one that [could not serve the index](FetchError::is_failover); a mirror that
-/// serves something that does not verify is fatal rather than a reason to try
-/// the next, since what it served was answered for by the URL that was asked
-/// for. A URL the transport will not accept is fatal for the same reason it is
-/// everywhere else: it is the configuration rather than the mirror, and walking
-/// past it would report the failure against a mirror that was spelled fine.
+/// `path` is mirror-relative, and the index comes from the first mirror that
+/// serves it ([`fetch_first`]). A mirror that serves something that does not
+/// verify is fatal rather than a reason to try the next, since what it served
+/// was answered for by the URL that was asked for.
 fn read_index(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
@@ -1328,45 +1323,34 @@ fn read_index(
     from: usize,
     observer: &mut dyn AlpineObserver,
 ) -> Result<(Vec<Record>, ResolvedIndex), AlpineError> {
-    walk_mirrors(
+    let Fetched { mirror, url, body } = fetch_first(
+        fetcher,
         &repository.mirrors,
-        |mirror| {
-            let url = mirror_url(mirror, path);
-            // Reported for the same reason a package fetch is: this walk spends
-            // one mirror timeout per unreachable mirror, and it is the slowest
-            // part of a resolve. An observer that saw only `Resolving` would
-            // watch a bootstrap that looks stopped.
-            observer.progress(AlpineEvent::Fetching { url: &url });
-            let mut bytes = Vec::new();
-            let request = FetchRequest::new(&url);
-            fetcher.fetch(
-                &request,
-                &mut LimitedWriter::new(&mut bytes, MAX_INDEX_FETCH),
-            )?;
-            let (records, signed_by, description) =
-                parse_index(&url, &bytes, repository, architecture, from)?;
-            Ok((
-                records,
-                ResolvedIndex {
-                    mirror: mirror.clone(),
-                    release: repository.release().to_string(),
-                    component: component.map(str::to_string),
-                    // Over the container as it arrived, signature segment
-                    // included, so the value names the exact bytes whose
-                    // signature was checked.
-                    sha256: Digest::of(Algorithm::Sha256, &bytes),
-                    signed_by,
-                    description,
-                    // A record built from a live resolution has no document
-                    // behind it, so there is nothing to carry. Qualified: this
-                    // module's own `Carried` is the installed database's, a
-                    // different question with the same name.
-                    carried: super::document::Carried::new(),
-                },
-            ))
+        path,
+        MAX_INDEX_FETCH,
+        observer,
+        || AlpineError::Cancelled,
+    )?;
+    let (records, signed_by, description) =
+        parse_index(&url, &body, repository, architecture, from)?;
+    Ok((
+        records,
+        ResolvedIndex {
+            mirror: mirror.to_string(),
+            release: repository.release().to_string(),
+            component: component.map(str::to_string),
+            // Over the container as it arrived, signature segment included, so
+            // the value names the exact bytes whose signature was checked.
+            sha256: Digest::of(Algorithm::Sha256, &body),
+            signed_by,
+            description,
+            // A record built from a live resolution has no document behind it,
+            // so there is nothing to carry. Qualified: this module's own
+            // `Carried` is the installed database's, a different question with
+            // the same name.
+            carried: super::document::Carried::new(),
         },
-        || AlpineError::Fetch(FetchError::not_found(path.to_string())),
-    )
+    ))
 }
 
 /// Verifies an index container, holds it to the release and the architecture
@@ -1481,14 +1465,19 @@ pub trait AlpineObserver {
         let _ = event;
     }
 
-    /// Whether the bootstrap should stop.
+    /// Whether the work should stop.
     ///
-    /// Consulted where stopping is clean — a package boundary, a mirror a
-    /// download walks, a batch of downloads, a script boundary — and on each
-    /// write of a package's body as it downloads. Returning `true` aborts with
-    /// [`ProvisionError::Cancelled`], and a run driven through
-    /// [`provision::ensure`](super::ensure) then removes the staging tree, so a
-    /// cancelled bootstrap leaves no destination behind.
+    /// Consulted where stopping is clean — each mirror an index read or a
+    /// download walks, a package boundary, a batch of downloads, a script
+    /// boundary — and on each write of a package's body as it downloads. So a
+    /// [`resolve`](Observed::resolve) or an [`available`](Observed::available)
+    /// stops on its way through the repositories, and a bootstrap between two
+    /// packages, two scripts, or part way through a download.
+    ///
+    /// Returning `true` aborts with [`AlpineError::Cancelled`], which a
+    /// provisioning run reports as [`ProvisionError::Cancelled`]. A run driven
+    /// through [`provision::ensure`](super::ensure) then removes the staging
+    /// tree, so a cancelled bootstrap leaves no destination behind.
     ///
     /// [`ProvisionError::Cancelled`]: super::ProvisionError::Cancelled
     fn cancelled(&mut self) -> bool {
@@ -1498,7 +1487,7 @@ pub trait AlpineObserver {
 
 /// A download's view of the observer: the layer's own fetch event, and its
 /// answer to whether the run should stop.
-impl cache::Watch for dyn AlpineObserver + '_ {
+impl super::Watch for dyn AlpineObserver + '_ {
     fn fetching(&mut self, url: &str) {
         self.progress(AlpineEvent::Fetching { url });
     }
@@ -3015,6 +3004,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::provision::FetchRequest;
     use crate::scratch::Scratch;
 
     /// A transport serving a fixed set of URLs and nothing else.
@@ -5174,6 +5164,80 @@ mod tests {
             "the Alpine events reached the run's observer"
         );
         assert!(!stopped.exists());
+    }
+
+    #[test]
+    fn an_index_read_stops_between_mirrors_once_cancelled() {
+        // Reading the indexes walks every configured mirror past one that does
+        // not answer, and each unreachable one costs a connect timeout, so the
+        // read half of a run is long enough to want stopping: a resolve and
+        // `available` both stop between one mirror and the next.
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        /// Answers every URL with a 503, recording what it was asked for.
+        struct Unavailable(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl Fetch for Unavailable {
+            fn fetch(
+                &mut self,
+                request: &FetchRequest<'_>,
+                _sink: &mut dyn Write,
+            ) -> Result<(), FetchError> {
+                self.0.lock().unwrap().push(request.url().to_string());
+                Err(FetchError::status(request.url(), 503))
+            }
+        }
+
+        /// Stops once it has heard one fetch announced.
+        struct StopAfterOne(usize);
+
+        impl AlpineObserver for StopAfterOne {
+            fn progress(&mut self, event: AlpineEvent<'_>) {
+                if let AlpineEvent::Fetching { .. } = event {
+                    self.0 += 1;
+                }
+            }
+
+            fn cancelled(&mut self) -> bool {
+                self.0 > 0
+            }
+        }
+
+        let alpine = || {
+            Alpine::builder("v3.23")
+                .architecture("x86_64")
+                .mirror("http://first.invalid/alpine")
+                .mirror_fallback("http://second.invalid/alpine")
+                .include(["musl"])
+                .fetcher(Unavailable(std::sync::Arc::clone(&asked)))
+                .build()
+                .expect("the bootstrap configures")
+        };
+
+        let err = alpine()
+            .observe(&mut StopAfterOne(0))
+            .available()
+            .expect_err("the observer asked it to stop");
+        assert!(matches!(err, AlpineError::Cancelled), "{err:?}");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "{:?}",
+            asked.lock().unwrap()
+        );
+
+        asked.lock().unwrap().clear();
+        let err = alpine()
+            .observe(&mut StopAfterOne(0))
+            .resolve()
+            .expect_err("the observer asked it to stop");
+        assert!(matches!(err, AlpineError::Cancelled), "{err:?}");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "{:?}",
+            asked.lock().unwrap()
+        );
     }
 
     #[test]

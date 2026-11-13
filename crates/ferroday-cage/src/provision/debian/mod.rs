@@ -74,9 +74,9 @@ use super::identity::Ownership;
 use super::layer::Staging;
 use super::rooted::Rooted;
 use super::{
-    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, FetchRequest, HttpFetch,
-    LimitedWriter, PackageCache, ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner,
-    Staged, Stream, mirror_url, walk_mirrors,
+    Available, BuildLayer, Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache,
+    ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Staged, Stream, fetch_bounded,
+    fetch_first, mirror_url, walk_mirrors,
 };
 use crate::failure::path_io_error;
 use crate::provision::digest::{Algorithm, Digest};
@@ -2125,18 +2125,25 @@ fn emit_resolved(
 /// path the archive signature is verified against the repository's keyring,
 /// and held to be unexpired where [`Repository::require_fresh`] holds the
 /// mirror that served it to freshness.
+///
+/// A release file is the trust root, so nothing signed declares its length. It
+/// is fetched under [`MAX_SIGNED_DOCUMENT_BYTES`], the ceiling every layer holds
+/// an unsized signed document to and the most that verifying one reads. The
+/// unsigned `Release` a trusted local mirror serves is held to the same
+/// ceiling: it is the same document without its armor.
 fn fetch_release(
     fetcher: &mut dyn Fetch,
     repository: &Repository,
     observer: &mut dyn DebianObserver,
 ) -> Result<(Release, Served), DebianError> {
-    let suite = &repository.suite;
     let (body, served) = match repository.keyring() {
         None => {
-            let suffix = format!("dists/{suite}/Release");
-            let (bytes, mirror) =
-                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, observer)?;
-            let url = mirror_url(&mirror, &suffix);
+            let Fetched {
+                mirror,
+                url,
+                body: bytes,
+            } = fetch_release_document(fetcher, repository, "Release", observer)?;
+            let mirror = mirror.to_string();
             let sha256 = Digest::of(Algorithm::Sha256, &bytes);
             let Ok(body) = String::from_utf8(bytes) else {
                 return Err(DebianError::Release {
@@ -2158,10 +2165,12 @@ fn fetch_release(
             )
         }
         Some(keyring_bytes) => {
-            let suffix = format!("dists/{suite}/InRelease");
-            let (bytes, mirror) =
-                fetch_from_mirrors(fetcher, &repository.mirrors, &suffix, observer)?;
-            let url = mirror_url(&mirror, &suffix);
+            let Fetched {
+                mirror,
+                url,
+                body: bytes,
+            } = fetch_release_document(fetcher, repository, "InRelease", observer)?;
+            let mirror = mirror.to_string();
             let sha256 = Digest::of(Algorithm::Sha256, &bytes);
             // The keyring parsed when the repository was built, so this is a
             // second parse of the same bytes rather than a new question; a
@@ -2341,7 +2350,7 @@ fn fetch_component_index(
         .map_or(MAX_UNSIZED_INDEX, |(size, _)| size);
 
     let suite = &repository.suite;
-    // What an exhausted walk reports, as `fetch_from_mirrors` reports one: the
+    // What an exhausted walk reports, as `fetch_first` reports one: the
     // resource below the mirror rather than a URL on any one of them.
     let unserved = format!("dists/{suite}/{component}/binary-{architecture}/Packages");
     // Three walks, each inside the next: the locations of one encoding (its
@@ -2384,7 +2393,7 @@ fn fetch_component_index(
                         &locations,
                         |url| {
                             observer.progress(DebianEvent::Fetching { url });
-                            let bytes = fetch_bytes(fetcher, url, Some(*size))?;
+                            let bytes = fetch_bounded(fetcher, url, *size)?;
                             verify_digest(url, &bytes, digests)?;
                             decompress_index(url, &bytes, expanded)
                         },
@@ -2421,44 +2430,21 @@ fn served_first<'m>(mirrors: &'m [String], served: &'m str) -> Vec<&'m str> {
         .collect()
 }
 
-/// Fetches `suffix` (a mirror-relative path) from the first mirror that serves
-/// it, advancing past a mirror that reports the resource missing or fails at
-/// the transport, and returning the last such error when every mirror is
-/// exhausted.
-///
-/// A release file is the trust root, so nothing signed declares its length. It
-/// is fetched under [`MAX_SIGNED_DOCUMENT_BYTES`], the ceiling every layer holds
-/// an unsized signed document to and the most that verifying one reads. The
-/// unsigned `Release` a trusted local mirror serves is held to the same
-/// ceiling: it is the same document without its armor.
-fn fetch_from_mirrors(
+/// Fetches the release document `name` of `repository`'s suite from the first
+/// of its mirrors that serves it, held to [`MAX_SIGNED_DOCUMENT_BYTES`].
+fn fetch_release_document<'r>(
     fetcher: &mut dyn Fetch,
-    mirrors: &[String],
-    suffix: &str,
+    repository: &'r Repository,
+    name: &str,
     observer: &mut dyn DebianObserver,
-) -> Result<(Vec<u8>, String), DebianError> {
-    walk_mirrors(
-        mirrors,
-        |mirror| {
-            // A mirror boundary, and the first point of every resolve: nothing
-            // has been read, so stopping costs nothing.
-            if observer.cancelled() {
-                return Err(DebianError::Cancelled);
-            }
-            let url = mirror_url(mirror, suffix);
-            observer.progress(DebianEvent::Fetching { url: &url });
-            // The mirror that answered, not the whole list: a repository with a
-            // snapshot backstop resolves against whichever one served, and a
-            // record naming the list would describe a choice rather than the
-            // choice made.
-            fetch_bytes(fetcher, &url, Some(MAX_SIGNED_DOCUMENT_BYTES))
-                .map(|bytes| (bytes, mirror.clone()))
-        },
-        || {
-            DebianError::Fetch(FetchError::NotFound {
-                url: suffix.to_string(),
-            })
-        },
+) -> Result<Fetched<'r>, DebianError> {
+    fetch_first(
+        fetcher,
+        &repository.mirrors,
+        &format!("dists/{}/{name}", repository.suite),
+        MAX_SIGNED_DOCUMENT_BYTES,
+        observer,
+        || DebianError::Cancelled,
     )
 }
 
@@ -2931,36 +2917,6 @@ fn maintainer_env(source_date_epoch: Option<i64>) -> Vec<(String, String)> {
     env
 }
 
-/// Fetches a URL fully into memory, bounded by the size a verified source
-/// declares for it, or by the ceiling for a document nothing declares a size
-/// for.
-///
-/// The declared size travels with the request, so a transport that honours it
-/// refuses an oversized framing before reading a byte, *and* bounds the sink
-/// here, because a caller-supplied [`Fetch`] is free to ignore the request and
-/// the sink is the one place the bound cannot be ignored. Without it the only
-/// bound is the built-in fetcher's own `MAX_BODY` — two gigabytes — or nothing
-/// at all for a transport of the caller's, while the release that named the
-/// resource says it is a few megabytes. The digest check that follows catches
-/// the substitution either way, but only after the memory has been spent.
-fn fetch_bytes(
-    fetcher: &mut dyn Fetch,
-    url: &str,
-    size: Option<u64>,
-) -> Result<Vec<u8>, DebianError> {
-    let mut bytes = Vec::new();
-    let request = FetchRequest::new(url);
-    let result = match size {
-        Some(size) => {
-            let mut sink = LimitedWriter::new(&mut bytes, size);
-            fetcher.fetch(&request.sized(size), &mut sink)
-        }
-        None => fetcher.fetch(&request, &mut bytes),
-    };
-    result?;
-    Ok(bytes)
-}
-
 /// Verifies bytes against every digest the release records for them, naming
 /// the URL they were fetched from on a mismatch.
 fn verify_digest(url: &str, bytes: &[u8], digests: &Digests) -> Result<(), DebianError> {
@@ -3124,7 +3080,7 @@ pub trait DebianObserver {
 
 /// A download's view of the observer: the layer's own fetch event, and its
 /// answer to whether the run should stop.
-impl cache::Watch for dyn DebianObserver + '_ {
+impl super::Watch for dyn DebianObserver + '_ {
     fn fetching(&mut self, url: &str) {
         self.progress(DebianEvent::Fetching { url });
     }
@@ -3583,6 +3539,7 @@ impl From<crate::Error> for DebianError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provision::FetchRequest;
     use crate::scratch::Scratch;
 
     #[test]
@@ -3607,29 +3564,6 @@ mod tests {
             unnamed.to_string(),
             "the dpkg unpack step exited with exit code 2",
         );
-    }
-
-    /// A transport that refuses the first mirror with a fixed error and serves
-    /// a body from any other, recording every URL it was asked for.
-    struct Failing {
-        primary: String,
-        refusal: fn(&str) -> FetchError,
-        asked: Vec<String>,
-    }
-
-    impl Fetch for Failing {
-        fn fetch(
-            &mut self,
-            request: &FetchRequest<'_>,
-            sink: &mut dyn std::io::Write,
-        ) -> Result<(), FetchError> {
-            self.asked.push(request.url().to_string());
-            if request.url().starts_with(&self.primary) {
-                return Err((self.refusal)(request.url()));
-            }
-            sink.write_all(b"from the backstop")
-                .map_err(|err| FetchError::io("writing the body", request.url(), err))
-        }
     }
 
     /// A transport that serves one fixed body to whatever it is asked for.
@@ -4761,146 +4695,6 @@ mod tests {
 
         assert_eq!(release.date(), Some("Tue, 21 Jul 2026 14:11:47 UTC"));
         assert_eq!(release.valid_until(), Some("Tue, 28 Jul 2026 14:11:47 UTC"));
-    }
-
-    /// What a mirror walk produced: the body, and the mirror that served it.
-    type Walked = Result<(Vec<u8>, String), DebianError>;
-
-    /// Walks a two-mirror list whose primary answers with `refusal`, returning
-    /// the outcome and the URLs the walk asked for.
-    fn walk_past(refusal: fn(&str) -> FetchError) -> (Walked, Vec<String>) {
-        let mut fetcher = Failing {
-            primary: "https://primary.example".to_string(),
-            refusal,
-            asked: Vec::new(),
-        };
-        let mirrors = [
-            "https://primary.example/debian".to_string(),
-            "https://snapshot.example/debian".to_string(),
-        ];
-        let result =
-            fetch_from_mirrors(&mut fetcher, &mirrors, "dists/stable/Release", &mut Silent);
-        (result, fetcher.asked)
-    }
-
-    #[test]
-    fn the_mirror_walk_advances_past_a_failing_mirror() {
-        // Every way a mirror can decline to serve is a reason to try the next
-        // one: the backstop exists for precisely the outage a 5xx reports, and
-        // a CDN answers an absent object with 403 as readily as with 404.
-        for refusal in [
-            |url: &str| FetchError::not_found(url),
-            |url: &str| FetchError::status(url, 503),
-            |url: &str| FetchError::status(url, 403),
-            |url: &str| {
-                FetchError::io(
-                    "connecting",
-                    url,
-                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
-                )
-            },
-        ] {
-            let (result, asked) = walk_past(refusal);
-            let (bytes, mirror) = result.expect("the backstop answers");
-            assert_eq!(bytes, b"from the backstop", "{asked:?}");
-            // And the walk reports the mirror that served, not the one that was
-            // asked first: a plan resolved this way records which mirror
-            // answered, which is the provenance a reader of the plan wants and
-            // not a decision about where the packages are later fetched from.
-            assert_eq!(mirror, "https://snapshot.example/debian", "{asked:?}");
-            assert_eq!(asked.len(), 2, "both mirrors were tried: {asked:?}");
-        }
-    }
-
-    #[test]
-    fn the_mirror_walk_stops_at_a_malformed_url() {
-        // A URL the transport cannot parse is the caller's configuration, not
-        // the mirror's state; trying the next mirror would bury the mistake.
-        let (result, asked) = walk_past(|url| FetchError::url(url, "unsupported scheme"));
-        assert!(
-            matches!(result, Err(DebianError::Fetch(FetchError::Url { .. }))),
-            "{asked:?}",
-        );
-        assert_eq!(asked.len(), 1, "the walk stopped at the first mirror");
-        // And it is reported against the mirror that carries the bad URL rather
-        // than against the backstop, which is the whole reason a `Url` failure
-        // does not advance the walk.
-        let reason = ErrorChain::new(&result.unwrap_err()).to_string();
-        assert!(reason.contains("primary.example"), "{reason}");
-        assert!(!reason.contains("snapshot.example"), "{reason}");
-    }
-
-    #[test]
-    fn an_exhausted_walk_is_reported_against_the_mirror_it_asked_last() {
-        // The other attribution: with every mirror declining, the answer names
-        // the one the walk ended on. Keeping the last failure is what makes the
-        // diagnostic survive a walk, and reporting the first would point at a
-        // mirror that may be perfectly healthy.
-        let mut fetcher = Failing {
-            // Every mirror below starts with this, so all of them refuse.
-            primary: "https://".to_string(),
-            refusal: |url: &str| FetchError::status(url, 503),
-            asked: Vec::new(),
-        };
-        let mirrors = [
-            "https://first.example/debian".to_string(),
-            "https://last.example/debian".to_string(),
-        ];
-        let result =
-            fetch_from_mirrors(&mut fetcher, &mirrors, "dists/stable/Release", &mut Silent);
-        assert_eq!(fetcher.asked.len(), 2, "{:?}", fetcher.asked);
-        let reason = ErrorChain::new(&result.unwrap_err()).to_string();
-        assert!(reason.contains("last.example"), "{reason}");
-        assert!(!reason.contains("first.example"), "{reason}");
-    }
-
-    #[test]
-    fn a_release_past_the_signed_document_ceiling_is_refused_as_it_arrives() {
-        // A release is the trust root, so nothing signed declares its length,
-        // and a transport is free to ignore the size a request states. The
-        // ceiling travels with the request for a transport that honours it, and
-        // the sink holds it for one that does not, so an oversized release is
-        // refused before it is held rather than after.
-        struct Serving {
-            body: Vec<u8>,
-            asked: Option<u64>,
-        }
-        impl Fetch for Serving {
-            fn fetch(
-                &mut self,
-                request: &FetchRequest<'_>,
-                sink: &mut dyn std::io::Write,
-            ) -> Result<(), FetchError> {
-                self.asked = request.size();
-                sink.write_all(&self.body)
-                    .map_err(|err| FetchError::io("writing the body", request.url(), err))
-            }
-        }
-        let ceiling = usize::try_from(MAX_SIGNED_DOCUMENT_BYTES).unwrap();
-        let mirrors = ["http://mirror.example/debian".to_string()];
-        let fetch = |len: usize| {
-            let mut fetcher = Serving {
-                body: vec![b'x'; len],
-                asked: None,
-            };
-            let result = fetch_from_mirrors(
-                &mut fetcher,
-                &mirrors,
-                "dists/stable/InRelease",
-                &mut Silent,
-            );
-            assert_eq!(fetcher.asked, Some(MAX_SIGNED_DOCUMENT_BYTES));
-            result
-        };
-        let (bytes, _) = fetch(ceiling).expect("a release at the ceiling is fetched");
-        assert_eq!(bytes.len(), ceiling);
-        assert!(
-            matches!(
-                fetch(ceiling + 1),
-                Err(DebianError::Fetch(FetchError::Io { .. }))
-            ),
-            "a release past the ceiling is refused",
-        );
     }
 
     #[test]

@@ -23,14 +23,19 @@ impl<'a> FetchRequest<'a> {
         FetchRequest { url, size: None }
     }
 
-    /// Records the size the body is expected to be, in bytes.
+    /// Records the most the body may hold, in bytes.
     ///
-    /// The provisioner states it wherever a verified source declares it: the
-    /// signed release records the length of every index alongside its digest,
-    /// and the index records the length of every package. Both are known before
-    /// the request is made and are as trustworthy as the signature they hang
-    /// from. A signed document is the trust root, so nothing declares its
-    /// length, and the provisioner states the ceiling it holds one to instead.
+    /// The provisioner states it on every request whose body it bounds, and it
+    /// is the bound the provisioner holds the body to itself. Where a verified
+    /// source declares the body's length, that length is the bound: the signed
+    /// release records the length of every index alongside its digest, and the
+    /// index records the length of every package. Both are known before the
+    /// request is made and are as trustworthy as the signature they hang from.
+    /// Where nothing declares it, the bound is the ceiling the provisioner holds
+    /// that document to: a signed document, which is the trust root, and an
+    /// index nothing signed describes. A body past the bound is refused either
+    /// way, so a transport that refuses an over-declared answer up front only
+    /// refuses it sooner.
     pub fn sized(mut self, bytes: u64) -> FetchRequest<'a> {
         self.size = Some(bytes);
         self
@@ -599,6 +604,118 @@ pub(crate) fn walk_mirrors<Entry, T, E: Failover>(
     Err(unserved.unwrap_or_else(exhausted))
 }
 
+/// What a fetch reports to, and asks whether to go on.
+///
+/// Each layer's own observer, seen from a fetch: the event a layer reports a
+/// fetch with is its own, and so is the answer to whether the run should stop.
+pub(crate) trait Watch {
+    /// A URL is about to be fetched.
+    fn fetching(&mut self, url: &str);
+
+    /// Whether the run has been asked to stop.
+    fn cancelled(&mut self) -> bool;
+}
+
+/// Fetches `url` into memory, refusing a body past `limit` bytes.
+///
+/// The bound is stated twice, and this is where every in-memory fetch states
+/// it. It travels with the request through [`FetchRequest::sized`], so a
+/// transport that honours it refuses an over-declared answer before reading
+/// it, and it bounds the sink, because a transport of the caller's is free to
+/// ignore the request and the sink is the one place the bound cannot be
+/// ignored. `limit` is the length a verified source declared for the body
+/// where one did, and otherwise the ceiling the layer holds the document to,
+/// which is the one rule `sized` documents.
+pub(crate) fn fetch_bounded(
+    fetcher: &mut dyn Fetch,
+    url: &str,
+    limit: u64,
+) -> Result<Vec<u8>, FetchError> {
+    let mut bytes = Vec::new();
+    fetcher.fetch(
+        &FetchRequest::new(url).sized(limit),
+        &mut super::LimitedWriter::new(&mut bytes, limit),
+    )?;
+    Ok(bytes)
+}
+
+/// A document as the first mirror that served it delivered it.
+#[derive(Debug)]
+pub(crate) struct Fetched<'m> {
+    /// The mirror that served it, as configured.
+    ///
+    /// The one that answered rather than the list: a plan resolved against a
+    /// repository with a backstop records whichever served, and a record naming
+    /// the list would describe a choice rather than the choice made. The
+    /// Gentoo layer records no mirror, so a build without the other two never
+    /// reads it.
+    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+    pub(crate) mirror: &'m str,
+    /// The URL it arrived from, which a refusal of what arrived names.
+    pub(crate) url: String,
+    /// The bytes as they arrived.
+    pub(crate) body: Vec<u8>,
+}
+
+/// Fetches `suffix`, a mirror-relative path, into memory from the first of
+/// `mirrors` that serves it, holding it to `limit` bytes as
+/// [`fetch_bounded`] does.
+///
+/// The walk is [`walk_mirrors`]'s: a mirror that [could not serve the
+/// document](FetchError::is_failover) advances it, the last such failure is
+/// what an exhausted walk reports, and a URL the transport refuses ends it,
+/// since that is the configuration rather than the mirror.
+///
+/// `watch` is asked before each mirror, so a walk over unreachable mirrors,
+/// which spends a connect timeout on each, stops between one and the next;
+/// `cancelled` is the layer's error for that stop. It hears each URL as it is
+/// fetched, since this walk is the slowest part of a resolve and an observer
+/// that heard nothing would watch a run that looks stopped.
+///
+/// What arrived is the caller's to verify. A document that does not verify is
+/// fatal rather than a reason to ask the next mirror, since what a mirror
+/// served was answered for by the URL that was asked for, so verifying once
+/// the walk has ended is the same as verifying inside it.
+pub(crate) fn fetch_first<'m, E, W>(
+    fetcher: &mut dyn Fetch,
+    mirrors: &'m [String],
+    suffix: &str,
+    limit: u64,
+    watch: &mut W,
+    cancelled: impl Fn() -> E,
+) -> Result<Fetched<'m>, E>
+where
+    E: From<FetchError> + Failover,
+    W: Watch + ?Sized,
+{
+    // Walked as `&str`s borrowed from the list, so the mirror that answers is
+    // handed back at the list's own lifetime rather than at the walk's.
+    let mirrors: Vec<&'m str> = mirrors.iter().map(String::as_str).collect();
+    walk_mirrors(
+        &mirrors,
+        |&mirror| {
+            if watch.cancelled() {
+                return Err(cancelled());
+            }
+            let url = mirror_url(mirror, suffix);
+            watch.fetching(&url);
+            let body = fetch_bounded(fetcher, &url, limit)?;
+            Ok(Fetched { mirror, url, body })
+        },
+        || E::from(no_mirror(suffix)),
+    )
+}
+
+/// The failure a mirror walk reports when it had nowhere to walk.
+///
+/// Unreachable as the layers are configured, since every builder composes its
+/// mirror list with a primary in it. It is a configuration
+/// failure rather than a missing resource, which is also what keeps it out of
+/// the failover class: there is nothing to advance to.
+pub(crate) fn no_mirror(suffix: &str) -> FetchError {
+    FetchError::url(suffix, "no mirror is configured to fetch it from")
+}
+
 /// Joins a mirror-relative path onto a mirror's URL.
 ///
 /// A configured mirror may or may not end in a slash and a composed suffix may
@@ -769,6 +886,222 @@ mod tests {
         // against the one that was spelled wrong.
         let malformed = FetchError::url("gopher://mirror.invalid/x", "unsupported scheme");
         assert!(!malformed.is_failover(), "{malformed}");
+    }
+
+    /// A layer's error, as a walk sees one: a transport failure, or the stop.
+    #[derive(Debug)]
+    enum Walked {
+        Fetch(FetchError),
+        Cancelled,
+    }
+
+    impl From<FetchError> for Walked {
+        fn from(err: FetchError) -> Walked {
+            Walked::Fetch(err)
+        }
+    }
+
+    impl Failover for Walked {
+        fn is_failover(&self) -> bool {
+            matches!(self, Walked::Fetch(err) if err.is_failover())
+        }
+    }
+
+    /// A watch recording what it heard, answering "stop" once it has been
+    /// asked `allowed` times.
+    struct Asked {
+        fetched: Vec<String>,
+        asked: usize,
+        allowed: usize,
+    }
+
+    impl Asked {
+        fn patient() -> Asked {
+            Asked::stopping_after(usize::MAX)
+        }
+
+        fn stopping_after(allowed: usize) -> Asked {
+            Asked {
+                fetched: Vec::new(),
+                asked: 0,
+                allowed,
+            }
+        }
+    }
+
+    impl Watch for Asked {
+        fn fetching(&mut self, url: &str) {
+            self.fetched.push(url.to_string());
+        }
+
+        fn cancelled(&mut self) -> bool {
+            self.asked += 1;
+            self.asked > self.allowed
+        }
+    }
+
+    /// A transport that refuses every URL beginning with `refused` with a
+    /// fixed error and serves `body` for any other, recording every URL it was
+    /// asked for and the size each request stated.
+    struct Failing {
+        refused: &'static str,
+        refusal: fn(&str) -> FetchError,
+        body: Vec<u8>,
+        asked: Vec<(String, Option<u64>)>,
+    }
+
+    impl Failing {
+        fn refusing(refused: &'static str, refusal: fn(&str) -> FetchError) -> Failing {
+            Failing {
+                refused,
+                refusal,
+                body: b"from the backstop".to_vec(),
+                asked: Vec::new(),
+            }
+        }
+    }
+
+    impl Fetch for Failing {
+        fn fetch(
+            &mut self,
+            request: &FetchRequest<'_>,
+            sink: &mut dyn Write,
+        ) -> Result<(), FetchError> {
+            self.asked.push((request.url().to_string(), request.size()));
+            if request.url().starts_with(self.refused) {
+                return Err((self.refusal)(request.url()));
+            }
+            sink.write_all(&self.body)
+                .map_err(FetchError::at("writing the body", request.url()))
+        }
+    }
+
+    const PRIMARY: &str = "https://primary.example/debian";
+    const BACKSTOP: &str = "https://snapshot.example/debian";
+
+    /// Walks a two-mirror list with `fetcher`.
+    fn walk<'m>(
+        fetcher: &mut Failing,
+        mirrors: &'m [String],
+        watch: &mut Asked,
+    ) -> Result<Fetched<'m>, Walked> {
+        fetch_first(
+            fetcher,
+            mirrors,
+            "dists/stable/Release",
+            1024,
+            watch,
+            || Walked::Cancelled,
+        )
+    }
+
+    fn both() -> [String; 2] {
+        [PRIMARY.to_string(), BACKSTOP.to_string()]
+    }
+
+    #[test]
+    fn a_walk_advances_past_a_mirror_that_could_not_serve() {
+        // Every way a mirror can decline to serve is a reason to try the next
+        // one: the backstop exists for precisely the outage a 5xx reports, and
+        // a CDN answers an absent object with 403 as readily as with 404.
+        for refusal in [
+            |url: &str| FetchError::not_found(url),
+            |url: &str| FetchError::status(url, 503),
+            |url: &str| FetchError::status(url, 403),
+            |url: &str| {
+                FetchError::io(
+                    "connecting",
+                    url,
+                    io::Error::from(io::ErrorKind::ConnectionRefused),
+                )
+            },
+        ] {
+            let mut fetcher = Failing::refusing(PRIMARY, refusal);
+            let mirrors = both();
+            let mut watch = Asked::patient();
+            let served = walk(&mut fetcher, &mirrors, &mut watch).expect("the backstop answers");
+            assert_eq!(served.body, b"from the backstop");
+            // The mirror that served, not the one asked first: a plan resolved
+            // this way records which mirror answered.
+            assert_eq!(served.mirror, BACKSTOP);
+            assert_eq!(served.url, format!("{BACKSTOP}/dists/stable/Release"));
+            assert_eq!(fetcher.asked.len(), 2, "{:?}", fetcher.asked);
+            // Each URL is announced as it is fetched.
+            assert_eq!(watch.fetched.len(), 2, "{:?}", watch.fetched);
+        }
+    }
+
+    #[test]
+    fn a_walk_stops_at_a_url_the_transport_refuses() {
+        // A URL the transport cannot parse is the caller's configuration, not
+        // the mirror's state; trying the next mirror would bury the mistake,
+        // and report it against the backstop rather than the mirror that
+        // carries it.
+        let mut fetcher = Failing::refusing(PRIMARY, |url| FetchError::url(url, "unsupported"));
+        let mirrors = both();
+        let result = walk(&mut fetcher, &mirrors, &mut Asked::patient());
+        assert!(
+            matches!(&result, Err(Walked::Fetch(FetchError::Url { url, .. })) if url.starts_with(PRIMARY)),
+            "{result:?}",
+        );
+        assert_eq!(
+            fetcher.asked.len(),
+            1,
+            "the walk stopped at the first mirror"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_walk_is_reported_against_the_mirror_it_asked_last() {
+        // Keeping the last failure is what makes the diagnostic survive a
+        // walk, and reporting the first would point at a mirror that may be
+        // perfectly healthy.
+        let mut fetcher = Failing::refusing("https://", |url| FetchError::status(url, 503));
+        let mirrors = both();
+        let result = walk(&mut fetcher, &mirrors, &mut Asked::patient());
+        assert!(
+            matches!(&result, Err(Walked::Fetch(FetchError::Status { url, .. })) if url.starts_with(BACKSTOP)),
+            "{result:?}",
+        );
+        assert_eq!(fetcher.asked.len(), 2);
+    }
+
+    #[test]
+    fn a_walk_stops_between_mirrors_once_the_run_is_cancelled() {
+        // An unreachable mirror costs a connect timeout, so a list of them is
+        // a step long enough to want stopping in the middle of: the watch is
+        // asked before each mirror, and the stop is the layer's own error
+        // rather than a failure the walk advances past.
+        let mut fetcher = Failing::refusing(PRIMARY, |url| FetchError::status(url, 503));
+        let mirrors = both();
+        let mut watch = Asked::stopping_after(1);
+        let result = walk(&mut fetcher, &mirrors, &mut watch);
+        assert!(matches!(result, Err(Walked::Cancelled)), "{result:?}");
+        assert_eq!(fetcher.asked.len(), 1, "the backstop was never asked");
+
+        let mut fetcher = Failing::refusing(PRIMARY, |url| FetchError::status(url, 503));
+        let result = walk(&mut fetcher, &mirrors, &mut Asked::stopping_after(0));
+        assert!(matches!(result, Err(Walked::Cancelled)), "{result:?}");
+        assert!(fetcher.asked.is_empty(), "nothing is fetched once stopped");
+    }
+
+    #[test]
+    fn a_bounded_fetch_states_its_bound_and_holds_the_sink_to_it() {
+        // The bound travels with the request for a transport that honours it,
+        // and the sink holds it for one that does not, so an oversized body is
+        // refused as it arrives rather than after it is held.
+        let fetch = |len: usize| {
+            let mut fetcher = Failing::refusing("none://", |url| FetchError::not_found(url));
+            fetcher.body = vec![b'x'; len];
+            let result = fetch_bounded(&mut fetcher, "http://mirror.example/x", 64);
+            assert_eq!(fetcher.asked[0].1, Some(64), "the request states the bound");
+            result
+        };
+        assert_eq!(fetch(64).expect("a body at the bound arrives").len(), 64);
+        assert!(
+            matches!(fetch(65), Err(FetchError::Io { .. })),
+            "a body past the bound is refused",
+        );
     }
 
     #[test]

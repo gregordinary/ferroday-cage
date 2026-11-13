@@ -104,8 +104,8 @@ use super::layer::{BuildLayer, Staging};
 use super::openpgp::{Keyring, OpenPgpError};
 use super::rooted::Rooted;
 use super::{
-    Delegate, Failover, Fetch, FetchError, FetchRequest, HttpFetch, LimitedWriter, PackageCache,
-    ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, Tarball, mirror_url,
+    Delegate, Failover, Fetch, FetchError, Fetched, HttpFetch, PackageCache, ProvisionError,
+    ProvisionEvent, ProvisionRequest, Provisioner, Tarball, fetch_first, mirror_url, no_mirror,
     walk_mirrors,
 };
 use crate::IdentityMap;
@@ -1203,44 +1203,17 @@ impl Gentoo {
         walk_mirrors(
             &index::NAMES,
             |name| {
-                let suffix = format!("{directory}/{name}");
-                let served = self.read_bytes(&suffix, MAX_INDEX_BYTES, to)?;
-                read_index_body(served, MAX_INDEX_BYTES)
+                let Fetched { url, body, .. } = fetch_first(
+                    &mut self.fetcher,
+                    &self.mirrors,
+                    &format!("{directory}/{name}"),
+                    MAX_INDEX_BYTES,
+                    to,
+                    || GentooError::Cancelled,
+                )?;
+                read_index_body(&url, body, MAX_INDEX_BYTES)
             },
             || GentooError::Fetch(no_mirror(&directory)),
-        )
-    }
-
-    /// Fetches one unsigned document, walking the mirrors as
-    /// [`read_signed`](Self::read_signed) does but stopping short of a
-    /// verification there is nothing to perform.
-    ///
-    /// Kept apart from that walk rather than folded into it, because the two
-    /// differ in what a failure means and not only in a step: a document that
-    /// does not verify is fatal there and there is no such outcome here, so a
-    /// shared body would carry a flag that decides whether the layer is
-    /// checking a signature. The index has none to check.
-    fn read_bytes(
-        &mut self,
-        suffix: &str,
-        limit: u64,
-        to: Reporting<'_>,
-    ) -> Result<Fetched, GentooError> {
-        let fetcher = &mut self.fetcher;
-        walk_mirrors(
-            &self.mirrors,
-            |mirror| {
-                stop_if_cancelled(to)?;
-                let url = mirror_url(mirror, suffix);
-                to.progress(GentooEvent::Fetching { url: &url });
-                let mut bytes = Vec::new();
-                fetcher.fetch(
-                    &FetchRequest::new(&url).sized(limit),
-                    &mut LimitedWriter::new(&mut bytes, limit),
-                )?;
-                Ok(Fetched { url, body: bytes })
-            },
-            || GentooError::Fetch(no_mirror(suffix)),
         )
     }
 
@@ -1442,55 +1415,33 @@ impl Gentoo {
         Ok(())
     }
 
-    /// Fetches a cleartext-signed document and returns it as the mirror that
-    /// answered served it.
+    /// Fetches a cleartext-signed document from the first mirror that serves
+    /// it ([`fetch_first`]) and verifies it.
     ///
-    /// The mirror list is walked in order, advancing past a mirror that could
-    /// not serve the document. One that serves something that does not verify is
-    /// fatal rather than a reason to try the next: what it served was answered
-    /// for by the URL that was asked for, and the answer to a refused signature
-    /// is never to ask somewhere else. A URL the transport will not accept is
-    /// fatal for the same reason -- it is the configuration rather than the
-    /// mirror, and walking past it would report the failure against a mirror
-    /// that was spelled fine.
+    /// A mirror that serves something that does not verify is fatal rather than
+    /// a reason to try the next: what it served was answered for by the URL
+    /// that was asked for, and the answer to a refused signature is never to
+    /// ask somewhere else.
     fn read_signed(
         &mut self,
         suffix: &str,
         limit: u64,
         to: Reporting<'_>,
     ) -> Result<Served, GentooError> {
-        let fetcher = &mut self.fetcher;
-        let keyring = &self.keyring;
-        walk_mirrors(
-            &self.mirrors,
-            |mirror| {
-                // Before each mirror rather than before the walk: an
-                // unreachable mirror costs a connect timeout, so a list of them
-                // is a step long enough to want stopping in the middle of.
-                stop_if_cancelled(to)?;
-                let url = mirror_url(mirror, suffix);
-                // Reported per mirror rather than per document: this walk spends
-                // one mirror timeout per unreachable mirror, and an observer
-                // that saw only the resolution would watch a bootstrap that
-                // looks stopped.
-                to.progress(GentooEvent::Fetching { url: &url });
-                let mut bytes = Vec::new();
-                fetcher.fetch(
-                    &FetchRequest::new(&url).sized(limit),
-                    &mut LimitedWriter::new(&mut bytes, limit),
-                )?;
-                let verified = keyring
-                    .verify(&bytes, true)
-                    .map_err(|err| GentooError::signature(&url, err))?;
-                Ok(Served {
-                    url,
-                    body: verified.body,
-                    certificate: verified.certificate,
-                    document: bytes,
-                })
-            },
-            || GentooError::Fetch(no_mirror(suffix)),
-        )
+        let Fetched { url, body, .. } =
+            fetch_first(&mut self.fetcher, &self.mirrors, suffix, limit, to, || {
+                GentooError::Cancelled
+            })?;
+        let verified = self
+            .keyring
+            .verify(&body, true)
+            .map_err(|err| GentooError::signature(&url, err))?;
+        Ok(Served {
+            url,
+            body: verified.body,
+            certificate: verified.certificate,
+            document: body,
+        })
     }
 
     /// The mirror-relative path of something in this architecture's autobuilds
@@ -1498,18 +1449,6 @@ impl Gentoo {
     fn url(&self, suffix: &str) -> String {
         format!("releases/{}/autobuilds/{suffix}", self.architecture)
     }
-}
-
-/// An unsigned document as it arrived, and the URL that served it.
-///
-/// The URL is the whole one, as [`Served`]'s is and for the same reason: a walk
-/// over several mirrors is exactly when a refusal has to name which one
-/// answered.
-struct Fetched {
-    /// The URL the document arrived from.
-    url: String,
-    /// The bytes, in whatever compression the archive served them.
-    body: Vec<u8>,
 }
 
 /// Reads a fetched index body into a parsed index, refusing one that
@@ -1533,8 +1472,7 @@ struct Fetched {
 /// What arrived is let go once it is decompressed, and the text once it is
 /// parsed, so what reading an index holds at once is its text and the records
 /// parsed out of it.
-fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooError> {
-    let Fetched { url, body: served } = served;
+fn read_index_body(url: &str, served: Vec<u8>, limit: u64) -> Result<index::Index, GentooError> {
     let refused = match compress::Codec::of(&served) {
         compress::Codec::Gzip | compress::Codec::Plain => None,
         compress::Codec::Xz => Some("xz"),
@@ -1542,7 +1480,7 @@ fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooEr
     };
     if let Some(codec) = refused {
         return Err(GentooError::index(
-            &url,
+            url,
             format!(
                 "is compressed with {codec}, and the archive publishes the index only as gzip or \
                  as plain text"
@@ -1551,12 +1489,12 @@ fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooEr
     }
     let bytes = compress::inflate(&served, limit).map_err(|refused| match refused {
         compress::Inflate::Undecodable(err) => GentooError::Index {
-            subject: url.clone(),
+            subject: url.to_string(),
             reason: "does not decompress".to_string(),
             source: Some(err),
         },
         compress::Inflate::Overlong => GentooError::index(
-            &url,
+            url,
             format!("holds more than the {limit} bytes this layer reads of an index"),
         ),
     })?;
@@ -1571,7 +1509,7 @@ fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooEr
     drop(text);
     if parsed.records().is_empty() {
         return Err(GentooError::index(
-            &url,
+            url,
             "names no package this layer can act on",
         ));
     }
@@ -1585,7 +1523,7 @@ fn read_index_body(served: Fetched, limit: u64) -> Result<index::Index, GentooEr
         && read < declared
     {
         return Err(GentooError::index(
-            &url,
+            url,
             format!("states that it holds {declared} packages and carries {read}"),
         ));
     }
@@ -1637,17 +1575,6 @@ struct Digested {
 /// there, and a resolution reads it back.
 fn kept_digests(dir: &Path, file: &str) -> PathBuf {
     dir.join(format!("{file}.DIGESTS"))
-}
-
-/// The failure a mirror walk reports when it had nowhere to walk.
-///
-/// Unreachable as the layer is configured — [`GentooBuilder::build`] composes at
-/// least the default archive, so every walk has a mirror and either returns or
-/// records that mirror's failure. It is a configuration failure rather than a
-/// missing resource, which is also what keeps it out of the failover class:
-/// there is nothing to advance to.
-fn no_mirror(path: &str) -> FetchError {
-    FetchError::url(path, "no mirror is configured to fetch it from")
 }
 
 impl Provisioner for Gentoo {
@@ -2166,7 +2093,7 @@ fn verify(mut file: File, tarball: &Path, expected: &Digest) -> Result<File, Gen
 
 /// A download's view of the observer: the layer's own fetch event, and its
 /// answer to whether the run should stop.
-impl cache::Watch for dyn GentooObserver + '_ {
+impl super::Watch for dyn GentooObserver + '_ {
     fn fetching(&mut self, url: &str) {
         self.progress(GentooEvent::Fetching { url });
     }
@@ -3083,6 +3010,7 @@ mod tests {
 
     use super::*;
     use crate::ErrorChain;
+    use crate::provision::FetchRequest;
     use crate::provision::digest::Algorithm;
     use crate::provision::openpgp::fixture;
     use crate::scratch::Scratch;
@@ -3975,14 +3903,11 @@ mod tests {
         let body = index_body().replace("PACKAGES: 1\n", "");
         let ceiling = body.len() as u64;
         for served in [body.as_bytes().to_vec(), gzipped(&body)] {
-            let fetched = |body: Vec<u8>| Fetched {
-                url: binhost_url("Packages"),
-                body,
-            };
-            let read = read_index_body(fetched(served.clone()), ceiling)
+            let url = binhost_url("Packages");
+            let read = read_index_body(&url, served.clone(), ceiling)
                 .expect("an index of exactly the ceiling reads");
             assert_eq!(read.records().len(), 2);
-            let err = read_index_body(fetched(served), ceiling - 1)
+            let err = read_index_body(&url, served, ceiling - 1)
                 .expect_err("an index past the ceiling is refused");
             assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
             assert!(err.to_string().contains("holds more than"), "{err}");
@@ -3999,14 +3924,8 @@ mod tests {
         let zstd = [&[0x28, 0xB5, 0x2F, 0xFD][..], b"not a frame"].concat();
         let skippable = [&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0][..], b"x"].concat();
         for (body, codec) in [(xz, "xz"), (zstd, "zstd"), (skippable, "zstd")] {
-            let err = read_index_body(
-                Fetched {
-                    url: binhost_url("Packages.gz"),
-                    body,
-                },
-                MAX_INDEX_BYTES,
-            )
-            .expect_err("the compression is refused");
+            let err = read_index_body(&binhost_url("Packages.gz"), body, MAX_INDEX_BYTES)
+                .expect_err("the compression is refused");
             assert!(matches!(err, GentooError::Index { .. }), "{err:?}");
             assert!(
                 err.to_string()

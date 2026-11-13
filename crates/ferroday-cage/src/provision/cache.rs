@@ -49,6 +49,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use super::fetch::Watch;
 use super::rooted::Rooted;
 use super::{
     Failover, Fetch, FetchError, FetchJob, FetchRequest, LimitedWriter, ProvisionError, Staged,
@@ -266,18 +267,6 @@ pub(crate) fn open_entry(path: &Path) -> io::Result<File> {
         ));
     };
     Rooted::open(crate::path::parent_of(path))?.reader(name)
-}
-
-/// What a download reports to, and asks whether to go on.
-///
-/// Each layer's own observer, seen from the cache: the event a layer reports a
-/// fetch with is its own, and so is the answer to whether the run should stop.
-pub(crate) trait Watch {
-    /// A URL is about to be fetched.
-    fn fetching(&mut self, url: &str);
-
-    /// Whether the run has been asked to stop.
-    fn cancelled(&mut self) -> bool;
 }
 
 /// A cache entry a download fills: where it is published, and the most its body

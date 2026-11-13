@@ -961,6 +961,12 @@ consumer upgrading can skip it.
   refused as `ConfigError::NestedUsernsProcfsReadOnly`, naming it. It was
   refused as `ConfigError::NestedUsernsNeedsProcfs`, which says the sandbox
   mounts no procfs at all.
+- An Alpine resolution, `available`, and a bootstrap's index read stop when
+  the observer asks, which is now asked before each mirror the read walks, as
+  the Debian and Gentoo index reads ask. A read walking unreachable mirrors
+  could not be stopped until every one had failed. Each index request also
+  states the ceiling the layer holds an index to, so `HttpFetch` refuses one
+  whose declared length is past it before reading the body.
 
 ### Internal
 
