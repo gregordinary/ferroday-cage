@@ -1847,10 +1847,7 @@ const SUPERVISOR_MASK: SigSet = SigSet::of(&[Signal::CHILD]);
 /// one that arrived meanwhile is pending, and ignoring it discards it: there is
 /// no moment at which one reaches this process at the default.
 fn ignore_outside_signals() -> Result<(), Errno> {
-    for number in 1..=64 {
-        // SAFETY: the numbers are non-zero and within the kernel's signal
-        // range on every architecture.
-        let signal = unsafe { Signal::from_raw_unchecked(number) };
+    for signal in every_signal() {
         if signal == Signal::KILL
             || signal == Signal::STOP
             || signal == Signal::CHILD
@@ -2194,13 +2191,10 @@ fn report_status(fd: BorrowedFd<'_>, status: WaitStatus) {
 /// Resetting the dispositions first leaves nothing to run when the mask comes
 /// off.
 pub(super) fn reset_signals(blocked: &SigSet) -> Result<(), Errno> {
-    for number in 1..=64 {
-        if number == Signal::KILL.as_raw() || number == Signal::STOP.as_raw() {
+    for signal in every_signal() {
+        if signal == Signal::KILL || signal == Signal::STOP {
             continue;
         }
-        // SAFETY: the numbers are non-zero and within the kernel's signal
-        // range on every architecture.
-        let signal = unsafe { Signal::from_raw_unchecked(number) };
         match sys::set_disposition(signal, Disposition::Default) {
             Ok(()) => {}
             // Numbers the kernel reserves are skipped, not errors.
@@ -2213,6 +2207,27 @@ pub(super) fn reset_signals(blocked: &SigSet) -> Result<(), Errno> {
     // forked, and after the loop above has no inherited handler to run.
     unsafe { sys::sigprocmask(How::SetMask, Some(blocked)) }?;
     Ok(())
+}
+
+/// Every signal number from 1 to 64, the kernel's range on every architecture
+/// the build admits, for the two loops that set every disposition after a fork:
+/// [`reset_signals`] and [`ignore_outside_signals`].
+///
+/// rustix asks that a number a libc reserves for itself, such as the ones
+/// glibc keeps for its threads and timers, not be used to alter a handler, so
+/// that the libc's own use of the signal is not disturbed. That use belongs to
+/// a process with a libc running in it, and none runs here: each of these
+/// processes is a single-threaded copy of the caller that makes raw syscalls
+/// only and ends in `execve` or `exit_group`. A command it executes starts its
+/// own libc against the dispositions `execve` leaves, the defaults the reset
+/// put back.
+fn every_signal() -> impl Iterator<Item = Signal> {
+    (1..=64).map(|number| {
+        // SAFETY: the number is non-zero and within the kernel's signal range
+        // on every architecture the build admits. One a libc reserves alters a
+        // disposition only in a process no libc runs in, as stated above.
+        unsafe { Signal::from_raw_unchecked(number) }
+    })
 }
 
 /// Holds each standard stream number the caller left closed with a
@@ -3227,9 +3242,11 @@ impl StackPath {
         }
     }
 
-    /// Appends literal bytes, if they fit alongside the terminating NUL.
+    /// Appends bytes, if they fit alongside the terminating NUL and hold no NUL
+    /// of their own; anything else is dropped whole. Every caller appends
+    /// literals and digits, which always pass.
     fn push(&mut self, bytes: &[u8]) {
-        if self.len + bytes.len() >= self.buf.len() {
+        if self.len + bytes.len() >= self.buf.len() || bytes.contains(&0) {
             return;
         }
         for &byte in bytes {
@@ -3257,8 +3274,9 @@ impl StackPath {
     }
 
     fn as_cstr(&self) -> &CStr {
-        // SAFETY: the buffer is zero-initialized and `push` never lets `len`
-        // reach the final byte, so the slice holds exactly one NUL, at the end.
+        // SAFETY: the buffer is zero-initialized, `push` never lets `len` reach
+        // the final byte, and it appends no NUL, so the slice holds exactly one
+        // NUL, at the end.
         unsafe { CStr::from_bytes_with_nul_unchecked(&self.buf[..self.len + 1]) }
     }
 }
@@ -3588,6 +3606,17 @@ mod tests {
             !dir.join("absent").exists(),
             "a file was created through the link",
         );
+    }
+
+    #[test]
+    fn a_stack_path_drops_what_would_end_it_early_or_overrun_it() {
+        let mut path = StackPath::new();
+        path.push(b"/proc/self/fd/");
+        path.push(b"3\0/etc");
+        path.push_decimal(7);
+        assert_eq!(path.as_cstr(), c"/proc/self/fd/7");
+        path.push(&[b'x'; 48]);
+        assert_eq!(path.as_cstr(), c"/proc/self/fd/7");
     }
 
     #[test]

@@ -266,6 +266,14 @@ Writing arbitrary bytes into a stack buffer as a `CStr`, post-fork: the refusal 
 is about what a `CStr` can hold rather than about what a path may name."""
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/mechanism/child.rs"
+count = 1
+why = """\
+`StackPath::push`, which builds the launch stages' `/proc` paths in a stack \
+buffer post-fork: the refusal keeps the buffer a `CStr`, as copy-in's does, and \
+says nothing about what a path may name."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/src/provision/debian/version.rs"
 count = 1
 why = """\
