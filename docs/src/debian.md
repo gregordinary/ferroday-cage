@@ -250,8 +250,11 @@ what an unqualified entry names, and `:any` names only a package that is
 `Multi-Arch: allowed`. Any other architecture names nothing the install set
 holds.
 
-A choice is where a conflict is avoided. A dependency group takes its first
-alternative that conflicts with nothing selected so far: the package the
+A choice is where a conflict is avoided, so what is selected when a group is met
+decides it, and the resolution meets groups in the order apt does. It selects
+the whole install list first, then walks it in order, each package's
+dependencies depth first, its `Pre-Depends` before its `Depends`. A dependency
+group takes its first alternative that conflicts with nothing selected so far: the package the
 alternative names, then each of its providers, then the next alternative. A
 group such as `default-mta | mail-transport-agent` beside a selected `postfix`
 therefore never draws in a second mail transport agent. Where every alternative

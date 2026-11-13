@@ -15,6 +15,19 @@
 //! and fails the compile an hour later, naming a library that is present and
 //! correct.
 //!
+//! # The order of the walk
+//!
+//! A choice depends on what is selected when its group is met, so the order the
+//! walk meets groups in is apt's. Every seed is selected before any group is
+//! resolved, as apt marks every package its command line names before it marks
+//! any dependency. The seeds are then walked in turn, each depth first: its
+//! `Pre-Depends` then its `Depends`, and a package a group selects is walked
+//! whole before the next group of the package that needed it. A group answered
+//! by a package already selected walks nothing, so a seed met as another's
+//! dependency waits for its own turn. apt 2.8 marks in that order: where `aa`
+//! depends on `mm` and on `bb | cc`, `mm` on `xx`, and `bb` conflicts with
+//! `xx`, it marks `xx` before it meets `bb | cc`, and takes `cc`.
+//!
 //! A group nothing satisfies is an error rather than a silent omission. Leaving
 //! it out produces a root that cannot work, and produces it quietly: the
 //! post-install check verifies that every *selected* package configured, and a
@@ -695,7 +708,10 @@ struct Closure<'a> {
     candidates: Candidates<'a>,
     excluded: HashSet<&'a str>,
     selected: BTreeMap<String, Package>,
-    /// The selected packages whose groups the walk has still to resolve.
+    /// The selected packages whose groups the walk has still to resolve, in
+    /// the order it takes them up: the seeds, and what the merged set's check
+    /// upgrades. A package a group selects is walked as it is selected rather
+    /// than waiting here; [`walk`](Self::walk) takes it off the back.
     queue: VecDeque<String>,
     refusals: Refusals,
     /// Every group refused so far, by who declares it and its place among
@@ -717,21 +733,44 @@ struct Closure<'a> {
 
 impl Closure<'_> {
     /// Resolves every group of every package selected since the walk last
-    /// ran, and of every package those select in turn.
+    /// ran, and of every package those select in turn, depth first, as the
+    /// module's [order of the walk](self#the-order-of-the-walk) describes.
     fn walk(&mut self) {
         while let Some(name) = self.queue.pop_front() {
-            for (at, group) in relations(&self.selected[&name]).iter().enumerate() {
-                self.resolve(&name, at, group);
+            // Each entry is a package and the groups it has still to resolve.
+            let mut stack: Vec<(String, VecDeque<(usize, Dependency)>)> = Vec::new();
+            let groups = relations(&self.selected[&name]).into_iter().enumerate();
+            stack.push((name, groups.collect()));
+            while let Some((name, groups)) = stack.last_mut() {
+                // A package a later selection unselected has nothing left to
+                // need.
+                let Some((at, group)) = groups
+                    .pop_front()
+                    .filter(|_| self.selected.contains_key(name.as_str()))
+                else {
+                    stack.pop();
+                    continue;
+                };
+                let name = name.clone();
+                if let Some(chosen) = self.resolve(&name, at, &group) {
+                    // Walked here rather than when the queue reaches it.
+                    self.queue.retain(|queued| *queued != chosen);
+                    let groups = relations(&self.selected[&chosen]).into_iter().enumerate();
+                    stack.push((chosen, groups.collect()));
+                }
             }
         }
     }
 
     /// Resolves `group`, the `at`th of the groups `required_by` declares,
     /// and records its refusal, where it is refused, once.
-    fn resolve(&mut self, required_by: &str, at: usize, group: &Dependency) {
+    ///
+    /// Returns the package the group selected, where it selected one, which
+    /// [`add`] has queued.
+    fn resolve(&mut self, required_by: &str, at: usize, group: &Dependency) -> Option<String> {
         let key = (required_by.to_string(), at);
         if self.refused.contains(&key) {
-            return;
+            return None;
         }
         let waiting = self.queue.len();
         if let Some(refusal) = resolve_group(
@@ -746,11 +785,11 @@ impl Closure<'_> {
             self.refusals.push(refusal);
         }
         // A group selects one package at most, which `add` queued last.
-        if self.queue.len() > waiting
-            && let Some(chosen) = self.queue.back().cloned()
-        {
-            self.unselect_named(&chosen);
-        }
+        let chosen = (self.queue.len() > waiting)
+            .then(|| self.queue.back().cloned())
+            .flatten()?;
+        self.unselect_named(&chosen);
+        Some(chosen)
     }
 
     /// Unselects each package `chosen` states a clash against that a
@@ -2184,6 +2223,52 @@ mod tests {
         assert_eq!(
             conflicts(install(&packages("Conflicts", "bb"), &["aa"])),
             expected,
+        );
+    }
+
+    #[test]
+    fn the_walk_marks_depth_first_in_the_order_apt_does() {
+        // xx is two levels below zz, and bb conflicts with it. apt walks zz
+        // whole before aa, so xx is there when aa's `bb | cc` is met, and cc
+        // answers; a walk taking zz's and aa's groups level by level would
+        // meet `bb | cc` first, take bb, and refuse xx after it.
+        let shared = format!(
+            "{}{}{}{}{}",
+            stanza("mm", "xx", ""),
+            stanza("bb", "", "Conflicts: xx"),
+            stanza("cc", "", ""),
+            stanza("xx", "", ""),
+            stanza("zz", "mm", ""),
+        );
+        let index_with = |aa: &str| index(&format!("{shared}{aa}"));
+        let walked = install(&index_with(&stanza("aa", "bb | cc", "")), &["zz", "aa"]);
+        assert_eq!(
+            names(&walked.into_packages()),
+            ["aa", "cc", "mm", "xx", "zz"]
+        );
+
+        // Within one package: mm, its first group, is walked down to xx
+        // before its second is met. A `Pre-Depends` comes before a `Depends`
+        // however the stanza orders them.
+        for aa in [
+            stanza("aa", "mm, bb | cc", ""),
+            stanza("aa", "bb | cc", "Pre-Depends: mm"),
+        ] {
+            let walked = install(&index_with(&aa), &["aa"]);
+            assert_eq!(
+                names(&walked.into_packages()),
+                ["aa", "cc", "mm", "xx"],
+                "{aa}"
+            );
+        }
+
+        // A seed another seed depends on waits for its own turn: aa's zz is
+        // already selected, so nothing below it is walked before `bb | cc`.
+        // apt takes bb and fails the same way.
+        let aa = stanza("aa", "zz, bb | cc", "");
+        assert_eq!(
+            conflicts(install(&index_with(&aa), &["aa", "zz"])),
+            ["bb 1.0 states \"Conflicts: xx\", and the resolution selects xx 1.0 too"],
         );
     }
 
