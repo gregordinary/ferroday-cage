@@ -3630,12 +3630,7 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
                 return Err(format!("{named} and {flag} are alternatives"));
             }
             target = Some((flag, removal, removal_target(flag, dest)?));
-        } else if arg == "--identity-map" {
-            map = parse_identity_map(
-                "--identity-map",
-                &string_value("--identity-map", &mut args)?,
-            )?;
-        } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
+        } else if let Some(value) = mode_value("--identity-map", &arg, &mut args)? {
             map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
         } else if arg == "--keep-lock" {
             keep_lock = true;
@@ -3672,6 +3667,24 @@ fn parse_removal(args: Vec<OsString>) -> Result<Invocation, String> {
         Removal::OverlayUpper => Removal::OverlayUpper,
     };
     Ok(Invocation::Remove { dest, map, removal })
+}
+
+/// The value `arg` gives `flag` in a mode's parser, written separated, as
+/// `--flag VALUE`, or joined, as `--flag=VALUE`; `None` where `arg` is not
+/// `flag` at all.
+///
+/// A mode's parser takes each of its flags in both forms, as a launch's does
+/// through [`apply_flag`]. A separated value is the next argument, read by
+/// [`value_for`], which refuses one that is a flag's spelling.
+fn mode_value(
+    flag: &str,
+    arg: &OsStr,
+    args: &mut dyn Iterator<Item = OsString>,
+) -> Result<Option<OsString>, String> {
+    if arg == flag {
+        return value_for(flag, "a value", Arity::One, args).map(Some);
+    }
+    Ok(flag_value(arg, format!("{flag}=").as_bytes()))
 }
 
 /// The tree a mode flag names, refusing an empty value.
@@ -3732,28 +3745,15 @@ fn parse_gentoo_variants(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
-        if arg == "--gentoo-variants" {
-            architecture = Some(string_value("--gentoo-variants", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-variants=") {
+        if let Some(value) = mode_value("--gentoo-variants", &arg, &mut args)? {
             architecture = Some(into_string("--gentoo-variants", value)?);
-        } else if arg == "--gentoo-mirror" {
-            let url = string_value("--gentoo-mirror", &mut args)?;
-            mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror=") {
+        } else if let Some(value) = mode_value("--gentoo-mirror", &arg, &mut args)? {
             let url = into_string("--gentoo-mirror", value)?;
             mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
-        } else if arg == "--gentoo-mirror-fallback" {
-            let url = string_value("--gentoo-mirror-fallback", &mut args)?;
-            fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror-fallback=") {
+        } else if let Some(value) = mode_value("--gentoo-mirror-fallback", &arg, &mut args)? {
             let url = into_string("--gentoo-mirror-fallback", value)?;
             fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
-        } else if arg == "--gentoo-max-pointer-age" {
-            max_pointer_age = Some(parse_pointer_age(&string_value(
-                "--gentoo-max-pointer-age",
-                &mut args,
-            )?)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-max-pointer-age=") {
+        } else if let Some(value) = mode_value("--gentoo-max-pointer-age", &arg, &mut args)? {
             max_pointer_age = Some(parse_pointer_age(&into_string(
                 "--gentoo-max-pointer-age",
                 value,
@@ -3821,24 +3821,14 @@ fn parse_gentoo_packages(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
-        if arg == "--gentoo-packages" {
-            architecture = Some(string_value("--gentoo-packages", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-packages=") {
+        if let Some(value) = mode_value("--gentoo-packages", &arg, &mut args)? {
             architecture = Some(into_string("--gentoo-packages", value)?);
-        } else if arg == "--gentoo-binhost" {
-            binhost = Some(string_value("--gentoo-binhost", &mut args)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-binhost=") {
+        } else if let Some(value) = mode_value("--gentoo-binhost", &arg, &mut args)? {
             binhost = Some(into_string("--gentoo-binhost", value)?);
-        } else if arg == "--gentoo-mirror" {
-            let url = string_value("--gentoo-mirror", &mut args)?;
-            mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror=") {
+        } else if let Some(value) = mode_value("--gentoo-mirror", &arg, &mut args)? {
             let url = into_string("--gentoo-mirror", value)?;
             mirror = Some(fetchable_mirror("--gentoo-mirror", url)?);
-        } else if arg == "--gentoo-mirror-fallback" {
-            let url = string_value("--gentoo-mirror-fallback", &mut args)?;
-            fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-mirror-fallback=") {
+        } else if let Some(value) = mode_value("--gentoo-mirror-fallback", &arg, &mut args)? {
             let url = into_string("--gentoo-mirror-fallback", value)?;
             fallbacks.push(fetchable_mirror("--gentoo-mirror-fallback", url)?);
         } else {
@@ -3876,12 +3866,7 @@ fn parse_gentoo_installed(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut root: Option<PathBuf> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == "--gentoo-installed" {
-            root = Some(tree_value(
-                "--gentoo-installed",
-                value_for("--gentoo-installed", "a value", Arity::One, &mut args)?,
-            )?);
-        } else if let Some(value) = flag_value(&arg, b"--gentoo-installed=") {
+        if let Some(value) = mode_value("--gentoo-installed", &arg, &mut args)? {
             root = Some(tree_value("--gentoo-installed", value)?);
         } else {
             return Err(mode_conflict(
@@ -3918,37 +3903,13 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
-        if arg == "--export-rootfs" {
-            source = Some(PathBuf::from(value_for(
-                "--export-rootfs",
-                "a value",
-                Arity::One,
-                &mut args,
-            )?));
-        } else if let Some(value) = flag_value(&arg, b"--export-rootfs=") {
+        if let Some(value) = mode_value("--export-rootfs", &arg, &mut args)? {
             source = Some(PathBuf::from(value));
-        } else if arg == "--export-to" {
-            dest = Some(PathBuf::from(value_for(
-                "--export-to",
-                "a value",
-                Arity::One,
-                &mut args,
-            )?));
-        } else if let Some(value) = flag_value(&arg, b"--export-to=") {
+        } else if let Some(value) = mode_value("--export-to", &arg, &mut args)? {
             dest = Some(PathBuf::from(value));
-        } else if arg == "--identity-map" {
-            map = parse_identity_map(
-                "--identity-map",
-                &string_value("--identity-map", &mut args)?,
-            )?;
-        } else if let Some(value) = flag_value(&arg, b"--identity-map=") {
+        } else if let Some(value) = mode_value("--identity-map", &arg, &mut args)? {
             map = parse_identity_map("--identity-map", &into_string("--identity-map", value)?)?;
-        } else if arg == "--clamp-mtime" {
-            clamp_mtime = Some(parse_epoch(
-                "--clamp-mtime",
-                &string_value("--clamp-mtime", &mut args)?,
-            )?);
-        } else if let Some(value) = flag_value(&arg, b"--clamp-mtime=") {
+        } else if let Some(value) = mode_value("--clamp-mtime", &arg, &mut args)? {
             clamp_mtime = Some(parse_epoch(
                 "--clamp-mtime",
                 &into_string("--clamp-mtime", value)?,
@@ -4726,18 +4687,13 @@ fn value_for(
     Ok(value)
 }
 
-/// Consumes the next argument as a required UTF-8 string value.
-///
-/// The library's examples carry helpers answering the same three questions —
-/// this, [`into_string`], and [`flag_value`] — and keep them because a crate's
-/// examples cannot reach another crate's code, so sharing four
-/// argument-parsing functions would mean publishing a crate for them. Each side
-/// owns the wording of its own diagnostics.
-fn string_value(name: &str, args: &mut dyn Iterator<Item = OsString>) -> Result<String, String> {
-    into_string(name, value_for(name, "a value", Arity::One, args)?)
-}
-
 /// Converts a flag value to a `String`, requiring UTF-8.
+///
+/// The library's examples carry helpers answering the same questions as this,
+/// [`value_for`], and [`flag_value`], and keep them because a crate's examples
+/// cannot reach another crate's code, so sharing the argument-parsing functions
+/// would mean publishing a crate for them. Each side owns the wording of its
+/// own diagnostics.
 fn into_string(name: &str, value: OsString) -> Result<String, String> {
     value
         .into_string()
