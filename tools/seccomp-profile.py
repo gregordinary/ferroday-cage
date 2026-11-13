@@ -10,19 +10,27 @@ addition the profile does not already allow outright. It reads moby's format,
 which Docker, Podman and CRI-O take, and the OCI runtime specification's, which
 containerd takes, since both keep their rules in one `syscalls` list.
 
-An addition the profile names in a rule of another action and no conditions,
-such as an explicit refusal, is taken out of that rule, since a profile naming
-one syscall under two unconditional actions is one a runtime will not load. That
-holds whatever the profile's default action: a profile that allows what it does
-not name can still refuse an addition by name, and once the refusal is gone the
-default allows it, so no rule is added. A rule that grants an addition only to a
-container holding a capability is left as it is. Everything else the profile
-says is unchanged, so the result refuses whatever the runtime's default refuses,
-except these.
+An addition the profile names in a rule of another action, such as an explicit
+refusal, is taken out of that rule, whether the rule holds for every call or
+only under its conditions. A profile naming one syscall under two unconditional
+actions is one a runtime will not load, and a refusal conditioned on an argument
+or on a capability is aimed at exactly the calls a launch makes: an `unshare`
+creating a user namespace, by a container without `CAP_SYS_ADMIN`. That holds
+whatever the profile's default action: a profile that allows what it does not
+name can still refuse an addition by name, and once the refusal is gone the
+default allows it, so no rule is added. A rule that allows an addition under
+conditions, such as only to a container holding a capability, is left as it
+is, beside the rule that allows it outright. Everything else the profile says is
+unchanged, so the result refuses whatever the runtime's default refuses, except
+these.
 
 Usage:
 
     python3 tools/seccomp-profile.py DEFAULT.json > PROFILE.json
+    python3 tools/seccomp-profile.py --self-test
+
+The script reads the profiles in `CASES` before any other, and refuses to write
+one where it gets a case wrong. `--self-test` reads only those.
 
 DEFAULT.json is the runtime's default profile, such as moby's `default.json`.
 The result is what Docker's `--security-opt seccomp=PROFILE.json` and a
@@ -55,8 +63,8 @@ def unconditional(rule: dict) -> bool:
 def extend(profile: dict, names: list[str]) -> dict:
     """The profile, with `names` allowed outright.
 
-    Each of `names` is taken out of every unconditional rule of another action.
-    Where the default action refuses, one rule more allows those no
+    Each of `names` is taken out of every rule of another action, conditional
+    or not. Where the default action refuses, one rule more allows those no
     unconditional rule already allows. Where it allows, they are allowed once
     nothing names them otherwise, and no rule is added.
     """
@@ -65,14 +73,14 @@ def extend(profile: dict, names: list[str]) -> dict:
     allowed = set()
     for rule in profile.get("syscalls", []):
         rule_names = rule.get("names", [])
-        if unconditional(rule):
-            if rule.get("action") == ALLOW:
+        if rule.get("action") == ALLOW:
+            if unconditional(rule):
                 allowed.update(rule_names)
-            else:
-                rule_names = [name for name in rule_names if name not in names]
-                if not rule_names:
-                    continue
-                rule = {**rule, "names": rule_names}
+        else:
+            rule_names = [name for name in rule_names if name not in names]
+            if not rule_names:
+                continue
+            rule = {**rule, "names": rule_names}
         rules.append(rule)
     missing = [name for name in names if name not in allowed]
     if missing and not allowed_by_default:
@@ -87,7 +95,95 @@ def extend(profile: dict, names: list[str]) -> dict:
     return {**profile, "syscalls": rules}
 
 
+# Profiles the extension must get right: each a name, a profile, the additions,
+# and the rules the result holds.
+CASES = [
+    (
+        "an unconditional refusal in a profile that allows by default",
+        {
+            "defaultAction": ALLOW,
+            "syscalls": [
+                {"names": ["keyctl", "reboot"], "action": "SCMP_ACT_ERRNO"},
+            ],
+        },
+        ["keyctl", "mount"],
+        [{"names": ["reboot"], "action": "SCMP_ACT_ERRNO"}],
+    ),
+    (
+        "a refusal conditioned on an argument, in either default",
+        {
+            "defaultAction": "SCMP_ACT_ERRNO",
+            "syscalls": [
+                {"names": ["read"], "action": ALLOW},
+                {
+                    "names": ["unshare", "personality"],
+                    "action": "SCMP_ACT_ERRNO",
+                    "args": [{"index": 0, "value": 268435456, "op": "SCMP_CMP_MASKED_EQ"}],
+                },
+            ],
+        },
+        ["unshare"],
+        [
+            {"names": ["read"], "action": ALLOW},
+            {
+                "names": ["personality"],
+                "action": "SCMP_ACT_ERRNO",
+                "args": [{"index": 0, "value": 268435456, "op": "SCMP_CMP_MASKED_EQ"}],
+            },
+            {"names": ["unshare"], "action": ALLOW},
+        ],
+    ),
+    (
+        "a refusal conditioned on a capability, and a grant conditioned on one",
+        {
+            "defaultAction": ALLOW,
+            "syscalls": [
+                {
+                    "names": ["mount"],
+                    "action": "SCMP_ACT_ERRNO",
+                    "excludes": {"caps": ["CAP_SYS_ADMIN"]},
+                },
+                {
+                    "names": ["setns"],
+                    "action": ALLOW,
+                    "includes": {"caps": ["CAP_SYS_ADMIN"]},
+                },
+            ],
+        },
+        ["mount", "setns"],
+        [
+            {
+                "names": ["setns"],
+                "action": ALLOW,
+                "includes": {"caps": ["CAP_SYS_ADMIN"]},
+            },
+        ],
+    ),
+]
+
+
+def self_test() -> list[str]:
+    """Every case the extension gets wrong, described."""
+    failures = []
+    for name, profile, names, expected in CASES:
+        got = [
+            {key: value for key, value in rule.items() if key != "comment"}
+            for rule in extend(profile, names)["syscalls"]
+        ]
+        if got != expected:
+            failures.append(f"{name}: wrote {got!r}, expected {expected!r}")
+    return failures
+
+
 def main(argv: list[str]) -> int:
+    problems = self_test()
+    for problem in problems:
+        print(f"seccomp-profile.py gets a case wrong: {problem}", file=sys.stderr)
+    if problems:
+        return 1
+    if argv[1:] == ["--self-test"]:
+        print(f"{len(CASES)} profiles extended as expected.")
+        return 0
     if len(argv) != 2 or argv[1].startswith("-"):
         print(
             "usage: python3 tools/seccomp-profile.py DEFAULT.json > PROFILE.json",
