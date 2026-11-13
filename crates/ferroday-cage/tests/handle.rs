@@ -5,27 +5,16 @@ mod common;
 
 use common::{Collect, process_exists, wait_gone};
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ferroday_cage::{Cage, Stdio};
-
-/// Builds a cage running `/bin/sh -c <script>` in the fixture rootfs.
-fn sh(rootfs: &Path, script: &str) -> Cage {
-    Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
-}
 
 #[test]
 fn a_deadline_expires_and_a_kill_ends_the_sandbox() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut running = sh(rootfs, "sleep 30")
+    let mut running = common::shell(rootfs, "sleep 30")
         .spawn()
         .expect("the sandbox launches");
     assert!(running.pid() > 0);
@@ -99,7 +88,7 @@ fn the_readiness_descriptor_drives_a_capturing_launch_to_its_outcome() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = sh(rootfs, "echo out; sleep 0.3; echo done");
+    let cage = common::shell(rootfs, "echo out; sleep 0.3; echo done");
     let mut observer = Collect::default();
     let (status, calls) = {
         let mut running = cage
@@ -131,7 +120,7 @@ fn the_readiness_descriptor_reports_a_kill() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut running = sh(rootfs, "sleep 30")
+    let mut running = common::shell(rootfs, "sleep 30")
         .spawn()
         .expect("the sandbox launches");
     assert_eq!(running.try_wait().expect("nothing is ready"), None);
@@ -160,7 +149,7 @@ fn a_core_dump_is_reported_as_the_kernel_reported_it() {
         .status()
         .expect("the reference runs");
     assert_eq!(reference.signal(), Some(11), "{reference:?}");
-    let status = sh(rootfs, crash)
+    let status = common::shell(rootfs, crash)
         .run()
         .expect("the sandbox runs to completion");
     assert_eq!(status.signal(), Some(11), "{status}");
@@ -172,7 +161,9 @@ fn a_core_dump_is_reported_as_the_kernel_reported_it() {
     assert_eq!(status.shell_code(), 139, "the flag changes no shell code");
 
     // A signal whose default action dumps nothing reports no dump.
-    let killed = sh(rootfs, "kill -KILL $$").run().expect("the sandbox runs");
+    let killed = common::shell(rootfs, "kill -KILL $$")
+        .run()
+        .expect("the sandbox runs");
     assert_eq!(killed.signal(), Some(9));
     assert!(!killed.core_dumped(), "{killed}");
 }
@@ -199,7 +190,7 @@ fn the_usage_reports_processor_time_and_peak_memory() {
     // test process's own resident set (see `ResourceUsage::peak_rss_bytes`),
     // so a buffer below the floor would pass unseen. A run that allocates
     // nothing measures the floor, and the buffer is placed above it.
-    let floor = sh(rootfs, "true")
+    let floor = common::shell(rootfs, "true")
         .output()
         .expect("the sandbox runs to completion")
         .usage
@@ -210,7 +201,7 @@ fn the_usage_reports_processor_time_and_peak_memory() {
     // resident; it runs as a child the shell waits for.
     let script =
         format!("{CPU_LOOP}; dd if=/dev/zero of=/dev/null bs={buffer_mib}M count=1 2>/dev/null");
-    let output = sh(rootfs, &script)
+    let output = common::shell(rootfs, &script)
         .output()
         .expect("the sandbox runs to completion");
     assert!(output.status.success(), "{output:?}");
@@ -223,7 +214,9 @@ fn the_usage_reports_processor_time_and_peak_memory() {
     assert_eq!(peak(usage) % 1024, 0, "{usage:?}");
 
     // The handle reports the same figure once its wait has returned.
-    let mut running = sh(rootfs, CPU_LOOP).spawn().expect("the sandbox launches");
+    let mut running = common::shell(rootfs, CPU_LOOP)
+        .spawn()
+        .expect("the sandbox launches");
     let status = running.wait().expect("the wait completes");
     assert!(status.success());
     let usage = running.usage().expect("the init reports the usage");
@@ -244,7 +237,7 @@ fn an_orphan_counts_under_a_pid_namespace_and_not_without_one() {
     let script = ORPHAN.replace("LOOP", CPU_LOOP);
 
     // The orphan reparents to the init, which collects it.
-    let output = sh(rootfs, &script)
+    let output = common::shell(rootfs, &script)
         .output()
         .expect("the sandbox runs to completion");
     assert!(output.status.success(), "{output:?}");
@@ -277,7 +270,7 @@ fn terminate_is_trappable_for_a_graceful_exit() {
     };
     // The trap can only fire while the shell is interruptible, hence
     // sleep-in-background plus `wait`.
-    let mut running = sh(rootfs, "trap 'exit 7' TERM; sleep 30 & wait $!")
+    let mut running = common::shell(rootfs, "trap 'exit 7' TERM; sleep 30 & wait $!")
         .spawn()
         .expect("the sandbox launches");
     let outcome = running
@@ -296,7 +289,9 @@ fn waits_are_fused_and_late_signals_are_not_errors() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut running = sh(rootfs, "exit 5").spawn().expect("the sandbox launches");
+    let mut running = common::shell(rootfs, "exit 5")
+        .spawn()
+        .expect("the sandbox launches");
     let first = running.wait().expect("the first wait completes");
     assert_eq!(first.code(), Some(5));
     let second = running.wait().expect("a repeated wait returns the fuse");
@@ -318,7 +313,7 @@ fn a_kill_handle_unblocks_a_waiting_thread() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let mut running = sh(rootfs, "sleep 30")
+    let mut running = common::shell(rootfs, "sleep 30")
         .spawn()
         .expect("the sandbox launches");
     let handle = running.kill_handle().expect("a kill handle is available");
@@ -337,7 +332,7 @@ fn output_produced_before_a_kill_is_drained_by_the_wait_after_it() {
         return;
     };
     let mut observer = Collect::default();
-    let cage = sh(rootfs, "echo before-kill; sleep 30");
+    let cage = common::shell(rootfs, "echo before-kill; sleep 30");
     let mut running = cage
         .spawn_with(&mut observer)
         .expect("the sandbox launches");
@@ -366,7 +361,7 @@ fn helper_report_peak() {
     let rootfs = common::fixture_rootfs().expect("the fixture root is provisioned");
     // Written to, page by page, so every page is resident rather than mapped.
     let held = vec![1u8; FLOOR_MIB << 20];
-    let output = sh(rootfs, "true")
+    let output = common::shell(rootfs, "true")
         .output()
         .expect("the sandbox runs to completion");
     let usage = output.usage.expect("the init reports the usage");

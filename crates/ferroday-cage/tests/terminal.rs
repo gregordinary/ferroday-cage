@@ -30,16 +30,6 @@ fn drain(pty: &mut Pty) -> String {
     String::from_utf8_lossy(&written).into_owned()
 }
 
-/// A cage running `/bin/sh -c script` against the fixture rootfs.
-fn shell(rootfs: &std::path::Path, script: &str) -> Cage {
-    Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
-}
-
 /// A command that reports itself ready, waits for `SIGWINCH`, and answers with
 /// the terminal's new size.
 ///
@@ -68,7 +58,7 @@ fn a_terminal_launch_gives_the_command_a_controlling_terminal() {
     // are it, and it is not the caller's — which is the whole point: an
     // interactive sandbox that reaches nothing of the terminal it was launched
     // from.
-    let cage = shell(
+    let cage = common::shell(
         rootfs,
         "for fd in 0 1 2; do [ -t $fd ] || exit 1; done; \
          echo \"tty=$(cut -d')' -f2- /proc/self/stat | cut -d' ' -f6)\"",
@@ -101,7 +91,7 @@ fn the_command_starts_at_the_stated_window_size() {
     // The size is set on the replica before the command exists, so the command
     // cannot observe a 0x0 window even at its first instruction, and it is
     // whatever the caller stated rather than anything read from the host.
-    let cage = shell(rootfs, "stty size");
+    let cage = common::shell(rootfs, "stty size");
     let (mut running, mut pty) = cage
         .spawn_terminal(&Terminal::new().size(43, 132))
         .expect("the sandbox launches on a terminal");
@@ -118,7 +108,7 @@ fn the_default_terminal_is_the_stated_constant() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let (mut running, mut pty) = shell(rootfs, "stty size")
+    let (mut running, mut pty) = common::shell(rootfs, "stty size")
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
     let written = drain(&mut pty);
@@ -137,7 +127,7 @@ fn the_line_discipline_is_the_stated_baseline() {
     // `ONLCR` and `ECHO` are the two the caller can see from outside: the
     // newline the command writes arrives as CRLF, and what the caller types is
     // echoed back before the command has read it.
-    let cage = shell(rootfs, "read line; echo \"got:$line\"");
+    let cage = common::shell(rootfs, "read line; echo \"got:$line\"");
     let (mut running, mut pty) = cage
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
@@ -164,7 +154,7 @@ fn dev_tty_resolves_to_the_sandboxs_own_terminal() {
     // `/dev/tty` is the character device 5:0, a per-process redirect to the
     // opener's controlling terminal, so what it yields here is the sandbox's
     // own terminal, and a write through it reaches the caller's primary.
-    let cage = shell(rootfs, "echo through-dev-tty > /dev/tty");
+    let cage = common::shell(rootfs, "echo through-dev-tty > /dev/tty");
     let (mut running, mut pty) = cage
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
@@ -231,7 +221,7 @@ fn a_path_for_the_terminal_resolves_inside_the_sandbox() {
     // replica is a node the sandbox can name. Anything that resolves a path for
     // its terminal works: `tty` is the plain case, and `GPG_TTY`, which gpg
     // fills from `tty` and pinentry then opens, is the one that matters.
-    let (mut running, mut pty) = shell(rootfs, THROUGH_THE_PATH)
+    let (mut running, mut pty) = common::shell(rootfs, THROUGH_THE_PATH)
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
     let written = drain(&mut pty);
@@ -326,7 +316,7 @@ fn nested_allocation_uses_the_sandboxs_own_devpts() {
     // The private devpts stays mounted, so a program that allocates a terminal
     // of its own inside the sandbox gets one from the same instance its own
     // terminal came from, and sees no host pseudoterminal at all.
-    let cage = shell(
+    let cage = common::shell(
         rootfs,
         "ls /dev/pts | tr '\\n' ' '; echo; \
          [ -e /dev/pts/ptmx ] && echo ptmx-present",
@@ -351,7 +341,7 @@ fn end_of_file_arrives_when_the_session_ends() {
     // the primary means every replica is closed, so the wait after it is prompt.
     // It only terminates because the init that allocated the terminal drops its
     // copy of the replica before it supervises, and nothing else holds one.
-    let (mut running, mut pty) = shell(rootfs, "echo done")
+    let (mut running, mut pty) = common::shell(rootfs, "echo done")
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
     let written = drain(&mut pty);
@@ -375,7 +365,7 @@ fn a_concurrent_export_does_not_withhold_end_of_file() {
         let mut sink = std::io::sink();
         ferroday_cage::provision::export_tar(rootfs, &mut sink, IdentityMap::Single)
     });
-    let (mut running, mut pty) = shell(rootfs, "echo brief")
+    let (mut running, mut pty) = common::shell(rootfs, "echo brief")
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
     let written = drain(&mut pty);
@@ -427,7 +417,7 @@ fn a_pending_terminal_launch_hands_the_primary_over_before_proceeding() {
     // The seam and a terminal compose: the caller holds the primary while the
     // command is still held at the gate, attaches whatever it attaches, and
     // proceeds. Nothing has been written to the terminal yet.
-    let cage = shell(rootfs, "echo after-the-gate");
+    let cage = common::shell(rootfs, "echo after-the-gate");
     let (pending, mut pty) = cage
         .spawn_pending_terminal(&Terminal::new())
         .expect("the gated sandbox launches on a terminal");
@@ -451,7 +441,7 @@ fn dropping_the_primary_hangs_the_terminal_up() {
     // the ignore too — precisely so that nothing but the failing writes can end
     // the command, and the write is far beyond the terminal's buffer, so with
     // nothing draining it would block forever if it did not fail.
-    let cage = shell(rootfs, "trap '' HUP; head -c 200000 /dev/zero; exit 7");
+    let cage = common::shell(rootfs, "trap '' HUP; head -c 200000 /dev/zero; exit 7");
     let (mut running, pty) = cage
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");
@@ -493,7 +483,7 @@ fn a_resize_reaches_the_running_command() {
     // constant is a starting point and `resize` is the rest. It both sets the
     // size and delivers SIGWINCH to the sandbox's foreground process group,
     // which is what lets a full-screen program redraw.
-    let cage = shell(
+    let cage = common::shell(
         rootfs,
         // The shell waits in short steps rather than one long block. A shell
         // acts on a trapped signal at a command boundary, and a signal that
@@ -533,7 +523,7 @@ fn a_shared_primary_serves_a_reader_thread_and_a_resize() {
     // into the reader would leave the resize path with nothing to call, and a
     // mutex would be worse — the reader holds it while blocked in `read`, so a
     // resize would land only when the sandbox next produced output.
-    let cage = shell(rootfs, WAIT_FOR_WINCH_QUIETLY);
+    let cage = common::shell(rootfs, WAIT_FOR_WINCH_QUIETLY);
     let (mut running, pty) = cage
         .spawn_terminal(&Terminal::new())
         .expect("the sandbox launches on a terminal");

@@ -15,19 +15,11 @@ use ferroday_cage::{
 };
 use rustix::io::Errno;
 
-/// Builds a cage that runs `/bin/sh -c <script>` in the given rootfs.
-fn sh(rootfs: &Path, script: &str) -> Cage {
-    Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
-}
-
 /// Runs `/bin/sh -c <script>` in the fixture rootfs.
 fn run_sh(rootfs: &Path, script: &str) -> ExitStatus {
-    sh(rootfs, script).run().expect("the sandbox launches")
+    common::shell(rootfs, script)
+        .run()
+        .expect("the sandbox launches")
 }
 
 #[test]
@@ -88,12 +80,7 @@ fn the_visible_root_is_the_rootfs() {
     // there on a host that happens to run Alpine, and the discriminator has to
     // be one no host root can satisfy.
     std::fs::write(rootfs.join("this-rootfs-and-no-other"), b"").expect("the marker is writable");
-    let status = Cage::builder()
-        .rootfs(&rootfs)
-        .command("/bin/sh")
-        .args(["-c", "test -f /this-rootfs-and-no-other"])
-        .build()
-        .expect("a valid sandbox configuration")
+    let status = common::shell(&rootfs, "test -f /this-rootfs-and-no-other")
         .run()
         .expect("the sandbox launches");
     assert!(status.success(), "expected the named rootfs at /");
@@ -113,7 +100,7 @@ fn a_cage_launches_repeatedly() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = sh(rootfs, "exit 7");
+    let cage = common::shell(rootfs, "exit 7");
     for _ in 0..2 {
         let status = cage.run().expect("the sandbox launches");
         assert_eq!(status.code(), Some(7));
@@ -955,12 +942,7 @@ fn the_resolved_mounts_are_the_ones_the_sandbox_establishes() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "cat /proc/mounts; ls -l /dev"])
-        .build()
-        .expect("a valid sandbox configuration");
+    let cage = common::shell(rootfs, "cat /proc/mounts; ls -l /dev");
 
     let inputs = cage.resolved_inputs();
     let output = cage.output().expect("the sandbox launches");

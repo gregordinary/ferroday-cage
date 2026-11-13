@@ -591,6 +591,7 @@ report name a package and its version bare.
 | Parse an argument in an example | `examples/common` |
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
 | Skip a test the host cannot run, or fail it where a `REQUIRE` variable says it must run | `ferroday_cage_testkit::require` |
+| A sandbox running a shell script in a test, with nothing else set, or one that keeps running, and an observer that keeps what it writes | `ferroday_cage_testkit::sandbox::shell`, `sandbox::sleeper`, `sandbox::Collect` |
 | Play the user at a pseudoterminal in a test | `ferroday_cage_testkit::pty` |
 | Wait in a test until a descriptor is readable, failing past a deadline | `ferroday_cage_testkit::fd::readable_by` |
 | Run a probe with its standard descriptors closed, and put them back | `ferroday_cage_testkit::fd::with_standard_streams_closed`, and `fd::is_open` to ask of one without opening another |

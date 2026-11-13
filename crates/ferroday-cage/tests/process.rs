@@ -124,12 +124,7 @@ fn orphaned_descendants_are_reaped_while_the_command_runs() {
         sleep 1
         ! grep -l ') Z ' /proc/[0-9]*/stat 2>/dev/null
     "#;
-    let status = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
+    let status = common::shell(rootfs, script)
         .run()
         .expect("the sandbox launches");
     assert!(status.success(), "expected no zombies after the reap tick");
@@ -147,12 +142,7 @@ fn sigpipe_is_reset_to_the_default_disposition() {
         ignored=$(grep '^SigIgn:' /proc/$$/status | cut -f2)
         [ $(( 0x$ignored & 4096 )) = 0 ]
     "#;
-    let status = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
+    let status = common::shell(rootfs, script)
         .run()
         .expect("the sandbox launches");
     assert!(status.success(), "expected SIGPIPE at SIG_DFL inside");
@@ -283,12 +273,7 @@ fn the_command_starts_with_a_clean_descriptor_table() {
             [ ! -e /proc/$$/fd/$fd ] || exit 1
         done
     "#;
-    let status = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
+    let status = common::shell(rootfs, script)
         .run()
         .expect("the sandbox launches");
     assert!(status.success(), "expected only fds 0, 1, 2 inside");

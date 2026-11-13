@@ -116,12 +116,7 @@ fn proceed_streams_the_command_output() {
         return;
     };
     let mut observer = Collect::default();
-    let cage = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "echo hello from the seam"])
-        .build()
-        .expect("a valid sandbox configuration");
+    let cage = common::shell(rootfs, "echo hello from the seam");
     let pending = cage
         .spawn_pending_with(&mut observer)
         .expect("the pending sandbox launches");

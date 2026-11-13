@@ -29,8 +29,6 @@ use std::ffi::CString;
 use std::io;
 use std::time::Duration;
 
-use ferroday_cage::Cage;
-
 /// Set in a launched command's environment to the serial of the key
 /// [`probe_keys`] reads, which makes that test probe rather than return.
 const PROBE: &str = "FERRODAY_CAGE_TEST_KEYRING_PROBE";
@@ -174,12 +172,7 @@ fn a_sandbox_does_not_possess_the_callers_session_keys() {
     let Some(key) = PrivateKey::add("cage") else {
         return;
     };
-    let status = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", &key.absence_script()])
-        .build()
-        .expect("a valid sandbox configuration")
+    let status = common::shell(rootfs, &key.absence_script())
         .run()
         .expect("the sandbox launches");
     assert_eq!(

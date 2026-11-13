@@ -5,6 +5,17 @@ use std::path::Path;
 
 use ferroday_cage::{Cage, Observer};
 
+/// A sandbox running `/bin/sh -c script` in `rootfs`, with every other setting
+/// the builder's own.
+pub fn shell(rootfs: &Path, script: &str) -> Cage {
+    Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args(["-c", script])
+        .build()
+        .expect("a valid sandbox configuration")
+}
+
 /// A sandbox running a long sleep in `rootfs`: a command that stays alive so
 /// its namespaces, and whatever is attached to them, can be inspected around
 /// it.

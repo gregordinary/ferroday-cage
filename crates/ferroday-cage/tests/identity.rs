@@ -758,12 +758,7 @@ fn run_as_alone_sets_no_new_privileges() {
 #[test]
 fn a_launch_without_a_run_as_identity_leaves_no_new_privileges_clear() {
     let Some(rootfs) = rootfs() else { return };
-    let cage = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "grep '^NoNewPrivs' /proc/self/status"])
-        .build()
-        .expect("the sandbox should build");
+    let cage = common::shell(rootfs, "grep '^NoNewPrivs' /proc/self/status");
     let output = run_script(&cage);
     let stdout = stdout_of(&output);
     assert!(output.status.success(), "{stdout}");

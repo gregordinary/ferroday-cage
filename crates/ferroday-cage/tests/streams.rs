@@ -25,12 +25,7 @@ fn stdout_and_stderr_arrive_separately() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let output = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "echo to-stdout; echo to-stderr >&2"])
-        .build()
-        .expect("a valid sandbox configuration")
+    let output = common::shell(rootfs, "echo to-stdout; echo to-stderr >&2")
         .output()
         .expect("the sandbox launches");
     assert!(output.status.success());
@@ -49,12 +44,7 @@ fn output_beyond_the_pipe_buffer_streams_without_deadlock() {
     let script = "\
         head -c 500000 /dev/zero; head -c 500000 /dev/zero >&2; \
         head -c 500000 /dev/zero; head -c 500000 /dev/zero >&2";
-    let output = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
+    let output = common::shell(rootfs, script)
         .output()
         .expect("the sandbox launches");
     assert!(output.status.success());
@@ -88,30 +78,14 @@ fn spawned_output_flows_during_the_handle_wait() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    /// A whole-stream collector, for the handle path where `output` — which
-    /// runs the command to completion — does not apply.
-    #[derive(Default)]
-    struct Stdout(Vec<u8>);
-
-    impl Observer for Stdout {
-        fn stdout(&mut self, chunk: &[u8]) {
-            self.0.extend_from_slice(chunk);
-        }
-    }
-
-    let mut observer = Stdout::default();
-    let cage = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "echo spawned"])
-        .build()
-        .expect("a valid sandbox configuration");
+    let mut observer = common::Collect::default();
+    let cage = common::shell(rootfs, "echo spawned");
     let mut running = cage
         .spawn_with(&mut observer)
         .expect("the sandbox launches");
     let status = running.wait().expect("the wait completes");
     assert!(status.success());
-    assert_eq!(observer.0, b"spawned\n");
+    assert_eq!(observer.stdout, b"spawned\n");
 }
 
 #[test]
@@ -120,12 +94,7 @@ fn launch_progress_milestones_arrive_in_order() {
         return;
     };
     let mut observer = Milestones::default();
-    let status = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "true"])
-        .build()
-        .expect("a valid sandbox configuration")
+    let status = common::shell(rootfs, "true")
         .run_with(&mut observer)
         .expect("the sandbox launches");
     assert!(status.success());
@@ -144,12 +113,7 @@ fn a_cloned_cage_launches_independently() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "echo cloned"])
-        .build()
-        .expect("a valid sandbox configuration");
+    let cage = common::shell(rootfs, "echo cloned");
     // The clone launches its own sandbox; the original still launches too.
     let clone = cage.clone();
     let first = clone.output().expect("the clone launches");

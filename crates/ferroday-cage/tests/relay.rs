@@ -334,16 +334,6 @@ impl Caller {
     }
 }
 
-/// A cage running `/bin/sh -c script` against the fixture rootfs.
-fn shell(rootfs: &std::path::Path, script: &str) -> Cage {
-    Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script])
-        .build()
-        .expect("a valid sandbox configuration")
-}
-
 // -- The interactive shape ----------------------------------------------------
 
 /// A typed line reaches the sandbox, its output comes back, and the caller's
@@ -400,7 +390,7 @@ fn a_relay_that_was_not_asked_for_raw_mode_leaves_the_terminal_alone() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(rootfs, "echo marker-from-inside");
+    let cage = common::shell(rootfs, "echo marker-from-inside");
     let session = relayed(
         Wiring::Terminal { raw: false },
         (24, 80),
@@ -436,7 +426,7 @@ fn a_window_change_resizes_the_sandboxs_terminal() {
     // Announces itself, then answers the window change with the new size. The
     // wait is a bounded sequence of short sleeps, so a run where the signal
     // never arrives ends rather than hanging.
-    let cage = shell(
+    let cage = common::shell(
         rootfs,
         "trap 'stty size; exit 0' WINCH; echo ready; \
          i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done",
@@ -470,7 +460,7 @@ fn an_interrupt_from_outside_ends_the_session_and_restores_the_terminal() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(rootfs, "echo ready; sleep 30");
+    let cage = common::shell(rootfs, "echo ready; sleep 30");
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -499,7 +489,7 @@ fn a_second_interrupt_kills_a_command_that_ignored_the_first() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(rootfs, "trap '' TERM; echo ready; sleep 30");
+    let cage = common::shell(rootfs, "trap '' TERM; echo ready; sleep 30");
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -590,7 +580,7 @@ fn a_paste_larger_than_the_sandboxs_terminal_arrives_whole() {
     // before the paste has been delivered. That is what puts the loop on the
     // pending path deterministically rather than depending on `cat` losing a
     // race it usually wins.
-    let cage = shell(rootfs, "sleep 1; exec /bin/cat");
+    let cage = common::shell(rootfs, "sleep 1; exec /bin/cat");
     // Line-shaped, since the sandbox's own line discipline is canonical and
     // delivers a line only when it ends. Thirty-two kilobytes: many times the
     // terminal's own buffer and many times the relay's read buffer, and well
@@ -645,7 +635,7 @@ fn an_expired_deadline_reports_no_status() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(rootfs, "echo ready; sleep 60");
+    let cage = common::shell(rootfs, "echo ready; sleep 60");
     let session = relayed(
         Wiring::Terminal { raw: false },
         (24, 80),
@@ -680,7 +670,7 @@ fn an_expired_deadline_reports_no_status_against_a_command_that_never_stops_prin
         return;
     };
     // Three writers, so the relay is refilled while it drains.
-    let cage = shell(rootfs, "yes flooding & yes flooding & yes flooding");
+    let cage = common::shell(rootfs, "yes flooding & yes flooding & yes flooding");
     let session = relayed(
         Wiring::Terminal { raw: false },
         (24, 80),
@@ -719,7 +709,7 @@ fn a_deadline_stops_a_command_that_closed_its_terminal() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(rootfs, CLOSES_ITS_TERMINAL);
+    let cage = common::shell(rootfs, CLOSES_ITS_TERMINAL);
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -751,7 +741,7 @@ fn a_termination_request_reaches_a_command_that_closed_its_terminal() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(rootfs, CLOSES_ITS_TERMINAL);
+    let cage = common::shell(rootfs, CLOSES_ITS_TERMINAL);
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -791,7 +781,7 @@ fn an_interrupt_before_the_terminal_closed_counts_toward_the_kill() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(
+    let cage = common::shell(
         rootfs,
         "trap '' TERM; echo ready; read line; exec 0<&- 1>&- 2>&-; exec sleep 60",
     );
@@ -835,7 +825,7 @@ fn a_session_held_at_the_network_seam_relays_once_it_proceeds() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
     };
-    let cage = shell(rootfs, "echo marker-from-inside");
+    let cage = common::shell(rootfs, "echo marker-from-inside");
     let session = relayed(
         Wiring::Terminal { raw: true },
         (24, 80),
@@ -1223,7 +1213,7 @@ fn helper_relay_started_in_the_background() {
     let shell_group = Pid::from_raw(foreground.id() as i32).expect("a live process id");
     termios::tcsetpgrp(terminal, shell_group).expect("the foreground moves to the shell's group");
 
-    let cage = shell(rootfs, "echo ready; sleep 60");
+    let cage = common::shell(rootfs, "echo ready; sleep 60");
     let (mut running, pty) = cage
         .spawn_terminal(&Terminal::new())
         .expect("the command starts on a terminal of its own");

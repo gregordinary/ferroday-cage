@@ -840,12 +840,7 @@ fn a_published_port_reaches_a_server_in_the_guest() {
     // The guest serves one connection on its port 8000: it greets, then prints
     // whatever it is sent. The host reaches it through a port the kernel picks.
     let mut observer = Collect::default();
-    let cage = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "echo hello from the guest | /usr/bin/nc -l -p 8000"])
-        .build()
-        .expect("a valid sandbox configuration");
+    let cage = common::shell(rootfs, "echo hello from the guest | /usr/bin/nc -l -p 8000");
     let pending = cage
         .spawn_pending_with(&mut observer)
         .expect("the pending sandbox launches");
@@ -963,12 +958,7 @@ fn a_published_port_reaches_a_server_in_the_guest_over_ipv6() {
     // An IPv6 listener carries its connections to the guest's IPv6 address,
     // from the gateway's.
     let mut observer = Collect::default();
-    let cage = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", "echo hello over ipv6 | /usr/bin/nc -l -p 8000"])
-        .build()
-        .expect("a valid sandbox configuration");
+    let cage = common::shell(rootfs, "echo hello over ipv6 | /usr/bin/nc -l -p 8000");
     let pending = cage
         .spawn_pending_with(&mut observer)
         .expect("the pending sandbox launches");
