@@ -401,6 +401,61 @@ fn a_target_that_refuses_is_reported_and_the_run_still_ends() {
 }
 
 #[test]
+fn a_target_that_resets_resets_the_command_s_connection() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The target reads the command's request and resets the connection. The
+    // command's `wget` reads a reset as one, and an end of stream as a reply
+    // that ended, so what it reports says which arrived.
+    //
+    // The reset comes before any reply on purpose. A reset behind bytes the
+    // command has yet to read reaches it in the read that returns them, which
+    // wget's buffered reader can take for an end of stream, so whether it
+    // reports one would depend on the timing of its reads.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("the target listener binds");
+    let target = listener
+        .local_addr()
+        .expect("the target has an address")
+        .to_string();
+    let replied = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().expect("the forward connects");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+            let read = connection.read(&mut buf).expect("the request arrives");
+            assert!(read > 0, "the request ended early");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let connection = OwnedFd::from(connection);
+        rustix::net::sockopt::set_socket_linger(&connection, Some(Duration::ZERO))
+            .expect("the target's close can be a reset");
+    });
+
+    let mut command = Command::new(FCAGE);
+    command
+        .args(["--rootfs", rootfs.to_str().expect("a UTF-8 fixture path")])
+        .args(["--forward-loopback", "4100", &target])
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "wget -q -O /dev/null http://127.0.0.1:4100/",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = common::run_bounded(&mut command, PATIENCE);
+    replied.join().expect("the target thread finishes");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "wget fetched nothing: {stderr}");
+    assert!(
+        stderr.contains("Connection reset by peer"),
+        "the command read an end of stream where the target reset: {stderr}"
+    );
+}
+
+#[test]
 fn a_forward_carries_a_megabyte_each_way_and_passes_each_end_on() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;

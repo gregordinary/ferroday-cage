@@ -15,8 +15,8 @@
 //! socket it holds is non-blocking, so nothing it does waits on a peer, and
 //! closing the stop pipe ends it at its next wakeup, whatever the target or the
 //! command's end of a connection is doing. Ending it closes the listener, which
-//! keeps the sandbox's network namespace alive, and every connection it holds:
-//! the run's end closes every forwarded connection.
+//! keeps the sandbox's network namespace alive, and resets every connection it
+//! holds: the run's end ends every forwarded connection.
 //!
 //! # Bounds
 //!
@@ -26,7 +26,7 @@
 //!   standard error, naming the bound, and the rest are not, so a command that
 //!   keeps connecting does not flood standard error.
 //! - A connection to the target not made within [`ESTABLISH_DEADLINE`] is
-//!   abandoned: the command's connection is closed, and the failure reported,
+//!   abandoned: the command's connection is reset, and the failure reported,
 //!   as a target that refuses is. A TCP connect runs in the background and
 //!   reports its end as writability. A unix socket whose accept queue is full
 //!   answers a non-blocking connect with `EAGAIN` at once instead, and leaves
@@ -42,8 +42,23 @@
 //! a shutdown of the other side's sending half once everything read before it
 //! has been written, and the other direction carries on: a command that sends
 //! a request and shuts down its sending half still receives the reply. A
-//! connection is closed once both directions have ended, and at once on a
-//! failure of either side.
+//! connection is closed once both directions have ended.
+//!
+//! # A connection that does not end in order ends in a reset
+//!
+//! A connection ends in order only where both directions have ended. Every
+//! other end resets each side the forward holds: a failure of either side, a
+//! target that refuses the connection or does not take it in time, and the
+//! forward's own end with the connection still open. Closing those plainly
+//! would hand each peer an end of stream after whatever arrived, and a peer
+//! reading to the end would take a cut-off stream for a complete one. A zero
+//! linger makes the close a reset instead, as the library's network stack does
+//! for a flow. A unix socket has no reset to send, so a unix target reads an
+//! end of stream all the same.
+//!
+//! A connection past the budget is closed rather than reset, as the network
+//! stack closes one past a published port's budget: it never reached a target,
+//! and the command reads its end before any byte.
 
 use std::fmt;
 use std::io;
@@ -353,7 +368,7 @@ impl Relay {
         for (index, connecting) in self.connecting.iter().enumerate() {
             if connecting.wait == Wait::Writable {
                 slots.push(Slot::Connecting(index));
-                fds.push(PollFd::new(&connecting.outbound, PollFlags::OUT));
+                fds.push(PollFd::new(&connecting.sides.outbound, PollFlags::OUT));
             }
         }
         // A side nothing is asked of is left out, as the library's poll loops
@@ -365,11 +380,11 @@ impl Relay {
             let (inbound, outbound) = carried.interest();
             if !inbound.is_empty() {
                 slots.push(Slot::Carried(index));
-                fds.push(PollFd::new(&carried.inbound, inbound));
+                fds.push(PollFd::new(&carried.sides.inbound, inbound));
             }
             if !outbound.is_empty() {
                 slots.push(Slot::Carried(index));
-                fds.push(PollFd::new(&carried.outbound, outbound));
+                fds.push(PollFd::new(&carried.sides.outbound, outbound));
             }
         }
         match rustix::event::poll(&mut fds, timeout.as_ref()) {
@@ -429,15 +444,13 @@ impl Relay {
     }
 
     /// Moves each connection to the target still being made along. One whose
-    /// connect has ended is carried, or reported and closed. One waiting out a
+    /// connect has ended is carried, or reported and reset. One waiting out a
     /// full accept queue is connected again once its retry is due. One past its
-    /// deadline is abandoned and reported.
+    /// deadline is abandoned, reported, and reset.
     fn advance(&mut self, now: Instant) {
         for mut connecting in std::mem::take(&mut self.connecting) {
             match connecting.advance(&self.target, now) {
-                Ok(true) => self
-                    .carried
-                    .push(Carried::new(connecting.inbound, connecting.outbound)),
+                Ok(true) => self.carried.push(Carried::new(connecting.sides)),
                 Ok(false) => self.connecting.push(connecting),
                 Err(err) => self.say_failed("connecting to the target", &err),
             }
@@ -481,26 +494,31 @@ impl Relay {
     }
 
     /// Starts the connection to the target for `inbound`. A target that
-    /// refuses it at once closes `inbound`, and is reported.
+    /// refuses it at once resets `inbound`, and is reported.
     fn connect(&mut self, inbound: OwnedFd, now: Instant) {
         let (outbound, attempt) = match self.target.connect() {
             Ok(started) => started,
             Err(err) => {
+                reset_on_close(&inbound);
                 self.say_failed("connecting to the target", &err);
                 return;
             }
         };
+        let sides = Sides {
+            inbound,
+            outbound,
+            finished: false,
+        };
         let wait = match attempt {
             Attempt::Connected => {
-                self.carried.push(Carried::new(inbound, outbound));
+                self.carried.push(Carried::new(sides));
                 return;
             }
             Attempt::InProgress => Wait::Writable,
             Attempt::Busy => Wait::Retry(now.checked_add(CONNECT_RETRY)),
         };
         self.connecting.push(Connecting {
-            inbound,
-            outbound,
+            sides,
             wait,
             deadline: now.checked_add(ESTABLISH_DEADLINE),
             ready: false,
@@ -521,19 +539,51 @@ impl Relay {
     }
 }
 
+/// The two sides of a forwarded connection: the command's, and the target's.
+///
+/// Each side is reset as it closes unless the connection ended in order; see
+/// [the module documentation](self).
+struct Sides {
+    /// The command's side.
+    inbound: OwnedFd,
+    /// The target's side, connected or still connecting.
+    outbound: OwnedFd,
+    /// Both directions have ended in order, so closing each side is an end of
+    /// stream rather than a reset.
+    finished: bool,
+}
+
+impl Drop for Sides {
+    fn drop(&mut self) {
+        if !self.finished {
+            reset_on_close(&self.inbound);
+            reset_on_close(&self.outbound);
+        }
+    }
+}
+
+/// Makes the close of `socket` a reset rather than an end of stream, by a zero
+/// linger. A unix socket takes the option and has no reset to send.
+///
+/// Best-effort: the option's value is a constant the kernel accepts on every
+/// socket, so the one way it fails is a descriptor that is not a socket, which
+/// neither side is.
+fn reset_on_close(socket: &OwnedFd) {
+    let _ = sockopt::set_socket_linger(socket, Some(Duration::ZERO));
+}
+
 /// A connection the command made whose connection to the target is still being
 /// made.
 struct Connecting {
-    /// The command's connection, accepted and not yet read.
-    inbound: OwnedFd,
-    /// The socket connecting to the target.
-    outbound: OwnedFd,
+    /// The command's connection, accepted and not yet read, and the socket
+    /// connecting to the target.
+    sides: Sides,
     /// What the connect waits on.
     wait: Wait,
     /// When the connect is abandoned; `None` where the clock cannot express it,
     /// which is no deadline at all.
     deadline: Option<Instant>,
-    /// Whether the last poll found `outbound` ready.
+    /// Whether the last poll found the target's side ready.
     ready: bool,
 }
 
@@ -564,12 +614,12 @@ impl Connecting {
             // Writability, or an error, means the connect ended; `SO_ERROR`
             // says how.
             Wait::Writable if std::mem::take(&mut self.ready) => {
-                return match sockopt::socket_error(&self.outbound)? {
+                return match sockopt::socket_error(&self.sides.outbound)? {
                     Ok(()) => Ok(true),
                     Err(errno) => Err(errno.into()),
                 };
             }
-            Wait::Retry(Some(at)) if now >= at => match target.connect_on(&self.outbound)? {
+            Wait::Retry(Some(at)) if now >= at => match target.connect_on(&self.sides.outbound)? {
                 Attempt::Connected => return Ok(true),
                 Attempt::InProgress => self.wait = Wait::Writable,
                 Attempt::Busy => self.wait = Wait::Retry(now.checked_add(CONNECT_RETRY)),
@@ -589,10 +639,8 @@ impl Connecting {
 /// A connection being carried: the command's side, the target's, and a
 /// direction each way between them.
 struct Carried {
-    /// The command's side.
-    inbound: OwnedFd,
-    /// The target's side.
-    outbound: OwnedFd,
+    /// The command's side and the target's.
+    sides: Sides,
     /// What the command sends, on its way to the target.
     upstream: Direction,
     /// What the target sends, on its way to the command.
@@ -603,10 +651,9 @@ struct Carried {
 
 impl Carried {
     /// A connection whose two sides are both connected.
-    fn new(inbound: OwnedFd, outbound: OwnedFd) -> Carried {
+    fn new(sides: Sides) -> Carried {
         Carried {
-            inbound,
-            outbound,
+            sides,
             upstream: Direction::new(),
             downstream: Direction::new(),
             ready: false,
@@ -634,12 +681,20 @@ impl Carried {
     }
 
     /// Moves what each direction can without waiting. Answers whether the
-    /// connection carries on: not once both directions have ended, nor once
-    /// either side has failed, and dropping it then closes both sides.
+    /// connection carries on: not once both directions have ended, and
+    /// dropping it then closes both sides, nor once either side has failed,
+    /// and dropping it then resets both.
     fn carry(&mut self) -> bool {
-        let upstream = self.upstream.carry(&self.inbound, &self.outbound);
-        let downstream = self.downstream.carry(&self.outbound, &self.inbound);
-        upstream.is_ok() && downstream.is_ok() && !(self.upstream.passed && self.downstream.passed)
+        let Sides {
+            inbound, outbound, ..
+        } = &self.sides;
+        let upstream = self.upstream.carry(inbound, outbound);
+        let downstream = self.downstream.carry(outbound, inbound);
+        if upstream.is_err() || downstream.is_err() {
+            return false;
+        }
+        self.sides.finished = self.upstream.passed && self.downstream.passed;
+        !self.sides.finished
     }
 }
 
@@ -744,24 +799,40 @@ mod tests {
     /// A relay over a listener of the host's own, standing in for the
     /// sandbox's, the listener's address, and the write end of its stop pipe.
     fn relay(target: &TcpListener) -> (Relay, SocketAddr, OwnedFd) {
+        relay_to(target.local_addr().expect("the target has an address"))
+    }
+
+    /// [`relay`], toward `target` whether or not anything listens there.
+    fn relay_to(target: SocketAddr) -> (Relay, SocketAddr, OwnedFd) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("the listener binds");
         let address = listener.local_addr().expect("the listener has an address");
-        let target = Target::Tcp(target.local_addr().expect("the target has an address"));
         let (stop_read, stop) = pipe::pipe_with(PipeFlags::CLOEXEC).expect("the stop pipe opens");
-        let relay = Relay::new(listener, stop_read, address, target).expect("the relay is made");
+        let relay = Relay::new(listener, stop_read, address, Target::Tcp(target))
+            .expect("the relay is made");
         (relay, address, stop)
     }
 
+    /// How a connection read to its end ended.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ending {
+        /// An end of stream.
+        Closed,
+        /// A reset.
+        Reset,
+    }
+
     /// Reads from `connection` until it ends, failing the test if it has not
-    /// within ten seconds, and returns what arrived.
-    fn read_to_end(mut connection: TcpStream) -> Vec<u8> {
+    /// within ten seconds, and returns what arrived and how it ended.
+    fn read_to_end(mut connection: TcpStream) -> (Vec<u8>, Ending) {
         connection
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("the read can be bounded");
         let mut received = Vec::new();
         match connection.read_to_end(&mut received) {
-            Ok(_) => received,
-            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => received,
+            Ok(_) => (received, Ending::Closed),
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
+                (received, Ending::Reset)
+            }
             Err(error) => panic!("the connection did not end: {error}"),
         }
     }
@@ -779,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_the_target_has_not_taken_by_its_deadline_is_closed() {
+    fn a_connection_the_target_has_not_taken_by_its_deadline_is_reset() {
         let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
         let (mut relay, address, _stop) = relay(&target);
         let command = TcpStream::connect(address).expect("the command connects");
@@ -797,7 +868,47 @@ mod tests {
         relay.advance(accepted + ESTABLISH_DEADLINE);
         assert!(relay.connecting.is_empty(), "held past its deadline");
         assert!(relay.carried.is_empty());
-        assert_eq!(read_to_end(command), b"");
+        assert_eq!(read_to_end(command), (Vec::new(), Ending::Reset));
+    }
+
+    #[test]
+    fn a_connection_the_target_refuses_is_reset() {
+        // Nothing listens at the target's address once its listener is gone,
+        // so the target refuses the connection, at once or as the connect's
+        // end; the command's connection is reset either way.
+        let address = TcpListener::bind("127.0.0.1:0")
+            .and_then(|gone| gone.local_addr())
+            .expect("an address nothing listens at");
+        let (relay, listening, stop) = relay_to(address);
+        let thread = std::thread::spawn(move || relay.run());
+        let command = TcpStream::connect(listening).expect("the command connects");
+        assert_eq!(read_to_end(command), (Vec::new(), Ending::Reset));
+        drop(stop);
+        joined_within(&thread, Duration::from_secs(5), "the relay");
+    }
+
+    #[test]
+    fn a_target_that_resets_mid_reply_resets_the_command() {
+        // The command reads to the end of the connection, so an end of stream
+        // where the target reset would pass the cut-off reply off as whole.
+        let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
+        let (relay, address, stop) = relay(&target);
+        let thread = std::thread::spawn(move || relay.run());
+        let command = TcpStream::connect(address).expect("the command connects");
+        let (mut connection, _) = target.accept().expect("the relay connects to the target");
+        connection
+            .write_all(b"the first part of a reply")
+            .expect("the target replies");
+        let connection = OwnedFd::from(connection);
+        reset_on_close(&connection);
+        drop(connection);
+
+        assert_eq!(
+            read_to_end(command),
+            (b"the first part of a reply".to_vec(), Ending::Reset)
+        );
+        drop(stop);
+        joined_within(&thread, Duration::from_secs(5), "the relay");
     }
 
     #[test]
@@ -826,7 +937,7 @@ mod tests {
             MAX_CONNECTIONS
         );
         assert!(relay.refused);
-        assert_eq!(read_to_end(past), b"");
+        assert_eq!(read_to_end(past), (Vec::new(), Ending::Closed));
         drop(held);
     }
 
@@ -854,10 +965,13 @@ mod tests {
         drop(stop);
         joined_within(&thread, Duration::from_secs(5), "the relay");
         thread.join().expect("the relay ends cleanly");
-        // The relay closed the command's side, so its writes fail.
+        // The relay reset the command's side, so its writes fail, and the
+        // target's: the connection did not end in order, and the target must
+        // not take what reached it for the whole of it.
         joined_within(&flood, Duration::from_secs(10), "the command's writes");
         flood.join().expect("the command's thread ends cleanly");
-        drop(connection);
+        let (_, ending) = read_to_end(connection);
+        assert_eq!(ending, Ending::Reset, "the target read an end of stream");
     }
 
     #[test]

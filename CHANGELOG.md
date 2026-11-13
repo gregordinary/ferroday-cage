@@ -182,8 +182,10 @@ consumer upgrading can skip it.
   thread however many connections the command makes, and holds at most 128 at
   once; a connection past that is closed at once, and the first such is
   reported. A connection the target refuses, or does not take within 30
-  seconds, is reported and closed. The run's end closes every forwarded
-  connection (`ferroday-cage-cli`).
+  seconds, is reported and reset. A connection that ends any other way than
+  with both directions ended in order, a failure of either side or the run's
+  end among them, is reset on each side the forward holds, so neither peer
+  takes a cut-off stream for a complete one (`ferroday-cage-cli`).
 - `CageBuilder::host_rootfs` roots a sandbox on the host's own filesystem,
   read-only: the launch clones the host's mount tree inside the sandbox's mount
   namespace and makes every mount of it read-only and `nosuid`. It hides

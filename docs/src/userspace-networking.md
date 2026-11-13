@@ -106,14 +106,18 @@ reply. Its bounds are the network stack's for a published port:
   closed at once. The first is reported on standard error, and later ones are
   not.
 - A connection the target refuses, or does not take within 30 seconds, is
-  reported on standard error and the command's connection closed. A unix
+  reported on standard error and the command's connection reset. A unix
   socket whose accept queue is full is tried again until then.
 - Each direction holds at most 64 KiB on its way across, so a peer that stops
   reading stalls only the direction toward it.
 
-The run's end closes every forwarded connection, whatever its peers are doing,
-along with the listener. A connection still being made is abandoned, and what a
-connection holds that its peer has not taken is dropped.
+A connection ends in order once both directions have ended, and every other
+end resets it: a failure of either side resets the other, as the network stack
+does for a flow, so a peer reading to the end never takes a cut-off stream for
+a complete one. A unix target has no reset to read, and reads an end of stream.
+The run's end resets every forwarded connection still open, whatever its peers
+are doing, and closes the listener. A connection still being made is abandoned,
+and what a connection holds that its peer has not taken is dropped.
 
 ## The native stack
 
