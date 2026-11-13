@@ -2004,6 +2004,13 @@ impl CageBuilder {
     /// `SIGABRT`). One of those, or a `SIGKILL`, sent to the whole group ends it
     /// as it ends the caller, and the command then runs on unsupervised.
     ///
+    /// With a [`cgroup_parent`](Self::cgroup_parent), dropping the last handle
+    /// also ends every process of the cgroup's tree, as
+    /// [`Running::kill`](crate::Running::kill) does, without waiting for the
+    /// supervisor, and removes the cgroup once they have exited. That reaches a
+    /// descendant that left the command's process tree without a PID
+    /// namespace, and does not wait for a forked copy of the caller's end.
+    ///
     /// [`KillHandle`]: crate::KillHandle
     pub fn stop_with_caller(mut self, tie: bool) -> Self {
         self.stop_with_caller = tie;

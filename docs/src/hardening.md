@@ -574,7 +574,9 @@ The cgroup does three things besides the limits:
   process is left in it. A sandbox without a PID namespace can leave processes
   running past the outcome, and the handle then keeps the cgroup. A kill ends
   them, and the last of the handle and its kill handles to drop removes the
-  cgroup once they have exited, waiting up to five seconds for them. Without a
+  cgroup once they have exited, waiting up to five seconds for them. A sandbox
+  tied to its caller with `stop_with_caller` is ended through the cgroup as the
+  last handle drops, and its cgroup removed the same way. Otherwise, without a
   kill, a cgroup still holding them when the last handle drops stays beneath
   the parent. The caller removes it once they have ended, by themselves or
   through a write of `1` to its `cgroup.kill`: an `rmdir` of the leaf, and then

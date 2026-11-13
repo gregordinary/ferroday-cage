@@ -59,9 +59,11 @@ const PUMP_BUF: usize = 8192;
 /// it, and the handle keeps it. A [`kill`](Self::kill), through this handle or
 /// a [`KillHandle`], ends that process through the cgroup, and the last of the
 /// handle and its kill handles to drop removes the cgroup once its tree has
-/// emptied, waiting up to five seconds for it. Without a kill, a cgroup still
-/// occupied when the last of them drops stays beneath the parent, for the
-/// caller to remove once what is in it has ended.
+/// emptied, waiting up to five seconds for it. With [`stop_with_caller`], the
+/// drop of the last of them ends the tree through the cgroup as a kill does,
+/// and removes the cgroup the same way. Otherwise, without a kill, a cgroup
+/// still occupied when the last of them drops stays beneath the parent, for
+/// the caller to remove once what is in it has ended.
 ///
 /// Where the launch gave the sandbox the foreground of the caller's terminal
 /// (see [`Stdio`](crate::Stdio)), the wait that observes the outcome gives it
@@ -291,7 +293,11 @@ impl<'obs> Running<'obs> {
             check_capture_composes(plan)?;
         }
         let ready = Readiness::new()?;
-        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
+        let cgroup = plan
+            .cgroup
+            .as_ref()
+            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
+            .transpose()?;
         // The progress sink borrows the observer only for the launch; the
         // borrow ends with the statement, leaving the observer to move into
         // the handle for the output pump.
@@ -345,7 +351,11 @@ impl<'obs> Running<'obs> {
     ) -> Result<(Running<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
         let ready = Readiness::new()?;
-        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
+        let cgroup = plan
+            .cgroup
+            .as_ref()
+            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
+            .transpose()?;
         let mut created = Vec::new();
         let spawned = mechanism::spawn(
             plan,
@@ -1214,7 +1224,11 @@ impl<'obs> Pending<'obs> {
         if observe {
             check_capture_composes(plan)?;
         }
-        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
+        let cgroup = plan
+            .cgroup
+            .as_ref()
+            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
+            .transpose()?;
         let mut created = Vec::new();
         let spawned = mechanism::spawn_pending(
             plan,
@@ -1251,7 +1265,11 @@ impl<'obs> Pending<'obs> {
         terminal: &Terminal,
     ) -> Result<(Pending<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
-        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
+        let cgroup = plan
+            .cgroup
+            .as_ref()
+            .map(|cgroup| Cgroup::create(cgroup, plan.stop_with_caller))
+            .transpose()?;
         let mut created = Vec::new();
         let spawned = mechanism::spawn_pending(
             plan,

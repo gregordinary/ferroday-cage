@@ -349,7 +349,7 @@ pub(crate) fn probe(parent: &Path, limits: &[CgroupLimit]) -> Option<CgroupRefus
         settings.set(*limit);
     }
     let plan = settings.plan().ok()??;
-    let cgroup = match Cgroup::create(&plan) {
+    let cgroup = match Cgroup::create(&plan, false) {
         Ok(cgroup) => cgroup,
         Err(Error::CgroupRefused { reason, .. }) => return Some(reason),
         Err(_) => return None,
@@ -645,7 +645,8 @@ const EMPTYING_BOUND: Duration = Duration::from_secs(5);
 /// removes it instead: after a [`kill`](Self::kill), once the tree has emptied,
 /// waiting up to [`EMPTYING_BOUND`] for it, and without one only if the tree
 /// has emptied by itself. A cgroup still holding a process stays beneath the
-/// parent.
+/// parent. Where the launch ties the sandbox to its handles, the drop of the
+/// last owner is the end of the tie, and it kills the tree itself first.
 ///
 /// Its descriptors are the launch's, and are kept off the standard streams'
 /// numbers as every descriptor of the launch's is; see
@@ -667,6 +668,10 @@ pub(crate) struct Cgroup {
     /// Whether [`kill`](Self::kill) has ended the tree, so that the drop waits
     /// for it to empty.
     killed: AtomicBool,
+    /// Whether the launch ties the sandbox to its handles, as
+    /// [`CageBuilder::stop_with_caller`](crate::CageBuilder::stop_with_caller)
+    /// does, so that the drop kills the tree before it removes the cgroup.
+    tied: bool,
     /// Whether [`remove_if_empty`](Self::remove_if_empty) has removed the
     /// cgroup, so that the drop has nothing to do.
     removed: AtomicBool,
@@ -677,12 +682,15 @@ impl Cgroup {
     /// controllers its limits need, writes the limits, and creates the
     /// [`LEAF`] beneath it that the launch stage joins.
     ///
+    /// `tied` says whether the launch ties the sandbox to its handles, which
+    /// the drop of the last of them then ends through the cgroup.
+    ///
     /// # Errors
     ///
     /// [`Error::CgroupRefused`] where the parent cannot hold such a cgroup, and
     /// [`Error::Cgroup`] where a step fails for a reason of the host's that no
     /// [`CgroupRefusal`] names.
-    pub(crate) fn create(plan: &CgroupPlan) -> Result<Cgroup, Error> {
+    pub(crate) fn create(plan: &CgroupPlan, tied: bool) -> Result<Cgroup, Error> {
         // An errno a step met: the refusal it stands for, or else the host's
         // failure, named by what the step was doing.
         let failed = |step: Step, op: &'static str, path: &Path| {
@@ -871,6 +879,7 @@ impl Cgroup {
                 procs,
                 kill,
                 killed: AtomicBool::new(false),
+                tied,
                 removed: AtomicBool::new(false),
             }),
             Err(err) => {
@@ -999,10 +1008,19 @@ impl Drop for Cgroup {
     /// Removes the leaf and the cgroup, which the kernel allows once no process
     /// is left in them, waiting up to [`EMPTYING_BOUND`] for a tree a kill
     /// ended to empty. One that still holds processes, as a sandbox without a
-    /// PID namespace can leave behind, stays beneath the parent.
+    /// PID namespace can leave behind, stays beneath the parent, unless the
+    /// launch tied the sandbox to its handles: this drop is then the last of
+    /// them going, which ends the sandbox, and it ends the tree with it.
+    ///
+    /// The supervisor's own teardown on that hangup is asynchronous, and
+    /// without a PID namespace it ends only the command, so the drop does not
+    /// rely on it.
     fn drop(&mut self) {
         if *self.removed.get_mut() {
             return;
+        }
+        if self.tied {
+            let _ = self.kill();
         }
         if *self.killed.get_mut() {
             self.await_empty(Instant::now().checked_add(EMPTYING_BOUND));

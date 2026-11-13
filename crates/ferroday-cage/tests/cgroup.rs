@@ -382,6 +382,43 @@ fn a_kill_handle_s_kill_after_the_outcome_removes_the_cgroup_whichever_handle_dr
 }
 
 #[test]
+fn dropping_a_tied_handle_ends_the_tree_and_removes_its_cgroup() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let own = own_parent(parent, "tied-drop");
+    for pid_namespace in [true, false] {
+        let running = sh_in(&own, "sleep 60 & exec sleep 60")
+            .pid_namespace(pid_namespace)
+            .stop_with_caller(true)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn()
+            .expect("the sandbox launches");
+        // The drop waits for the tree it ended to empty, a bounded wait, and
+        // removes the cgroup before it returns.
+        let started = Instant::now();
+        drop(running);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the drop waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            sandbox_cgroups(&own),
+            Vec::<String>::new(),
+            "the cgroup is removed as the tied handle drops, pid_namespace({pid_namespace})",
+        );
+    }
+}
+
+#[test]
 fn a_cgroup_still_holding_what_the_command_left_stays_beneath_the_parent() {
     if !common::require::userns() {
         return;

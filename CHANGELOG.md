@@ -327,8 +327,10 @@ consumer upgrading can skip it.
   is known and nothing is left in it. Where a process the command left behind
   still holds it then, the last of the handle and its kill handles to drop
   removes it after a kill, once the tree has emptied, waiting up to five seconds
-  for it. A cgroup still holding a process nothing killed stays beneath the
-  parent. A launch the parent cannot serve fails with `Error::CgroupRefused` and
+  for it. Under `stop_with_caller`, dropping the last of them ends the tree
+  through `cgroup.kill` and removes the cgroup the same way. A cgroup still
+  holding a process nothing killed stays beneath the parent. A launch the parent
+  cannot serve fails with `Error::CgroupRefused` and
   a `CgroupRefusal`: a parent that is missing, outside a cgroup v2 hierarchy,
   read-only, not delegated to the caller, lacking a controller, or holding
   processes, a kernel without a limit's file, or a caller the launch cannot move
