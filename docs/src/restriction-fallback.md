@@ -222,10 +222,14 @@ both reaches:
   it, and no grant carrying write access lies at, above, or beneath a mount of
   the cgroup v2 hierarchy in the caller's mount table. A grant is judged
   through its links, as the launch resolves it.
-- Its seccomp policy answers `clone3` with an errno. The curated policy
+- Its seccomp policy lets no call of `clone3` run: it answers it with an
+  errno, or kills the thread or the process that makes it. The curated policy
   answers it with `ENOSYS`, which the C library reads as a kernel without
-  `clone3`, falling back to `clone`. A precompiled program is not read, so it
-  does not count.
+  `clone3`, falling back to `clone`. No other answer lets a program use it:
+  glibc 2.34 and later starts threads and `posix_spawn` children through
+  `clone3`, so under another errno a program that does either fails to, and
+  under a kill it ends. A precompiled program is not read, so it does not
+  count.
 
 Otherwise the build fails with [`ConfigError::RestrictionCgroupReachable`], and
 a [`CgroupReach`] naming the reach left open. Limits that are not required are

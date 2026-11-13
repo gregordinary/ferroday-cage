@@ -888,7 +888,7 @@ rendered as text.
     ///
     /// A restriction carrying a cgroup parent or a limit builds only where its
     /// Landlock domain keeps every write off the cgroup v2 hierarchy and its
-    /// seccomp policy answers `clone3` with an errno; [`CgroupReach`] says
+    /// seccomp policy lets no call of `clone3` run; [`CgroupReach`] says
     /// which of those does not hold.
     // The sentence links a feature-gated item, so its doc text is gated on the
     // feature, as a restriction is.

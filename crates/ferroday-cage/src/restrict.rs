@@ -438,10 +438,16 @@ impl RestrictionBuilder {
     ///   gives it, and no grant carrying [`FsAccess::WRITE`] lies at, above, or
     ///   beneath a mount of the cgroup v2 hierarchy in this process's mount
     ///   table, judged through links as the launch resolves the grant;
-    /// - its [`seccomp`](Self::seccomp) policy answers `clone3` with an errno,
-    ///   as the [curated roster](crate::SeccompRules::curated) does with
-    ///   `ENOSYS`. A precompiled [`SeccompPolicy::Program`] is not read, so it
-    ///   does not count.
+    /// - its [`seccomp`](Self::seccomp) policy lets no call of `clone3` run,
+    ///   answering it with an errno, as the
+    ///   [curated roster](crate::SeccompRules::curated) does with `ENOSYS`, or
+    ///   killing the thread or the process that makes it. A precompiled
+    ///   [`SeccompPolicy::Program`] is not read, so it does not count.
+    ///
+    /// Only `ENOSYS` leaves `clone3` usable as a kernel without it, from which
+    /// the C library falls back to `clone`. glibc 2.34 and later starts a
+    /// thread and a `posix_spawn` through `clone3`, so under any other errno a
+    /// program that does either fails to, and under a kill it ends.
     ///
     /// Otherwise [`build`](Self::build) fails with
     /// [`ConfigError::RestrictionCgroupReachable`], whose
@@ -979,7 +985,7 @@ fn settle_landlock(
 /// The command could write the cgroup's files unless its Landlock domain
 /// governs file writes and grants none at, above, or beneath a mount of the
 /// cgroup v2 hierarchy, and could start a process in another cgroup unless its
-/// seccomp policy answers `clone3` with an errno. A grant is judged both as
+/// seccomp policy lets no call of `clone3` run. A grant is judged both as
 /// named and as resolved through links, as the launch resolves it.
 ///
 /// `mounts` is where this process's mount table mounts the hierarchy, or
@@ -1021,7 +1027,7 @@ fn ensure_cgroup_held(
         }
     }
     let clone3 = i64::from(syscalls::Sysno::clone3.id());
-    if !seccomp.is_some_and(|policy| policy.answers_with_errno(clone3)) {
+    if !seccomp.is_some_and(|policy| policy.never_runs(clone3)) {
         return refused(CgroupReach::Clone3Allowed);
     }
     Ok(())
@@ -1030,7 +1036,7 @@ fn ensure_cgroup_held(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SeccompRules;
+    use crate::{SeccompAction, SeccompArg, SeccompRules};
 
     /// Every field of a restriction's builder is classified against the cage
     /// builder's, and stays classified because this stops compiling otherwise.
@@ -1524,6 +1530,26 @@ mod tests {
             reach(confined(SeccompPolicy::Rules(denied)), as_named),
             None
         );
+        // A kill runs no call either, listed or as the default.
+        for action in [SeccompAction::KillThread, SeccompAction::KillProcess] {
+            let killed = SeccompRules::denying([clone3_number()]).listed_action(action);
+            let unlisted = SeccompRules::allowing([clone3_number() - 1]).default_action(action);
+            for rules in [killed, unlisted] {
+                assert_eq!(
+                    reach(confined(SeccompPolicy::Rules(rules)), as_named),
+                    None,
+                    "{action:?}"
+                );
+            }
+        }
+        // A rule with conditions refuses every call where both actions do.
+        let conditional = SeccompRules::denying([])
+            .rule(clone3_number(), [SeccompArg::eq_qword(1, 88)])
+            .default_action(SeccompAction::KillProcess);
+        assert_eq!(
+            reach(confined(SeccompPolicy::Rules(conditional)), as_named),
+            None
+        );
     }
 
     #[test]
@@ -1587,9 +1613,10 @@ mod tests {
     fn a_restriction_whose_seccomp_policy_lets_clone3_run_is_refused_a_cgroup() {
         let clone3 = clone3_number();
         let flags_on_the_stack =
-            SeccompRules::denying([]).rule(clone3, [crate::SeccompArg::eq_qword(1, 88)]);
-        let killed =
-            SeccompRules::denying([clone3]).listed_action(crate::SeccompAction::KillThread);
+            SeccompRules::denying([]).rule(clone3, [SeccompArg::eq_qword(1, 88)]);
+        let logged = SeccompRules::denying([clone3]).listed_action(SeccompAction::Log);
+        let unlisted_logged =
+            SeccompRules::allowing([clone3 - 1]).default_action(SeccompAction::Log);
         for policy in [
             None,
             Some(SeccompPolicy::Rules(SeccompRules::denying([
@@ -1597,7 +1624,8 @@ mod tests {
             ]))),
             Some(SeccompPolicy::Rules(SeccompRules::allowing([clone3]))),
             Some(SeccompPolicy::Rules(flags_on_the_stack)),
-            Some(SeccompPolicy::Rules(killed)),
+            Some(SeccompPolicy::Rules(logged)),
+            Some(SeccompPolicy::Rules(unlisted_logged)),
             // A program the build cannot read.
             Some(SeccompPolicy::Program(Vec::new())),
         ] {

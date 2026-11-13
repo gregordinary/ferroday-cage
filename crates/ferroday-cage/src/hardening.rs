@@ -853,8 +853,10 @@ impl SeccompAction {
     }
 
     /// Whether the action lets the syscall run. `Allow` runs it and `Log` runs
-    /// it after auditing; the rest deny it. Used to decide whether a policy
-    /// restricts anything at all.
+    /// it after auditing. The rest refuse it without running it: `Errno` fails
+    /// it, and `KillThread` and `KillProcess` end the thread or the process
+    /// that made it. Decides whether a policy restricts anything at all, and
+    /// whether it lets a syscall run.
     fn is_permissive(self) -> bool {
         matches!(self, SeccompAction::Allow | SeccompAction::Log)
     }
@@ -1426,14 +1428,13 @@ impl SeccompRules {
         (rules, errnos)
     }
 
-    /// Whether every call of `syscall` is answered with an errno, whatever its
-    /// arguments, so that it never runs.
+    /// Whether no call of `syscall` runs, whatever its arguments.
     ///
-    /// An errno given for it answers it so. Otherwise a listing without
+    /// An errno given for it refuses it so. Otherwise a listing without
     /// conditions takes the listed action, no listing takes the default
     /// action, and a listing with conditions only takes either by the
-    /// arguments, so both must be errnos.
-    fn answers_with_errno(&self, syscall: i64) -> bool {
+    /// arguments, so both must refuse it.
+    fn never_runs(&self, syscall: i64) -> bool {
         let (rules, errnos) = self.lowered();
         if errnos.contains_key(&syscall) {
             return true;
@@ -1442,10 +1443,9 @@ impl SeccompRules {
             .iter()
             .filter(|rule| rule.syscall == syscall)
             .collect();
-        let errno = |action: SeccompAction| matches!(action, SeccompAction::Errno(_));
         let unconditional = listed.iter().any(|rule| rule.conditions.is_empty());
-        (listed.is_empty() || errno(self.listed_action))
-            && (unconditional || errno(self.default_action))
+        (listed.is_empty() || !self.listed_action.is_permissive())
+            && (unconditional || !self.default_action.is_permissive())
     }
 
     /// Whether these are the curated roster with nothing added: what a profile
@@ -1487,14 +1487,20 @@ impl SeccompPolicy {
         }
     }
 
-    /// Whether the policy answers every call of `syscall` with an errno, so
-    /// that it never runs.
+    /// Whether the policy lets no call of `syscall` run, whatever its
+    /// arguments: each is failed with an errno, or ends the thread or the
+    /// process that made it.
     ///
-    /// A precompiled [`Program`](Self::Program) is not read, so it answers no
-    /// syscall this way as far as the crate can tell.
-    pub(crate) fn answers_with_errno(&self, syscall: i64) -> bool {
+    /// Every action a [`SeccompAction`] names either runs the syscall or does
+    /// not; none hands it to a tracer or a supervisor that could run it. A
+    /// filter installed beside this one cannot run it either, since the kernel
+    /// takes the most restrictive answer of all a process's filters, and every
+    /// answer that hands a syscall on ranks below an errno. A precompiled
+    /// [`Program`](Self::Program) is not read, so as far as the crate can tell
+    /// it lets every syscall run.
+    pub(crate) fn never_runs(&self, syscall: i64) -> bool {
         match self {
-            SeccompPolicy::Rules(rules) => rules.answers_with_errno(syscall),
+            SeccompPolicy::Rules(rules) => rules.never_runs(syscall),
             SeccompPolicy::Program(_) => false,
         }
     }

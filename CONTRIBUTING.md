@@ -568,7 +568,7 @@ report name a package and its version bare.
 | What does the single-identity map write? | `idmap::single_identity_lines` |
 | Validate the command a sandbox or a restriction executes | `spec::validate_command` |
 | Which syscall number, or which errno, does a name spell for a seccomp policy? | `SeccompRules::syscall`, `SeccompRules::errno` |
-| Does a seccomp policy answer every call of a syscall with an errno, whatever its arguments? | `SeccompPolicy::answers_with_errno` |
+| Does a seccomp policy let no call of a syscall run, whatever its arguments? | `SeccompPolicy::never_runs` |
 | Write a classic-BPF seccomp program by hand, or install one | `mechanism::seccomp`: its `bpf` opcodes and offsets, its audit architectures, and `seccomp::install` |
 | Run a seccomp program over a syscall in a unit test | `mechanism::seccomp::eval` |
 | Does a launch install the network filter, and what does the filter refuse? | `mechanism::seccomp::installs_network_filter` and `seccomp::NETWORK_FILTER_REFUSALS`, which the launch and the provenance record both read |

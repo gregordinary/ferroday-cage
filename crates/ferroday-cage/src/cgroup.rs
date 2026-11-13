@@ -296,8 +296,8 @@ impl fmt::Display for CgroupRefusal {
 /// domain governing file writes refuses wherever it grants none. The other is
 /// `clone3` with `CLONE_INTO_CGROUP`, which starts a process in a cgroup named
 /// by a descriptor that may be opened with `O_PATH`, which Landlock does not
-/// check, and which a seccomp policy refuses by answering `clone3` with an
-/// errno. Each variant is one of those left open.
+/// check, and which a seccomp policy refuses by letting no call of `clone3`
+/// run. Each variant is one of those left open.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CgroupReach {
@@ -317,9 +317,9 @@ pub enum CgroupReach {
     /// This process's mount table, which says where the cgroup v2 hierarchy
     /// is mounted, cannot be read, so no grant can be judged against it.
     MountTableUnread,
-    /// The restriction's seccomp policy does not answer `clone3` with an
-    /// errno: it has none, it is a precompiled program, which the build does
-    /// not read, or it lets some call of `clone3` run.
+    /// The restriction's seccomp policy may let a call of `clone3` run: it has
+    /// none, it is a precompiled program, which the build does not read, or it
+    /// allows or only logs some call of `clone3`.
     Clone3Allowed,
 }
 
@@ -342,9 +342,8 @@ impl fmt::Display for CgroupReach {
                  mounted, cannot be read",
             ),
             CgroupReach::Clone3Allowed => f.write_str(
-                "its seccomp policy does not answer clone3 with an errno, and clone3 starts a \
-                 process in any cgroup the command can name; the curated policy answers it \
-                 with ENOSYS",
+                "its seccomp policy may let clone3 run, and clone3 starts a process in any \
+                 cgroup the command can name; the curated policy answers it with ENOSYS",
             ),
         }
     }

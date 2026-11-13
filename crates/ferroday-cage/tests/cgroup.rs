@@ -763,6 +763,66 @@ fn a_restricted_command_can_neither_lift_its_limit_nor_leave_its_tree() {
     assert_held_to_the_limit(&output, &report);
 }
 
+/// A seccomp policy that kills whatever calls `clone3` lets no call of it run,
+/// so a restriction holds its cgroup under it as under an errno: the build
+/// accepts it, the launch reaches the command, and the command ends at its
+/// first `clone3`.
+///
+/// The command is a shell that reports its cgroup through `cat`, which the
+/// shell starts with `fork`, and then runs this test binary, whose harness
+/// starts each test on a thread of its own through `clone3`.
+#[cfg(feature = "hardening")]
+#[test]
+fn a_restricted_command_killed_at_clone3_ends_in_its_cgroup() {
+    use ferroday_cage::{FsAccess, Restriction, SeccompAction, SeccompPolicy, SeccompRules};
+
+    if !(common::landlock() && common::require::seccomp()) {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let clone3 = SeccompRules::syscall("clone3").expect("the host has clone3");
+    for action in [SeccompAction::KillThread, SeccompAction::KillProcess] {
+        let output = common::grant_system_trees(Restriction::builder())
+            .command("/bin/sh")
+            .args([
+                "-c",
+                "cat /proc/self/cgroup && exec \"$0\" --exact probe_reach",
+                exe.to_str().expect("the test binary's path is UTF-8"),
+            ])
+            .landlock_fs(
+                FsAccess::READ | FsAccess::EXECUTE,
+                exe.parent().expect("the test binary is in a directory"),
+            )
+            .landlock_fs(FsAccess::READ, "/proc")
+            .seccomp(SeccompPolicy::Rules(
+                SeccompRules::denying([clone3]).listed_action(action),
+            ))
+            .cgroup_parent(parent)
+            .cgroup_limit(CgroupLimit::PidsMax(8))
+            .build()
+            .expect("a restriction whose policy kills at clone3 holds its cgroup")
+            .output()
+            .expect("the restriction runs");
+        // The cgroup line, and then the harness's own, which it prints
+        // before it starts the test's thread.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines().filter(|line| !line.is_empty());
+        assert!(
+            lines.next().is_some_and(|own| own.ends_with("/sandbox")),
+            "{action:?}: {stdout}"
+        );
+        assert_eq!(lines.next(), Some("running 1 test"), "{action:?}: {stdout}");
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSYS),
+            "{action:?}: {output:?}"
+        );
+    }
+}
+
 #[test]
 fn a_caged_command_mounting_its_cgroup_namespace_sees_no_limit_to_lift() {
     if !common::require::userns() {

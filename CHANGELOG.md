@@ -179,11 +179,12 @@ consumer upgrading can skip it.
   command can neither write the cgroup's files nor start a process in another
   cgroup. Its Landlock domain must govern file writes and grant none at, above,
   or beneath a mount of the cgroup v2 hierarchy, and its seccomp policy must
-  answer `clone3` with an errno, as the curated policy does. Otherwise the build
-  fails with the new `ConfigError::RestrictionCgroupReachable`, and the new
-  `CgroupReach` names the reach left open. `cgroup_required(false)` does not
-  waive the rule, and `fcage --restrict` with the cgroup flags is refused the
-  same way.
+  let no call of `clone3` run, answering it with an errno, as the curated
+  policy does with `ENOSYS`, or killing the thread or the process that makes
+  it. Otherwise the build fails with the new
+  `ConfigError::RestrictionCgroupReachable`, and the new `CgroupReach` names
+  the reach left open. `cgroup_required(false)` does not waive the rule, and
+  `fcage --restrict` with the cgroup flags is refused the same way.
 - The library requires irongall 0.2.0, with which the Debian and Gentoo layers
   verify an archive's signed documents. A signature that names intended
   recipients in its hashed area is refused over a document, as RFC 9580 makes
