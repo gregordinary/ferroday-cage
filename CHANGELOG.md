@@ -891,6 +891,9 @@ consumer upgrading can skip it.
   directory, hidden or read-only path, or `PATH` reached the terminal raw when
   the error was printed, so a profile from an untrusted source could carry an
   escape sequence onto it.
+- A NUL byte in the `PATH` a path lookup searches is reported as
+  `ConfigError::EmbeddedNul` naming that `PATH`. It named a search candidate
+  built from it instead.
 
 ### Internal
 

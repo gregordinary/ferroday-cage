@@ -2862,6 +2862,25 @@ impl CageBuilder {
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
         let command = validate_command(self.command, Some(self.path_lookup))?;
+        // With the base opted out of, the caller's pairs are the whole
+        // environment; the library contributes nothing, in this release or a
+        // later one. A command that runs as another identity than uid 0 gets
+        // no `HOME`: a presented identity is never uid 0, and a run-as one is
+        // where it names another uid.
+        let runs_as_root = self.present_as.is_none()
+            && self
+                .run_as
+                .as_ref()
+                .is_none_or(|identity| identity.uid == 0);
+        let base: &[(&str, &str)] = match (base_env, runs_as_root) {
+            (false, _) => &[],
+            (true, true) => &BASE_ENV,
+            (true, false) => &BASE_ENV_UNPRIVILEGED,
+        };
+        // Composed before the search below, so a NUL in `PATH` is reported
+        // against the value that carries it rather than a candidate built
+        // from it.
+        let env = compose_env(base, &self.env)?;
         let program_search = if command.searched {
             // A `PATH` with no absolute entry leaves nothing to search. Refuse
             // it here rather than fall through to an `execve` of the bare name,
@@ -2890,22 +2909,6 @@ impl CageBuilder {
             .map(|arg| cstring(arg))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // With the base opted out of, the caller's pairs are the whole
-        // environment; the library contributes nothing, in this release or a
-        // later one. A command that runs as another identity than uid 0 gets
-        // no `HOME`: a presented identity is never uid 0, and a run-as one is
-        // where it names another uid.
-        let runs_as_root = self.present_as.is_none()
-            && self
-                .run_as
-                .as_ref()
-                .is_none_or(|identity| identity.uid == 0);
-        let base: &[(&str, &str)] = match (base_env, runs_as_root) {
-            (false, _) => &[],
-            (true, true) => &BASE_ENV,
-            (true, false) => &BASE_ENV_UNPRIVILEGED,
-        };
-        let env = compose_env(base, &self.env)?;
         let hostname = self
             .hostname
             .map(|name| validate_hostname(&name))
@@ -6082,6 +6085,20 @@ mod tests {
         match err {
             Error::Config(ConfigError::EmbeddedNul { value }) => {
                 assert_eq!(value, OsStr::from_bytes(b"/bin/s\0h"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // In the `PATH` a lookup searches, it is the value that is named, not
+        // a candidate the search built from it.
+        let err = sh_in("/tmp")
+            .command("sh")
+            .path_lookup(true)
+            .env("PATH", OsStr::from_bytes(b"/usr/b\0in"))
+            .build()
+            .unwrap_err();
+        match err {
+            Error::Config(ConfigError::EmbeddedNul { value }) => {
+                assert_eq!(value, OsStr::from_bytes(b"/usr/b\0in"));
             }
             other => panic!("unexpected error: {other}"),
         }
