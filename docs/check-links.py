@@ -8,7 +8,9 @@ rustdoc output instead, where the URL path maps one-to-one onto a generated
 file and a `#method.x` fragment onto an anchor in it.
 
 Relative links between chapters are checked too, including their heading
-anchors, so a section rename does not leave a dangling cross-reference. So are
+anchors, so a section rename does not leave a dangling cross-reference. A
+reference-style link whose label no definition in its chapter names is a
+failure as well: mdBook renders it as the bracketed text, with no link. So are
 the links that point at this repository's own source on GitHub: they are
 external URLs and mdBook skips them, but the file they name is right here, and a
 rename would otherwise leave the guide pointing at nothing with nothing
@@ -51,6 +53,18 @@ REFERENCE = re.compile(r"^\[[^\]]+\]:\s*(\S+)", re.MULTILINE)
 # Fenced code blocks: skipped, so an example that happens to contain `](` is
 # not mistaken for a link.
 FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
+
+# A code span, as CommonMark closes one: a backtick run ended by the next run
+# of the same length. HTML comments are dropped with them, since neither holds
+# a link.
+CODE_SPAN_ANYWHERE = re.compile(r"(`+).+?(?<!`)\1(?!`)", re.DOTALL)
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+# A reference-style link: `[text][label]`, `[label][]`, or `[label]` alone. An
+# inline link, a definition, an image, and an escaped bracket are not one, and
+# neither is the second half of a full reference, which the first half's match
+# consumes.
+REFERENCE_USE = re.compile(r"(?<![\\!\]])\[([^\[\]]+)\](?:\[([^\[\]]*)\])?(?![(:\[])")
 
 
 # A code span in a heading: mdBook keeps its text and drops the backticks.
@@ -215,6 +229,39 @@ def check_rendered_anchors(chapter: Path, book: Path) -> str | None:
     )
 
 
+def undefined_references(text: str) -> list[str]:
+    """The labels of the reference-style links in a chapter that no definition
+    in it names, in the order they appear.
+
+    Code spans are masked rather than removed: a label is often one, as in
+    ``[`Network`]``, and a bracket inside one elsewhere, as in `` `[[mount]]` ``,
+    is no link. Labels compare as CommonMark compares them, ignoring case and
+    collapsing whitespace.
+    """
+    spans: list[str] = []
+
+    def mask(match: re.Match[str]) -> str:
+        spans.append(match.group(0))
+        return f"\0{len(spans) - 1}\0"
+
+    masked = CODE_SPAN_ANYWHERE.sub(mask, HTML_COMMENT.sub("", FENCE.sub("", text)))
+
+    def label(raw: str) -> str:
+        unmasked = re.sub("\0(\\d+)\0", lambda found: spans[int(found.group(1))], raw)
+        return " ".join(unmasked.split())
+
+    definitions = re.finditer(r"^\[([^\]]+)\]:", masked, re.MULTILINE)
+    defined = {label(found.group(1)).casefold() for found in definitions}
+    missing = []
+    for use in REFERENCE_USE.finditer(masked):
+        text_part, label_part = use.group(1), use.group(2)
+        named = label(label_part) if label_part else label(text_part)
+        if named.startswith("^") or named.casefold() in defined:
+            continue
+        missing.append(named)
+    return missing
+
+
 def links_in(text: str) -> list[str]:
     stripped = FENCE.sub("", text)
     return [
@@ -248,6 +295,11 @@ def main() -> int:
             if problem:
                 failures.append(f"{chapter.relative_to(REPO)}: heading anchors\n    {problem}")
         text = chapter.read_text(encoding="utf-8")
+        for missing in undefined_references(text):
+            checked += 1
+            failures.append(
+                f"{chapter.relative_to(REPO)}: [{missing}]\n    no reference definition names this label"
+            )
         for url in links_in(text):
             if url.startswith(DOCS_RS):
                 problem = check_rustdoc_link(url)

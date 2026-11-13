@@ -548,6 +548,7 @@ with no sandbox around it.
 [`SeccompPolicy`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.SeccompPolicy.html
 [`SeccompRules`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html
 [`SeccompRules::rule`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.rule
+[`SeccompRules::curated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.curated
 [`SeccompRules::syscall`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.syscall
 [`SeccompArg`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompArg.html
 [`SockFilter`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SockFilter.html
@@ -557,6 +558,8 @@ with no sandbox around it.
 [`Network::None`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
 [`Network::Host`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
 [`pid_namespace(false)`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.pid_namespace
+[`rlimit`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.rlimit
+[`Resource`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/limits/enum.Resource.html
 [`landlock_scope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.landlock_scope
 [`LandlockScope`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.LandlockScope.html
 [`SeccompRules::errno_for`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.errno_for
