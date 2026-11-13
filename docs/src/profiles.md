@@ -126,6 +126,26 @@ target = "usr/bin"   # what the link points at, as `ln -s` writes it
 path = "/bin"        # the link itself, inside the sandbox
 ```
 
+`host-rootfs = true` roots the sandbox on the [host's own
+root](how-the-sandbox-is-built.md#the-hosts-own-root), read-only, and is the
+fourth alternative. `reveal` takes back paths it hides by default:
+
+```toml
+host-rootfs = true
+reveal = ["/var/tmp"]          # shown read-only, as the rest of the host
+command = "/usr/bin/make"
+workdir = "/home/user/project"
+
+[[mount]]
+kind = "bind"
+source = "/home/user/project"
+target = "/home/user/project"
+
+[[mount]]
+kind = "read-only"
+target = "/home/user/project/.git/hooks"
+```
+
 `[env]` is a table of environment variables, added on top of the
 deterministic base (`PATH` and `HOME`) — or the whole environment, where
 `base-env = false`.
@@ -155,6 +175,11 @@ profile. The `kind` selects which fields the entry carries:
   bits — and `data` string go to the kernel verbatim.
 - `kind = "symlink"` makes a symbolic link at `path`, pointing at `target`. The
   link is not a mount, but it takes its place in the same order.
+- `kind = "hide"` leaves `target` empty: a directory holds nothing and a file
+  reads empty, and neither can be written. A `target` with nothing at it hides
+  nothing.
+- `kind = "read-only"` makes `target` read-only where it stands, mounts beneath
+  it included. The `target` must exist.
 
 Every kind shares one array so that their relative order is expressible. It
 matters whenever a mount covers a path an earlier one established: declaring a
@@ -409,7 +434,13 @@ sandbox, write to the host outside it, or share a host namespace:
 - a symbolic link, a `[[mount]]` entry with `kind = "symlink"`
 - host networking
 - an overlay root
+- the host's own root, `host-rootfs`, and a path it hides taken back, `reveal`
 - sharing the host PID namespace
+
+A hidden path and a path made read-only only take away, so the policy admits
+both. The host's own root maps the host's whole tree in, and a path the
+profile takes back from its hides would be shown by a consumer's own
+`host_rootfs` after loading.
 
 An overlay root is refused because, unlike the root filesystem, its upper layer
 is created rather than required to exist. The profile would choose a host path
@@ -466,8 +497,8 @@ it:
 - Scalar flags override the profile's value. Every toggle has both
   directions for this purpose — `--share-net`/`--isolate-net`,
   `--share-pid`/`--pid-ns`, `--proc`/`--no-proc`, and so on.
-- `--bind`, `--ro-bind`, `--raw-mount`, `--symlink`, and `--setenv` extend the
-  profile's lists.
+- `--bind`, `--ro-bind`, `--raw-mount`, `--symlink`, `--hide`, `--read-only`,
+  `--reveal`, and `--setenv` extend the profile's lists.
 - A command on the command line replaces the profile's `command` and
   `args` as a unit.
 - `stop-with-caller` is the one key `fcage` defaults differently from the

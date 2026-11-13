@@ -59,6 +59,14 @@ const DEV_DEVICES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tt
 /// distribution ships `/dev` and `/proc` as.
 const DIR_MODE: RawMode = 0o755;
 
+/// The paths the [host's own root](CageBuilder::host_rootfs) hides by default:
+/// where the host keeps its users' credentials and its live sockets, which a
+/// read-only mount does not stop a `connect` to.
+///
+/// `/tmp` and `/dev/shm` are not here because the managed profile already
+/// replaces them with tmpfs instances of the sandbox's own.
+const HOST_ROOT_HIDDEN: [&str; 5] = ["/home", "/root", "/run", "/var/run", "/var/tmp"];
+
 /// The sandbox path the host's resolver configuration is bound onto, and the
 /// one a caller's own mount there replaces.
 const RESOLV_CONF: &str = "/etc/resolv.conf";
@@ -93,14 +101,17 @@ const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
 fn claims_resolv_conf(mount: &Mount) -> bool {
     let arrival = match mount {
         // A link at the target or above it decides what the path names, as a
-        // tree mounted there would.
-        Mount::Bind(_) | Mount::Symlink(_) => Some(Arrival::Tree),
+        // tree mounted there would. A path made read-only is a tree bound onto
+        // itself.
+        Mount::Bind(_) | Mount::Symlink(_) | Mount::ReadOnly(_) => Some(Arrival::Tree),
+        // A hidden directory is a tmpfs of the sandbox's own, as a fresh
+        // filesystem mounted above the target is.
+        Mount::Hide(_) => Some(Arrival::Fresh),
         Mount::Raw(raw) => u32::try_from(raw.flags)
             .ok()
             .and_then(|flags| Arrival::of_raw(MountFlags::from_bits_retain(flags))),
     };
-    let target =
-        sandbox_path_components(mount.get_target()).and_then(|components| rel_cstring(&components));
+    let target = sandbox_target(mount.get_target());
     let (Some(arrival), Ok(target)) = (arrival, target) else {
         return false;
     };
@@ -881,8 +892,97 @@ impl Symlink {
     }
 }
 
-/// One mount a consumer adds to a sandbox: a bind, a raw mount, or a symbolic
-/// link.
+/// A path inside the sandbox the command finds empty: a directory holding
+/// nothing, or an empty file, either on a read-only mount.
+///
+/// Added with [`CageBuilder::hide`], or as a `[[mount]]` table with
+/// `kind = "hide"` in a profile. It takes its place in the mount sequence, and
+/// works on every kind of root.
+///
+/// What is at the path when the sequence reaches it decides what hides it. A
+/// directory gets an empty tmpfs of the sandbox's own, mounted `nosuid`,
+/// `nodev` and `noexec`, and made read-only once the mount profile is in
+/// place, so a later mount can still be made beneath it: a working tree bound
+/// back into a hidden home directory, for one. Anything else gets an empty
+/// regular file bound over it from a tmpfs of the sandbox's own, read-only
+/// from the start. Reads find nothing there, and a write fails with `EROFS`
+/// wherever the file's permissions, `0644` to the sandbox's root, admit one.
+///
+/// A path with nothing at it hides nothing and is not an error, so one list of
+/// paths serves hosts that hold different subsets of them. A symbolic link at
+/// the path is followed inside the root, as every mount target is, and what it
+/// names is hidden.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case", deny_unknown_fields)
+)]
+pub struct Hide {
+    target: PathBuf,
+}
+
+impl Hide {
+    /// Hides `target`, an absolute path inside the sandbox.
+    ///
+    /// [`CageBuilder::hide`] is the ordinary way to add one.
+    pub fn new(target: impl AsRef<Path>) -> Hide {
+        Hide {
+            target: target.as_ref().to_path_buf(),
+        }
+    }
+
+    /// The path inside the sandbox it hides.
+    pub fn get_target(&self) -> &Path {
+        &self.target
+    }
+}
+
+/// A path inside the sandbox made read-only where it stands: the tree at the
+/// path is bound onto itself, read-only, with every mount beneath it.
+///
+/// Added with [`CageBuilder::read_only`], or as a `[[mount]]` table with
+/// `kind = "read-only"` in a profile. It takes its place in the mount
+/// sequence, after the mount that brought the path, and works on every kind
+/// of root. It protects a path inside a writable bind, such as a working
+/// tree's `.git/hooks`, without naming the host path the bind came from, so it
+/// holds wherever the tree is bound from.
+///
+/// The path must exist when the sequence reaches it, or the launch fails at
+/// [`SetupStep::OpenMountTarget`](crate::SetupStep::OpenMountTarget): a path
+/// left writable because it was missing is one the command could create. A
+/// symbolic link at the path is followed inside the root, as every mount
+/// target is.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case", deny_unknown_fields)
+)]
+pub struct ReadOnly {
+    target: PathBuf,
+}
+
+impl ReadOnly {
+    /// Makes `target`, an absolute path inside the sandbox, read-only.
+    ///
+    /// [`CageBuilder::read_only`] is the ordinary way to add one.
+    pub fn new(target: impl AsRef<Path>) -> ReadOnly {
+        ReadOnly {
+            target: target.as_ref().to_path_buf(),
+        }
+    }
+
+    /// The path inside the sandbox it makes read-only.
+    pub fn get_target(&self) -> &Path {
+        &self.target
+    }
+}
+
+/// One mount a consumer adds to a sandbox: a bind, a raw mount, a symbolic
+/// link, a hidden path, or a path made read-only.
 ///
 /// The sandbox applies these in the order they are declared, after the
 /// managed mount profile. Holding every kind in one sequence is what makes
@@ -890,9 +990,10 @@ impl Symlink {
 /// interleaved, which a bind-then-raw arrangement cannot express.
 ///
 /// Added with [`CageBuilder::bind`], [`CageBuilder::bind_ro`],
-/// [`CageBuilder::raw_mount`], and [`CageBuilder::symlink`], whole with
-/// [`CageBuilder::mount`] and [`CageBuilder::mounts`], or as a `[[mount]]`
-/// table in a profile, and read back through [`CageBuilder::get_mounts`].
+/// [`CageBuilder::raw_mount`], [`CageBuilder::symlink`], [`CageBuilder::hide`],
+/// and [`CageBuilder::read_only`], whole with [`CageBuilder::mount`] and
+/// [`CageBuilder::mounts`], or as a `[[mount]]` table in a profile, and read
+/// back through [`CageBuilder::get_mounts`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -907,6 +1008,10 @@ pub enum Mount {
     Raw(RawMount),
     /// A symbolic link, created in the sandbox's filesystem.
     Symlink(Symlink),
+    /// A path the command finds empty.
+    Hide(Hide),
+    /// A path made read-only where it stands.
+    ReadOnly(ReadOnly),
 }
 
 impl Mount {
@@ -921,6 +1026,8 @@ impl Mount {
             Mount::Bind(bind) => bind.get_target(),
             Mount::Raw(raw) => raw.get_target(),
             Mount::Symlink(symlink) => symlink.get_path(),
+            Mount::Hide(hide) => hide.get_target(),
+            Mount::ReadOnly(read_only) => read_only.get_target(),
         }
     }
 }
@@ -1185,6 +1292,12 @@ pub struct CageBuilder {
     rootfs: Option<PathBuf>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
     empty_rootfs: bool,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "std::ops::Not::not"))]
+    host_rootfs: bool,
+    // The host root's default hides the caller takes back. An array of strings
+    // is a value rather than a table, so it may sit among the scalars.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    reveal: Vec<PathBuf>,
     command: Option<PathBuf>,
     #[cfg_attr(
         feature = "serde",
@@ -1334,6 +1447,8 @@ impl Default for CageBuilder {
         CageBuilder {
             rootfs: None,
             empty_rootfs: false,
+            host_rootfs: false,
+            reveal: Vec::new(),
             command: None,
             args: Vec::new(),
             network: Network::default(),
@@ -1372,11 +1487,11 @@ impl CageBuilder {
     ///
     /// The path is resolved and opened by [`build`](Self::build); it must
     /// exist, be a directory, and not be the host root. Setting a plain rootfs
-    /// supersedes an [`overlay_rootfs`](Self::overlay_rootfs) or an
-    /// [`empty_rootfs`](Self::empty_rootfs) call, and either of those
-    /// supersedes it; the last call wins. A consumer overriding an untrusted
-    /// profile's rootfs therefore clears any other root it configured along
-    /// with it.
+    /// supersedes an [`overlay_rootfs`](Self::overlay_rootfs), an
+    /// [`empty_rootfs`](Self::empty_rootfs), or a
+    /// [`host_rootfs`](Self::host_rootfs) call, and each of those supersedes
+    /// it; the last call wins. A consumer overriding an untrusted profile's
+    /// rootfs therefore clears any other root it configured along with it.
     ///
     /// The rootfs must live under a directory the calling user controls, not a
     /// world-writable one. The launch resolves the path a second time inside the
@@ -1389,6 +1504,7 @@ impl CageBuilder {
         self.rootfs = Some(path.as_ref().to_path_buf());
         self.overlay = None;
         self.empty_rootfs = false;
+        self.host_rootfs = false;
         self
     }
 
@@ -1423,13 +1539,89 @@ impl CageBuilder {
     /// # }
     /// ```
     ///
-    /// Setting an empty root supersedes a plain [`rootfs`](Self::rootfs) or an
-    /// [`overlay`](Self::overlay), and either of those supersedes it; the last
-    /// call wins.
+    /// Setting an empty root supersedes a plain [`rootfs`](Self::rootfs), an
+    /// [`overlay`](Self::overlay), or a [`host_rootfs`](Self::host_rootfs),
+    /// and each of those supersedes it; the last call wins.
     pub fn empty_rootfs(mut self) -> Self {
         self.rootfs = None;
         self.overlay = None;
         self.empty_rootfs = true;
+        self.host_rootfs = false;
+        self
+    }
+
+    /// Roots the sandbox on the host's own filesystem, read-only throughout.
+    ///
+    /// The command sees the host's tree as the host does, every mount in it
+    /// included, and can write nowhere in it: the launch clones the host's
+    /// mount tree inside the sandbox's own mount namespace and makes every
+    /// mount of the clone read-only and `nosuid`. The managed `/proc`, `/dev`
+    /// and `/tmp` are mounted over the host's, and the caller's mounts go on
+    /// top: a working tree bound writable is where the command writes.
+    ///
+    /// The host's tree holds the user's credentials and live sockets, and a
+    /// read-only mount does not stop a `connect`. So this root
+    /// [hides](Self::hide) `/home`, `/root`, `/run`, `/var/run`, and
+    /// `/var/tmp` by default, and a working tree beneath one of them is bound
+    /// back in. Each default hide is listed in
+    /// [`resolved_inputs`](Cage::resolved_inputs), [`reveal`](Self::reveal)
+    /// takes one back, and [`managed_mounts(false)`](Self::managed_mounts)
+    /// takes them all with the rest of the managed profile. `/sys` is the
+    /// host's, read-only.
+    ///
+    /// ```no_run
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// let cage = ferroday_cage::Cage::builder()
+    ///     .host_rootfs()
+    ///     .bind("/home/user/project", "/home/user/project")
+    ///     .read_only("/home/user/project/.git/hooks")
+    ///     .current_dir("/home/user/project")
+    ///     .command("/usr/bin/make")
+    ///     .build()?;
+    /// # let _ = cage;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Nothing is created on the host. A mount target must already exist,
+    /// unless it lies inside a filesystem the sandbox mounts itself, such as a
+    /// hidden directory or the managed `/tmp`. [`build`](Self::build) refuses
+    /// one missing from the host with [`ConfigError::MountTargetMissing`],
+    /// and a target that disappears before the launch fails it at
+    /// [`SetupStep::OpenMountTarget`](crate::SetupStep::OpenMountTarget). A
+    /// symbolic link of the caller's must likewise be made inside such a
+    /// filesystem. With [`Network::Host`] the host's own `/etc/resolv.conf` is
+    /// the sandbox's, so no `resolv.conf` is bound; one that links into
+    /// `/run` reads through the hidden `/run`, and is reached by binding the
+    /// file it links to at its own path.
+    ///
+    /// The clone and its read-only marking need `mount_setattr`, Linux 5.12;
+    /// an older kernel fails the launch at
+    /// [`SetupStep::MountHostRoot`](crate::SetupStep::MountHostRoot) rather
+    /// than leave a mount of the host writable.
+    ///
+    /// Setting the host's root supersedes a plain [`rootfs`](Self::rootfs), an
+    /// [`overlay`](Self::overlay), or an [`empty_rootfs`](Self::empty_rootfs),
+    /// and each of those supersedes it; the last call wins.
+    pub fn host_rootfs(mut self) -> Self {
+        self.rootfs = None;
+        self.overlay = None;
+        self.empty_rootfs = false;
+        self.host_rootfs = true;
+        self
+    }
+
+    /// Takes back one of the paths [`host_rootfs`](Self::host_rootfs) hides by
+    /// default, so the command sees the host's own there, read-only.
+    ///
+    /// `path` is one of `/home`, `/root`, `/run`, `/var/run`, and `/var/tmp`.
+    /// [`build`](Self::build) refuses any other, and any at all for another
+    /// kind of root, with [`ConfigError::RevealUnhidden`], since a path taken
+    /// back from nothing is most likely a misspelling. A hidden path is
+    /// followed where it is a symbolic link, so on a host where `/var/run`
+    /// links to `/run`, the host's `/run` is shown only with both taken back.
+    pub fn reveal(mut self, path: impl AsRef<Path>) -> Self {
+        self.reveal.push(path.as_ref().to_path_buf());
         self
     }
 
@@ -1497,6 +1689,7 @@ impl CageBuilder {
     pub fn overlay(mut self, overlay: Overlay) -> Self {
         self.rootfs = None;
         self.empty_rootfs = false;
+        self.host_rootfs = false;
         self.overlay = Some(overlay);
         self
     }
@@ -1945,14 +2138,54 @@ impl CageBuilder {
         self
     }
 
+    /// Hides `path`, an absolute path inside the sandbox, in its place in the
+    /// mount sequence: the command finds an empty directory or an empty file
+    /// there, on a read-only mount.
+    ///
+    /// See [`Hide`] for what hides each kind of entry, and for a path with
+    /// nothing at it, which hides nothing. A mount declared after the hide can
+    /// still land beneath a hidden directory:
+    ///
+    /// ```no_run
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// let cage = ferroday_cage::Cage::builder()
+    ///     .rootfs("/srv/rootfs/alpine")
+    ///     .bind("/home/user", "/home/user")
+    ///     .hide("/home/user/.ssh")
+    ///     .hide("/home/user/.env")
+    ///     .command("/bin/sh")
+    ///     .build()?;
+    /// # let _ = cage;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn hide(mut self, path: impl AsRef<Path>) -> Self {
+        self.mounts.push(Mount::Hide(Hide::new(path)));
+        self
+    }
+
+    /// Makes `path`, an absolute path inside the sandbox, read-only where it
+    /// stands, in its place in the mount sequence.
+    ///
+    /// The tree at the path is bound onto itself read-only, mounts beneath it
+    /// included, so a path inside a writable bind is protected without naming
+    /// the host path the bind came from. See [`ReadOnly`]. The path must exist
+    /// when the sequence reaches it.
+    pub fn read_only(mut self, path: impl AsRef<Path>) -> Self {
+        self.mounts.push(Mount::ReadOnly(ReadOnly::new(path)));
+        self
+    }
+
     /// Adds a mount of any kind, applied in declaration order with the rest.
     ///
     /// The counterpart of [`get_mounts`](Self::get_mounts), for a caller that
     /// holds a [`Mount`] rather than its parts: one read back from another
     /// builder, or one assembled with [`Bind::new`]. A [`Mount::Bind`] is the
     /// [`bind`](Self::bind) or [`bind_ro`](Self::bind_ro) its read-only flag
-    /// names, a [`Mount::Raw`] is a [`raw_mount`](Self::raw_mount), and a
-    /// [`Mount::Symlink`] is a [`symlink`](Self::symlink).
+    /// names, a [`Mount::Raw`] is a [`raw_mount`](Self::raw_mount), a
+    /// [`Mount::Symlink`] is a [`symlink`](Self::symlink), a [`Mount::Hide`] is
+    /// a [`hide`](Self::hide), and a [`Mount::ReadOnly`] is a
+    /// [`read_only`](Self::read_only).
     pub fn mount(mut self, mount: Mount) -> Self {
         self.mounts.push(mount);
         self
@@ -2183,6 +2416,17 @@ impl CageBuilder {
         self.overlay.as_ref()
     }
 
+    /// Whether the sandbox is rooted on the [host's own root](Self::host_rootfs).
+    pub fn get_host_rootfs(&self) -> bool {
+        self.host_rootfs
+    }
+
+    /// The default hides of the host's root taken back with
+    /// [`reveal`](Self::reveal), in the order they were named.
+    pub fn get_reveal(&self) -> &[PathBuf] {
+        &self.reveal
+    }
+
     /// The configured command path.
     pub fn get_command(&self) -> Option<&Path> {
         self.command.as_deref()
@@ -2222,7 +2466,7 @@ impl CageBuilder {
     pub fn get_binds(&self) -> impl Iterator<Item = &Bind> {
         self.mounts.iter().filter_map(|mount| match mount {
             Mount::Bind(bind) => Some(bind),
-            Mount::Raw(_) | Mount::Symlink(_) => None,
+            Mount::Raw(_) | Mount::Symlink(_) | Mount::Hide(_) | Mount::ReadOnly(_) => None,
         })
     }
 
@@ -2230,7 +2474,7 @@ impl CageBuilder {
     pub fn get_raw_mounts(&self) -> impl Iterator<Item = &RawMount> {
         self.mounts.iter().filter_map(|mount| match mount {
             Mount::Raw(raw) => Some(raw),
-            Mount::Bind(_) | Mount::Symlink(_) => None,
+            Mount::Bind(_) | Mount::Symlink(_) | Mount::Hide(_) | Mount::ReadOnly(_) => None,
         })
     }
 
@@ -2246,12 +2490,15 @@ impl CageBuilder {
     /// A mount or a symlink of the caller's at `/etc/resolv.conf`, a host tree
     /// bound or moved over a directory above it, or a symlink at such a
     /// directory, replaces the bind, so this answers `false` for a sandbox
-    /// carrying one. The library acts on this only under
+    /// carrying one. So does the [host's own root](Self::host_rootfs), whose
+    /// `/etc` is the host's already. The library acts on this only under
     /// [`Network::Host`]. A caller that composes resolver configuration of its
     /// own, as `fcage` does for a native-stack run, reads it to honor the same
     /// opt-outs and to yield to the same mounts.
     pub fn get_resolv_conf(&self) -> bool {
-        self.managed(self.resolv_conf) && !self.mounts.iter().any(claims_resolv_conf)
+        self.managed(self.resolv_conf)
+            && !self.host_rootfs
+            && !self.mounts.iter().any(claims_resolv_conf)
     }
 
     /// Whether the sandbox gets its own PID namespace.
@@ -2405,6 +2652,7 @@ impl CageBuilder {
             self.rootfs.is_some(),
             self.overlay.is_some(),
             self.empty_rootfs,
+            self.host_rootfs,
         ];
         if named.into_iter().filter(|&named| named).count() > 1 {
             return Err(ConfigError::RootContradiction.into());
@@ -2418,7 +2666,7 @@ impl CageBuilder {
                     .ok_or(ConfigError::OverlayLowerMissing)?
                     .clone(),
             ),
-            (None, None) if self.empty_rootfs => None,
+            (None, None) if self.empty_rootfs || self.host_rootfs => None,
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
         let command = validate_command(self.command, Some(self.path_lookup))?;
@@ -2502,7 +2750,32 @@ impl CageBuilder {
         if mount_tmp {
             lowering.push_tmp()?;
         }
-        // The caller's mounts in declaration order, both kinds in one pass.
+        // The host root's default hides, part of the managed profile, less the
+        // ones the caller took back. A path taken back from nothing is refused
+        // rather than ignored: it is most likely a misspelling of one that is
+        // hidden.
+        let hidden_by_default = HOST_ROOT_HIDDEN
+            .iter()
+            .map(|hidden| Ok((*hidden, sandbox_target(Path::new(hidden))?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut revealed = Vec::with_capacity(self.reveal.len());
+        for path in &self.reveal {
+            let target = sandbox_target(path).ok().filter(|target| {
+                self.host_rootfs && hidden_by_default.iter().any(|(_, hidden)| hidden == target)
+            });
+            match target {
+                Some(target) => revealed.push(target),
+                None => return Err(ConfigError::RevealUnhidden { path: path.clone() }.into()),
+            }
+        }
+        if self.host_rootfs && profile_managed {
+            for (hidden, target) in &hidden_by_default {
+                if !revealed.contains(target) {
+                    lowering.push_hide(&Hide::new(hidden))?;
+                }
+            }
+        }
+        // The caller's mounts in declaration order, every kind in one pass.
         // The managed profile above goes first because it establishes the tree
         // these land in; among the caller's own, the order is theirs.
         for mount in &self.mounts {
@@ -2510,7 +2783,15 @@ impl CageBuilder {
                 Mount::Bind(bind) => lowering.push_bind(bind)?,
                 Mount::Raw(raw) => lowering.push_raw(raw)?,
                 Mount::Symlink(symlink) => lowering.push_symlink(symlink)?,
+                Mount::Hide(hide) => lowering.push_hide(hide)?,
+                Mount::ReadOnly(read_only) => lowering.push_read_only(read_only)?,
             }
+        }
+        // The host's own root is read-only and the launch creates nothing in
+        // it, so every target outside a filesystem the sandbox mounts must
+        // already be there.
+        if self.host_rootfs {
+            settle_host_root_targets(&mut lowering.ops)?;
         }
         // The managed `resolv.conf` bind, which `resolv_conf` above already
         // withholds where the caller mounted something of their own at that
@@ -2623,6 +2904,7 @@ impl CageBuilder {
         // sandbox's own: what the launch creates in it goes with it, and none
         // of it has a host path.
         let (root, managed_placeholders) = match &canonical {
+            None if self.host_rootfs => (RootPlan::HostReadOnly, ManagedPlaceholders::default()),
             None => (RootPlan::Empty, ManagedPlaceholders::default()),
             Some(canonical) => {
                 let base = cstring(canonical.as_os_str())?;
@@ -2729,6 +3011,9 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// - host networking;
 /// - an overlay root (`[overlay]`, whose upper creates host directories at a
 ///   path the profile picks);
+/// - the host's own root (`host-rootfs`), which maps the host's whole tree in,
+///   and a path it hides taken back (`reveal`), which a consumer's later
+///   `host_rootfs` would honor;
 /// - sharing the host PID namespace (`pid-namespace = false`, which would bind
 ///   the host's `/proc` into the sandbox).
 ///
@@ -2745,7 +3030,8 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// A profile using any of them is refused. Everything else is accepted, so a
 /// restricted profile still shapes the sandbox: the rootfs (never the host
 /// root, which [`CageBuilder::build`] rejects for every profile), an empty
-/// root, command, arguments, environment, working directory, hostname, resource
+/// root, a hidden path or one made read-only, command, arguments, environment,
+/// working directory, hostname, resource
 /// limits, the identity map, the run-as and presented identities, and the
 /// remaining mount toggles. So is the hardening that only removes: a seccomp
 /// policy, a full capability drop (`drop-caps`), and the Landlock scopes, each
@@ -2840,9 +3126,10 @@ impl<'de> serde::Deserialize<'de> for RestrictedProfile {
 #[cfg(feature = "serde")]
 impl CageBuilder {
     /// Rejects the profile operations the restricted policy reserves for a
-    /// trusted profile: every kind of mount, host networking, an overlay root,
-    /// sharing the host PID namespace, Landlock grants, and a kept capability
-    /// set. Backs [`RestrictedProfile`]'s conversion from a builder, and
+    /// trusted profile: every kind of mount that maps something in or creates
+    /// something, host networking, an overlay root, the host's own root and a
+    /// path it hides taken back, sharing the host PID namespace, Landlock
+    /// grants, and a kept capability set. Backs [`RestrictedProfile`]'s conversion from a builder, and
     /// through it its deserialization.
     fn check_restricted(&self) -> Result<(), ConfigError> {
         // Destructured exhaustively, with no `..`: a new builder field fails to
@@ -2874,6 +3161,10 @@ impl CageBuilder {
             // A tmpfs of the sandbox's own maps nothing of the host in; what
             // the profile could then put in it, it could not bind there.
             empty_rootfs: _,
+            // Examined below: the host's whole tree, and a default hide of it
+            // taken back.
+            host_rootfs,
+            reveal,
             command: _,
             args: _,
             hostname: _,
@@ -2936,6 +3227,19 @@ impl CageBuilder {
                 operation: "an overlay root",
             });
         }
+        // The host's own root maps the host's whole tree in, read-only, and a
+        // consumer that roots a restricted profile on it later would have the
+        // profile's revealed paths shown where the default hides them.
+        if *host_rootfs {
+            return Err(ConfigError::ProfileOperationForbidden {
+                operation: "the host's own root (host-rootfs)",
+            });
+        }
+        if !reveal.is_empty() {
+            return Err(ConfigError::ProfileOperationForbidden {
+                operation: "a path the host's root hides taken back (reveal)",
+            });
+        }
         // A shared host PID namespace is a host-resource mapping in disguise:
         // with `pid_namespace = false` the default `mount_proc` binds the
         // host's own `/proc` read-write into the sandbox (see
@@ -2984,6 +3288,12 @@ fn restricted_mount_refusal(mount: &Mount) -> Option<&'static str> {
         // restricted profile can bind nothing, so an empty root, where links
         // persist nowhere, gains nothing from one either.
         Mount::Symlink(_) => Some("a symbolic link"),
+        // Each takes something away from what the command sees or can write,
+        // and maps nothing in: a hidden path is a tmpfs of the sandbox's own
+        // or an empty file from one, and a path made read-only is the
+        // sandbox's own tree, restricted. Neither creates anything where a
+        // path is missing.
+        Mount::Hide(_) | Mount::ReadOnly(_) => None,
     }
 }
 
@@ -4256,6 +4566,38 @@ impl Lowering {
         Ok(())
     }
 
+    /// A hidden path. It creates nothing: what is at the path when the launch
+    /// reaches it decides how it is hidden, and nothing there hides nothing.
+    fn push_hide(&mut self, hide: &Hide) -> Result<(), Error> {
+        self.push(
+            MountOp {
+                dirs: Vec::new(),
+                create_file: None,
+                action: MountAction::Hide {
+                    target: sandbox_target(&hide.target)?,
+                },
+            },
+            format!("hiding {}", hide.target.display()),
+        );
+        Ok(())
+    }
+
+    /// A path made read-only where it stands. It creates nothing: a path that
+    /// is missing when the launch reaches it fails the launch.
+    fn push_read_only(&mut self, read_only: &ReadOnly) -> Result<(), Error> {
+        self.push(
+            MountOp {
+                dirs: Vec::new(),
+                create_file: None,
+                action: MountAction::ReadOnly {
+                    target: sandbox_target(&read_only.target)?,
+                },
+            },
+            format!("{} made read-only", read_only.target.display()),
+        );
+        Ok(())
+    }
+
     /// A caller's symbolic link, made in whatever holds its parent directory
     /// once the ops before it have run.
     fn push_symlink(&mut self, symlink: &Symlink) -> Result<(), Error> {
@@ -4328,6 +4670,100 @@ impl Lowering {
         );
         Ok(())
     }
+}
+
+/// Holds a host-rooted sandbox's ops to what that root allows: the launch
+/// creates nothing in the host's tree.
+///
+/// Each op's target is placed by the latest op before it whose arrival covers
+/// it, as the launch will find it. Inside a fresh filesystem of the sandbox's
+/// own, a hidden directory or the managed `/tmp` for instance, the directories
+/// and the file the target needs below that filesystem are created as on any
+/// root, and those above it are already there. Anywhere else the target is in
+/// the host's tree, or in a tree a mount brought, which is the host's too, so
+/// nothing is created and the target must exist: it is looked up on the host,
+/// through a bind's source where a bind brought the tree, and refused with
+/// [`ConfigError::MountTargetMissing`] when it is not there. A symbolic link
+/// there could only be made in the host's tree, so it is refused unless the
+/// same link already stands, which the launch leaves as it is. A tree a raw
+/// mount or a read-only path brought is not looked into; the launch fails at
+/// the target if it is missing.
+///
+/// A hidden path and a read-only one create nothing, and are left alone.
+fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
+    for at in 0..ops.len() {
+        let target = match &ops[at].action {
+            MountAction::Hide { .. } | MountAction::ReadOnly { .. } => continue,
+            MountAction::Symlink { parent, leaf, .. } => join_target(parent, leaf),
+            MountAction::Tmpfs { target, .. }
+            | MountAction::Procfs { target }
+            | MountAction::Devpts { target, .. }
+            | MountAction::Bind { target, .. }
+            | MountAction::Raw { target, .. } => target.clone(),
+        };
+        let cover = ops[..at].iter().rev().find_map(|earlier| {
+            earlier
+                .action
+                .arrival()
+                .filter(|(over, _)| covers(over, &target))
+                .map(|(over, arrival)| (over.to_owned(), arrival, &earlier.action))
+        });
+        let host_path = match &cover {
+            Some((over, Arrival::Fresh, _)) => {
+                let beneath = |path: &CStr| path != over.as_c_str() && covers(over, path);
+                let op = &mut ops[at];
+                op.dirs
+                    .retain(|dir| beneath(&join_target(&dir.parent, &dir.leaf)));
+                if op.create_file.as_deref().is_some_and(|file| !beneath(file)) {
+                    op.create_file = None;
+                }
+                continue;
+            }
+            Some((over, Arrival::Tree, MountAction::Bind { source, .. })) => {
+                let rest = &target.as_bytes()[over.as_bytes().len()..];
+                let mut path = source.as_bytes().to_vec();
+                path.extend_from_slice(rest);
+                Some(PathBuf::from(OsString::from_vec(path)))
+            }
+            Some((_, Arrival::Tree, _)) => None,
+            None => Some(Path::new("/").join(OsStr::from_bytes(target.as_bytes()))),
+        };
+        let op = &mut ops[at];
+        op.dirs.clear();
+        op.create_file = None;
+        let Some(host_path) = host_path else {
+            continue;
+        };
+        let named = Path::new("/").join(OsStr::from_bytes(target.as_bytes()));
+        let missing = |source| ConfigError::MountTargetMissing {
+            target: named.clone(),
+            source,
+        };
+        match &op.action {
+            MountAction::Symlink { content, .. } => {
+                let standing = std::fs::read_link(&host_path)
+                    .is_ok_and(|link| link.as_os_str().as_bytes() == content.as_bytes());
+                if !standing {
+                    return Err(missing(Errno::ROFS.into()).into());
+                }
+            }
+            _ => {
+                std::fs::metadata(&host_path).map_err(missing)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The root-relative path an entry `leaf` in the root-relative directory
+/// `parent` has, the empty `parent` being the root itself.
+fn join_target(parent: &CStr, leaf: &CStr) -> CString {
+    let mut path = parent.to_bytes().to_vec();
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(leaf.to_bytes());
+    CString::new(path).expect("two C strings joined hold no NUL")
 }
 
 /// The host directories a sandbox's root is made of, as far as the mount
@@ -4566,6 +5002,12 @@ fn sandbox_path_components(path: &Path) -> Result<Vec<&OsStr>, Error> {
         return Err(invalid());
     }
     Ok(components)
+}
+
+/// A sandbox path as the launch freezes a mount target: root-relative, with no
+/// leading slash, its components read through [`sandbox_path_components`].
+fn sandbox_target(path: &Path) -> Result<CString, Error> {
+    rel_cstring(&sandbox_path_components(path)?)
 }
 
 /// Builds the mount-target directory chain for a rootfs-relative path: one
@@ -7786,7 +8228,7 @@ access = "c"
     /// than the curated policy, once per side, since a table allows or denies
     /// and never both.
     #[cfg(feature = "hardening")]
-    const OTHER_FORM_PROFILES: [&str; 3] = [
+    const OTHER_FORM_PROFILES: [&str; 4] = [
         r#"
 [hardening]
 drop-caps = true
@@ -7825,6 +8267,18 @@ kind = "symlink"
 target = "usr/bin"
 path = "/bin"
 "#,
+        r#"
+host-rootfs = true
+reveal = ["/run"]
+
+[[mount]]
+kind = "hide"
+target = "/home/user/.ssh"
+
+[[mount]]
+kind = "read-only"
+target = "/work/.git/hooks"
+"#,
     ];
 
     /// Every value `network` can take, as a profile spells it.
@@ -7849,7 +8303,7 @@ path = "/bin"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 93] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 95] = [
         "args",
         "base-env",
         "command",
@@ -7887,6 +8341,7 @@ path = "/bin"
         "hardening.seccomp.deny-rule[].syscall",
         "hardening.seccomp.errno",
         "hardening.seccomp.errno.clone3",
+        "host-rootfs",
         "hostname",
         "identity-map",
         "identity-map.ranges",
@@ -7920,6 +8375,7 @@ path = "/bin"
         "pid-namespace",
         "present-as",
         "resolv-conf",
+        "reveal",
         "rlimit",
         "rlimit.address-space",
         "rlimit.core-dump",
@@ -8577,6 +9033,109 @@ read-only = true
         assert!(builder.get_empty_rootfs());
         let inputs = builder.build().expect("a valid sandbox").resolved_inputs();
         assert!(matches!(inputs.root, crate::ResolvedRoot::Empty));
+    }
+
+    #[test]
+    fn a_profile_naming_the_host_root_beside_another_root_is_refused() {
+        for other in [
+            "rootfs = \"/srv/alpine\"\n",
+            "empty-rootfs = true\n",
+            "[overlay]\nlower = [\"/srv/base\"]\n",
+        ] {
+            let profile = format!("host-rootfs = true\ncommand = \"/bin/sh\"\n{other}");
+            let builder: CageBuilder = toml::from_str(&profile).expect("the profile parses");
+            let err = builder.build().unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::RootContradiction)),
+                "{err}"
+            );
+        }
+    }
+
+    /// The host's whole tree is a host resource mapped in, and a path taken
+    /// back from its hides would be honored by a consumer's own `host_rootfs`
+    /// after loading. A hidden path and a read-only one only take away.
+    #[test]
+    fn a_restricted_profile_rejects_the_host_root_and_admits_hiding() {
+        for (profile, operation) in [
+            (
+                "host-rootfs = true\ncommand = \"/bin/sh\"\n",
+                "the host's own root (host-rootfs)",
+            ),
+            (
+                "rootfs = \"/srv/rootfs\"\nreveal = [\"/run\"]\ncommand = \"/bin/sh\"\n",
+                "a path the host's root hides taken back (reveal)",
+            ),
+        ] {
+            let builder: CageBuilder = toml::from_str(profile).expect("a trusted load accepts it");
+            match RestrictedProfile::try_from(builder) {
+                Err(ConfigError::ProfileOperationForbidden { operation: named }) => {
+                    assert_eq!(named, operation);
+                }
+                other => panic!("{profile}: {other:?}"),
+            }
+        }
+        let profile = "empty-rootfs = true\ncommand = \"/bin/sh\"\n\
+                       [[mount]]\nkind = \"hide\"\ntarget = \"/home\"\n\
+                       [[mount]]\nkind = \"read-only\"\ntarget = \"/etc\"\n";
+        let builder = toml::from_str::<RestrictedProfile>(profile)
+            .expect("the restricted policy admits a hidden path and a read-only one")
+            .into_builder();
+        assert!(matches!(
+            builder.get_mounts(),
+            [Mount::Hide(_), Mount::ReadOnly(_)]
+        ));
+    }
+
+    /// Under the host's own root, a link of the caller's can be made only
+    /// inside a filesystem the sandbox mounts, and a bind target outside one
+    /// creates nothing: its directories are not made, and one missing is
+    /// refused.
+    #[test]
+    fn the_host_root_creates_mount_targets_only_inside_the_sandbox_s_own_filesystems() {
+        let refused = Cage::builder()
+            .host_rootfs()
+            .symlink("/usr/bin/env", "/usr/local/bin/ferroday-cage-test-link")
+            .command("/bin/true")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                Error::Config(ConfigError::MountTargetMissing { source, .. })
+                    if source.raw_os_error() == Some(Errno::ROFS.raw_os_error())
+            ),
+            "{refused:?}"
+        );
+
+        let cage = Cage::builder()
+            .host_rootfs()
+            .symlink("/usr/bin/env", "/tmp/links/env")
+            .bind_ro("/etc/passwd", "/home/user/passwd")
+            .bind_ro("/usr", "/usr")
+            .command("/bin/true")
+            .build()
+            .expect("targets inside the sandbox's own filesystems, or present on the host");
+        let op = |label: &str| {
+            let at = cage
+                .plan
+                .op_labels
+                .iter()
+                .position(|named| named.contains(label))
+                .expect("the op is planned");
+            &cage.plan.ops[at]
+        };
+        // The link's directory is made inside the managed /tmp.
+        let link = op("symlink at /tmp/links/env");
+        assert_eq!(link.dirs.len(), 1, "{:?}", link.dirs);
+        assert_eq!(link.dirs[0].leaf.as_bytes(), b"links");
+        // The file target is made inside the hidden /home, its directory too.
+        let file = op("/home/user/passwd");
+        assert_eq!(file.dirs.len(), 1, "{:?}", file.dirs);
+        assert_eq!(file.create_file.as_deref(), Some(c"home/user/passwd"));
+        // The host's own /usr is the target, and nothing is made for it.
+        let usr = op("/usr at /usr");
+        assert!(usr.dirs.is_empty() && usr.create_file.is_none());
     }
 
     /// A link is made before any confinement applies, and on a plain rootfs it

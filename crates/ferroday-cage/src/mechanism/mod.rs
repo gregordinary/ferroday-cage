@@ -286,6 +286,9 @@ pub(crate) enum RootPlan {
     /// A tmpfs of the sandbox's own, holding only what the mount profile
     /// creates in it and made read-only once the profile is in place.
     Empty,
+    /// The host's own mount tree, cloned inside the sandbox's mount namespace
+    /// and read-only throughout. The launch creates nothing in it.
+    HostReadOnly,
 }
 
 /// How an overlay-rooted cage's root is assembled.
@@ -1140,6 +1143,19 @@ pub(crate) enum MountAction {
         /// The link's content.
         content: CString,
     },
+    /// Hide what is at a path: an empty tmpfs over a directory, made read-only
+    /// once the profile is in place, or an empty read-only file over anything
+    /// else. A path with nothing at it hides nothing.
+    Hide {
+        /// Rootfs-relative path to hide.
+        target: CString,
+    },
+    /// Bind the tree at a path onto itself, read-only, with every mount
+    /// beneath it.
+    ReadOnly {
+        /// Rootfs-relative path to make read-only.
+        target: CString,
+    },
 }
 
 /// What a [`MountAction`] brings to rest on its target.
@@ -1224,8 +1240,11 @@ impl MountAction {
         match self {
             MountAction::Tmpfs { target, .. }
             | MountAction::Procfs { target }
-            | MountAction::Devpts { target, .. } => Some((target, Arrival::Fresh)),
-            MountAction::Bind { target, .. } => Some((target, Arrival::Tree)),
+            | MountAction::Devpts { target, .. }
+            | MountAction::Hide { target } => Some((target, Arrival::Fresh)),
+            MountAction::Bind { target, .. } | MountAction::ReadOnly { target } => {
+                Some((target, Arrival::Tree))
+            }
             MountAction::Raw { target, flags, .. } => {
                 Arrival::of_raw(*flags).map(|arrival| (target.as_c_str(), arrival))
             }
@@ -1741,6 +1760,15 @@ fn fork_launch(
         None
     };
 
+    // The slots the setup keeps each hidden directory's tmpfs in until the
+    // profile is in place, allocated here because the child cannot allocate.
+    let hidden: Vec<std::cell::Cell<Option<OwnedFd>>> = plan
+        .ops
+        .iter()
+        .filter(|op| matches!(op.action, MountAction::Hide { .. }))
+        .map(|_| std::cell::Cell::new(None))
+        .collect();
+
     // SAFETY: the child-process branch only constructs a struct of references
     // on its own stack and runs `child::stage_a`, which performs raw rustix
     // syscalls over the data frozen above — no allocation, no locking, no
@@ -1770,6 +1798,7 @@ fn fork_launch(
                     .as_ref()
                     .map(|(_, sandbox)| sandbox.as_fd()),
                 take_foreground: foreground.is_some(),
+                hidden: &hidden,
             };
             child::stage_a(&context)
         }

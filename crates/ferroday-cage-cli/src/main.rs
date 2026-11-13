@@ -58,11 +58,11 @@ use ferroday_cage::provision::debian::{Priority, Repository};
 use ferroday_cage::provision::{ProvisionError, ProvisionEvent, Provisioned, Provisioner};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
-    Bind, Cage, CageBuilder, Capability, Error, ErrorChain, ExitStatus, FsAccess, IdRange,
+    Bind, Cage, CageBuilder, Capability, Error, ErrorChain, ExitStatus, FsAccess, Hide, IdRange,
     Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, NetStackHandle,
-    Network, Overlay, PresentedIdentity, RawMount, Resource, RestrictedProfile, Restriction,
-    RestrictionBuilder, Running, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy,
-    SeccompRules, Stdio, Symlink,
+    Network, Overlay, PresentedIdentity, RawMount, ReadOnly, Resource, RestrictedProfile,
+    Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen, SeccompCompare,
+    SeccompPolicy, SeccompRules, Stdio, Symlink,
 };
 use serde::Deserialize as _;
 
@@ -349,6 +349,35 @@ const FLAGS: &[Flag] = &[
         ],
         take: Take::Bare(|options| {
             options.empty_rootfs = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--host-rootfs",
+        section: Section::Provisioning,
+        help: &[
+            "Root the sandbox on the host's own filesystem,",
+            "read-only, with /home, /root, /run, /var/run and",
+            "/var/tmp hidden (--reveal takes one back). Bind a",
+            "working tree back in to write there. Nothing is",
+            "created on the host. Alternative to --rootfs",
+        ],
+        take: Take::Bare(|options| {
+            options.host_rootfs = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--reveal",
+        section: Section::Provisioning,
+        placeholder: "PATH",
+        help: &[
+            "Show one of the paths --host-rootfs hides by default,",
+            "read-only as the rest of the host (repeatable)",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.reveal.push(PathBuf::from(value));
+            Ok(())
         }),
         ..Flag::DEFAULTS
     },
@@ -1356,6 +1385,41 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--hide",
+        section: Section::Profiles,
+        placeholder: "PATH",
+        help: &[
+            "Hide PATH inside the sandbox, in its place among the",
+            "mounts: a directory reads empty, a file reads empty,",
+            "and neither can be written. A missing PATH hides",
+            "nothing (repeatable)",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options
+                .mounts
+                .push(Mount::Hide(Hide::new(PathBuf::from(value))));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--read-only",
+        section: Section::Profiles,
+        placeholder: "PATH",
+        help: &[
+            "Make PATH inside the sandbox read-only where it stands,",
+            "in its place among the mounts, such as a working",
+            "tree's .git/hooks; PATH must exist (repeatable)",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options
+                .mounts
+                .push(Mount::ReadOnly(ReadOnly::new(PathBuf::from(value))));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--raw-mount",
         section: Section::Profiles,
         placeholder: "SPEC",
@@ -2340,6 +2404,9 @@ struct Options {
     rootfs: Option<PathBuf>,
     /// `--empty-rootfs`.
     empty_rootfs: bool,
+    host_rootfs: bool,
+    /// The `--reveal` paths, in the order given.
+    reveal: Vec<PathBuf>,
     provision_tar: Option<PathBuf>,
     provision_debian: Option<String>,
     debian_arch: Option<String>,
@@ -2872,6 +2939,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         profile_restricted: false,
         rootfs: None,
         empty_rootfs: false,
+        host_rootfs: false,
+        reveal: Vec::new(),
         provision_tar: None,
         provision_debian: None,
         debian_arch: None,
@@ -3035,6 +3104,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         let conflicts = [
             (options.rootfs.is_some(), "--rootfs"),
             (options.empty_rootfs, "--empty-rootfs"),
+            (options.host_rootfs, "--host-rootfs"),
+            (!options.reveal.is_empty(), "--reveal"),
             (
                 options.profile.is_some(),
                 "--profile or --restricted-profile",
@@ -3078,6 +3149,20 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
                     .iter()
                     .any(|mount| matches!(mount, Mount::Symlink(_))),
                 "--symlink",
+            ),
+            (
+                options
+                    .mounts
+                    .iter()
+                    .any(|mount| matches!(mount, Mount::Hide(_))),
+                "--hide",
+            ),
+            (
+                options
+                    .mounts
+                    .iter()
+                    .any(|mount| matches!(mount, Mount::ReadOnly(_))),
+                "--read-only",
             ),
             (
                 !options.overlay_lowers.is_empty()
@@ -3167,14 +3252,26 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             return Err("--empty-rootfs and the --overlay-* options are alternatives".to_string());
         }
     }
+    if options.host_rootfs {
+        if options.rootfs.is_some() {
+            return Err("--rootfs and --host-rootfs are alternatives".to_string());
+        }
+        if overlay_given {
+            return Err("--host-rootfs and the --overlay-* options are alternatives".to_string());
+        }
+        if options.empty_rootfs {
+            return Err("--empty-rootfs and --host-rootfs are alternatives".to_string());
+        }
+    }
     if options.rootfs.is_none()
         && options.profile.is_none()
         && !overlay_given
         && !options.empty_rootfs
+        && !options.host_rootfs
     {
         return Err(
-            "--rootfs, --empty-rootfs, --overlay-lower, --profile, --restricted-profile, \
-                    or --restrict is required"
+            "--rootfs, --empty-rootfs, --host-rootfs, --overlay-lower, --profile, \
+             --restricted-profile, or --restrict is required"
                 .to_string(),
         );
     }
@@ -5201,6 +5298,12 @@ impl Launch {
         }
         if options.empty_rootfs {
             builder = builder.empty_rootfs();
+        }
+        if options.host_rootfs {
+            builder = builder.host_rootfs();
+        }
+        for path in options.reveal {
+            builder = builder.reveal(path);
         }
         // An overlay root, when the run named one. Parse-time validation has
         // already established that a lower and an upper are both present and
@@ -8675,6 +8778,68 @@ mod tests {
         assert_eq!(parse_priority("required").unwrap(), Priority::Required);
         assert_eq!(parse_priority("optional").unwrap(), Priority::Optional);
         assert!(parse_priority("urgent").is_err());
+    }
+
+    #[test]
+    fn the_host_root_hides_and_protects_through_the_mount_flags_and_stands_alone() {
+        let options = run_options(&[
+            "--host-rootfs",
+            "--reveal",
+            "/var/tmp",
+            "--bind",
+            "/srv/work",
+            "/srv/work",
+            "--hide",
+            "/srv/work/.env",
+            "--read-only",
+            "/srv/work/.git/hooks",
+            "/bin/true",
+        ]);
+        assert!(options.host_rootfs);
+        assert_eq!(options.reveal, [PathBuf::from("/var/tmp")]);
+        // Each takes its place in the one mount sequence, after the bind.
+        let [
+            Mount::Bind(_),
+            Mount::Hide(hide),
+            Mount::ReadOnly(read_only),
+        ] = &options.mounts[..]
+        else {
+            panic!(
+                "a bind, a hide, then a read-only path: {:?}",
+                options.mounts
+            );
+        };
+        assert_eq!(hide.get_target(), Path::new("/srv/work/.env"));
+        assert_eq!(read_only.get_target(), Path::new("/srv/work/.git/hooks"));
+
+        for args in [
+            ["--host-rootfs", "--rootfs", "/r", "/bin/true"].as_slice(),
+            ["--host-rootfs", "--empty-rootfs", "/bin/true"].as_slice(),
+            [
+                "--host-rootfs",
+                "--overlay-lower",
+                "/l",
+                "--overlay-upper",
+                "/u",
+                "/bin/true",
+            ]
+            .as_slice(),
+        ] {
+            let error = parse_error(args);
+            assert!(error.contains("are alternatives"), "{args:?}: {error}");
+        }
+        for flag in ["--host-rootfs", "--hide", "--read-only", "--reveal"] {
+            let mut args = vec!["--restrict", "--landlock-ro", "/usr", flag];
+            if flag != "--host-rootfs" {
+                args.push("/srv");
+            }
+            args.push("/bin/true");
+            let error = parse_error(&args);
+            assert!(
+                error.contains(&format!("{flag} cannot be used with --restrict")),
+                "{args:?}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -123,6 +123,26 @@ consumer upgrading can skip it.
 - `fcage --forward-loopback PORT TARGET` listens on the sandbox's loopback at
   `PORT` and carries each connection the command makes there to `TARGET` on the
   host, a unix socket's absolute path or an `ADDRESS:PORT` (`ferroday-cage-cli`).
+- `CageBuilder::host_rootfs` roots a sandbox on the host's own filesystem,
+  read-only: the launch clones the host's mount tree inside the sandbox's mount
+  namespace and makes every mount of it read-only and `nosuid`. It hides
+  `/home`, `/root`, `/run`, `/var/run`, and `/var/tmp` by default, listed in
+  `resolved_inputs`; `CageBuilder::reveal` takes one back. Nothing is created on
+  the host: a mount target outside a filesystem the sandbox mounts must exist,
+  and the new `ConfigError::MountTargetMissing` refuses one that does not. The
+  new `ResolvedRoot::HostReadOnly` reports the root, and a launch whose clone
+  fails reports the new `SetupStep::MountHostRoot`. `fcage --host-rootfs` and
+  `--reveal`, and the profile keys `host-rootfs` and `reveal`, reach them; a
+  `RestrictedProfile` refuses both.
+- `CageBuilder::hide` leaves a path inside the sandbox empty, on any root: an
+  empty tmpfs over a directory, made read-only once the mount profile is in
+  place, or an empty read-only regular file over anything else. A path with
+  nothing at it hides nothing. `CageBuilder::read_only` makes a path read-only
+  where it stands, mounts beneath it included, such as `.git/hooks` inside a
+  writable working tree. They arrive as `Mount::Hide` and `Mount::ReadOnly`,
+  the profile kinds `hide` and `read-only`, `ResolvedMount::Hide` and
+  `ResolvedMount::ReadOnly`, and `fcage --hide` and `--read-only`, and fail a
+  launch at the new `SetupStep::HidePath` or `SetupStep::ReadOnlyPath`.
 - `CageBuilder::present_as` presents the caller to the command as another
   identity under the single-identity map. The command sees the caller as the
   given uid and gid rather than as root, or, with `PresentedIdentity::Own`, as

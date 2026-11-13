@@ -341,6 +341,21 @@ On a plain root filesystem it stays on the host after the sandbox exits. A path
 already holding a link with the same target is left as it is, so the next
 launch over that root succeeds. Anything else at the path fails the launch.
 
+Two kinds take something away rather than add it, on any root.
+[`hide`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.hide)
+leaves a path empty. A directory is covered with an empty tmpfs of the
+sandbox's own, mounted `nosuid`, `nodev` and `noexec`, and made read-only once
+the profile is in place, so a later mount can still land beneath it. A file is
+covered with an empty regular file bound from a tmpfs of its own, read-only from
+the start. A path with nothing at it hides nothing, so one list serves hosts
+that hold different subsets of it.
+[`read_only`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.read_only)
+binds the tree at a path onto itself, read-only, mounts beneath it included. It
+protects a path inside a writable bind, such as a working tree's `.git/hooks`,
+without naming the host path the bind came from. Its path must exist when the
+sequence reaches it: a path left writable because it was missing is one the
+command could create.
+
 Last, the host's `resolv.conf` — resolved to its real file — is bound
 read-only onto `/etc/resolv.conf` when the host network is shared. Unless the
 caller mounted that target themselves: a mount of their own there replaces this
@@ -406,6 +421,48 @@ Once the profile is in place, the root mount itself is made read-only, and only
 it. The mounts the profile made keep their own flags. A writable bind and the
 managed `/tmp` stay writable, and the command can write nowhere else. A place to
 write elsewhere is a mount of its own: a bind, or a tmpfs added as a raw mount.
+
+### The host's own root
+
+[`host_rootfs`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.host_rootfs)
+roots the sandbox on the host's own filesystem, the layout most agent sandboxes
+are built on. Inside the sandbox's own mount namespace the launch clones the
+host's mount tree, every mount in it included, makes every mount of the clone
+read-only and `nosuid`, and attaches the clone on top of the inherited root, as
+the empty root is attached. The managed `/proc`, `/dev` and `/tmp` are mounted
+over the host's, and the caller's mounts go on top. A working tree bound
+writable is where the command writes, and nowhere else is writable but the
+managed `/tmp`.
+
+The host's tree holds the user's credentials and live sockets, and a read-only
+mount does not stop a `connect` to a socket. So this root hides `/home`,
+`/root`, `/run`, `/var/run`, and `/var/tmp` by default, as the first mounts after
+the managed profile. A working tree beneath one of them is bound back in, and
+its mount point is made inside the hidden directory. The default hides are
+listed in the [resolved inputs](embedding.md#recording-what-a-build-ran-under),
+[`reveal`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.reveal)
+takes one back, and `managed_mounts(false)` takes them all. Where `/var/run`
+links to `/run`, as it does on most hosts, hiding `/var/run` hides `/run` too,
+so the host's `/run` is shown only with both taken back.
+
+Two parts of the host stay in view, and are disclosed rather than hidden. `/sys`
+is the host's sysfs, read-only: it describes the host's devices and kernel
+settings, and bubblewrap-based tools leave it in place too. A socket anywhere
+outside the hidden paths stays connectable through the read-only tree.
+
+Nothing is created on the host. A mount target outside every filesystem the
+sandbox mounts must already exist, and `build` refuses one missing from the
+host with `ConfigError::MountTargetMissing`. Inside a hidden directory, the
+managed `/tmp`, or another tmpfs of the sandbox's own, a target is created as on
+any root. A symbolic link of the caller's is made only inside such a filesystem.
+With `Network::Host`, the host's `/etc/resolv.conf` is the sandbox's own and no
+`resolv.conf` is bound. A `resolv.conf` that links into `/run` reads through the
+hidden `/run`, and binding the file it links to at its own path brings it back.
+
+The clone and its read-only marking need `mount_setattr`, which arrived in Linux
+5.12. An older kernel fails the launch at `SetupStep::MountHostRoot`, since a
+remount by path reaches only the top mount of a tree and would leave the rest of
+the host writable.
 
 ## What a launch leaves in the root
 

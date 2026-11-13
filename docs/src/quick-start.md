@@ -122,6 +122,34 @@ holding a repository of its own, with hooks. Review what a run changed before
 running anything from the tree on the host. `fcage` spells the same pair as
 `--bind` followed by `--ro-bind`.
 
+A sandbox can also run the host's own programs over the host's own files,
+read-only, with the working tree the one place it writes. The host's `/home`,
+`/root`, `/run`, `/var/run` and `/var/tmp` are hidden, so the project is bound
+back in.
+[`read_only`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.read_only)
+protects a path inside it where it stands:
+
+```rust,no_run
+use ferroday_cage::Cage;
+
+# fn main() -> ferroday_cage::Result<()> {
+let cage = Cage::builder()
+    .host_rootfs()
+    .bind("/home/user/project", "/home/user/project")
+    .read_only("/home/user/project/.git")
+    .hide("/home/user/project/.env")
+    .current_dir("/home/user/project")
+    .command("/usr/bin/make")
+    .build()?;
+# let _ = cage;
+# Ok(())
+# }
+```
+
+[The host's own root](how-the-sandbox-is-built.md#the-hosts-own-root) sets out
+what stays in view. `fcage` spells it `--host-rootfs`, with `--hide` and
+`--read-only`.
+
 ## Using the command line
 
 The `fcage` binary offers the same sandbox at a shell prompt:
@@ -168,6 +196,8 @@ interface.
 
 - Compose the root from the host's own files, with no root directory at all:
   [An empty root](how-the-sandbox-is-built.md#an-empty-root).
+- Run over the host's own tree, read-only, with credentials and sockets hidden:
+  [The host's own root](how-the-sandbox-is-built.md#the-hosts-own-root).
 - Stream the command's output to your own code: [Streaming
   output](streaming.md).
 - Wait with deadlines, stop gracefully, kill outright, and tie the

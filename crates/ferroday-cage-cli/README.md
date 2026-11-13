@@ -92,6 +92,16 @@ one way out instead. The command connects to `PORT` on its loopback, and `fcage`
 connection to a unix socket or an address on the host. `--share-net` gives the command the
 host's network.
 
+A sandbox can also run over the host's own tree. `--host-rootfs` roots it on the host's
+filesystem, read-only, with `/home`, `/root`, `/run`, `/var/run` and `/var/tmp` hidden. A
+working tree bound back in is where the command writes, `--hide` empties a path, and
+`--read-only` protects one inside the working tree:
+
+```sh
+fcage --host-rootfs --bind ~/project ~/project --read-only ~/project/.git \
+    --hide ~/project/.env --chdir ~/project -- make
+```
+
 A sandbox composed from host binds needs no root directory. `--empty-rootfs` roots it on an
 empty filesystem of its own, which the mount flags populate and which becomes read-only once
 they are in place:

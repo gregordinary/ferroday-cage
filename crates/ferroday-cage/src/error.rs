@@ -201,6 +201,15 @@ wire_enum! {
         /// where the sandbox has a process group of its own in the caller's
         /// session.
         AwaitLaunchStage = 63 => "waiting for the launch stage to exit",
+        /// Clone the host's mount tree as the sandbox's root and make every
+        /// mount of it read-only; see
+        /// [`CageBuilder::host_rootfs`](crate::CageBuilder::host_rootfs).
+        MountHostRoot = 64 => "mounting the host's root, read-only",
+        /// Hide a path; see [`CageBuilder::hide`](crate::CageBuilder::hide).
+        HidePath = 65 => "hiding a path",
+        /// Make a path read-only where it stands; see
+        /// [`CageBuilder::read_only`](crate::CageBuilder::read_only).
+        ReadOnlyPath = 66 => "making a path read-only",
     }
 }
 
@@ -243,17 +252,18 @@ impl fmt::Display for OverlayLayer {
 pub enum ConfigError {
     /// No root was provided: no rootfs, no overlay, and no empty root.
     RootfsMissing,
-    /// More than one of a plain rootfs, an overlay root, and an empty root was
-    /// configured, where exactly one root can be in force.
+    /// More than one of a plain rootfs, an overlay root, an empty root, and the
+    /// host's own root was configured, where exactly one root can be in force.
     ///
     /// The builder's setters keep them exclusive — each of [`rootfs`],
-    /// [`overlay`], and [`empty_rootfs`] clears the other two — so this arises
-    /// from a profile that carries more than one of their keys. Honoring one
-    /// silently would discard the others' configuration.
+    /// [`overlay`], [`empty_rootfs`], and [`host_rootfs`] clears the others —
+    /// so this arises from a profile that carries more than one of their keys.
+    /// Honoring one silently would discard the others' configuration.
     ///
     /// [`rootfs`]: crate::CageBuilder::rootfs
     /// [`overlay`]: crate::CageBuilder::overlay
     /// [`empty_rootfs`]: crate::CageBuilder::empty_rootfs
+    /// [`host_rootfs`]: crate::CageBuilder::host_rootfs
     RootContradiction,
     /// The rootfs path could not be resolved and opened as a directory.
     #[non_exhaustive]
@@ -805,6 +815,32 @@ rendered as text.
         /// The hard limit as it was given.
         hard: crate::limits::Limit,
     },
+    /// A mount target the [host's own root](crate::CageBuilder::host_rootfs)
+    /// would need created is not there.
+    ///
+    /// That root is the host's tree, read-only, and a launch creates nothing in
+    /// it. A target must already exist on the host, or lie inside a filesystem
+    /// the sandbox mounts itself, such as a hidden directory or the managed
+    /// `/tmp`, where it is created. A symbolic link of the caller's is made only
+    /// inside such a filesystem.
+    #[non_exhaustive]
+    MountTargetMissing {
+        /// The target, as the mount names it inside the sandbox.
+        target: PathBuf,
+        /// What looking the target up on the host answered: `ENOENT` for one
+        /// that is not there, or `EROFS` for a symbolic link that would be
+        /// made in the host's tree.
+        source: io::Error,
+    },
+    /// [`CageBuilder::reveal`](crate::CageBuilder::reveal) names a path the
+    /// root does not hide by default: one outside the
+    /// [host's own root](crate::CageBuilder::host_rootfs)'s list, or any path
+    /// for another kind of root.
+    #[non_exhaustive]
+    RevealUnhidden {
+        /// The path as it was given.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -814,8 +850,8 @@ impl fmt::Display for ConfigError {
                 f.write_str("no root was provided: set a rootfs, an overlay, or an empty rootfs")
             }
             ConfigError::RootContradiction => f.write_str(
-                "more than one of a rootfs, an overlay root, and an empty rootfs is configured, \
-                 but exactly one root is in force; keep one",
+                "more than one of a rootfs, an overlay root, an empty rootfs, and the host's own \
+                 root is configured, but exactly one root is in force; keep one",
             ),
             ConfigError::RootfsUnusable { path, .. } => {
                 write!(f, "cannot use {} as the rootfs", path.display())
@@ -1110,13 +1146,26 @@ impl fmt::Display for ConfigError {
                 f,
                 "the {resource} soft limit {soft} is above its hard limit {hard}",
             ),
+            ConfigError::MountTargetMissing { target, .. } => write!(
+                f,
+                "the mount target {} is not in the host's root, where a launch creates \
+                 nothing (mount over a path that exists, or beneath a filesystem the sandbox \
+                 mounts, such as a hidden directory or /tmp)",
+                target.display()
+            ),
+            ConfigError::RevealUnhidden { path } => write!(
+                f,
+                "{} is not a path the root hides by default, so revealing it is a mistake (the \
+                 host's own root hides /home, /root, /run, /var/run, and /var/tmp)",
+                path.display()
+            ),
         }
     }
 }
 
 impl std::error::Error for ConfigError {
     /// The failure underneath, for the refusals that have one: an OS failure
-    /// for the three that resolve a host path, and a configured identity-map
+    /// for the four that resolve a host path, and a configured identity-map
     /// delegate's own error.
     ///
     /// Every other variant is a request the builder refused on its own terms —
@@ -1126,7 +1175,8 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::RootfsUnusable { source, .. }
             | ConfigError::BindSourceUnusable { source, .. }
-            | ConfigError::OverlayDirUnusable { source, .. } => Some(source),
+            | ConfigError::OverlayDirUnusable { source, .. }
+            | ConfigError::MountTargetMissing { source, .. } => Some(source),
             ConfigError::IdentityMapUnavailable {
                 source: Some(source),
                 ..

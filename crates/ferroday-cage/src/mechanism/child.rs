@@ -60,6 +60,7 @@
 //! descriptor through its `/proc/self/fd` path, formatted into a stack
 //! buffer; the host `/proc` is still mounted at that point.
 
+use std::cell::Cell;
 use std::convert::Infallible;
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
@@ -147,6 +148,10 @@ pub(super) struct Context<'a> {
     /// terminal, standard input: the caller decided at the launch that it
     /// lends the terminal, as [`Foreground`](super::Foreground) describes.
     pub(super) take_foreground: bool,
+    /// One slot per hidden path of the profile, allocated by the caller, where
+    /// the setup keeps each hidden directory's tmpfs until the profile is in
+    /// place and the tmpfs is made read-only. The caller's copy stays empty.
+    pub(super) hidden: &'a [Cell<Option<OwnedFd>>],
 }
 
 impl Context<'_> {
@@ -1633,6 +1638,9 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
         RootPlan::Empty => {
             mount_empty_root().map_err(|errno| (SetupStep::MountEmptyRoot, errno, 0))?
         }
+        RootPlan::HostReadOnly => {
+            mount_host_root().map_err(|errno| (SetupStep::MountHostRoot, errno, 0))?
+        }
         // A sandbox's plan always names a root to pivot into, and a
         // restriction's never reaches this stage.
         RootPlan::Host => return Err((SetupStep::EnterRootfs, Errno::INVAL, 0)),
@@ -1640,10 +1648,23 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
 
     // The mount profile: host bind sources are still resolvable (the host
     // tree is mounted until the pivot), and every target resolves inside
-    // the new root.
+    // the new root. A hidden directory's tmpfs is kept, in a slot the caller
+    // allocated, until nothing more is made in it.
+    let mut slots = context.hidden.iter();
     for (index, op) in plan.ops.iter().enumerate() {
-        execute_op(newroot.as_fd(), op, index, context.report_fd)
-            .map_err(|(step, errno)| (step, errno, index as u32 + 1))?;
+        let detail = index as u32 + 1;
+        let hidden = execute_op(newroot.as_fd(), op, index, context.report_fd)
+            .map_err(|(step, errno)| (step, errno, detail))?;
+        if let Some(hidden) = hidden {
+            match slots.next() {
+                Some(slot) => slot.set(Some(hidden)),
+                // The caller allocates a slot for every hidden path, so this
+                // is not reached; made read-only at once, the directory still
+                // hides, and only a mount beneath it would fail.
+                None => read_only_mount(hidden.as_fd())
+                    .map_err(|errno| (SetupStep::HidePath, errno, detail))?,
+            }
+        }
     }
 
     // The procfs the command's nested identity map will be written through,
@@ -1658,9 +1679,15 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
         None => None,
     };
 
-    // Last of all, once nothing more is made in it.
+    // Last of all, once nothing more is made in them: every hidden
+    // directory, and an empty root.
+    for slot in context.hidden {
+        if let Some(hidden) = slot.take() {
+            read_only_mount(hidden.as_fd()).map_err(|errno| (SetupStep::HidePath, errno, 0))?;
+        }
+    }
     if matches!(plan.root, RootPlan::Empty) {
-        read_only_root(newroot.as_fd())
+        read_only_mount(newroot.as_fd())
             .map_err(|errno| (SetupStep::ReadOnlyEmptyRoot, errno, 0))?;
     }
 
@@ -2477,12 +2504,15 @@ fn share_target(file: &OwnedFd) -> Result<(), Errno> {
 }
 
 /// Executes one frozen mount op, the plan's `index`th, against the new root.
+///
+/// Returns a hidden directory's tmpfs, which the setup makes read-only once
+/// the profile is in place, and `None` for every other op.
 fn execute_op(
     root: BorrowedFd<'_>,
     op: &MountOp,
     index: usize,
     report_fd: BorrowedFd<'_>,
-) -> Result<(), (SetupStep, Errno)> {
+) -> Result<Option<OwnedFd>, (SetupStep, Errno)> {
     // Create missing mount-target directories, one component at a time.
     // The parent directory is resolved in-root first, so a symlinked
     // component is followed only within the rootfs; an existing entry —
@@ -2506,7 +2536,13 @@ fn execute_op(
             .map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
     }
 
-    match &op.action {
+    let done = match &op.action {
+        MountAction::Hide { target } => return hide(root, target),
+        MountAction::ReadOnly { target } => {
+            let target = open_in_root(root, target, OFlags::PATH)
+                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+            read_only_in_place(target.as_fd())
+        }
         MountAction::Tmpfs {
             target,
             flags,
@@ -2601,7 +2637,98 @@ fn execute_op(
                 Err(errno) => Err((SetupStep::CreateSymlink, errno)),
             }
         }
+    };
+    done.map(|()| None)
+}
+
+/// Hides what `target` names in `root`: an empty tmpfs over a directory, and an
+/// empty read-only file over anything else. Nothing at the path hides nothing.
+///
+/// Returns a hidden directory's tmpfs, writable, so that a later op can still
+/// make a mount point in it; the setup makes it read-only once the profile is
+/// in place. A hidden file is read-only from the start: nothing is made in a
+/// file.
+///
+/// The file is created in a tmpfs of its own and bound over the target, so the
+/// command sees a regular file, not a device. A clone of a path is taken only
+/// of a mount attached in the caller's mount namespace, so that tmpfs is
+/// attached for the moment the clone takes, stacked on the root mount, where no
+/// lookup crosses it, and detached again at once: a lookup that starts at a
+/// mount's root does not cross a mount stacked on that root.
+fn hide(root: BorrowedFd<'_>, target: &CStr) -> Result<Option<OwnedFd>, (SetupStep, Errno)> {
+    let at = match open_in_root(root, target, OFlags::PATH) {
+        Ok(at) => at,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(errno) => return Err((SetupStep::OpenMountTarget, errno)),
+    };
+    let failed = |errno| (SetupStep::HidePath, errno);
+    let directory = fs::fstat(&at)
+        .map(|stat| fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::Directory)
+        .map_err(failed)?;
+    let tmpfs = empty_tmpfs(
+        mount::MountAttrFlags::MOUNT_ATTR_NOSUID
+            | mount::MountAttrFlags::MOUNT_ATTR_NODEV
+            | mount::MountAttrFlags::MOUNT_ATTR_NOEXEC,
+    )
+    .map_err(failed)?;
+    if directory {
+        attach(tmpfs.as_fd(), at.as_fd()).map_err(failed)?;
+        return Ok(Some(tmpfs));
     }
+    let file = fs::openat(
+        &tmpfs,
+        HIDDEN_FILE,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::from_raw_mode(HIDDEN_FILE_MODE),
+    )
+    .map_err(failed)?;
+    drop(file);
+    attach(tmpfs.as_fd(), root).map_err(failed)?;
+    let clone = mount::open_tree(
+        &tmpfs,
+        HIDDEN_FILE,
+        mount::OpenTreeFlags::OPEN_TREE_CLONE | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC,
+    );
+    let detached = mount::unmount(fd_path(&tmpfs).as_cstr(), UnmountFlags::DETACH);
+    let clone = clone.map_err(failed)?;
+    detached.map_err(failed)?;
+    attach_tree(clone, at.as_fd(), true, SetupStep::HidePath)?;
+    Ok(None)
+}
+
+/// The name of the empty file a hidden file is bound from, inside its own
+/// tmpfs.
+const HIDDEN_FILE: &CStr = c"hidden";
+
+/// The mode of the empty file a hidden file is bound from: an ordinary file's.
+const HIDDEN_FILE_MODE: u32 = 0o644;
+
+/// Makes the tree at `target` read-only where it stands: a clone of it, every
+/// mount beneath it included, read-only, bound onto it.
+fn read_only_in_place(target: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
+    let tree = mount::open_tree(
+        target,
+        c"",
+        mount::OpenTreeFlags::OPEN_TREE_CLONE
+            | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC
+            | mount::OpenTreeFlags::AT_RECURSIVE
+            | mount::OpenTreeFlags::AT_EMPTY_PATH,
+    )
+    .map_err(|errno| (SetupStep::ReadOnlyPath, errno))?;
+    attach_tree(tree, target, true, SetupStep::ReadOnlyPath)
+}
+
+/// Attaches the detached mount `mount` names onto the mount target `target`
+/// names.
+fn attach(mount: BorrowedFd<'_>, target: BorrowedFd<'_>) -> Result<(), Errno> {
+    mount::move_mount(
+        mount,
+        c"",
+        target,
+        c"",
+        mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH
+            | mount::MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
+    )
 }
 
 /// Whether the entry `leaf` names in `dir` is a symbolic link to `content`.
@@ -2646,21 +2773,26 @@ fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (S
             | mount::OpenTreeFlags::AT_RECURSIVE,
     )
     .map_err(|errno| (SetupStep::BindMount, errno))?;
+    attach_tree(tree, target, read_only, SetupStep::BindMount)
+}
+
+/// Attaches a detached clone, `tree`, onto the mount target `target` names,
+/// read-only throughout when `read_only` asks, with the restriction made
+/// before the attach as [`bind`] sets out. A failure of the attach is reported
+/// as `step`, the operation the clone serves.
+fn attach_tree(
+    tree: OwnedFd,
+    target: BorrowedFd<'_>,
+    read_only: bool,
+    step: SetupStep,
+) -> Result<(), (SetupStep, Errno)> {
     let remount_after = read_only
         && match mount_setattr(tree.as_fd(), MOUNT_ATTR_RDONLY, true) {
             Ok(()) => false,
             Err(Errno::NOSYS) => true,
             Err(errno) => return Err((SetupStep::RemountReadOnly, errno)),
         };
-    mount::move_mount(
-        tree.as_fd(),
-        c"",
-        target,
-        c"",
-        mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH
-            | mount::MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
-    )
-    .map_err(|errno| (SetupStep::BindMount, errno))?;
+    attach(tree.as_fd(), target).map_err(|errno| (step, errno))?;
     if remount_after {
         remount_top(tree.as_fd(), MountFlags::RDONLY)
             .map_err(|errno| (SetupStep::RemountReadOnly, errno))?;
@@ -2721,31 +2853,68 @@ fn open_root(path: &CStr) -> Result<OwnedFd, Failure> {
 /// `nosuid` and `nodev` from the start: nothing in it is executable or a
 /// device, and a mount the profile makes beneath it carries its own flags.
 fn mount_empty_root() -> Result<OwnedFd, Errno> {
+    let root = empty_tmpfs(
+        mount::MountAttrFlags::MOUNT_ATTR_NOSUID | mount::MountAttrFlags::MOUNT_ATTR_NODEV,
+    )?;
+    attach_over_root(root.as_fd())?;
+    Ok(root)
+}
+
+/// Clones the host's mount tree, makes every mount of the clone read-only and
+/// `nosuid`, and attaches it on top of `/`, returning a descriptor of it.
+///
+/// The clone is taken in the sandbox's own mount namespace, after the
+/// inherited tree was made private, so nothing done to it reaches the host.
+/// The mounts the namespace copied are locked, which the clone keeps: a lock
+/// refuses lifting a restriction, and this only adds them. Attached on top of
+/// `/`, as the empty root is, every host path a bind of the profile names still
+/// resolves on the host until the pivot.
+///
+/// There is no fallback below Linux 5.12. A remount by path reaches only the
+/// top mount of a tree, and a root whose submounts stayed writable is not the
+/// read-only host it is configured as, so `ENOSYS` fails the launch.
+fn mount_host_root() -> Result<OwnedFd, Errno> {
+    let tree = mount::open_tree(
+        fs::CWD,
+        c"/",
+        mount::OpenTreeFlags::OPEN_TREE_CLONE
+            | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC
+            | mount::OpenTreeFlags::AT_RECURSIVE,
+    )?;
+    mount_setattr(tree.as_fd(), MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID, true)?;
+    attach_over_root(tree.as_fd())?;
+    Ok(tree)
+}
+
+/// Creates a tmpfs of the sandbox's own, mode `0755`, detached, carrying
+/// `attributes`, and returns a descriptor of it.
+fn empty_tmpfs(attributes: mount::MountAttrFlags) -> Result<OwnedFd, Errno> {
     let context = mount::fsopen(c"tmpfs", mount::FsOpenFlags::FSOPEN_CLOEXEC)?;
     mount::fsconfig_set_string(&context, c"mode", c"0755")?;
     mount::fsconfig_create(&context)?;
-    let root = mount::fsmount(
-        &context,
-        mount::FsMountFlags::FSMOUNT_CLOEXEC,
-        mount::MountAttrFlags::MOUNT_ATTR_NOSUID | mount::MountAttrFlags::MOUNT_ATTR_NODEV,
-    )?;
+    mount::fsmount(&context, mount::FsMountFlags::FSMOUNT_CLOEXEC, attributes)
+}
+
+/// Attaches the detached mount `root` names on top of `/`, as a root the
+/// sandbox pivots into.
+fn attach_over_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
     mount::move_mount(
-        &root,
+        root,
         c"",
         fs::CWD,
         c"/",
         mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )?;
-    Ok(root)
+    )
 }
 
-/// Makes the root mount `root` names read-only, and only it: every mount the
-/// profile made beneath it keeps its own flags, so a writable bind and the
-/// managed `/tmp` stay writable.
-fn read_only_root(root: BorrowedFd<'_>) -> Result<(), Errno> {
-    match mount_setattr(root, MOUNT_ATTR_RDONLY, false) {
+/// Makes the mount `target` names read-only, and only it: every mount made
+/// beneath it keeps its own flags. That is an empty root once the profile is
+/// in place, where a writable bind and the managed `/tmp` stay writable, and a
+/// hidden directory, where a working tree bound back in stays writable.
+fn read_only_mount(target: BorrowedFd<'_>) -> Result<(), Errno> {
+    match mount_setattr(target, MOUNT_ATTR_RDONLY, false) {
         Ok(()) => Ok(()),
-        Err(Errno::NOSYS) => remount_top(root, MountFlags::RDONLY),
+        Err(Errno::NOSYS) => remount_top(target, MountFlags::RDONLY),
         Err(errno) => Err(errno),
     }
 }

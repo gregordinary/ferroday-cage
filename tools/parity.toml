@@ -46,6 +46,14 @@ name = "empty_rootfs"
 flags = ["--empty-rootfs"]
 
 [[builder.setting]]
+name = "host_rootfs"
+flags = ["--host-rootfs"]
+
+[[builder.setting]]
+name = "reveal"
+flags = ["--reveal"]
+
+[[builder.setting]]
 name = "overlay"
 flags = ["--overlay-lower", "--overlay-upper", "--overlay-work"]
 
@@ -69,6 +77,14 @@ flags = ["--raw-mount"]
 [[builder.setting]]
 name = "symlink"
 flags = ["--symlink"]
+
+[[builder.setting]]
+name = "hide"
+flags = ["--hide"]
+
+[[builder.setting]]
+name = "read_only"
+flags = ["--read-only"]
 
 [[builder.setting]]
 name = "mount"

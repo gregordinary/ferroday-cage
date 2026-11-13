@@ -1598,6 +1598,9 @@ pub ferroday_cage::ConfigError::MountFlagsInvalid::flags: u64
 pub ferroday_cage::ConfigError::MountFlagsInvalid::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::MountTargetInvalid
 pub ferroday_cage::ConfigError::MountTargetInvalid::path: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ConfigError::MountTargetMissing
+pub ferroday_cage::ConfigError::MountTargetMissing::source: core::io::error::Error
+pub ferroday_cage::ConfigError::MountTargetMissing::target: std::path::PathBuf
 pub ferroday_cage::ConfigError::NestedUsernsNeedsProcfs
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayDirUnowned
 pub ferroday_cage::ConfigError::OverlayDirUnowned::layer: ferroday_cage::OverlayLayer
@@ -1630,6 +1633,8 @@ pub ferroday_cage::ConfigError::ProfileOperationForbidden::operation: &'static s
 pub ferroday_cage::ConfigError::RestrictionEmpty
 #[non_exhaustive] pub ferroday_cage::ConfigError::RestrictionLandlockUnenforceable
 pub ferroday_cage::ConfigError::RestrictionLandlockUnenforceable::abi: core::option::Option<i32>
+#[non_exhaustive] pub ferroday_cage::ConfigError::RevealUnhidden
+pub ferroday_cage::ConfigError::RevealUnhidden::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::RlimitInvalid
 pub ferroday_cage::ConfigError::RlimitInvalid::hard: ferroday_cage::limits::Limit
 pub ferroday_cage::ConfigError::RlimitInvalid::resource: ferroday_cage::limits::Resource
@@ -1811,7 +1816,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ListenRefusal
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ListenRefusal
 #[non_exhaustive] pub enum ferroday_cage::Mount
 pub ferroday_cage::Mount::Bind(ferroday_cage::Bind)
+pub ferroday_cage::Mount::Hide(ferroday_cage::Hide)
 pub ferroday_cage::Mount::Raw(ferroday_cage::RawMount)
+pub ferroday_cage::Mount::ReadOnly(ferroday_cage::ReadOnly)
 pub ferroday_cage::Mount::Symlink(ferroday_cage::Symlink)
 impl ferroday_cage::Mount
 pub fn ferroday_cage::Mount::get_target(&self) -> &std::path::Path
@@ -1968,6 +1975,8 @@ pub ferroday_cage::ResolvedMount::Bind::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Devpts
 pub ferroday_cage::ResolvedMount::Devpts::data: alloc::string::String
 pub ferroday_cage::ResolvedMount::Devpts::target: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Hide
+pub ferroday_cage::ResolvedMount::Hide::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Procfs
 pub ferroday_cage::ResolvedMount::Procfs::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Raw
@@ -1976,6 +1985,8 @@ pub ferroday_cage::ResolvedMount::Raw::flags: u64
 pub ferroday_cage::ResolvedMount::Raw::fstype: core::option::Option<alloc::string::String>
 pub ferroday_cage::ResolvedMount::Raw::source: core::option::Option<std::path::PathBuf>
 pub ferroday_cage::ResolvedMount::Raw::target: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::ReadOnly
+pub ferroday_cage::ResolvedMount::ReadOnly::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Symlink
 pub ferroday_cage::ResolvedMount::Symlink::path: std::path::PathBuf
 pub ferroday_cage::ResolvedMount::Symlink::target: std::path::PathBuf
@@ -1995,6 +2006,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedMount
 #[non_exhaustive] pub enum ferroday_cage::ResolvedRoot
 pub ferroday_cage::ResolvedRoot::Empty
 pub ferroday_cage::ResolvedRoot::Host
+pub ferroday_cage::ResolvedRoot::HostReadOnly
 #[non_exhaustive] pub ferroday_cage::ResolvedRoot::Overlay
 pub ferroday_cage::ResolvedRoot::Overlay::lower: alloc::vec::Vec<std::path::PathBuf>
 pub ferroday_cage::ResolvedRoot::Overlay::upper: std::path::PathBuf
@@ -2112,6 +2124,7 @@ pub ferroday_cage::SetupStep::EnterRootfs = 9
 pub ferroday_cage::SetupStep::Exec = 21
 pub ferroday_cage::SetupStep::ForkCommand = 28
 pub ferroday_cage::SetupStep::ForkInit = 23
+pub ferroday_cage::SetupStep::HidePath = 65
 pub ferroday_cage::SetupStep::InstallNetworkFilter = 58
 pub ferroday_cage::SetupStep::InstallSeccomp = 36
 pub ferroday_cage::SetupStep::LandlockAddRule = 34
@@ -2119,6 +2132,7 @@ pub ferroday_cage::SetupStep::LandlockCreateRuleset = 33
 pub ferroday_cage::SetupStep::LandlockRestrictSelf = 35
 pub ferroday_cage::SetupStep::MountDevpts = 13
 pub ferroday_cage::SetupStep::MountEmptyRoot = 59
+pub ferroday_cage::SetupStep::MountHostRoot = 64
 pub ferroday_cage::SetupStep::MountOverlayRoot = 43
 pub ferroday_cage::SetupStep::MountProc = 25
 pub ferroday_cage::SetupStep::MountRaw = 26
@@ -2136,6 +2150,7 @@ pub ferroday_cage::SetupStep::OpenSandboxProcfs = 52
 pub ferroday_cage::SetupStep::PivotRoot = 17
 pub ferroday_cage::SetupStep::PrivatizeMounts = 7
 pub ferroday_cage::SetupStep::ReadOnlyEmptyRoot = 60
+pub ferroday_cage::SetupStep::ReadOnlyPath = 66
 pub ferroday_cage::SetupStep::RemountReadOnly = 15
 pub ferroday_cage::SetupStep::ReplaceSessionKeyring = 55
 pub ferroday_cage::SetupStep::ResetSignals = 22
@@ -2237,6 +2252,7 @@ pub fn ferroday_cage::CageBuilder::get_command(&self) -> core::option::Option<&s
 pub fn ferroday_cage::CageBuilder::get_current_dir(&self) -> core::option::Option<&std::path::Path>
 pub fn ferroday_cage::CageBuilder::get_empty_rootfs(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_envs(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&std::ffi::os_str::OsStr, &std::ffi::os_str::OsStr)>
+pub fn ferroday_cage::CageBuilder::get_host_rootfs(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_hostname(&self) -> core::option::Option<&std::ffi::os_str::OsStr>
 pub fn ferroday_cage::CageBuilder::get_identity_map(&self) -> &ferroday_cage::IdentityMap
 pub fn ferroday_cage::CageBuilder::get_managed_mounts(&self) -> bool
@@ -2251,6 +2267,7 @@ pub fn ferroday_cage::CageBuilder::get_pid_namespace(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_present_as(&self) -> core::option::Option<ferroday_cage::PresentedIdentity>
 pub fn ferroday_cage::CageBuilder::get_raw_mounts(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferroday_cage::RawMount>
 pub fn ferroday_cage::CageBuilder::get_resolv_conf(&self) -> bool
+pub fn ferroday_cage::CageBuilder::get_reveal(&self) -> &[std::path::PathBuf]
 pub fn ferroday_cage::CageBuilder::get_rlimits(&self) -> impl core::iter::traits::iterator::Iterator<Item = (ferroday_cage::limits::Resource, ferroday_cage::limits::Limit, ferroday_cage::limits::Limit)>
 pub fn ferroday_cage::CageBuilder::get_rootfs(&self) -> core::option::Option<&std::path::Path>
 pub fn ferroday_cage::CageBuilder::get_run_as(&self) -> core::option::Option<&ferroday_cage::Identity>
@@ -2258,6 +2275,8 @@ pub fn ferroday_cage::CageBuilder::get_stderr(&self) -> &ferroday_cage::Stdio
 pub fn ferroday_cage::CageBuilder::get_stdin(&self) -> &ferroday_cage::Stdio
 pub fn ferroday_cage::CageBuilder::get_stdout(&self) -> &ferroday_cage::Stdio
 pub fn ferroday_cage::CageBuilder::get_stop_with_caller(&self) -> bool
+pub fn ferroday_cage::CageBuilder::hide(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::CageBuilder::host_rootfs(self) -> Self
 pub fn ferroday_cage::CageBuilder::hostname(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
 pub fn ferroday_cage::CageBuilder::id_mapper(self, impl ferroday_cage::IdMapper + 'static) -> Self
 pub fn ferroday_cage::CageBuilder::identity_map(self, ferroday_cage::IdentityMap) -> Self
@@ -2274,7 +2293,9 @@ pub fn ferroday_cage::CageBuilder::path_lookup(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::pid_namespace(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::present_as(self, ferroday_cage::PresentedIdentity) -> Self
 pub fn ferroday_cage::CageBuilder::raw_mount(self, ferroday_cage::RawMount) -> Self
+pub fn ferroday_cage::CageBuilder::read_only(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::resolv_conf(self, bool) -> Self
+pub fn ferroday_cage::CageBuilder::reveal(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::rlimit(self, ferroday_cage::limits::Resource, impl core::convert::Into<ferroday_cage::limits::Limit>, impl core::convert::Into<ferroday_cage::limits::Limit>) -> Self
 pub fn ferroday_cage::CageBuilder::rootfs(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::run_as(self, ferroday_cage::Identity) -> Self
@@ -2387,6 +2408,17 @@ impl core::marker::Unpin for ferroday_cage::FsAccess
 impl core::marker::UnsafeUnpin for ferroday_cage::FsAccess
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::FsAccess
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::FsAccess
+#[non_exhaustive] pub struct ferroday_cage::Hide
+impl ferroday_cage::Hide
+pub fn ferroday_cage::Hide::get_target(&self) -> &std::path::Path
+pub fn ferroday_cage::Hide::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::Hide
+impl core::marker::Freeze for ferroday_cage::Hide
+impl core::marker::Send for ferroday_cage::Hide
+impl core::marker::Sync for ferroday_cage::Hide
+impl core::marker::Unpin for ferroday_cage::Hide
+impl core::marker::UnsafeUnpin for ferroday_cage::Hide
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Hide
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Hide
 pub struct ferroday_cage::IdRange
 pub ferroday_cage::IdRange::count: u32
 pub ferroday_cage::IdRange::inside: u32
@@ -2686,6 +2718,17 @@ impl core::marker::Unpin for ferroday_cage::RawMount
 impl core::marker::UnsafeUnpin for ferroday_cage::RawMount
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::RawMount
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::RawMount
+#[non_exhaustive] pub struct ferroday_cage::ReadOnly
+impl ferroday_cage::ReadOnly
+pub fn ferroday_cage::ReadOnly::get_target(&self) -> &std::path::Path
+pub fn ferroday_cage::ReadOnly::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::ReadOnly
+impl core::marker::Freeze for ferroday_cage::ReadOnly
+impl core::marker::Send for ferroday_cage::ReadOnly
+impl core::marker::Sync for ferroday_cage::ReadOnly
+impl core::marker::Unpin for ferroday_cage::ReadOnly
+impl core::marker::UnsafeUnpin for ferroday_cage::ReadOnly
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ReadOnly
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ReadOnly
 #[non_exhaustive] pub struct ferroday_cage::ResolvedInputs
 pub ferroday_cage::ResolvedInputs::env: alloc::vec::Vec<(std::ffi::os_str::OsString, std::ffi::os_str::OsString)>
 pub ferroday_cage::ResolvedInputs::hardening: ferroday_cage::ResolvedHardening

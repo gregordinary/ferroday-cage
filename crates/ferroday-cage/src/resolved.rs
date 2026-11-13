@@ -240,6 +240,10 @@ pub enum ResolvedRoot {
     /// mount profile creates in it, and read-only once the profile is in
     /// place. See [`CageBuilder::empty_rootfs`](crate::CageBuilder::empty_rootfs).
     Empty,
+    /// The host's own tree, cloned and read-only throughout, with the profile
+    /// laid over it. See
+    /// [`CageBuilder::host_rootfs`](crate::CageBuilder::host_rootfs).
+    HostReadOnly,
 }
 
 /// The identity map a built sandbox's user namespace carries.
@@ -607,6 +611,22 @@ pub enum ResolvedMount {
         /// The path the link points at, as written.
         target: PathBuf,
     },
+    /// A hidden path: an empty directory or an empty file, read-only, where
+    /// something stands at the path. See [`Hide`](crate::Hide). The
+    /// [host's own root](crate::CageBuilder::host_rootfs)'s default hides
+    /// arrive this way.
+    #[non_exhaustive]
+    Hide {
+        /// The path inside the sandbox it hides.
+        target: PathBuf,
+    },
+    /// A path made read-only where it stands. See
+    /// [`ReadOnly`](crate::ReadOnly).
+    #[non_exhaustive]
+    ReadOnly {
+        /// The path inside the sandbox it makes read-only.
+        target: PathBuf,
+    },
 }
 
 impl ResolvedMount {
@@ -620,7 +640,9 @@ impl ResolvedMount {
             | ResolvedMount::Procfs { target }
             | ResolvedMount::Devpts { target, .. }
             | ResolvedMount::Bind { target, .. }
-            | ResolvedMount::Raw { target, .. } => target,
+            | ResolvedMount::Raw { target, .. }
+            | ResolvedMount::Hide { target }
+            | ResolvedMount::ReadOnly { target } => target,
             ResolvedMount::Symlink { path, .. } => path,
         }
     }
@@ -681,6 +703,7 @@ fn project_root(plan: &LaunchPlan) -> ResolvedRoot {
             work: overlay.work.clone(),
         },
         RootPlan::Empty => ResolvedRoot::Empty,
+        RootPlan::HostReadOnly => ResolvedRoot::HostReadOnly,
     }
 }
 
@@ -899,6 +922,12 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
                 target: PathBuf::from(OsString::from_vec(content.as_bytes().to_vec())),
             }
         }
+        MountAction::Hide { target } => ResolvedMount::Hide {
+            target: absolute(target),
+        },
+        MountAction::ReadOnly { target } => ResolvedMount::ReadOnly {
+            target: absolute(target),
+        },
     }
 }
 
@@ -1108,6 +1137,12 @@ mod serde_tests {
                     path: PathBuf::from("/dev/fd"),
                     target: PathBuf::from("/proc/self/fd"),
                 },
+                ResolvedMount::Hide {
+                    target: PathBuf::from("/home"),
+                },
+                ResolvedMount::ReadOnly {
+                    target: PathBuf::from("/work/.git/hooks"),
+                },
             ],
             identity: ResolvedIdentity::Ranged {
                 uid: vec![extent],
@@ -1168,7 +1203,11 @@ mod serde_tests {
             root: ResolvedRoot::Empty,
             ..everything.clone()
         };
-        vec![everything, overlaid, restricted, empty]
+        let host = ResolvedInputs {
+            root: ResolvedRoot::HostReadOnly,
+            ..everything.clone()
+        };
+        vec![everything, overlaid, restricted, empty, host]
     }
 
     /// Which variant of each of the record's enums a record holds.
@@ -1183,6 +1222,7 @@ mod serde_tests {
             ResolvedRoot::Plain { .. } => "root plain",
             ResolvedRoot::Overlay { .. } => "root overlay",
             ResolvedRoot::Empty => "root empty",
+            ResolvedRoot::HostReadOnly => "root host read-only",
         };
         let identity = match record.identity {
             ResolvedIdentity::Caller => "identity caller",
@@ -1200,6 +1240,8 @@ mod serde_tests {
             ResolvedMount::Bind { .. } => "mount bind",
             ResolvedMount::Raw { .. } => "mount raw",
             ResolvedMount::Symlink { .. } => "mount symlink",
+            ResolvedMount::Hide { .. } => "mount hide",
+            ResolvedMount::ReadOnly { .. } => "mount read-only",
         });
         [root, identity, hardening]
             .into_iter()
@@ -1230,12 +1272,15 @@ mod serde_tests {
                 "identity single",
                 "mount bind",
                 "mount devpts",
+                "mount hide",
                 "mount procfs",
                 "mount raw",
+                "mount read-only",
                 "mount symlink",
                 "mount tmpfs",
                 "root empty",
                 "root host",
+                "root host read-only",
                 "root overlay",
                 "root plain",
             ]),
