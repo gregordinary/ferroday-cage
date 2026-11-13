@@ -556,6 +556,9 @@ consumer upgrading can skip it.
   FIN that answers the host's, and the host had not taken them within ten
   seconds, the network stack discarded them as the guest's socket left
   TIME_WAIT, and then reset the host.
+- `NetStackError::TapCreate` names the interface with its control characters
+  escaped, as `NetStackError::InterfaceNameInvalid` does. The kernel admits a
+  control character in an interface name, and one reached the terminal raw.
 - `relay::restore_terminal`, and the hook `relay::install_panic_restore`
   installs, restore the caller's terminal during a panic only where the panic
   ends the session or the process: on the thread the session runs on, on the

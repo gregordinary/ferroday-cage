@@ -1028,7 +1028,7 @@ impl fmt::Display for NetStackError {
             ),
             NetStackError::TapOpen { .. } => f.write_str("could not open /dev/net/tun"),
             NetStackError::TapCreate { name, .. } => {
-                write!(f, "could not create the tap interface {name}")
+                write!(f, "could not create the tap interface {name:?}")
             }
             NetStackError::TapConfigure { detail, .. } => {
                 write!(f, "could not configure the tap interface while {detail}")
@@ -1339,6 +1339,22 @@ mod tests {
             .interface("\u{e9}th0")
             .build()
             .expect("a name the kernel accepts");
+    }
+
+    #[test]
+    fn an_interface_name_is_rendered_escaped() {
+        // The kernel's alphabet for a name admits control characters, so a
+        // name that failed to be created is named with them escaped.
+        let hostile = &crate::failure::hostile::TEXT[..12];
+        NetStack::builder()
+            .interface(hostile)
+            .build()
+            .expect("a name the kernel accepts");
+        let refused = NetStackError::TapCreate {
+            name: hostile.to_string(),
+            source: io::Error::from_raw_os_error(1),
+        };
+        crate::failure::hostile::assert_escaped(&refused.to_string());
     }
 
     #[test]
