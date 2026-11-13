@@ -55,12 +55,18 @@ pub(crate) struct Namespaces {
 
 impl Namespaces {
     /// Opens the namespaces of the process `pid` names, through
-    /// `/proc/<pid>/ns`.
+    /// `/proc/<pid>/ns`, holding the pid to the process `pidfd` refers to.
     ///
-    /// `pid` is a pending launch's supervisor, which the pending handle keeps
-    /// alive, so the pid cannot be recycled while these are opened. A failure
-    /// names what was being opened, as a phrase that completes "while".
-    pub(crate) fn of(pid: u32) -> Result<Namespaces, (&'static str, Errno)> {
+    /// `pid` is a pending launch's supervisor, and the pending handle holds its
+    /// pidfd but does not reap it. With a PID namespace the init's parent is
+    /// the launch stage, which exits, and the init is reaped by whatever reaper
+    /// it was reparented to, so an init killed from outside leaves its pid free
+    /// for the next process to take. The pidfd is asked after the files are
+    /// opened: a supervisor that has not exited by then was alive when they
+    /// were, and a live process's pid names it, so they are its namespaces.
+    /// One that has exited is refused with `ESRCH`. A failure names what was
+    /// being opened, as a phrase that completes "while".
+    pub(crate) fn of(pid: u32, pidfd: BorrowedFd<'_>) -> Result<Namespaces, (&'static str, Errno)> {
         let open = |kind: &str| {
             rustix::fs::open(
                 format!("/proc/{pid}/ns/{kind}"),
@@ -71,6 +77,9 @@ impl Namespaces {
         let net =
             open("net").map_err(|errno| ("opening the sandbox's network namespace", errno))?;
         let user = open("user").map_err(|errno| ("opening the sandbox's user namespace", errno))?;
+        if super::has_exited(pidfd) {
+            return Err(("opening the sandbox's namespaces", Errno::SRCH));
+        }
         Ok(Namespaces { user, net })
     }
 }
@@ -345,5 +354,35 @@ mod tests {
         assert_eq!(ListenStep::from_wire(0), None);
         assert_eq!(ListenStep::from_wire(ListenStep::past_the_last()), None);
         assert_eq!(ListenStep::from_wire(RECORD_DONE), None);
+    }
+
+    /// The namespaces a pid names are refused once the process the pidfd
+    /// refers to has exited, and taken while it lives.
+    ///
+    /// The files are opened through this process's own pid, which a live
+    /// process holds, so only the pidfd decides.
+    #[test]
+    fn namespaces_held_to_a_supervisor_that_has_exited_are_refused() {
+        // SAFETY: the child makes one raw syscall, `exit_group`, and never
+        // returns.
+        let child = match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
+            PidfdFork::Child => sys::exit_group(0),
+            PidfdFork::ParentOf(child) => child,
+        };
+        super::super::await_exit(child.pidfd()).expect("the child exits");
+        let refused = Namespaces::of(std::process::id(), child.pidfd());
+        assert!(
+            matches!(refused, Err((_, Errno::SRCH))),
+            "{:?}",
+            refused.err()
+        );
+        child.reap().expect("the child is reaped");
+
+        let alive = rustix::process::pidfd_open(
+            rustix::process::getpid(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .expect("a pidfd of this process");
+        assert!(Namespaces::of(std::process::id(), alive.as_fd()).is_ok());
     }
 }

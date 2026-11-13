@@ -1402,10 +1402,15 @@ impl<'obs> Pending<'obs> {
 
     /// Opens the sandbox's user and network namespaces, for a helper to join.
     ///
-    /// The supervisor is alive while this handle holds the launch, so the pid
-    /// they are opened through names it.
+    /// The pid they are opened through is held to the supervisor's pidfd, as
+    /// [`Namespaces::of`] states, since holding the launch does not keep a pid
+    /// from being taken by another process once the supervisor is gone.
     pub(crate) fn namespaces(&self) -> Result<Namespaces, (&'static str, Errno)> {
-        Namespaces::of(self.netns_pid())
+        let inner = self
+            .inner
+            .as_ref()
+            .expect("a Pending holds its launch until proceed consumes it");
+        Namespaces::of(inner.netns_pid(), inner.supervisor())
     }
 
     /// The handled mask of the sandbox's Landlock network grants, zero where
