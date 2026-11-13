@@ -1367,9 +1367,7 @@ fn pool_path(component: &str, name: &str, version: &str, architecture: &str) -> 
 /// index names.
 fn filename_version(version: &str) -> &str {
     match version.split_once(':') {
-        Some((epoch, rest)) if !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) => {
-            rest
-        }
+        Some((epoch, rest)) if crate::provision::number::is_digits(epoch) => rest,
         _ => version,
     }
 }

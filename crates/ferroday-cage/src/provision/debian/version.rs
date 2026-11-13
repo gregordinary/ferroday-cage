@@ -82,7 +82,7 @@ fn as_dpkg_reads(version: &str) -> &str {
 /// boundary is the last hyphen.
 fn split(version: &str) -> (u64, &str, &str) {
     let (epoch, rest) = match version.find(':') {
-        Some(colon) if colon > 0 && version[..colon].bytes().all(|b| b.is_ascii_digit()) => {
+        Some(colon) if crate::provision::number::is_digits(&version[..colon]) => {
             // The field is all digits, so a parse failure is an overflow of a
             // pathologically large epoch. Saturate to the maximum: such an
             // epoch sorts above every real one, the correct direction, where

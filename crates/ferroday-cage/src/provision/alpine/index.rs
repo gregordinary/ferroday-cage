@@ -18,6 +18,7 @@
 //! an index carrying it is still the index this reader can use, so unknown
 //! letters are ignored and unknown syntax is refused.
 
+use crate::provision::number;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -374,8 +375,8 @@ fn record(fields: &[(char, &str)], line: usize, from: usize) -> Result<Option<Re
         // download bounded by the fetcher's own ceiling rather than being
         // dropped: the digest is what decides whether the bytes are the package,
         // and a missing bound is a weaker fetch rather than a wrong one.
-        size: value('S').and_then(|value| value.parse().ok()),
-        installed_size: value('I').and_then(|value| value.parse().ok()),
+        size: value('S').and_then(number::digits),
+        installed_size: value('I').and_then(number::digits),
         // Stated by every published record, and equal to the name for most of
         // them; kept only where it says something the name does not.
         origin: value('o')

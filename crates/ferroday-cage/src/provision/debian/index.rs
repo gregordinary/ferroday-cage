@@ -8,6 +8,7 @@
 //! written in as well; [`Index`] is the package set built from a `Packages`
 //! file, deduplicated to the highest version of each name.
 
+use crate::provision::number;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -260,12 +261,13 @@ impl Package {
         // leaves the download bounded by the fetcher's own ceiling rather than
         // being dropped: the digest is what decides whether the bytes are the
         // package, and a missing bound is a weaker fetch, not a wrong one.
-        let size = size.and_then(|value| value.parse::<u64>().ok());
+        let size = size.and_then(|value| number::digits::<u64>(value.as_bytes()));
         // Read before the literal below moves `name`, which the source name is
         // compared against. Neither field is required: a stanza missing or
         // malforming one is reported as carrying no value rather than dropped,
         // since nothing the bootstrap does depends on either.
-        let installed_size = installed_size.and_then(|value| value.parse::<u64>().ok());
+        let installed_size =
+            installed_size.and_then(|value| number::digits::<u64>(value.as_bytes()));
         let source = source.and_then(|value| source_name(&value, &name));
         Some(Package {
             name,

@@ -8,6 +8,7 @@
 //! SHA-512, or both — so every fetch below the release is checked against
 //! digests that chain back to the signature.
 
+use crate::provision::number;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -114,7 +115,7 @@ impl Release {
                 if let (Some(digest), Some(size), Some(path)) =
                     (fields.next(), fields.next(), fields.next())
                     && algorithm.is_hex(digest)
-                    && let Ok(size) = size.parse::<u64>()
+                    && let Some(size) = number::digits::<u64>(size)
                 {
                     let entry = listed
                         .entry(path.to_string())

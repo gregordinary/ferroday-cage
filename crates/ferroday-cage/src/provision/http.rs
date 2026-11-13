@@ -1273,20 +1273,6 @@ fn read_field_section<R: BufRead>(
     ))
 }
 
-/// `text` as a number the framing grammar spells: one or more digits of
-/// `radix`, and nothing else.
-///
-/// Rust's integer parsers also take a leading `+`, which neither
-/// `Content-Length` (`1*DIGIT`) nor a chunk size (`1*HEXDIG`) admits. Both
-/// decide where a body ends, and framing read more leniently than its grammar
-/// is framing that another reader of the same bytes disagrees with.
-fn framing_number(text: &str, radix: u32) -> Option<u64> {
-    if text.is_empty() || !text.chars().all(|digit| digit.is_digit(radix)) {
-        return None;
-    }
-    u64::from_str_radix(text, radix).ok()
-}
-
 /// Reads the response headers up to the blank separator line.
 fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
     let mut headers = Headers::default();
@@ -1299,7 +1285,7 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
                 // body's extent unknown. Reading such a response to end of
                 // stream would turn a truncation into a short, successful body,
                 // so it is refused instead.
-                let length = framing_number(value, 10).ok_or_else(|| {
+                let length = super::number::digits_in(value, 10).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "malformed Content-Length")
                 })?;
                 if headers.content_length.is_some_and(|first| first != length) {
@@ -1462,7 +1448,7 @@ fn read_chunked<R: BufRead>(reader: &mut R, sink: &mut dyn Write) -> io::Result<
         let mut line = String::new();
         read_line_limited(reader, &mut line)?;
         // The chunk size is hex, before any `;`-delimited extension.
-        let size = framing_number(line.trim().split(';').next().unwrap_or("").trim(), 16)
+        let size = super::number::digits_in(line.trim().split(';').next().unwrap_or("").trim(), 16)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed chunk size"))?;
         if size == 0 {
             // The last chunk is followed by the trailer section, which is part

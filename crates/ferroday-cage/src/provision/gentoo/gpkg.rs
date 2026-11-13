@@ -94,6 +94,7 @@
 //! agreeing with the first buys nothing the first does not already give, and
 //! BLAKE2B is not otherwise in this crate.
 
+use crate::provision::number;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::path::Path;
@@ -635,7 +636,7 @@ impl Manifest {
             let (Some(name), Some(size)) = (fields.next(), fields.next()) else {
                 continue;
             };
-            let Ok(size) = size.parse::<u64>() else {
+            let Some(size) = number::digits::<u64>(size) else {
                 return Err(GentooError::container(
                     path,
                     format!("states a length of {size:?} for {name:?}, which is not a number"),
@@ -796,7 +797,7 @@ fn check_identity(
                     .strip_prefix(name)
                     .and_then(|rest| rest.strip_prefix('-'))
                     .is_some_and(|version| version == planned.version)
-                && build_id.parse::<u64>() == Ok(planned.build_id)
+                && number::digits::<u64>(build_id) == Some(planned.build_id)
         });
     if !matched {
         return Err(GentooError::container(

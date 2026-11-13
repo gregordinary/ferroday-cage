@@ -35,6 +35,7 @@
 //! `.sig`, `Manifest` or `.DIGESTS` is published beside it — so a timestamp it
 //! carries says when a mirror claims it was generated and not when it was.
 
+use crate::provision::number;
 use std::borrow::Cow;
 
 use super::atom::{self, Dependency};
@@ -488,10 +489,16 @@ impl Index {
 /// than refusing an index whose package stanzas are fine.
 fn read_preamble(stanza: &Stanza<'_>) -> Preamble {
     Preamble {
-        generated: stanza.get("TIMESTAMP").and_then(|text| text.parse().ok()),
-        ttl: stanza.get("TTL").and_then(|text| text.parse().ok()),
+        generated: stanza
+            .get("TIMESTAMP")
+            .and_then(|value| number::digits(value.as_bytes())),
+        ttl: stanza
+            .get("TTL")
+            .and_then(|value| number::digits(value.as_bytes())),
         chost: stanza.get("CHOST").map(Cow::into_owned),
-        declared: stanza.get("PACKAGES").and_then(|text| text.parse().ok()),
+        declared: stanza
+            .get("PACKAGES")
+            .and_then(|value| number::digits(value.as_bytes())),
     }
 }
 
@@ -555,11 +562,13 @@ fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
     if !crate::provision::digest::md5::is_hex(&md5) {
         return None;
     }
-    let build_id = build_id?.parse().ok()?;
+    let build_id = number::digits(build_id?.as_bytes())?;
     // Absent or unreadable is the epoch rather than a refusal: the value is the
     // last of three ranking keys, so a record without one ranks last among
     // equals instead of not being a candidate.
-    let build_time = build_time.and_then(|text| text.parse().ok()).unwrap_or(0);
+    let build_time = build_time
+        .and_then(|value| number::digits(value.as_bytes()))
+        .unwrap_or(0);
     let rdepend = rdepend.unwrap_or_default();
     let pdepend = pdepend.unwrap_or_default();
     // A plan states each of these on one line, and the slot as a value of its
@@ -578,7 +587,7 @@ fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
     // classes of the builds it chooses, and those alone.
     read_class(&rdepend).ok()?;
     read_class(&pdepend).ok()?;
-    let size = size?.parse().ok()?;
+    let size = number::digits(size?.as_bytes())?;
     Record::compose(
         [
             &name, version, &slot, &use_flags, &iuse, &rdepend, &pdepend, &path, &md5,

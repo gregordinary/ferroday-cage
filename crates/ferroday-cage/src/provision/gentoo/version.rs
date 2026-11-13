@@ -51,6 +51,7 @@
 //! is defined by that archive, so each gets the comparator its own
 //! specification describes.
 
+use crate::provision::number;
 use std::cmp::Ordering;
 
 /// The suffixes the format defines, in ascending order.
@@ -97,7 +98,10 @@ impl Ord for Version<'_> {
             .then_with(|| self.letter.cmp(&other.letter))
             .then_with(|| compare_suffixes(&self.suffixes, &other.suffixes))
             .then_with(|| {
-                compare_numeric(self.revision.unwrap_or("0"), other.revision.unwrap_or("0"))
+                number::compare_digit_runs(
+                    self.revision.unwrap_or("0"),
+                    other.revision.unwrap_or("0"),
+                )
             })
     }
 }
@@ -163,7 +167,7 @@ impl<'a> Version<'a> {
 /// components being equal.
 fn compare_numbers(a: &[&str], b: &[&str]) -> Ordering {
     // Both runs are non-empty: the grammar requires at least one component.
-    let first = compare_numeric(a[0], b[0]);
+    let first = number::compare_digit_runs(a[0], b[0]);
     if first != Ordering::Equal {
         return first;
     }
@@ -175,25 +179,13 @@ fn compare_numbers(a: &[&str], b: &[&str]) -> Ordering {
             // are one version, and both sit below `1.1`.
             left.trim_end_matches('0').cmp(right.trim_end_matches('0'))
         } else {
-            compare_numeric(left, right)
+            number::compare_digit_runs(left, right)
         };
         if order != Ordering::Equal {
             return order;
         }
     }
     a.len().cmp(&b.len())
-}
-
-/// Compares two runs of decimal digits by value, without parsing either.
-///
-/// Leading zeros are insignificant, so they are dropped and the longer run
-/// wins; equal lengths compare lexically, which for digits is the same as
-/// numerically. A component of any length orders, where an integer parse would
-/// overflow.
-fn compare_numeric(a: &str, b: &str) -> Ordering {
-    let a = a.trim_start_matches('0');
-    let b = b.trim_start_matches('0');
-    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
 /// Compares two suffix runs.
@@ -211,7 +203,7 @@ fn compare_suffixes(a: &[Suffix<'_>], b: &[Suffix<'_>]) -> Ordering {
             .cmp(&right.map_or(RANK_P, |suffix| suffix.rank))
             .then_with(|| match (left, right) {
                 // Both present: an absent number is zero.
-                (Some(left), Some(right)) => compare_numeric(
+                (Some(left), Some(right)) => number::compare_digit_runs(
                     if left.number.is_empty() {
                         "0"
                     } else {
@@ -249,7 +241,7 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
     // so finding it before anything else keeps the rest of the parse free of
     // the separator.
     let (rest, revision) = match text.rsplit_once("-r") {
-        Some((rest, digits)) if is_digits(digits) => (rest, Some(digits)),
+        Some((rest, digits)) if number::is_digits(digits) => (rest, Some(digits)),
         _ => (text, None),
     };
 
@@ -264,7 +256,7 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
                 .unwrap_or(suffix.len()),
         );
         let rank = SUFFIXES.iter().position(|known| *known == name)?;
-        if !number.is_empty() && !is_digits(number) {
+        if !number.is_empty() && !number::is_digits(number) {
             return None;
         }
         suffixes.push(Suffix { rank, number });
@@ -283,7 +275,7 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
     // a single empty component and is refused by the digit check rather than by
     // a length test of its own.
     let numbers: Vec<&str> = head.split('.').collect();
-    if !numbers.iter().all(|component| is_digits(component)) {
+    if !numbers.iter().all(number::is_digits) {
         return None;
     }
     Some(Version {
@@ -292,11 +284,6 @@ pub(super) fn parse(text: &str) -> Option<Version<'_>> {
         suffixes,
         revision,
     })
-}
-
-/// Whether `text` is a non-empty run of ASCII digits.
-fn is_digits(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Orders two versions, or `None` where either is not one this format defines.

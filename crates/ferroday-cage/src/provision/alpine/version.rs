@@ -77,6 +77,7 @@
 //! comparison. So the characters may appear in any order and any combination,
 //! `<=` and `=<` are one operator, and `<>=` is the one that admits everything.
 
+use crate::provision::number;
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -210,7 +211,7 @@ impl Token<'_> {
             ) => compare_component(a, b, *dotted || *also),
             (Token::Letter(a), Token::Letter(b)) | (Token::Suffix(a), Token::Suffix(b)) => a.cmp(b),
             (Token::SuffixNumber(a), Token::SuffixNumber(b))
-            | (Token::Revision(a), Token::Revision(b)) => compare_numerically(a, b),
+            | (Token::Revision(a), Token::Revision(b)) => number::compare_digit_runs(a, b),
             (Token::Commit(a), Token::Commit(b)) => a.cmp(b),
             _ => Ordering::Equal,
         }
@@ -534,13 +535,6 @@ fn take_digits<'a>(bytes: &'a [u8], at: &mut usize) -> Option<&'a str> {
     })
 }
 
-/// Compares two digit runs as numbers of unbounded length.
-fn compare_numerically(a: &str, b: &str) -> Ordering {
-    let a = a.trim_start_matches('0');
-    let b = b.trim_start_matches('0');
-    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
-}
-
 /// Compares two dotted components, `dotted` being false only for the first.
 ///
 /// A leading zero on either side after the first component reads as a decimal
@@ -551,7 +545,7 @@ fn compare_component(a: &str, b: &str, dotted: bool) -> Ordering {
     if dotted && (a.starts_with('0') || b.starts_with('0')) {
         a.cmp(b)
     } else {
-        compare_numerically(a, b)
+        number::compare_digit_runs(a, b)
     }
 }
 

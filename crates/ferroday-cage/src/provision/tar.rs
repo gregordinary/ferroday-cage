@@ -913,19 +913,6 @@ fn base256_field(field: &[u8]) -> Result<i64, Numeric> {
     Ok(value)
 }
 
-/// A pax record's decimal number: one or more ASCII digits, and nothing else.
-///
-/// Rust's integer parsers also accept a leading `+`, which no pax writer emits.
-/// The record length is framing, deciding where the next record begins, and a
-/// reader more lenient than the format is one that reads an archive
-/// differently from the tools that wrote it.
-fn pax_decimal<T: std::str::FromStr>(text: &[u8]) -> Option<T> {
-    if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(text).ok()?.parse().ok()
-}
-
 /// Parses a pax header body: a sequence of `"%d key=value\n"` records,
 /// where the decimal length counts the whole record. Unknown keys are
 /// ignored.
@@ -938,7 +925,7 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             .position(|b| *b == b' ')
             .ok_or("a pax record has no length delimiter")?;
         let length: usize =
-            pax_decimal(&rest[..space]).ok_or("a pax record length is not decimal")?;
+            super::number::digits(&rest[..space]).ok_or("a pax record length is not decimal")?;
         if length <= space + 1 || length > rest.len() {
             return Err("a pax record length is out of bounds");
         }
@@ -956,7 +943,8 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             b"path" => records.path = Some(value.to_vec()),
             b"linkpath" => records.link_target = Some(value.to_vec()),
             b"size" => {
-                let size: u64 = pax_decimal(value).ok_or("a pax size record is not decimal")?;
+                let size: u64 =
+                    super::number::digits(value).ok_or("a pax size record is not decimal")?;
                 // A size whose block-padded length does not fit in u64
                 // cannot describe real entry data; rejecting it here keeps
                 // the reader's data and padding arithmetic overflow-free.
@@ -970,8 +958,8 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             // ownership here and nowhere else. Ignoring them while reporting
             // the header's ids as meaningful yields silently wrong ownership.
             b"uid" | b"gid" => {
-                let id: u32 =
-                    pax_decimal(value).ok_or("a pax uid or gid record is not a decimal id")?;
+                let id: u32 = super::number::digits(value)
+                    .ok_or("a pax uid or gid record is not a decimal id")?;
                 if key == b"uid" {
                     records.uid = Some(id);
                 } else {
@@ -1013,7 +1001,7 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
                     return Err("a pax mtime record is not numeric");
                 }
                 let magnitude: u64 =
-                    pax_decimal(magnitude).ok_or("a pax mtime record is not numeric")?;
+                    super::number::digits(magnitude).ok_or("a pax mtime record is not numeric")?;
                 let seconds = if negative {
                     0i64.checked_sub_unsigned(magnitude)
                 } else {

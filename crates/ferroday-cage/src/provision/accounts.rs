@@ -142,11 +142,7 @@ pub(super) fn ids(
         else {
             continue;
         };
-        let Some(id) = std::str::from_utf8(id)
-            .ok()
-            .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|id| id.parse::<u32>().ok())
-        else {
+        let Some(id) = super::number::digits::<u32>(id) else {
             continue;
         };
         ids.entry(name.to_vec()).or_insert(id);

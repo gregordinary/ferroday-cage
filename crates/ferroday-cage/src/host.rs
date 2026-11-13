@@ -497,6 +497,11 @@ impl MountEntry {
 
 /// A mount table path with its octal escapes decoded, or `None` where an
 /// escape is malformed.
+///
+/// The kernel writes an escape as a backslash and three octal digits, and a
+/// backslash in a path as such an escape itself, so the three bytes after a
+/// backslash it wrote are octal digits. The leading `+` `from_str_radix` would
+/// also take is not something the kernel writes there.
 fn unescape_mount_path(field: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 

@@ -58,6 +58,7 @@
 //! substitution off the path there.
 
 use super::{AlpineError, keyring};
+use crate::provision::number;
 
 /// The release the development branch is published as.
 const EDGE: &str = "edge";
@@ -150,7 +151,7 @@ pub(super) fn check(
 fn stable(release: &str) -> Option<&str> {
     let series = release.strip_prefix('v')?;
     let (major, minor) = series.split_once('.')?;
-    (is_number(major) && is_number(minor)).then_some(series)
+    (number::is_digits(major) && number::is_digits(minor)).then_some(series)
 }
 
 /// The `(X, Y)` a series `X.Y` names, or `None` for a number past `u32`.
@@ -158,12 +159,7 @@ fn stable(release: &str) -> Option<&str> {
 /// A [`Tag`] has already held both to digits, so this only orders them.
 fn series_of(series: &str) -> Option<(u32, u32)> {
     let (major, minor) = series.split_once('.')?;
-    Some((major.parse().ok()?, minor.parse().ok()?))
-}
-
-/// Whether `text` is a non-empty run of ASCII digits.
-fn is_number(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+    Some((number::digits(major)?, number::digits(minor)?))
 }
 
 /// The aports tag a description is a `git describe` of, by the kind of tag it
@@ -197,7 +193,7 @@ impl Tag<'_> {
         let Some(version) = tag.strip_prefix('v') else {
             return Tag::Unknown;
         };
-        if is_number(version) {
+        if number::is_digits(version) {
             return Tag::Snapshot;
         }
         let (version, pre_release) = match version.split_once('_') {
@@ -210,7 +206,7 @@ impl Tag<'_> {
         else {
             return Tag::Unknown;
         };
-        if !(is_number(major) && is_number(minor) && is_number(point)) {
+        if !(number::is_digits(major) && number::is_digits(minor) && number::is_digits(point)) {
             return Tag::Unknown;
         }
         let series = &version[..major.len() + 1 + minor.len()];
@@ -230,7 +226,9 @@ fn is_describe_suffix(rest: &str) -> bool {
     let Some(hash) = hash.strip_prefix('g') else {
         return false;
     };
-    is_number(count) && !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    number::is_digits(count)
+        && !hash.is_empty()
+        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]

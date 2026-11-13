@@ -496,6 +496,7 @@ report name a package and its version bare.
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
 | Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode` |
+| Is this text a run of digits, and what number does it spell, without the leading `+` Rust's parsers take? How do two runs of digits compare? | `provision::number::is_digits`, `number::digits`, `number::digits_in` for HTTP's hexadecimal framing, `number::compare_digit_runs` |
 | Spell bytes as lowercase hex, or read lowercase hex back | `provision::digest::hex`, `digest::unhex`; a percent escape, which either case spells, is `fetch::percent_decode`'s to read |
 | Read a field-and-stanza document one stanza at a time, in place, or carry a stanza on whole, or write a plan document and read its header, its number fields and its list fields | `provision::document::parse`, `Stanza::get`, `Stanza::get_each`, `Stanza::text`, `document::header`, `document::number`, `document::list` |
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |

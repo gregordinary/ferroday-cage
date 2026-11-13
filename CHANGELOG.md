@@ -521,6 +521,11 @@ consumer upgrading can skip it.
 - `alpine::Observed` renders its sink in its `Debug` output as
   `<dyn AlpineObserver>`, as the Debian and Gentoo layers' `Observed` render
   theirs.
+- A number an archive states, a size, a build id or a timestamp in a Debian or
+  Alpine index, a Debian release, or a Gentoo index, pointer or binary
+  package, is read only as a run of ASCII digits. One with a leading sign, which
+  read as the number it signed, now reads as malformed, as the field's own
+  rules for a malformed value say.
 
 ### Fixed
 

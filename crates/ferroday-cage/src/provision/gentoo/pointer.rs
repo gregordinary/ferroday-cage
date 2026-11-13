@@ -32,6 +32,7 @@
 
 use super::GentooError;
 use crate::provision::coordinate::{self, Nesting};
+use crate::provision::number;
 
 /// The suffix every published stage3 carries. Checked rather than assumed: the
 /// build id is read back out of the file name, and the name has to end in
@@ -87,7 +88,7 @@ impl Pointer {
         for line in body.lines() {
             let line = line.trim();
             if let Some(stamp) = line.strip_prefix("# ts=") {
-                published = stamp.trim().parse().ok();
+                published = number::digits(stamp.trim());
                 continue;
             }
             if line.is_empty() || line.starts_with('#') {
@@ -95,7 +96,7 @@ impl Pointer {
             }
             let mut fields = line.split_whitespace();
             if let (Some(path), Some(size), None) = (fields.next(), fields.next(), fields.next())
-                && let Ok(size) = size.parse()
+                && let Some(size) = number::digits(size)
                 && let Some(entry) = entry_at(path, size)
             {
                 entries.push(entry);
