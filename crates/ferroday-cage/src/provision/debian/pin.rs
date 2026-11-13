@@ -431,6 +431,7 @@ mod tests {
                 clashes: Vec::new(),
                 multi_arch_allowed: false,
                 essential: false,
+                important: false,
                 priority: None,
                 installed_size: None,
                 source: None,

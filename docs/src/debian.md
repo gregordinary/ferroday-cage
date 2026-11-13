@@ -153,6 +153,13 @@ point them all at a single cache.
 The install set is the base system, plus the packages `include` names, closed
 over their dependencies, minus the packages `exclude` removes.
 
+A dependency on a virtual name several packages provide takes the provider apt
+would. One already selected answers it. Otherwise apt's ranking decides: an
+essential provider first, then one marked `Important` or `Protected`, then the
+more essential `Priority`, then the provider whose name the indexes mention for
+the first time last. So `devscripts`'s `sopv | gpgv` takes `sopv-gpgv`, as apt
+does, since `dpkg-dev` names every other provider of `sopv` earlier.
+
 The base system is chosen by priority, not by an enumerated list.
 `base_priority` sets the least essential `Priority` band it seeds from. The base
 is then every essential package, plus every package at least as essential as the

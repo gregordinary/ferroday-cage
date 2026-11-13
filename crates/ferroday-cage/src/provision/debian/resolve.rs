@@ -3,7 +3,8 @@
 //! From a seed set the resolver closes over `Depends` and `Pre-Depends`,
 //! following `debootstrap`'s discipline: the first satisfiable alternative of
 //! an `a | b` group, virtual packages satisfied by preferring an
-//! already-selected provider. The result is the set of real packages to
+//! already-selected provider and otherwise the one apt ranks first
+//! ([`available_providers`]). The result is the set of real packages to
 //! download and install, none of which `Conflicts` with or `Breaks` another.
 //!
 //! Version constraints are **enforced**, not assumed. A full bootstrap draws
@@ -102,6 +103,7 @@
 //! A base that already holds two packages that clash is refused too, as apt
 //! refuses to act on a broken system.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
@@ -1526,8 +1528,7 @@ fn base_kept(
 
 /// The first provider of `atom`'s virtual name that is not excluded and whose
 /// version supplies it at a version the constraint accepts, or `None` when no
-/// provider qualifies. Providers are held in sorted order, so the choice is
-/// deterministic.
+/// provider qualifies: the first [`available_providers`] ranks.
 fn first_available_provider(
     candidates: &Candidates<'_>,
     atom: &DepAtom,
@@ -1539,22 +1540,40 @@ fn first_available_provider(
 }
 
 /// Every provider of `atom`'s virtual name that is not excluded and whose
-/// version supplies it at a version the constraint accepts, in name order.
+/// version supplies it at a version the constraint accepts, in the order apt
+/// 2.8.4 tries them.
+///
+/// That order, measured with `apt-get --simulate install` against crafted
+/// indexes, is an `Essential` provider first, then one `Important` or
+/// `Protected`, then the more essential `Priority`
+/// ([`Package::priority_rank`]), then the provider whose name the indexes
+/// mention for the first time last ([`Index::mentioned`]). A provider's
+/// `Section`, its architecture, and the version it provides the name at decide
+/// nothing. The last rule is what takes `sopv-gpgv` for `devscripts`'s
+/// `sopv | gpgv` in trixie: every other provider of `sopv` is first mentioned
+/// by `dpkg-dev`'s `Recommends`, long before `sopv-gpgv`'s own stanza.
 fn available_providers<'c>(
     candidates: &'c Candidates<'_>,
     atom: &'c DepAtom,
     excluded: &'c HashSet<&str>,
 ) -> impl Iterator<Item = &'c String> {
-    candidates
-        .index
+    let index = candidates.index;
+    let mut ranked: Vec<(&'c String, &'c Package)> = index
         .providers(&atom.name)
         .iter()
-        .filter(move |provider| {
-            !excluded.contains(provider.as_str())
-                && candidates
-                    .of(provider)
-                    .is_some_and(|package| provides_satisfies(package, atom))
-        })
+        .filter(|provider| !excluded.contains(provider.as_str()))
+        .filter_map(|provider| Some((provider, candidates.of(provider)?)))
+        .filter(|(_, package)| provides_satisfies(package, atom))
+        .collect();
+    ranked.sort_by_key(|(provider, package)| {
+        (
+            Reverse(package.essential),
+            Reverse(package.important),
+            package.priority_rank(),
+            Reverse(index.mentioned(provider)),
+        )
+    });
+    ranked.into_iter().map(|(provider, _)| provider)
 }
 
 /// One package of the root a resolution produces, as a [`Clash`] asks about
@@ -2003,14 +2022,14 @@ mod tests {
 
     #[test]
     fn a_provider_that_clashes_is_passed_over_for_the_next() {
-        // p1 is the provider the resolver takes first, and it conflicts with
-        // xx, so p2 answers. Where every provider clashes, the next
-        // alternative does.
+        // p1 is the provider the resolver takes first, the one the index
+        // mentions last, and it conflicts with xx, so p2 answers. Where every
+        // provider clashes, the next alternative does.
         let text = format!(
             "{}{}{}{}{}",
             stanza("aa", "vv", ""),
-            stanza("p1", "", "Provides: vv\nConflicts: xx"),
             stanza("p2", "", "Provides: vv"),
+            stanza("p1", "", "Provides: vv\nConflicts: xx"),
             stanza("xx", "", ""),
             stanza("dd", "ww | cc", ""),
         );
@@ -2033,6 +2052,72 @@ mod tests {
             names(&install(&index, &["xx", "dd"]).into_packages()),
             ["cc", "dd", "xx"],
         );
+    }
+
+    #[test]
+    fn providers_are_tried_in_the_order_apt_ranks_them() {
+        // Each pair as apt 2.8.4 answered `apt-get --simulate install aa`,
+        // where aa depends on vv and both packages provide it: the first
+        // stanza here is the one apt takes.
+        let provides = "Provides: vv";
+        for (taken, other) in [
+            // Essential, then Important or Protected, outrank a later name.
+            (
+                format!("{provides}\nEssential: yes\nPriority: optional"),
+                format!("{provides}\nPriority: required"),
+            ),
+            (format!("{provides}\nImportant: yes"), provides.to_string()),
+            (format!("{provides}\nProtected: yes"), provides.to_string()),
+            // The more essential priority outranks a later name; a stanza
+            // stating none outranks every one, and one apt does not know
+            // ranks with extra.
+            (
+                format!("{provides}\nPriority: important"),
+                format!("{provides}\nPriority: optional"),
+            ),
+            (
+                format!("{provides}\nPriority: standard"),
+                format!("{provides}\nPriority: extra"),
+            ),
+            (
+                provides.to_string(),
+                format!("{provides}\nPriority: required"),
+            ),
+            (
+                format!("{provides}\nPriority: optional"),
+                format!("{provides}\nPriority: weird"),
+            ),
+        ] {
+            let text = format!(
+                "{}{}{}",
+                stanza("aa", "vv", ""),
+                stanza("p1", "", &taken),
+                stanza("p2", "", &other),
+            );
+            let selected = install(&index(&text), &["aa"]).into_packages();
+            assert_eq!(names(&selected), ["aa", "p1"], "{taken:?} over {other:?}");
+        }
+        // Otherwise the provider whose name the index mentions first last.
+        // Neither the version provided nor the section decides.
+        let text = format!(
+            "{}{}{}",
+            stanza("aa", "vv", ""),
+            stanza("p2", "", "Provides: vv (= 2)\nSection: admin"),
+            stanza("p1", "", "Provides: vv (= 1)"),
+        );
+        let selected = install(&index(&text), &["aa"]).into_packages();
+        assert_eq!(names(&selected), ["aa", "p1"]);
+        // A stanza before both mentioning each moves that first mention up.
+        // It meets its Depends before its Suggests whatever order it writes
+        // them in, so p1 is mentioned first here and p2 is taken.
+        let zz = fixture::stanza(
+            "zz",
+            "1.0",
+            &fixture::digest_of("zz"),
+            "Suggests: p2\nDepends: p1",
+        );
+        let selected = install(&index(&format!("{zz}{text}")), &["aa"]).into_packages();
+        assert_eq!(names(&selected), ["aa", "p2"]);
     }
 
     #[test]
@@ -2462,14 +2547,14 @@ mod tests {
     #[test]
     fn an_exclude_defers_to_a_virtual_provider() {
         // `aa` depends on the virtual `awk`, provided by both gawk and mawk.
-        // Providers are held sorted, so gawk is the default pick; excluding it
+        // The index mentions gawk last, so it is the default pick; excluding it
         // resolves the group through mawk, proving the exclusion redirected the
         // choice rather than the default coinciding with it.
         let text = format!(
             "{}{}{}",
             stanza("aa", "awk", ""),
-            stanza("gawk", "", "Provides: awk"),
             stanza("mawk", "", "Provides: awk"),
+            stanza("gawk", "", "Provides: awk"),
         );
         let selected =
             resolve(&index(&text), &["aa".into()], &[], &["gawk".into()]).into_packages();

@@ -53,6 +53,9 @@ pub(crate) struct Package {
     /// lets a relation qualified `:any` name the package.
     pub multi_arch_allowed: bool,
     pub essential: bool,
+    /// Whether the stanza declares `Important: yes` or `Protected: yes`, which
+    /// apt ranks a provider by after `Essential`.
+    pub important: bool,
     pub priority: Option<String>,
     /// The archive's `Installed-Size:` in kibibytes, when the stanza carries
     /// one. Kept in the archive's own unit rather than normalized to bytes, so
@@ -291,6 +294,8 @@ impl Package {
             breaks,
             multi_arch,
             essential,
+            important,
+            protected,
             priority,
         ] = stanza.get_each([
             "Package",
@@ -309,6 +314,8 @@ impl Package {
             "Breaks",
             "Multi-Arch",
             "Essential",
+            "Important",
+            "Protected",
             "Priority",
         ]);
         let name = name?.into_owned();
@@ -361,6 +368,10 @@ impl Package {
             clashes: parse_clashes(conflicts.as_deref(), breaks.as_deref(), native),
             multi_arch_allowed: multi_arch.is_some_and(|value| is_multi_arch_allowed(&value)),
             essential: essential.is_some_and(|value| value.eq_ignore_ascii_case("yes")),
+            important: [important, protected]
+                .into_iter()
+                .flatten()
+                .any(|value| value.eq_ignore_ascii_case("yes")),
             priority: priority.map(Cow::into_owned),
             installed_size,
             source,
@@ -368,6 +379,24 @@ impl Package {
             // repository this stanza came from is not known here.
             origin: 0,
         })
+    }
+
+    /// How apt 2.8.4 ranks the package's `Priority` among providers of one
+    /// name, the lower first: `required` 1 through `extra` 5.
+    ///
+    /// A stanza stating no priority ranks 0, ahead of `required`, and one
+    /// stating a value apt does not know ranks with `extra`. Both were measured:
+    /// a provider with no `Priority` field is taken over a `required` one, and
+    /// one stating `Priority: weird` ties with an `extra` one.
+    pub(crate) fn priority_rank(&self) -> usize {
+        let Some(priority) = self.priority.as_deref() else {
+            return 0;
+        };
+        let known = priority
+            .parse::<Priority>()
+            .ok()
+            .and_then(|band| Priority::ALL.iter().position(|each| *each == band));
+        known.map_or(Priority::ALL.len(), |at| at + 1)
     }
 
     /// The package's priority as a [`Priority`], or `None` when it carries no
@@ -494,6 +523,9 @@ pub(crate) struct Index {
     /// The real packages one of whose versions states a [`Clash`] on each
     /// name, in name order.
     clashing: HashMap<String, Vec<String>>,
+    /// Where each name is first mentioned in the indexes, as [`mentions`]
+    /// counts it.
+    mentioned: HashMap<String, usize>,
     /// The suite and the rank of each repository, by origin.
     releases: HashMap<usize, (String, ReleasePriority)>,
     /// The pin the index was merged under.
@@ -545,9 +577,14 @@ impl Index {
         let mut by_name: HashMap<String, Vec<Package>> = HashMap::new();
         let mut releases = HashMap::new();
         let mut skipped = 0;
+        let mut mentioned: HashMap<String, usize> = HashMap::new();
         for source in sources {
             releases.insert(source.origin, (source.suite.to_string(), source.priority));
             for stanza in document::parse(source.text) {
+                for name in mentions(&stanza) {
+                    let next = mentioned.len();
+                    mentioned.entry(name).or_insert(next);
+                }
                 let Some(mut package) = Package::from_stanza(&stanza, architecture) else {
                     skipped += 1;
                     continue;
@@ -609,8 +646,9 @@ impl Index {
             }
         }
         // The lists are built by iterating a HashMap, so their order is not
-        // reproducible; resolution picks the first provider, so sort each into
-        // a stable order for a deterministic selection across runs.
+        // reproducible; sort each into a stable order, so what is built from
+        // them reads alike across runs. The resolver ranks the providers it
+        // chooses among itself.
         for names in providers.values_mut() {
             names.sort();
             names.dedup();
@@ -635,6 +673,7 @@ impl Index {
             by_name,
             providers,
             clashing,
+            mentioned,
             releases,
             pins: pins.clone(),
             skipped,
@@ -673,6 +712,15 @@ impl Index {
     /// naming `name`, in name order.
     pub(crate) fn clashing(&self, name: &str) -> &[String] {
         self.clashing.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Where `name` is first mentioned in the indexes the index was merged
+    /// from, as [`mentions`] counts it, and zero for a name none mentions.
+    ///
+    /// apt 2.8.4 numbers a package as its cache first meets the name, and among
+    /// providers it ranks no other way takes the one numbered last.
+    pub(crate) fn mentioned(&self, name: &str) -> usize {
+        self.mentioned.get(name).copied().unwrap_or(0)
     }
 
     /// The suite the repository at `origin` publishes, as configured.
@@ -844,6 +892,43 @@ impl Index {
         seed.sort();
         seed
     }
+}
+
+/// The names one stanza mentions, in the order apt 2.8.4's cache meets them:
+/// the package's own, then each relation field's in turn, `Pre-Depends`,
+/// `Depends`, `Conflicts`, `Breaks`, `Recommends`, `Suggests`, `Replaces`,
+/// `Enhances`, then `Provides`, each left to right. `Built-Using` names a
+/// source and mentions nothing.
+///
+/// The order is apt's whatever order the stanza writes its fields in, and was
+/// measured pair by pair, as the name a provider is ranked by
+/// ([`Index::mentioned`]).
+fn mentions(stanza: &Stanza<'_>) -> Vec<String> {
+    const FIELDS: [&str; 9] = [
+        "Pre-Depends",
+        "Depends",
+        "Conflicts",
+        "Breaks",
+        "Recommends",
+        "Suggests",
+        "Replaces",
+        "Enhances",
+        "Provides",
+    ];
+    let mut names: Vec<String> = stanza
+        .get("Package")
+        .map(|name| name.trim().to_string())
+        .into_iter()
+        .collect();
+    for value in stanza.get_each(FIELDS).into_iter().flatten() {
+        names.extend(
+            value
+                .split([',', '|'])
+                .filter_map(parse_atom)
+                .map(|atom| atom.name),
+        );
+    }
+    names
 }
 
 /// Whether `offered` is a higher version than `held`.

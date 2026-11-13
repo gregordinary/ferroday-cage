@@ -449,6 +449,12 @@ consumer upgrading can skip it.
 - The network stack resets a connection past a published port's budget of 128
   on the host side, as it resets one the guest refuses. It closed the
   connection, so the peer read an empty reply where it had been refused.
+- **Breaking.** A Debian dependency on a virtual name several packages provide,
+  where none is selected yet, takes the provider apt 2.8 takes: an essential
+  one, then one `Important` or `Protected`, then the more essential `Priority`,
+  then the one the indexes first mention last. It took the first in name
+  order, so a resolution can now draw in another provider: trixie's
+  `devscripts` takes `sopv-gpgv` and `gpgv` where it took `gosop`.
 - Verifying a signed document holds less memory, with irongall 0.2.0: a
   document at most 9 times its size and a keyring at most 44 times, where
   irongall 0.1.2 held them in up to 16 and 56 times.
