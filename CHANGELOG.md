@@ -846,6 +846,14 @@ consumer upgrading can skip it.
   Alpine package and its postmarketOS republish, replaced each other's entry
   in a cache two runs share. An entry under the previous name is not read, and
   the package is downloaded again.
+- An Alpine bootstrap holds no file open per package. It held every package's
+  file open from the cache pass through extraction, so a closure of about a
+  thousand packages, the scale of a postmarketOS image, exhausted the common
+  open-file limit of 1024 and failed with a misleading error about staging a
+  download. Each package is now opened again and checked again in full before
+  it is extracted. A package cache download batch whose staging file cannot be
+  created, read back, or published now reports that failure, where it left the
+  package to the per-mirror walk to fail on.
 
 ### Internal
 

@@ -252,8 +252,14 @@ an Alpine package and the postmarketOS republish of it.
 A package is never held in memory: the bytes are written to a staging file as
 they arrive. That file is read back and checked as a cache entry is. It is
 renamed into the cache only once it reads as the package the plan names. Nothing
-unverified is ever visible at a cache path, and installing reads the file
-through the descriptor the check read.
+unverified is ever visible at a cache path.
+
+Installing opens each entry again and checks it again, in full, before it
+extracts anything, and extracts through the descriptor that check read. What is
+laid down is therefore what was verified, whatever another run sharing the
+cache did in between. The files a bootstrap holds open do not grow with its
+closure, so a closure of any size fits within the open-file limit a process
+commonly starts with.
 
 ## Resolving, replaying, and pinning
 

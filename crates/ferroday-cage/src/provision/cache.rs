@@ -531,16 +531,20 @@ pub(crate) struct Job<'a> {
 /// [`Fetch::fetch_all`], publishing each body `verify` accepts.
 ///
 /// Answers, per job and in order, what `verify` made of it, or `None` where the
-/// job did not arrive, did not verify, or could not be staged or published.
-/// None of that fails the call: this is an optimization over [`download`] and
-/// nothing more, and a job it does not deliver is the walk's, which has every
-/// mirror rather than the first. What is published is exactly what the walk
-/// would have published, a body that arrived complete within its size and that
-/// `verify` accepted; `verify` is handed it rewound, with the job's index.
+/// job did not arrive or did not verify. Neither fails the call: this is an
+/// optimization over [`download`] and nothing more, and a job it does not
+/// deliver is the walk's, which has every mirror rather than the first. What is
+/// published is exactly what the walk would have published, a body that arrived
+/// complete within its size and that `verify` accepted; `verify` is handed it
+/// rewound, with the job's index.
 ///
-/// A staging file that refuses a write is the one failure that ends the call.
-/// A full disk is the same whichever mirror the walk asks, so leaving each job
-/// to the walk would download as much of every one as fits, and fail anyway.
+/// A host operation on the cache that fails ends the call instead: creating a
+/// job's staging file, writing it, reading it back, or publishing it. Each is
+/// this host's disk, the same whichever mirror the walk asks, so leaving the
+/// job to the walk would only meet the failure again there. A full disk would
+/// download as much of every job as fits and fail anyway, and a staging file
+/// the host cannot create would be reported against a package rather than as
+/// what it is.
 ///
 /// `watch` hears each URL as its job is staged, and is asked before each batch.
 /// It is not asked while a batch's bodies arrive: a transport that fetches
@@ -552,9 +556,11 @@ pub(crate) struct Job<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`Failure::Cancelled`] where the run was cancelled before a batch,
-/// and [`Failure::Io`] where a job's staging file refused a write, once the
-/// batch it was in has finished. Nothing of that batch is published.
+/// Returns [`Failure::Cancelled`] where the run was cancelled before a batch.
+/// Returns [`Failure::Io`] where a job's staging file refused a write, once the
+/// batch it was in has finished, and nothing of that batch is published; and
+/// where a job's staging file could not be created, read back, or published, as
+/// it fails.
 pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
     fetcher: &mut dyn Fetch,
     jobs: &[Job<'_>],
@@ -566,13 +572,17 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
         if watch.cancelled() {
             return Err(Failure::Cancelled);
         }
-        let mut staged: Vec<Option<(Staged, File)>> = batch
-            .iter()
-            .map(|job| {
-                watch.fetching(&job.url);
-                Staged::beside(job.entry.path).ok()
-            })
-            .collect();
+        let mut staged: Vec<(Staged, File)> = Vec::with_capacity(batch.len());
+        for job in batch {
+            watch.fetching(&job.url);
+            staged.push(Staged::beside(job.entry.path).map_err(|err| {
+                Failure::Io(ProvisionError::io(
+                    "staging a download of",
+                    job.entry.path,
+                    err,
+                ))
+            })?);
+        }
 
         // Whether each job's body arrived whole and reached the disk, and the
         // first job whose staging file refused a write.
@@ -582,10 +592,7 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
             let mut sinks: Vec<(usize, Sink<'_>)> = staged
                 .iter_mut()
                 .enumerate()
-                .filter_map(|(at, slot)| {
-                    let (_, file) = slot.as_mut()?;
-                    Some((at, sink(file, batch[at].entry.size)))
-                })
+                .map(|(at, (_, file))| (at, sink(file, batch[at].entry.size)))
                 .collect();
             let outcomes = {
                 let mut fetching: Vec<FetchJob<'_>> = sinks
@@ -612,12 +619,9 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
         // batch stops here rather than leaving each job to find that out, and
         // every staging file of the batch goes unpublished.
         if let Some((at, err)) = refused {
-            let path = staged[at]
-                .as_ref()
-                .map_or(batch[at].entry.path, |(staged, _)| staged.path());
             return Err(Failure::Io(ProvisionError::io(
                 "writing a download to",
-                path,
+                staged[at].0.path(),
                 err,
             )));
         }
@@ -625,14 +629,30 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
         // A job that did not arrive, or that its check refuses, drops its
         // staging file here, unpublished.
         let first = verified.len();
-        for ((at, slot), arrived) in staged.into_iter().enumerate().zip(arrived) {
-            let published = slot.filter(|_| arrived).and_then(|(staged, mut file)| {
-                file.rewind().ok()?;
-                let checked = verify(first + at, file).ok()?;
-                staged.publish().ok()?;
-                Some(checked)
-            });
-            verified.push(published);
+        for ((at, (staged, mut file)), arrived) in staged.into_iter().enumerate().zip(arrived) {
+            if !arrived {
+                verified.push(None);
+                continue;
+            }
+            file.rewind().map_err(|err| {
+                Failure::Io(ProvisionError::io(
+                    "reading back a download at",
+                    staged.path(),
+                    err,
+                ))
+            })?;
+            let Ok(checked) = verify(first + at, file) else {
+                verified.push(None);
+                continue;
+            };
+            staged.publish().map_err(|err| {
+                Failure::Io(ProvisionError::io(
+                    "publishing a download at",
+                    batch[at].entry.path,
+                    err,
+                ))
+            })?;
+            verified.push(Some(checked));
         }
     }
     Ok(verified)
@@ -1060,6 +1080,34 @@ mod tests {
         assert_eq!(verified, [Some((0, "a body".to_string())), None, None],);
         assert_eq!(entries_of(&dir), ["good"]);
         assert_eq!(watch.fetched.len(), 3, "every job was announced");
+    }
+
+    #[test]
+    fn a_batch_reports_a_staging_file_it_cannot_create() {
+        // The host's failure rather than the job's: the walk would meet it at
+        // its first mirror, so the batch reports it rather than leaving the job
+        // to be reported against a package.
+        let dir = Scratch::new("cache-batch-unstaged");
+        let staged = dir.join("staged");
+        let unstaged = dir.join("absent/package");
+        let jobs: Vec<Job<'_>> = [&staged, &unstaged]
+            .into_iter()
+            .map(|path| Job {
+                url: "http://mirror.example/package".to_string(),
+                entry: Entry { path, size: None },
+            })
+            .collect();
+        let mut fetcher = Canned::new(b"a body");
+        let outcome = prefetch(&mut fetcher, &jobs, &mut Watching::patient(), |_, _| {
+            Ok::<(), ()>(())
+        });
+        let Err(Failure::Io(ProvisionError::Io { path, source, .. })) = &outcome else {
+            panic!("a staging file that cannot be created ends the batch: {outcome:?}");
+        };
+        assert_eq!(path, &unstaged);
+        assert_eq!(source.kind(), io::ErrorKind::NotFound, "{source}");
+        assert!(fetcher.asked.is_empty(), "nothing of the batch was fetched");
+        assert!(entries_of(&dir).is_empty(), "left: {:?}", entries_of(&dir));
     }
 
     #[test]

@@ -1705,7 +1705,14 @@ struct Silent;
 
 impl AlpineObserver for Silent {}
 
-/// One package acquired and verified, waiting to be laid down.
+/// One package the cache holds as the plan names it, waiting to be laid down.
+///
+/// What [`read_acquired`] found, without the descriptor it read: [`lay_down`]
+/// opens the entry again and checks it again before it extracts anything from
+/// it. A descriptor held per package from the cache pass to the extraction
+/// would hold a closure's worth at once, and a closure of a thousand packages,
+/// which a postmarketOS image reaches, is past the soft limit of 1024 open files
+/// a process commonly starts with.
 #[derive(Debug)]
 struct Acquired {
     /// The plan entry it answers, which is where its name, version and
@@ -1713,18 +1720,8 @@ struct Acquired {
     planned: PlannedPackage,
     /// What the container says about itself, and where its file tree begins.
     package: apk::Package,
-    /// The verified file itself, still open, to be seeked to the file tree the
-    /// verification already digested.
-    ///
-    /// The descriptor rather than the path, and that is the whole point: a cache
-    /// directory is the caller's and its atomic publish is written for concurrent
-    /// writers, so re-opening the path would extract whatever is there by then
-    /// rather than what was verified. Nothing can be swapped underneath an open
-    /// descriptor — a replacement publishes a new inode and this one keeps
-    /// reading the old.
-    file: std::fs::File,
-    /// Where that file is, for the errors, which name a path rather than a
-    /// descriptor.
+    /// The package's entry in the cache, which the extraction opens again and
+    /// the errors name.
     path: PathBuf,
     /// The file's length, which the record states as `S:`.
     size: u64,
@@ -1879,7 +1876,7 @@ fn install(
     // The cache disposes of itself when this frame ends, on the failure paths
     // below as on the success path.
     let cache = PackageCache::beside(into, alpine.cache_dir.as_deref(), APK_CACHE);
-    let mut acquired = acquire(
+    let acquired = acquire(
         &mut *alpine.fetcher,
         &plan,
         &alpine.repositories,
@@ -1894,7 +1891,8 @@ fn install(
         into,
         base.map(|base| (base.path(), ownership.clone())),
         carried,
-        &mut acquired,
+        &acquired,
+        &alpine.architecture,
         &order,
         observer,
     )?;
@@ -2033,7 +2031,8 @@ fn acquire(
         // error; it is a download waiting to happen.
         let held = cache::open_entry(&path)
             .map_err(AlpineError::at("reading a package", &path))
-            .and_then(|file| read_acquired(file, &path, planned, architecture));
+            .and_then(|file| read_acquired(file, &path, planned, architecture))
+            .map(|(held, _)| held);
         if held.is_err() {
             missing.push(Missing {
                 at,
@@ -2075,7 +2074,7 @@ fn acquire(
         .unzip();
     let delivered = cache::prefetch(fetcher, &jobs, observer, |job, file| {
         let entry = batched[job];
-        read_acquired(file, &entry.path, entry.planned, architecture)
+        read_acquired(file, &entry.path, entry.planned, architecture).map(|(held, _)| held)
     })
     .map_err(|failure| failure.into_provision(wrap))?;
     for (entry, held) in batched.iter().zip(delivered) {
@@ -2097,7 +2096,9 @@ fn acquire(
             |mirror| entry.url(mirror, architecture),
             entry.cache_entry(),
             observer,
-            |file, _, _| read_acquired(file, &entry.path, entry.planned, architecture),
+            |file, _, _| {
+                read_acquired(file, &entry.path, entry.planned, architecture).map(|(held, _)| held)
+            },
             || FetchError::not_found(entry.planned.file_name()),
         )
         .map_err(|failure| failure.into_provision(wrap))?;
@@ -2152,10 +2153,11 @@ impl Missing<'_> {
 /// version and architecture are compared to the plan's.
 ///
 /// `file` is the package, read from its start, and `path` its entry in the
-/// cache, for the errors. The file the checks were made against is carried out
-/// in the [`Acquired`], rather than the path being opened again where the tree
-/// is laid down: the two opens would be two files, and only the first of them
-/// was verified.
+/// cache, for the errors. The descriptor is handed back beside what it read, at
+/// the end of the file, for a caller that goes on to extract the file tree:
+/// [`lay_down`] extracts through the descriptor this checked, because a cache
+/// directory is the caller's and written for concurrent writers, so another
+/// open of the name is another file, which this check says nothing about.
 ///
 /// The binding is what a signature alone cannot do. A signature says that *some*
 /// package was signed; without the binding a mirror answers a request for
@@ -2168,7 +2170,7 @@ fn read_acquired(
     path: &Path,
     planned: &PlannedPackage,
     architecture: &str,
-) -> Result<Acquired, AlpineError> {
+) -> Result<(Acquired, File), AlpineError> {
     let subject = planned.file_name();
     let size = file
         .metadata()
@@ -2213,13 +2215,13 @@ fn read_acquired(
         ));
     }
 
-    Ok(Acquired {
+    let acquired = Acquired {
         planned: planned.clone(),
         package,
-        file,
         path: path.to_path_buf(),
         size,
-    })
+    };
+    Ok((acquired, file))
 }
 
 /// The order the closure is laid down and configured in: a package after
@@ -2268,10 +2270,19 @@ fn install_order(acquired: &[Acquired]) -> Vec<usize> {
 /// Lays every package's file tree into the staging tree, building the installed
 /// database as it goes.
 ///
-/// One pass per package, in `order`, and the second read of each acquired file:
-/// the first established that the bytes are the package, and this one decodes
-/// the file tree it already digested. It is the same open file both times, which
-/// is what makes "already digested" true of the bytes this reads.
+/// One pass per package, in `order`. Each package's cache entry is opened again
+/// here and read through [`read_acquired`] again, as the cache pass read it: its
+/// control identity against the plan's, its name, version and architecture, and
+/// `datahash` over its file tree. The file tree is then decoded from that same
+/// descriptor, so what is laid down is what that check read, whatever the
+/// cache's name held in between, and the record, the scripts and the triggers
+/// are that read's too. One package's descriptor is open at a time; `acquired`
+/// is what the cache pass found, which says which entry to open and what it
+/// must be. The check costs a second digest of each file before it is
+/// decoded, which a file the cache pass has just read serves from memory.
+///
+/// `architecture` is the one the bootstrap targets, which a package is held to
+/// as it was in the cache.
 ///
 /// `over` is the base a layered build's staging tree is an overlay upper over,
 /// which the extraction places every entry through ([`Extraction::over`]), so a
@@ -2290,7 +2301,8 @@ fn lay_down(
     staging: &Path,
     over: Option<(&Path, Ownership)>,
     carried: Carried,
-    acquired: &mut [Acquired],
+    acquired: &[Acquired],
+    architecture: &str,
     order: &[usize],
     observer: &mut dyn AlpineObserver,
 ) -> Result<(Database, Vec<ScriptSubject<'static>>), ProvisionError> {
@@ -2308,12 +2320,16 @@ fn lay_down(
     let tree = Rooted::open(staging).map_err(|err| ProvisionError::io("opening", staging, err))?;
 
     for at in order {
-        let held = &mut acquired[*at];
         // A package boundary again: the staging tree is discarded wholesale by
         // `ensure` when this returns an error, so a partial layout is no hazard.
         if observer.cancelled() {
             return Err(ProvisionError::Cancelled);
         }
+        let found = &acquired[*at];
+        let (held, mut file) = cache::open_entry(&found.path)
+            .map_err(AlpineError::at("reading a package", &found.path))
+            .and_then(|file| read_acquired(file, &found.path, &found.planned, architecture))
+            .map_err(wrap)?;
         observer.progress(AlpineEvent::Extracting {
             package: &held.package.info.name,
         });
@@ -2331,12 +2347,11 @@ fn lay_down(
         .with_scripts(held.package.scripts.clone());
         let at = database.add(record);
 
-        // Rewound rather than reopened: the verification left this descriptor at
-        // the end of the file it authenticated.
-        held.file
-            .seek(std::io::SeekFrom::Start(held.package.data_at))
+        // Rewound rather than reopened: the check left this descriptor at the
+        // end of the file it authenticated.
+        file.seek(std::io::SeekFrom::Start(held.package.data_at))
             .map_err(|err| ProvisionError::io("reading the package", &held.path, err))?;
-        let mut archive = TarReader::new(apk::data_reader(&mut held.file), &held.path);
+        let mut archive = TarReader::new(apk::data_reader(&mut file), &held.path);
         lay_package(
             &mut extraction,
             &tree,
@@ -3629,7 +3644,7 @@ mod tests {
             .expect("it was asked for");
         let path = scratch.join(planned.file_name());
         std::fs::write(&path, fixtures::POSTMARKETOS_BASELAYOUT).expect("the package is writable");
-        let held = read_acquired(
+        let (held, _) = read_acquired(
             File::open(&path).expect("the package opens"),
             &path,
             planned,
@@ -3949,15 +3964,7 @@ mod tests {
             let planned = planned_from(container, "x86_64");
             let path = cache.join(planned.file_name());
             std::fs::write(&path, container).expect("the package is writable");
-            acquired.push(
-                read_acquired(
-                    File::open(&path).expect("the package opens"),
-                    &path,
-                    &planned,
-                    "x86_64",
-                )
-                .expect("the package answers the plan entry"),
-            );
+            acquired.push(acquired_at(&path, &planned));
         }
 
         let order: Vec<usize> = (0..acquired.len()).collect();
@@ -3965,7 +3972,8 @@ mod tests {
             &staging,
             None,
             Carried::default(),
-            &mut acquired,
+            &acquired,
+            "x86_64",
             &order,
             &mut Silent,
         )
@@ -4036,13 +4044,20 @@ mod tests {
         let planned = planned_from(container, "x86_64");
         let path = cache.join(planned.file_name());
         std::fs::write(&path, container).expect("the package is writable");
-        read_acquired(
-            File::open(&path).expect("the package opens"),
-            &path,
-            &planned,
+        acquired_at(&path, &planned)
+    }
+
+    /// The x86_64 package at `path`, read as the cache pass reads it, without
+    /// the descriptor it was read through.
+    fn acquired_at(path: &Path, planned: &PlannedPackage) -> Acquired {
+        let (acquired, _) = read_acquired(
+            File::open(path).expect("the package opens"),
+            path,
+            planned,
             "x86_64",
         )
-        .expect("the package answers the plan entry")
+        .expect("the package answers the plan entry");
+        acquired
     }
 
     #[test]
@@ -4108,20 +4123,13 @@ mod tests {
         let planned = planned_from(&container, "x86_64");
         let path = cache.join(planned.file_name());
         std::fs::write(&path, &container).expect("the package is writable");
-        let mut acquired = vec![
-            read_acquired(
-                File::open(&path).expect("the package opens"),
-                &path,
-                &planned,
-                "x86_64",
-            )
-            .expect("the package answers the plan entry"),
-        ];
+        let acquired = [acquired_at(&path, &planned)];
         let (database, subjects) = lay_down(
             &staging,
             None,
             Carried::default(),
-            &mut acquired,
+            &acquired,
+            "x86_64",
             &[0],
             &mut Silent,
         )
@@ -4170,6 +4178,171 @@ mod tests {
             std::os::unix::fs::MetadataExt::ino(&on_disk) == helper.ino
                 && std::os::unix::fs::MetadataExt::dev(&on_disk) == helper.dev,
             "the entry is named as it lies on disk",
+        );
+    }
+
+    #[test]
+    fn a_cache_entry_replaced_after_the_cache_pass_is_not_laid_down() {
+        // The cache pass closes each package's file once it is checked, and the
+        // lay-down opens the entry again. What it extracts has to be what it
+        // checks then, not what the cache pass checked: here the entry is
+        // replaced in between by another validly signed package.
+        let scratch = Scratch::new("alpine-replaced-entry");
+        let staging = scratch.join("root");
+        std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
+        let planned = planned_from(fixtures::MUSL, "x86_64");
+        let path = scratch.join(planned.file_name());
+        std::fs::write(&path, fixtures::MUSL).expect("the package is writable");
+        let acquired = [acquired_at(&path, &planned)];
+
+        std::fs::write(&path, fixtures::ALPINE_BASELAYOUT).expect("the entry is replaceable");
+        let err = lay_down(
+            &staging,
+            None,
+            Carried::default(),
+            &acquired,
+            "x86_64",
+            &[0],
+            &mut Silent,
+        )
+        .err()
+        .expect("the entry is no longer the package the plan names");
+        assert!(
+            matches!(
+                std::error::Error::source(&err).and_then(|source| source.downcast_ref()),
+                Some(AlpineError::Digest { .. }),
+            ),
+            "{err:?}",
+        );
+        assert!(
+            std::fs::read_dir(&staging)
+                .expect("the staging tree is readable")
+                .next()
+                .is_none(),
+            "nothing of either package was laid down",
+        );
+    }
+
+    /// Names the role this test binary plays when it runs itself as the child
+    /// process of [`a_closure_larger_than_the_open_file_limit_installs`], and
+    /// the directory the child works in.
+    const NOFILE_LIMITED: &str = "FERRODAY_CAGE_TEST_ALPINE_NOFILE";
+
+    /// The soft open-file limit the child process runs under.
+    const NOFILE_LIMIT: u64 = 64;
+
+    /// How many packages the child's closure holds: well past
+    /// [`NOFILE_LIMIT`], so a descriptor held per package fails it.
+    const NOFILE_CLOSURE: usize = 160;
+
+    /// A closure of more packages than the process may hold files open installs,
+    /// from a cold cache and from a warm one.
+    ///
+    /// The limit is process-wide, so the test runs this test binary as a child
+    /// process under it, which plays [`closure_past_the_limit_installs`].
+    #[test]
+    fn a_closure_larger_than_the_open_file_limit_installs() {
+        if let Some(dir) = std::env::var_os(NOFILE_LIMITED) {
+            let limit = rustix::process::Rlimit {
+                current: Some(NOFILE_LIMIT),
+                maximum: rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum,
+            };
+            rustix::process::setrlimit(rustix::process::Resource::Nofile, limit)
+                .expect("the open-file limit lowers");
+            closure_past_the_limit_installs(Path::new(&dir));
+            std::fs::write(Path::new(&dir).join("done"), b"").expect("the marker is written");
+            return;
+        }
+
+        let dir = Scratch::new("alpine-nofile");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "provision::alpine::tests::a_closure_larger_than_the_open_file_limit_installs",
+            "--test-threads=1",
+        ])
+        .env(NOFILE_LIMITED, dir.path())
+        .output()
+        .expect("the child test process runs");
+        assert!(
+            child.status.success(),
+            "the child process failed: {}\n{}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        // A child that matched no test would succeed having asserted nothing.
+        assert!(dir.join("done").is_file(), "the child ran the test");
+    }
+
+    /// The child's half of the open-file test, in a repository, a cache and two
+    /// roots under `dir`.
+    fn closure_past_the_limit_installs(dir: &Path) {
+        // The fixture index resolves a plan, whose packages are then replaced by
+        // a closure of synthetic ones the repository serves beside it. A plan
+        // names each package's control identity, which is all that
+        // authenticates a package, so none needs an index record.
+        let component = dir.join("mirror/v3.23/main/x86_64");
+        std::fs::create_dir_all(&component).expect("the repository tree is creatable");
+        std::fs::write(component.join("APKINDEX.tar.gz"), fixtures::INDEX)
+            .expect("the index is writable");
+        std::fs::write(component.join("musl-1.2.5-r23.apk"), fixtures::MUSL)
+            .expect("the package is writable");
+        let mirror = crate::provision::file_url(&dir.join("mirror")).expect("the path is nameable");
+        let mut plan = Alpine::builder("v3.23")
+            .architecture("x86_64")
+            .mirror(&mirror)
+            .include(["musl"])
+            .build()
+            .expect("the bootstrap configures")
+            .resolve()
+            .expect("musl resolves");
+        plan.packages = (0..NOFILE_CLOSURE)
+            .map(|at| {
+                let name = format!("closure-{at:04}");
+                let mut tree = ferroday_cage_testkit::tar::Tar::new();
+                tree.dir("usr", 0o755).dir("usr/share", 0o755).file(
+                    &format!("usr/share/{name}"),
+                    0o644,
+                    name.as_bytes(),
+                );
+                let container = container_of(
+                    &format!("pkgname = {name}\npkgver = 1.0-r0\narch = x86_64\nsize = 1\n"),
+                    &tree.finish(),
+                );
+                let planned = planned_from(&container, "x86_64");
+                std::fs::write(component.join(planned.file_name()), &container)
+                    .expect("the package is writable");
+                planned
+            })
+            .collect();
+
+        let cache = dir.join("cache");
+        for root in ["cold", "warm"] {
+            let mut alpine = Alpine::builder("v3.23")
+                .architecture("x86_64")
+                .mirror(&mirror)
+                .plan(plan.clone())
+                .extract_only(true)
+                .cache_dir(&cache)
+                .build()
+                .expect("the bootstrap configures");
+            let root = dir.join(root);
+            crate::provision::ensure(&root, &mut alpine).unwrap_or_else(|err| {
+                panic!("the closure installs: {}", ErrorChain::new(&err));
+            });
+            for at in [0, NOFILE_CLOSURE - 1] {
+                assert!(root.join(format!("usr/share/closure-{at:04}")).is_file());
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(&cache)
+                .expect("the cache is readable")
+                .count(),
+            NOFILE_CLOSURE,
+            "every package is cached once, and the warm run downloaded nothing",
         );
     }
 
