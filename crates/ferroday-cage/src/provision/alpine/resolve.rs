@@ -71,8 +71,32 @@
 //! when apk lets it answer one. Where no closure holds, the resolution is
 //! refused, naming the packages, rather than installing two packages apk would
 //! never install together. This is a search over the packages that contend
-//! rather than apk's solver; for every package of Alpine's own `main` and
-//! `community`, resolved alone, it keeps the packages apk keeps.
+//! rather than apk's solver. For every package of Alpine's own `main` and
+//! `community`, resolved alone, it settles each contended name as apk does.
+//!
+//! # What an `i:` condition brings in
+//!
+//! The closure's last pass adds every package whose `i:` condition it meets,
+//! unless taking one with what it requires breaks a `!` entry in either
+//! direction. apk leaves such a package out, and so does this. A provider its
+//! own condition brings in is also taken ahead of every other answer to a name,
+//! whatever version it offers: apk requires what every option for a name shares
+//! before it chooses among them, and a package whose condition that completes is
+//! selected by its own name first. Both providers of `cmd:rofi` require `rofi`,
+//! which brings in `rofi-x11-wayland`.
+//!
+//! # Where the closure differs from apk's
+//!
+//! A provider already in the closure answers a later dependency on the name, as
+//! it does in apk. The order the dependencies are reached in is not apk's,
+//! which settles names by propagating what their options share rather than one
+//! dependency at a time. Where a name provided at no version is reached after
+//! one of its providers was taken for another reason, the closure keeps that
+//! provider alone, and apk, having reached the name first, can hold its
+//! highest-priority provider as well. A few KDE applications' closures hold
+//! `kwallet`, and apk installs `gnome-keyring` beside it for
+//! `dbus:org.freedesktop.Secrets`. Naming the provider with `include` makes
+//! the two agree.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -496,7 +520,7 @@ fn close(
         }
     }
 
-    install_if(index, barred, &mut selection, &mut queue)?;
+    install_if(index, barred, &mut selection)?;
     conflicts(&selection)?;
     Ok(selection)
 }
@@ -664,7 +688,19 @@ fn select(
                 .is_none()
         })
         .collect();
-    let Some(best) = best(&installable) else {
+    // A provider its own `i:` condition brings in is taken ahead of the rest,
+    // as apk takes it; see `brought_in`.
+    let brought: Vec<&Candidate<'_>> = installable
+        .iter()
+        .copied()
+        .filter(|candidate| brought_in(index, candidate, &accepted, selection))
+        .collect();
+    let choosing = if brought.is_empty() {
+        &installable
+    } else {
+        &brought
+    };
+    let Some(best) = best(choosing) else {
         let carried = selection
             .carried_in_the_way(&dependency.name, highest)
             .expect("no candidate is installable, so the base carries one in the highest's way");
@@ -685,8 +721,9 @@ fn select(
     // that is what keeps a closure from silently taking whichever shell or
     // whichever `awk` the archive happens to list. The choice is among what can
     // be installed, so a provider the base already carries is not one of the
-    // names the refusal offers.
-    if best.offers.is_none() && best.package.provider_priority.is_none() {
+    // names the refusal offers. A provider an `i:` condition brings in is no
+    // such choice, since apk takes it by its own name.
+    if best.offers.is_none() && best.package.provider_priority.is_none() && brought.is_empty() {
         return Err(ResolveError::Ambiguous {
             name: dependency.name.clone(),
             providers: installable
@@ -699,6 +736,46 @@ fn select(
 
     add(selection, queue, best.package);
     Ok(())
+}
+
+/// Whether `candidate`, one of the `options` that answer a dependency, is a
+/// package its own `i:` condition brings into the closure: one whose condition
+/// `selection` meets, or will meet once it holds what every option requires.
+///
+/// apk requires a dependency every option for a name shares before it chooses
+/// among them. A package whose `i:` condition that completes is then selected by
+/// its own name, ahead of the choice, and answers the name itself, so it is
+/// taken whatever version it offers and whatever priority it declares.
+/// `rofi-x11-wayland` provides `cmd:rofi` and asks to join any closure holding
+/// `rofi`, which both providers of `cmd:rofi` require, so apk answers
+/// `cmd:rofi` with it rather than with `rofi-wayland`. A shared requirement
+/// meets a condition with a version only where the package of that name
+/// offers one the condition accepts.
+fn brought_in(
+    index: &Index,
+    candidate: &Candidate<'_>,
+    options: &[&Candidate<'_>],
+    selection: &Selection,
+) -> bool {
+    let record = candidate.package;
+    let shared = |condition: &Dependency| {
+        !condition.conflict
+            && options.iter().all(|option| {
+                option
+                    .package
+                    .depends
+                    .iter()
+                    .any(|entry| !entry.conflict && entry.name == condition.name)
+            })
+            && index
+                .get(&condition.name)
+                .is_some_and(|package| condition.accepts(Some(&package.version)))
+    };
+    !record.install_if.is_empty()
+        && record
+            .install_if
+            .iter()
+            .all(|condition| selection.holds(condition, Some(&record.name)) || shared(condition))
 }
 
 /// Adds every package whose `i:` condition the closure satisfies, to a fixed
@@ -715,20 +792,31 @@ fn select(
 /// required to be absent. The passes only add, so such a package stays, which is
 /// the same order of evaluation apk applies and the reason the rule is stated
 /// here rather than left to be inferred.
+///
+/// A package whose condition holds is still one the closure may decline, as
+/// apk declines it: where taking it, with what it requires, would break a `!`
+/// entry in either direction, it is left out and the closure stands as it was.
+/// `rofi-x11-wayland` asks to join any closure holding `rofi`, and
+/// `rofi-wayland` refuses it. What it requires and nothing offers is still a
+/// refusal of the whole closure, as apk refuses it. The closure only grows, so
+/// a package declined once stays declined. One that would hold a second package
+/// for a name only one may answer is taken here, and set aside by the search
+/// the module documentation describes, as any such package is.
 fn install_if(
     index: &Index,
     barred: Barred<'_>,
     selection: &mut Selection,
-    queue: &mut VecDeque<String>,
 ) -> Result<(), ResolveError> {
+    let mut declined: BTreeSet<String> = BTreeSet::new();
     loop {
-        let mut added = Vec::new();
+        let mut met = Vec::new();
         for record in index.records() {
             if record.install_if.is_empty()
                 || selection.packages.contains_key(&record.name)
                 // A base layer already carrying it needs no second copy, and its
                 // own installation ran whatever condition it declared.
                 || selection.assumed.contains_key(&record.name)
+                || declined.contains(&record.name)
                 || barred.excluded.contains(&record.name.as_str())
                 || barred.sets_aside(index, record)
             {
@@ -739,24 +827,39 @@ fn install_if(
                 .iter()
                 .all(|condition| selection.holds(condition, Some(&record.name)))
             {
-                added.push(record);
+                met.push(record);
             }
         }
-        if added.is_empty() {
+        if met.is_empty() {
             return Ok(());
         }
         // Sorted so that a round adding several packages adds them in one order
         // whatever order the index yielded them in.
-        added.sort_by(|a, b| a.name.cmp(&b.name));
-        for record in added {
-            add(selection, queue, record);
-        }
-        // Whatever the new packages require is resolved before the next round,
-        // so a condition is tested against a closure that is whole again.
-        while let Some(name) = queue.pop_front() {
-            let requirements = selection.packages[&name].depends.clone();
-            for dependency in requirements.iter().filter(|entry| !entry.conflict) {
-                select(index, dependency, Some(&name), barred, selection, queue)?;
+        met.sort_by(|a, b| a.name.cmp(&b.name));
+        for record in met {
+            // Taken on a copy, with whatever it requires resolved, so a
+            // condition in the next round is tested against a closure that is
+            // whole again, and a declined package leaves no trace.
+            let mut taken = selection.clone();
+            let mut queue = VecDeque::new();
+            add(&mut taken, &mut queue, record);
+            while let Some(name) = queue.pop_front() {
+                let requirements = taken.packages[&name].depends.clone();
+                for dependency in requirements.iter().filter(|entry| !entry.conflict) {
+                    select(
+                        index,
+                        dependency,
+                        Some(&name),
+                        barred,
+                        &mut taken,
+                        &mut queue,
+                    )?;
+                }
+            }
+            if conflicts(&taken).is_err() {
+                declined.insert(record.name.clone());
+            } else {
+                *selection = taken;
             }
         }
     }
@@ -884,6 +987,7 @@ fn add(selection: &mut Selection, queue: &mut VecDeque<String>, record: &Record)
 }
 
 /// One selected package's answer to one name.
+#[derive(Clone)]
 struct Offer {
     /// The package answering.
     package: String,
@@ -935,6 +1039,7 @@ impl fmt::Display for Offer {
 /// what the selection *answers*, not about which packages are in it: a
 /// dependency on `so:libc.musl-x86_64.so.1` is satisfied by whichever selected
 /// package provides that name.
+#[derive(Clone)]
 struct Selection {
     /// The chosen packages by name, ordered so the resolution is one value.
     packages: BTreeMap<String, Record>,
@@ -1970,5 +2075,232 @@ mod tests {
             resolved_over(&index, &["newer-app"], &[], &base),
             Err(ResolveError::WouldUpgrade { name, .. }) if name == "lib"
         ));
+    }
+
+    #[test]
+    fn a_conditional_package_the_closure_refuses_is_left_out() {
+        // Each shape as apk.static 3.0.9 resolves it: a package whose `i:`
+        // condition holds joins the closure, unless taking it breaks a `!`
+        // entry either way, directly or through what it requires, or answers a
+        // name another package already holds. Then apk leaves it out, and the
+        // closure stands without it.
+        type Records = &'static [(&'static str, &'static str, &'static str)];
+        let shapes: [(&str, Records, &[&str]); 7] = [
+            (
+                "a condition that holds",
+                &[
+                    ("a", "1.0-r0", "D:base"),
+                    ("base", "1.0-r0", ""),
+                    ("x", "1.0-r0", "i:base"),
+                ],
+                &["a", "base", "x"],
+            ),
+            (
+                "refused by the closure",
+                &[
+                    ("a", "1.0-r0", "D:base !x"),
+                    ("base", "1.0-r0", ""),
+                    ("x", "1.0-r0", "i:base"),
+                ],
+                &["a", "base"],
+            ),
+            (
+                "refusing the closure",
+                &[
+                    ("a", "1.0-r0", "D:base"),
+                    ("base", "1.0-r0", ""),
+                    ("x", "1.0-r0", "D:!a\ni:base"),
+                ],
+                &["a", "base"],
+            ),
+            (
+                "requiring what the closure refuses",
+                &[
+                    ("a", "1.0-r0", "D:base !y"),
+                    ("base", "1.0-r0", ""),
+                    ("x", "1.0-r0", "D:y\ni:base"),
+                    ("y", "1.0-r0", ""),
+                ],
+                &["a", "base"],
+            ),
+            (
+                "answering a name the closure holds",
+                &[
+                    ("a", "1.0-r0", "D:base\np:cmd:t=1"),
+                    ("base", "1.0-r0", ""),
+                    ("x", "1.0-r0", "i:base\np:cmd:t=1"),
+                ],
+                &["a", "base"],
+            ),
+            (
+                "requiring a package that answers a name the closure holds",
+                &[
+                    ("a", "1.0-r0", "D:base\np:cmd:t=1"),
+                    ("base", "1.0-r0", ""),
+                    ("x", "1.0-r0", "D:z\ni:base"),
+                    ("z", "1.0-r0", "p:cmd:t=1"),
+                ],
+                &["a", "base"],
+            ),
+            (
+                "a condition on a package the closure took, which it refuses",
+                &[
+                    ("a", "1.0-r0", "D:base !w"),
+                    ("base", "1.0-r0", ""),
+                    ("x", "1.0-r0", "i:base"),
+                    ("w", "1.0-r0", "i:x"),
+                ],
+                &["a", "base", "x"],
+            ),
+        ];
+        for (shape, records, expected) in shapes {
+            assert_eq!(closure(&merged(records), &["a"]), expected, "{shape}");
+        }
+    }
+
+    #[test]
+    fn rofi_wayland_takes_no_x11_variant_and_rofi_takes_it() {
+        // Alpine's own shape: `rofi-x11-wayland` asks to join any closure
+        // holding `rofi`, and the two variants refuse each other and provide
+        // `cmd:rofi` at one version. apk installs `rofi-wayland` alone, and
+        // the X11 variant where nothing stands in its way.
+        let index = merged(&[
+            ("rofi", "2.0.0-r0", ""),
+            (
+                "rofi-wayland",
+                "2.0.0-r0",
+                "D:rofi=2.0.0-r0 !rofi-x11-wayland\np:cmd:rofi=2.0.0-r0",
+            ),
+            (
+                "rofi-x11-wayland",
+                "2.0.0-r0",
+                "D:rofi=2.0.0-r0 !rofi-wayland\np:cmd:rofi=2.0.0-r0\ni:rofi",
+            ),
+        ]);
+        assert_eq!(closure(&index, &["rofi-wayland"]), ["rofi", "rofi-wayland"]);
+        assert_eq!(closure(&index, &["rofi"]), ["rofi", "rofi-x11-wayland"]);
+    }
+
+    #[test]
+    fn a_conditional_package_requiring_what_nothing_offers_refuses_the_closure() {
+        // apk refuses these rather than leaving the package out: the condition
+        // holds, and what the package requires cannot be supplied.
+        for (shape, required) in [("nothing offers it", "D:missing"), ("too old", "D:y>=2")] {
+            let index = merged(&[
+                ("a", "1.0-r0", "D:base"),
+                ("base", "1.0-r0", ""),
+                ("x", "1.0-r0", &format!("{required}\ni:base")),
+                ("y", "1.0-r0", ""),
+            ]);
+            assert!(
+                matches!(
+                    resolved(&index, &["a"], &[]),
+                    Err(ResolveError::Unsatisfied { required_by: Some(by), .. }) if by == "x"
+                ),
+                "{shape}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_its_own_condition_brings_in_is_taken_first() {
+        // Each as apk.static 3.0.9 resolves it. `plug` requires `cmd:t`, which
+        // `v1` and `v2` provide, and `v2` asks to join a closure holding what
+        // its condition names. Where that is something every option requires,
+        // or something the closure holds already, apk takes `v2` whatever the
+        // version it offers or the priority either declares; where it is not,
+        // the providers rank as any others do.
+        type Records = &'static [(&'static str, &'static str, &'static str)];
+        let shapes: [(&str, Records, &str); 7] = [
+            (
+                "over a higher version",
+                &[
+                    ("v1", "1.0-r0", "D:base\np:cmd:t=2"),
+                    ("v2", "1.0-r0", "D:base\np:cmd:t=1\ni:base"),
+                ],
+                "v2",
+            ),
+            (
+                "over a provider priority",
+                &[
+                    ("v1", "1.0-r0", "D:base\np:cmd:t=1\nk:10"),
+                    ("v2", "1.0-r0", "D:base\np:cmd:t=1\ni:base"),
+                ],
+                "v2",
+            ),
+            (
+                "at no version, with no priority to choose by",
+                &[
+                    ("v1", "1.0-r0", "D:base\np:cmd:t"),
+                    ("v2", "1.0-r0", "D:base\np:cmd:t\ni:base"),
+                ],
+                "v2",
+            ),
+            (
+                "on the package that requires it",
+                &[
+                    ("v1", "1.0-r0", "D:base\np:cmd:t=1"),
+                    ("v2", "1.0-r0", "D:base\np:cmd:t=1\ni:plug"),
+                ],
+                "v2",
+            ),
+            (
+                "on what nothing requires",
+                &[
+                    ("v1", "1.0-r0", "D:base\np:cmd:t=1"),
+                    ("v2", "1.0-r0", "D:base\np:cmd:t=1\ni:elsewhere"),
+                    ("elsewhere", "1.0-r0", ""),
+                ],
+                "v1",
+            ),
+            (
+                "on what one option requires and not the other",
+                &[
+                    ("v1", "1.0-r0", "D:other\np:cmd:t=1"),
+                    ("v2", "1.0-r0", "D:base\np:cmd:t=1\ni:base"),
+                    ("other", "1.0-r0", ""),
+                ],
+                "v1",
+            ),
+            (
+                "on a version the shared requirement is not at",
+                &[
+                    ("v1", "1.0-r0", "D:base\np:cmd:t=1"),
+                    ("v2", "1.0-r0", "D:base\np:cmd:t=1\ni:base>=2"),
+                ],
+                "v1",
+            ),
+        ];
+        for (shape, providers, taken) in shapes {
+            let mut records = vec![("plug", "1.0-r0", "D:cmd:t"), ("base", "1.0-r0", "")];
+            records.extend_from_slice(providers);
+            let held = closure(&merged(&records), &["plug"]);
+            assert!(held.contains(&taken.to_string()), "{shape}: {held:?}");
+        }
+    }
+
+    #[test]
+    fn a_rofi_plugin_takes_the_x11_variant_as_apk_does() {
+        // Alpine's own shape: a plugin requires `cmd:rofi`, which both variants
+        // provide at one version, and both require `rofi`, which brings in
+        // `rofi-x11-wayland`.
+        let index = merged(&[
+            ("rofi", "2.0.0-r0", ""),
+            (
+                "rofi-wayland",
+                "2.0.0-r0",
+                "D:rofi=2.0.0-r0 !rofi-x11-wayland\np:cmd:rofi=2.0.0-r0",
+            ),
+            (
+                "rofi-x11-wayland",
+                "2.0.0-r0",
+                "D:rofi=2.0.0-r0 !rofi-wayland\np:cmd:rofi=2.0.0-r0\ni:rofi",
+            ),
+            ("rofi-top", "0_git20171016-r3", "D:cmd:rofi"),
+        ]);
+        assert_eq!(
+            closure(&index, &["rofi-top"]),
+            ["rofi", "rofi-top", "rofi-x11-wayland"]
+        );
     }
 }

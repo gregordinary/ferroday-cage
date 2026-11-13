@@ -108,6 +108,21 @@ dependency at a time. Where its closure holds two such packages, it resolves
 again, keeping each in turn and setting the others aside. A closure no choice
 settles fails the resolve with `AlpineError::Resolve`, naming the packages.
 
+A package whose `install_if` condition the closure meets joins it, unless it,
+or what it requires, would break a `!` entry in either direction. Then it is
+left out, as `apk` leaves it out. A provider its own condition brings in also
+answers a name ahead of the others. Both providers of `cmd:rofi` require `rofi`,
+which brings in `rofi-x11-wayland`, so a plugin that requires `cmd:rofi` takes
+it, as `apk` does.
+
+The resolver is not `apk`'s solver, and one difference remains. A provider
+already in the closure answers a later dependency on its name, in both. The two
+reach dependencies in different orders, though, so where a name is provided at
+no version they can settle it differently. A few KDE applications' closures hold
+`kwallet` and answer `dbus:org.freedesktop.Secrets` with it, where `apk`
+installs `gnome-keyring` beside it. Naming the provider with `include` makes the
+two agree.
+
 ## Repositories
 
 A bootstrap resolves against one or more repositories. The builder's `mirror`,
