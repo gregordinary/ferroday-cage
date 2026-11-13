@@ -48,6 +48,16 @@ pub(crate) enum ReleasePriority {
     Default,
 }
 
+/// Each of `values` quoted with `{:?}`, joined with `, `, for a refusal naming
+/// what a release lists.
+fn quoted(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A parsed `Release` body: the index digests and the release's own claims.
 pub(crate) struct Release {
     /// Index path (relative to `dists/<suite>/`) to `(size, sha256)`.
@@ -168,6 +178,13 @@ impl Release {
     /// neither. None of this widens what is fetched: an index is read only
     /// where the release lists its digest, and one it does not list is refused
     /// where it is asked for.
+    ///
+    /// A refusal quotes what the release lists with `{:?}`, as it quotes the
+    /// release's suite and codename: a trusted-unsigned release is a mirror's
+    /// text, and a control character in it is escaped rather than written to
+    /// the terminal the error is printed on. The architecture and the
+    /// components asked for are the caller's, held to their own alphabet, and
+    /// named bare.
     pub(crate) fn check(
         &self,
         suite: &str,
@@ -179,14 +196,14 @@ impl Release {
         if !self.offers_architecture(architecture) {
             return Err(format!(
                 "the suite does not offer architecture {architecture} (offers {})",
-                self.architectures.join(", "),
+                quoted(&self.architectures),
             ));
         }
         for component in components {
             if !self.offers_component(component) {
                 return Err(format!(
                     "the suite does not offer component {component} (offers {})",
-                    self.components.join(", "),
+                    quoted(&self.components),
                 ));
             }
         }
@@ -284,7 +301,7 @@ impl Release {
                 .to_string()
         })?;
         if now > deadline {
-            return Err(format!("the release expired at {valid_until}"));
+            return Err(format!("the release expired at {valid_until:?}"));
         }
         Ok(())
     }
@@ -622,7 +639,7 @@ Components: updates/main updates/contrib updates/non-free-firmware updates/non-f
             )
             .unwrap_err();
         assert!(
-            err.contains("offers updates/main, updates/contrib"),
+            err.contains(r#"offers "updates/main", "updates/contrib""#),
             "the refusal quotes the release's own spelling: {err}"
         );
     }
@@ -640,13 +657,13 @@ Components: updates/main updates/contrib updates/non-free-firmware updates/non-f
         let release = Release::parse("Codename: local\nArchitectures: amd64\n").unwrap();
         let err = release.check("local", "arm64", &wanted, false).unwrap_err();
         assert!(
-            err.contains("does not offer architecture arm64 (offers amd64)"),
+            err.contains(r#"does not offer architecture arm64 (offers "amd64")"#),
             "{err}"
         );
         let release = Release::parse("Codename: local\nComponents: main\n").unwrap();
         let err = release.check("local", "arm64", &wanted, false).unwrap_err();
         assert!(
-            err.contains("does not offer component contrib (offers main)"),
+            err.contains(r#"does not offer component contrib (offers "main")"#),
             "{err}"
         );
     }
@@ -805,6 +822,36 @@ Components: main
         // loudly rather than silently reading the time as UTC.
         assert_eq!(parse_rfc5322("11 Jul 2026 09:02:23"), None);
         assert_eq!(parse_rfc5322("11 Jul 2026 09:02:23 EST"), None);
+    }
+
+    #[test]
+    fn what_a_release_lists_reaches_a_refusal_with_its_control_characters_escaped() {
+        // A trusted-unsigned release is the mirror's text, and the date parser
+        // reads a weekday by its comma and ignores what follows the zone, so a
+        // deadline it accepts can still carry a control character.
+        let hostile = crate::failure::hostile::TEXT;
+        let release = Release::parse(&format!(
+            "Suite: trixie\nArchitectures: {hostile}\nComponents: {hostile}\n\
+             Valid-Until: {hostile}, 01 Jan 1990 00:00:00 UTC {hostile}\n"
+        ))
+        .unwrap();
+        // Refused for the architecture it lists, then for the components: the
+        // second asks for the one architecture the release does list.
+        for architecture in ["amd64", hostile] {
+            let err = release
+                .check("trixie", architecture, &["main".to_string()], false)
+                .unwrap_err();
+            crate::failure::hostile::assert_escaped(&err);
+        }
+        let release = Release::parse(&format!(
+            "Suite: trixie\nValid-Until: {hostile}, 01 Jan 1990 00:00:00 UTC {hostile}\n"
+        ))
+        .unwrap();
+        let err = release
+            .check("trixie", "amd64", &["main".to_string()], true)
+            .unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        crate::failure::hostile::assert_escaped(&err);
     }
 
     #[test]

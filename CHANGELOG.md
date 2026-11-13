@@ -131,6 +131,11 @@ consumer upgrading can skip it.
   terminal through it. dpkg also installs a name in upper case, one holding
   `_`, and one of a single character, none of which a Debian or Ubuntu archive
   publishes; a resolution no longer selects such a package.
+- A Debian release's refusals quote the architectures and the components it
+  lists, and its `Valid-Until`, with their control characters escaped, as they
+  already quoted its suite and codename. A trusted-unsigned release is a
+  mirror's text, and a deadline the release parser accepts may carry any text
+  before its weekday's comma and after its zone.
 
 ### Added
 
