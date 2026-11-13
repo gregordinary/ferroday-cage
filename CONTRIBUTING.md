@@ -449,7 +449,7 @@ report name a package and its version bare.
 | Open a named pipe just created, to set its metadata through a descriptor | `provision::containment::open_created_fifo` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
 | What occupies a name in such a tree, without following it? | `Rooted::stat` |
-| Read a file in such a tree, bounded, with absence as an answer | `Rooted::read`, `Rooted::read_if_present` |
+| Read a file in such a tree, bounded, with absence as an answer | `Rooted::read`, `Rooted::read_if_present`, and `Rooted::read_text`, `Rooted::read_text_if_present` for a file read as text |
 | Remove or empty a file in such a tree only where what holds the name is approved | `Rooted::remove_if`, `Rooted::truncate_if`, judged by `Rooted::is_file_with_content` or `Rooted::is_whiteout` |
 | Rewrite a file in place, keeping the owner and mode a script gave it | `Rooted::overwrite` |
 | Lay a host tree into a root | `provision::CopyIn`, or `extract::overlay_tree` between configure waves |

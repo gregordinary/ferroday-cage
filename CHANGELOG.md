@@ -514,6 +514,10 @@ consumer upgrading can skip it.
   module, fails with the layer's `Io` error naming the registration file, the
   read's own failure its cause. It failed with the layer's `Config` error,
   saying only that the registration could not be read.
+- An Alpine base layer whose `etc/apk/arch`, `world`, or `repositories` file is
+  not UTF-8 is refused with `AlpineError::Io` naming the file, an
+  `InvalidData` failure beneath it, as a file the layer cannot read is. It was
+  refused with `AlpineError::Config`.
 
 ### Fixed
 

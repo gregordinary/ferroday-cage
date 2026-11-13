@@ -663,7 +663,7 @@ fn write_delta_statoverride(
     // an arbitrary host-file read whose contents are written into the tree the
     // caller goes on to export.
     let base_tree = open_tree(lower)?;
-    let base = match read_text_if_present(&base_tree, STATOVERRIDE, MAX_STATOVERRIDE) {
+    let base = match base_tree.read_text_if_present(STATOVERRIDE, MAX_STATOVERRIDE) {
         Ok(text) => text.unwrap_or_default(),
         Err(source) => {
             return Err(DebianError::io(
@@ -878,7 +878,7 @@ fn run_dpkg(
 /// The packages the tree's dpkg status database records as present and
 /// configured, as [`is_configured`] reads a `Status` field.
 fn installed_packages(tree: &Rooted) -> Result<HashSet<String>, DebianError> {
-    let text = read_text(tree, STATUS, MAX_STATUS).map_err(at(
+    let text = tree.read_text(STATUS, MAX_STATUS).map_err(at(
         "reading the dpkg status database",
         tree,
         STATUS,
@@ -1211,7 +1211,7 @@ fn ships_archive_keyring(tree: &Rooted) -> Result<bool, DebianError> {
         return Ok(false);
     }
     let list = format!("var/lib/dpkg/info/{ARCHIVE_KEYRING_PACKAGE}.list");
-    let files = match read_text_if_present(tree, &list, MAX_FILE_LIST) {
+    let files = match tree.read_text_if_present(&list, MAX_FILE_LIST) {
         Ok(Some(files)) => files,
         Ok(None) => return Ok(false),
         Err(source) => return Err(at("reading the package's file list", tree, &list)(source)),
@@ -1267,42 +1267,12 @@ fn remove_if_present(tree: &Rooted, rootfs_path: &str) -> Result<(), DebianError
 /// The failure is the raw one, so the layered build can tell an absent database
 /// — which it reports as a misconfigured base — from a read that failed.
 pub(super) fn read_base_status(base: &Path) -> io::Result<String> {
-    read_text(&Rooted::open(base)?, STATUS, MAX_STATUS)
+    Rooted::open(base)?.read_text(STATUS, MAX_STATUS)
 }
 
 /// Opens a tree for the host-side steps that read and write inside it.
 fn open_tree(root: &Path) -> Result<Rooted, DebianError> {
     Rooted::open(root).map_err(DebianError::at("opening the tree", root))
-}
-
-/// Reads a file of the tree as text, as [`std::fs::read_to_string`] would:
-/// invalid UTF-8 is an `InvalidData` failure rather than lossily decoded. A
-/// file past `limit` bytes is refused, as [`Rooted::read`] refuses it.
-fn read_text(tree: &Rooted, rootfs_path: &str, limit: u64) -> io::Result<String> {
-    text(tree.read(rootfs_path, limit)?)
-}
-
-/// [`read_text`], with `None` where the tree holds no file at the path, as
-/// [`Rooted::read_if_present`] answers it.
-fn read_text_if_present(
-    tree: &Rooted,
-    rootfs_path: &str,
-    limit: u64,
-) -> io::Result<Option<String>> {
-    tree.read_if_present(rootfs_path, limit)?
-        .map(text)
-        .transpose()
-}
-
-/// `bytes` as text, refusing invalid UTF-8 as [`std::fs::read_to_string`]
-/// does.
-fn text(bytes: Vec<u8>) -> io::Result<String> {
-    String::from_utf8(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stream did not contain valid UTF-8",
-        )
-    })
 }
 
 /// Builds an I/O error closure for a host-side step, naming the host path the

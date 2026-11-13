@@ -272,6 +272,41 @@ impl Rooted {
         }
     }
 
+    /// Reads the file at `relative` as [`read`](Self::read) does, as text.
+    ///
+    /// Bytes that are not UTF-8 are refused, an `InvalidData` failure naming
+    /// the path, rather than decoded lossily: a file read as text is one whose
+    /// contents a step goes on to parse, and a replacement character in place
+    /// of what the tree holds would parse as something it does not hold.
+    pub(crate) fn read_text(&self, relative: impl AsRef<Path>, limit: u64) -> io::Result<String> {
+        let relative = relative.as_ref();
+        self.text(relative, self.read(relative, limit)?)
+    }
+
+    /// Reads the file at `relative` as [`read_text`](Self::read_text) does,
+    /// answering `None` where [`read_if_present`](Self::read_if_present) does.
+    pub(crate) fn read_text_if_present(
+        &self,
+        relative: impl AsRef<Path>,
+        limit: u64,
+    ) -> io::Result<Option<String>> {
+        let relative = relative.as_ref();
+        self.read_if_present(relative, limit)?
+            .map(|bytes| self.text(relative, bytes))
+            .transpose()
+    }
+
+    /// `bytes`, read from `relative`, as text, refusing them where they are not
+    /// UTF-8.
+    fn text(&self, relative: &Path, bytes: Vec<u8>) -> io::Result<String> {
+        String::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not UTF-8 text", self.path(relative).display()),
+            )
+        })
+    }
+
     /// Opens the file at `relative` for reading, contained as every path here
     /// is.
     ///

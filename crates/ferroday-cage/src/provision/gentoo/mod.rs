@@ -1344,12 +1344,24 @@ impl Gentoo {
     fn read_digests(&mut self, path: &str, to: Reporting<'_>) -> Result<Digested, GentooError> {
         let file = file_name_of(path);
         let mut passed_over = None;
-        if let Some(entry) = self.cache_dir.as_deref().map(|dir| kept_digests(dir, file))
-            && let Ok(held) = cache::open_entry(&entry)
-        {
-            match self.read_kept_digests(held, &entry, file) {
-                Ok(digested) => return Ok(digested),
-                Err(err) => passed_over = Some(err),
+        if let Some(dir) = self.cache_dir.as_deref() {
+            let entry = kept_digests(dir, file);
+            // A cache not made yet keeps no document, as one without it does.
+            let kept = Rooted::open(dir).map_or(Ok(None), |cache| {
+                cache.read_if_present(entry.strip_prefix(dir).unwrap_or(&entry), MAX_DIGESTS_BYTES)
+            });
+            match kept {
+                Ok(Some(bytes)) => match self.read_kept_digests(&bytes, &entry, file) {
+                    Ok(digested) => return Ok(digested),
+                    Err(err) => passed_over = Some(err),
+                },
+                Ok(None) => {}
+                Err(err) => {
+                    passed_over = Some(GentooError::at(
+                        "reading the digest document kept at",
+                        &entry,
+                    )(err));
+                }
             }
         }
         let suffix = self.url(&format!("{path}.DIGESTS"));
@@ -1373,23 +1385,14 @@ impl Gentoo {
     /// records for the tarball `file`.
     fn read_kept_digests(
         &self,
-        mut held: File,
+        bytes: &[u8],
         entry: &Path,
         file: &str,
     ) -> Result<Digested, GentooError> {
-        let mut bytes = Vec::new();
-        io::copy(
-            &mut held,
-            &mut LimitedWriter::new(&mut bytes, MAX_DIGESTS_BYTES),
-        )
-        .map_err(GentooError::at(
-            "reading the digest document kept at",
-            entry,
-        ))?;
         let subject = entry.display().to_string();
         let verified = self
             .keyring
-            .verify(&bytes, true)
+            .verify(bytes, true)
             .map_err(|err| GentooError::signature(&subject, err))?;
         Ok(Digested {
             sha512: digests::sha512_of(&subject, &verified.body, file)?,

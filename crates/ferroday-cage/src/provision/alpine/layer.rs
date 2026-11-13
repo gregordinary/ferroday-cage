@@ -462,18 +462,9 @@ fn optional_text(
     base: &Path,
     limit: u64,
 ) -> Result<Option<String>, AlpineError> {
-    let bytes = optional_bytes(tree, relative, base, limit)?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| AlpineError::Config {
-            reason: format!(
-                "the base layer at {}: its {relative} is not UTF-8",
-                base.display(),
-            ),
-        })
+    tree.read_text_if_present(relative, limit)
+        .map(|text| text.filter(|text| !text.is_empty()))
+        .map_err(|source| AlpineError::io("reading the base layer", base.join(relative), source))
 }
 
 /// The non-empty lines of an optional file, trimmed.

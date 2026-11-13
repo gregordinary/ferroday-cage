@@ -1257,10 +1257,7 @@ impl OtherIndexes<'_> {
                 if !held.is_some_and(|stat| is_regular(&stat)) {
                     continue;
                 }
-                let bytes = tree.read(&rel, MAX_UNSIZED_INDEX).map_err(reading())?;
-                let text = String::from_utf8(bytes).map_err(|err| {
-                    reading()(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
-                })?;
+                let text = tree.read_text(&rel, MAX_UNSIZED_INDEX).map_err(reading())?;
                 for stanza in document::parse(&text) {
                     if let (Some(filename), Some(digest)) =
                         (stanza.get("Filename"), stanza.get("SHA256"))
@@ -1645,16 +1642,8 @@ fn gzip(bytes: &[u8]) -> Result<Vec<u8>, DebianError> {
 /// most the provisioner reads of an index whose size nothing has vouched for,
 /// which a prior index is until this publish's own release records it.
 fn read_if_present(tree: &Rooted, rel: &Path, path: &Path) -> Result<Option<String>, DebianError> {
-    let reading = || DebianError::at("reading the existing index", path);
-    let Some(bytes) = tree
-        .read_if_present(rel, MAX_UNSIZED_INDEX)
-        .map_err(reading())?
-    else {
-        return Ok(None);
-    };
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|err| reading()(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))
+    tree.read_text_if_present(rel, MAX_UNSIZED_INDEX)
+        .map_err(DebianError::at("reading the existing index", path))
 }
 
 /// Creates a directory and its parents.
