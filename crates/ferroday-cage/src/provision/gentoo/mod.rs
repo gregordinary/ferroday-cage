@@ -1759,6 +1759,10 @@ impl Gentoo {
         // so a second open reads whatever the name binds by then: bytes nothing
         // verified, after a digest pass that reported success.
         Tarball::from_file(verified, &tarball).provision(request)?;
+        // The stage3 is down, and the second wave neither reads the tarball nor
+        // keeps its downloads here, so a cache that is the run's own goes now
+        // rather than holding half a gigabyte or more through the install.
+        drop(cache);
 
         // The second wave. A run that asked for no package stops here and has
         // done exactly what a stage3 bootstrap does, byte for byte.
