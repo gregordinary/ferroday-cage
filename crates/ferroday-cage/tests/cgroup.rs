@@ -1035,7 +1035,11 @@ fn probe_closed_streams() {
                 }
             }
         };
-        // The command's outcome, or what kept it from one.
+        // The command's outcome, or what kept it from one. Not
+        // `common::outcome_within`, which fails the test where it stands: this
+        // runs with the standard descriptors closed, where a failure could not
+        // be reported, so what went wrong is kept and asserted once they are
+        // back.
         let outcome = |launched: Result<ferroday_cage::Running<'_>, Error>| match launched {
             Ok(mut running) => match running.wait_timeout(Duration::from_secs(30)) {
                 Ok(Some(status)) if status.success() => None,

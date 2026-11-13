@@ -703,6 +703,11 @@ fn exec_absent(err: &Error) -> bool {
 
 /// Waits for `running` within [`PATIENCE`], killing it past that, and returns
 /// its outcome, keeping in `findings` what went wrong.
+///
+/// Not `common::outcome_within`, which fails the test where it stands: the
+/// probe this serves runs with standard descriptors closed, where a failure
+/// could not be reported, so it keeps every finding and reports them once
+/// they are back.
 fn settle(running: &mut Running<'_>, what: &str, findings: &mut Vec<String>) -> Option<ExitStatus> {
     match running.wait_timeout(PATIENCE) {
         Ok(Some(status)) => Some(status),
