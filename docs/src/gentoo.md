@@ -464,6 +464,10 @@ end, and inside a provisioning run nothing does. Character and block devices
 never appear: laying one down needs privilege the layer does not have, and the
 sandbox provides its own `/dev`.
 
+A container whose path or link target holds a line ending is refused, as
+portage's own merge refuses one. What follows the line ending would read back as
+a `CONTENTS` line of its own, claiming a file the package never shipped.
+
 **Phase functions are not run.** Around 30% of packages define a `pkg_postinst`
 or a `pkg_preinst`. They live in the container's `environment.bz2` as a
 serialized bash environment. Running one therefore means running portage's own

@@ -129,9 +129,10 @@ enum Laid {
 /// Returns [`GentooError::Container`] for a container that ships something the
 /// root's database cannot record: a metadata file whose name is not one path
 /// component, more than [`MAX_CONTENTS_ENTRIES`] paths, or a path or a link
-/// target that is not UTF-8. Returns [`GentooError::Io`] where the root could
-/// not be written or a merged file could not be read back, and whatever the
-/// extractor reports for an image archive it will not unpack.
+/// target that is not UTF-8 or that holds a line ending. Returns
+/// [`GentooError::Io`] where the root could not be written or a merged file
+/// could not be read back, and whatever the extractor reports for an image
+/// archive it will not unpack.
 pub(super) fn merge(
     root: &Path,
     over: Option<&Path>,
@@ -241,23 +242,23 @@ fn extract_image(
             .into());
         }
         // A path is bytes and `CONTENTS` is a text file portage reads line by
-        // line, so one that is not UTF-8 cannot be recorded -- and a path in
-        // the database that does not describe what is on disk is worse than a
-        // refusal. A link's target is recorded on the same line, so it is
-        // held to the same rule.
-        let path = String::from_utf8(components.join(&b'/').to_vec()).map_err(|_| {
+        // line, so one it cannot read back as written cannot be recorded --
+        // and a path in the database that does not describe what is on disk is
+        // worse than a refusal. A link's target is recorded on the same line,
+        // so it is held to the same rule.
+        let path = recordable(components.join(&b'/').to_vec()).map_err(|why| {
             ProvisionError::from(GentooError::container(
                 container,
-                "ships a path that is not UTF-8",
+                format!("ships a path that {why}"),
             ))
         })?;
         laid.push(match entry.typeflag {
             b'5' => Laid::Directory(path),
             b'2' => {
-                let target = String::from_utf8(entry.link_target.clone()).map_err(|_| {
+                let target = recordable(entry.link_target.clone()).map_err(|why| {
                     ProvisionError::from(GentooError::container(
                         container,
-                        format!("ships a link at {path} whose target is not UTF-8"),
+                        format!("ships a link at {path} whose target {why}"),
                     ))
                 })?;
                 Laid::Link(path, target, entry.mtime)
@@ -271,6 +272,24 @@ fn extract_image(
     })?;
     extraction.finalize(root)?;
     Ok(laid)
+}
+
+/// `bytes` as text a `CONTENTS` line can hold, or why it cannot hold it.
+///
+/// Portage reads the file a line at a time, with Python's universal newlines,
+/// so a carriage return ends a line as a newline does. A path or a target
+/// holding either would be read back as two lines, the second whatever the
+/// container spelled after it: `usr/lib/x\nobj /etc/shadow ...` registers the
+/// package as the owner of a file it never shipped, which an unmerge then
+/// removes. Portage's own merge refuses a package whose paths hold either,
+/// for the same reason. The text must also be UTF-8, which is what the file
+/// is read as.
+fn recordable(bytes: Vec<u8>) -> Result<String, &'static str> {
+    let text = String::from_utf8(bytes).map_err(|_| "is not UTF-8")?;
+    if text.contains(['\n', '\r']) {
+        return Err("holds a line ending, which a database line cannot hold");
+    }
+    Ok(text)
 }
 
 /// Renders the entry's `CONTENTS` from the paths the merge laid down.
@@ -516,8 +535,11 @@ mod tests {
     #[test]
     fn a_path_or_a_link_target_the_database_cannot_record_is_the_containers_failure() {
         // `CONTENTS` is a text file portage reads line by line, and a link's
-        // target is on the same line as its path. Either one that is not UTF-8
-        // is what the container ships, so it is the container that is refused.
+        // target is on the same line as its path. Either one that is not UTF-8,
+        // or that holds a line ending, is what the container ships, so it is
+        // the container that is refused. A line ending is the dangerous one:
+        // what follows it reads back as a line of its own, here claiming a
+        // file the package never shipped, which an unmerge would remove.
         for (raw, why) in [
             (
                 (&b"image/usr/lib/libz-\xff"[..], b'0', &b""[..]),
@@ -526,6 +548,38 @@ mod tests {
             (
                 (&b"image/usr/lib/libz.so.1"[..], b'2', &b"libz-\xff"[..]),
                 "whose target is not UTF-8",
+            ),
+            (
+                (
+                    &b"image/usr/lib/libz\nobj /etc/shadow d41d8cd98f00b204e9800998ecf8427e 0"[..],
+                    b'0',
+                    &b""[..],
+                ),
+                "a path that holds a line ending",
+            ),
+            (
+                (
+                    &b"image/usr/lib/libz\robj /etc/shadow d41d8cd98f00b204e9800998ecf8427e 0"[..],
+                    b'0',
+                    &b""[..],
+                ),
+                "a path that holds a line ending",
+            ),
+            (
+                (
+                    &b"image/usr/lib/libz.so.1"[..],
+                    b'2',
+                    &b"libz\nobj /etc/shadow d41d8cd98f00b204e9800998ecf8427e 0"[..],
+                ),
+                "whose target holds a line ending",
+            ),
+            (
+                (
+                    &b"image/usr/lib/libz.so.1"[..],
+                    b'2',
+                    &b"libz\robj /etc/shadow d41d8cd98f00b204e9800998ecf8427e 0"[..],
+                ),
+                "whose target holds a line ending",
             ),
         ] {
             let (dir, merged) = merging(
@@ -547,12 +601,21 @@ mod tests {
                 crate::ErrorChain::new(&err).to_string().contains(why),
                 "{why}: {err}"
             );
-            // Refused before it was laid down, so the root holds no link with
-            // a target the database could not describe.
+            // Refused before it was laid down, so the root holds nothing the
+            // database could not describe, and no entry claims anything.
+            let root = dir.join("root");
+            let held: Vec<_> = std::fs::read_dir(root.join("usr/lib"))
+                .expect("the ordinary entries are laid")
+                .map(|found| found.expect("an entry").file_name())
+                .collect();
             assert!(
-                std::fs::symlink_metadata(dir.join("root/usr/lib/libz.so.1")).is_err(),
-                "{why}",
+                !held
+                    .iter()
+                    .any(|name| name.as_encoded_bytes().starts_with(b"libz")
+                        && !["libz.so.1.3.2", "libz.so"].contains(&name.to_str().unwrap_or(""))),
+                "{why}: {held:?}",
             );
+            assert!(!entry(&dir).exists(), "{why}");
         }
     }
 
