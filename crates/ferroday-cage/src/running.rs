@@ -986,6 +986,17 @@ impl<'obs> Pending<'obs> {
             .netns_pid()
     }
 
+    /// The handled mask of the sandbox's Landlock network grants, zero where
+    /// it has none: what a network stack attaching here checks the kernel can
+    /// enforce.
+    #[cfg(all(feature = "hardening", feature = "netstack"))]
+    pub(crate) fn landlock_net_handled(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .expect("a Pending holds its launch until proceed consumes it")
+            .landlock_net_handled()
+    }
+
     /// Releases the gated command and returns a handle to it.
     ///
     /// Blocks until the command is executing, so a setup failure past the gate

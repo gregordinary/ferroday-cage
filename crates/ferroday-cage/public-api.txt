@@ -1803,6 +1803,8 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Mount
 pub ferroday_cage::NetStackError::HelperLost
 #[non_exhaustive] pub ferroday_cage::NetStackError::InterfaceNameInvalid
 pub ferroday_cage::NetStackError::InterfaceNameInvalid::name: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::NetStackError::LandlockNetUnenforceable
+pub ferroday_cage::NetStackError::LandlockNetUnenforceable::abi: core::option::Option<i32>
 #[non_exhaustive] pub ferroday_cage::NetStackError::MtuInvalid
 pub ferroday_cage::NetStackError::MtuInvalid::minimum: u16
 pub ferroday_cage::NetStackError::MtuInvalid::mtu: u16

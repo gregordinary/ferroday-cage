@@ -3384,6 +3384,12 @@ impl CageBuilder {
     /// [`host::landlock_abi`](crate::host::landlock_abi) before the build where
     /// that matters.
     ///
+    /// A network stack attached to such a sandbox gives its namespace outbound
+    /// TCP, after which the grant is the only bound on the ports the command
+    /// reaches. The build cannot see a stack, which attaches at the pending
+    /// seam, so the attachment refuses a kernel that cannot enforce the grant:
+    /// `NetStack::attach` answers `NetStackError::LandlockNetUnenforceable`.
+    ///
     /// An empty `access` is refused at build with
     /// [`ConfigError::LandlockGrantEmpty`](crate::ConfigError::LandlockGrantEmpty):
     /// enrolling a grant denies everything ungranted and the kernel skips a rule

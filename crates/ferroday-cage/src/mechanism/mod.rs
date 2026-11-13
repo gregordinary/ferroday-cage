@@ -817,6 +817,10 @@ impl HardeningPlan {
     /// filesystem grants, behind the swapped root; a network grant or the
     /// socket scope in a network namespace of the sandbox's own; the signal
     /// scope in a PID namespace.
+    ///
+    /// A network namespace stops bounding a network grant once a network stack
+    /// attaches to it, which the build cannot see. `NetStack::attach` asks
+    /// [`net_grant_unenforced`](Self::net_grant_unenforced) for that case.
     pub(crate) fn ensure_sandbox_enforceable(
         &self,
         host_network: bool,
@@ -839,14 +843,25 @@ impl HardeningPlan {
         }
 
         let abi = landlock_abi();
-        if net_grant
-            && abi.is_none_or(|abi| {
-                crate::hardening::net_grant_masked_away(self.landlock_net_handled, abi)
-            })
-        {
+        if net_grant && Self::net_grant_unenforced(self.landlock_net_handled, abi) {
             return Err(crate::error::ConfigError::HostNetworkLandlockUnenforceable { abi });
         }
         crate::hardening::ensure_scopes_enforceable(scoped, abi)
+    }
+
+    /// Whether a kernel at `abi` leaves a Landlock network grant whose handled
+    /// mask is `net_handled` governing nothing: a kernel below ABI 4, which
+    /// masks every network right away, or one without the LSM (`None`). A zero
+    /// mask is no grant, and nothing is lost.
+    ///
+    /// The rule for every place a network grant is the only bound on a reach:
+    /// a host-network sandbox at build
+    /// ([`ensure_sandbox_enforceable`](Self::ensure_sandbox_enforceable)), and
+    /// a sandbox a network stack attaches to, whose namespace the stack gives
+    /// outbound TCP (`NetStack::attach`).
+    pub(crate) fn net_grant_unenforced(net_handled: u64, abi: Option<i32>) -> bool {
+        net_handled != 0
+            && abi.is_none_or(|abi| crate::hardening::net_grant_masked_away(net_handled, abi))
     }
 }
 
@@ -1952,6 +1967,11 @@ pub(crate) struct PendingLaunch {
     /// add after release.
     #[cfg(feature = "hardening")]
     landlock_labels: Vec<String>,
+    /// The handled mask of the launch's Landlock network grants, zero where it
+    /// has none, for a network stack attaching to it to check against the
+    /// kernel.
+    #[cfg(all(feature = "hardening", feature = "netstack"))]
+    landlock_net_handled: u64,
 }
 
 /// Launches the sandbox but holds the command at the gate before `execve`,
@@ -2068,6 +2088,8 @@ pub(crate) fn spawn_pending(
             rlimit_labels: plan.rlimit_labels.clone(),
             #[cfg(feature = "hardening")]
             landlock_labels: plan.hardening.landlock_labels.clone(),
+            #[cfg(all(feature = "hardening", feature = "netstack"))]
+            landlock_net_handled: plan.hardening.landlock_net_handled,
         },
         primary,
     ))
@@ -2078,6 +2100,13 @@ impl PendingLaunch {
     /// namespace, the target for `/proc/<pid>/ns/net`.
     pub(crate) fn netns_pid(&self) -> u32 {
         self.pid
+    }
+
+    /// The handled mask of the launch's Landlock network grants, zero where it
+    /// has none.
+    #[cfg(all(feature = "hardening", feature = "netstack"))]
+    pub(crate) fn landlock_net_handled(&self) -> u64 {
+        self.landlock_net_handled
     }
 
     /// The supervisor's pidfd.

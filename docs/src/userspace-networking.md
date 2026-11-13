@@ -151,6 +151,12 @@ guest reaches it there, though its loopback address is refused. A caller that
 must bound egress confines it outside the stack, with a host firewall or an
 [external stack](#bring-your-own-stack) of its own.
 
+A [Landlock network rule](hardening.md#landlock-network-rules) bounds egress by
+port from inside the sandbox, and the stack carries nothing past it. Once a
+stack is attached, the rule is that bound rather than an addition to the
+namespace's, so [`attach`][`NetStack::attach`] refuses a sandbox whose rule the
+kernel cannot enforce: below Landlock ABI 4, or without the LSM.
+
 Multicast, broadcast, unspecified, loopback, and link-local destinations are
 always refused. Refusing loopback keeps the sandbox away from services bound to
 the host's `127.0.0.1`.

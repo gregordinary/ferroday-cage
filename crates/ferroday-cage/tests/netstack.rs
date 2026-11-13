@@ -76,6 +76,96 @@ fn attach_refuses_a_host_network_sandbox() {
     drop(pending);
 }
 
+/// Set inside a restriction to make [`probe_attach_where_landlock_is_absent`]
+/// probe rather than return.
+#[cfg(feature = "hardening")]
+const NO_LANDLOCK_PROBE: &str = "FERRODAY_CAGE_TEST_NETSTACK_NO_LANDLOCK";
+
+/// An attachment that would carry the command's connections past a network
+/// grant the kernel does not enforce is refused.
+///
+/// The host's kernel enforces network grants, so the probe is this test binary
+/// run again under a restriction whose seccomp policy answers
+/// `landlock_create_ruleset` with `ENOSYS`, which is how a kernel without the
+/// LSM answers. Below ABI 4 the same refusal is the unit tests'.
+#[cfg(feature = "hardening")]
+#[test]
+fn attach_refuses_a_network_grant_the_kernel_cannot_enforce() {
+    use ferroday_cage::{Restriction, SeccompPolicy, SeccompRules};
+
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    let landlock =
+        SeccompRules::syscall("landlock_create_ruleset").expect("a syscall of this host");
+    let enosys = SeccompRules::errno("ENOSYS").expect("an errno name");
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = Restriction::builder()
+        .command(&exe)
+        .args([
+            "--exact",
+            "probe_attach_where_landlock_is_absent",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(NO_LANDLOCK_PROBE, "1")
+        .seccomp(SeccompPolicy::Rules(
+            SeccompRules::denying([]).errno_for(landlock, enosys),
+        ))
+        .build()
+        .expect("a valid restriction configuration")
+        .output()
+        .expect("the probe runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("probe refused"),
+        "the probe did not report the refusal:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Not a test of its own: with [`NO_LANDLOCK_PROBE`] set, attaches a stack to
+/// a sandbox carrying a network grant where Landlock answers as absent, and
+/// reports the refusal. Without the variable it does nothing.
+#[cfg(feature = "hardening")]
+#[test]
+fn probe_attach_where_landlock_is_absent() {
+    use ferroday_cage::NetAccess;
+
+    if std::env::var_os(NO_LANDLOCK_PROBE).is_none() {
+        return;
+    }
+    let rootfs =
+        common::fixture_rootfs().expect("the parent runs the probe only where sandboxes launch");
+    assert_eq!(
+        ferroday_cage::host::landlock_abi(),
+        None,
+        "the probe's premise: Landlock answers as absent",
+    );
+    let pending = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/true")
+        .landlock_net(NetAccess::CONNECT, 443)
+        .build()
+        .expect("an isolated sandbox's grant is the namespace's to bound at build")
+        .spawn_pending()
+        .expect("the pending sandbox launches");
+    let err = NetStack::default()
+        .attach(&pending)
+        .expect_err("a grant the kernel cannot enforce is refused");
+    assert!(
+        matches!(
+            err,
+            NetStackError::LandlockNetUnenforceable { abi: None, .. }
+        ),
+        "{err:?}",
+    );
+    println!("probe refused");
+}
+
 #[test]
 fn dropping_the_handle_does_not_kill_the_sandbox() {
     let Some(rootfs) = common::fixture_rootfs() else {

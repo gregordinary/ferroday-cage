@@ -109,11 +109,16 @@ no-op rather than an error, and no ruleset is built at all. Check
 [`host::landlock_abi`] for a version of 4 or more when a command must not run
 unless its network restriction can be enforced.
 
-The one place that downgrade is refused rather than taken is where the grant is
-the sandbox's only network boundary: a host-network cage, and the restriction
-fallback. Both fail the build on a kernel that cannot enforce the grant. An
-isolated cage keeps its network namespace either way, which is why the same
-kernel is tolerated there.
+The downgrade is refused rather than taken wherever the grant is the only bound
+on the command's network reach. A host-network cage and the restriction
+fallback fail the build on a kernel that cannot enforce the grant. An isolated
+cage keeps its network namespace either way, which is why the build tolerates
+the same kernel there. Attaching the [native network
+stack](userspace-networking.md) changes that: the stack gives the namespace
+outbound TCP, so
+[`NetStack::attach`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.attach)
+refuses a sandbox whose grant the kernel cannot enforce, and `fcage --netstack`
+with it.
 
 ## Landlock scopes
 

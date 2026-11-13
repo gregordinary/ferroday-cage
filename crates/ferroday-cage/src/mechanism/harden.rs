@@ -279,14 +279,17 @@ fn apply_landlock(plan: &HardeningPlan) -> Result<(), Failure> {
     // network grants and scopes alone on a kernel too old for either.
     //
     // Every case where that downgrade would leave a reach genuinely unconfined
-    // is refused at build time instead, before any fork: a restriction's grants
-    // and the scopes it names (`ensure_landlock_enforceable`,
-    // `ensure_scopes_enforceable`), and a sandbox's network grant or scope with
-    // no namespace behind it (`ensure_sandbox_enforceable`). What reaches here
-    // is a request some namespace also bounds, or a restriction's default
-    // scopes, which its build already masked to this kernel; that is why the
-    // drop is tolerated. `CageBuilder::landlock_net` and
-    // `CageBuilder::landlock_scope` state it for callers.
+    // is refused before the command runs instead. At build time, before any
+    // fork: a restriction's grants and the scopes it names
+    // (`ensure_landlock_enforceable`, `ensure_scopes_enforceable`), and a
+    // sandbox's network grant or scope with no namespace behind it
+    // (`ensure_sandbox_enforceable`). At the pending seam: a network grant an
+    // attaching network stack would carry connections past
+    // (`NetStack::attach`). What reaches here is a request some namespace also
+    // bounds, or a restriction's default scopes, which its build already masked
+    // to this kernel; that is why the drop is tolerated.
+    // `CageBuilder::landlock_net` and `CageBuilder::landlock_scope` state it
+    // for callers.
     if handled_fs == 0 && handled_net == 0 && scoped == 0 {
         return Ok(());
     }

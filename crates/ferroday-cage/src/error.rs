@@ -419,7 +419,8 @@ pub enum ConfigError {
     /// without it. That is every Landlock grant where the Landlock LSM is
     /// absent, and every network grant on a kernel below ABI 4, whatever
     /// filesystem grants accompany it. A sandbox in the same case keeps its
-    /// namespace isolation, so this is specific to the restriction fallback.
+    /// namespace isolation, so this is specific to the restriction fallback;
+    /// a network stack attaching to such a sandbox refuses the grant itself.
     #[non_exhaustive]
     RestrictionLandlockUnenforceable {
         /// The kernel's supported Landlock ABI, or `None` when the LSM is
@@ -435,7 +436,8 @@ pub enum ConfigError {
     /// there) or the LSM is absent, the grant governs nothing and the command
     /// would reach the host network unrestricted, so the build is refused. A
     /// [`Isolated`](crate::Network::Isolated) or [`None`](crate::Network::None)
-    /// cage is unaffected: its network namespace remains the boundary.
+    /// cage builds: its network namespace remains the boundary until a network
+    /// stack attaches, and the attachment is where such a grant is refused.
     #[non_exhaustive]
     HostNetworkLandlockUnenforceable {
         /// The kernel's supported Landlock ABI, or `None` when the LSM is

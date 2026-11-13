@@ -283,6 +283,12 @@ impl NetStack {
     /// namespace ([`Network::Host`](crate::Network::Host)) is refused with
     /// [`NetStackError::SharedNamespace`].
     ///
+    /// A sandbox carrying a Landlock network grant, from
+    /// `CageBuilder::landlock_net`, is refused with [`NetStackError::LandlockNetUnenforceable`] where the
+    /// kernel cannot enforce the grant: below Landlock ABI 4, or without the
+    /// LSM. The stack gives the sandbox outbound TCP, so the grant is then the
+    /// only bound on the ports the command reaches through it.
+    ///
     /// When the configuration enables IPv6, the guest address is usable
     /// immediately where the stack could disable duplicate address detection
     /// (it tries, through the sandbox's `net.ipv6.conf` sysctls); where it
@@ -290,6 +296,12 @@ impl NetStack {
     /// after launch, and the guest's first IPv6 connection may stall that
     /// long. IPv4 is never delayed.
     pub fn attach(&self, pending: &Pending<'_>) -> Result<NetStackHandle, NetStackError> {
+        #[cfg(feature = "hardening")]
+        ensure_net_grant_enforced(
+            pending.landlock_net_handled(),
+            crate::mechanism::probe_landlock_abi,
+        )?;
+
         // The published ports first, since a host address already in use is the
         // failure a caller is likeliest to meet, and it is better met before a
         // tap exists to be torn down again.
@@ -376,6 +388,30 @@ impl NetStack {
             published,
         })
     }
+}
+
+/// Refuses an attachment that would carry the guest's connections past a
+/// Landlock network grant the kernel does not enforce.
+///
+/// Without a stack, the sandbox's network namespace bounds what a network grant
+/// governs, so the command stage narrows the grant best-effort on a kernel too
+/// old for it. An attached stack gives that namespace outbound TCP to every
+/// destination it forwards, and the grant becomes the only bound on the ports
+/// the command connects to. `net_handled` is the launch's grant mask, and
+/// `landlock_abi` probes the kernel, asked only where there is a grant.
+#[cfg(feature = "hardening")]
+fn ensure_net_grant_enforced(
+    net_handled: u64,
+    landlock_abi: impl FnOnce() -> Option<i32>,
+) -> Result<(), NetStackError> {
+    if net_handled == 0 {
+        return Ok(());
+    }
+    let abi = landlock_abi();
+    if crate::mechanism::HardeningPlan::net_grant_unenforced(net_handled, abi) {
+        return Err(NetStackError::LandlockNetUnenforceable { abi });
+    }
+    Ok(())
 }
 
 /// A host listener for one published port, bound and ready for the pump.
@@ -879,6 +915,20 @@ pub enum NetStackError {
     /// must not attach. Sandboxes built with
     /// [`Network::Host`](crate::Network::Host) are refused with this error.
     SharedNamespace,
+    /// The sandbox carries a Landlock network grant the kernel cannot
+    /// enforce, which the stack would carry the command's connections past.
+    ///
+    /// An attached stack gives the sandbox's network namespace outbound TCP,
+    /// so a grant from `CageBuilder::landlock_net` is the only bound on the
+    /// ports the command connects to through it. Network rights first appear
+    /// in Landlock ABI 4. On an older kernel, or one without the LSM, the grant
+    /// governs nothing, so the attachment is refused rather than made.
+    #[non_exhaustive]
+    LandlockNetUnenforceable {
+        /// The kernel's supported Landlock ABI, or `None` when the LSM is
+        /// absent.
+        abi: Option<i32>,
+    },
     /// The sandbox's network namespace could not be examined or joined.
     #[non_exhaustive]
     NamespaceJoin {
@@ -987,6 +1037,19 @@ impl fmt::Display for NetStackError {
                 "the sandbox shares the caller's network namespace; a network stack \
                  attaches only to a private one",
             ),
+            NetStackError::LandlockNetUnenforceable { abi } => match abi {
+                Some(abi) => write!(
+                    f,
+                    "the sandbox's Landlock network grant needs Landlock ABI 4, and the kernel \
+                     supports ABI {abi}; an attached network stack would carry its connections \
+                     to every port"
+                ),
+                None => f.write_str(
+                    "the sandbox requests a Landlock network grant, but the kernel offers no \
+                     Landlock LSM to enforce it; an attached network stack would carry its \
+                     connections to every port",
+                ),
+            },
             NetStackError::NamespaceJoin { which, .. } => write!(
                 f,
                 "could not join the sandbox's network namespace while {which}"
@@ -1017,8 +1080,8 @@ impl std::error::Error for NetStackError {
     ///
     /// The configuration refusals — an unusable prefix, an MTU below the
     /// minimum, an invalid interface name, no protocols, an unusable
-    /// publication, a shared namespace — carry no inner error: nothing
-    /// failed, the request was refused.
+    /// publication, a shared namespace, an unenforceable network grant — carry
+    /// no inner error: nothing failed, the request was refused.
     /// [`HelperLost`](Self::HelperLost) carries none either: the helper's
     /// silence is the failure.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -1238,6 +1301,32 @@ mod tests {
             matches!(err, NetStackError::MtuInvalid { minimum: 576, .. }),
             "{err}"
         );
+    }
+
+    /// An attachment carries the guest's connections past a network grant
+    /// only where the kernel enforces the grant: from Landlock ABI 4, with the
+    /// LSM present. The kernel is asked only about a launch with a grant.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_network_grant_the_kernel_cannot_enforce_refuses_the_attachment() {
+        use crate::hardening::net_access;
+
+        for abi in [None, Some(1), Some(3)] {
+            let refused = ensure_net_grant_enforced(net_access::CONNECT_TCP, || abi);
+            assert!(
+                matches!(
+                    refused,
+                    Err(NetStackError::LandlockNetUnenforceable { abi: reported }) if reported == abi
+                ),
+                "{abi:?}: {refused:?}",
+            );
+        }
+        for abi in [4, 9] {
+            ensure_net_grant_enforced(net_access::ALL, || Some(abi))
+                .expect("a kernel at ABI 4 or later enforces the grant");
+        }
+        ensure_net_grant_enforced(0, || panic!("a launch without a grant probes nothing"))
+            .expect("a launch without a grant is not the check's to refuse");
     }
 
     #[test]
