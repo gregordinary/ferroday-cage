@@ -85,12 +85,13 @@ why = "The answer."
 
 [[idiom]]
 name = "splitting a path on its separators"
-# Every spelling of a split at a `/`: a byte slice's closure, whatever it names
-# its byte, and a string's `split`, `rsplit`, `splitn` and `split_once`. A
-# regular expression cannot tell a path from any other value written with a
-# `/`, so a CIDR or a Gentoo `category/name` is a site too, recorded as what it
-# is.
-pattern = '''\b(?:r?split|split_terminator|split_inclusive|r?splitn|r?split_once)\((?:\w+, )?(?:'/'|"/"|\|&?\w+\| \*?\w+ == b?'/')\)'''
+# Every spelling of a split at a `/`: a string's `split`, `rsplit`, `splitn` and
+# `split_once`, a byte slice's closure for any of them, whatever it names its
+# byte, and the `find`, `rfind`, `position` and `rposition` a hand-written split
+# slices at. A regular expression cannot tell a path from any other value
+# written with a `/`, so a CIDR, a URL or a Gentoo `category/name` is a site
+# too, recorded as what it is.
+pattern = '''\b(?:r?split|split_terminator|split_inclusive|r?splitn|r?split_once|r?find|r?position)\((?:\w+, )?(?:'/'|"/"|\|&?\w+\| \*?\w+ == b?'/')\)'''
 answer = """\
 `path::tree_components` for a path that names something inside a tree, and \
 `path::is_ordinary_component` for what it leaves behind. Both refuse `..`, a \
@@ -113,11 +114,14 @@ has no business holding them and a link's target routinely does."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/mechanism/copyin.rs"
-count = 1
+count = 2
 why = """\
-The hardlink anchor's check, which runs post-fork where nothing may allocate. \
-It splits itself and holds every component to `path::is_ordinary_component`, \
-so the rule is shared even though the walk over it is not."""
+Both run post-fork, where nothing may allocate. The hardlink anchor's check \
+splits itself and holds every component to `path::is_ordinary_component`, so \
+the rule is shared even though the walk over it is not. `parent_in_root` \
+splits a frame's path at its last `/` in the frame's own buffer, giving the \
+directory and the leaf each a NUL, and resolves the directory in the root \
+through `containment::open_dir_path`, which keeps the walk inside it."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/debian/index.rs"
@@ -160,6 +164,15 @@ part in the comparison, and a shape `tree_components` would refuse is simply \
 one the glob does not match."""
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/provision/alpine/installed.rs"
+count = 1
+why = """\
+The installed database's own layout rather than a path a caller named: a file \
+is recorded as an `R:` name under the `F:` line of its directory, and a file \
+at the top of the tree under the empty directory, as `apk` writes it. The \
+split never refuses, so there is nothing for it to decide differently."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/src/provision/coordinate.rs"
 count = 1
 why = """\
@@ -170,11 +183,15 @@ mirror URL rather than a path in a tree, and the check refuses an empty, `.` or 
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/http.rs"
-count = 1
+count = 4
 why = """\
-A `file://` URL's path, percent-decoded one component at a time, as an HTTP \
-server decodes a request line. A component that decoding changed is then held \
-to `path::is_ordinary_component`, so the rule is shared."""
+URL syntax rather than paths in a tree. A `file://` URL's path is \
+percent-decoded one component at a time, as an HTTP server decodes a request \
+line, and a component that decoding changed is then held to \
+`path::is_ordinary_component`, so the rule is shared. The first `/` after a \
+scheme ends a URL's authority, in an `http://` URL and in a `file://` one \
+alike, and a redirect's relative location is resolved against the directory \
+its request path names, up to its last `/`."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/debian/mod.rs"
@@ -213,8 +230,11 @@ specification's own grammar."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/gentoo/gpkg.rs"
-count = 1
-why = "Not a path: a planned package's `category/name`."
+count = 2
+why = """\
+One is not a path: a planned package's `category/name`. The other is a gpkg \
+container's member, exactly one level down, whose two halves are each held to \
+`path::is_ordinary_component`, so the rule is shared."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/gentoo/vdb.rs"
@@ -474,7 +494,9 @@ why = "The answer."
 
 [[idiom]]
 name = "walking an error's chain of causes"
-pattern = '\.source\(\)'
+# The method call, and the trait's function called with the error as its
+# argument, which is the same walk.
+pattern = '\.source\(\)|\bError::source\('
 answer = """\
 `ErrorChain`, which renders an error and every cause beneath it on one line. \
 No error's message repeats its cause, so a reader that stops at `Display` \
