@@ -68,10 +68,10 @@ grants it also makes. The refusal is
 [`ConfigError::RestrictionLandlockUnenforceable`].
 
 The command starts in `/` (or the [`current_dir`]) with a deterministic base
-environment plus the caller's variables. The base is `PATH` alone — unlike
-the cage's, it carries no `HOME`, because the command runs as the real
-calling user, for whom `/root` would be wrong; set `HOME` explicitly if the
-command needs one. Standard streams, the [`stdin`] disposition, output
+environment plus the caller's variables. The base is `PATH` alone. It carries
+no `HOME`, as a sandbox's does not for an identity other than root, because the
+command runs as the real calling user, for whom `/root` would be wrong; set
+`HOME` explicitly if the command needs one. Standard streams, the [`stdin`] disposition, output
 streaming through an observer, a pseudoterminal of its own (see [A terminal of
 the sandbox's own](terminal.md)), and the [`Running`] handle — wait, deadline,
 terminate, kill, [`stop_with_caller`] — all work as they do for a cage.

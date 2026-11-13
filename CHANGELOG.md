@@ -214,6 +214,12 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking.** The base environment carries `HOME=/root` only for a command
+  that runs as uid 0 of its namespace. A command under `CageBuilder::present_as`,
+  or a `run_as` identity naming another uid, gets `PATH` alone, and a program
+  that needs a home falls back to its passwd entry. A `run_as` caller that
+  relied on `/root` sets `HOME` with `CageBuilder::env`; `base_env(false)` is
+  unchanged.
 - **Breaking.** `SeccompPolicy::Curated` is removed. The curated roster is
   `SeccompRules::curated()`, a deny-list a caller extends with `rule` and
   `errno_for`, so `SeccompPolicy::Rules(SeccompRules::curated())` replaces it.

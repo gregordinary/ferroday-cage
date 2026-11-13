@@ -32,12 +32,25 @@ use crate::terminal::{Pty, Terminal};
 /// base environments.
 pub(crate) const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// The base environment every sandboxed command starts with.
+/// The base environment a sandboxed command starts with, where it runs as
+/// uid 0 of its namespace.
 ///
 /// Deterministic: nothing is read from the host. Caller-supplied variables
-/// are added on top and override these on collision. `HOME` is `/root`
-/// because the command runs mapped to root inside the sandbox.
+/// are added on top and override these on collision. `HOME` is `/root`,
+/// root's home. A command running as another identity starts from
+/// [`BASE_ENV_UNPRIVILEGED`] instead.
 const BASE_ENV: [(&str, &str); 2] = [("PATH", BASE_PATH), ("HOME", "/root")];
+
+/// The base environment of a command running as an identity other than uid 0:
+/// a [presented identity](CageBuilder::present_as), or a non-root
+/// [run-as identity](CageBuilder::run_as).
+///
+/// It carries no `HOME`. The library cannot know where that identity's home is
+/// in the sandbox, and contributes nothing rather than something wrong: a
+/// program that needs one falls back to its passwd entry, and the caller sets
+/// `HOME` where it knows better. `USER` and `LOGNAME` are the caller's to set
+/// for every identity.
+const BASE_ENV_UNPRIVILEGED: [(&str, &str); 1] = [("PATH", BASE_PATH)];
 
 /// The character devices bound from the host into the sandbox's `/dev`.
 ///
@@ -1211,8 +1224,8 @@ impl Overlay {
 /// By default the sandbox mounts `/proc`, a minimal `/dev`, and a tmpfs
 /// `/tmp` over the rootfs, runs in its own PID namespace under a reaping
 /// init and in an isolated loopback-only network namespace, starts in `/`
-/// with the deterministic base environment (`PATH` and `HOME`), and keeps
-/// the host's hostname. Every part of that profile has a builder method to
+/// with the deterministic base environment (`PATH`, and `HOME` for a command
+/// running as root inside), and keeps the host's hostname. Every part of that profile has a builder method to
 /// change it.
 ///
 /// With the `serde` feature the builder is the profile format: it
@@ -1827,8 +1840,12 @@ impl CageBuilder {
     /// Sets an environment variable for the command.
     ///
     /// The command's environment is built from scratch: the deterministic
-    /// base (`PATH` and `HOME`) plus the variables set here, which override
-    /// the base on collision. Nothing is inherited from the host.
+    /// base plus the variables set here, which override the base on
+    /// collision. Nothing is inherited from the host. The base is `PATH`, and
+    /// `HOME=/root` where the command runs as uid 0 of its namespace; a
+    /// [presented](Self::present_as) or non-root [run-as](Self::run_as)
+    /// identity gets no `HOME` from the library, and a caller that knows where
+    /// that identity's home is sets it here.
     pub fn env(mut self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.env
             .push((name.as_ref().to_os_string(), value.as_ref().to_os_string()));
@@ -2385,8 +2402,8 @@ impl CageBuilder {
     /// composed under the caller's variables (default `true`).
     ///
     /// Set to `false`, the command's environment is exactly the pairs given
-    /// to [`env`](Self::env) and [`envs`](Self::envs) — `PATH` and `HOME` are
-    /// not supplied, and **no variable the library may add to its base in a
+    /// to [`env`](Self::env) and [`envs`](Self::envs) — neither `PATH` nor
+    /// `HOME` is supplied, and **no variable the library may add to its base in a
     /// later release is supplied either**. That is what this exists for: a
     /// caller can override base variables it knows the names of, but only an
     /// exact environment excludes one it cannot yet name.
@@ -2702,8 +2719,19 @@ impl CageBuilder {
 
         // With the base opted out of, the caller's pairs are the whole
         // environment; the library contributes nothing, in this release or a
-        // later one.
-        let base: &[(&str, &str)] = if base_env { &BASE_ENV } else { &[] };
+        // later one. A command that runs as another identity than uid 0 gets
+        // no `HOME`: a presented identity is never uid 0, and a run-as one is
+        // where it names another uid.
+        let runs_as_root = self.present_as.is_none()
+            && self
+                .run_as
+                .as_ref()
+                .is_none_or(|identity| identity.uid == 0);
+        let base: &[(&str, &str)] = match (base_env, runs_as_root) {
+            (false, _) => &[],
+            (true, true) => &BASE_ENV,
+            (true, false) => &BASE_ENV_UNPRIVILEGED,
+        };
         let env = compose_env(base, &self.env)?;
         let hostname = self
             .hostname
@@ -6032,6 +6060,46 @@ mod tests {
             .map(|entry| entry.to_str().unwrap())
             .collect();
         assert_eq!(env, ["HOME=/root", "PATH=/custom", "ZED=last"]);
+    }
+
+    /// `HOME` follows the identity the command runs as: root's home for uid 0
+    /// of the namespace, and none from the library for any other, which the
+    /// caller's own `HOME` then supplies.
+    #[test]
+    fn home_follows_the_command_s_identity() {
+        let env = |builder: CageBuilder| -> Vec<String> {
+            builder
+                .build()
+                .unwrap()
+                .plan
+                .env
+                .iter()
+                .map(|entry| entry.to_str().unwrap().to_owned())
+                .collect()
+        };
+        let path = format!("PATH={BASE_PATH}");
+        assert_eq!(env(sh_in("/tmp")), ["HOME=/root", path.as_str()]);
+        assert_eq!(
+            env(sh_in("/tmp").run_as(Identity::new(0, 0))),
+            ["HOME=/root", path.as_str()]
+        );
+        assert_eq!(
+            env(sh_in("/tmp").present_as(PresentedIdentity::Ids {
+                uid: 1000,
+                gid: 1000
+            })),
+            [path.as_str()]
+        );
+        assert_eq!(
+            env(sh_in("/tmp")
+                .present_as(PresentedIdentity::Ids {
+                    uid: 1000,
+                    gid: 1000
+                })
+                .env("HOME", "/home/user")),
+            ["HOME=/home/user", path.as_str()]
+        );
+        assert!(env(sh_in("/tmp").base_env(false)).is_empty());
     }
 
     #[test]

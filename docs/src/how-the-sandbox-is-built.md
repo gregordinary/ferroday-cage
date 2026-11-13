@@ -130,8 +130,9 @@ sequence itself.
     identity](identity-maps.md#running-as-a-non-root-identity), when one is
     set: securebits, no-new-privileges, and Landlock before it, the
     capability drop and the seccomp filter after. The command receives the
-    composed environment: the deterministic base (`PATH` and `HOME`) plus
-    the caller's variables, nothing from the host. The init remains as the
+    composed environment: the deterministic base (`PATH`, and `HOME` where
+    the command runs as root inside) plus the caller's variables, nothing
+    from the host. The init remains as the
     namespace's supervisor.
 
 ## The nested user namespace

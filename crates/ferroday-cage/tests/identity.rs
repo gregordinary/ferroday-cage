@@ -391,6 +391,47 @@ fn run_as_is_the_identity_the_command_observes() {
     assert_eq!(stdout.trim(), "250 250 250 100", "{stdout}");
 }
 
+/// `HOME` follows the identity the command runs as: `/root` for root inside,
+/// none from the library for a presented or a non-root run-as identity, and
+/// the caller's own wherever the caller sets one.
+#[test]
+fn home_follows_the_identity_the_command_runs_as() {
+    let Some(rootfs) = rootfs() else { return };
+    let home = |builder: ferroday_cage::CageBuilder| {
+        let cage = builder
+            .rootfs(rootfs)
+            .command("/bin/sh")
+            .args(["-c", "echo \"home=${HOME-unset}\""])
+            .build()
+            .expect("the sandbox should build");
+        let output = run_script(&cage);
+        let stdout = stdout_of(&output);
+        assert!(output.status.success(), "{stdout}");
+        stdout.trim().to_string()
+    };
+    assert_eq!(home(Cage::builder()), "home=/root");
+    assert_eq!(home(Cage::builder().present_as(PRESENTED)), "home=unset");
+    assert_eq!(
+        home(
+            Cage::builder()
+                .present_as(PRESENTED)
+                .env("HOME", "/home/user")
+        ),
+        "home=/home/user"
+    );
+    #[cfg(feature = "subid")]
+    if common::require::range_map() {
+        assert_eq!(
+            home(
+                Cage::builder()
+                    .identity_map(IdentityMap::Subordinate)
+                    .run_as(Identity::new(250, 250))
+            ),
+            "home=unset"
+        );
+    }
+}
+
 /// The nested user namespace's map under the range tier: the whole of the
 /// sandbox's map, reflected onto its own inside ids.
 ///

@@ -147,8 +147,8 @@ target = "/home/user/project/.git/hooks"
 ```
 
 `[env]` is a table of environment variables, added on top of the
-deterministic base (`PATH` and `HOME`) — or the whole environment, where
-`base-env = false`.
+deterministic base (`PATH`, and `HOME` for a command running as root inside) —
+or the whole environment, where `base-env = false`.
 
 `managed-mounts = false` and `base-env = false` are opt-outs rather than
 toggles: each reduces the library's contribution to nothing, including

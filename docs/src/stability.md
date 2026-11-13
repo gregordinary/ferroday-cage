@@ -238,8 +238,8 @@ release, including a patch.
   populate it reproduces a managed mount's structure as well as its contents.
   Its own set includes a procfs, which every container needs, as [Recording
   what a build ran under](embedding.md#recording-what-a-build-ran-under) shows.
-- **The base environment.** `PATH` and `HOME=/root`, and nothing else, is the
-  current default. A build whose output depends on the environment should set
+- **The base environment.** `PATH`, and `HOME=/root` for a command running as
+  uid 0 of its namespace, and nothing else, is the current default. A build whose output depends on the environment should set
   every variable it cares about explicitly through `env`, and use
   `base_env(false)` so that a variable added to the base later cannot reach
   the command.

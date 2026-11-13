@@ -53,8 +53,9 @@ for the library itself failing, and a failure during sandbox setup names the
 exact step and OS error.
 
 The command runs with inherited standard streams and `/` as its working
-directory. Its environment is clean: `PATH` and `HOME`, plus whatever the
-builder's `env` calls add. The command path is interpreted inside the sandbox
+directory. Its environment is clean: `PATH` and `HOME=/root`, plus whatever the
+builder's `env` calls add. A command running as another identity than root gets
+no `HOME` from the library. The command path is interpreted inside the sandbox
 and must be absolute. It is not searched for on `PATH` unless `path_lookup` is
 enabled. That resolves a command with no slash against the sandbox's `PATH`,
 like a shell.
