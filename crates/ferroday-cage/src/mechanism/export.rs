@@ -289,9 +289,12 @@ fn export_child(
         stream.as_raw_fd(),
         gate.as_ref().map_or(-1 as RawFd, |gate| gate.as_raw_fd()),
     ];
-    if let Err(failure) =
-        super::child::enter_mapped_namespace(&keep, map.duty(), gate.as_ref().map(OwnedFd::as_fd))
-    {
+    if let Err(failure) = super::child::enter_mapped_namespace(
+        &keep,
+        rustix::thread::UnshareFlags::empty(),
+        map.duty(),
+        gate.as_ref().map(OwnedFd::as_fd),
+    ) {
         match failure {
             // The caller left without applying the map; its own error is the
             // diagnostic, and it is no longer reading the stream a report

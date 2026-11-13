@@ -119,6 +119,31 @@ pub(crate) unsafe fn fork_with_pidfd() -> Result<PidfdFork, Errno> {
     })
 }
 
+/// Runs `child` in a forked child process that exits with the code it returns,
+/// and answers that code once the child is reaped: `None` where a signal ended
+/// it.
+///
+/// The fork, the exit and the reap of every out-of-band probe, each a question
+/// only a throwaway child can put to the kernel: an overlay or a procfs mount,
+/// a cgroup join, a seccomp install. The child is reaped through the pidfd its
+/// fork opened, so a caller that reaps children of its own cannot collect it
+/// first. A fork or a reap that fails is the `Err`, and the probe then has no
+/// answer.
+///
+/// # Safety
+///
+/// `child` runs in the forked child, under the discipline [`fork`] states: no
+/// allocation, no lock, no libc, no panic.
+pub(crate) unsafe fn probe(child: impl FnOnce() -> i32) -> Result<Option<i32>, Errno> {
+    // SAFETY: the new process runs `child`, whose discipline the caller
+    // vouches for, and ends in `exit_group` with its answer, so it never
+    // returns into the caller's code.
+    match unsafe { fork_with_pidfd() }? {
+        PidfdFork::Child => exit_group(child()),
+        PidfdFork::ParentOf(forked) => forked.reap(),
+    }
+}
+
 /// The `clone` both forks make: `flags` with `SIGCHLD` as the exit signal,
 /// `parent_tid` as the third argument, and every other argument zero, with
 /// every signal blocked across the call. `None` in the child, and the child's

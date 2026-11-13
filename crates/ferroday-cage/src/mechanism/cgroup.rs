@@ -14,7 +14,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 
 use rustix::io::Errno;
 
-use super::sys::{self, PidfdFork};
+use super::sys;
 
 /// The outcome of the join probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,19 +40,14 @@ const EXIT_SETUP_FAILED: i32 = 255;
 /// The child exits at once, so the cgroup holds nothing once the probe returns
 /// and can be removed.
 pub(crate) fn probe_cgroup_join(procs: BorrowedFd<'_>) -> JoinProbe {
-    // SAFETY: the child branch runs only raw syscalls, with no allocation, no
-    // lock and no libc, and always ends in `exit_group`.
-    // `sys::fork_with_pidfd` is the launch's own fork primitive.
-    match unsafe { sys::fork_with_pidfd() } {
-        Err(_) => JoinProbe::Inconclusive,
-        Ok(PidfdFork::Child) => sys::exit_group(join_child(procs)),
-        Ok(PidfdFork::ParentOf(child)) => match child.reap() {
-            Ok(Some(EXIT_JOINED)) => JoinProbe::Joined,
-            Ok(Some(code)) if code != EXIT_SETUP_FAILED => {
-                JoinProbe::Refused(Errno::from_raw_os_error(code))
-            }
-            _ => JoinProbe::Inconclusive,
-        },
+    // SAFETY: `join_child` makes only raw syscalls, with no allocation, no
+    // lock, no libc and no panic.
+    match unsafe { sys::probe(|| join_child(procs)) } {
+        Ok(Some(EXIT_JOINED)) => JoinProbe::Joined,
+        Ok(Some(code)) if code != EXIT_SETUP_FAILED => {
+            JoinProbe::Refused(Errno::from_raw_os_error(code))
+        }
+        _ => JoinProbe::Inconclusive,
     }
 }
 

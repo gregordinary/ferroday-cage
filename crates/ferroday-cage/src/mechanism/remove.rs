@@ -216,9 +216,12 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
     };
 
     // The gate is kept: the outcome record travels back on it.
-    if let Err(failure) =
-        super::child::enter_mapped_namespace(&[gate.as_raw_fd()], duty, Some(gate))
-    {
+    if let Err(failure) = super::child::enter_mapped_namespace(
+        &[gate.as_raw_fd()],
+        rustix::thread::UnshareFlags::empty(),
+        duty,
+        Some(gate),
+    ) {
         match failure {
             // The caller left without applying the map; its own error is the
             // diagnostic, and the gate a report would travel on is closed.

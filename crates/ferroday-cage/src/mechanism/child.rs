@@ -1203,7 +1203,8 @@ pub(super) enum MapFailure {
 
 /// Takes a freshly forked child into a user namespace of its own, with the
 /// identity map in force: the sequence every provisioning child performs
-/// before it touches the tree it was forked for.
+/// before it touches the tree it was forked for, and every probe that asks the
+/// kernel something only a mapped user namespace can ask.
 ///
 /// `keep` is the descriptors the child needs — its channels to the caller;
 /// everything else the fork copied is closed. The sweep matters beyond
@@ -1215,14 +1216,20 @@ pub(super) enum MapFailure {
 ///
 /// `SIGPIPE` is put back to ignored after the scrub, whose default for it is
 /// termination: a child killed the instant the caller stopped reading could
-/// neither report the failure nor exit on its own terms.
+/// neither report the failure nor exit on its own terms. A probe writes to no
+/// pipe, and the ignored signal changes nothing for it.
 ///
-/// The namespace is the only thing unshared. The work runs on the caller's
-/// own mount view, through real paths, as root of the mapped namespace.
+/// `also` is what is unshared beside the user namespace, in the same call, so
+/// the user namespace owns it: a mount namespace for a probe that mounts, and
+/// a PID namespace for one whose next child must be that namespace's first
+/// process. A provisioning child unshares nothing else, and its work runs on
+/// the caller's own mount view, through real paths, as root of the mapped
+/// namespace.
 ///
 /// Post-fork safe: no allocation, no locking, and no panic.
 pub(super) fn enter_mapped_namespace(
     keep: &[RawFd],
+    also: thread::UnshareFlags,
     duty: MapDuty<'_>,
     gate: Option<BorrowedFd<'_>>,
 ) -> Result<(), MapFailure> {
@@ -1230,9 +1237,9 @@ pub(super) fn enter_mapped_namespace(
         .map_err(|errno| MapFailure::Step(MapStep::ResetSignals, errno))?;
     ignore_sigpipe().map_err(|errno| MapFailure::Step(MapStep::ResetSignals, errno))?;
     sweep_fds_keeping(keep).map_err(|errno| MapFailure::Step(MapStep::SweepFds, errno))?;
-    // SAFETY: the flags never include the descriptor table, and this process
+    // SAFETY: the callers never ask for the descriptor table, and this process
     // is a freshly forked single-threaded child besides.
-    unsafe { thread::unshare_unsafe(thread::UnshareFlags::NEWUSER) }
+    unsafe { thread::unshare_unsafe(thread::UnshareFlags::NEWUSER | also) }
         .map_err(|errno| MapFailure::Step(MapStep::Unshare, errno))?;
     establish_map(duty, gate)
 }

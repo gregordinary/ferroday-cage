@@ -506,7 +506,8 @@ report name a package and its version bare.
 | Fill a buffer from the kernel's randomness | `host::fill_random` |
 | Fork, exec, exit, change signal state, or read signals from a descriptor, without libc | `mechanism::sys` |
 | Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
-| Fork a helper child and signal or reap it whatever else in the caller reaps | `mechanism::sys::fork_with_pidfd`, which hands back a `mechanism::Forked` |
+| Fork a helper child and signal or reap it whatever else in the caller reaps | `mechanism::sys::fork_with_pidfd`, which hands back a `mechanism::Forked`, or `mechanism::sys::probe` for a probe whose exit code is its answer |
+| Write a forked child's own identity map, or take the child into a mapped user namespace of its own | `mechanism::child::establish_map`, and `child::enter_mapped_namespace` for the whole entry, other namespaces beside it included |
 | Keep a descriptor the launch creates off the standard streams' numbers | `mechanism::above_stdio` in the caller, and in the sandbox's processes the launch stage's `child::hold_closed_streams`, which holds each number the caller left closed before any stage creates a descriptor |
 | Do work in a sandbox's network namespace and get one descriptor back | `mechanism::netns::in_network_namespace`, after `netns::Namespaces::of` |
 | Open a socket in the family of the address it connects to or binds | `mechanism::netns::socket_for` |

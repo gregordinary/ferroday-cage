@@ -21,9 +21,10 @@
 
 use rustix::io::Errno;
 use rustix::mount::{self, MountFlags, MountPropagationFlags};
-use rustix::thread::{self, UnshareFlags};
+use rustix::thread::UnshareFlags;
 
-use super::sys::{self, PidfdFork};
+use super::child::{MapDuty, MapPaths, enter_mapped_namespace};
+use super::sys;
 
 /// The outcome of the procfs probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,16 +60,11 @@ const EXIT_SETUP_FAILED: i32 = 2;
 pub(crate) fn probe_procfs_mount() -> ProcfsProbe {
     let (uid_line, gid_line) = crate::idmap::single_identity_lines();
 
-    // SAFETY: the child branch runs only raw syscalls over the data formatted
-    // above, with no allocation, no lock and no libc, and always ends in
-    // `exit_group`. `sys::fork_with_pidfd` is the launch's own fork primitive.
-    match unsafe { sys::fork_with_pidfd() } {
+    // SAFETY: `probe_child` makes only raw syscalls over the data formatted
+    // above, with no allocation, no lock, no libc and no panic.
+    match unsafe { sys::probe(|| probe_child(&uid_line, &gid_line)) } {
+        Ok(code) => classify(code),
         Err(_) => ProcfsProbe::Inconclusive,
-        Ok(PidfdFork::Child) => sys::exit_group(probe_child(&uid_line, &gid_line)),
-        Ok(PidfdFork::ParentOf(child)) => match child.reap() {
-            Ok(code) => classify(code),
-            Err(_) => ProcfsProbe::Inconclusive,
-        },
     }
 }
 
@@ -89,41 +85,24 @@ fn classify(code: Option<i32>) -> ProcfsProbe {
 ///
 /// Runs under the post-fork constraints of [`child`](super::child).
 fn probe_child(uid_line: &[u8], gid_line: &[u8]) -> i32 {
-    if super::child::reset_signals(&sys::SigSet::empty()).is_err() {
-        return EXIT_SETUP_FAILED;
-    }
-    // The caller's descriptors are closed for every forked child's reason,
-    // which `sweep_fds_keeping` states, and the probe needs none of them.
-    if super::child::sweep_fds_keeping(&[]).is_err() {
-        return EXIT_SETUP_FAILED;
-    }
     // A procfs belongs to the PID namespace of the process that mounts it, and
     // mounting one takes `CAP_SYS_ADMIN` over that namespace's owner. Only a
     // PID namespace this user namespace owns grants it, so the mount is made by
-    // a process inside one, which `unshare` gives the next child alone.
-    let flags = UnshareFlags::NEWUSER | UnshareFlags::NEWNS | UnshareFlags::NEWPID;
-    // SAFETY: `unshare_unsafe` is unsafe only because `UnshareFlags::FILES`
-    // could invalidate descriptors other threads observe; these flags omit it,
-    // and this is a freshly forked single-threaded child besides.
-    if unsafe { thread::unshare_unsafe(flags) }.is_err() {
+    // a process inside one, which `unshare` gives the next child alone. The
+    // probe keeps no descriptor.
+    let duty = MapDuty::Write {
+        paths: MapPaths::SELF,
+        uid_line,
+        gid_line,
+    };
+    let also = UnshareFlags::NEWNS | UnshareFlags::NEWPID;
+    if enter_mapped_namespace(&[], also, duty, None).is_err() {
         return EXIT_SETUP_FAILED;
     }
-    if super::child::write_file(c"/proc/self/setgroups", b"deny").is_err()
-        || super::child::write_file(c"/proc/self/gid_map", gid_line).is_err()
-        || super::child::write_file(c"/proc/self/uid_map", uid_line).is_err()
-    {
-        return EXIT_SETUP_FAILED;
-    }
-    // SAFETY: as for the fork above; the grandchild runs `mount_in_namespace`,
-    // which keeps the same discipline, and ends in `exit_group`. Reaping it
-    // through its pidfd is one raw syscall.
-    match unsafe { sys::fork_with_pidfd() } {
-        Err(_) => EXIT_SETUP_FAILED,
-        Ok(PidfdFork::Child) => sys::exit_group(mount_in_namespace()),
-        Ok(PidfdFork::ParentOf(grandchild)) => match grandchild.reap() {
-            Ok(code) => code.unwrap_or(EXIT_SETUP_FAILED),
-            Err(_) => EXIT_SETUP_FAILED,
-        },
+    // SAFETY: `mount_in_namespace` keeps the same discipline as this child.
+    match unsafe { sys::probe(mount_in_namespace) } {
+        Ok(Some(code)) => code,
+        Ok(None) | Err(_) => EXIT_SETUP_FAILED,
     }
 }
 

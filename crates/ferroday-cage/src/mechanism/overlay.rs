@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 
 use rustix::io::Errno;
 use rustix::mount::{self, MountFlags, MountPropagationFlags};
-use rustix::thread::{self, UnshareFlags};
+use rustix::thread::UnshareFlags;
 
-use super::sys::{self, PidfdFork};
+use super::child::{MapDuty, MapPaths, enter_mapped_namespace};
+use super::sys;
 
 /// The outcome of the overlay mount probe.
 pub(crate) enum OverlayProbe {
@@ -59,20 +60,11 @@ pub(crate) fn probe_overlay_mount(merged: &CStr, options: &CStr) -> OverlayProbe
     // formats its own.
     let (uid_line, gid_line) = crate::idmap::single_identity_lines();
 
-    // SAFETY: the child branch runs only raw syscalls over the data frozen
-    // above — no allocation, no locking, no libc — and never returns: it
-    // always ends in `exit_group`. `sys::fork_with_pidfd` is the launch's own
-    // fork primitive.
-    match unsafe { sys::fork_with_pidfd() } {
+    // SAFETY: `probe_child` makes only raw syscalls over the data frozen above,
+    // with no allocation, no lock, no libc and no panic.
+    match unsafe { sys::probe(|| probe_child(merged, options, &uid_line, &gid_line)) } {
+        Ok(code) => classify(code),
         Err(_) => OverlayProbe::Inconclusive,
-        Ok(PidfdFork::Child) => {
-            let code = probe_child(merged, options, &uid_line, &gid_line);
-            sys::exit_group(code)
-        }
-        Ok(PidfdFork::ParentOf(child)) => match child.reap() {
-            Ok(code) => classify(code),
-            Err(_) => OverlayProbe::Inconclusive,
-        },
     }
 }
 
@@ -94,36 +86,16 @@ fn classify(code: Option<i32>) -> OverlayProbe {
 /// Runs under the post-fork constraints of [`child`](super::child): raw
 /// syscalls over frozen data, no allocation, no panic.
 fn probe_child(merged: &CStr, options: &CStr, uid_line: &[u8], gid_line: &[u8]) -> i32 {
-    // Scrub inherited signal dispositions: an inherited handler must not run
-    // inside this no-allocation child.
-    if super::child::reset_signals(&super::sys::SigSet::empty()).is_err() {
-        return EXIT_SETUP_FAILED;
-    }
-
-    // Close the caller's descriptor table, keeping nothing: the probe needs no
-    // channel, only the two paths frozen above. The reason is every other
-    // forked child's — an inherited copy of a live sandbox's control socket
-    // holds that socket open, and the supervisor's hangup detection waits on
-    // the last copy closing — and it applies here for as long as the probe
-    // runs, which is one unshare, three `/proc` writes, and a mount.
-    if super::child::sweep_fds_keeping(&[]).is_err() {
-        return EXIT_SETUP_FAILED;
-    }
-
-    // SAFETY: `unshare_unsafe` is unsafe only because `UnshareFlags::FILES`
-    // could invalidate descriptors observed by other threads; these flags omit
-    // it, and this is a freshly forked single-threaded child besides.
-    if unsafe { thread::unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.is_err() {
-        return EXIT_SETUP_FAILED;
-    }
-
-    // The single-identity map: deny setgroups so an unprivileged process may
-    // write its own gid map, then the gid and uid lines. Root inside is the
-    // caller outside — enough credential to mount overlay in the new namespace.
-    if super::child::write_file(c"/proc/self/setgroups", b"deny").is_err()
-        || super::child::write_file(c"/proc/self/gid_map", gid_line).is_err()
-        || super::child::write_file(c"/proc/self/uid_map", uid_line).is_err()
-    {
+    // A user and mount namespace of the child's own under the single-identity
+    // map, keeping no descriptor: the probe needs only the two paths frozen
+    // above. Root inside is the caller outside, which is credential enough to
+    // mount an overlay in the new namespace.
+    let duty = MapDuty::Write {
+        paths: MapPaths::SELF,
+        uid_line,
+        gid_line,
+    };
+    if enter_mapped_namespace(&[], UnshareFlags::NEWNS, duty, None).is_err() {
         return EXIT_SETUP_FAILED;
     }
 

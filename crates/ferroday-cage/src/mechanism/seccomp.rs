@@ -15,7 +15,7 @@ use rustix::io::Errno;
 use rustix::thread::UnshareFlags;
 use syscalls::Sysno;
 
-use super::sys::{self, PidfdFork, errno};
+use super::sys::{self, errno};
 use super::{LaunchPlan, SockFilter};
 
 /// Classic-BPF opcodes and `seccomp_data` field offsets.
@@ -686,15 +686,12 @@ pub(crate) fn install(program: &[SockFilter]) -> Result<(), Errno> {
 /// kernel accepts either. A fork that fails answers `false`: it established
 /// nothing, and a launch would fail at the same fork.
 pub(crate) fn installable() -> bool {
-    // SAFETY: the child branch makes only raw syscalls over static data — no
-    // allocation, no lock, no libc, no panic — and always ends in
-    // `exit_group`. It leaves every signal blocked, as the fork hands it, so
-    // no inherited handler can run before it exits.
-    match unsafe { sys::fork_with_pidfd() } {
-        Err(_) => false,
-        Ok(PidfdFork::Child) => sys::exit_group(install_in_probe()),
-        Ok(PidfdFork::ParentOf(child)) => child.reap() == Ok(Some(0)),
-    }
+    // SAFETY: `install_in_probe` makes only raw syscalls over static data,
+    // with no allocation, no lock, no libc and no panic. It leaves every signal
+    // blocked, as the fork hands it, so no inherited handler can run before it
+    // exits.
+    let installed = unsafe { sys::probe(install_in_probe) };
+    installed == Ok(Some(0))
 }
 
 /// The probe child of [`installable`]: closes the caller's descriptors, takes

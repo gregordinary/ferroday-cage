@@ -443,7 +443,12 @@ fn copy_child(
     // The gate is kept: unlike the export's, it is also the channel the
     // outcome record goes back on.
     let keep = [stream.as_raw_fd(), gate.as_raw_fd()];
-    if let Err(failure) = super::child::enter_mapped_namespace(&keep, map.duty(), Some(gate)) {
+    if let Err(failure) = super::child::enter_mapped_namespace(
+        &keep,
+        rustix::thread::UnshareFlags::empty(),
+        map.duty(),
+        Some(gate),
+    ) {
         match failure {
             // The caller left without applying the map; its own error is the
             // diagnostic, and the gate a report would travel on is closed.
