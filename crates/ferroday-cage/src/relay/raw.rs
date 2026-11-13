@@ -526,14 +526,13 @@ mod tests {
             // from a thread of its own, so the queue is waited for rather than
             // assumed: what a restore does to a *filled* queue is the question,
             // and a flush that ran first would answer a different one.
-            let mut watched = [rustix::event::PollFd::new(
-                &replica,
-                rustix::event::PollFlags::IN,
-            )];
-            let wait = crate::poll::timeout(Duration::from_secs(5));
-            let ready =
-                rustix::event::poll(&mut watched, Some(&wait)).expect("the queue is pollable");
-            assert_eq!(ready, 1, "the input reached the line discipline");
+            assert!(
+                ferroday_cage_testkit::fd::readable_by(
+                    &replica,
+                    std::time::Instant::now() + Duration::from_secs(5)
+                ),
+                "the input reached the line discipline"
+            );
 
             restore();
             let mut buffer = [0u8; 16];

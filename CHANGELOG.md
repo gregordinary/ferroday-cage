@@ -755,6 +755,8 @@ consumer upgrading can skip it.
   its step enum declares.
 - The terminal baseline's end-of-file character is one
   `terminal::BASELINE_VEOF`, which the relay's fallback reads.
+- Two unit tests that waited on a descriptor by hand wait through the
+  testkit's `fd::readable_by`.
 
 ## [0.5.2] - 2026-11-10
 

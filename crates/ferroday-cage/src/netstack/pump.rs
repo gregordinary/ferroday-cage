@@ -1635,16 +1635,8 @@ mod tests {
         let deadline = std::time::Instant::now() + within;
         let mut buffer = [0u8; 2048];
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
+            if !ferroday_cage_testkit::fd::readable_by(&driven.guest, deadline) {
                 return false;
-            }
-            let mut ready = [PollFd::new(&driven.guest, PollFlags::IN)];
-            match rustix::event::poll(&mut ready, Some(&crate::poll::timeout(left))) {
-                Ok(0) => return false,
-                Ok(_) => {}
-                Err(Errno::INTR) => continue,
-                Err(errno) => panic!("the guest's end cannot be polled: {errno}"),
             }
             let len = match rustix::io::read(&driven.guest, &mut buffer) {
                 Ok(len) => len,
