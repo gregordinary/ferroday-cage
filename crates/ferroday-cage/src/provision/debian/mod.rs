@@ -82,7 +82,7 @@ use super::{
 use crate::failure::path_io_error;
 use crate::provision::digest::{Algorithm, Digest};
 use crate::status::ExitStatus;
-use crate::{ErrorChain, IdMapper, IdentityMap};
+use crate::{IdMapper, IdentityMap};
 use bootstrap::{Installable, StatOverride};
 use digests::Digests;
 use index::{Index, Package};
@@ -729,37 +729,23 @@ impl Debian {
         // bootstrap takes: the increment's configure wave runs the target's
         // binaries, and a range map must be establishable.
         arch::preflight_foreign(&arch::host_architecture(), &self.architecture).map_err(wrap)?;
-        crate::provision::layer::network_filter_preflight()
+        super::layer::sandbox_preflight(&self.identity_map, self.id_mapper.as_ref())
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
-        crate::idmap::establishable(&self.identity_map, self.id_mapper.as_ref()).map_err(
-            |refusal| {
-                wrap(DebianError::Config {
-                    reason: ErrorChain::new(&refusal).to_string(),
-                })
-            },
-        )?;
 
         // The base's configured set seeds the resolver, and reading it refuses a
         // base that is not a configured bootstrap.
         let assume_installed = layer::read_installed_set(&base).map_err(wrap)?;
 
         // Create the upper and refuse a host that cannot establish an
-        // unprivileged overlay on its filesystem, before any download — the
-        // overlay preflight the primitive would make at cage-build time, hoisted
-        // ahead of the work. The probe runs on the upper's parent, its own
-        // filesystem, so its scratch files land beside the upper.
-        // The guard is taken as the upper is created, not on the way out, so a
+        // unprivileged overlay on its filesystem, before any download. The
+        // guard is taken as the upper is created, not on the way out, so a
         // failure below disposes of a partly-installed increment instead of
         // orphaning it: there is no handle in an `Err` for the caller to drop.
         // It disposes only of an upper this call created; one that was already
         // there is the caller's.
         let staging = Staging::begin(upper, self.identity_map.clone(), self.id_mapper.clone())?;
-        let scratch = crate::path::parent_of(upper);
-        if let Some(blocker) = crate::host::overlay_blocker(scratch) {
-            return Err(wrap(DebianError::Config {
-                reason: format!("an overlay-rooted build layer cannot be established: {blocker}"),
-            }));
-        }
+        super::layer::overlay_preflight(upper)
+            .map_err(|reason| wrap(DebianError::Config { reason }))?;
 
         // The archives cache: the caller's shared one, or a sibling of the
         // upper, which goes with this frame however it ends.
@@ -1785,17 +1771,8 @@ fn bootstrap_suite(
     // A full bootstrap must be able to run the target's binaries.
     if !extract_only {
         arch::preflight_foreign(&arch::host_architecture(), architecture).map_err(wrap)?;
-        crate::provision::layer::network_filter_preflight()
+        super::layer::sandbox_preflight(identity_map, id_mapper)
             .map_err(|reason| wrap(DebianError::Config { reason }))?;
-
-        // A range map must be establishable before anything is downloaded:
-        // an unavailable map is a configuration problem, and the identity
-        // posture is never quietly downgraded to the single-identity form.
-        crate::idmap::establishable(identity_map, id_mapper).map_err(|refusal| {
-            wrap(DebianError::Config {
-                reason: ErrorChain::new(&refusal).to_string(),
-            })
-        })?;
     }
 
     let packages = match plan {

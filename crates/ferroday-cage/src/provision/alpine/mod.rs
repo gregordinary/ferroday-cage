@@ -87,7 +87,7 @@ use super::{
     mirror_url,
 };
 use crate::failure::path_io_error;
-use crate::{ErrorChain, IdMapper, IdentityMap};
+use crate::{IdMapper, IdentityMap};
 use bootstrap::{Declared, ScriptSubject};
 use index::{Index, Record};
 use installed::{Carried, Claim, Database, Shape};
@@ -543,22 +543,15 @@ impl Alpine {
         // there is the caller's.
         let staging = Staging::begin(upper, self.identity_map.clone(), self.id_mapper.clone())?;
         // Refuse a host that cannot establish an unprivileged overlay on the
-        // upper's filesystem before any download — the preflight the primitive
-        // would make at cage-build time, hoisted ahead of the work. The probe
-        // runs on the upper's parent, its own filesystem, so its scratch files
-        // land beside the upper.
+        // upper's filesystem before any download.
         //
         // Not for an extract-only staging, which runs nothing and so roots no
         // cage of its own, for the same reason `preflight` skips the identity
         // map and the interpreter there. A caller who goes on to root a build
         // cage on the result meets the primitive's own check.
-        let scratch = crate::path::parent_of(upper);
-        if !self.extract_only
-            && let Some(blocker) = crate::host::overlay_blocker(scratch)
-        {
-            return Err(wrap(AlpineError::Config {
-                reason: format!("an overlay-rooted build layer cannot be established: {blocker}"),
-            }));
+        if !self.extract_only {
+            super::layer::overlay_preflight(upper)
+                .map_err(|reason| wrap(AlpineError::Config { reason }))?;
         }
 
         install(self, upper, Some(&base), observer)?;
@@ -1672,15 +1665,8 @@ fn preflight(alpine: &Alpine) -> Result<(), AlpineError> {
         return Ok(());
     }
     preflight_foreign(&host_architecture(), &alpine.architecture)?;
-    crate::provision::layer::network_filter_preflight()
-        .map_err(|reason| AlpineError::Config { reason })?;
-    // The identity posture is never quietly downgraded to the single-identity
-    // form.
-    crate::idmap::establishable(&alpine.identity_map, alpine.id_mapper.as_ref()).map_err(
-        |refusal| AlpineError::Config {
-            reason: ErrorChain::new(&refusal).to_string(),
-        },
-    )
+    super::layer::sandbox_preflight(&alpine.identity_map, alpine.id_mapper.as_ref())
+        .map_err(|reason| AlpineError::Config { reason })
 }
 
 /// The whole bootstrap: preflight, then install into the staging tree.
@@ -2923,6 +2909,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::ErrorChain;
     use crate::provision::FetchRequest;
     use crate::scratch::Scratch;
 

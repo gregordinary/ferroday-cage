@@ -66,13 +66,13 @@ use rustix::fs::Stat;
 use super::installed::{DB_DIR, Database, EXEC_DIR};
 use super::repository::Repository;
 use super::{AlpineError, AlpineEvent, AlpineObserver};
-use crate::provision::Stream;
+
 use crate::provision::accounts;
 use crate::provision::copyin::{self, Owed, Owner};
 use crate::provision::identity::Ownership;
-use crate::provision::layer::Rooting;
+use crate::provision::layer::{Forward, Rooting};
 use crate::provision::rooted::Rooted;
-use crate::{IdMapper, IdentityMap, Observer, Stdio};
+use crate::{IdMapper, IdentityMap};
 
 /// The set the caller asked for, as against the closure it resolved to.
 pub(super) const WORLD: &str = "etc/apk/world";
@@ -469,8 +469,7 @@ fn launch(
         source_date_epoch,
     } = site;
     let mut builder = rooting
-        .builder(staging)
-        .command(script)
+        .script_cage(staging, script, identity_map, id_mapper)
         .args(args)
         .base_env(false)
         .env("PATH", SCRIPT_PATH)
@@ -479,17 +478,10 @@ fn launch(
     if let Some(epoch) = source_date_epoch {
         builder = builder.env("SOURCE_DATE_EPOCH", epoch.to_string());
     }
-    let cage = builder
-        .stdin(Stdio::Null)
-        // The script exists only to serve this bootstrap. Tie it to the caller
-        // so a caller killed mid-bootstrap does not leave a maintainer script
-        // writing into a staging tree the error path is removing.
-        .stop_with_caller(true)
-        .identity_map(identity_map.clone())
-        .shared_id_mapper(id_mapper.cloned())
-        .build()
-        .map_err(AlpineError::Launch)?;
-    let mut output = ScriptOutput { emit: observer };
+    let cage = builder.build().map_err(AlpineError::Launch)?;
+    let mut output = Forward(|stream, bytes: &[u8]| {
+        observer.progress(AlpineEvent::CommandOutput { stream, bytes });
+    });
     let status = cage.run_with(&mut output).map_err(AlpineError::Launch)?;
     if status.success() {
         Ok(())
@@ -499,26 +491,6 @@ fn launch(
             script: kind.name(),
             status,
         })
-    }
-}
-
-/// Forwards a script's output to the bootstrap's observer.
-struct ScriptOutput<'a> {
-    emit: &'a mut dyn AlpineObserver,
-}
-
-impl Observer for ScriptOutput<'_> {
-    fn stdout(&mut self, chunk: &[u8]) {
-        self.emit.progress(AlpineEvent::CommandOutput {
-            stream: Stream::Stdout,
-            bytes: chunk,
-        });
-    }
-    fn stderr(&mut self, chunk: &[u8]) {
-        self.emit.progress(AlpineEvent::CommandOutput {
-            stream: Stream::Stderr,
-            bytes: chunk,
-        });
     }
 }
 

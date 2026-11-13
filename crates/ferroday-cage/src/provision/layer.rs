@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{Delegate, ProvisionError};
-use crate::{Cage, CageBuilder, IdMapper, IdentityMap};
+use crate::{IdMapper, IdentityMap};
 
 /// Where a wave of a provisioning run is rooted.
 ///
@@ -67,27 +67,37 @@ impl<'a> Rooting<'a> {
         }
     }
 
-    /// A cage builder rooted for the tree at `staging`, which is the whole root
-    /// or the increment's upper according to which rooting this is.
+    /// A cage builder for `command`, which a bootstrap runs in the tree at
+    /// `staging`: rooted on the whole root or on the increment's upper
+    /// according to which rooting this is, under `identity_map` through
+    /// `id_mapper`, with no standard input, and stopped with the caller.
     ///
-    /// The type's own allowance covers its variants and not this: an inherent
-    /// method is not the enum. It is dead in the same builds and for the same
-    /// reason — a `gentoo`-only build roots no cage during a bootstrap.
-    #[cfg_attr(
-        not(any(feature = "debian", feature = "alpine")),
-        allow(
-            dead_code,
-            reason = "the Gentoo layer roots no cage during a bootstrap"
-        )
-    )]
-    pub(crate) fn builder(self, staging: &Path) -> CageBuilder {
-        match self {
-            Rooting::Whole => Cage::builder().rootfs(staging),
+    /// The command exists only to serve the bootstrap, a `dpkg` wave or a
+    /// package's install script. Tied to the caller, a caller killed part way
+    /// does not leave it writing into a staging tree the error path is
+    /// removing. The caller adds the arguments, the environment and the binds
+    /// that are its own.
+    #[cfg(any(feature = "debian", feature = "alpine"))]
+    pub(crate) fn script_cage(
+        self,
+        staging: &Path,
+        command: &str,
+        identity_map: &IdentityMap,
+        id_mapper: Option<&Arc<dyn IdMapper>>,
+    ) -> crate::CageBuilder {
+        let builder = match self {
+            Rooting::Whole => crate::Cage::builder().rootfs(staging),
             // The base is the read-only lower and the tree being built is the
             // writable upper, so the command sees the merged root and writes
             // only into the upper.
-            Rooting::Over(base) => Cage::builder().overlay_rootfs(base, staging),
-        }
+            Rooting::Over(base) => crate::Cage::builder().overlay_rootfs(base, staging),
+        };
+        builder
+            .command(command)
+            .stdin(crate::Stdio::Null)
+            .stop_with_caller(true)
+            .identity_map(identity_map.clone())
+            .shared_id_mapper(id_mapper.cloned())
     }
 }
 
@@ -96,7 +106,7 @@ impl<'a> Rooting<'a> {
 /// before it downloads anything, beside
 /// [`idmap::establishable`](crate::idmap::establishable).
 ///
-/// [`Rooting::builder`] leaves a wave's cage the default network, a namespace of
+/// [`Rooting::script_cage`] leaves a wave's cage the default network, a namespace of
 /// its own, so every wave installs the network filter. A host where
 /// [`host::seccomp_available`](crate::host::seccomp_available) answers `false`
 /// fails each one at its launch, and asked before the download the refusal
@@ -113,6 +123,72 @@ pub(crate) fn network_filter_preflight() -> Result<(), String> {
          to lay out the root filesystem without running its binaries"
             .to_string(),
     )
+}
+
+/// Whether the sandboxes a bootstrap runs the target's binaries in can launch on
+/// this host, asked before it downloads anything: the network filter they carry
+/// ([`network_filter_preflight`]) and the identity map they run under
+/// ([`idmap::establishable`](crate::idmap::establishable)).
+///
+/// Each is a configuration problem, cheaper to report now than once a closure
+/// has been fetched, and the identity posture is never quietly downgraded to
+/// the single-identity form. Whether the host can execute the target's
+/// architecture at all is asked beside this, by each layer under its own
+/// architecture names.
+///
+/// # Errors
+///
+/// Returns the reason the first check refuses, for the layer to wrap in its own
+/// configuration failure.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) fn sandbox_preflight(
+    identity_map: &IdentityMap,
+    id_mapper: Option<&Arc<dyn IdMapper>>,
+) -> Result<(), String> {
+    network_filter_preflight()?;
+    crate::idmap::establishable(identity_map, id_mapper)
+        .map_err(|refusal| crate::ErrorChain::new(&refusal).to_string())
+}
+
+/// Whether an overlay-rooted build layer can be established over `upper`,
+/// asked before a layered build downloads anything: the check the cage would
+/// make when its build roots one, hoisted ahead of the work.
+///
+/// The probe runs on the upper's parent, its own filesystem, so its scratch
+/// files land beside the upper.
+///
+/// # Errors
+///
+/// Returns what the host lacks, for the layer to wrap in its own configuration
+/// failure.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) fn overlay_preflight(upper: &Path) -> Result<(), String> {
+    match crate::host::overlay_blocker(crate::path::parent_of(upper)) {
+        None => Ok(()),
+        Some(blocker) => Err(format!(
+            "an overlay-rooted build layer cannot be established: {blocker}"
+        )),
+    }
+}
+
+/// Forwards a sandboxed command's output to a layer's observer, handing each
+/// chunk to the closure with the stream it came from.
+///
+/// The closure turns a chunk into the layer's own output event, and is where a
+/// layer keeps what it needs of the output besides, as the Debian layer keeps
+/// the tail of `dpkg`'s stderr.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) struct Forward<F>(pub(crate) F);
+
+#[cfg(any(feature = "debian", feature = "alpine"))]
+impl<F: FnMut(super::Stream, &[u8])> crate::Observer for Forward<F> {
+    fn stdout(&mut self, chunk: &[u8]) {
+        (self.0)(super::Stream::Stdout, chunk);
+    }
+
+    fn stderr(&mut self, chunk: &[u8]) {
+        (self.0)(super::Stream::Stderr, chunk);
+    }
 }
 
 /// A staged build layer: the disposable overlay upper an increment was installed

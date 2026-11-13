@@ -542,7 +542,8 @@ report name a package and its version bare.
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Resolve a range identity map into the extents a delegate writes, validated | `idmap::resolve_delegate`, through the configured delegate or the bundled chain |
 | Can a provisioner establish its range map, asked before it downloads anything? | `idmap::establishable` |
-| Can the sandboxes a provisioner runs the target's binaries in install their network filter, asked before it downloads anything? | `provision::layer::network_filter_preflight`, over `host::seccomp_available` |
+| Can the sandboxes a provisioner runs the target's binaries in launch here, asked before it downloads anything? | `provision::layer::sandbox_preflight`, over `layer::network_filter_preflight`, which asks `host::seccomp_available`, and `idmap::establishable`; `layer::overlay_preflight` for a layered build's overlay |
+| Build the cage a bootstrap runs a package's command in, and hand its output to the layer's events | `provision::layer::Rooting::script_cage`, `layer::Forward` |
 | Can this process install a seccomp filter? | `host::seccomp_available`, which installs one in a forked child through `mechanism::seccomp::installable` |
 | Can a sandbox with a PID namespace of its own mount its procfs here, and why not? | `host::procfs_blocker`, which mounts one in a forked child through `mechanism::probe_procfs_mount`, and `host::procfs_refusal` for the explanation alone |
 | Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork with the limits on it and a leaf beneath it, which the launch stage joins through the leaf's `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |

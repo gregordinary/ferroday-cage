@@ -44,46 +44,19 @@ The delegate the builder takes for that map and hands each of the bootstrap's \
 cages, imported once by the layer and once by its bootstrap."""
 
 [[layer.reach]]
-name = "Observer"
-count = 1
-kind = "public"
-why = "The observer dpkg's output reaches the layer's own events through."
-
-[[layer.reach]]
-name = "Stdio"
-count = 1
-kind = "public"
-why = "`Stdio::Null`, the standard input a package script's cage runs with."
-
-[[layer.reach]]
-name = "host"
-count = 1
-kind = "public"
-why = "`host::overlay_blocker`, the preflight a layered build makes."
-
-[[layer.reach]]
 name = "status"
 count = 1
 kind = "public"
 why = "`ExitStatus`, the outcome a dpkg wave reports."
 
 [[layer.reach]]
-name = "idmap"
-count = 2
-kind = "internal"
-why = """\
-`idmap::establishable`, the preflight that refuses an unavailable or malformed \
-range map, through the caller's delegate or the bundled chain, before anything \
-is downloaded. Nothing public answers the question."""
-
-[[layer.reach]]
 name = "ErrorChain"
-count = 2
+count = 1
 kind = "public"
 why = """\
 The renderer that flattens one of the crate's own errors into a reason with \
-its causes: an index that does not decompress, a `.deb` the pool cannot read, \
-and a range map no delegate can establish."""
+its causes: an index that does not decompress, and a `.deb` the pool cannot \
+read."""
 
 [[layer.reach]]
 name = "failure"
@@ -96,15 +69,6 @@ name = "roster"
 count = 1
 kind = "internal"
 why = "`roster::roster_enum!`, which declares `Priority` and its roster."
-
-[[layer.reach]]
-name = "path"
-count = 1
-kind = "internal"
-why = """\
-`path::parent_of`, the directory beside a build layer's upper that the overlay \
-preflight probes, where `Path::parent` would answer a bare name with the empty \
-path."""
 
 [[layer]]
 name = "alpine"
@@ -134,34 +98,10 @@ kind = "public"
 why = "As in the Debian layer: once by the layer, once by its bootstrap."
 
 [[layer.reach]]
-name = "Observer"
-count = 1
-kind = "public"
-why = "The observer an install script's output reaches the layer's own events through."
-
-[[layer.reach]]
-name = "Stdio"
-count = 1
-kind = "public"
-why = "`Stdio::Null`, the standard input an install script's cage runs with."
-
-[[layer.reach]]
-name = "host"
-count = 1
-kind = "public"
-why = "`host::overlay_blocker`, the preflight a layered build makes."
-
-[[layer.reach]]
-name = "idmap"
-count = 1
-kind = "internal"
-why = "`idmap::establishable`, as in the Debian layer."
-
-[[layer.reach]]
 name = "ErrorChain"
-count = 3
+count = 2
 kind = "public"
-why = "As in the Debian layer, for a container's, a base layer's, and a refused map's reasons."
+why = "As in the Debian layer, for a container's and a base layer's reasons."
 
 [[layer.reach]]
 name = "failure"
@@ -177,10 +117,9 @@ why = "`roster::roster_enum!`, which declares `ScriptKind` and its roster."
 
 [[layer.reach]]
 name = "path"
-count = 2
+count = 1
 kind = "internal"
 why = """\
-`path::parent_of`, as in the Debian layer, for the same preflight; and \
 `path::is_ordinary_component`, the one rule for a name that becomes a single \
 path component: a signing key's name, which a bootstrap writes the key to \
 `/etc/apk/keys` under."""

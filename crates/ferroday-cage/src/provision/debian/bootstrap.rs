@@ -37,9 +37,9 @@ use crate::provision::Stream;
 use crate::provision::accounts;
 use crate::provision::document;
 use crate::provision::identity::Ownership;
-use crate::provision::layer::Rooting;
+use crate::provision::layer::{Forward, Rooting};
 use crate::provision::rooted::Rooted;
-use crate::{IdMapper, IdentityMap, Observer, Stdio};
+use crate::{IdMapper, IdentityMap};
 
 /// The core packages configured before the rest, in dependency order, so the
 /// base system (accounts, directories, the C library, dpkg itself) is in
@@ -680,16 +680,6 @@ fn write_delta_statoverride(
         .map_err(at("writing", upper, STATOVERRIDE))
 }
 
-/// Forwards a wave's dpkg output to the bootstrap's observer, keeping enough of
-/// stderr that a failing wave can name the packages dpkg reported.
-struct DpkgOutput<'a> {
-    emit: &'a mut dyn DebianObserver,
-    /// The tail of dpkg's stderr, bounded at [`DPKG_STDERR_KEPT`] and discarded
-    /// from the front: the list [`failed_packages`] reads is the last thing
-    /// dpkg writes, so what a bound drops is the unpack output ahead of it.
-    stderr_tail: Vec<u8>,
-}
-
 /// How much of a wave's stderr is kept to read its failure list out of. The
 /// whole of it is unbounded — a line per package acted on, plus whatever the
 /// maintainer scripts write — while the list sits at its end.
@@ -723,26 +713,6 @@ fn failed_packages(stderr: &[u8]) -> Vec<String> {
         .take_while(|line| line.starts_with(' ') && !line.trim().is_empty())
         .map(|line| line.trim().to_string())
         .collect()
-}
-
-impl Observer for DpkgOutput<'_> {
-    fn stdout(&mut self, chunk: &[u8]) {
-        self.emit.progress(DebianEvent::CommandOutput {
-            stream: Stream::Stdout,
-            bytes: chunk,
-        });
-    }
-    fn stderr(&mut self, chunk: &[u8]) {
-        self.emit.progress(DebianEvent::CommandOutput {
-            stream: Stream::Stderr,
-            bytes: chunk,
-        });
-        self.stderr_tail.extend_from_slice(chunk);
-        if self.stderr_tail.len() > DPKG_STDERR_KEPT {
-            let excess = self.stderr_tail.len() - DPKG_STDERR_KEPT;
-            self.stderr_tail.drain(..excess);
-        }
-    }
 }
 
 /// Installs one core package by name, if it is in the selection.
@@ -837,8 +807,7 @@ fn run_dpkg(
         source_date_epoch: _,
     } = wave;
     let cage = rooting
-        .builder(staging)
-        .command("/usr/bin/dpkg")
+        .script_cage(staging, "/usr/bin/dpkg", identity_map, id_mapper)
         .args(args)
         // Read-only so a wave cannot rewrite the packages it installs, in the
         // ordinary course of unpacking or otherwise. The command enters a nested
@@ -846,31 +815,33 @@ fn run_dpkg(
         // even though dpkg runs as namespace root — as a maintainer script needs
         // it to. See `CageBuilder::bind_ro`.
         .bind_ro(archives_host, ARCHIVES)
-        .stdin(Stdio::Null)
-        // The wave exists only to serve this bootstrap. Tie it to the caller so
-        // that a caller killed mid-bootstrap does not leave dpkg writing into a
-        // staging tree that `provision::ensure`'s error path is removing.
-        .stop_with_caller(true)
-        .identity_map(identity_map.clone())
-        .shared_id_mapper(id_mapper.cloned())
         .envs(
             env.iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         )
         .build()
         .map_err(DebianError::Launch)?;
-    let mut output = DpkgOutput {
-        emit: observer,
-        stderr_tail: Vec::new(),
-    };
-    let status = cage.run_with(&mut output).map_err(DebianError::Launch)?;
+    // The tail of dpkg's stderr, bounded at `DPKG_STDERR_KEPT` and discarded
+    // from the front: the list `failed_packages` reads is the last thing dpkg
+    // writes, so what a bound drops is the unpack output ahead of it.
+    let mut stderr_tail = Vec::new();
+    let status = cage
+        .run_with(&mut Forward(|stream, bytes: &[u8]| {
+            observer.progress(DebianEvent::CommandOutput { stream, bytes });
+            if stream == Stream::Stderr {
+                stderr_tail.extend_from_slice(bytes);
+                let excess = stderr_tail.len().saturating_sub(DPKG_STDERR_KEPT);
+                stderr_tail.drain(..excess);
+            }
+        }))
+        .map_err(DebianError::Launch)?;
     if status.success() {
         Ok(())
     } else {
         Err(DebianError::Configure {
             wave: name,
             status,
-            packages: failed_packages(&output.stderr_tail),
+            packages: failed_packages(&stderr_tail),
         })
     }
 }
