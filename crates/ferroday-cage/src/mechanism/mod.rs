@@ -632,6 +632,9 @@ pub(crate) struct LaunchPlan {
     /// The caller creates it before the fork; the launch stage only joins it,
     /// through a descriptor the context carries.
     pub(crate) cgroup: Option<crate::cgroup::CgroupPlan>,
+    /// The cgroup limits a launch runs without: set, not required, and with no
+    /// parent named. Caller-side, for the resolved inputs to report.
+    pub(crate) cgroup_unapplied: Vec<crate::cgroup::CgroupLimit>,
     /// The frozen hardening plan applied in the command stage before exec.
     /// Present only with the `hardening` feature.
     #[cfg(feature = "hardening")]

@@ -588,7 +588,8 @@ cannot hold the sandbox's cgroup:
   The kernel lets a process move one only where it may write the
   `cgroup.procs` of the nearest cgroup the two share.
 
-A value the kernel would refuse is refused at build.
+A value the kernel would refuse is refused at build, and so is a limit with no
+parent to apply it beneath, unless the limits are not required.
 [`host::cgroup_blocker`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.cgroup_blocker.html)
 gives the same answer before a launch, by the launch's own steps: it creates a
 cgroup beneath the parent, moves a short-lived child into it, and removes it.
@@ -615,6 +616,30 @@ memory-max = 536870912
 pids-max = 64
 cpu-max = { quota = 50000, period = 100000 }
 ```
+
+A configuration meant for hosts with and without a delegated cgroup marks its
+limits not required, with
+[`cgroup_required(false)`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.cgroup_required),
+`required = false` in the table, or `fcage --no-cgroup-required`. Where a
+parent is named, the limits apply as above. Where none is, the launch runs
+without them rather than being refused. Nothing drops silently: the [resolved
+inputs](embedding.md#recording-what-a-build-ran-under) report the limits as
+`ResolvedCgroup::NotApplied`, and `fcage` says so on standard error. `[rlimit]`
+limits then serve as the floor that holds everywhere:
+
+```toml
+[rlimit]
+data = 4294967296
+processes = 1024
+
+[cgroup]
+required = false
+memory-max = 4294967296
+pids-max = 1024
+```
+
+A named parent that cannot hold the sandbox's cgroup is refused whether or not
+the limits are required.
 
 ## What this boundary does not cover
 

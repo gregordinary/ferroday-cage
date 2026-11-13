@@ -2379,6 +2379,32 @@ impl CageBuilder {
         self
     }
 
+    /// Whether the [`cgroup_limit`](Self::cgroup_limit)s need a
+    /// [`cgroup_parent`](Self::cgroup_parent) (default `true`).
+    ///
+    /// Required, a limit without a parent is refused at [`build`](Self::build),
+    /// since it would hold nothing. Not required, a sandbox without a parent
+    /// runs without its cgroup limits, and
+    /// [`resolved_inputs`](Cage::resolved_inputs) reports them as
+    /// [`ResolvedCgroup::NotApplied`](crate::ResolvedCgroup::NotApplied), so
+    /// nothing drops silently. That suits a profile that holds a command to
+    /// limits where its caller can delegate a cgroup and runs it elsewhere,
+    /// with [`rlimit`](Self::rlimit)s as the floor that applies everywhere.
+    ///
+    /// It decides only what a missing parent means. A parent that is named and
+    /// cannot hold the sandbox's cgroup is refused at launch either way.
+    ///
+    /// ```toml
+    /// [cgroup]
+    /// required = false
+    /// memory-max = 4294967296
+    /// pids-max = 1024
+    /// ```
+    pub fn cgroup_required(mut self, required: bool) -> Self {
+        self.cgroup.required = Some(required);
+        self
+    }
+
     /// Controls whether `/proc` is mounted (default `true`).
     ///
     /// With the default PID namespace, `/proc` is a fresh procfs instance
@@ -2726,6 +2752,12 @@ impl CageBuilder {
         self.cgroup.limits()
     }
 
+    /// Whether the cgroup limits need a cgroup parent; see
+    /// [`cgroup_required`](Self::cgroup_required).
+    pub fn get_cgroup_required(&self) -> bool {
+        self.cgroup.required()
+    }
+
     /// Validates the configuration and freezes it into a [`Cage`].
     ///
     /// All fallible and allocating preparation happens here, in the calling
@@ -2820,6 +2852,7 @@ impl CageBuilder {
         let exec_label = exec_label(&command.path, &program_search);
         let (rlimits, rlimit_labels) = lower_rlimits(&self.rlimits)?;
         let cgroup = self.cgroup.plan()?;
+        let cgroup_unapplied = self.cgroup.unapplied();
         let args = self
             .args
             .iter()
@@ -3122,6 +3155,7 @@ impl CageBuilder {
                 rlimits,
                 rlimit_labels,
                 cgroup,
+                cgroup_unapplied,
                 #[cfg(feature = "hardening")]
                 hardening,
             },
@@ -3412,7 +3446,9 @@ impl CageBuilder {
         // in, and whose `cgroup.subtree_control` it enables controllers on,
         // which every sibling beneath the parent then has. Reserve it for a
         // trusted profile; the limits alone constrain only the sandbox, and
-        // without a parent `build` refuses them.
+        // without a parent `build` refuses them. `required = false` changes
+        // only that refusal: the limits are then the profile's own to waive,
+        // and the record reports them unapplied.
         if cgroup.parent.is_some() {
             return Err(ConfigError::ProfileOperationForbidden {
                 operation: "a cgroup parent",
@@ -8519,6 +8555,7 @@ work = "/var/tmp/work"
 
 [cgroup]
 parent = "/sys/fs/cgroup/delegated"
+required = true
 memory-max = 536870912
 memory-swap-max = 0
 pids-max = 64
@@ -8649,7 +8686,7 @@ target = "/work/.git/hooks"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 105] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 106] = [
         "args",
         "base-env",
         "cgroup",
@@ -8661,6 +8698,7 @@ target = "/work/.git/hooks"
         "cgroup.memory-swap-max",
         "cgroup.parent",
         "cgroup.pids-max",
+        "cgroup.required",
         "command",
         "empty-rootfs",
         "env",

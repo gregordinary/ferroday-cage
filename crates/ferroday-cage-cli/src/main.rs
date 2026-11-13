@@ -60,9 +60,9 @@ use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, Error, ErrorChain, ExitStatus, FsAccess,
     Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack,
-    NetStackHandle, Network, Overlay, PresentedIdentity, RawMount, ReadOnly, Resource,
-    RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen,
-    SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
+    NetStackHandle, Network, Overlay, PresentedIdentity, RawMount, ReadOnly, ResolvedCgroup,
+    ResolvedInputs, Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running,
+    SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
 };
 use serde::Deserialize as _;
 
@@ -1553,6 +1553,19 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--cgroup-required",
+        section: Section::Identity,
+        help: &[
+            "Refuse a launch whose --cgroup limits have no",
+            "--cgroup-parent to apply them beneath (the default;",
+            "--no-cgroup-required runs it without them)",
+        ],
+        take: Take::Bare(|options| {
+            options.cgroup_required = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--path-lookup",
         section: Section::Command,
         help: &[
@@ -2177,6 +2190,19 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--no-cgroup-required",
+        section: Section::Off,
+        help: &[
+            "Run without the cgroup limits where no --cgroup-parent",
+            "names a parent, saying so on standard error, rather",
+            "than refuse the launch",
+        ],
+        take: Take::Bare(|options| {
+            options.cgroup_required = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--no-landlock-resolve-unix",
         section: Section::Off,
         help: &[
@@ -2552,6 +2578,7 @@ struct Options {
     rlimits: Vec<(Resource, Limit, Limit)>,
     cgroup_parent: Option<PathBuf>,
     cgroup_limits: Vec<CgroupLimit>,
+    cgroup_required: Option<bool>,
     setenv: Vec<(OsString, OsString)>,
     hostname: Option<OsString>,
     chdir: Option<PathBuf>,
@@ -3088,6 +3115,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         rlimits: Vec::new(),
         cgroup_parent: None,
         cgroup_limits: Vec::new(),
+        cgroup_required: None,
         setenv: Vec::new(),
         hostname: None,
         chdir: None,
@@ -5481,6 +5509,9 @@ impl Launch {
         for limit in options.cgroup_limits {
             builder = builder.cgroup_limit(limit);
         }
+        if let Some(required) = options.cgroup_required {
+            builder = builder.cgroup_required(required);
+        }
         if let Some(map) = options.identity_map {
             builder = builder.identity_map(map);
         }
@@ -5858,6 +5889,9 @@ fn run_pending(
         Ok(cage) => cage,
         Err(error) => return finish(relay, Err(error.into())),
     };
+    if say_unapplied_cgroup(&cage.resolved_inputs()).is_err() {
+        return finish(relay, Err(Failure::ReaderGone));
+    }
 
     // Hold the command at the gate, attach the stack to the sandbox's
     // namespace and make the listeners on its loopback, then release the
@@ -6077,6 +6111,9 @@ fn run_restricted(options: Options) -> ExitCode {
     for limit in options.cgroup_limits {
         builder = builder.cgroup_limit(limit);
     }
+    if let Some(required) = options.cgroup_required {
+        builder = builder.cgroup_required(required);
+    }
     if let Some(tie) = stop_with_caller_default(options.stop_with_caller, false) {
         builder = builder.stop_with_caller(tie);
     }
@@ -6104,9 +6141,14 @@ fn run_restricted(options: Options) -> ExitCode {
             Ok(signals) => signals,
             Err(error) => return conclude(Err(error.into())),
         };
-        let launched = builder
-            .build()
-            .and_then(|restriction| restriction.spawn_terminal(&terminal::terminal_for_caller()));
+        let restriction = match builder.build() {
+            Ok(restriction) => restriction,
+            Err(error) => return conclude(Err(error.into())),
+        };
+        if say_unapplied_cgroup(&restriction.resolved_inputs()).is_err() {
+            return conclude(Err(Failure::ReaderGone));
+        }
+        let launched = restriction.spawn_terminal(&terminal::terminal_for_caller());
         let (running, pty) = match launched {
             Ok(launched) => launched,
             Err(error) => return conclude(Err(error.into())),
@@ -6125,11 +6167,33 @@ fn run_restricted(options: Options) -> ExitCode {
         Ok(relayed) => relayed,
         Err(code) => return code,
     };
-    let outcome = builder
-        .build()
-        .and_then(|restriction| restriction.spawn())
+    let restriction = match builder.build() {
+        Ok(restriction) => restriction,
+        Err(error) => return finish(relay, Err(error.into())),
+    };
+    if say_unapplied_cgroup(&restriction.resolved_inputs()).is_err() {
+        return finish(relay, Err(Failure::ReaderGone));
+    }
+    let outcome = restriction
+        .spawn()
         .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
     finish(relay, outcome.map_err(Failure::from))
+}
+
+/// Says on standard error that the cgroup limits are not applied, where the
+/// launch runs without them: they are not required, and no parent is named to
+/// apply them beneath.
+///
+/// The record a build resolves to reports the limits as unapplied; this is
+/// where a reader of `fcage`'s output learns it.
+fn say_unapplied_cgroup(inputs: &ResolvedInputs) -> Result<(), output::ReaderGone> {
+    match &inputs.cgroup {
+        Some(ResolvedCgroup::NotApplied { .. }) => output::say(format_args!(
+            "fcage: the cgroup limits are not applied: they are not required, and no \
+             --cgroup-parent names a parent to apply them beneath"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Makes `fcage` non-dumpable for the rest of its life, ahead of a restricted
@@ -8987,6 +9051,44 @@ mod tests {
                 "{args:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn cgroup_limits_without_a_parent_are_refused_unless_they_are_not_required() {
+        let options = run_options(&["--empty-rootfs", "--cgroup", "pids-max=8", "/bin/true"]);
+        assert_eq!(options.cgroup_required, None);
+        let options = run_options(&[
+            "--empty-rootfs",
+            "--cgroup",
+            "pids-max=8",
+            "--no-cgroup-required",
+            "/bin/true",
+        ]);
+        assert_eq!(options.cgroup_required, Some(false));
+        let options = run_options(&[
+            "--empty-rootfs",
+            "--no-cgroup-required",
+            "--cgroup-required",
+            "/bin/true",
+        ]);
+        assert_eq!(options.cgroup_required, Some(true), "the last flag wins");
+
+        let unparented = |required: bool| {
+            Cage::builder()
+                .empty_rootfs()
+                .command("/bin/true")
+                .cgroup_limit(CgroupLimit::PidsMax(8))
+                .cgroup_required(required)
+                .build()
+        };
+        assert!(unparented(true).is_err(), "required limits need a parent");
+        let inputs = unparented(false)
+            .expect("limits not required build without a parent")
+            .resolved_inputs();
+        assert!(
+            matches!(inputs.cgroup, Some(ResolvedCgroup::NotApplied { .. })),
+            "{inputs:?}"
+        );
     }
 
     #[test]

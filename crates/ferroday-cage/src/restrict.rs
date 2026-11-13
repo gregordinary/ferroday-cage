@@ -424,6 +424,16 @@ impl RestrictionBuilder {
         self
     }
 
+    /// Whether the cgroup limits need a cgroup parent (default `true`).
+    ///
+    /// The restriction's counterpart of
+    /// [`CageBuilder::cgroup_required`](crate::CageBuilder::cgroup_required),
+    /// with the same semantics.
+    pub fn cgroup_required(mut self, required: bool) -> Self {
+        self.cgroup.required = Some(required);
+        self
+    }
+
     /// Appends one argument to the command's argument list.
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
         self.args.push(arg.as_ref().to_os_string());
@@ -740,6 +750,12 @@ impl RestrictionBuilder {
         self.cgroup.limits()
     }
 
+    /// Whether the cgroup limits need a cgroup parent; see
+    /// [`cgroup_required`](Self::cgroup_required).
+    pub fn get_cgroup_required(&self) -> bool {
+        self.cgroup.required()
+    }
+
     /// Validates the configuration and freezes it into a [`Restriction`].
     ///
     /// All fallible and allocating preparation happens here: the command
@@ -754,6 +770,7 @@ impl RestrictionBuilder {
         let exec_label = spec::exec_label(&command.path, &[]);
         let (rlimits, rlimit_labels) = spec::lower_rlimits(&self.rlimits)?;
         let cgroup = self.cgroup.plan()?;
+        let cgroup_unapplied = self.cgroup.unapplied();
         let args = self
             .args
             .iter()
@@ -839,6 +856,7 @@ impl RestrictionBuilder {
                 rlimits,
                 rlimit_labels,
                 cgroup,
+                cgroup_unapplied,
                 hardening,
             },
         })

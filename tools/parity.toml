@@ -198,6 +198,10 @@ name = "cgroup_limit"
 flags = ["--cgroup"]
 
 [[builder.setting]]
+name = "cgroup_required"
+flags = ["--cgroup-required", "--no-cgroup-required"]
+
+[[builder.setting]]
 name = "seccomp"
 flags = [
     "--seccomp",
@@ -301,6 +305,10 @@ flags = ["--cgroup-parent"]
 [[builder.setting]]
 name = "cgroup_limit"
 flags = ["--cgroup"]
+
+[[builder.setting]]
+name = "cgroup_required"
+flags = ["--cgroup-required", "--no-cgroup-required"]
 
 [[builder.setting]]
 name = "seccomp"

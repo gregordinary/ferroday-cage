@@ -19,6 +19,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use crate::Network;
+use crate::cgroup::CgroupLimit;
 use crate::idmap::{IdRange, Identity};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{Confinement, IdentityPlan, LaunchPlan, MountAction, RootPlan, seccomp};
@@ -181,6 +182,13 @@ namespace the sandbox creates, not what may later be plugged into it.
     /// The resource limits applied to the command process, in the order they
     /// are applied.
     pub rlimits: Vec<ResolvedRlimit>,
+    /// The cgroup each launch is placed in, with the limits it holds the
+    /// sandbox's whole process tree to, or the cgroup limits a launch runs
+    /// without.
+    ///
+    /// `None` where the configuration names neither a cgroup parent nor a
+    /// cgroup limit.
+    pub cgroup: Option<ResolvedCgroup>,
     /// The hardening controls the command runs under.
     ///
     /// Present whether or not the `hardening` feature is compiled in, reporting
@@ -417,6 +425,55 @@ pub struct ResolvedRlimit {
     pub soft: Limit,
     /// The hard limit: the ceiling the command may raise its soft limit to.
     pub hard: Limit,
+}
+
+/// The cgroup a built sandbox's launches are placed in, and the limits on the
+/// whole process tree.
+///
+/// A tree held to a memory or a process ceiling can fail a build that an
+/// unbounded one completes, so the limits belong in the record beside the
+/// resource limits. Limits a launch runs without are recorded as well, so a
+/// record shows them dropped rather than leaving them out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(
+        tag = "kind",
+        rename_all = "kebab-case",
+        rename_all_fields = "kebab-case"
+    )
+)]
+pub enum ResolvedCgroup {
+    /// Each launch creates a cgroup of its own beneath `parent` and holds the
+    /// sandbox's whole process tree to `limits`. See
+    /// [`CageBuilder::cgroup_parent`](crate::CageBuilder::cgroup_parent).
+    #[non_exhaustive]
+    Applied {
+        /// The delegated directory each launch's cgroup is created beneath.
+        parent: PathBuf,
+        /// The limits, one of each kind, in a fixed order. Serialized as the
+        /// profile format's `[cgroup]` table spells them.
+        #[cfg_attr(
+            feature = "serde",
+            serde(serialize_with = "crate::cgroup::serialize_limits")
+        )]
+        limits: Vec<CgroupLimit>,
+    },
+    /// The limits are not applied. The configuration does not require them,
+    /// with [`cgroup_required(false)`](crate::CageBuilder::cgroup_required),
+    /// and names no parent, so a launch runs without them.
+    #[non_exhaustive]
+    NotApplied {
+        /// The limits a launch runs without, as
+        /// [`Applied::limits`](Self::Applied::limits) holds them.
+        #[cfg_attr(
+            feature = "serde",
+            serde(serialize_with = "crate::cgroup::serialize_limits")
+        )]
+        limits: Vec<CgroupLimit>,
+    },
 }
 
 /// The hardening controls a built sandbox applies before `execve`.
@@ -689,8 +746,24 @@ impl ResolvedInputs {
                 stderr: project_stdio(&plan.stderr),
             },
             rlimits: plan.rlimits.iter().map(project_rlimit).collect(),
+            cgroup: project_cgroup(plan),
             hardening: project_hardening(plan),
         }
+    }
+}
+
+/// Projects the cgroup each launch is placed in, or the limits a launch runs
+/// without.
+fn project_cgroup(plan: &LaunchPlan) -> Option<ResolvedCgroup> {
+    match &plan.cgroup {
+        Some(cgroup) => Some(ResolvedCgroup::Applied {
+            parent: cgroup.parent.clone(),
+            limits: cgroup.limits.clone(),
+        }),
+        None if !plan.cgroup_unapplied.is_empty() => Some(ResolvedCgroup::NotApplied {
+            limits: plan.cgroup_unapplied.clone(),
+        }),
+        None => None,
     }
 }
 
@@ -1019,17 +1092,29 @@ mod serde_tests {
     use std::path::PathBuf;
 
     use super::{
-        ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
+        ResolvedCgroup, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
         ResolvedLandlockNet, ResolvedMount, ResolvedNetworkFilter, ResolvedRlimit, ResolvedRoot,
         ResolvedStdio, ResolvedStreams, ResolvedSyscallRefusal,
     };
+    use crate::cgroup::CgroupLimit;
     use crate::idmap::{IdRange, Identity};
     use crate::limits::{Limit, Resource};
     use crate::scratch::Scratch;
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 64] = [
+    const EXPECTED_RECORD_KEYS: [&str; 75] = [
+        "cgroup",
+        "cgroup.kind",
+        "cgroup.limits",
+        "cgroup.limits.cpu-max",
+        "cgroup.limits.cpu-max.period",
+        "cgroup.limits.cpu-max.quota",
+        "cgroup.limits.cpu-weight",
+        "cgroup.limits.memory-max",
+        "cgroup.limits.memory-swap-max",
+        "cgroup.limits.pids-max",
+        "cgroup.parent",
         "env",
         "env.SOURCE_DATE_EPOCH",
         "hardening",
@@ -1182,6 +1267,16 @@ mod serde_tests {
                 soft: Limit::of(1024),
                 hard: Limit::UNLIMITED,
             }],
+            cgroup: Some(ResolvedCgroup::Applied {
+                parent: PathBuf::from("/sys/fs/cgroup/delegated"),
+                limits: vec![
+                    CgroupLimit::MemoryMax(1 << 30),
+                    CgroupLimit::MemorySwapMax(0),
+                    CgroupLimit::PidsMax(64),
+                    CgroupLimit::cpu_max(50_000, 100_000),
+                    CgroupLimit::CpuWeight(100),
+                ],
+            }),
             hardening: ResolvedHardening::Applied {
                 landlock_fs: vec![ResolvedLandlockFs {
                     path: PathBuf::from("/usr"),
@@ -1207,6 +1302,9 @@ mod serde_tests {
             identity: ResolvedIdentity::Single,
             run_as: None,
             present_as: Some(Identity::new(1000, 1000)),
+            cgroup: Some(ResolvedCgroup::NotApplied {
+                limits: vec![CgroupLimit::PidsMax(64)],
+            }),
             hardening: ResolvedHardening::Unavailable,
             ..everything.clone()
         };
@@ -1249,6 +1347,10 @@ mod serde_tests {
             ResolvedHardening::Unavailable => "hardening unavailable",
             ResolvedHardening::Applied { .. } => "hardening applied",
         };
+        let cgroup = record.cgroup.as_ref().map(|cgroup| match cgroup {
+            ResolvedCgroup::Applied { .. } => "cgroup applied",
+            ResolvedCgroup::NotApplied { .. } => "cgroup not applied",
+        });
         let mounts = record.mounts.iter().map(|mount| match mount {
             ResolvedMount::Tmpfs { .. } => "mount tmpfs",
             ResolvedMount::Procfs { .. } => "mount procfs",
@@ -1261,6 +1363,7 @@ mod serde_tests {
         });
         [root, identity, hardening]
             .into_iter()
+            .chain(cgroup)
             .chain(mounts)
             .collect()
     }
@@ -1281,6 +1384,8 @@ mod serde_tests {
         assert_eq!(
             held,
             BTreeSet::from([
+                "cgroup applied",
+                "cgroup not applied",
                 "hardening applied",
                 "hardening unavailable",
                 "identity caller",

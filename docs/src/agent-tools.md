@@ -49,9 +49,9 @@ let cage = Cage::builder()
 # }
 ```
 
-The limits come later in the chapter, since the example chooses them at run
-time. A core-dump limit of 0 holds in every case, because a core dump lands in
-the working tree. The command's standard input is empty. If the example exits,
+The limits come later in the chapter, since the example chooses where they
+apply at run time. A core-dump limit of 0 holds in every case, because a core
+dump lands in the working tree. The command's standard input is empty. If the example exits,
 the sandbox stops with it.
 
 ### The root
@@ -216,25 +216,29 @@ returns.
 ## The limits
 
 A command can fork without end and allocate without end, so the example bounds
-both. Where it runs in a delegated cgroup, it bounds the whole process tree in a
-[cgroup of the command's own](hardening.md#limits-on-the-whole-tree). Elsewhere
-it bounds each process alone:
+both. It bounds each process alone everywhere, and where it runs in a delegated
+cgroup, it bounds the whole process tree in a [cgroup of the command's
+own](hardening.md#limits-on-the-whole-tree) as well. The cgroup limits are not
+required, so a sandbox without a parent runs on the per-process limits, and its
+resolved inputs report the cgroup limits as not applied:
 
 ```rust,no_run
 use ferroday_cage::{Cage, CgroupLimit, Resource};
 
 # fn main() -> ferroday_cage::Result<()> {
 # let delegated: Option<std::path::PathBuf> = None;
-let builder = Cage::builder().host_rootfs().command("/usr/bin/make");
+let builder = Cage::builder()
+    .host_rootfs()
+    .command("/usr/bin/make")
+    .rlimit(Resource::Data, 4 << 30, 4 << 30)
+    .rlimit(Resource::Processes, 1024, 1024)
+    .cgroup_required(false)
+    .cgroup_limit(CgroupLimit::MemoryMax(4 << 30))
+    .cgroup_limit(CgroupLimit::MemorySwapMax(0))
+    .cgroup_limit(CgroupLimit::PidsMax(1024));
 let builder = match delegated {
-    Some(parent) => builder
-        .cgroup_parent(parent)
-        .cgroup_limit(CgroupLimit::MemoryMax(4 << 30))
-        .cgroup_limit(CgroupLimit::MemorySwapMax(0))
-        .cgroup_limit(CgroupLimit::PidsMax(1024)),
-    None => builder
-        .rlimit(Resource::Data, 4 << 30, 4 << 30)
-        .rlimit(Resource::Processes, 1024, 1024),
+    Some(parent) => builder.cgroup_parent(parent),
+    None => builder,
 };
 # let _ = builder.build()?;
 # Ok(())
@@ -245,8 +249,8 @@ A memory limit alone lets a tree that reaches it go on in swap, and a swap limit
 of 0 keeps the tree in memory. A host that does not account swap has no
 `memory.swap.max`, and the library refuses the launch with
 `Error::CgroupRefused`, which the example learns from `host::cgroup_blocker`
-before it chooses the limits. The per-process limits bound less: each process can hold
-4 GiB of writable memory, and [Resource limits](hardening.md#resource-limits)
+before it names the parent. The per-process limits bound less: each process can
+hold 4 GiB of writable memory, and [Resource limits](hardening.md#resource-limits)
 says how the kernel counts processes.
 
 ### Finding a delegated cgroup
@@ -266,8 +270,8 @@ one in the cgroup it runs in:
    controller the cgroup does not offer, or a kernel without
    `memory.swap.max`, among others.
 
-Where a step fails, the example uses the per-process limits, and says why on
-standard error. A scope from `systemd-run --user --scope -p Delegate=yes` is a
+Where a step fails, the example names no parent and runs on the per-process
+limits, and says why on standard error. A scope from `systemd-run --user --scope -p Delegate=yes` is a
 delegated cgroup with nothing else in it, and so is a service with
 `Delegate=yes`.
 
@@ -314,12 +318,11 @@ fcage --profile crates/ferroday-cage/examples/agent-tools.toml \
 `--forward-loopback` copies each connection to the target the service listens
 at on the host, a TCP address or a unix socket.
 
-The profile carries the per-process limits. With a delegated parent,
-`--cgroup-parent DIR` adds limits on the whole tree, each named by a `--cgroup`
-flag: `--cgroup memory-max=4294967296`, `--cgroup memory-swap-max=0` and
-`--cgroup pids-max=1024`. [Limits on the whole
-tree](hardening.md#limits-on-the-whole-tree) shows a shell moving itself into a
-leaf first.
+The profile carries both sets of limits, the cgroup's with `required = false`.
+With a delegated parent, `--cgroup-parent DIR` applies the limits on the whole
+tree; [Limits on the whole tree](hardening.md#limits-on-the-whole-tree) shows a
+shell moving itself into a leaf first. Without one, `fcage` runs the command on
+the per-process limits and says so on standard error.
 
 The profile leaves the unix-socket restriction to the host root's default,
 which applies where the kernel enforces it. `--landlock-resolve-unix` asks for

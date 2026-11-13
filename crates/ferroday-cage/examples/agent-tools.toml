@@ -31,9 +31,17 @@ HOME = "/tmp"
 [hardening]
 seccomp = "curated"
 
-# Per-process limits. Where a delegated cgroup is available, --cgroup-parent
-# and --cgroup add limits on the whole tree.
+# Limits on each process, which hold wherever the command runs.
 [rlimit]
 core-dump = 0
 data = 4294967296
 processes = 1024
+
+# Limits on the whole tree, where --cgroup-parent names a delegated cgroup to
+# apply them beneath. They are not required: without a parent the command runs
+# on the limits above, and fcage says so.
+[cgroup]
+required = false
+memory-max = 4294967296
+memory-swap-max = 0
+pids-max = 1024

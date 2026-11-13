@@ -322,6 +322,12 @@ creates a cgroup in, and whose controllers it enables for every cgroup beneath
 it. A trusted caller sets the parent after loading, with
 `CageBuilder::cgroup_parent`.
 
+A limit with no parent is refused at build, unless the table sets `required =
+false`. The launch then runs without the limits where no parent is named, and
+the resolved inputs report them as not applied. The [hardening
+chapter](hardening.md#limits-on-the-whole-tree) shows the pairing with an
+`[rlimit]` table as the floor.
+
 ## Hardening in a profile
 
 With the `hardening` feature, a profile carries the sandbox's Landlock,

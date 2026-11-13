@@ -253,6 +253,13 @@ pub(crate) struct CgroupSettings {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub(crate) parent: Option<PathBuf>,
+    /// Whether a launch without a parent is refused (the default) or runs
+    /// without the limits. `None` is the default.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub(crate) required: Option<bool>,
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -333,18 +340,35 @@ impl CgroupSettings {
         limits
     }
 
+    /// Whether a launch without a parent is refused rather than run without
+    /// the limits.
+    pub(crate) fn required(&self) -> bool {
+        self.required.unwrap_or(true)
+    }
+
+    /// The limits a launch leaves unapplied: every limit set, where no parent
+    /// is named and the limits are not required.
+    pub(crate) fn unapplied(&self) -> Vec<CgroupLimit> {
+        match self.parent.is_none() && !self.required() {
+            true => self.limits(),
+            false => Vec::new(),
+        }
+    }
+
     /// The plan a launch carries out, or the reason the settings are not one.
     ///
     /// `None` where no parent is named, which is no cgroup at all. A limit
-    /// without a parent is refused, since it would hold nothing.
+    /// without a parent is refused, since it would hold nothing, unless the
+    /// limits are not [required](Self::required): the launch then runs
+    /// without them, and [`unapplied`](Self::unapplied) names them.
     pub(crate) fn plan(&self) -> Result<Option<CgroupPlan>, crate::ConfigError> {
         let limits = self.limits();
         let Some(parent) = &self.parent else {
-            return match limits.is_empty() {
+            return match limits.is_empty() || !self.required() {
                 true => Ok(None),
                 false => Err(crate::ConfigError::CgroupLimitInvalid {
                     reason: "a cgroup limit needs a cgroup parent to create the sandbox's cgroup \
-                             beneath"
+                             beneath, unless the limits are not required"
                         .to_string(),
                 }),
             };
@@ -358,11 +382,12 @@ impl CgroupSettings {
             });
         }
         let mut writes = Vec::new();
-        for limit in limits {
-            writes.push(LimitWrite::of(limit)?);
+        for limit in &limits {
+            writes.push(LimitWrite::of(*limit)?);
         }
         Ok(Some(CgroupPlan {
             parent: parent.clone(),
+            limits,
             writes,
         }))
     }
@@ -373,8 +398,24 @@ impl CgroupSettings {
 pub(crate) struct CgroupPlan {
     /// The delegated directory the sandbox's cgroup is created beneath.
     pub(crate) parent: PathBuf,
+    /// The limits, in [`CgroupSettings::limits`]' order.
+    pub(crate) limits: Vec<CgroupLimit>,
     /// The limits, as the files and values they are written as.
     writes: Vec<LimitWrite>,
+}
+
+/// Writes `limits` as the profile format's `[cgroup]` table spells them, for
+/// the record [`ResolvedCgroup`](crate::ResolvedCgroup) serializes to.
+#[cfg(feature = "serde")]
+pub(crate) fn serialize_limits<S: serde::Serializer>(
+    limits: &[CgroupLimit],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut table = CgroupSettings::default();
+    for limit in limits {
+        table.set(*limit);
+    }
+    serde::Serialize::serialize(&table, serializer)
 }
 
 /// One limit, as the write that sets it.
@@ -868,5 +909,19 @@ mod tests {
         settings.parent = Some(PathBuf::from("/sys/fs/cgroup/delegated"));
         let plan = settings.plan().expect("a valid plan").expect("a cgroup");
         assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.limits, [CgroupLimit::PidsMax(8)]);
+        assert!(settings.unapplied().is_empty(), "a parent applies them");
+    }
+
+    #[test]
+    fn limits_not_required_and_without_a_parent_are_named_rather_than_refused() {
+        let mut settings = CgroupSettings::default();
+        settings.set(CgroupLimit::PidsMax(8));
+        settings.required = Some(false);
+        assert!(settings.plan().expect("not refused").is_none());
+        assert_eq!(settings.unapplied(), [CgroupLimit::PidsMax(8)]);
+        settings.required = Some(true);
+        assert!(settings.plan().is_err(), "required is the default's answer");
+        assert!(settings.unapplied().is_empty());
     }
 }

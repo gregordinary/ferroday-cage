@@ -2040,6 +2040,19 @@ impl core::marker::Unpin for ferroday_cage::Progress
 impl core::marker::UnsafeUnpin for ferroday_cage::Progress
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Progress
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Progress
+#[non_exhaustive] pub enum ferroday_cage::ResolvedCgroup
+#[non_exhaustive] pub ferroday_cage::ResolvedCgroup::Applied
+pub ferroday_cage::ResolvedCgroup::Applied::limits: alloc::vec::Vec<ferroday_cage::CgroupLimit>
+pub ferroday_cage::ResolvedCgroup::Applied::parent: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ResolvedCgroup::NotApplied
+pub ferroday_cage::ResolvedCgroup::NotApplied::limits: alloc::vec::Vec<ferroday_cage::CgroupLimit>
+impl core::marker::Freeze for ferroday_cage::ResolvedCgroup
+impl core::marker::Send for ferroday_cage::ResolvedCgroup
+impl core::marker::Sync for ferroday_cage::ResolvedCgroup
+impl core::marker::Unpin for ferroday_cage::ResolvedCgroup
+impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedCgroup
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedCgroup
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedCgroup
 #[non_exhaustive] pub enum ferroday_cage::ResolvedHardening
 #[non_exhaustive] pub ferroday_cage::ResolvedHardening::Applied
 pub ferroday_cage::ResolvedHardening::Applied::keep_capabilities: core::option::Option<u64>
@@ -2345,6 +2358,7 @@ pub fn ferroday_cage::CageBuilder::bind_ro(self, impl core::convert::AsRef<std::
 pub fn ferroday_cage::CageBuilder::build(self) -> core::result::Result<ferroday_cage::Cage, ferroday_cage::Error>
 pub fn ferroday_cage::CageBuilder::cgroup_limit(self, ferroday_cage::CgroupLimit) -> Self
 pub fn ferroday_cage::CageBuilder::cgroup_parent(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::CageBuilder::cgroup_required(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::clear_args(self) -> Self
 pub fn ferroday_cage::CageBuilder::command(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::current_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
@@ -2356,6 +2370,7 @@ pub fn ferroday_cage::CageBuilder::get_base_env(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_binds(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferroday_cage::Bind>
 pub fn ferroday_cage::CageBuilder::get_cgroup_limits(&self) -> alloc::vec::Vec<ferroday_cage::CgroupLimit>
 pub fn ferroday_cage::CageBuilder::get_cgroup_parent(&self) -> core::option::Option<&std::path::Path>
+pub fn ferroday_cage::CageBuilder::get_cgroup_required(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_command(&self) -> core::option::Option<&std::path::Path>
 pub fn ferroday_cage::CageBuilder::get_current_dir(&self) -> core::option::Option<&std::path::Path>
 pub fn ferroday_cage::CageBuilder::get_empty_rootfs(&self) -> bool
@@ -2843,6 +2858,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::ReadOnly
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ReadOnly
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ReadOnly
 #[non_exhaustive] pub struct ferroday_cage::ResolvedInputs
+pub ferroday_cage::ResolvedInputs::cgroup: core::option::Option<ferroday_cage::ResolvedCgroup>
 pub ferroday_cage::ResolvedInputs::env: alloc::vec::Vec<(std::ffi::os_str::OsString, std::ffi::os_str::OsString)>
 pub ferroday_cage::ResolvedInputs::hardening: ferroday_cage::ResolvedHardening
 pub ferroday_cage::ResolvedInputs::hostname: std::ffi::os_str::OsString
@@ -2994,6 +3010,7 @@ pub fn ferroday_cage::RestrictionBuilder::base_env(self, bool) -> Self
 pub fn ferroday_cage::RestrictionBuilder::build(self) -> core::result::Result<ferroday_cage::Restriction, ferroday_cage::Error>
 pub fn ferroday_cage::RestrictionBuilder::cgroup_limit(self, ferroday_cage::CgroupLimit) -> Self
 pub fn ferroday_cage::RestrictionBuilder::cgroup_parent(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::RestrictionBuilder::cgroup_required(self, bool) -> Self
 pub fn ferroday_cage::RestrictionBuilder::command(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::current_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
@@ -3002,6 +3019,7 @@ pub fn ferroday_cage::RestrictionBuilder::get_args(&self) -> &[std::ffi::os_str:
 pub fn ferroday_cage::RestrictionBuilder::get_base_env(&self) -> bool
 pub fn ferroday_cage::RestrictionBuilder::get_cgroup_limits(&self) -> alloc::vec::Vec<ferroday_cage::CgroupLimit>
 pub fn ferroday_cage::RestrictionBuilder::get_cgroup_parent(&self) -> core::option::Option<&std::path::Path>
+pub fn ferroday_cage::RestrictionBuilder::get_cgroup_required(&self) -> bool
 pub fn ferroday_cage::RestrictionBuilder::get_command(&self) -> core::option::Option<&std::path::Path>
 pub fn ferroday_cage::RestrictionBuilder::get_current_dir(&self) -> core::option::Option<&std::path::Path>
 pub fn ferroday_cage::RestrictionBuilder::get_envs(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&std::ffi::os_str::OsStr, &std::ffi::os_str::OsStr)>

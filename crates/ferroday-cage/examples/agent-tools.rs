@@ -24,9 +24,8 @@
 //! - **The restrictions** are the curated seccomp roster, and Landlock's refusal
 //!   of the pathname sockets the mounts leave in view, where the kernel enforces
 //!   it.
-//! - **The limits** are on the whole process tree, in a cgroup of the command's
-//!   own, where the example runs in a delegated cgroup. Elsewhere they are
-//!   per-process resource limits.
+//! - **The limits** are on each process, and on the whole process tree in a
+//!   cgroup of the command's own where the example runs in a delegated cgroup.
 //!
 //! Once the command has exited, the example reports what it used, the whole
 //! tree's figures included where the limits are a cgroup's.
@@ -92,12 +91,12 @@ const DEFAULT_PORT: u16 = 8080;
 /// stop and the kill.
 const KILL_AFTER: Duration = Duration::from_secs(5);
 
-/// The memory the command may use: the whole tree's under a cgroup, and each
-/// process's writable memory under the per-process limits.
+/// The memory the command may use: each process's writable memory, and the
+/// whole tree's under a cgroup.
 const MEMORY_MAX: u64 = 4 << 30;
 
-/// The processes and threads the command may run: at once across the tree
-/// under a cgroup, and per user id under the per-process limits.
+/// The processes and threads the command may run: per user id, and at once
+/// across the tree under a cgroup.
 const PROCESSES_MAX: u64 = 1024;
 
 /// The limits on the whole tree. Without the swap limit, a tree past its memory
@@ -192,16 +191,6 @@ struct Config {
 enum Entry {
     Directory,
     File,
-}
-
-/// How the example bounds what a command consumes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Limits {
-    /// A cgroup of the command's own beneath this delegated directory, which
-    /// bounds the whole tree.
-    Cgroup(PathBuf),
-    /// Per-process resource limits, where no delegated cgroup is available.
-    PerProcess,
 }
 
 /// Why a run did not reach the command's outcome.
@@ -356,17 +345,17 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
     }
     prepare_protected(&worktree)?;
 
-    let limits = match delegated_cgroup() {
+    let cgroup = match delegated_cgroup() {
         Ok(parent) => {
             eprintln!(
                 "agent-tools: limits on the whole tree, in a cgroup beneath {}",
                 parent.display()
             );
-            Limits::Cgroup(parent)
+            Some(parent)
         }
         Err(reason) => {
             eprintln!("agent-tools: limits on each process alone: {reason}");
-            Limits::PerProcess
+            None
         }
     };
     // Asked for on a kernel that cannot enforce it, the unix-socket restriction
@@ -379,7 +368,7 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
         );
     }
 
-    let cage = posture(&config, &worktree, &limits, resolve_unix)
+    let cage = posture(&config, &worktree, cgroup.as_deref(), resolve_unix)
         .command(&config.command[0])
         .args(&config.command[1..])
         .build()?;
@@ -407,8 +396,14 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
     })
 }
 
-/// The sandbox a tool command runs in, short of the command itself.
-fn posture(config: &Config, worktree: &Path, limits: &Limits, resolve_unix: bool) -> CageBuilder {
+/// The sandbox a tool command runs in, short of the command itself, with its
+/// limits on the whole tree in a cgroup beneath `cgroup` where one is given.
+fn posture(
+    config: &Config,
+    worktree: &Path,
+    cgroup: Option<&Path>,
+    resolve_unix: bool,
+) -> CageBuilder {
     let mut builder = if config.empty_root {
         host_userland()
     } else {
@@ -433,6 +428,12 @@ fn posture(config: &Config, worktree: &Path, limits: &Limits, resolve_unix: bool
         .landlock_resolve_unix(resolve_unix)
         // A core dump would land in the working tree.
         .rlimit(Resource::CoreDump, 0, 0)
+        // Each process alone, whether or not a cgroup holds the tree.
+        .rlimit(Resource::Data, MEMORY_MAX, MEMORY_MAX)
+        .rlimit(Resource::Processes, PROCESSES_MAX, PROCESSES_MAX)
+        // The whole tree, where a parent is named; without one the launch runs
+        // without these, and its resolved inputs say so.
+        .cgroup_required(false)
         .stdin(Stdio::Null)
         .stop_with_caller(true)
         .path_lookup(true)
@@ -441,13 +442,12 @@ fn posture(config: &Config, worktree: &Path, limits: &Limits, resolve_unix: bool
         .env("HOME", HOME)
         .envs(config.env.iter().map(|(name, value)| (name, value)));
 
-    match limits {
-        Limits::Cgroup(parent) => CGROUP_LIMITS
-            .into_iter()
-            .fold(builder.cgroup_parent(parent), CageBuilder::cgroup_limit),
-        Limits::PerProcess => builder
-            .rlimit(Resource::Data, MEMORY_MAX, MEMORY_MAX)
-            .rlimit(Resource::Processes, PROCESSES_MAX, PROCESSES_MAX),
+    builder = CGROUP_LIMITS
+        .into_iter()
+        .fold(builder, CageBuilder::cgroup_limit);
+    match cgroup {
+        Some(parent) => builder.cgroup_parent(parent),
+        None => builder,
     }
 }
 
@@ -802,19 +802,16 @@ mod tests {
     }
 
     #[test]
-    fn the_posture_builds_on_either_root_with_either_limits() {
+    fn the_posture_builds_on_either_root_with_or_without_a_cgroup() {
         let tree = worktree("posture");
         for empty_root in [false, true] {
-            for limits in [
-                Limits::PerProcess,
-                Limits::Cgroup(PathBuf::from("/sys/fs/cgroup/agent")),
-            ] {
+            for cgroup in [None, Some(Path::new("/sys/fs/cgroup/agent"))] {
                 let mut config = parse_run(&["git", "status"]);
                 config.empty_root = empty_root;
                 let built = posture(
                     &config,
                     &tree,
-                    &limits,
+                    cgroup,
                     host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
                 )
                 .command("git")
@@ -822,7 +819,7 @@ mod tests {
                 .build();
                 if let Err(error) = built {
                     panic!(
-                        "empty root {empty_root}, {limits:?}: {}",
+                        "empty root {empty_root}, cgroup {cgroup:?}: {}",
                         ErrorChain::new(&error)
                     );
                 }
@@ -849,7 +846,8 @@ mod tests {
 
     /// `fcage` reads the profile beside this file, and the guide's command line
     /// adds the working tree. Composed the way `fcage` composes them, the two
-    /// give the sandbox the example builds with per-process limits.
+    /// give the sandbox the example builds, with a cgroup parent and without
+    /// one.
     #[cfg(feature = "serde")]
     #[test]
     fn the_profile_describes_the_example_s_sandbox() {
@@ -858,36 +856,49 @@ mod tests {
         let profile: CageBuilder = toml::from_str(&text).expect("the profile parses");
 
         let tree = worktree("profile");
-        // The flags the guide gives: --bind, --chdir, --hide and --read-only,
-        // each extending the profile's lists or replacing its value.
-        let from_profile = profile
-            .bind(&tree, &tree)
-            .current_dir(&tree)
-            .hide(tree.join(".env"))
-            .read_only(tree.join(".git/hooks"))
-            .read_only(tree.join(".git/config"))
+        let parent = Path::new("/sys/fs/cgroup/agent");
+        for cgroup in [None, Some(parent)] {
+            // The flags the guide gives: --bind, --chdir, --hide and
+            // --read-only, each extending the profile's lists or replacing its
+            // value, and --cgroup-parent where a delegated cgroup is available.
+            let from_profile = profile
+                .clone()
+                .bind(&tree, &tree)
+                .current_dir(&tree)
+                .hide(tree.join(".env"))
+                .read_only(tree.join(".git/hooks"))
+                .read_only(tree.join(".git/config"))
+                .command("git");
+            let from_profile = match cgroup {
+                Some(parent) => from_profile.cgroup_parent(parent),
+                None => from_profile,
+            };
+            let example = posture(
+                &parse_run(&["git"]),
+                &tree,
+                cgroup,
+                host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
+            )
             .command("git");
-        let example = posture(
-            &parse_run(&["git"]),
-            &tree,
-            &Limits::PerProcess,
-            host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
-        )
-        .command("git");
-        // Two settings the resolved inputs do not record.
-        assert_eq!(
-            from_profile.get_stop_with_caller(),
-            example.get_stop_with_caller()
-        );
-        assert_eq!(from_profile.get_path_lookup(), example.get_path_lookup());
-        // The profile leaves the unix-socket restriction to the host root's
-        // default, which holds where the kernel enforces it, as the example's
-        // own choice does.
-        let [from_profile, example] = [from_profile, example].map(|builder| {
-            builder
-                .build()
-                .unwrap_or_else(|error| panic!("{}", ErrorChain::new(&error)))
-        });
-        assert_eq!(from_profile.resolved_inputs(), example.resolved_inputs());
+            // Two settings the resolved inputs do not record.
+            assert_eq!(
+                from_profile.get_stop_with_caller(),
+                example.get_stop_with_caller()
+            );
+            assert_eq!(from_profile.get_path_lookup(), example.get_path_lookup());
+            // The profile leaves the unix-socket restriction to the host root's
+            // default, which holds where the kernel enforces it, as the
+            // example's own choice does.
+            let [from_profile, example] = [from_profile, example].map(|builder| {
+                builder
+                    .build()
+                    .unwrap_or_else(|error| panic!("{}", ErrorChain::new(&error)))
+            });
+            assert_eq!(
+                from_profile.resolved_inputs(),
+                example.resolved_inputs(),
+                "cgroup {cgroup:?}"
+            );
+        }
     }
 }
