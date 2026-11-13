@@ -705,6 +705,10 @@ consumer upgrading can skip it.
 - `fcage` refuses a launch whose command no sandbox would run, a relative path
   or a name with no `PATH` to look it up in, before a `--provision-*` flag
   provisions its root, rather than after.
+- The network stack finds a UDP flow's port socket by its port, and expires a
+  port socket by a count of the flows using it. Each lookup searched the other
+  table, so every datagram a guest sent cost the product of the two tables'
+  sizes.
 
 ### Internal
 

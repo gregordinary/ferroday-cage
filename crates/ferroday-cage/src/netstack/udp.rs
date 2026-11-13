@@ -17,6 +17,15 @@
 //! reaped when its timeout falls due rather than waiting on the next unrelated
 //! wakeup. The clock is injected, so expiry is testable.
 //!
+//! The port sockets are indexed by port, and each counts the flows using it,
+//! so a pass costs what its flows and datagrams do: a flow finds its port
+//! socket in logarithmic time, and expiry removes a port socket by its count
+//! rather than by searching the flows for one still using it. The guest
+//! drives the passes, by sending, so a search of one table per entry of the
+//! other would make each datagram cost the product of the two. A guest
+//! datagram finds its flow by a search of the flow table, at most
+//! [`MAX_FLOWS`] long.
+//!
 //! Both directions are bounded by one packet. IP fragmentation is not compiled
 //! in, so a guest datagram larger than the interface MTU never arrives, and a
 //! host reply larger than [`deliverable`] cannot be carried to the guest: the
@@ -25,6 +34,7 @@
 //! resolver advertising a large EDNS buffer is the usual case — needs a larger
 //! MTU, which the stack's builder configures.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
@@ -96,8 +106,9 @@ const REPLY_BATCH: usize = PACKET_SLOTS;
 /// A smoltcp socket bound to one destination port, receiving the guest's
 /// datagrams to any address on it.
 struct UdpPort {
-    port: u16,
     handle: SocketHandle,
+    /// How many flows use the port, which keeps its socket while any does.
+    flows: usize,
 }
 
 /// One guest UDP flow and its host side.
@@ -119,7 +130,8 @@ struct UdpFlow {
 /// The UDP forwarding tables: the per-port receive sockets and the
 /// per-endpoint-pair host flows.
 pub(super) struct UdpTables {
-    ports: Vec<UdpPort>,
+    /// The port sockets, by the port each is bound to.
+    ports: BTreeMap<u16, UdpPort>,
     flows: Vec<UdpFlow>,
     /// The interface MTU, which sets the reply ceiling; see [`deliverable`].
     mtu: usize,
@@ -141,7 +153,7 @@ impl UdpTables {
     /// datagram is at most one MTU, each ring holds [`PACKET_SLOTS`] of them.
     pub(super) fn new(mtu: u16) -> UdpTables {
         UdpTables {
-            ports: Vec::new(),
+            ports: BTreeMap::new(),
             flows: Vec::new(),
             mtu: usize::from(mtu),
             payload_bytes: PACKET_SLOTS * usize::from(mtu),
@@ -153,7 +165,7 @@ impl UdpTables {
     /// somewhere to deliver the guest's datagrams. Called when a datagram
     /// to `port` is sniffed, before the interface processes it.
     pub(super) fn ensure_port(&mut self, port: u16, sockets: &mut SocketSet<'static>) {
-        if self.ports.iter().any(|entry| entry.port == port) {
+        if self.ports.contains_key(&port) {
             return;
         }
         let socket = udp::Socket::new(
@@ -174,7 +186,7 @@ impl UdpTables {
             sockets.remove(handle);
             return;
         }
-        self.ports.push(UdpPort { port, handle });
+        self.ports.insert(port, UdpPort { handle, flows: 0 });
     }
 
     /// How many flows the tables hold, which is the most host sockets
@@ -201,8 +213,7 @@ impl UdpTables {
             .iter()
             .filter(move |flow| {
                 self.ports
-                    .iter()
-                    .find(|port| port.port == flow.destination.port)
+                    .get(&flow.destination.port)
                     .is_some_and(|port| sockets.get::<udp::Socket>(port.handle).can_send())
             })
             .map(|flow| &flow.host)
@@ -241,9 +252,9 @@ impl UdpTables {
             scratch,
             ..
         } = self;
-        for &UdpPort { port, handle } in ports.iter() {
+        for (&port, entry) in ports.iter_mut() {
             loop {
-                let socket = sockets.get_mut::<udp::Socket>(handle);
+                let socket = sockets.get_mut::<udp::Socket>(entry.handle);
                 let (len, meta) = match socket.recv_slice(scratch) {
                     Ok(datagram) => datagram,
                     // The ring is drained; move to the next port.
@@ -279,7 +290,9 @@ impl UdpTables {
                 if !plan.is_guest(guest.addr) {
                     continue;
                 }
-                forward_out(flows, guest, destination, &scratch[..len], plan, now);
+                if forward_out(flows, guest, destination, &scratch[..len], plan, now) {
+                    entry.flows += 1;
+                }
             }
         }
         progress
@@ -303,7 +316,7 @@ impl UdpTables {
             ..
         } = self;
         for flow in flows.iter_mut() {
-            let Some(port) = ports.iter().find(|port| port.port == flow.destination.port) else {
+            let Some(port) = ports.get(&flow.destination.port) else {
                 continue;
             };
             let ceiling = deliverable(*mtu, &flow.destination);
@@ -390,12 +403,16 @@ impl UdpTables {
     /// than to the flow: dropping it while another flow shares the port would
     /// silently stop that flow's replies.
     pub(super) fn expire(&mut self, sockets: &mut SocketSet<'static>, now: Instant) {
-        self.flows.retain(|flow| {
-            !flow.dead && now.saturating_duration_since(flow.last_active) < IDLE_TIMEOUT
+        let UdpTables { ports, flows, .. } = self;
+        flows.retain(|flow| {
+            let live = !flow.dead && now.saturating_duration_since(flow.last_active) < IDLE_TIMEOUT;
+            if !live && let Some(port) = ports.get_mut(&flow.destination.port) {
+                port.flows -= 1;
+            }
+            live
         });
-        let flows = &self.flows;
-        self.ports.retain(|port| {
-            let used = flows.iter().any(|flow| flow.destination.port == port.port);
+        ports.retain(|_, port| {
+            let used = port.flows > 0;
             if !used {
                 sockets.remove(port.handle);
             }
@@ -405,7 +422,8 @@ impl UdpTables {
 }
 
 /// Sends one guest datagram out its host flow, opening a flow in `flows` if the
-/// endpoint pair is new and policy admits the destination.
+/// endpoint pair is new and policy admits the destination. Returns whether it
+/// opened one, which the caller counts against the destination's port.
 ///
 /// Takes the flow table rather than the whole of [`UdpTables`] so its caller can
 /// hold the shared scratch buffer across the call.
@@ -416,7 +434,7 @@ fn forward_out(
     payload: &[u8],
     plan: &Plan,
     now: Instant,
-) {
+) -> bool {
     if let Some(flow) = flows
         .iter_mut()
         .find(|flow| flow.guest == guest && flow.destination == destination)
@@ -424,26 +442,28 @@ fn forward_out(
         if rustix::net::send(&flow.host, payload, SendFlags::NOSIGNAL).is_ok() {
             flow.last_active = now;
         }
-        return;
+        return false;
     }
     if flows.len() >= MAX_FLOWS {
-        return;
+        return false;
     }
     let Some(target) = host_target(destination, plan) else {
-        return;
+        return false;
     };
     let Ok(host) = connect_host(target) else {
-        return;
+        return false;
     };
-    if rustix::net::send(&host, payload, SendFlags::NOSIGNAL).is_ok() {
-        flows.push(UdpFlow {
-            guest,
-            destination,
-            host,
-            last_active: now,
-            dead: false,
-        });
+    if rustix::net::send(&host, payload, SendFlags::NOSIGNAL).is_err() {
+        return false;
     }
+    flows.push(UdpFlow {
+        guest,
+        destination,
+        host,
+        last_active: now,
+        dead: false,
+    });
+    true
 }
 
 /// Opens a connected, nonblocking host UDP socket to `target`.
@@ -489,6 +509,22 @@ mod tests {
         }
     }
 
+    impl UdpTables {
+        /// Adds `flow` as `forward_out` opens one, counted against its port.
+        fn adopt(&mut self, flow: UdpFlow) {
+            self.ports
+                .get_mut(&flow.destination.port)
+                .expect("the flow's port has a socket")
+                .flows += 1;
+            self.flows.push(flow);
+        }
+
+        /// The handle of the socket bound to `port`.
+        fn port(&self, port: u16) -> SocketHandle {
+            self.ports.get(&port).expect("the port has a socket").handle
+        }
+    }
+
     /// Whether the flow's host socket has been drained empty.
     fn drained(flow: &UdpFlow) -> bool {
         let mut leftover = [0u8; 8];
@@ -511,7 +547,7 @@ mod tests {
             let (flow_side, _peer) = host_pair();
             let mut flow = flow_over(flow_side);
             flow.last_active = base;
-            tables.flows.push(flow);
+            tables.adopt(flow);
             tables.expire(&mut sockets, base + elapsed);
             (tables.flows.len(), tables.ports.len())
         };
@@ -543,7 +579,7 @@ mod tests {
         let mut flow = flow_over(flow_side);
         flow.last_active = now;
         flow.dead = true;
-        tables.flows.push(flow);
+        tables.adopt(flow);
 
         tables.expire(&mut sockets, now);
         assert!(tables.flows.is_empty());
@@ -563,13 +599,13 @@ mod tests {
         let (idle_side, _idle_peer) = host_pair();
         let mut idle = flow_over(idle_side);
         idle.last_active = now;
-        tables.flows.push(idle);
+        tables.adopt(idle);
 
         let (live_side, _live_peer) = host_pair();
         let mut live = flow_over(live_side);
         live.guest = IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 40_001);
         live.last_active = now + IDLE_TIMEOUT;
-        tables.flows.push(live);
+        tables.adopt(live);
 
         tables.expire(&mut sockets, now + IDLE_TIMEOUT);
         assert_eq!(tables.flows.len(), 1, "only the idle flow is reaped");
@@ -590,7 +626,7 @@ mod tests {
         for _ in 0..REPLY_BATCH * 4 {
             rustix::net::send(&peer, b"reply", SendFlags::NOSIGNAL).unwrap();
         }
-        tables.flows.push(flow_over(flow_side));
+        tables.adopt(flow_over(flow_side));
 
         assert!(tables.host_to_guest(&mut sockets, Instant::now()));
         let flow = &tables.flows[0];
@@ -614,11 +650,11 @@ mod tests {
         let (flow_side, peer) = host_pair();
         rustix::net::send(&peer, b"", SendFlags::NOSIGNAL).unwrap();
         rustix::net::send(&peer, b"answer", SendFlags::NOSIGNAL).unwrap();
-        tables.flows.push(flow_over(flow_side));
+        tables.adopt(flow_over(flow_side));
 
         assert!(tables.host_to_guest(&mut sockets, Instant::now()));
         assert!(drained(&tables.flows[0]), "both datagrams were taken");
-        let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+        let socket = sockets.get_mut::<udp::Socket>(tables.port(53));
         assert_eq!(
             socket.send_queue(),
             b"answer".len(),
@@ -638,7 +674,7 @@ mod tests {
         let (flow_side, peer) = host_pair();
         let flow = flow_over(flow_side);
         {
-            let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+            let socket = sockets.get_mut::<udp::Socket>(tables.port(53));
             for _ in 0..PACKET_SLOTS {
                 let meta = udp::UdpMetadata {
                     endpoint: flow.guest,
@@ -653,7 +689,7 @@ mod tests {
         }
         rustix::net::send(&peer, b"answer", SendFlags::NOSIGNAL).unwrap();
         let before = flow.last_active;
-        tables.flows.push(flow);
+        tables.adopt(flow);
 
         assert!(
             !tables.host_to_guest(&mut sockets, Instant::now()),
@@ -683,10 +719,10 @@ mod tests {
             local_address: Some(flow.destination.addr),
             meta: Default::default(),
         };
-        tables.flows.push(flow);
+        tables.adopt(flow);
         assert_eq!(tables.reply_interest(&sockets).count(), 1);
 
-        let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+        let socket = sockets.get_mut::<udp::Socket>(tables.port(53));
         for _ in 0..PACKET_SLOTS {
             socket
                 .send_slice(b"queued", meta)
@@ -714,11 +750,11 @@ mod tests {
             vec![0u8; deliverable(1500, &IpEndpoint::new(IpAddress::v4(10, 0, 2, 3), 53)) + 1];
         rustix::net::send(&peer, &oversized, SendFlags::NOSIGNAL).unwrap();
         rustix::net::send(&peer, b"answer", SendFlags::NOSIGNAL).unwrap();
-        tables.flows.push(flow_over(flow_side));
+        tables.adopt(flow_over(flow_side));
 
         assert!(tables.host_to_guest(&mut sockets, Instant::now()));
         assert!(drained(&tables.flows[0]), "both datagrams were taken");
-        let socket = sockets.get_mut::<udp::Socket>(tables.ports[0].handle);
+        let socket = sockets.get_mut::<udp::Socket>(tables.port(53));
         assert_eq!(
             socket.send_queue(),
             b"answer".len(),
