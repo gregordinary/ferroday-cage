@@ -97,13 +97,31 @@ impl PackageCache {
     /// when the caller names none: the sibling of the tree named after it with
     /// `suffix`.
     ///
+    /// Composed from the tree's parent and its final component, as an overlay
+    /// upper's work directory is (`spec::overlay_work_dir`), rather than by
+    /// appending to the path as it was spelled: `/srv/upper/` names the tree
+    /// `/srv/upper`, and appending would derive `/srv/upper/.fcage-debs`, a
+    /// directory inside it. A tree spelled with no final component, such as
+    /// `.`, is named by its canonical path. The root directory has no sibling,
+    /// and its cache is the root followed by the suffix.
+    ///
     /// Answered on its own so a caller can tell whether a directory it was
     /// handed is that one, which the run would remove as its own; see
     /// `is_derived`, which asks it of the directory rather than of a spelling.
     pub(crate) fn derived(tree: &Path, suffix: &str) -> PathBuf {
-        let mut sibling = tree.as_os_str().to_os_string();
-        sibling.push(suffix);
-        PathBuf::from(sibling)
+        let sibling = |tree: &Path| {
+            let (parent, name) = (tree.parent()?, tree.file_name()?);
+            let mut name = name.to_os_string();
+            name.push(suffix);
+            Some(parent.join(name))
+        };
+        sibling(tree)
+            .or_else(|| fs::canonicalize(tree).ok().as_deref().and_then(sibling))
+            .unwrap_or_else(|| {
+                let mut inside = tree.as_os_str().to_os_string();
+                inside.push(suffix);
+                PathBuf::from(inside)
+            })
     }
 
     /// Whether `dir` is the directory [`derived`](Self::derived) names for
@@ -1182,5 +1200,30 @@ mod tests {
             .expect("the open returned rather than waiting on the pipe");
         let err = outcome.expect_err("a pipe is not an entry");
         assert!(err.to_string().contains("is not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn a_derived_cache_is_a_sibling_however_the_tree_is_spelled() {
+        // A trailing slash names the same tree, and appending to the spelling
+        // would put the cache inside it, where an extraction can reach it.
+        for (tree, cache) in [
+            ("/srv/upper", "/srv/upper.cache"),
+            ("/srv/upper/", "/srv/upper.cache"),
+            ("/srv/upper/.", "/srv/upper.cache"),
+            ("upper/", "upper.cache"),
+        ] {
+            assert_eq!(
+                PackageCache::derived(Path::new(tree), ".cache"),
+                Path::new(cache),
+                "{tree}"
+            );
+        }
+        // A spelling with no final component is named by where it resolves.
+        let dir = Scratch::new("cache-derived");
+        std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
+        assert_eq!(
+            PackageCache::derived(&dir.join("tree/sub/.."), ".cache"),
+            fs::canonicalize(dir.path()).unwrap().join("tree.cache"),
+        );
     }
 }

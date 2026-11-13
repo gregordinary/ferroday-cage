@@ -910,6 +910,10 @@ consumer upgrading can skip it.
   recorded the entry as owned by 65534: a tree built under the subordinate map
   and exported with the default map was archived with every entry the caller
   did not own given to `nobody`.
+- A provisioner that is given no cache directory derives its own beside the
+  tree it builds however the tree's path is spelled. A tree named with a
+  trailing slash, as `/srv/upper/`, had its downloads placed inside the tree,
+  within reach of the packages extracted there.
 
 ### Internal
 
