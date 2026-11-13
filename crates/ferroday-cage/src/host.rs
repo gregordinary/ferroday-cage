@@ -365,7 +365,16 @@ pub fn cgroup_blocker(
 /// moves no process of the caller's. [`cgroup_blocker`] then answers whether
 /// the cgroup can hold a launch's.
 ///
+/// A process moves with its threads, except a thread already exiting, which
+/// the kernel leaves in the cgroup until its exit completes. Until then the
+/// cgroup cannot enable a controller for its children, and a launch whose
+/// limits need one is refused with [`CgroupRefusal::ParentHoldsProcesses`],
+/// although `cgroup.procs`, which lists only each process's leader, may list
+/// nothing. A caller whose threads can be ending as it moves waits for the
+/// cgroup's `cgroup.threads` to list none.
+///
 /// [`CageBuilder::cgroup_parent`]: crate::CageBuilder::cgroup_parent
+/// [`CgroupRefusal::ParentHoldsProcesses`]: crate::CgroupRefusal::ParentHoldsProcesses
 pub fn own_cgroup() -> Option<PathBuf> {
     let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;

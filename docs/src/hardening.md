@@ -575,6 +575,12 @@ systemd-run --user --scope -p Delegate=yes sh -c '
         --cgroup pids-max=64 --rootfs /srv/rootfs/alpine -- /usr/bin/analyze'
 ```
 
+A process moves with its threads, except a thread already exiting, which stays
+in the parent until its exit completes. The parent refuses controllers for its
+children until then, as it does while it holds a process. A caller whose
+threads can be ending as it moves waits for the parent's `cgroup.threads` to
+list none before it launches.
+
 A limit is never left silently unenforced. A launch fails with
 `Error::CgroupRefused`, and a `CgroupRefusal` saying why, where the parent
 cannot hold the sandbox's cgroup:
