@@ -23,13 +23,16 @@
 //! tag, and its point releases are tagged on that branch alone. So an index of
 //! a stable release describes itself by one of that release's tags, and an
 //! `edge` index by a snapshot, a pre-release (`v3.25.0_rc1`), or the newest
-//! release's `.0`, never by a point release. That is the rule [`check`]
-//! applies:
+//! release's `.0`, never by a point release. Which release is the newest is a
+//! fact about the archive at the moment of the fetch, which nothing signed
+//! states; [`NEWEST_RELEASE`] is the newest this version knows of, and an
+//! `edge` index describing a `.0` is held to that release or a later one. That
+//! is the rule [`check`] applies:
 //!
 //! | Requested | The description's tag must be |
 //! | --- | --- |
 //! | `vX.Y` | a release of `X.Y`: `vX.Y.Z`, with no pre-release suffix |
-//! | `edge` | a snapshot, a pre-release, or a `.0` release |
+//! | `edge` | a snapshot, a pre-release, or the `.0` of [`NEWEST_RELEASE`] or of a later release |
 //! | `latest-stable` | a release of any version |
 //!
 //! Any other release name is refused for an index Alpine signed, since Alpine
@@ -42,8 +45,11 @@
 //! Until the development branch is next tagged, an `edge` index describes
 //! itself by the newest release's `.0` tag, exactly as that release's own
 //! indexes do before its first point release, so in that window the two cannot
-//! be told apart either; `latest-stable` binds to some stable release and not
-//! to which.
+//! be told apart either. The window this version leaves open is wider by every
+//! release made since [`NEWEST_RELEASE`]: a release this version cannot know of
+//! may be the newest, so its `.0` is admitted as `edge`, and so is an index of
+//! that release's own from before its first point release. `latest-stable` binds
+//! to some stable release and not to which.
 //!
 //! The rule is Alpine's builders' convention, so it applies to an index a key
 //! of Alpine's verified and to no other. postmarketOS describes its indexes by
@@ -58,6 +64,18 @@ const EDGE: &str = "edge";
 
 /// The name the archive publishes its newest stable release under as well.
 const LATEST_STABLE: &str = "latest-stable";
+
+/// The newest release Alpine had made when this version was written, as its
+/// series `X.Y`.
+///
+/// An `edge` index describes itself by the `.0` of the newest release until the
+/// development branch is next tagged, and an index of any release does so too
+/// until that release's first point release. Holding an `edge` index's `.0` to
+/// this release or a later one keeps an older release's index from binding as
+/// `edge`. Raising it with each release narrows that window back to the newest
+/// release's; left as it is, it refuses nothing an `edge` index describes
+/// itself by.
+const NEWEST_RELEASE: (u32, u32) = (3, 24);
 
 /// Requires an index fetched as `release` and verified by the key named
 /// `signed_by` to describe itself as that release, where Alpine signed it.
@@ -92,10 +110,13 @@ pub(super) fn check(
     };
     let tag = Tag::of(description);
     let binds = match release {
-        EDGE => matches!(
-            tag,
-            Tag::Snapshot | Tag::PreRelease { .. } | Tag::Release { point: "0", .. }
-        ),
+        EDGE => match tag {
+            Tag::Snapshot | Tag::PreRelease { .. } => true,
+            Tag::Release { series, point: "0" } => {
+                series_of(series).is_some_and(|series| series >= NEWEST_RELEASE)
+            }
+            Tag::Release { .. } | Tag::Unknown => false,
+        },
         LATEST_STABLE => matches!(tag, Tag::Release { .. }),
         _ => {
             let Some(requested) = stable(release) else {
@@ -130,6 +151,14 @@ fn stable(release: &str) -> Option<&str> {
     let series = release.strip_prefix('v')?;
     let (major, minor) = series.split_once('.')?;
     (is_number(major) && is_number(minor)).then_some(series)
+}
+
+/// The `(X, Y)` a series `X.Y` names, or `None` for a number past `u32`.
+///
+/// A [`Tag`] has already held both to digits, so this only orders them.
+fn series_of(series: &str) -> Option<(u32, u32)> {
+    let (major, minor) = series.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 /// Whether `text` is a non-empty run of ASCII digits.
@@ -294,13 +323,27 @@ mod tests {
             "v3.23.0_alpha20250612-3-g9794cca5e08",
             // The window after a release, before the next snapshot.
             "v3.24.0-1200-gabc",
+            // And after a release this version cannot know of.
+            "v3.25.0-31-gabc",
+            "v4.0.0",
         ] {
             assert!(binds("edge", description), "{description}");
         }
-        // A point release is tagged on its stable branch alone.
-        for description in ["v3.23.8-18-g133b733e65d", "v3.24.1-2-gabc"] {
+        for description in [
+            // A point release is tagged on its stable branch alone.
+            "v3.23.8-18-g133b733e65d",
+            "v3.24.1-2-gabc",
+            // A release older than the newest is not the newest's window: its
+            // index before its first point release is a stable index.
+            "v3.23.0-40-gabc",
+            "v3.10.0-43-g3feb769ea3",
+            // A series past what a number holds is no release.
+            "v3.99999999999.0",
+        ] {
             assert!(!binds("edge", description), "{description}");
         }
+        let (major, minor) = NEWEST_RELEASE;
+        assert!(binds("edge", &format!("v{major}.{minor}.0")));
     }
 
     #[test]

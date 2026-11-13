@@ -549,8 +549,9 @@ covers. Alpine's builders write `git describe` of the tree the index was built
 from there, such as `v3.23.8-18-g133b733e65d`:
 
 - An index fetched as `vX.Y` must describe a release of `X.Y`.
-- One fetched as `edge` must describe a snapshot, a pre-release, or a
-  release's `.0`. Point releases are tagged on their stable branch alone.
+- One fetched as `edge` must describe a snapshot, a pre-release, or the `.0`
+  of v3.24 or a later release. Point releases are tagged on their stable branch
+  alone, and v3.24 is the newest release this version of the library knows of.
 - One fetched as `latest-stable` must describe some release.
 - Any other release name is refused, since Alpine publishes under no other.
 
@@ -564,7 +565,10 @@ The description cannot tell every substitution apart:
   offers is still exactly what that index names.
 - After a release, `edge` describes itself by the release's `.0` tag until the
   development branch is next tagged, which can take months. The release's own
-  indexes describe themselves the same way until its first point release.
+  indexes describe themselves the same way until its first point release. A
+  release made after v3.24 cannot be known to this version of the library, so
+  the `.0` of every such release binds as `edge`, which widens this window to
+  each of them.
 - `latest-stable` binds to a stable release, not to which one.
 - postmarketOS describes an index by the time it was built, so nothing binds a
   postmarketOS index to its release at all.

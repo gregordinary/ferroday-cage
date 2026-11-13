@@ -861,6 +861,10 @@ consumer upgrading can skip it.
   postmarketOS repository substituted this way vanished from the resolution
   without an error. An index that holds records of the architecture keeps
   dropping the others, as `apk` refuses to install them.
+- An index fetched as Alpine's `edge` that describes itself by the `.0` of a
+  release older than v3.24 is refused with `AlpineError::Index`. Any release's
+  `.0` bound as `edge`, so an older release's index from before its first point
+  release could be served in its place.
 
 ### Internal
 
