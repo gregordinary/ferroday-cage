@@ -518,6 +518,10 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- `fcage --profile` and `--restricted-profile` write a profile's parse error
+  with every control character in the line it quotes escaped. A raw escape
+  sequence in a profile reached the terminal as written
+  (`ferroday-cage-cli`).
 - **Breaking.** A Debian `pin` holds the version of every name it names by
   every route a resolution takes to a version. An `include` entry written
   `name/release`, a versioned dependency such an entry takes from its release,

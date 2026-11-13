@@ -5019,8 +5019,22 @@ fn stop_with_caller_default(flag: Option<bool>, profile_states_it: bool) -> Opti
 /// diagnostic keeps its span, its caret, and the line breaks between them, and
 /// a single-line refusal -- an `unknown field`, or one of the restricted
 /// policy's -- becomes the one line it reads as.
+///
+/// A parse diagnostic quotes the line it failed on, and a profile is not
+/// always its caller's own writing: a raw escape sequence in one would reach
+/// the terminal and drive it. Every control character but the line breaks
+/// between the diagnostic's own lines is written as the escape `{:?}` gives
+/// it, as the library renders a string an untrusted source supplied.
 fn toml_diagnostic(error: &impl std::fmt::Display) -> String {
-    error.to_string().trim_end().to_string()
+    let mut rendered = String::new();
+    for character in error.to_string().trim_end().chars() {
+        if character.is_control() && character != '\n' {
+            rendered.extend(character.escape_debug());
+        } else {
+            rendered.push(character);
+        }
+    }
+    rendered
 }
 
 /// Loads a profile into a builder, and says whether the profile states
@@ -7980,6 +7994,30 @@ mod tests {
             };
             assert!(error.contains(refused), "{error}");
             assert!(load_profile(&profile, false).is_ok(), "{table}");
+        }
+    }
+
+    #[test]
+    fn a_profile_s_parse_failure_quotes_no_control_character() {
+        // A raw escape sequence in a key or a string fails to parse, and the
+        // parser's diagnostic quotes the line it failed on. Written to the
+        // terminal raw, this one would set its clipboard; it is quoted escaped.
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-hostile-profile");
+        let profile = dir.join("profile.toml");
+        for line in [
+            "workdir = \"/x\u{1b}]52;c;aGk=\u{7}\"",
+            "bogus\u{1b}]52;c;aGk=\u{7} = 1",
+        ] {
+            std::fs::write(&profile, format!("rootfs = \"/tmp\"\n{line}\n"))
+                .expect("the profile is written");
+            for restricted in [true, false] {
+                let Err(error) = load_profile(&profile, restricted) else {
+                    panic!("{line:?} parsed");
+                };
+                assert!(error.contains("TOML parse error"), "{error:?}");
+                assert!(!error.contains(['\u{1b}', '\u{7}']), "{error:?}");
+                assert!(error.contains("\\u{1b}]52"), "{error:?}");
+            }
         }
     }
 
