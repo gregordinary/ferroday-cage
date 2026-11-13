@@ -177,9 +177,13 @@ why = "`roster::roster_enum!`, which declares `ScriptKind` and its roster."
 
 [[layer.reach]]
 name = "path"
-count = 1
+count = 2
 kind = "internal"
-why = "`path::parent_of`, as in the Debian layer, for the same preflight."
+why = """\
+`path::parent_of`, as in the Debian layer, for the same preflight; and \
+`path::is_ordinary_component`, the one rule for a name that becomes a single \
+path component: a signing key's name, which a bootstrap writes the key to \
+`/etc/apk/keys` under."""
 
 [[layer]]
 name = "gentoo"

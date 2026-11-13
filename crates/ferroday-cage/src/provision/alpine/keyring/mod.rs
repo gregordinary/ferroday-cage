@@ -276,19 +276,32 @@ impl KeySet {
     /// caller's own. A signature naming a key the set does not hold under
     /// exactly that name is refused, so the name matters as much as the bytes.
     ///
+    /// The name is also the file a bootstrap writes the key to in the root's
+    /// `/etc/apk/keys`, so a later `apk` there trusts what this one did, and it
+    /// is held to what one file name in that directory can be: not empty,
+    /// neither `.` nor `..`, and holding neither a `/` nor a NUL.
+    ///
     /// A key added under a name already present replaces it.
     ///
     /// # Errors
     ///
-    /// Returns [`AlpineError::Config`] for a key that is not a PEM
-    /// `SubjectPublicKeyInfo` holding an RSA public key, or whose modulus is
-    /// narrower than 2048 bits or wider than 8192: a key set is the
-    /// configuration a repository is verified under, and no signature has been
-    /// read yet.
+    /// Returns [`AlpineError::Config`] for a name that is not one file name,
+    /// and for a key that is not a PEM `SubjectPublicKeyInfo` holding an RSA
+    /// public key, or whose modulus is narrower than 2048 bits or wider than
+    /// 8192: a key set is the configuration a repository is verified under, and
+    /// no signature has been read yet.
     pub fn insert(&mut self, name: impl Into<String>, pem: &str) -> Result<(), AlpineError> {
         let name = name.into();
+        if !crate::path::is_ordinary_component(name.as_bytes()) {
+            return Err(AlpineError::Config {
+                reason: format!(
+                    "the key name {name:?} is not one file name, which a key is written to \
+                     /etc/apk/keys under"
+                ),
+            });
+        }
         let key = spki::rsa_public_key(pem).map_err(|reason| AlpineError::Config {
-            reason: format!("the key {name} is not a usable RSA public key: {reason}"),
+            reason: format!("the key {name:?} is not a usable RSA public key: {reason}"),
         })?;
         self.keys.insert(
             name,
@@ -429,6 +442,32 @@ mod tests {
             "{err}",
         );
         assert!(set.is_empty(), "a refused key is not held");
+    }
+
+    #[test]
+    fn a_key_name_that_is_not_one_file_name_is_refused() {
+        // The name is the file the key is written to under `/etc/apk/keys`, so
+        // a name that is not one file name would write it somewhere else, or
+        // nowhere.
+        let mut set = KeySet::new();
+        for name in ["", ".", "..", "a/b", "../escape.rsa.pub", "nul\0.rsa.pub"] {
+            let err = set
+                .insert(name, POSTMARKETOS.pem)
+                .expect_err("the name is not one file name");
+            assert!(
+                matches!(&err, AlpineError::Config { reason } if reason.contains(&format!("{name:?}"))),
+                "{name:?}: {err}",
+            );
+        }
+        assert!(set.is_empty(), "a refused key is not held");
+        // A key name may carry anything else a file name can, and is quoted.
+        let hostile = format!("{}.rsa.pub", crate::failure::hostile::TEXT);
+        set.insert(hostile.clone(), POSTMARKETOS.pem)
+            .expect("one file name, however it is spelled");
+        let err = set
+            .insert(hostile, "not a key")
+            .expect_err("the key does not parse");
+        crate::failure::hostile::assert_escaped(&err.to_string());
     }
 
     #[test]

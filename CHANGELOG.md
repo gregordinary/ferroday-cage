@@ -865,6 +865,10 @@ consumer upgrading can skip it.
   release older than v3.24 is refused with `AlpineError::Index`. Any release's
   `.0` bound as `edge`, so an older release's index from before its first point
   release could be served in its place.
+- `alpine::KeySet::insert` refuses a key name that is not one file name: empty,
+  `.`, `..`, or holding a `/` or a NUL. A bootstrap writes each key to the
+  root's `/etc/apk/keys` under its name, which such a name placed elsewhere or
+  failed to place. The refusal quotes the name.
 
 ### Internal
 
