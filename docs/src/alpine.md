@@ -697,9 +697,9 @@ downloading anything.
 
 Where the foreign binaries cannot run, `extract_only` lays the files down and
 **still registers them**. That is a real difference from the Debian layer, where
-an extract-only root has no configured `dpkg` database: an apk installed record is
-a file format rather than a program's output, so writing it needs nothing
-executed. An extract-only Alpine root for a foreign architecture therefore knows
+an extract-only root's `dpkg` database is empty and records none of its files:
+an apk installed record is a file format rather than a program's output, so
+writing it needs nothing executed. An extract-only Alpine root for a foreign architecture therefore knows
 exactly what it holds, and an `apk` running there later reads it back.
 
 ## Where the two layers differ
@@ -716,7 +716,7 @@ Everything in this table is a difference the archives make, not a gap:
 | Unsigned mode | `trust_unsigned`, for a local pool | None; a private repository signs its index |
 | Freshness | `Valid-Until`, and `allow_stale_release` to relax it | None; the format expresses no validity window |
 | Package identity | A SHA-256 of the whole file, from the index | A SHA-1 of the control segment, plus `datahash` over the tree |
-| Extract-only | Files only; no configured database | Files *and* the installed database |
+| Extract-only | Files and an empty database | Files *and* the installed database |
 | Configuration | `dpkg` runs in a sandbox | Each package's install scripts run in a sandbox, in dependency order |
 
 ## The command line

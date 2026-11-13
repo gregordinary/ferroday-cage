@@ -129,11 +129,11 @@ against whatever syscalls the workload made natively.
 
 An architecture with no `qemu-user` handler — or a host with no `binfmt_misc` —
 can still have a root laid out for it, just not configured. [`extract_only`]
-unpacks every package and writes the dpkg metadata without running a single
-target binary, producing a tree that is complete on disk and unconfigured. It is
-what a cross-build wants when it needs headers and libraries rather than a
-working userland, and it is the documented alternative the preflight's failure
-message points at.
+unpacks every package without running a single target binary. The tree holds
+the packages' files and an empty dpkg database, which records none of them as
+installed. It is what a cross-build wants when it needs headers and libraries
+rather than a working userland, and it is the documented alternative the
+preflight's failure message points at.
 
 [`resolve`] and [`available`] need neither a handler nor an identity map either,
 since they talk to the archive and run nothing. Asking what an architecture's

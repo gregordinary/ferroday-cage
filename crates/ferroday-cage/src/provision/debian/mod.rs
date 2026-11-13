@@ -1217,9 +1217,10 @@ impl DebianBuilder {
 
     /// Stops after laying out the packages' files, without configuring them.
     ///
-    /// An extract-only rootfs has no configured dpkg database and has run no
-    /// maintainer scripts. It is the escape hatch for a foreign architecture
-    /// with no qemu binfmt handler, where the packages' code cannot run.
+    /// An extract-only rootfs has run no maintainer scripts. It holds the
+    /// packages' files and an empty dpkg database, which records none of them
+    /// as installed. It is the escape hatch for a foreign architecture with no
+    /// qemu binfmt handler, where the packages' code cannot run.
     ///
     /// It applies to a whole bootstrap only. Alongside a
     /// [`base_layer`](Self::base_layer) it is refused at [`build`](Self::build)

@@ -1732,8 +1732,8 @@ actionable error when it is absent.
 
 Where the foreign binaries cannot run, `extract_only` lays out the packages'
 files without configuring them. An extract-only tree has run no maintainer
-scripts and has no configured dpkg database. It is the raw file tree, suitable
-for completing the configuration elsewhere.
+scripts. It holds the packages' files and an empty dpkg database, which records
+none of them as installed.
 
 ### Recording which interpreter ran
 
