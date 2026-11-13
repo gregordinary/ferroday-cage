@@ -1621,6 +1621,9 @@ pub ferroday_cage::CgroupLimit::MemorySwapMax(u64)
 pub ferroday_cage::CgroupLimit::PidsMax(u64)
 impl ferroday_cage::CgroupLimit
 pub fn ferroday_cage::CgroupLimit::cpu_max(u64, u64) -> ferroday_cage::CgroupLimit
+impl core::str::traits::FromStr for ferroday_cage::CgroupLimit
+pub type ferroday_cage::CgroupLimit::Err = ferroday_cage::ParseCgroupLimitError
+pub fn ferroday_cage::CgroupLimit::from_str(&str) -> core::result::Result<ferroday_cage::CgroupLimit, ferroday_cage::ParseCgroupLimitError>
 impl core::marker::Freeze for ferroday_cage::CgroupLimit
 impl core::marker::Send for ferroday_cage::CgroupLimit
 impl core::marker::Sync for ferroday_cage::CgroupLimit
@@ -2736,6 +2739,19 @@ impl core::marker::Unpin for ferroday_cage::ParseCapabilityError
 impl core::marker::UnsafeUnpin for ferroday_cage::ParseCapabilityError
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParseCapabilityError
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParseCapabilityError
+pub struct ferroday_cage::ParseCgroupLimitError
+impl ferroday_cage::ParseCgroupLimitError
+pub fn ferroday_cage::ParseCgroupLimitError::text(&self) -> &str
+impl core::error::Error for ferroday_cage::ParseCgroupLimitError
+impl core::fmt::Display for ferroday_cage::ParseCgroupLimitError
+pub fn ferroday_cage::ParseCgroupLimitError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::ParseCgroupLimitError
+impl core::marker::Send for ferroday_cage::ParseCgroupLimitError
+impl core::marker::Sync for ferroday_cage::ParseCgroupLimitError
+impl core::marker::Unpin for ferroday_cage::ParseCgroupLimitError
+impl core::marker::UnsafeUnpin for ferroday_cage::ParseCgroupLimitError
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParseCgroupLimitError
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParseCgroupLimitError
 pub struct ferroday_cage::ParseFsAccessError
 impl ferroday_cage::ParseFsAccessError
 pub fn ferroday_cage::ParseFsAccessError::text(&self) -> &str

@@ -78,6 +78,103 @@ impl CgroupLimit {
     }
 }
 
+impl std::str::FromStr for CgroupLimit {
+    type Err = ParseCgroupLimitError;
+
+    /// Parses `NAME=VALUE`, a limit named as a profile's `[cgroup]` table names
+    /// it, in the units of the file it is written to.
+    ///
+    /// `memory-max`, `memory-swap-max`, and `pids-max` take a count, and
+    /// `cpu-weight` a weight. `cpu-max` takes `QUOTA:PERIOD` in microseconds,
+    /// or `QUOTA` alone, in each period of 100000, the kernel's own default.
+    /// Whitespace around the name and the value is ignored. A value of the
+    /// right form that the kernel would refuse parses, and is refused at build,
+    /// as one a profile states is.
+    fn from_str(s: &str) -> Result<CgroupLimit, ParseCgroupLimitError> {
+        /// The period `cpu.max` holds where only a quota is written to it.
+        const DEFAULT_PERIOD: &str = "100000";
+
+        let error = |reason| ParseCgroupLimitError {
+            text: s.to_string(),
+            reason,
+        };
+        let (name, value) = s
+            .split_once('=')
+            .ok_or_else(|| error(CgroupLimitParse::Shape))?;
+        let value = value.trim();
+        let number = |text: &str| {
+            text.trim()
+                .parse::<u64>()
+                .map_err(|_| error(CgroupLimitParse::Value))
+        };
+        Ok(match name.trim() {
+            "memory-max" => CgroupLimit::MemoryMax(number(value)?),
+            "memory-swap-max" => CgroupLimit::MemorySwapMax(number(value)?),
+            "pids-max" => CgroupLimit::PidsMax(number(value)?),
+            "cpu-max" => {
+                let (quota, period) = value.split_once(':').unwrap_or((value, DEFAULT_PERIOD));
+                CgroupLimit::cpu_max(number(quota)?, number(period)?)
+            }
+            "cpu-weight" => {
+                CgroupLimit::CpuWeight(value.parse().map_err(|_| error(CgroupLimitParse::Value))?)
+            }
+            _ => return Err(error(CgroupLimitParse::Name)),
+        })
+    }
+}
+
+/// The error from parsing a [`CgroupLimit`] that is not `NAME=VALUE` with a
+/// limit's name and a value of its form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseCgroupLimitError {
+    text: String,
+    reason: CgroupLimitParse,
+}
+
+/// What made a limit's text unparsable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgroupLimitParse {
+    /// No `=` between a name and a value.
+    Shape,
+    /// A name no limit has.
+    Name,
+    /// A value not of the limit's form.
+    Value,
+}
+
+impl ParseCgroupLimitError {
+    /// The unparsed text, as it was given.
+    ///
+    /// Named `text` on every parse error in this crate, so a caller moving
+    /// between them does not have to check.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for ParseCgroupLimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = &self.text;
+        match self.reason {
+            CgroupLimitParse::Shape => {
+                write!(f, "expected NAME=VALUE for a cgroup limit, not {text:?}")
+            }
+            CgroupLimitParse::Name => write!(
+                f,
+                "{text:?} names no cgroup limit; expected memory-max, memory-swap-max, \
+                 pids-max, cpu-max, or cpu-weight"
+            ),
+            CgroupLimitParse::Value => write!(
+                f,
+                "{text:?} is not a value of its cgroup limit's form: a count, QUOTA[:PERIOD] \
+                 for cpu-max, or a weight for cpu-weight"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseCgroupLimitError {}
+
 /// Why a sandbox could not be given a cgroup of its own beneath the parent the
 /// caller named.
 ///
@@ -932,6 +1029,62 @@ fn keyed(text: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_parses_from_its_name_and_value() {
+        let parsed = |text: &str| text.parse::<CgroupLimit>();
+        assert_eq!(
+            parsed("memory-max=1048576"),
+            Ok(CgroupLimit::MemoryMax(1 << 20))
+        );
+        assert_eq!(parsed(" pids-max = 64 "), Ok(CgroupLimit::PidsMax(64)));
+        assert_eq!(
+            parsed("cpu-max=50000:200000"),
+            Ok(CgroupLimit::cpu_max(50_000, 200_000))
+        );
+        assert_eq!(
+            parsed("cpu-max=50000"),
+            Ok(CgroupLimit::cpu_max(50_000, 100_000)),
+            "the kernel's own default period",
+        );
+        assert_eq!(parsed("cpu-weight=200"), Ok(CgroupLimit::CpuWeight(200)));
+        for (text, says) in [
+            ("pids-max", "NAME=VALUE"),
+            ("memory-maximum=1", "names no cgroup limit"),
+            ("pids-max=many", "not a value"),
+            ("cpu-max=1:", "not a value"),
+            ("cpu-weight=70000", "not a value"),
+        ] {
+            let error = parsed(text).expect_err(text);
+            assert_eq!(error.text(), text);
+            assert!(error.to_string().contains(says), "{text}: {error}");
+        }
+    }
+
+    /// Every name the parse takes is the key a profile's `[cgroup]` table
+    /// spells the same limit with, which the table's field names decide.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_limits_name_is_its_profile_key() {
+        for limit in [
+            "memory-max=1048576",
+            "memory-swap-max=0",
+            "pids-max=64",
+            "cpu-weight=200",
+        ] {
+            let (name, value) = limit.split_once('=').expect("a name and a value");
+            let table: CgroupSettings =
+                toml::from_str(&format!("{name} = {value}\n")).expect("the table reads");
+            assert_eq!(table.limits(), [limit.parse::<CgroupLimit>().expect(limit)]);
+        }
+        let table: CgroupSettings =
+            toml::from_str("cpu-max = { quota = 50000, period = 100000 }\n")
+                .expect("the table reads");
+        assert_eq!(
+            table.limits(),
+            ["cpu-max=50000:100000".parse().expect("cpu-max")]
+        );
+    }
 
     #[test]
     fn a_flat_keyed_file_is_read_by_its_key() {

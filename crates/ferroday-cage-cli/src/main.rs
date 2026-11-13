@@ -4236,36 +4236,9 @@ fn parse_rlimit(spec: &str) -> Result<(Resource, Limit, Limit), String> {
 
 /// Parses one `--cgroup LIMIT=VALUE`: a cgroup limit named as the profile
 /// format's `[cgroup]` table names it, in the units of the file it is written
-/// to.
+/// to, as [`CgroupLimit`]'s own parse reads one.
 fn parse_cgroup_limit(spec: &str) -> Result<CgroupLimit, String> {
-    let (name, value) = spec
-        .split_once('=')
-        .ok_or_else(|| format!("--cgroup expects LIMIT=VALUE, not {spec:?}"))?;
-    let number = |text: &str| -> Result<u64, String> {
-        text.trim()
-            .parse::<u64>()
-            .map_err(|_| format!("--cgroup {name}: {text:?} is not a number"))
-    };
-    Ok(match name.trim() {
-        "memory-max" => CgroupLimit::MemoryMax(number(value)?),
-        "memory-swap-max" => CgroupLimit::MemorySwapMax(number(value)?),
-        "pids-max" => CgroupLimit::PidsMax(number(value)?),
-        "cpu-max" => {
-            // The kernel's own default period, 100 ms, where none is given.
-            let (quota, period) = value.split_once(':').unwrap_or((value, "100000"));
-            CgroupLimit::cpu_max(number(quota)?, number(period)?)
-        }
-        "cpu-weight" => CgroupLimit::CpuWeight(
-            u16::try_from(number(value)?)
-                .map_err(|_| format!("--cgroup cpu-weight: {value:?} is out of range"))?,
-        ),
-        other => {
-            return Err(format!(
-                "--cgroup: {other:?} is not a limit; expected memory-max, memory-swap-max, \
-                 pids-max, cpu-max, or cpu-weight"
-            ));
-        }
-    })
+    spec.parse().map_err(|error| format!("--cgroup: {error}"))
 }
 
 /// Parses a Debian priority floor for `--debian-base-priority`.

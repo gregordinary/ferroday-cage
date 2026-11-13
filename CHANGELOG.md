@@ -349,6 +349,9 @@ consumer upgrading can skip it.
   stanzas it left out as ones the layer cannot act on, which it left out
   without a word before. `fcage` prints both, as it prints a Gentoo binhost
   index's (`ferroday-cage-cli`).
+- `CgroupLimit` implements `FromStr`, reading `NAME=VALUE` with a limit named
+  as a profile's `[cgroup]` table names it, and refusing other text with
+  `ParseCgroupLimitError`. `fcage --cgroup` reads its value through it.
 
 ### Changed
 
