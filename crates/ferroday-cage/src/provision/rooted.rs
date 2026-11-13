@@ -272,6 +272,24 @@ impl Rooted {
         }
     }
 
+    /// Reads the file the merged view of `layers` shows at `relative`, as
+    /// [`read_if_present`](Self::read_if_present) reads it from the layer
+    /// [`merged_lookup`] says holds it, answering `None` where the view shows
+    /// nothing there.
+    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+    pub(crate) fn read_merged(
+        layers: &[&Rooted],
+        relative: impl AsRef<Path>,
+        limit: u64,
+        link: AncestorLink,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let relative = relative.as_ref();
+        match merged_lookup(layers, relative, link)? {
+            Merged::Entry { layer, .. } => layers[layer].read_if_present(relative, limit),
+            Merged::Hidden { .. } | Merged::Absent => Ok(None),
+        }
+    }
+
     /// Reads the file at `relative` as [`read`](Self::read) does, as text.
     ///
     /// Bytes that are not UTF-8 are refused, an `InvalidData` failure naming
@@ -899,6 +917,116 @@ struct MadeDir {
     modified: Option<rustix::fs::Timespec>,
 }
 
+/// What a symbolic link at an ancestor of a path does, in a layer above
+/// another, to the layers beneath it.
+///
+/// Each layer is read on its own, with symbolic links resolved inside it,
+/// where the merged view resolves a link across layers, so a link at an
+/// ancestor is the one shape the per-layer reading cannot answer exactly. A
+/// caller says which approximation its question wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AncestorLink {
+    /// The link passes the question down to the layers beneath, rather than
+    /// deciding it. Right for the links a provisioned root carries, such as a
+    /// merged-usr `bin`, since every layer that has one has the same one.
+    PassesDown,
+    /// The link hides the layers beneath, as any non-directory does, since
+    /// only a directory merges with what lies beneath it. Right for a path
+    /// that names an entry rather than resolving to one, such as a package
+    /// database's entry directory.
+    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+    Hides,
+}
+
+/// What an overlay's merged view shows at a path, as [`merged_lookup`] reads
+/// it, and which layer decides it.
+#[derive(Debug)]
+pub(crate) enum Merged {
+    /// An entry, of whatever kind, which the layer at index `layer` holds.
+    Entry {
+        /// The index of the layer that holds it.
+        layer: usize,
+    },
+    /// Nothing: the layer at index `layer` hides the path from every layer
+    /// beneath it. Where `whiteout`, by a whiteout at the path itself;
+    /// otherwise by what it holds at an ancestor.
+    Hidden {
+        /// The index of the layer that hides it.
+        layer: usize,
+        /// Whether a whiteout at the path itself is what hides it.
+        whiteout: bool,
+    },
+    /// Nothing: no layer holds an entry at the path, and none hides it.
+    Absent,
+}
+
+/// What the merged view of `layers` shows at `relative`.
+///
+/// `layers` is in the order overlayfs consults them: the upper, then the lowers
+/// from the last stacked down to the base. The first layer holding an entry at
+/// the path decides. A whiteout there, a character device numbered 0:0, hides
+/// the name from every layer below; anything else is the entry the merged view
+/// shows. A layer holding nothing at the path passes the question down, unless
+/// it hides the directory the path lies in: a whiteout or another non-directory
+/// at an ancestor, or an ancestor directory marked opaque, behind which the
+/// layers below do not show. `link` says what a symbolic link at an ancestor
+/// does there.
+///
+/// The ancestors of the last layer are not walked, since there is nothing
+/// beneath it for them to hide.
+///
+/// # Errors
+///
+/// Returns the failure of any `stat` or opaque-marker read the walk needed. A
+/// caller that cannot answer without one says so rather than guessing.
+pub(crate) fn merged_lookup(
+    layers: &[&Rooted],
+    relative: &Path,
+    link: AncestorLink,
+) -> io::Result<Merged> {
+    let ancestors: Vec<&Path> = relative
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect();
+    for (at, layer) in layers.iter().enumerate() {
+        match layer.stat(relative)? {
+            Some(stat) if Rooted::is_whiteout(&stat) => {
+                return Ok(Merged::Hidden {
+                    layer: at,
+                    whiteout: true,
+                });
+            }
+            Some(_) => return Ok(Merged::Entry { layer: at }),
+            None => {}
+        }
+        if at + 1 == layers.len() {
+            break;
+        }
+        let hidden = Merged::Hidden {
+            layer: at,
+            whiteout: false,
+        };
+        // Outermost ancestor first, as the kernel walks the path.
+        for ancestor in ancestors.iter().rev() {
+            // Nothing here at or below this ancestor: the layers beneath
+            // decide.
+            let Some(stat) = layer.stat(ancestor)? else {
+                break;
+            };
+            match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Directory if layer.is_opaque(ancestor)? => return Ok(hidden),
+                FileType::Directory => {}
+                FileType::Symlink if link == AncestorLink::PassesDown => break,
+                // A whiteout, a link that hides, or a file standing where a
+                // directory would have to be: nothing below shows through here.
+                _ => return Ok(hidden),
+            }
+        }
+    }
+    Ok(Merged::Absent)
+}
+
 /// Splits a tree-relative path into its components.
 ///
 /// [`path::tree_components`] is the split, with a leading `/` naming the tree's
@@ -924,6 +1052,54 @@ mod tests {
     use super::*;
     use crate::scratch::Scratch;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_link_at_an_ancestor_passes_down_or_hides_as_the_caller_says() {
+        // A merged-usr root's `lib` is a link in every layer that has one, so a
+        // question about what lies beneath it is the base's to answer; a
+        // package database's entry is named rather than resolved, so a link at
+        // a directory of its path hides the base's entry as a file would.
+        let base_dir = Scratch::new("merged-base");
+        let upper_dir = Scratch::new("merged-upper");
+        let base = Rooted::open(&base_dir).unwrap();
+        let upper = Rooted::open(&upper_dir).unwrap();
+        base.write("lib/x", b"x").unwrap();
+        upper.symlink("usr/lib", "lib").unwrap();
+        let layers = [&upper, &base];
+        let x = Path::new("lib/x");
+
+        assert!(matches!(
+            merged_lookup(&layers, x, AncestorLink::PassesDown).unwrap(),
+            Merged::Entry { layer: 1 }
+        ));
+        assert!(matches!(
+            merged_lookup(&layers, x, AncestorLink::Hides).unwrap(),
+            Merged::Hidden {
+                layer: 0,
+                whiteout: false
+            }
+        ));
+        assert_eq!(
+            Rooted::read_merged(&layers, x, 16, AncestorLink::PassesDown).unwrap(),
+            Some(b"x".to_vec()),
+        );
+        assert_eq!(
+            Rooted::read_merged(&layers, x, 16, AncestorLink::Hides).unwrap(),
+            None
+        );
+
+        // What the upper holds itself is its own, whatever the rule; what no
+        // layer holds is absent.
+        upper.write("usr/lib/x", b"upper").unwrap();
+        assert!(matches!(
+            merged_lookup(&layers, x, AncestorLink::Hides).unwrap(),
+            Merged::Entry { layer: 0 }
+        ));
+        assert!(matches!(
+            merged_lookup(&layers, Path::new("lib/y"), AncestorLink::PassesDown).unwrap(),
+            Merged::Absent
+        ));
+    }
 
     fn tree(tag: &str) -> (Scratch, Rooted) {
         let scratch = Scratch::new(&format!("rooted-{tag}"));

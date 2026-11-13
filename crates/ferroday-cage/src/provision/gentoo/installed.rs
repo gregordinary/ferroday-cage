@@ -41,18 +41,13 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-
-use rustix::fs::{OFlags, ResolveFlags};
-use rustix::io::Errno;
 
 use super::atom::{self, Atom, Candidate, Dependency};
 use super::index::{self, MAX_FLAGS_BYTES, MAX_SLOT_BYTES};
 use super::version;
 use super::{COUNTER_FILE, DB_DIR, GentooError};
-use crate::provision::containment;
-use crate::provision::rooted::Rooted;
+use crate::provision::rooted::{AncestorLink, Merged, Rooted, merged_lookup};
 
 /// The file inside an entry naming its slot.
 const SLOT_FILE: &str = "SLOT";
@@ -408,7 +403,7 @@ fn read_database(rooted: &Rooted, at: &Path) -> Result<Vec<InstalledPackage>, Ge
     let mut budget = Budget::new();
     entries(rooted, at, &mut budget)?
         .iter()
-        .map(|(category, pf)| read_entry(&Layers::Plain(rooted), at, category, pf, &mut budget))
+        .map(|(category, pf)| read_entry(&[rooted], at, category, pf, &mut budget))
         .collect()
 }
 
@@ -501,53 +496,19 @@ fn entries(
     Ok(found)
 }
 
-/// The layers one entry's files are read from.
-///
-/// A plain root holds each entry whole. An overlay's merged view need not: an
-/// entry directory the upper holds and the base holds too is the union of the
-/// two, because overlayfs copies up only what changes. An entry one file of
-/// which a command inside the sandbox rewrote holds that file alone in the
-/// upper, and every other file of it in the base.
-enum Layers<'a> {
-    /// One tree, holding every entry whole.
-    Plain(&'a Rooted),
-    /// An overlay upper over a base: each file is the upper's where the upper
-    /// names it, and otherwise the base's, where `lower` is given because the
-    /// upper does not hide the base's entry as a whole.
-    Over {
-        /// The upper.
-        upper: &'a Rooted,
-        /// The base, where its entry shows through.
-        lower: Option<&'a Rooted>,
-    },
-}
-
-impl Layers<'_> {
-    /// The file at `path`, or `None` where the entry holds none, refused as
-    /// [`Rooted::read`] refuses one where it holds more than `limit` bytes.
-    ///
-    /// A whiteout in the upper is the file removed, so the base's copy beneath
-    /// it is not read; [`Rooted::is_whiteout`] tells one from a file.
-    fn read(&self, path: &str, limit: u64) -> io::Result<Option<Vec<u8>>> {
-        match *self {
-            Layers::Plain(tree) => tree.read_if_present(path, limit),
-            Layers::Over { upper, lower } => match upper.stat(path)? {
-                Some(stat) if Rooted::is_whiteout(&stat) => Ok(None),
-                Some(_) => upper.read_if_present(path, limit),
-                None => match lower {
-                    Some(lower) => lower.read_if_present(path, limit),
-                    None => Ok(None),
-                },
-            },
-        }
-    }
-}
-
 /// Reads one entry: its name and version from the two directory names, its slot
-/// and flags from the files inside, each read through `layers` and charged to
-/// `budget`.
+/// and flags from the files inside, each read from the merged view of `layers`
+/// and charged to `budget`.
+///
+/// A plain root is one layer, holding each entry whole. An overlay's merged view
+/// need not: an entry directory the upper holds and the base holds too is the
+/// union of the two, because overlayfs copies up only what changes. An entry one
+/// file of which a command inside the sandbox rewrote holds that file alone in
+/// the upper, and every other file of it in the base. A whiteout in the upper is
+/// the file removed, and an entry directory recreated there is marked opaque,
+/// so the base's copy beneath either is not read.
 fn read_entry(
-    layers: &Layers<'_>,
+    layers: &[&Rooted],
     at: &Path,
     category: &str,
     pf: &str,
@@ -579,7 +540,12 @@ fn read_entry(
     // Each file is read only to what the budget has left, so a file past that
     // is refused unread rather than held and then refused.
     let field = |file: &str| -> Result<Option<String>, GentooError> {
-        match layers.read(&format!("{dir}/{file}"), budget.left) {
+        match Rooted::read_merged(
+            layers,
+            format!("{dir}/{file}"),
+            budget.left,
+            AncestorLink::Hides,
+        ) {
             Ok(bytes) => {
                 let bytes = bytes.as_deref();
                 budget.charge(bytes.map_or(0, <[u8]>::len), at)?;
@@ -801,22 +767,28 @@ fn read_package<E>(
 /// A base entry the upper hides is not in the merged view at all. A package
 /// removed inside a sandbox rooted on the overlay leaves a whiteout in the
 /// upper where its entry was, and an entry or a category recreated there is
-/// marked opaque; [`Upper::hides`] reads both the way overlayfs does.
+/// marked opaque; [`merged_lookup`] reads both the way overlayfs does. A
+/// database entry is named rather than resolved, so a symbolic link in the
+/// upper at a directory of its path hides what the base holds beneath it.
 ///
 /// An entry both layers hold is read file by file through the two, as
-/// [`Layers`] describes. That is the shape a base entry takes once something in
-/// the sandbox has changed one of its files, and the upper's directory alone
-/// would read as an entry missing its `SLOT`.
+/// [`read_entry`] describes. That is the shape a base entry takes once
+/// something in the sandbox has changed one of its files, and the upper's
+/// directory alone would read as an entry missing its `SLOT`.
 pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooError> {
     let base = Rooted::open(lower).map_err(GentooError::at("opening the root", lower))?;
     let top = Rooted::open(upper).map_err(GentooError::at("opening the overlay upper", upper))?;
-    let layer = Upper::open(upper).map_err(GentooError::at("opening the overlay upper", upper))?;
-    // Whether the base's entry of this name shows through the upper.
+    let layers = [&top, &base];
+    // Whether the base's entry of this name shows through the upper, which is
+    // the base holding the entry the merged view shows there.
     let shows = |category: &str, pf: &str| {
-        layer
-            .hides(&format!("{DB_DIR}/{category}/{pf}"))
-            .map(|hidden| !hidden)
-            .map_err(|err| GentooError::io("reading the overlay upper", upper, err))
+        merged_lookup(
+            &layers,
+            Path::new(&format!("{DB_DIR}/{category}/{pf}")),
+            AncestorLink::Hides,
+        )
+        .map(|merged| matches!(merged, Merged::Entry { layer: 1 }))
+        .map_err(|err| GentooError::io("reading the overlay upper", upper, err))
     };
     let mut budget = Budget::new();
     let held: BTreeSet<(String, String)> = entries(&top, upper, &mut budget)?.into_iter().collect();
@@ -826,19 +798,9 @@ pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooErro
         if held.contains(&(category.clone(), pf.clone())) || !shows(&category, &pf)? {
             continue;
         }
-        packages.push(read_entry(
-            &Layers::Plain(&base),
-            lower,
-            &category,
-            &pf,
-            &mut budget,
-        )?);
+        packages.push(read_entry(&[&base], lower, &category, &pf, &mut budget)?);
     }
     for (category, pf) in &held {
-        let layers = Layers::Over {
-            upper: &top,
-            lower: shows(category, pf)?.then_some(&base),
-        };
         let above = read_entry(&layers, upper, category, pf, &mut budget)?;
         packages.retain(|below| {
             !(below.name == above.name && slot_of(&below.slot) == slot_of(&above.slot))
@@ -846,66 +808,6 @@ pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooErro
         packages.push(above);
     }
     Ok(Installed::sorted(packages))
-}
-
-/// The upper layer of an overlay, read for what it hides of the layer beneath.
-///
-/// Read through descriptors with no symbolic link followed, since overlayfs
-/// follows none inside a layer: a link in the upper at a directory's name is a
-/// non-directory there, whatever it points at.
-struct Upper {
-    /// The upper's root. `O_PATH`: it is only ever the anchor of an `openat2`.
-    fd: OwnedFd,
-}
-
-impl Upper {
-    /// Opens the upper at `path`.
-    fn open(path: &Path) -> io::Result<Upper> {
-        let fd = rustix::fs::open(
-            path,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?;
-        Ok(Upper { fd })
-    }
-
-    /// Whether the upper hides what the lower holds at `path`, a `/`-separated
-    /// path of ordinary components.
-    ///
-    /// Overlayfs looks a path up one component at a time, the upper first. The
-    /// lower shows through while each component is, in the upper, absent or a
-    /// directory that is not opaque. From the first absent one on, nothing in
-    /// the upper speaks for the rest of the path. A whiteout, the character
-    /// device overlayfs leaves where something of the lower was removed, hides
-    /// it. So does any other non-directory, since only a directory merges with
-    /// what lies beneath it. An opaque directory hides everything beneath it.
-    ///
-    /// The rule the layered walk (`containment::copy_up`) reads each name by,
-    /// and one marker answer, `containment::is_opaque`. Where that walk resolves
-    /// a path through a link, this asks about the path as spelled, since a
-    /// database entry is named rather than resolved, so a link here hides.
-    fn hides(&self, path: &str) -> io::Result<bool> {
-        let components: Vec<&str> = path.split('/').collect();
-        for depth in 1..=components.len() {
-            let dir = match containment::open_dir(
-                self.fd.as_fd(),
-                &components[..depth],
-                OFlags::RDONLY | OFlags::NOFOLLOW,
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-            ) {
-                Ok(dir) => dir,
-                Err(Errno::NOENT) => return Ok(false),
-                // The upper holds something at the name that is not a
-                // directory: a whiteout, a file, or a symbolic link.
-                Err(Errno::NOTDIR | Errno::LOOP) => return Ok(true),
-                Err(errno) => return Err(errno.into()),
-            };
-            if containment::is_opaque(dir.as_fd())? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
 }
 
 /// The slot proper of a `slot` or `slot/subslot` spelling.
@@ -924,6 +826,7 @@ pub(super) fn slot_of(slot: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provision::containment;
     use crate::scratch::Scratch;
 
     /// Writes a vdb entry into `root`.

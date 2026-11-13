@@ -443,6 +443,7 @@ report name a package and its version bare.
 | Replace whatever holds a name in a tree with a new entry, an empty directory included | `provision::containment::replacing`, over `containment::remove_at`, and `containment::link_replacing` for a hard link, to which a name already holding its target is done |
 | Write into an overlay upper where the mounted overlay would place it | `provision::containment::copy_up`, which the extractor and `Rooted::over` take over a base |
 | Is this entry an overlay whiteout, or this directory opaque? | `provision::containment::is_whiteout`, `containment::is_opaque` |
+| What does an overlay's merged view show at a path, and which layer holds it? | `provision::rooted::merged_lookup`, with `AncestorLink` saying what a symbolic link at an ancestor does, and `Rooted::read_merged` for the file it shows |
 | Is this extended attribute the host's rather than the tree's? | `provision::containment::host_assigned_xattr` |
 | Read an entry's extended attributes, or restate an access control list or a file capability for the other side of an identity map | `provision::xattr::read_all`, `xattr::Acl` (`Acl::narrowed` where it cannot be restated), `xattr::capability_mapped` |
 | Open the regular file a walk just inspected, refusing whatever took its name | `provision::containment::open_typed_file` |

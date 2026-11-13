@@ -14,9 +14,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::rooted::Rooted;
+use super::rooted::{AncestorLink, Merged, Rooted, merged_lookup};
 
 /// The shadow file, and the copy of its previous version the account tools
 /// leave beside it on every change.
@@ -62,53 +62,47 @@ impl Failure {
     }
 }
 
-/// What an accounts file holds, as the root the tree belongs to sees it.
-enum Accounts {
-    /// The tree holds the file, with these contents.
-    Held(Vec<u8>),
-    /// The tree holds an overlay whiteout there. A layered build's scripts
-    /// removed the base's file, so the merged root holds none.
-    Removed,
-    /// Nothing occupies the name in the tree.
-    Absent,
-}
-
-impl Accounts {
-    /// Reads the accounts file at `path`, stating what occupies it first.
-    ///
-    /// A whiteout is a character device, and opening one fails, so the kind is
-    /// told apart before anything is opened. Whatever else is there that is not
-    /// a regular file is refused as [`Rooted::read`] refuses it.
-    fn read(tree: &Rooted, path: &str) -> Result<Accounts, Failure> {
-        let held = tree
-            .stat(path)
-            .map_err(Failure::at("inspecting the accounts", tree, path))?;
-        match held {
-            None => Ok(Accounts::Absent),
-            Some(stat) if Rooted::is_whiteout(&stat) => Ok(Accounts::Removed),
-            Some(_) => tree
-                .read(path, MAX_SHADOW)
-                .map(Accounts::Held)
-                .map_err(Failure::at("reading the accounts", tree, path)),
-        }
-    }
+/// The accounts file at `path` as the root `tree` belongs to sees it: the
+/// merged view of `tree` over `beneath`, where the tree is a layered build's
+/// upper, or `tree` alone.
+///
+/// `None` is a root that holds no such file: no layer holds one, or the tree
+/// hides the base's, by a whiteout at the file, which is a layered build's
+/// scripts removing it, or by a whiteout or an opaque directory at `/etc`.
+/// [`merged_lookup`] reads the view, with a symbolic link at an ancestor passing
+/// the question down, since every layer of a root that carries such a link
+/// carries the same one. Whatever the view shows that is not a regular file is
+/// refused as [`Rooted::read`] refuses it.
+fn read_accounts(
+    tree: &Rooted,
+    beneath: Option<&Rooted>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, Failure> {
+    let layers: Vec<&Rooted> = std::iter::once(tree).chain(beneath).collect();
+    let merged = merged_lookup(&layers, Path::new(path), AncestorLink::PassesDown)
+        .map_err(Failure::at("inspecting the accounts", tree, path))?;
+    let Merged::Entry { layer } = merged else {
+        return Ok(None);
+    };
+    let holder = layers[layer];
+    holder.read(path, MAX_SHADOW).map(Some).map_err(Failure::at(
+        "reading the accounts",
+        holder,
+        path,
+    ))
 }
 
 /// Each account's last-change day as `/etc/shadow` records it before the
-/// scripts run: the file in the tree, or where the tree holds none, the one
-/// beneath it in a layered build. No file is no accounts, and neither is a
-/// whiteout, which removes the base's file from the merged root.
+/// scripts run, in the file [`read_accounts`] reads: the tree's, or where the
+/// tree holds none and hides none, the one beneath it in a layered build. No
+/// file is no accounts.
 ///
 /// The first line naming an account is the one that counts, as `getspnam(3)`
 /// reads the file and as [`ids`] reads the other two. A later line naming the
 /// same account is one nothing on the root reads.
 pub(super) fn account_dates(tree: &Rooted, beneath: Option<&Rooted>) -> Result<Dates, Failure> {
     let [shadow, _] = SHADOW;
-    let held = match (Accounts::read(tree, shadow)?, beneath) {
-        (Accounts::Absent, Some(beneath)) => Accounts::read(beneath, shadow)?,
-        (held, _) => held,
-    };
-    let Accounts::Held(contents) = held else {
+    let Some(contents) = read_accounts(tree, beneath, shadow)? else {
         return Ok(Dates::new());
     };
     let mut dates = Dates::new();
@@ -125,25 +119,20 @@ pub(super) fn account_dates(tree: &Rooted, beneath: Option<&Rooted>) -> Result<D
 }
 
 /// The id each name in the accounts file at `path` is given, as the root sees
-/// the file: the tree's, or where the tree holds none, the one beneath it in a
-/// layered build. `path` is one of [`ACCOUNTS`], both of which keep the id in a
-/// line's third field.
+/// the file ([`read_accounts`]): the tree's, or where the tree holds none and
+/// hides none, the one beneath it in a layered build. `path` is one of
+/// [`ACCOUNTS`], both of which keep the id in a line's third field.
 ///
 /// The first line naming an account is the one that counts, as `getpwnam(3)`
 /// and `getgrnam(3)` read the files, and a line whose third field is not a
-/// number names no id. No file is no accounts, and neither is a whiteout, which
-/// removes the base's file from the merged root.
+/// number names no id. No file is no accounts.
 #[cfg(feature = "alpine")]
 pub(super) fn ids(
     tree: &Rooted,
     beneath: Option<&Rooted>,
     path: &str,
 ) -> Result<HashMap<Vec<u8>, u32>, Failure> {
-    let held = match (Accounts::read(tree, path)?, beneath) {
-        (Accounts::Absent, Some(beneath)) => Accounts::read(beneath, path)?,
-        (held, _) => held,
-    };
-    let Accounts::Held(contents) = held else {
+    let Some(contents) = read_accounts(tree, beneath, path)? else {
         return Ok(HashMap::new());
     };
     let mut ids = HashMap::new();
@@ -203,7 +192,9 @@ pub(super) fn redate(
     rewrites: impl Fn(&[u8]) -> bool,
 ) -> Result<(), Failure> {
     for path in SHADOW {
-        let Accounts::Held(contents) = Accounts::read(tree, path)? else {
+        // The tree's own file alone: what lies beneath is the base's, and
+        // nothing this run wrote.
+        let Some(contents) = read_accounts(tree, None, path)? else {
             continue;
         };
         if let Some(dated) = redated(&contents, found, day, &rewrites) {
@@ -469,6 +460,58 @@ mod tests {
         assert_eq!(
             upper.read("etc/shadow", MAX_SHADOW).unwrap(),
             b"klogd:!:19675:0:99999:7:::\n"
+        );
+    }
+
+    #[test]
+    fn an_etc_the_upper_hides_hides_the_bases_accounts() {
+        // The merged root shows nothing of the base beneath a whiteout or an
+        // opaque directory at `/etc`, so neither does a read of its accounts:
+        // the base's `/etc/shadow` and `/etc/passwd` are not the root's.
+        let (_base_dir, base) = rooted_tree("hidden-etc-base");
+        base.write("etc/shadow", b"klogd:!:19000:0:99999:7:::\n")
+            .unwrap();
+        base.write("etc/passwd", b"klogd:x:100:101::/:/sbin/nologin\n")
+            .unwrap();
+        let [shadow, _] = SHADOW;
+
+        let (whited_dir, whited) = rooted_tree("hidden-etc-whiteout");
+        if let Err(errno) = whiteout(&whited_dir, "etc") {
+            ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                "the host refused an unprivileged whiteout: {errno}"
+            ));
+            return;
+        }
+        let (opaque_dir, opaque) = rooted_tree("hidden-etc-opaque");
+        opaque.write("etc/hostname", b"recreated\n").unwrap();
+        if let Err(errno) = rustix::fs::setxattr(
+            opaque_dir.join("etc"),
+            super::super::containment::OPAQUE,
+            b"y",
+            rustix::fs::XattrFlags::empty(),
+        ) {
+            ferroday_cage_testkit::require::OVERLAY
+                .skip(format!("this filesystem refuses user attributes ({errno})"));
+            return;
+        }
+
+        for upper in [&whited, &opaque] {
+            let dates = account_dates(upper, Some(&base)).expect("the accounts read");
+            assert_eq!(dates, Dates::new(), "the base's shadow is hidden");
+            assert!(read_accounts(upper, Some(&base), shadow).unwrap().is_none());
+            #[cfg(feature = "alpine")]
+            assert!(
+                ids(upper, Some(&base), "etc/passwd").unwrap().is_empty(),
+                "the base's passwd is hidden",
+            );
+        }
+
+        // A plain `/etc` in the upper hides nothing: the base's file shows.
+        let (_plain_dir, plain) = rooted_tree("hidden-etc-plain");
+        plain.write("etc/hostname", b"kept\n").unwrap();
+        assert_eq!(
+            account_dates(&plain, Some(&base)).unwrap(),
+            found(&[("klogd", "19000")]),
         );
     }
 }

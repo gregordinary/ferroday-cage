@@ -23,7 +23,7 @@ use crate::mechanism::{
 };
 use crate::observer::{Observer, Output};
 use crate::path;
-use crate::provision::rooted::Rooted;
+use crate::provision::rooted::{AncestorLink, Merged, Rooted, merged_lookup};
 use crate::resolved::ResolvedInputs;
 use crate::running::{Pending, Running};
 use crate::status::ExitStatus;
@@ -5299,65 +5299,30 @@ fn layer_presence(layer: Option<&Rooted>, relative: &Path) -> Presence {
 
 /// Whether the merged view of an overlay shows an entry at `relative`.
 ///
-/// `layers` is in the order overlayfs consults them: the upper, then the lowers
-/// from the last stacked down to the base. The first layer holding an entry at
-/// the path decides. A whiteout there, a character device numbered 0:0, hides
-/// the name from every layer below; anything else is the entry the merged view
-/// shows. A layer holding nothing at the path passes the question down, unless
-/// it hides the directory the path lies in: a whiteout or another non-directory
-/// at an ancestor, or an ancestor directory marked opaque, behind which the
-/// layers below do not show.
+/// `layers` is in the order overlayfs consults them, the upper first, and the
+/// view is [`merged_lookup`]'s, with a symbolic link at an ancestor passing the
+/// question down to the layers beneath: right for the links a provisioned root
+/// carries, such as a merged-usr `bin`, since every layer that has one has the
+/// same one. A whiteout in the upper itself is [`Presence::WhitedOut`], since
+/// creating the target replaces it; anything else the view hides is absent.
 ///
-/// Each layer is read on its own, with symbolic links resolved inside it, where
-/// the merged view resolves a link across layers. An ancestor that is a link
-/// therefore passes the question down rather than deciding it, which is right
-/// for the links a provisioned root carries, such as a merged-usr `bin`, since
-/// every layer that has one has the same one.
+/// A layer that could not be opened, reached before any layer above it decided,
+/// and a lookup that failed, are both [`Presence::Unknown`].
 fn merged_presence(layers: &[Option<Rooted>], relative: &Path) -> Presence {
-    let ancestors: Vec<&Path> = relative
-        .ancestors()
-        .skip(1)
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .collect();
-    for (depth, layer) in layers.iter().enumerate() {
-        let Some(layer) = layer else {
-            return Presence::Unknown;
-        };
-        match layer.stat(relative) {
-            Ok(Some(stat)) if Rooted::is_whiteout(&stat) => {
-                return if depth == 0 {
-                    Presence::WhitedOut
-                } else {
-                    Presence::Absent
-                };
-            }
-            Ok(Some(_)) => return Presence::Present,
-            Ok(None) => {}
-            Err(_) => return Presence::Unknown,
-        }
-        // Outermost ancestor first, as the kernel walks the path.
-        for ancestor in ancestors.iter().rev() {
-            let stat = match layer.stat(ancestor) {
-                // Nothing here at or below this ancestor: the layers beneath
-                // decide.
-                Ok(None) => break,
-                Ok(Some(stat)) => stat,
-                Err(_) => return Presence::Unknown,
-            };
-            match FileType::from_raw_mode(stat.st_mode) {
-                FileType::Directory => match layer.is_opaque(ancestor) {
-                    Ok(true) => return Presence::Absent,
-                    Ok(false) => {}
-                    Err(_) => return Presence::Unknown,
-                },
-                FileType::Symlink => break,
-                // A whiteout, or a file standing where a directory would have to
-                // be: either way nothing below shows through here.
-                _ => return Presence::Absent,
-            }
-        }
+    let opened: Vec<&Rooted> = layers.iter().map_while(Option::as_ref).collect();
+    match merged_lookup(&opened, relative, AncestorLink::PassesDown) {
+        Ok(Merged::Entry { .. }) => Presence::Present,
+        Ok(Merged::Hidden {
+            layer: 0,
+            whiteout: true,
+        }) => Presence::WhitedOut,
+        Ok(Merged::Hidden { .. }) => Presence::Absent,
+        // Every layer that opened passed the question down, so the first that
+        // did not open is the one that would have answered it.
+        Ok(Merged::Absent) if opened.len() < layers.len() => Presence::Unknown,
+        Ok(Merged::Absent) => Presence::Absent,
+        Err(_) => Presence::Unknown,
     }
-    Presence::Absent
 }
 
 /// Splits an absolute sandbox path into its ordinary components.

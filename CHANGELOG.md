@@ -973,6 +973,13 @@ consumer upgrading can skip it.
   root's `/etc/apk/repositories` one to a line, and a `file://` mirror or a
   caller's own transport carried a newline in one through, adding a repository
   nobody configured.
+- A layered Debian or Alpine build reads the base's `/etc/shadow`, and an
+  Alpine one its `/etc/passwd` and `/etc/group`, only where the upper lets the
+  merged root show them. A whiteout or an opaque directory at `/etc` in the
+  upper hides them, and they were read anyway, so the days a run's account
+  tools wrote were taken for the base's and left undated under
+  `source_date_epoch`, and an Alpine package's owner was named by the base's
+  ids rather than the root's.
 
 ### Internal
 

@@ -198,11 +198,9 @@ has accepted it as two segments of a mirror URL."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/gentoo/installed.rs"
-count = 2
+count = 1
 why = """\
-One undoes the layer's own join of `DB_DIR`, a category and an entry name, to \
-open each prefix beneath the overlay upper through `containment::open_dir`. The \
-other is not a path: `slot_of` takes the slot out of a `slot/subslot` value."""
+Not a path: `slot_of` takes the slot out of a `slot/subslot` value."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/gentoo/atom.rs"
