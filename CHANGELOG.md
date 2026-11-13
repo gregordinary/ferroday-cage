@@ -898,6 +898,11 @@ consumer upgrading can skip it.
   `SEEK_DATA` and `SEEK_HOLE` and left a hole in the copy, where it was written
   as the zeros it reads as, so a file a sandbox made long with
   `truncate -s 16T` filled the destination's disk.
+- A run that uses a package cache removes from it the staging files a run
+  killed outright left behind, where each stayed as a hidden `.partial` file,
+  one more for every killed run: a stage3 download several hundred megabytes
+  long among them. A staging file is held under an `flock` for as long as it is
+  being written, so only one nothing is writing is removed.
 
 ### Internal
 

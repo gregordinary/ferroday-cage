@@ -961,7 +961,9 @@ tarball is arriving, as every layer consults it during a download. A stage3 has
 no package boundary to break the work up. A check that ran only around the
 download would answer a caller who asked to stop once all of it had arrived. A
 run stopped this way fails with `ProvisionError::Cancelled`, leaves no root
-behind, and leaves no partial tarball in the cache.
+behind, and leaves no partial tarball in the cache. A run killed outright
+removes nothing, and leaves what it had downloaded as a hidden staging file
+beside the tarball's name. The next run that uses the cache removes it.
 
 ## The command line
 

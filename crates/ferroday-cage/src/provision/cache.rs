@@ -13,7 +13,8 @@
 //! serves it, and [`prefetch`] fetches several at once where the transport can.
 //! Both stream the body into a [`Staged`] file beside the entry, so nothing is
 //! ever held whole in memory and nothing incomplete is ever visible at the
-//! entry's name. The body is held to the size the entry may hold, where one is
+//! entry's name. A staging file a killed run left behind is removed the next
+//! time the cache is [created](create). The body is held to the size the entry may hold, where one is
 //! known, as it arrives. Once it is complete, the caller's own check reads it
 //! back through the descriptor that wrote it, and only a body the check accepts
 //! is published by the rename. Nothing unverified is ever at an entry's name,
@@ -144,7 +145,11 @@ impl Drop for PackageCache {
 }
 
 /// Creates the cache directory `path`, and any directory above it that is
-/// missing.
+/// missing, and sweeps it of the staging files nothing is writing.
+///
+/// A run killed outright leaves the download it was writing as a hidden
+/// staging file beside the entry, and the next run to use the cache is the one
+/// that can tell it is nobody's: [`Staged::sweep`].
 ///
 /// # Errors
 ///
@@ -152,7 +157,9 @@ impl Drop for PackageCache {
 /// created is a host failure whichever layer's cache it is.
 pub(crate) fn create(path: &Path) -> Result<(), ProvisionError> {
     fs::create_dir_all(path)
-        .map_err(|err| ProvisionError::io("creating the package cache", path, err))
+        .map_err(|err| ProvisionError::io("creating the package cache", path, err))?;
+    Staged::sweep(path);
+    Ok(())
 }
 
 /// Opens the cache entry at `path` for reading.
@@ -511,12 +518,13 @@ fn fetch<T, E, W: Watch + ?Sized>(
 
 /// How many downloads one batch asks for.
 ///
-/// Each job holds an open staging file for as long as the batch runs, so this is
-/// a bound on descriptors rather than on the transport, which decides for itself
-/// how many of a batch to have in flight. It is also the granularity a cancelled
-/// run stops at within a batch's downloads, which is the reason it is not
-/// larger.
-const BATCH: usize = 32;
+/// Each job holds its staging file open for as long as the batch runs, through
+/// two descriptors: the one its body is written through, and the one its lock
+/// is held on ([`Staged`]). So this is a bound on descriptors, at twice its
+/// value, rather than on the transport, which decides for itself how many of a
+/// batch to have in flight. It is also the granularity a cancelled run stops at
+/// within a batch's downloads, which is the reason it is not larger.
+const BATCH: usize = 16;
 
 /// One download of a batch: the URL to fetch, and the entry it fills.
 #[derive(Debug)]

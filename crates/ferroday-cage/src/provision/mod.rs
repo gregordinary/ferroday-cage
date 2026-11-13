@@ -1685,6 +1685,15 @@ pub(crate) fn now_epoch() -> Option<i64> {
 /// is removed is this call's own file, when the value is dropped unpublished,
 /// so a failure at any step leaves nothing behind in a directory that outlives
 /// the call and never reuses the name.
+///
+/// A process killed outright runs no drop, and leaves its staging file. So the
+/// file is held under an `flock` for as long as the value lives, which is what
+/// tells one being written from one whose writer is gone: [`sweep`] removes
+/// those, and a package cache is swept that way each time a run creates it.
+/// A filesystem that keeps no locks stages its files unlocked, and a sweep,
+/// which cannot lock them either, leaves them.
+///
+/// [`sweep`]: Self::sweep
 #[cfg(feature = "tarball")]
 pub(crate) struct Staged {
     /// The staging file's name.
@@ -1694,7 +1703,24 @@ pub(crate) struct Staged {
     /// Whether the rename happened, after which the name is no longer this
     /// value's to remove.
     published: bool,
+    /// A descriptor of the staging file, sharing the open file description the
+    /// lock is held on, so the lock lasts as long as this value does whether
+    /// or not the caller keeps the file it was handed.
+    _held: std::os::fd::OwnedFd,
 }
+
+/// What every staging file's name ends with.
+#[cfg(feature = "tarball")]
+const PARTIAL: &str = ".partial";
+
+/// How many staging names [`Staged::beside`] tries before giving up, each one
+/// lost to a [`Staged::sweep`] that took the file in the moment between its
+/// creation and its lock.
+///
+/// One retry answers that; the bound is there for the reason
+/// [`LOCK_ATTEMPTS`] is.
+#[cfg(feature = "tarball")]
+const STAGE_ATTEMPTS: u32 = 16;
 
 #[cfg(feature = "tarball")]
 impl Staged {
@@ -1704,24 +1730,107 @@ impl Staged {
     /// Readable as well as writable so that what was written can be read back
     /// and checked through the descriptor that wrote it, before it is
     /// published, rather than through a second open of a name.
+    ///
+    /// The file is locked before it is handed back, and checked to still be at
+    /// its name once it is: a [`sweep`](Self::sweep) that found it in the
+    /// moment before the lock may have taken it, and a name it removed is
+    /// given up for a fresh one.
     pub(crate) fn beside(dest: &Path) -> io::Result<(Staged, fs::File)> {
         let dir = crate::path::parent_of(dest);
         let name = dest.file_name().unwrap_or(dest.as_os_str());
-        let mut staging = OsString::from(".");
-        staging.push(name);
-        staging.push(format!(".{}.partial", crate::host::unique_hex()));
-        let path = dir.join(staging);
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        let staged = Staged {
-            path,
-            dest: dest.to_path_buf(),
-            published: false,
+        for _ in 0..STAGE_ATTEMPTS {
+            let mut staging = OsString::from(".");
+            staging.push(name);
+            staging.push(format!(".{}{PARTIAL}", crate::host::unique_hex()));
+            let path = dir.join(staging);
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            let held = match try_lock(&file) {
+                Ok(Locked::Held | Locked::Unsupported) => {
+                    rustix::io::fcntl_dupfd_cloexec(&file, 0).map_err(io::Error::from)
+                }
+                // A sweep holds it, and is removing it.
+                Ok(Locked::Elsewhere) => continue,
+                Err(err) => Err(err),
+            };
+            let held =
+                match held.and_then(|held| still_named(&path, &held).map(|named| (held, named))) {
+                    Ok((held, true)) => held,
+                    Ok((_, false)) => continue,
+                    Err(err) => {
+                        let _ = fs::remove_file(&path);
+                        return Err(err);
+                    }
+                };
+            let staged = Staged {
+                path,
+                dest: dest.to_path_buf(),
+                published: false,
+                _held: held,
+            };
+            return Ok((staged, file));
+        }
+        Err(Errno::AGAIN.into())
+    }
+
+    /// Removes the staging files in `dir` that nothing is writing: what a run
+    /// killed outright, rather than unwound, left behind there.
+    ///
+    /// A staging file is locked for as long as the value that made it lives,
+    /// in this process or another, so one whose lock is free has no writer.
+    /// It is removed only while this holds that lock and its name still holds
+    /// the file that was locked, and only a name of the shape
+    /// [`beside`](Self::beside) gives is looked at, so a file of anyone else's
+    /// that happens to end in `.partial` is left alone. Anything at such a name
+    /// that is not a regular file is left too.
+    ///
+    /// Best effort, as the removal a drop makes is: a directory that cannot be
+    /// read, or a file that cannot be opened, locked, or removed, is left as it
+    /// is, and what the sweep was for, the run, goes on.
+    #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+    pub(crate) fn sweep(dir: &Path) {
+        use std::os::fd::AsFd as _;
+
+        use rustix::fs::{AtFlags, FileType};
+
+        let Ok(handle) = rustix::fs::open(
+            dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return;
         };
-        Ok((staged, file))
+        let Ok(entries) = rustix::fs::Dir::read_from(&handle) else {
+            return;
+        };
+        let names: Vec<std::ffi::CString> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_owned())
+            .filter(|name| is_staging_name(name.to_bytes()))
+            .collect();
+        for name in names {
+            let Ok(typed) = rustix::fs::statat(&handle, &name, AtFlags::SYMLINK_NOFOLLOW) else {
+                continue;
+            };
+            if FileType::from_raw_mode(typed.st_mode) != FileType::RegularFile {
+                continue;
+            }
+            let Ok(file) =
+                containment::open_typed_file(handle.as_fd(), &name, &typed, OFlags::RDONLY)
+            else {
+                continue;
+            };
+            if !matches!(try_lock(&file), Ok(Locked::Held)) {
+                continue;
+            }
+            let still = rustix::fs::statat(&handle, &name, AtFlags::SYMLINK_NOFOLLOW);
+            if still.is_ok_and(|now| now.st_dev == typed.st_dev && now.st_ino == typed.st_ino) {
+                let _ = rustix::fs::unlinkat(&handle, &name, AtFlags::empty());
+            }
+        }
     }
 
     /// The staging file's own name, for a failure that is the staging file's.
@@ -1751,6 +1860,69 @@ impl Drop for Staged {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+/// What [`try_lock`] made of a staging file's lock.
+#[cfg(feature = "tarball")]
+enum Locked {
+    /// This descriptor holds it now.
+    Held,
+    /// Another holds it, and the file is being written or being swept.
+    Elsewhere,
+    /// The filesystem keeps no locks.
+    Unsupported,
+}
+
+/// Takes an exclusive `flock` on a staging file without waiting.
+#[cfg(feature = "tarball")]
+fn try_lock(file: &impl std::os::fd::AsFd) -> io::Result<Locked> {
+    // `lock_exclusive` takes a lock file and waits its turn for it. A staging
+    // file is locked by the call that created it, or tried by a sweep that
+    // passes over one in use, and neither waits.
+    #[expect(clippy::disallowed_methods)]
+    let locked = frame::retry_on_intr!(rustix::fs::flock(
+        file,
+        FlockOperation::NonBlockingLockExclusive
+    ));
+    match locked {
+        Ok(()) => Ok(Locked::Held),
+        Err(Errno::WOULDBLOCK) => Ok(Locked::Elsewhere),
+        Err(Errno::NOLCK | Errno::NOTSUP) => Ok(Locked::Unsupported),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Whether `path` still names the file `held` is a descriptor of.
+#[cfg(feature = "tarball")]
+fn still_named(path: &Path, held: &std::os::fd::OwnedFd) -> io::Result<bool> {
+    let held = rustix::fs::fstat(held)?;
+    match rustix::fs::lstat(path) {
+        Ok(named) => Ok(named.st_dev == held.st_dev && named.st_ino == held.st_ino),
+        Err(Errno::NOENT) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Whether `name` has the shape [`Staged::beside`] gives a staging file: a
+/// dot, the destination's name, a dot and sixteen lowercase hex digits, and
+/// [`PARTIAL`].
+#[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+fn is_staging_name(name: &[u8]) -> bool {
+    let Some(rest) = name
+        .strip_prefix(b".")
+        .and_then(|rest| rest.strip_suffix(PARTIAL.as_bytes()))
+    else {
+        return false;
+    };
+    let Some(dot) = rest.iter().rposition(|byte| *byte == b'.') else {
+        return false;
+    };
+    let (dest, hex) = (&rest[..dot], &rest[dot + 1..]);
+    !dest.is_empty()
+        && hex.len() == 16
+        && hex
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Writes bytes to `dest` atomically and durably, through a [`Staged`] file
@@ -2376,5 +2548,61 @@ mod tests {
             .filter(|name| name != "entry")
             .collect();
         assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
+    }
+
+    #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+    #[test]
+    fn a_sweep_removes_the_staging_files_nothing_holds() {
+        // A run killed outright leaves its staging file, unlocked once the
+        // process is gone. A live one holds its own, which no sweep may take,
+        // and a file merely ending in `.partial` is not a staging file at all.
+        let dir = Scratch::for_test("provision", "staging-sweep");
+        let (held, file) = Staged::beside(&dir.join("entry")).expect("a staging file");
+        let orphan = dir.join(".entry.0123456789abcdef.partial");
+        fs::write(&orphan, b"part of a download").unwrap();
+        let foreign = dir.join(".notes.partial");
+        fs::write(&foreign, b"the caller's own").unwrap();
+        let shaped_link = dir.join(".link.fedcba9876543210.partial");
+        std::os::unix::fs::symlink(&foreign, &shaped_link).unwrap();
+
+        Staged::sweep(&dir);
+        assert!(!orphan.exists(), "a staging file nothing holds was kept");
+        assert!(
+            held.path().exists(),
+            "a staging file being written was swept"
+        );
+        assert!(foreign.exists(), "a file of another shape was swept");
+        assert!(
+            shaped_link.symlink_metadata().is_ok(),
+            "a link at a staging name was removed"
+        );
+
+        // The lock is the value's: the caller letting go of the file it was
+        // handed, as an export does before it publishes, leaves it held.
+        drop(file);
+        Staged::sweep(&dir);
+        assert!(held.path().exists(), "the lock went with the caller's file");
+    }
+
+    #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+    #[test]
+    fn a_staging_name_has_one_shape() {
+        for (name, staging) in [
+            (&b".entry.0123456789abcdef.partial"[..], true),
+            (b".a.b.0123456789abcdef.partial", true),
+            (b"..0123456789abcdef.partial", false),
+            (b".entry.0123456789ABCDEF.partial", false),
+            (b".entry.0123456789abcde.partial", false),
+            (b"entry.0123456789abcdef.partial", false),
+            (b".entry.0123456789abcdef", false),
+            (b".notes.partial", false),
+        ] {
+            assert_eq!(
+                is_staging_name(name),
+                staging,
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 }
