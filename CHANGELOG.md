@@ -238,6 +238,11 @@ consumer upgrading can skip it.
   `tools/seccomp-additions.toml` lists the syscalls a launch makes that a
   runtime's default seccomp profile refuses, and `tools/seccomp-profile.py`
   adds them to the runtime's own default profile.
+- `ExitStatus::core_dumped`, whether the kernel dumped the command's core when a
+  signal terminated it, as the supervisor read it from the wait status, and
+  `ExitStatus::signaled_with_core_dump` for a caller reporting an outcome of
+  its own. A status that dumped core displays as `terminated by signal 11 (core
+  dumped)`. `shell_code` is unchanged.
 
 ### Changed
 

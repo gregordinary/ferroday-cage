@@ -76,6 +76,38 @@ const CPU_LOOP: &str = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";
 const LOOP_FLOOR: Duration = Duration::from_millis(150);
 
 /// The processor time a process's usage reports, user and system together.
+#[test]
+fn a_core_dump_is_reported_as_the_kernel_reported_it() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Whether the kernel dumps a core is the host's to decide, through its
+    // `core_pattern`, so the reference is the same crash outside a sandbox.
+    let crash = "kill -SEGV $$";
+    let reference = std::process::Command::new("/bin/sh")
+        .args(["-c", crash])
+        .status()
+        .expect("the reference runs");
+    assert_eq!(reference.signal(), Some(11), "{reference:?}");
+    let status = sh(rootfs, crash)
+        .run()
+        .expect("the sandbox runs to completion");
+    assert_eq!(status.signal(), Some(11), "{status}");
+    assert_eq!(
+        status.core_dumped(),
+        reference.core_dumped(),
+        "the sandbox reports what the kernel did: {status}",
+    );
+    assert_eq!(status.shell_code(), 139, "the flag changes no shell code");
+
+    // A signal whose default action dumps nothing reports no dump.
+    let killed = sh(rootfs, "kill -KILL $$").run().expect("the sandbox runs");
+    assert_eq!(killed.signal(), Some(9));
+    assert!(!killed.core_dumped(), "{killed}");
+}
+
 fn cpu(usage: ferroday_cage::ResourceUsage) -> Duration {
     usage.user_time + usage.system_time
 }

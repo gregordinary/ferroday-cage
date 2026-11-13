@@ -85,8 +85,8 @@ use super::resolve;
 use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
-    IdentityPlan, LaunchPlan, MountAction, MountOp, RootPlan, STATUS_EXITED, STATUS_SIGNALED,
-    StdioPlan, encode_status,
+    IdentityPlan, LaunchPlan, MountAction, MountOp, RootPlan, STATUS_DUMPED, STATUS_EXITED,
+    STATUS_SIGNALED, StdioPlan, encode_status,
 };
 use crate::error::SetupStep;
 
@@ -2118,6 +2118,11 @@ fn collect_exited() {
     }
 }
 
+/// The bit of a wait status that says the kernel dumped the terminated
+/// process's core, which `WCOREDUMP` tests. rustix reads the signal from a
+/// wait status and not this bit.
+const WCOREFLAG: i32 = 0x80;
+
 /// Writes the status record: the command's outcome, and what the command and
 /// the descendants this process collected used, as
 /// [`STATUS_RECORD_LEN`](super::STATUS_RECORD_LEN) lays it out.
@@ -2128,7 +2133,15 @@ fn report_status(fd: BorrowedFd<'_>, status: WaitStatus) {
     let (kind, value) = if let Some(code) = status.exit_status() {
         (STATUS_EXITED, code)
     } else if let Some(signal) = status.terminating_signal() {
-        (STATUS_SIGNALED, signal)
+        let dumped = status.as_raw() & WCOREFLAG != 0;
+        (
+            if dumped {
+                STATUS_DUMPED
+            } else {
+                STATUS_SIGNALED
+            },
+            signal,
+        )
     } else {
         // Neither exited nor signaled cannot describe a reaped process;
         // exit without a record rather than invent one.

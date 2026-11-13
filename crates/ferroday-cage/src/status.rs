@@ -17,7 +17,7 @@ pub struct ExitStatus(Kind);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
     Exited(i32),
-    Signaled(i32),
+    Signaled { signal: i32, core_dumped: bool },
 }
 
 impl ExitStatus {
@@ -44,7 +44,23 @@ impl ExitStatus {
     /// assert_eq!(ExitStatus::signaled(13).shell_code(), 141);
     /// ```
     pub fn signaled(signal: i32) -> ExitStatus {
-        ExitStatus(Kind::Signaled(signal))
+        ExitStatus(Kind::Signaled {
+            signal,
+            core_dumped: false,
+        })
+    }
+
+    /// The status of a command that signal number `signal` terminated, and
+    /// whose core the kernel dumped.
+    ///
+    /// For the caller [`exited`](Self::exited) describes, reporting a crash of
+    /// its own in the terms a launch reports one. [`signaled`](Self::signaled)
+    /// reports no dump.
+    pub fn signaled_with_core_dump(signal: i32) -> ExitStatus {
+        ExitStatus(Kind::Signaled {
+            signal,
+            core_dumped: true,
+        })
     }
 
     /// Returns `true` if the command exited normally with code `0`.
@@ -56,7 +72,7 @@ impl ExitStatus {
     pub fn code(&self) -> Option<i32> {
         match self.0 {
             Kind::Exited(code) => Some(code),
-            Kind::Signaled(_) => None,
+            Kind::Signaled { .. } => None,
         }
     }
 
@@ -65,8 +81,28 @@ impl ExitStatus {
     pub fn signal(&self) -> Option<i32> {
         match self.0 {
             Kind::Exited(_) => None,
-            Kind::Signaled(signal) => Some(signal),
+            Kind::Signaled { signal, .. } => Some(signal),
         }
+    }
+
+    /// Whether the kernel dumped the command's core when a signal terminated
+    /// it.
+    ///
+    /// The supervisor reads it from the wait status it collects, the flag
+    /// `WCOREDUMP` tests, so it reports what the kernel did and nothing else.
+    /// Whether the kernel dumps a core at all is the host's to decide: a signal
+    /// whose default action dumps one, `kernel.core_pattern`, and the
+    /// [`Resource::CoreDump`](crate::Resource::CoreDump) limit, which a pattern that
+    /// pipes the core to a program does not consult. A command that exited
+    /// reports `false`.
+    pub fn core_dumped(&self) -> bool {
+        matches!(
+            self.0,
+            Kind::Signaled {
+                core_dumped: true,
+                ..
+            }
+        )
     }
 
     /// The status as a process exit code, following the shell's convention.
@@ -103,7 +139,7 @@ impl ExitStatus {
             // A signal number never approaches 128, so the sum is in range;
             // the wrapping form states what happens to a nonsensical one
             // rather than leaving it to a debug-only panic.
-            Kind::Signaled(signal) => 128_u8.wrapping_add(signal as u8),
+            Kind::Signaled { signal, .. } => 128_u8.wrapping_add(signal as u8),
         }
     }
 }
@@ -112,7 +148,14 @@ impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Kind::Exited(code) => write!(f, "exit code {code}"),
-            Kind::Signaled(signal) => write!(f, "terminated by signal {signal}"),
+            Kind::Signaled {
+                signal,
+                core_dumped: false,
+            } => write!(f, "terminated by signal {signal}"),
+            Kind::Signaled {
+                signal,
+                core_dumped: true,
+            } => write!(f, "terminated by signal {signal} (core dumped)"),
         }
     }
 }
@@ -204,5 +247,17 @@ mod tests {
         // SIGKILL and SIGTERM, the two a caller most often sees.
         assert_eq!(ExitStatus::signaled(9).shell_code(), 137);
         assert_eq!(ExitStatus::signaled(15).shell_code(), 143);
+    }
+
+    #[test]
+    fn a_core_dump_is_reported_beside_the_signal_and_changes_no_code() {
+        let dumped = ExitStatus::signaled_with_core_dump(11);
+        assert!(dumped.core_dumped());
+        assert_eq!(dumped.signal(), Some(11));
+        assert_eq!(dumped.shell_code(), 139, "the shell's code takes no flag");
+        assert_eq!(dumped.to_string(), "terminated by signal 11 (core dumped)");
+        assert_ne!(dumped, ExitStatus::signaled(11));
+        assert!(!ExitStatus::signaled(11).core_dumped());
+        assert!(!ExitStatus::exited(0).core_dumped());
     }
 }

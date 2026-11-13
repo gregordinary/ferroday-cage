@@ -1263,13 +1263,16 @@ pub(crate) const STATUS_EXITED: u32 = 1;
 /// The wire encoding of the status record: the command was terminated by a
 /// signal.
 pub(crate) const STATUS_SIGNALED: u32 = 2;
+/// The wire encoding of the status record: the command was terminated by a
+/// signal, and the kernel dumped its core.
+pub(crate) const STATUS_DUMPED: u32 = 3;
 
 /// The length of the status record the supervisor writes once it has collected
 /// the command's exit, little-endian throughout:
 ///
 /// | Bytes | Field |
 /// | --- | --- |
-/// | 0..4 | The kind, [`STATUS_EXITED`] or [`STATUS_SIGNALED`] |
+/// | 0..4 | The kind, [`STATUS_EXITED`], [`STATUS_SIGNALED`], or [`STATUS_DUMPED`] |
 /// | 4..8 | The exit code, or the signal number |
 /// | 8..12 | 1 when the three fields below hold what `getrusage` reported, 0 when it failed |
 /// | 12..20 | User processor time, in microseconds |
@@ -1316,6 +1319,7 @@ pub(crate) fn decode_status(
     let status = match word(0) {
         STATUS_EXITED => ExitStatus::exited(value),
         STATUS_SIGNALED => ExitStatus::signaled(value),
+        STATUS_DUMPED => ExitStatus::signaled_with_core_dump(value),
         _ => return None,
     };
     let usage = match word(8) {
