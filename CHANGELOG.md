@@ -31,14 +31,84 @@ consumer upgrading can skip it.
   `Network::Isolated` (the default) or `Network::None`, installs a seccomp
   filter that refuses the routes out such a namespace does not cover. An
   `AF_VSOCK` socket is refused with `EAFNOSUPPORT`, `io_uring_setup` with
-  `ENOSYS`, and on x86, socket creation through `socketcall` with `ENOSYS`. A
-  sandboxed command could previously open a vsock socket, which reaches a
-  virtual machine guest's hypervisor host, and the host's own services where the
-  host runs vsock loopback. A consumer must act on three consequences. io_uring
-  is unavailable in such a sandbox. A 32-bit x86 program built against glibc
-  creates no socket there. A host that cannot install a seccomp filter fails the
-  launch at the new `SetupStep::InstallNetworkFilter`. `Network::Host` is
-  unchanged.
+  `ENOSYS`, and on x86, socket creation through `socketcall` with
+  `EAFNOSUPPORT`, whatever the family. A sandboxed command could previously
+  open a vsock socket, which reaches a virtual machine guest's hypervisor host,
+  and the host's own services where the host runs vsock loopback. A consumer
+  must act on three consequences. io_uring is unavailable in such a sandbox. A
+  32-bit x86 program built against glibc creates no socket there, and reads
+  each address family as one the kernel does not offer. A host that cannot
+  install a seccomp filter fails the launch at the new
+  `SetupStep::InstallNetworkFilter`, and a Debian or Alpine bootstrap that runs
+  its packages' scripts refuses such a host before it downloads anything.
+  `Network::Host` is unchanged.
+- A sandbox with a PID namespace that inherits the caller's standard input runs
+  in a process group of its own, in the caller's session, which its init
+  creates before the command exists. A sandboxed command could previously
+  signal the caller's whole process group with `kill(0, sig)`, whatever
+  hardening applied: `kill -KILL 0` ended the caller and every process beside
+  it, and any other signal ran the caller's handler for it. Where the command's
+  standard input and output are both the caller's controlling terminal, and the
+  caller's group holds its foreground at the launch, the sandbox's group takes
+  the foreground for the launch, so a typed `^C` still reaches the command; the
+  wait that collects the outcome, or dropping the handle, gives it back. A
+  launch that cannot move into its group, take the foreground, or wait for its
+  launch stage fails at the new `SetupStep::NewProcessGroup`,
+  `SetupStep::TakeForeground`, or `SetupStep::AwaitLaunchStage`. Without a PID
+  namespace the command still shares the caller's process group and PID space,
+  and `LandlockScope::Signal` is the bound there.
+- **Breaking.** A `RestrictedProfile` refuses the `[hardening]` keys
+  `landlock-fs`, `landlock-net`, and `keep-caps` with
+  `ConfigError::ProfileOperationForbidden`, naming the key, and so does `fcage
+  --restricted-profile`. A restricted profile's Landlock grants were added to
+  the grants the consumer configured after loading, and its kept capability set
+  survived the consumer's switch to a non-root `run_as` identity, so an
+  untrusted profile could widen the consumer's own confinement. A seccomp
+  policy, `drop-caps`, and the Landlock scopes are still accepted. A consumer
+  that loads such a profile restricted moves those keys into its own calls.
+- `NetStack::attach`, and `fcage --netstack` with it, refuses a sandbox
+  carrying a Landlock network grant the kernel cannot enforce, below Landlock
+  ABI 4 or without the LSM, with the new
+  `NetStackError::LandlockNetUnenforceable`. The build accepts such a grant in
+  an isolated sandbox, whose network namespace bounds the command, and an
+  attached stack then gave the namespace outbound TCP with the grant silently
+  narrowed away.
+- An Alpine index that a key of Alpine's verifies must describe, in its signed
+  `DESCRIPTION`, the release it was fetched as: a release of `X.Y` for `vX.Y`,
+  a snapshot, pre-release, or `.0` release for `edge`, and some release for
+  `latest-stable`. Alpine signs every release of an architecture with one key,
+  so a mirror could previously answer a request for one release with a genuine
+  index of an older one, or of `edge`. Such an index now fails with
+  `AlpineError::Index`, as does an Alpine-signed index fetched under a release
+  name Alpine does not publish. The description names no component, and
+  postmarketOS writes a timestamp there, so neither is bound; the guide
+  recommends an `https://` transport for postmarketOS.
+- The Gentoo layer holds each field of a binary-package index record to a
+  length (512 bytes for a CPV, 256 for a slot, 16 KiB for each of USE and
+  IUSE, 1 KiB for a path) and leaves a record past one out, as it does a
+  dependency class past 64 KiB, and holds a plan to the same. A resolution
+  records at most 16,384 refusals, charges each comparison of an atom with a
+  candidate build what it reads before making it, and stops before reading past
+  128 MiB, as it stops past 4,194,304 comparisons. An atom names a package and
+  version no longer than a CPV and states at most 64 USE dependencies. Nothing
+  signs the index, and a mirror could previously exhaust memory before any
+  signature was consulted, or make a resolution take hours.
+- The Gentoo layer refuses a binary package whose paths or link targets hold a
+  newline or a carriage return, as portage does. Each became a line of the
+  database entry's `CONTENTS`, so such a package could register itself as the
+  owner of a file it never shipped, which an unmerge inside the root then
+  removed.
+- The Gentoo layer accepts a signature on a stage3 pointer, a digest document,
+  or a binary package's Manifest only from Gentoo's release certificates, the
+  four `sec-keys/openpgp-keys-gentoo-release` installs and Gentoo's own tooling
+  verifies these documents against. It accepted one from any signing
+  certificate in the vendored service-key bundle, which also holds keys Gentoo
+  uses for security advisories and infrastructure. `Gentoo::keyring_horizon`
+  and `fcage --gentoo-keyring-horizon` report the four.
+- A redirect `HttpFetch` refuses is reported against the URL that was fetched,
+  with the target's control characters escaped. A mirror, or anyone on a
+  plain-HTTP path, could otherwise write terminal escape sequences into an
+  operator's error output through a `Location` header.
 
 ### Added
 
@@ -50,14 +120,19 @@ consumer upgrading can skip it.
   capability across its `execve` beyond a kept set, and has no-new-privileges
   set. It is a presentation, not a boundary: on the host the command is still
   the caller. `fcage --present-as UID:GID|own` and the profile key `present-as`
-  reach it, and `ResolvedInputs::present_as` reports it. A range map refuses it.
+  reach it, and `ResolvedInputs::present_as` reports it. A range map refuses
+  it, and so does a presented uid of 0, with `ConfigError::PresentAsRoot`,
+  including `own` for a caller that is the host's root.
 - `Running::usage` reports what the command and its descendants used once a
   wait has returned the outcome, as a `ResourceUsage`: user and system processor
   time, and the largest peak resident set size one process reached. `Output`
   carries it as `usage`. The supervisor reads it after collecting the command's
   exit, so it covers every process collected by then, which under a PID
   namespace includes the orphans the init collected. A kill under a PID
-  namespace reports no usage.
+  namespace reports no usage. The peak is never below the resident set the
+  calling process had at the launch: the command's image before its `execve` is
+  a copy of the caller, and the kernel counts the replaced image's peak toward
+  the command.
 - `CageBuilder::empty_rootfs` roots a sandbox on an empty tmpfs of its own, for
   a sandbox composed from binds that needs no root directory on the host. The
   launch writes nothing on the host, and the root itself becomes read-only once
@@ -72,7 +147,25 @@ consumer upgrading can skip it.
   the host's `/usr`. A link already standing with the same target is kept, so a
   launch over a plain rootfs repeats. `fcage --symlink TARGET PATH` and a
   `[[mount]]` entry with `kind = "symlink"` reach it, and a target that is empty
-  or too long for a path is refused with `ConfigError::SymlinkTargetInvalid`.
+  or too long for a path is refused with `ConfigError::SymlinkTargetInvalid`. A
+  `RestrictedProfile` refuses a link, as it refuses a bind.
+- `ResolvedInputs::network_filter` reports what the network filter refuses, as
+  a `ResolvedNetworkFilter` holding one `ResolvedSyscallRefusal` per refused
+  call: the syscall's name, the value of its first argument where that decides
+  the refusal, and the errno it answers. It is `None` under `Network::Host` and
+  for a restriction, which install no filter, so their records render as
+  before; a record of an isolated or a denied network carries a
+  `network-filter` table.
+- `CopyReport::attributes` names every extended attribute a `CopyIn` run did not
+  give an entry it copied, as a `SkippedAttribute` with an `AttributeSkip`
+  reason: one the sandbox's root cannot set (a `trusted.` attribute, a
+  `security.` one other than a capability, a `system.` one other than an access
+  control list, anything a symbolic link holds), or one naming an id the
+  identity map has no id for.
+- `UnheldReason::Release`, for a pinned Debian package an `include` entry asks
+  of a release that offers it only at another version, and
+  `UnheldReason::Requirement`, for a pinned package at a version a selected
+  package's dependency rules out.
 
 ### Changed
 
@@ -87,18 +180,173 @@ consumer upgrading can skip it.
   and `--seccomp-errno`, which extend it, and is still refused beside an allow
   side. `--seccomp-errno` beside a profile's curated policy joins it rather than
   being refused.
-- `host::seccomp_available` is available without the `hardening` feature.
+- **Breaking.** A sandbox with a PID namespace that inherits the caller's
+  standard input is no longer one of the caller's shell's jobs. A `^Z` typed at
+  the caller's terminal no longer suspends it. In an interactive run, where the
+  sandbox holds the terminal, the kernel discards the stop, or, where the
+  caller's reaper is a subreaper in the caller's session, the init continues the
+  command. A run whose standard output is piped, redirected, or captured leaves
+  the terminal with the caller's job, so the far end of a pipeline reads it as
+  before. The sandbox then runs as a background group: its reads of the terminal
+  fail, and a typed `^C` or `^Z` reaches the caller's job rather than the
+  command. `fcage` ends such a sandbox with itself, and a library caller decides
+  for itself. An interactive command whose output goes elsewhere runs as a
+  terminal launch instead. Without a PID namespace the sandbox is the shell's
+  job as before.
+- `host::seccomp_available` is available without the `hardening` feature, and
+  answers whether this process can install a seccomp filter, by installing one
+  in a short-lived child. It answered `true` on a kernel built without
+  `CONFIG_SECCOMP_FILTER` and under a seccomp policy refusing the `seccomp`
+  syscall, where a launch with a network namespace of its own fails.
 - A run-as identity naming another id than the single-identity map's one is
   refused with the new `ConfigError::RunAsOutsideSingleMap`, which names
   presenting the caller as that id as the remedy, rather than with
   `ConfigError::RunAsUnmapped`. A run-as identity naming a presented identity
   is accepted, and switches nothing.
+- The init collects an orphaned process as soon as it exits, rather than on a
+  once-a-second tick. `SetupStep::WatchCommand` names the descriptors the
+  supervisor watches the command through, a pidfd and the descriptor its
+  children's `SIGCHLD` arrives on.
+- `HttpFetch` asks for a resource's own bytes with `Accept-Encoding: identity`,
+  and refuses a response that applies a content coding regardless as a
+  transport failure, so a mirror walk asks the next mirror. A server compressing
+  on the fly previously produced a digest failure, which no other mirror is
+  asked about.
+
+### Fixed
+
+- **Breaking.** A Debian `pin` holds the version of every name it names by
+  every route a resolution takes to a version. An `include` entry written
+  `name/release`, a versioned dependency such an entry takes from its release,
+  and an upgrade of a package a `base_layer` holds each selected a pinned name
+  at another version without reporting it. Each now takes the pinned version
+  alone, an upgrade doing so whatever the rank of its release. Where the pinned
+  version cannot answer what is asked, the resolution fails with
+  `DebianError::Pin` rather than resolving around the pin, as it now also does
+  for a versioned dependency the pinned version does not meet, which failed
+  with `DebianError::Resolve`. Every refusal is still reported as a
+  `DebianEvent::Unsatisfiable`.
+- `Pool::publish` no longer replaces the `.deb` a pool's index names with a
+  lower version that differs from it only by its epoch, such as `1.0-1`
+  published after `1:1.0-1`, which share a file name. The index kept the
+  higher version's digest, so every bootstrap selecting the package failed its
+  digest check. A `.deb` below the version the index keeps for its name is now
+  neither indexed nor copied into the pool.
+- Publishing a pool syncs each index and `Release` it writes, and the directory
+  holding it, before the publish returns. A crash could leave a pool's
+  `Packages` short, and the next publish, which merges into it, then dropped
+  every package published before.
+- An Alpine bootstrap refuses two packages that ship one path as a directory
+  and as an entry that is not one, whichever is unpacked first and whatever
+  their `replaces` say, as `apk` does. The later one previously replaced the
+  earlier silently, so the tree depended on the unpack order. A link that
+  resolves to a directory still satisfies a later directory entry.
+  `AlpineError::Collision` gains `directory`, naming the package that ships the
+  path as a directory.
+- An Alpine resolution no longer depends on the order `include` names packages
+  in, and `/etc/apk/world` lists them sorted. A closure no longer holds two
+  packages for a name only one may answer, a package's own name or a name
+  provided at a version, which `apk` never installs together: it is resolved
+  again keeping each in turn, and refused naming them where none holds. A
+  layered build refuses an increment whose provider contends with a package the
+  base carries.
+- A Gentoo plan replayed over a root refuses, before merging anything, a build
+  with a runtime or post-merge dependency that neither the root nor the plan
+  answers, as a resolution would have. Such a plan was installed without the
+  dependency.
+- `GentooBuilder::build` refuses a `Stage3` resolved for another architecture
+  than the builder's, or whose variant or build id differs from one the builder
+  names, as it refuses a plan resolved for other coordinates. Such a `Stage3`
+  fetched its tarball from under the builder's architecture, or, from a cache
+  shared with the other architecture, provisioned a root for it.
+- An overlay root whose upper or work directory lies inside a lower is refused
+  at build with the new `ConfigError::OverlayLayersOverlap`, before anything is
+  created on the host. The kernel mounted such an overlay, and every write the
+  sandbox made landed in that lower. The overlaps the kernel refuses at mount
+  are refused at build the same way: a lower inside the upper or the work
+  directory, the upper and the work directory nested, and two lowers nested or
+  the same.
+- A command whose exit a tracer holds no longer keeps the supervisor polling in
+  a loop. Under a PID namespace the init ends the namespace's other processes
+  once the command has exited, so a tracer no longer holds the outcome from
+  `run` and `wait`; without one the launch stage waits until the tracer lets
+  go.
+- A launch takes its launch stage's pidfd from the fork that creates the stage,
+  so a caller that reaps its children elsewhere, with `waitpid(-1)`, can no
+  longer have a launch signal or wait for an unrelated process that took the
+  stage's pid.
+- A capability drop removes every capability the running kernel defines from
+  the bounding set. A capability past the last one rustix names, as a later
+  kernel adds, stayed in it.
+- A TCP flow the network stack aborts at its establish deadline or its hangup
+  deadline resets the guest. The reset was discarded with the flow's socket, so
+  a guest whose connection to an unanswering destination had already
+  established on its side waited indefinitely.
+- A reset from the guest, and every other way a TCP flow ends short of both
+  sides closing in order (a timeout, a deadline, a host-side failure, the stack
+  stopping), reaches the host peer as a reset. The guest's reset reached it as
+  an orderly end of stream, so a server reading an upload to its end accepted a
+  truncated one as complete. A published connection the guest refuses is
+  likewise reset on the host side rather than closed. A guest that finishes
+  while a slow host is still taking its last bytes no longer loses them.
+- `NetStackBuilder::build` refuses an interface name holding `%`. The kernel
+  took such a name as a template and named the interface itself, so the stack's
+  configuration of it failed at attach with "No such device".
+- A terminal session in the background no longer reads the caller's terminal.
+  A line typed at the shell stopped it with `SIGTTIN`, and the `fg` that
+  continued it left it inside a read of a cooked terminal, relaying nothing and
+  answering neither a deadline nor an interrupt until another line was typed.
+- `CopyIn` copies extended attributes the rootfs's root can set: `user.`
+  attributes, POSIX access control lists, and file capabilities. A list's named
+  users and groups and a capability's root are read through the identity map
+  as an owner is. Every attribute was dropped before, while the report said the
+  copy was complete, and a dropped list with a mask left the owning group with
+  the mask's access. A list that cannot be copied is now reported and the entry
+  given the list's narrowing, so the owning group keeps only what the list gave
+  it.
+- The tar extractor applies the POSIX access control lists an `Export` records
+  (`SCHILY.xattr.system.posix_acl_access` and `..._default`), their named ids
+  read through the identity map, a directory's once its contents are written. A
+  list it cannot apply is given as its narrowing. The pre-configure overlay,
+  which lays no attributes, gives an entry whose source carries a list the same
+  narrowing.
+- `Export` spells an extended attribute whose name holds `=` or `%` as GNU tar
+  spells it in a `SCHILY.xattr.` keyword, `%3D` and `%25`, so the name reads
+  back whole.
+- A hard link onto a name that already holds its target is taken as done, as
+  GNU tar takes it, by the extractor and by `CopyIn`. A link naming itself, as
+  GNU tar writes for a path listed twice, or reaching its target through a
+  merged-usr alias, removed the file and then failed; `CopyIn` failed part-way
+  through a tree.
+- The Debian and Alpine pre-configure overlay lays a source directory its owner
+  cannot write, `0555` or `0500`, together with its contents, and gives it its
+  mode once they are written. It failed with a permission error for a caller
+  other than root. A directory a layered build carries up from its base meets
+  the same rule.
+- The tar reader retries a read a signal interrupted. An archive streamed
+  through `Tarball::from_reader` over a pipe or a socket failed on the first
+  signal whose handler does not restart the calls it interrupts.
+- A `file://` fetch through `HttpFetch` no longer waits on a named pipe at the
+  path: anything that is not a regular file is refused at once, as a transport
+  failure a mirror walk advances past. The fetch is held to `request_timeout`
+  as an `http://` one is.
+- A bootstrap given a `source_date_epoch` reads an account `/etc/shadow` names
+  twice by its first line, as `getspnam` does.
+- `fcage --help` names `--no-stop-with-caller` among the counterpart toggles,
+  where it named `--stop-with-caller`.
 
 ### Internal
 
 - The classic-BPF vocabulary, the seccomp install, and the unit tests'
   interpreter of a seccomp program moved from the hardening layer to
   `mechanism::seccomp`, which the network filter and the hardening layer share.
+- The pre-configure overlay walks its source by descriptor, as `CopyIn` does,
+  and opens each file with `containment::open_typed_file`.
+- The Gentoo layer spells a database entry's `COUNTER` file once, beside
+  `DB_DIR`, and reads a container's metadata files through the one conversion
+  the root's reader uses.
+- The relay and the supervisor open their signal descriptors through one
+  `mechanism::sys::signalfd`.
 
 ## [0.5.2] - 2026-11-10
 
