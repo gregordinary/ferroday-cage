@@ -116,7 +116,7 @@ whether one arrived, so a program stops a run on `^C` without a signal handler.
 The first `SIGINT` asks the run to stop, the next acts as `SIGINT` does, and
 nothing is held where the process ignores `SIGINT`. Hold it before the program
 starts a thread of its own, since a thread started earlier would take the
-signal and end the process:
+signal and end the process. `fcage` holds one for each provisioning run:
 
 ```rust,no_run
 use ferroday_cage::provision::{Interrupt, Provision, ProvisionObserver, Tarball};

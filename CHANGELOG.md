@@ -689,6 +689,11 @@ consumer upgrading can skip it.
   the parser applies. It left out the cgroup flags and those of the unix-socket
   restriction, which a restriction takes. A flag a restriction refuses is named
   in the refusal, where a family of flags was.
+- `fcage` stops a provisioning run at its next clean point on `SIGINT`, removing
+  what the run staged, its staging tree and a part-written download, and then
+  ends by the signal. A second `SIGINT` ends it at once. An interrupted run
+  ended at once and left both behind. A launch after the run keeps `SIGINT` as
+  it was.
 - `fcage` refuses a launch whose command no sandbox would run, a relative path
   or a name with no `PATH` to look it up in, before a `--provision-*` flag
   provisions its root, rather than after.

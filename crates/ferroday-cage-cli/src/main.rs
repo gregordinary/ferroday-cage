@@ -55,7 +55,9 @@ use std::time::Duration;
 
 use ferroday_cage::provision::alpine::KeySet as AlpineKeySet;
 use ferroday_cage::provision::debian::{Priority, Repository};
-use ferroday_cage::provision::{ProvisionError, ProvisionEvent, Provisioned, Provisioner};
+use ferroday_cage::provision::{
+    Interrupt, ProvisionError, ProvisionEvent, Provisioned, Provisioner,
+};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, Error, ErrorChain, ExitStatus, FsAccess,
@@ -6286,23 +6288,53 @@ fn provisioner(options: &Options) -> Result<Option<Box<dyn Provisioner>>, ExitCo
 /// goes away stops the run at the provisioner's next clean point, which leaves
 /// no destination behind, and the run exits 141. So does a run that finished
 /// before it reached such a point, since the reader left before the run did.
+///
+/// A `SIGINT` stops the run the same way, through an [`Interrupt`] held for
+/// the run alone, and `fcage` then ends by the signal, as an interrupted
+/// process does, with nothing of the run left behind. One that arrives after
+/// the run's last clean point leaves the root it published, and `fcage` ends
+/// by it all the same rather than launch. The launch that may follow an
+/// uninterrupted run keeps `SIGINT` as it was. Where the hold cannot be taken, the run
+/// goes ahead without it, and a `SIGINT` ends `fcage` as it did before.
 fn provision(rootfs: &Path, provisioner: &mut dyn Provisioner) -> Result<Provisioned, ExitCode> {
     let mut progress = Progress::new(std::io::stderr());
+    progress.interrupt = Interrupt::hold().ok();
     let published = ferroday_cage::provision::Provision::new(rootfs)
         .observe(&mut progress)
         .run(provisioner);
+    let interrupted = progress
+        .interrupt
+        .take()
+        .is_some_and(|interrupt| interrupt.requested());
     match published {
         Ok(_) | Err(ProvisionError::Cancelled) if progress.gone => {
             Err(ExitCode::from(output::broken_pipe()))
         }
+        // An interrupt that arrived after the run's last clean point leaves the
+        // root published, and is still an interrupt.
+        Ok(_) | Err(ProvisionError::Cancelled) if interrupted => Err(end_by_interrupt()),
         Ok(provisioned) => Ok(provisioned),
         Err(error) => Err(fail(error)),
     }
 }
 
+/// Ends `fcage` by `SIGINT`, once an interrupted run has stopped.
+///
+/// A process that cleans up on `SIGINT` raises it again rather than exiting
+/// with a code of its own, so that its parent learns it was interrupted: a
+/// shell running a script stops the script when a command it waited for died
+/// of `SIGINT`, and goes on when the command merely exited 130. The hold has
+/// ended by the time this runs, so the signal does what it would have done
+/// without one. 130 is the shell's code for it, should the raise return.
+fn end_by_interrupt() -> ExitCode {
+    let _ = rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT);
+    ExitCode::from(130)
+}
+
 /// What a provisioning run reports as it goes: each userland's progress, and
 /// the output of the commands its bootstrap runs in a cage. Also whether the
-/// run should stop, which it should once nothing reads what it reports.
+/// run should stop, which it should once nothing reads what it reports, or
+/// once it is interrupted.
 ///
 /// Generic over where the report goes so that a test can hand it a pipe whose
 /// reader has gone; a run hands it standard error.
@@ -6311,11 +6343,17 @@ struct Progress<W> {
     /// Whether a write found the reader gone. Nothing more is written once it
     /// has, and the run is asked to stop.
     gone: bool,
+    /// The hold on `SIGINT` a run takes, whose `SIGINT` asks the run to stop.
+    interrupt: Option<Interrupt>,
 }
 
 impl<W: std::io::Write> Progress<W> {
     fn new(out: W) -> Progress<W> {
-        Progress { out, gone: false }
+        Progress {
+            out,
+            gone: false,
+            interrupt: None,
+        }
     }
 
     /// Writes one line of progress.
@@ -6490,7 +6528,7 @@ impl<W: std::io::Write> ferroday_cage::provision::ProvisionObserver for Progress
     }
 
     fn cancelled(&mut self) -> bool {
-        self.gone
+        self.gone || self.interrupt.as_ref().is_some_and(Interrupt::requested)
     }
 }
 
