@@ -198,6 +198,11 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `GentooEvent::Database` reports, before a Gentoo resolution or a replayed
+  plan is held to a root, how many packages the root's package database
+  describes and how many of its entries it left out as naming none. `fcage`
+  prints both, and `fcage --gentoo-installed` prints the second on stderr
+  where it is not zero (`ferroday-cage-cli`).
 - The Debian layer reads a `.deb` whose `data.tar` member is compressed with
   LZMA, `data.tar.lzma`, as dpkg-deb does, with the dictionary its header
   declares held to the 128 MiB an xz block's is. A `control.tar.lzma`, which
@@ -785,13 +790,15 @@ consumer upgrading can skip it.
   package's own spelling, and its message wrote it to the terminal raw,
   control characters included.
 - `gentoo::installed`, and the Gentoo layer reading a root before it installs
-  into one, refuse a package database entry whose category or package name
-  the package manager specification does not permit, with
-  `GentooError::Database`. A resolution names a root's packages bare, so a
-  directory name holding a control character reached the terminal raw. A
-  container's `CATEGORY`, `PF` and `CHOST`, the `CHOST`s a root's database
-  states, and a link path a container ships are quoted with `{:?}` where a
-  refusal names them.
+  into one, leave out a package database entry whose directory names spell no
+  package, as portage does, and count it in the new `Installed::skipped`: a
+  category or package name the package manager specification does not permit,
+  a name with no version, or one that is not UTF-8. An entry with no version or
+  a name that is not UTF-8 was refused with `GentooError::Database`, and a
+  resolution names a root's packages bare, so a directory name holding a
+  control character reached the terminal raw. A container's `CATEGORY`, `PF`
+  and `CHOST`, the `CHOST`s a root's database states, and a link path a
+  container ships are quoted with `{:?}` where a refusal names them.
 - A Debian resolution asks for a repository's indexes first at the mirror that
   served its release, then at the rest in the order they are configured. The
   index walk started again at the first mirror, so where a backstop served the

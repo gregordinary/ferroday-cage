@@ -40,8 +40,10 @@
 //! this way it names something inside the tree or nothing at all.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use super::atom::{self, Atom, Candidate, Dependency};
 use super::index::{self, MAX_FLAGS_BYTES, MAX_SLOT_BYTES};
@@ -82,7 +84,8 @@ const RUNTIME_DEPENDENCY_FILES: [&str; 2] = ["RDEPEND", "PDEPEND"];
 /// The prefix portage gives an entry it is part way through merging.
 ///
 /// An interrupted merge leaves one behind, and it describes a package that is
-/// not installed. It is skipped rather than read or refused: the marker is
+/// not installed. It is skipped rather than read or refused, and is not
+/// counted among the entries [`Installed::skipped`] counts: the marker is
 /// portage's own and says exactly what the directory is, and a root that has
 /// one is a root a merge was interrupted in rather than a malformed one.
 const MERGING_PREFIX: &str = "-MERGING-";
@@ -227,6 +230,8 @@ pub struct Installed {
     /// The packages, ordered by `category/name` and then by slot, so two reads
     /// of one root are the same read.
     packages: Vec<InstalledPackage>,
+    /// How many entry directories named no package and were left out.
+    skipped: usize,
 }
 
 impl Installed {
@@ -243,6 +248,21 @@ impl Installed {
     /// Whether the root has none, which a provisioned Gentoo root never does.
     pub fn is_empty(&self) -> bool {
         self.packages.is_empty()
+    }
+
+    /// How many entry directories the database holds that name no package,
+    /// and were left out of [`packages`](Self::packages).
+    ///
+    /// An entry directory's two names, its category's and its own, spell the
+    /// package and its version. Where they spell none, the directory is passed
+    /// over as portage passes it over, rather than failing the read: no
+    /// `name-version` to split, a category or a name the package manager
+    /// specification does not permit, or a name that is not UTF-8. portage
+    /// reports such an entry as an invalid one and reads on, and never lists
+    /// the entries of a category whose name it does not permit. A root portage
+    /// built reports zero.
+    pub fn skipped(&self) -> usize {
+        self.skipped
     }
 
     /// The target triples the root's packages were built for: every `CHOST`
@@ -312,6 +332,7 @@ impl Installed {
                     chost: None,
                 })
                 .collect(),
+            0,
         )
     }
 
@@ -344,7 +365,7 @@ impl Installed {
     /// Every version here is one the comparator orders: an entry's version is
     /// what [`version::split_cpv`] split off its directory name, and that split
     /// is made only where what follows parses as a version.
-    fn sorted(mut packages: Vec<InstalledPackage>) -> Installed {
+    fn sorted(mut packages: Vec<InstalledPackage>, skipped: usize) -> Installed {
         packages.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
@@ -354,7 +375,7 @@ impl Installed {
                         .expect("an installed version is one split_cpv found to parse")
                 })
         });
-        Installed { packages }
+        Installed { packages, skipped }
     }
 }
 
@@ -367,14 +388,15 @@ impl Installed {
 ///
 /// # Errors
 ///
-/// Returns [`GentooError::Database`] for a tree whose `/var/db/pkg` holds
-/// something that is not a package entry — a directory that does not name a
-/// `name-version`, one naming a category or a package the package manager
-/// specification does not permit, one carrying no `SLOT`, or one whose runtime
-/// dependencies do not parse — and [`GentooError::Io`] where the tree could
-/// not be read. A root with no `/var/db/pkg` at all reports no packages rather
-/// than failing: an empty answer is a true one about a directory that is not
-/// there.
+/// Returns [`GentooError::Database`] for a tree whose `/var/db/pkg` holds an
+/// entry that names a package and does not describe one — one carrying no
+/// `SLOT`, one whose runtime dependencies do not parse, or one stating a field
+/// longer than an index record may — or that costs more to read than any root
+/// a binhost could have built, and [`GentooError::Io`] where the tree could
+/// not be read. An entry directory that names no package is left out instead,
+/// and counted in [`Installed::skipped`]. A root with no `/var/db/pkg` at all
+/// reports no packages rather than failing: an empty answer is a true one
+/// about a directory that is not there.
 ///
 /// # Example
 ///
@@ -393,18 +415,14 @@ impl Installed {
 pub fn installed(root: impl AsRef<Path>) -> Result<Installed, GentooError> {
     let root = root.as_ref();
     let rooted = Rooted::open(root).map_err(GentooError::at("opening the root", root))?;
-    Ok(Installed::sorted(read_database(&rooted, root)?))
-}
-
-/// Reads every entry of the database, or reports the first that is not one.
-///
-/// `at` names the root in a failure; nothing resolves through it.
-fn read_database(rooted: &Rooted, at: &Path) -> Result<Vec<InstalledPackage>, GentooError> {
     let mut budget = Budget::new();
-    entries(rooted, at, &mut budget)?
+    let listing = entries(&rooted, root, &mut budget)?;
+    let packages = listing
+        .entries
         .iter()
-        .map(|(category, pf)| read_entry(&[rooted], at, category, pf, &mut budget))
-        .collect()
+        .map(|entry| read_entry(&[&rooted], root, entry, &mut budget))
+        .collect::<Result<_, _>>()?;
+    Ok(Installed::sorted(packages, listing.skipped.len()))
 }
 
 /// What reading one root's package database may still cost, charged as it
@@ -449,51 +467,91 @@ impl Budget {
     }
 }
 
-/// Every entry directory the database holds, as its category and its `PF`, in
-/// a stable order.
+/// What a database's directories hold: the entries that name a package, and
+/// the paths of those that name none.
+struct Listing {
+    /// Each entry naming a package, in a stable order.
+    entries: Vec<Listed>,
+    /// Each entry directory naming no package, as its path in the tree, which
+    /// [`Installed::skipped`] counts.
+    skipped: Vec<PathBuf>,
+}
+
+/// One entry directory that names a package: its category and its `PF`, and
+/// the package and the version they spell.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Listed {
+    /// The category directory's name.
+    category: String,
+    /// The entry directory's name, `name-version`.
+    pf: String,
+    /// `category/name`, held to the specification's alphabet.
+    name: String,
+    /// The version, which [`version::split_cpv`] found to parse.
+    version: String,
+}
+
+impl Listed {
+    /// The entry `category` and `pf` name, or `None` where they spell no
+    /// package.
+    ///
+    /// The two directory names are whatever the tree holds, and the name they
+    /// spell is what a resolution reports a package by, bare. Holding it to the
+    /// specification's alphabet is what lets it be named so: none of its
+    /// characters is a control character. The version is held by the split,
+    /// which is what tells the package name from the version: the entry
+    /// directory holds both with a hyphen between them and no marker for where
+    /// it is.
+    fn of(category: &[u8], pf: &[u8]) -> Option<Listed> {
+        let category = std::str::from_utf8(category).ok()?;
+        let pf = std::str::from_utf8(pf).ok()?;
+        let cpv = format!("{category}/{pf}");
+        let (_, package, version) = version::split_cpv(&cpv)?;
+        let name = format!("{category}/{package}");
+        atom::is_package(&name).then(|| Listed {
+            category: category.to_string(),
+            pf: pf.to_string(),
+            name,
+            version: version.to_string(),
+        })
+    }
+}
+
+/// Every entry directory the database holds, those that name a package in a
+/// stable order and the paths of the rest.
 ///
-/// An interrupted merge's entry is skipped: see [`MERGING_PREFIX`]. Each one
-/// listed is charged to `budget` at what holding its two names costs.
-fn entries(
-    rooted: &Rooted,
-    at: &Path,
-    budget: &mut Budget,
-) -> Result<Vec<(String, String)>, GentooError> {
-    let mut found = Vec::new();
+/// An interrupted merge's entry is passed over: see [`MERGING_PREFIX`]. Every
+/// other one listed is charged to `budget` at what holding its two names costs,
+/// whether or not it names a package, so a database of directories naming none
+/// is bounded as one naming packages is.
+fn entries(rooted: &Rooted, at: &Path, budget: &mut Budget) -> Result<Listing, GentooError> {
+    let mut listing = Listing {
+        entries: Vec::new(),
+        skipped: Vec::new(),
+    };
     let categories = rooted
         .directories(DB_DIR)
         .map_err(GentooError::at("reading the package database", at))?;
     for category in categories {
-        let Ok(category) = String::from_utf8(category) else {
-            // A category is a path segment of an atom, so one that is not UTF-8
-            // is not a category whatever else it is.
-            return Err(GentooError::database(
-                at,
-                "the package database holds a category whose name is not UTF-8",
-            ));
-        };
-        let dir = format!("{DB_DIR}/{category}");
+        let dir = Path::new(DB_DIR).join(OsStr::from_bytes(&category));
         let entries = rooted
             .directories(&dir)
             .map_err(GentooError::at("reading a package database category", at))?;
-        for entry in entries {
-            let Ok(pf) = String::from_utf8(entry) else {
-                return Err(GentooError::database(
-                    at,
-                    format!("{dir:?} holds an entry whose name is not UTF-8"),
-                ));
-            };
-            if pf.starts_with(MERGING_PREFIX) {
+        for pf in entries {
+            if pf.starts_with(MERGING_PREFIX.as_bytes()) {
                 continue;
             }
             budget.charge(
                 size_of::<(String, String)>() + category.len() + pf.len(),
                 at,
             )?;
-            found.push((category.clone(), pf));
+            match Listed::of(&category, &pf) {
+                Some(entry) => listing.entries.push(entry),
+                None => listing.skipped.push(dir.join(OsStr::from_bytes(&pf))),
+            }
         }
     }
-    Ok(found)
+    Ok(listing)
 }
 
 /// Reads one entry: its name and version from the two directory names, its slot
@@ -510,32 +568,10 @@ fn entries(
 fn read_entry(
     layers: &[&Rooted],
     at: &Path,
-    category: &str,
-    pf: &str,
+    entry: &Listed,
     budget: &mut Budget,
 ) -> Result<InstalledPackage, GentooError> {
-    let dir = format!("{DB_DIR}/{category}/{pf}");
-    // The entry's own two directory names spell a `CPV`, and splitting that is
-    // what tells the package name from the version -- the entry directory holds
-    // both with a hyphen between them and no marker for where it is.
-    let cpv = format!("{category}/{pf}");
-    let Some((category, package, version)) = version::split_cpv(&cpv) else {
-        return Err(GentooError::database(
-            at,
-            format!("{dir:?} does not name a package and a version"),
-        ));
-    };
-    // The two directory names are whatever the tree holds, and the name they
-    // spell is what a resolution reports a package by, bare. Holding it to the
-    // specification's alphabet is what lets it be named so: none of its
-    // characters is a control character. The version is held by the split.
-    let name = format!("{category}/{package}");
-    if !atom::is_package(&name) {
-        return Err(GentooError::database(
-            at,
-            format!("{dir:?} names a package the package manager specification does not permit"),
-        ));
-    }
+    let dir = format!("{DB_DIR}/{}/{}", entry.category, entry.pf);
     budget.charge(size_of::<InstalledPackage>(), at)?;
     // Each file is read only to what the budget has left, so a file past that
     // is refused unread rather than held and then refused.
@@ -557,7 +593,7 @@ fn read_entry(
     };
     // What an installed package requires is the state the root arrived in,
     // and not this layer's to hold it to.
-    let (package, _) = read_package(name, version, field, |unreadable| {
+    let (package, _) = read_package(entry.name.clone(), &entry.version, field, |unreadable| {
         GentooError::database(
             at,
             match unreadable {
@@ -779,35 +815,42 @@ pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooErro
     let base = Rooted::open(lower).map_err(GentooError::at("opening the root", lower))?;
     let top = Rooted::open(upper).map_err(GentooError::at("opening the overlay upper", upper))?;
     let layers = [&top, &base];
-    // Whether the base's entry of this name shows through the upper, which is
+    // Whether the base's entry at this path shows through the upper, which is
     // the base holding the entry the merged view shows there.
-    let shows = |category: &str, pf: &str| {
-        merged_lookup(
-            &layers,
-            Path::new(&format!("{DB_DIR}/{category}/{pf}")),
-            AncestorLink::Hides,
-        )
-        .map(|merged| matches!(merged, Merged::Entry { layer: 1 }))
-        .map_err(|err| GentooError::io("reading the overlay upper", upper, err))
+    let shows = |path: &Path| {
+        merged_lookup(&layers, path, AncestorLink::Hides)
+            .map(|merged| matches!(merged, Merged::Entry { layer: 1 }))
+            .map_err(|err| GentooError::io("reading the overlay upper", upper, err))
     };
     let mut budget = Budget::new();
-    let held: BTreeSet<(String, String)> = entries(&top, upper, &mut budget)?.into_iter().collect();
+    let above = entries(&top, upper, &mut budget)?;
+    let below = entries(&base, lower, &mut budget)?;
+    let held: BTreeSet<&Listed> = above.entries.iter().collect();
 
     let mut packages = Vec::new();
-    for (category, pf) in entries(&base, lower, &mut budget)? {
-        if held.contains(&(category.clone(), pf.clone())) || !shows(&category, &pf)? {
+    for entry in &below.entries {
+        let path = Path::new(DB_DIR).join(&entry.category).join(&entry.pf);
+        if held.contains(entry) || !shows(&path)? {
             continue;
         }
-        packages.push(read_entry(&[&base], lower, &category, &pf, &mut budget)?);
+        packages.push(read_entry(&[&base], lower, entry, &mut budget)?);
     }
-    for (category, pf) in &held {
-        let above = read_entry(&layers, upper, category, pf, &mut budget)?;
+    for entry in &held {
+        let above = read_entry(&layers, upper, entry, &mut budget)?;
         packages.retain(|below| {
             !(below.name == above.name && slot_of(&below.slot) == slot_of(&above.slot))
         });
         packages.push(above);
     }
-    Ok(Installed::sorted(packages))
+    // An entry naming no package is one entry of the merged view where either
+    // layer holds it, and the upper's hides the base's as any entry does.
+    let mut skipped = above.skipped.len();
+    for path in &below.skipped {
+        if shows(path)? {
+            skipped += 1;
+        }
+    }
+    Ok(Installed::sorted(packages, skipped))
 }
 
 /// The slot proper of a `slot` or `slot/subslot` spelling.
@@ -1049,23 +1092,74 @@ mod tests {
     }
 
     #[test]
-    fn a_database_name_outside_the_alphabet_is_refused_with_its_control_characters_escaped() {
+    fn an_entry_naming_no_package_is_skipped_and_counted() {
         // The directory names are whatever anything run in the root left
-        // there, and a resolution names the package they spell bare. One the
-        // specification does not permit is refused where it is read, and the
-        // refusal quotes it.
+        // there, and a resolution names the package they spell bare. Where
+        // they spell none, portage passes the entry over and reads on, and so
+        // does this: a category or a name outside the specification's alphabet,
+        // control characters included, no version to split off, or a name
+        // that is not UTF-8. Each is left out and counted, and the packages
+        // beside it are read.
+        use std::os::unix::ffi::OsStrExt;
         let hostile = crate::failure::hostile::TEXT;
-        for (category, pf) in [
-            (hostile, "zlib-1.3.1".to_string()),
-            ("sys-libs", format!("zlib{hostile}-1.3.1")),
-        ] {
-            let dir = Scratch::for_test("gentoo-installed", "hostile-name");
-            entry(&dir, category, &pf, Some("0"), "amd64");
-            let err = installed(&*dir).expect_err("the name is refused");
-            assert!(matches!(err, GentooError::Database { .. }), "{err:?}");
-            assert!(err.to_string().contains("does not permit"), "{err}");
-            crate::failure::hostile::assert_escaped(&crate::ErrorChain::new(&err).to_string());
+        let not_utf8 = std::ffi::OsStr::from_bytes(b"zlib\xff-1.3.1");
+        let dir = stage3("unnamed");
+        entry(&dir, hostile, "zlib-1.3.1", Some("0"), "amd64");
+        entry(
+            &dir,
+            "sys-libs",
+            &format!("zlib{hostile}-1.3.1"),
+            Some("0"),
+            "amd64",
+        );
+        entry(&dir, "Sys_Libs!", "zlib-1.3.1", Some("0"), "amd64");
+        std::fs::create_dir_all(dir.join(DB_DIR).join("sys-libs").join("zlib")).unwrap();
+        std::fs::create_dir_all(dir.join(DB_DIR).join("sys-libs").join(not_utf8)).unwrap();
+        std::fs::create_dir_all(dir.join(DB_DIR).join(not_utf8).join("zlib-1.3.1")).unwrap();
+
+        let read = installed(&*dir).expect("the database is read");
+        assert_eq!(read.skipped(), 6);
+        assert_eq!(
+            names(&read),
+            ["app-crypt/pinentry", "sys-apps/util-linux", "sys-libs/zlib"],
+        );
+        assert_eq!(installed(&*stage3("named")).unwrap().skipped(), 0);
+    }
+
+    #[test]
+    fn an_entry_naming_no_package_is_charged_to_the_budget() {
+        // Listing one costs what listing an entry naming a package does, so a
+        // database of directories that name nothing is bounded as one of
+        // packages is.
+        let dir = Scratch::for_test("gentoo-installed", "unnamed-budget");
+        let name = format!("zlib{}-1.3.1", crate::failure::hostile::TEXT);
+        std::fs::create_dir_all(dir.join(DB_DIR).join("sys-libs").join(&name)).unwrap();
+        let rooted = Rooted::open(&dir).unwrap();
+        let mut budget = Budget::new();
+        let listing = entries(&rooted, &dir, &mut budget).expect("the database is listed");
+        assert_eq!((listing.entries.len(), listing.skipped.len()), (0, 1));
+        assert_eq!(
+            MAX_DATABASE_BYTES - budget.left,
+            (size_of::<(String, String)>() + "sys-libs".len() + name.len()) as u64,
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_no_package_counts_once_in_the_merged_view() {
+        // Where both layers hold it, the upper's hides the base's, as it hides
+        // any entry; where the upper hides it outright, it is not counted.
+        let lower = stage3("unnamed-lower");
+        let upper = Scratch::for_test("gentoo-installed", "unnamed-upper");
+        for root in [&*lower, &*upper] {
+            std::fs::create_dir_all(root.join(DB_DIR).join("sys-libs").join("both")).unwrap();
         }
+        std::fs::create_dir_all(lower.join(DB_DIR).join("sys-libs").join("below")).unwrap();
+        std::fs::create_dir_all(upper.join(DB_DIR).join("sys-libs").join("above")).unwrap();
+        std::fs::create_dir_all(lower.join(DB_DIR).join("sys-libs").join("hidden")).unwrap();
+        std::fs::write(upper.join(DB_DIR).join("sys-libs").join("hidden"), b"").unwrap();
+        let merged = merged(&lower, &upper).expect("the merged view is read");
+        assert_eq!(merged.skipped(), 3);
+        assert_eq!(merged.len(), 3);
     }
 
     #[test]
@@ -1438,14 +1532,5 @@ mod tests {
                 .expect("the merged view is read")
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn a_directory_that_does_not_name_a_package_is_refused() {
-        let dir = Scratch::for_test("gentoo-installed", "not-a-package");
-        std::fs::create_dir_all(dir.join(DB_DIR).join("sys-libs").join("zlib"))
-            .expect("the directory is created");
-        let err = installed(&*dir).expect_err("a versionless entry is refused");
-        assert!(matches!(err, GentooError::Database { .. }), "{err:?}");
     }
 }

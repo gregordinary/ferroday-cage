@@ -6554,6 +6554,15 @@ impl<W: std::io::Write> Progress<W> {
                 },
                 generated.map_or_else(String::new, |at| format!(", generated at {at}")),
             )),
+            GentooEvent::Database {
+                packages, skipped, ..
+            } => self.line(format_args!(
+                "fcage: the root's package database describes {packages} packages{}",
+                match skipped {
+                    0 => String::new(),
+                    skipped => format!(", skipping {skipped} entries that name no package"),
+                },
+            )),
             GentooEvent::Planned {
                 packages, bytes, ..
             } => self.line(format_args!(
@@ -6911,13 +6920,26 @@ fn gentoo_packages(
 /// what a mistyped path or a root of some other distribution produces. The
 /// listing itself stays on stdout and the exit stays 0, because nothing failed;
 /// what the note adds is that the reader learns the answer was empty rather
-/// than inferring it from a blank screen.
+/// than inferring it from a blank screen. Entries the database holds that name
+/// no package are left out of the listing, and their count is reported on
+/// stderr the same way.
 fn gentoo_installed(root: &Path) -> ExitCode {
     let installed = match ferroday_cage::provision::gentoo::installed(root) {
         Ok(installed) => installed,
         Err(error) => return fail(error),
     };
     // Said before the listing, so a reader that has gone stops it there.
+    if installed.skipped() > 0
+        && output::say(format_args!(
+            "fcage: {} entries of the package database at {} name no package, and are not \
+             listed",
+            installed.skipped(),
+            root.display(),
+        ))
+        .is_err()
+    {
+        return ExitCode::from(output::broken_pipe());
+    }
     if installed.is_empty()
         && output::say(format_args!(
             "fcage: no packages are installed at {}: its package database is empty or \

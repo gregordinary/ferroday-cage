@@ -410,15 +410,19 @@ pub enum GentooError {
         /// What was wrong with it.
         reason: String,
     },
-    /// A root's own package database holds something that is not a package
-    /// entry, costs more to read than the layer reads of one, or states a
-    /// merge counter too near its largest value for the merges a plan needs.
+    /// A root's own package database holds an entry that names a package and
+    /// does not describe one, costs more to read than the layer reads of one,
+    /// or states a merge counter too near its largest value for the merges a
+    /// plan needs.
     ///
     /// The database is read to learn what a root already has, so an entry that
     /// cannot be read is a gap in that answer rather than a detail to pass
     /// over: resolving against a set that is missing a package asks the archive
     /// for something the root already satisfies, or -- where the archive does
-    /// not publish it -- refuses an install that would have worked.
+    /// not publish it -- refuses an install that would have worked. An entry
+    /// directory whose names spell no package is the exception, passed over as
+    /// portage passes it over and counted in [`Installed::skipped`]: there is
+    /// no package it could be said to describe.
     #[non_exhaustive]
     Database {
         /// The root whose database was being read.
@@ -1108,6 +1112,10 @@ impl Gentoo {
         installed: &Installed,
         to: Reporting<'_>,
     ) -> Result<Plan, GentooError> {
+        to.progress(GentooEvent::Database {
+            packages: installed.len(),
+            skipped: installed.skipped(),
+        });
         // A plan is a caller saying what to install, so there is nothing to
         // resolve and no index to fetch. What the root already has at the
         // version the plan names is not installed again, as a resolution would
@@ -2235,6 +2243,17 @@ pub enum GentooEvent<'a> {
         atom: &'a str,
         /// Who asked for it: the caller, or the package whose dependency it is.
         wanted_by: &'a str,
+    },
+    /// The root's own package database has been read, before a resolution or
+    /// a replayed plan is held to it.
+    #[non_exhaustive]
+    Database {
+        /// How many installed packages it describes.
+        packages: usize,
+        /// How many entry directories it holds that name no package, which
+        /// were left out as portage leaves them out; see
+        /// [`Installed::skipped`]. A root portage built reports zero.
+        skipped: usize,
     },
 }
 

@@ -855,6 +855,9 @@ pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::blocks: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::installed: bool
 pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::stated_by: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Conflict::stated_in_root: bool
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Database
+pub ferroday_cage::provision::gentoo::GentooEvent::Database::packages: usize
+pub ferroday_cage::provision::gentoo::GentooEvent::Database::skipped: usize
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::DependencyCycle
 pub ferroday_cage::provision::gentoo::GentooEvent::DependencyCycle::packages: &'a [alloc::string::String]
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Extracting
@@ -977,6 +980,7 @@ impl ferroday_cage::provision::gentoo::Installed
 pub fn ferroday_cage::provision::gentoo::Installed::is_empty(&self) -> bool
 pub fn ferroday_cage::provision::gentoo::Installed::len(&self) -> usize
 pub fn ferroday_cage::provision::gentoo::Installed::packages(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferroday_cage::provision::gentoo::InstalledPackage>
+pub fn ferroday_cage::provision::gentoo::Installed::skipped(&self) -> usize
 impl core::marker::Freeze for ferroday_cage::provision::gentoo::Installed
 impl core::marker::Send for ferroday_cage::provision::gentoo::Installed
 impl core::marker::Sync for ferroday_cage::provision::gentoo::Installed

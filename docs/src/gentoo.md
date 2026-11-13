@@ -238,6 +238,14 @@ println!("{} packages", installed.len());
 # }
 ```
 
+An entry directory whose names spell no package, such as one with no version
+or with a character the package manager specification does not permit in a
+name, describes nothing a resolution could ask about. portage passes such an
+entry over and reads on, and so does this layer. `Installed::skipped` counts
+them, and a resolution reports the count in `GentooEvent::Database`. An entry
+that names a package and does not describe one, such as one carrying no `SLOT`,
+still fails the read with `GentooError::Database`.
+
 ### Which build
 
 The archive publishes a version more than once. `binpkg-multi-instance` gives
@@ -1000,6 +1008,7 @@ $ fcage --provision-gentoo amd64 --gentoo-variant amd64-openrc \
         --gentoo-prefer-use '-X' \
         --gentoo-cache ./gentoo-cache --rootfs ./gentoo \
         /usr/bin/git --version
+fcage: the root's package database describes 306 packages
 fcage: the binhost index names 15773 builds, generated at 1787145736
 fcage: installing 74 packages (215048192 bytes)
 fcage: merging dev-lang/perl-5.42.2
