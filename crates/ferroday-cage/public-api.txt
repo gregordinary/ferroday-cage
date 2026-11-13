@@ -2657,6 +2657,7 @@ pub ferroday_cage::ResolvedInputs::hostname: std::ffi::os_str::OsString
 pub ferroday_cage::ResolvedInputs::identity: ferroday_cage::ResolvedIdentity
 pub ferroday_cage::ResolvedInputs::mounts: alloc::vec::Vec<ferroday_cage::ResolvedMount>
 pub ferroday_cage::ResolvedInputs::network: ferroday_cage::Network
+pub ferroday_cage::ResolvedInputs::network_filter: core::option::Option<ferroday_cage::ResolvedNetworkFilter>
 pub ferroday_cage::ResolvedInputs::no_new_privileges: bool
 pub ferroday_cage::ResolvedInputs::pid_namespace: bool
 pub ferroday_cage::ResolvedInputs::present_as: core::option::Option<ferroday_cage::Identity>
@@ -2703,6 +2704,15 @@ impl core::marker::Unpin for ferroday_cage::ResolvedMap
 impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedMap
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedMap
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedMap
+#[non_exhaustive] pub struct ferroday_cage::ResolvedNetworkFilter
+pub ferroday_cage::ResolvedNetworkFilter::refusals: alloc::vec::Vec<ferroday_cage::ResolvedSyscallRefusal>
+impl core::marker::Freeze for ferroday_cage::ResolvedNetworkFilter
+impl core::marker::Send for ferroday_cage::ResolvedNetworkFilter
+impl core::marker::Sync for ferroday_cage::ResolvedNetworkFilter
+impl core::marker::Unpin for ferroday_cage::ResolvedNetworkFilter
+impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedNetworkFilter
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedNetworkFilter
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedNetworkFilter
 #[non_exhaustive] pub struct ferroday_cage::ResolvedRlimit
 pub ferroday_cage::ResolvedRlimit::hard: ferroday_cage::limits::Limit
 pub ferroday_cage::ResolvedRlimit::resource: ferroday_cage::limits::Resource
@@ -2725,6 +2735,17 @@ impl core::marker::Unpin for ferroday_cage::ResolvedStreams
 impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedStreams
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedStreams
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedStreams
+#[non_exhaustive] pub struct ferroday_cage::ResolvedSyscallRefusal
+pub ferroday_cage::ResolvedSyscallRefusal::errno: u16
+pub ferroday_cage::ResolvedSyscallRefusal::first_argument: core::option::Option<u32>
+pub ferroday_cage::ResolvedSyscallRefusal::syscall: alloc::string::String
+impl core::marker::Freeze for ferroday_cage::ResolvedSyscallRefusal
+impl core::marker::Send for ferroday_cage::ResolvedSyscallRefusal
+impl core::marker::Sync for ferroday_cage::ResolvedSyscallRefusal
+impl core::marker::Unpin for ferroday_cage::ResolvedSyscallRefusal
+impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedSyscallRefusal
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedSyscallRefusal
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedSyscallRefusal
 #[non_exhaustive] pub struct ferroday_cage::ResourceUsage
 pub ferroday_cage::ResourceUsage::peak_rss_bytes: u64
 pub ferroday_cage::ResourceUsage::system_time: core::time::Duration

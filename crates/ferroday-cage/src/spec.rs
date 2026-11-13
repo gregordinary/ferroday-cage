@@ -151,7 +151,8 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 /// that probes for one reads it as absent. Every other address family is the
 /// namespace's to govern. A seccomp policy of the hardening layer is installed
 /// after the filter. Where both refuse a syscall with an errno, the command
-/// sees the policy's.
+/// sees the policy's. [`ResolvedInputs::network_filter`](crate::ResolvedInputs::network_filter)
+/// records the refusals.
 ///
 /// A host that cannot install the filter fails the launch at
 /// [`SetupStep::InstallNetworkFilter`](crate::SetupStep::InstallNetworkFilter).

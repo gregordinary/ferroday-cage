@@ -646,7 +646,7 @@ fn exec_command(
     // identity switch and the exec. Installed before the hardening layer, so a
     // caller's own policy stacks on top of it and, where both answer a syscall
     // with an errno, answers with its own.
-    if context.plan.unshare.contains(thread::UnshareFlags::NEWNET)
+    if seccomp::installs_network_filter(context.plan)
         && let Err(errno) = seccomp::install(seccomp::NETWORK_FILTER)
     {
         report(context.report_fd, SetupStep::InstallNetworkFilter, errno, 0);

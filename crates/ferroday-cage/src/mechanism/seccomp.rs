@@ -11,10 +11,11 @@
 //! reviewable.
 
 use rustix::io::Errno;
+use rustix::thread::UnshareFlags;
 use syscalls::Sysno;
 
-use super::SockFilter;
 use super::sys::errno;
+use super::{LaunchPlan, SockFilter};
 
 /// Classic-BPF opcodes and `seccomp_data` field offsets.
 pub(crate) mod bpf {
@@ -350,7 +351,67 @@ const fn program_for(family: Family) -> &'static [SockFilter] {
 /// layer. A syscall under any other audit architecture kills the process, as
 /// the hardening layer's filters do. No such syscall reaches a kernel this
 /// build runs on. Everything else is allowed.
+///
+/// [`NETWORK_FILTER_REFUSALS`] states the same refusals as data.
 pub(crate) const NETWORK_FILTER: &[SockFilter] = program_for(HOST);
+
+/// One syscall the network filter refuses: the call, the value its first
+/// argument holds where the refusal depends on one, and the errno it answers
+/// in place of running the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// The syscall's name in the kernel's syscall table, which is the same at
+    /// every entry point that has the call, where its number is not.
+    pub(crate) syscall: &'static str,
+    /// The value the low 32 bits of the first argument hold where the call is
+    /// refused, or `None` where every call is.
+    pub(crate) first_argument: Option<u32>,
+    /// The errno the call is answered with.
+    pub(crate) errno: u16,
+}
+
+/// `socket` creating an `AF_VSOCK` socket.
+const VSOCK_SOCKET: Refusal = Refusal {
+    syscall: "socket",
+    first_argument: Some(AF_VSOCK),
+    errno: EAFNOSUPPORT,
+};
+/// `io_uring_setup`, whatever it is asked.
+const RING_SETUP: Refusal = Refusal {
+    syscall: "io_uring_setup",
+    first_argument: None,
+    errno: ENOSYS,
+};
+/// `socketcall` creating a socket of any family.
+const SOCKETCALL_SOCKET: Refusal = Refusal {
+    syscall: "socketcall",
+    first_argument: Some(SYS_SOCKET),
+    errno: EAFNOSUPPORT,
+};
+
+/// What `family`'s network filter refuses.
+const fn refusals_for(family: Family) -> &'static [Refusal] {
+    match family {
+        Family::X86 => &[VSOCK_SOCKET, RING_SETUP, SOCKETCALL_SOCKET],
+        Family::Arm | Family::RiscV => &[VSOCK_SOCKET, RING_SETUP],
+    }
+}
+
+/// What [`NETWORK_FILTER`] refuses, each refusal applying at every entry point
+/// of the build's family that has the call. Everything else it allows.
+///
+/// The provenance record reports these. The unit tests hold the list to the
+/// programs, every family's: each refusal is made, and nothing else is.
+pub(crate) const NETWORK_FILTER_REFUSALS: &[Refusal] = refusals_for(HOST);
+
+/// Whether a launch of `plan` installs [`NETWORK_FILTER`]: wherever its
+/// sandbox has a network namespace of its own.
+///
+/// The launch asks this before it installs the filter, and the provenance
+/// record asks it before it reports the filter, so the two cannot disagree.
+pub(crate) fn installs_network_filter(plan: &LaunchPlan) -> bool {
+    plan.unshare.contains(UnshareFlags::NEWNET)
+}
 
 /// `SECCOMP_SET_MODE_FILTER`: install a classic BPF filter.
 const SECCOMP_SET_MODE_FILTER: usize = 1;
@@ -618,6 +679,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The number `refusal`'s syscall has at the entry point whose `socket`
+    /// and `socketcall` numbers are given, or `None` where it has no such
+    /// call.
+    fn number_at(refusal: &Refusal, socket: u32, socketcall: Option<u32>) -> Option<u32> {
+        match refusal.syscall {
+            "socket" => Some(socket),
+            "io_uring_setup" => Some(io_uring_setup_beside(socket)),
+            "socketcall" => socketcall,
+            other => panic!("the tests know no number for {other}"),
+        }
+    }
+
+    #[test]
+    fn each_program_refuses_exactly_what_its_refusals_state() {
+        // Every number an entry point's syscall table reaches, each over first
+        // arguments that cover every address family and every socketcall call
+        // number, with and without high bits set. Whatever no stated refusal
+        // covers is allowed, so a refusal the list omits fails here as surely
+        // as one the program does not make.
+        let firsts: Vec<u64> = (0..=64)
+            .chain([1 << 32 | 1, 1 << 32 | 40, u64::MAX << 32 | 40, u64::MAX])
+            .collect();
+        for family in FAMILIES {
+            let program = program_for(family);
+            let refusals = refusals_for(family);
+            for refusal in refusals {
+                assert!(
+                    entry_points(family)
+                        .into_iter()
+                        .any(
+                            |(_, socket, socketcall)| number_at(refusal, socket, socketcall)
+                                .is_some()
+                        ),
+                    "{family:?} states a refusal of a call it has no entry point for: {refusal:?}"
+                );
+            }
+            for (arch, socket, socketcall) in entry_points(family) {
+                let tag = socket & X32_SYSCALL_BIT;
+                for nr in (0..1024).map(|base| base | tag) {
+                    for &first in &firsts {
+                        // The low 32 bits, as the filter compares them.
+                        let low = first as u32;
+                        let expected = refusals
+                            .iter()
+                            .find(|refusal| {
+                                number_at(refusal, socket, socketcall) == Some(nr)
+                                    && refusal.first_argument.is_none_or(|value| value == low)
+                            })
+                            .map_or(RET_ALLOW, |refusal| ret_errno(refusal.errno));
+                        let call = Call::new(arch, nr, &[first, 0x0804_8000, 0]);
+                        assert_eq!(
+                            run(program, &call),
+                            expected,
+                            "{family:?}, arch {arch:#x}, nr {nr:#x}, first argument {first:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_host_reports_its_own_familys_refusals() {
+        assert_eq!(NETWORK_FILTER_REFUSALS, refusals_for(HOST));
     }
 
     #[test]

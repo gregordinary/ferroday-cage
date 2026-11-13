@@ -216,6 +216,9 @@ carries on without it. The shadow suite's account tools open the kernel's audit
 socket that way. A 32-bit Debian bootstrap therefore still creates the system
 accounts its packages' scripts ask for.
 
+`Cage::resolved_inputs` reports the filter's refusals in `network_filter`, so a
+provenance record shows which calls a command under it cannot make.
+
 The launch sets no-new-privileges only where the hardening layer asks for it, so
 the filter is installed without it. Creating the nested user namespace grants
 the capability the kernel requires in its place. A [seccomp

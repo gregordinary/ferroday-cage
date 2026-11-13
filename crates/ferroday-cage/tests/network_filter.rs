@@ -8,7 +8,9 @@
 //! prints one line per route. Each test compares a sandbox under
 //! [`Network::Host`], which carries no filter, with the postures that do, so a
 //! refusal the host's kernel would have made anyway is told apart from one the
-//! filter made.
+//! filter made. Each also holds the cage's provenance record to what the probe
+//! saw: the record states the refusals a command observes, and none where it
+//! observes none.
 
 #![allow(unsafe_code)]
 
@@ -17,7 +19,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ferroday_cage::{Cage, CageBuilder, Network};
+use ferroday_cage::{Cage, CageBuilder, Network, ResolvedNetworkFilter};
 
 /// Set inside the sandbox to make a probe test probe rather than return.
 const PROBE: &str = "FERRODAY_CAGE_TEST_NETWORK_FILTER_PROBE";
@@ -199,10 +201,12 @@ fn host_userland() -> CageBuilder {
     builder
 }
 
-/// Runs the probe test `test` in a sandbox under `network`.
-fn probe(network: Network, test: &str) -> Report {
+/// Runs the probe test `test` in a sandbox under `network`, returning what it
+/// reported and what the sandbox's provenance record says its network filter
+/// refuses.
+fn probe(network: Network, test: &str) -> (Report, Option<ResolvedNetworkFilter>) {
     let exe = std::env::current_exe().expect("the test binary has a path");
-    let output = host_userland()
+    let cage = host_userland()
         .command(PROBE_PATH)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(PROBE, "1")
@@ -210,9 +214,9 @@ fn probe(network: Network, test: &str) -> Report {
         .resolv_conf(false)
         .bind_ro(&exe, PROBE_PATH)
         .build()
-        .expect("a valid sandbox configuration")
-        .output()
-        .expect("the sandbox launches");
+        .expect("a valid sandbox configuration");
+    let recorded = cage.resolved_inputs().network_filter;
+    let output = cage.output().expect("the sandbox launches");
     let stdout = String::from_utf8_lossy(&output.stdout);
     if output.status.signal().is_some() || !stdout.contains("probe done") {
         assert!(
@@ -220,7 +224,7 @@ fn probe(network: Network, test: &str) -> Report {
             "the probe failed without reporting:\n{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr),
         );
-        return None;
+        return (None, recorded);
     }
     let routes = stdout
         .lines()
@@ -234,7 +238,7 @@ fn probe(network: Network, test: &str) -> Report {
             (route.to_string(), outcome)
         })
         .collect();
-    Some(routes)
+    (Some(routes), recorded)
 }
 
 /// Whether this host can build a sandbox that installs the filter, reporting
@@ -251,17 +255,49 @@ fn outcome(report: &BTreeMap<String, Outcome>, route: &str) -> Outcome {
         .unwrap_or_else(|| panic!("the probe reported no {route} route: {report:?}"))
 }
 
+/// The errno the record says `syscall` answers with where its first argument
+/// is `first_argument`, failing the test where the record states no such
+/// refusal.
+fn recorded_errno(
+    filter: Option<&ResolvedNetworkFilter>,
+    syscall: &str,
+    first_argument: Option<u32>,
+) -> i32 {
+    let filter = filter.expect("a filtered sandbox records its network filter");
+    let refusal = filter
+        .refusals
+        .iter()
+        .find(|refusal| refusal.syscall == syscall && refusal.first_argument == first_argument)
+        .unwrap_or_else(|| panic!("the record states no refusal of {syscall}: {filter:?}"));
+    i32::from(refusal.errno)
+}
+
 #[test]
 fn an_isolated_network_refuses_vsock_and_io_uring() {
     if !host_runs_the_filter() {
         return;
     }
-    let host = probe(Network::Host, "probe_native").expect("the host-network probe reports");
+    let (host, unfiltered) = probe(Network::Host, "probe_native");
+    let host = host.expect("the host-network probe reports");
+    assert_eq!(unfiltered, None, "the host network records no filter");
+    let vsock = u32::try_from(libc::AF_VSOCK).expect("a family fits a u32");
     for network in [Network::Isolated, Network::None] {
-        let filtered = probe(network, "probe_native").expect("the filtered probe reports");
+        let (filtered, recorded) = probe(network, "probe_native");
+        let filtered = filtered.expect("the filtered probe reports");
         assert_eq!(
             outcome(&filtered, "vsock"),
             Err(libc::EAFNOSUPPORT),
+            "{network:?}"
+        );
+        // The record states the answers the command saw.
+        assert_eq!(
+            outcome(&filtered, "vsock"),
+            Err(recorded_errno(recorded.as_ref(), "socket", Some(vsock))),
+            "{network:?}"
+        );
+        assert_eq!(
+            outcome(&filtered, "io_uring"),
+            Err(recorded_errno(recorded.as_ref(), "io_uring_setup", None)),
             "{network:?}"
         );
         #[cfg(target_pointer_width = "64")]
@@ -305,7 +341,7 @@ fn an_isolated_network_closes_the_32_bit_entry_points() {
     // Without the 32-bit entry point there is nothing to close: a kernel
     // built without IA32 emulation, or booted with it off, faults the probe or
     // refuses its calls.
-    let Some(host) = probe(Network::Host, "probe_compat") else {
+    let Some(host) = probe(Network::Host, "probe_compat").0 else {
         common::require::premise_unmet("this host offers no 32-bit x86 entry point");
         return;
     };
@@ -317,10 +353,17 @@ fn an_isolated_network_closes_the_32_bit_entry_points() {
         return;
     }
     for network in [Network::Isolated, Network::None] {
-        let filtered = probe(network, "probe_compat").expect("the filtered probe reports");
+        let (filtered, recorded) = probe(network, "probe_compat");
+        let filtered = filtered.expect("the filtered probe reports");
         assert_eq!(
             outcome(&filtered, "i386-socket-vsock"),
             Err(libc::EAFNOSUPPORT),
+            "{network:?}"
+        );
+        // SYS_SOCKET, the call number socketcall creates a socket under.
+        assert_eq!(
+            outcome(&filtered, "i386-socketcall-unix"),
+            Err(recorded_errno(recorded.as_ref(), "socketcall", Some(1))),
             "{network:?}"
         );
         // socketcall hides the family, so no socket is created through it,

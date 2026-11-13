@@ -236,9 +236,9 @@ because that stack is what the root was made of. Recording only the mounts would
 leave two builds — one on a rootfs, one on an overlay over the same base —
 looking identical.
 
-`identity`, `run-as`, `no-new-privileges`, `network`, `pid-namespace`,
-`hostname`, `rlimits`, and `hardening` are the posture the launch puts the
-command under, and each changes what a build produces:
+`identity`, `run-as`, `no-new-privileges`, `network`, `network-filter`,
+`pid-namespace`, `hostname`, `rlimits`, and `hardening` are the posture the
+launch puts the command under, and each changes what a build produces:
 
 - **`identity`** — the identity map: which ids exist inside the sandbox. A
   file's recorded ownership follows from it.
@@ -251,6 +251,12 @@ command under, and each changes what a build produces:
   hardening control.
 - **`network`** — the namespace the sandbox creates. A stack attached to a
   pending launch is not visible here, being established after the cage is built.
+- **`network-filter`** — the syscalls [the network
+  filter](how-the-sandbox-is-built.md#the-network-filter) refuses under an
+  isolated or a denied network, each by name, with the value its first argument
+  holds where that decides it, and the errno it answers. A configure test that
+  probes vsock or io_uring reads the refusal as an absent feature. The key is
+  absent under the host network, which installs no filter.
 - **`pid-namespace`** — whether the command runs under the sandbox's own init.
   Without one it sees the caller's processes, and its descendants can outlive
   it.
