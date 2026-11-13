@@ -808,6 +808,13 @@ consumer upgrading can skip it.
   between them. It found each member wherever it lay, and never read
   `debian-binary`, so a package dpkg-deb refuses for its layout was read and
   installed.
+- Every archive reader refuses a GNU sparse member, with
+  `ProvisionError::EntryUnsupported`, as the tarball extractor did. GNU tar's
+  old sparse format follows the header of a file with more than four runs of
+  data with extension blocks its size does not count, so the readers that pass
+  over members, of a `.deb`'s control member, an apk's segments and a gpkg
+  container, read the archive's next header from inside the member's data and
+  ended the archive early, silently.
 
 ### Internal
 

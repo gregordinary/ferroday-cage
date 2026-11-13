@@ -371,9 +371,9 @@ impl Extraction {
                 // Unextractable without privilege; the sandbox provides its
                 // own /dev. GNU volume labels are archive metadata.
                 b'3' | b'4' | b'V' => continue,
-                // Sparse and multi-volume members are not supported. The reader
-                // reports a sparse member as `S` whichever GNU format wrote it.
-                b'S' | b'M' => {
+                // Multi-volume members are not supported. A sparse member is
+                // the reader's to refuse, since it cannot frame every one.
+                b'M' => {
                     return Err(ProvisionError::EntryUnsupported {
                         path: bytes_to_path(&entry.path),
                         kind: entry.typeflag,

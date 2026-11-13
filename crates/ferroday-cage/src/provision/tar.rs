@@ -24,6 +24,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::ProvisionError;
@@ -50,13 +51,8 @@ pub(crate) struct Entry {
     pub link_target: Vec<u8>,
     /// The tar typeflag byte.
     ///
-    /// `S` for a GNU sparse member, whichever of GNU's formats wrote it. The
-    /// old GNU format marks one with that typeflag. The pax formats (0.0, 0.1
-    /// and 1.0) write a regular file's `0` and describe the sparseness only in
-    /// `GNU.sparse.*` records, so the member's data is a packed form of the
-    /// file, or a map and the packed form, rather than its contents. Reading
-    /// one as the `0` it claims would yield a file other than the one archived,
-    /// so the reader reports the type the member is.
+    /// Never `S`: the reader refuses a GNU sparse member, whichever of GNU's
+    /// formats wrote it, rather than yield it ([`TarReader::next_entry`]).
     pub typeflag: u8,
     /// The permission bits, as stored (may include setuid/setgid/sticky).
     pub mode: u32,
@@ -271,6 +267,22 @@ impl<R: Read> TarReader<R> {
     /// Any unread data of the previous entry is drained first. Metadata
     /// entries (GNU long names, pax headers) are consumed internally and
     /// folded into the entry they describe.
+    ///
+    /// A GNU sparse member is refused, with
+    /// [`ProvisionError::EntryUnsupported`] and the type `S`, whichever of
+    /// GNU's formats wrote it. The old GNU format marks one with that typeflag,
+    /// and where the file has more than four runs of data, follows its header
+    /// with extension blocks that its size does not count; a reader that took
+    /// the size at its word would read those blocks as data and the archive's
+    /// next header from inside it, ending the archive early or reading members
+    /// that are not there. The pax formats (0.0, 0.1 and 1.0) write a regular
+    /// file's `0` and describe the sparseness only in `GNU.sparse.*` records,
+    /// so the member's data is a packed form of the file, or a map and the
+    /// packed form, rather than its contents, and a reader that took the `0` at
+    /// its word would hand on a file other than the one archived. The extractor
+    /// has no way to write one either, and no other reader in the crate has a
+    /// use for one, so every reader is held to one rule here rather than each
+    /// deciding what to make of a member it cannot frame.
     pub fn next_entry(&mut self) -> Result<Option<Entry>, ProvisionError> {
         if self.finished {
             return Ok(None);
@@ -407,11 +419,14 @@ impl<R: Read> TarReader<R> {
                     entry.checksum_sha1 = pax.checksum_sha1;
                     entry.acl_access = pax.acl_access;
                     entry.acl_default = pax.acl_default;
-                    // A pax sparse member says `0` in its header; see
-                    // `Entry::typeflag`. Its size is still the stored length,
-                    // so the reader reads past it as it would any member.
-                    if pax.gnu_sparse {
-                        entry.typeflag = b'S';
+                    // A pax sparse member says `0` in its header, and an old
+                    // GNU one is followed by blocks its size does not count;
+                    // see `next_entry`.
+                    if pax.gnu_sparse || entry.typeflag == b'S' {
+                        return Err(ProvisionError::EntryUnsupported {
+                            path: PathBuf::from(std::ffi::OsStr::from_bytes(&entry.path)),
+                            kind: b'S',
+                        });
                     }
                     // A trailing slash marks a directory, whatever the typeflag
                     // says. The oldest archives predate a reliably-set typeflag
@@ -1797,6 +1812,35 @@ mod tests {
             .next_entry()
             .expect_err("the entry contradicts itself");
         assert!(!reader.not_a_tar());
+    }
+
+    #[test]
+    fn an_old_gnu_sparse_member_is_refused_rather_than_misframed() {
+        // What GNU tar 1.35 writes under `--format=gnu --sparse` for a file of
+        // more than four runs of data: an `S` header with its `isextended`
+        // byte set, then an extension block its size does not count, then the
+        // data. A reader skipping the member by its size read the extension
+        // block as data and the archive's next header from inside the data;
+        // where that held zeros, the archive ended there, silently, and the
+        // member after it was never seen. Every reader meets the member here,
+        // so every reader refuses it.
+        let mut header = sized_header(b"sparse", BLOCK, b'S');
+        header[257..265].copy_from_slice(b"ustar  \0");
+        header[482] = 1;
+        checksum(&mut header);
+        let mut archive = header.to_vec();
+        // The extension block, extending no further, and the data, zeros as
+        // the end of a run of data leaves them.
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        archive.extend_from_slice(&sized_header(b"after", 0, b'0'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let err = TarReader::in_memory(&archive)
+            .next_entry()
+            .expect_err("the sparse member is refused");
+        assert!(
+            matches!(&err, ProvisionError::EntryUnsupported { kind: b'S', path } if path == Path::new("sparse")),
+            "{err:?}",
+        );
     }
 
     #[test]
