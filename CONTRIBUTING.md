@@ -373,7 +373,7 @@ Each row is a question the workspace answers once. Before writing something that
 answers one of them, reach for the answer. Before adding a row, check that the
 question is not already here under different words.
 
-Five rows below name one answer per package format rather than one answer
+Six rows below name one answer per package format rather than one answer
 outright. Three of them are deliberate for one reason. Each format defines its
 own version ordering, so a shared comparator would have to be told which set of
 rules to apply. That is the format's identity rather than a parameter. The rows
@@ -399,6 +399,12 @@ The fifth, what a bootstrap clears of its own run, is split because each
 format's root boots differently. `systemd` generates a machine id from an empty
 file, while the D-Bus service that generates one on Alpine refuses an empty
 file. The Gentoo layer runs no package script, so it has nothing to clear.
+
+The sixth, what a package's name can contain, is split because each format's
+own rules define its names: Debian policy's, apk's, and the package manager
+specification's, which differ in case, in `_`, and in where a `.` may fall. None
+admits a control character, which is what lets an error or a progress report
+name a package bare.
 
 | The question | The answer |
 | --- | --- |
@@ -443,6 +449,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Which id does a root's `/etc/passwd` or `/etc/group` give a name? | `provision::accounts::ids` |
 | Where does portage keep its database inside a root? | `provision::gentoo::DB_DIR` |
 | What can a USE flag's name contain, and what does a candidate answer for one? | `provision::gentoo::atom::is_flag`, `atom::use_flag` |
+| What can a package's name contain, as an index or a plan states it? | `provision::debian::index::is_package_name`, `alpine::index::is_package_name`, `gentoo::atom::is_package` |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
@@ -511,7 +518,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | State a `poll` deadline | `poll::timeout` |
 | Stop watching a channel a `poll` loop has finished with | leave it out of the polled slice, as the `poll` module states |
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |
-| Name, in an error, a string a mirror, an index, a package, or a sandbox supplied | `{:?}`, which escapes a control character, as the `failure` module states, unless an alphabet without control characters already admitted the value |
+| Name, in an error or a progress report, a string a mirror, an index, a package, or a sandbox supplied | `{:?}`, which escapes a control character, as the `failure` module states, unless an alphabet without control characters already admitted the value |
 | Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |
 | Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, `say`, `report` |

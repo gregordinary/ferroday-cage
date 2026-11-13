@@ -25,6 +25,7 @@ use crate::roster::roster_enum;
 /// One package's metadata from a `Packages` index.
 #[derive(Debug, Clone)]
 pub(crate) struct Package {
+    /// The package's name, one [`is_package_name`] admits.
     pub name: String,
     pub version: String,
     pub architecture: String,
@@ -196,7 +197,8 @@ impl std::error::Error for ParsePriorityError {}
 
 impl Package {
     /// Builds a package from a `Packages` stanza, or `None` when a required
-    /// field is missing or malformed.
+    /// field is missing or malformed: among them a name [`is_package_name`]
+    /// does not admit.
     fn from_stanza(stanza: &Stanza<'_>) -> Option<Package> {
         let [
             name,
@@ -228,6 +230,9 @@ impl Package {
             "Priority",
         ]);
         let name = name?.into_owned();
+        if !is_package_name(&name) {
+            return None;
+        }
         let version = version?.into_owned();
         let architecture = architecture?.into_owned();
         // The digest becomes a cache filename and the fetch verifier's expected
@@ -286,6 +291,37 @@ impl Package {
             .as_deref()
             .and_then(|value| value.parse().ok())
     }
+}
+
+/// Whether `name` is a package name Debian policy permits.
+///
+/// Policy 5.6.1 gives the alphabet: lowercase letters, digits, `+`, `-`, and
+/// `.`, at least two characters, starting with a letter or a digit. The archive
+/// software of Debian and of Ubuntu refuses an upload outside it, so every name
+/// their archives publish is within it.
+///
+/// A name is held to it wherever one arrives. A stanza naming a package outside
+/// it is malformed and dropped as the index is read, a plan naming one is
+/// refused
+/// ([`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable)),
+/// and the pool refuses a `.deb` whose control file names one
+/// ([`checked_name`](super::pool::checked_name)). An admitted name reaches
+/// progress reports and errors as written, and a published one becomes two
+/// segments of a pool path. The alphabet holds no control character, so a name
+/// carries no escape sequence onto the terminal a report is printed on, and no
+/// separator, so it stays one path segment.
+///
+/// dpkg itself installs a little more: an upper-case name, which it folds to
+/// lower case, a name holding `_`, and a single character. None occurs in an
+/// archive, and this layer compares names as written, so a name it read in
+/// upper case would not be the one dpkg records.
+pub(super) fn is_package_name(name: &str) -> bool {
+    let lowercase_or_digit = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    name.len() >= 2
+        && name.starts_with(lowercase_or_digit)
+        && name
+            .chars()
+            .all(|c| lowercase_or_digit(c) || matches!(c, '+' | '-' | '.'))
 }
 
 /// Whether `filename` is a safe pool path: a non-empty relative path with no
@@ -1111,6 +1147,54 @@ mod tests {
 
         let good = format!("{base}Filename: pool/p.deb\nSHA256: {}\n", "a".repeat(64));
         assert!(Index::parse(&good, "amd64").get("pp").is_some());
+    }
+
+    #[test]
+    fn a_stanza_naming_a_package_outside_policy_is_dropped() {
+        // The name goes on to progress reports and errors as written, so it is
+        // held to policy's alphabet before anything reads it. The pool path is
+        // a safe one throughout, so the name is what drops each stanza. dpkg
+        // installs the upper-case, `_`, and one-character names; no archive
+        // publishes one.
+        let stanza = |name: &str| {
+            format!(
+                "Package: {name}\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\n\
+                 SHA256: {}\n\n",
+                "a".repeat(64),
+            )
+        };
+        let hostile = crate::failure::hostile::TEXT;
+        for name in [
+            hostile, "Upper", "lib_c", "x", "-lead", ".dot", "a/b", "a b",
+        ] {
+            let index = Index::parse(&format!("{}{}", stanza(name), stanza("kept")), "amd64");
+            assert!(index.get(name).is_none(), "{name:?} was kept");
+            assert!(
+                index.get("kept").is_some(),
+                "{name:?} dropped its neighbour"
+            );
+            assert!(!index.into_available().contains(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn policy_admits_every_shape_an_archive_name_takes() {
+        for name in [
+            "0ad",
+            "g++",
+            "libstdc++6",
+            "lib32z1-dev",
+            "python3.13",
+            "x11-common",
+            "e2fsprogs",
+        ] {
+            assert!(is_package_name(name), "{name:?}");
+        }
+        for name in [
+            "", "a", "A", "Libc6", "lib_c", "-a", "+a", ".a", "a/b", "a\u{1b}b",
+        ] {
+            assert!(!is_package_name(name), "{name:?}");
+        }
     }
 
     #[test]

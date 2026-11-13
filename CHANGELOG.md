@@ -119,6 +119,18 @@ consumer upgrading can skip it.
   list could put terminal escape sequences on an operator's terminal. A refusal
   now quotes such text, as `"lib>=2.0"` rather than `lib>=2.0`, and a Debian
   refusal quotes its requirement in double quotes rather than backticks.
+- The Debian layer holds the name of a package an index or a plan states to the
+  alphabet Debian policy gives a package name: lowercase letters, digits, `+`,
+  `-`, and `.`, at least two characters, starting with a letter or a digit. An
+  index stanza naming a package any other way is left out and counted in
+  `DebianEvent::Index`, as a stanza whose pool path leaves the mirror is. A plan
+  naming one is refused with `DebianError::PlanDocument`, or with
+  `DebianError::Config` where `DebianBuilder::plan` or `DebianBuilder::pin` is
+  handed one. The name reached `fcage`'s progress lines and the layer's errors
+  as written, so a mirror could put terminal escape sequences on an operator's
+  terminal through it. dpkg also installs a name in upper case, one holding
+  `_`, and one of a single character, none of which a Debian or Ubuntu archive
+  publishes; a resolution no longer selects such a package.
 
 ### Added
 

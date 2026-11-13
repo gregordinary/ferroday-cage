@@ -29,6 +29,12 @@
 //! carry an escape sequence onto it that rewrites the screen or sets the
 //! clipboard. A value an alphabet without control characters has already
 //! admitted, such as a package name an index reader checked, is named bare.
+//!
+//! A progress report reaches the same terminal and follows the same rule.
+//! `fcage` quotes the dependency a refusal names and names a package bare: each
+//! layer's index and plan readers hold a package's name to its format's
+//! alphabet before anything reports it, and none of the three holds a control
+//! character.
 
 use std::error::Error as StdError;
 use std::fmt;

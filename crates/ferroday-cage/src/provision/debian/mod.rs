@@ -375,18 +375,19 @@ fn validate_plan(
     // panic mid-download; `Plan::to_document` makes the same check on the way
     // out.
     for package in &plan.packages {
+        // A document is held to this as it is read; a `Plan` is public and
+        // `Clone`, so one taken from `resolve()` and edited reaches here having
+        // passed nothing. First, because it is what admits the name the
+        // refusal below names.
+        if let Some(reason) = package.unaddressable() {
+            return contradiction(reason);
+        }
         if package.archive >= repositories {
             return contradiction(format!(
                 "the plan's package {} names archive {} but only {repositories} repositories \
                  are configured, so it names no mirror",
                 package.name, package.archive,
             ));
-        }
-        // A document is held to this as it is read; a `Plan` is public and
-        // `Clone`, so one taken from `resolve()` and edited reaches here having
-        // passed nothing.
-        if let Some(reason) = package.unaddressable() {
-            return contradiction(reason);
         }
     }
     Ok(())
@@ -3189,10 +3190,11 @@ pub enum DebianEvent<'a> {
         packages: usize,
         /// How many stanzas were read and not kept, because this layer cannot
         /// act on them: a stanza missing its package's name, version,
-        /// architecture, pool path, or SHA-256, or one whose pool path would
-        /// leave the mirror or whose digest is not lowercase hex. A package left
-        /// out this way is one a resolution cannot select. A live archive
-        /// reports zero.
+        /// architecture, pool path, or SHA-256, one naming its package outside
+        /// the alphabet Debian policy gives a package name, or one whose pool
+        /// path would leave the mirror or whose digest is not lowercase hex. A
+        /// package left out this way is one a resolution cannot select. A live
+        /// archive reports zero.
         skipped: usize,
     },
 }
@@ -3885,6 +3887,7 @@ mod tests {
             stanza("escaping", "amd64", "../../etc/passwd", &digest),
             stanza("undigested", "amd64", "pool/undigested.deb", "not-a-digest"),
             "Version: 1\nArchitecture: amd64\n\n".to_string(),
+            stanza("Shouted", "amd64", "pool/shouted.deb", &digest),
         ]
         .concat();
         let (mut debian, _) = unsigned_archive(index.as_bytes());
@@ -3894,7 +3897,7 @@ mod tests {
             .available()
             .expect("the index is read");
         assert!(available.contains("kept") && available.contains("also-kept"));
-        assert_eq!(counts.0, [(2, 3)]);
+        assert_eq!(counts.0, [(2, 4)]);
     }
 
     #[test]

@@ -853,29 +853,22 @@ fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
 /// ([`is_safe_pool_path`](super::index::is_safe_pool_path)); this is the produce
 /// side of it.
 ///
-/// The rule is policy 5.6.1 rather than a traversal filter: lowercase letters,
-/// digits, `+`, `-`, and `.`, at least two characters, starting with a letter or
-/// a digit. That admits every name the archive holds and excludes `.` and `..`
-/// outright, along with the separator, whitespace, and every control character —
-/// so checking the alphabet settles the path question and rejects a `.deb` no
-/// archive would accept in the same step.
+/// The rule is policy 5.6.1 rather than a traversal filter, and it is the one
+/// the index reader holds a stanza's name to:
+/// [`is_package_name`](super::index::is_package_name). That admits every name
+/// the archive holds and excludes `.` and `..` outright, along with the
+/// separator, whitespace, and every control character — so checking the
+/// alphabet settles the path question and rejects a `.deb` no archive would
+/// accept, and that the pool's own consumers would not read back, in the same
+/// step.
 fn checked_name(name: &str) -> Result<(), String> {
-    let refuse = || {
-        Err(format!(
-            "its package name {name:?} is not one Debian policy permits: at least two characters \
-             of lowercase letters, digits, `+`, `-`, and `.`, starting with a letter or a digit",
-        ))
-    };
-    if name.len() < 2 || !name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()) {
-        return refuse();
+    if super::index::is_package_name(name) {
+        return Ok(());
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
-    {
-        return refuse();
-    }
-    Ok(())
+    Err(format!(
+        "its package name {name:?} is not one Debian policy permits: at least two characters \
+         of lowercase letters, digits, `+`, `-`, and `.`, starting with a letter or a digit",
+    ))
 }
 
 /// Checks a control file's `Version` against the alphabet Debian policy gives a

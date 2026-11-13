@@ -240,6 +240,9 @@ pub struct PlannedPackage {
 impl PlannedPackage {
     /// Why this entry cannot be addressed, or `None` where it can.
     ///
+    /// [`name`](Self::name) is what a bootstrap reports the package by, in its
+    /// progress and its errors, so it is held to the alphabet Debian policy
+    /// gives a package name, which holds no control character.
     /// [`filename`](Self::filename) is interpolated verbatim into the URL the
     /// `.deb` is fetched from and, for a `file://` mirror, into a local path, so
     /// one holding a `..`, a leading slash, or a byte a request line ends on
@@ -249,16 +252,19 @@ impl PlannedPackage {
     /// other way can only ever mismatch.
     ///
     /// A package resolved from an index passed
+    /// [`index::is_package_name`](super::index::is_package_name),
     /// [`index::is_safe_pool_path`](super::index::is_safe_pool_path) and
     /// [`Algorithm::is_hex`](crate::provision::digest::Algorithm::is_hex) on the
-    /// way in,
-    /// so this is the same gate for the way a plan arrives instead: a document a
-    /// caller kept and may have edited, or a [`Plan`] taken from
+    /// way in, so this is the same gate for the way a plan arrives instead: a
+    /// document a caller kept and may have edited, or a [`Plan`] taken from
     /// [`resolve`](super::Debian::resolve) and modified, neither of which has an
-    /// index behind it. The package's name and version are not held to a shape,
-    /// because neither reaches a URL or a path: the pool path names the file,
-    /// and the cache entry is named from the digest.
+    /// index behind it. The version is not held to a shape, because it reaches
+    /// no URL or path: the pool path names the file, and the cache entry is
+    /// named from the digest.
     pub(super) fn unaddressable(&self) -> Option<String> {
+        if let Some(reason) = unpermitted_name(&self.name) {
+            return Some(reason);
+        }
         if !super::index::is_safe_pool_path(&self.filename) {
             return Some(format!(
                 "the plan fetches {} from {:?}, which is not a path a mirror can be asked for",
@@ -273,6 +279,17 @@ impl PlannedPackage {
         }
         None
     }
+}
+
+/// Why a plan cannot name a package `name`, or `None` where it can.
+///
+/// The refusal quotes the name with `{:?}`, since nothing has admitted it. The
+/// reader and [`validate_plan`](super::validate_plan) ask this before any other
+/// message names the package, and those name it bare.
+fn unpermitted_name(name: &str) -> Option<String> {
+    (!super::index::is_package_name(name)).then(|| {
+        format!("the plan names {name:?}, which is not a package name Debian policy permits")
+    })
 }
 
 impl Plan {
@@ -368,8 +385,9 @@ impl Plan {
     /// [`DebianError::PlanDocument`] for a document with no header, a format
     /// version this library does not read, a stanza missing a field the plan
     /// cannot do without, a malformed archive index, a package naming an
-    /// archive the document does not carry, or a package whose pool path or
-    /// digest is not one a fetch could be composed from.
+    /// archive the document does not carry, a package named outside the
+    /// alphabet Debian policy gives a package name, or a package whose pool
+    /// path or digest is not one a fetch could be composed from.
     pub fn parse_document(text: &str) -> Result<Plan, DebianError> {
         let (header, rest) = document::header(document::parse(text), FORMAT).map_err(document)?;
         let mut plan = Plan {
@@ -382,6 +400,10 @@ impl Plan {
 
         for stanza in rest {
             if let Some(name) = stanza.get("Package") {
+                // Before the name is in any message: each one below names it.
+                if let Some(reason) = unpermitted_name(&name) {
+                    return Err(document(reason));
+                }
                 let at_package = format!("the package {name}");
                 let at = number::<usize>(stanza.get("Archive"), "Archive", &at_package)?
                     .ok_or_else(|| document(format!("the package {name} names no archive")))?;
@@ -924,6 +946,43 @@ Source: local-suite
                 assert!(reason.contains("lowercase hex"), "{reason}");
             }
             other => panic!("expected a digest refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_package_named_outside_policy_is_refused_before_any_message_names_it() {
+        // A bootstrap reports a planned package by its name, so a document is
+        // held to the alphabet an index is. The archive index is dropped too, so
+        // the refusal that would otherwise come first names the package as well.
+        let hostile = crate::failure::hostile::TEXT;
+        for name in [hostile, "Base-files", "base_files", "b"] {
+            let document = sample()
+                .to_document()
+                .unwrap()
+                .replace("Package: base-files", &format!("Package: {name}"))
+                .replace("Archive: 0\nInstalled-Size", "Installed-Size");
+            match Plan::parse_document(&document) {
+                Err(DebianError::PlanDocument { reason }) => {
+                    assert!(reason.contains("Debian policy"), "{name:?}: {reason}");
+                    if name == hostile {
+                        crate::failure::hostile::assert_escaped(&reason);
+                    }
+                }
+                other => panic!("expected a name refusal for {name:?}, got {other:?}"),
+            }
+        }
+
+        // A plan held in memory reaches a bootstrap without a document, and is
+        // held to the same alphabet, before the archive it names is.
+        let mut plan = sample();
+        plan.packages[0].name = hostile.to_string();
+        plan.packages[0].archive = 7;
+        match super::super::validate_plan(&plan, "trixie", "arm64", 2, false, &[], &[]) {
+            Err(DebianError::Config { reason }) => {
+                assert!(reason.contains("Debian policy"), "{reason}");
+                crate::failure::hostile::assert_escaped(&reason);
+            }
+            other => panic!("expected a name refusal, got {other:?}"),
         }
     }
 

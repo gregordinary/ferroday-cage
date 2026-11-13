@@ -39,9 +39,10 @@ A bootstrap runs in stages:
    carries the digest of every package index.
 2. **The package set.** It fetches each component's `Packages` index and
    verifies it against the release digest. A stanza the layer cannot act on is
-   left out and counted, and `DebianEvent::Index` reports how many: one missing
-   a field a package is fetched by, and one whose pool path would leave the
-   mirror or whose digest is malformed. It then resolves the install set:
+   left out and counted, and `DebianEvent::Index` reports how many: one naming
+   its package outside the alphabet Debian policy gives a package name, one
+   missing a field a package is fetched by, and one whose pool path would leave
+   the mirror or whose digest is malformed. It then resolves the install set:
    the base system (every essential and required package the primary
    repository marks, plus `apt`) together with the packages named by
    `include`, closed over their dependencies.
