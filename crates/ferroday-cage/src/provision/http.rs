@@ -1135,16 +1135,27 @@ struct Headers {
 /// Reads one line through its newline into `line`, capping its length at
 /// [`MAX_LINE`]. Returns the bytes read, zero at end of stream. A line over the
 /// cap is a hostile or broken mirror, refused rather than buffered.
+///
+/// A byte that is not UTF-8 is read as U+FFFD rather than refused. RFC 9110
+/// permits such bytes, obs-text, in a field's value and in a status line's
+/// reason phrase, and treats the value as opaque. No field this client acts on
+/// can hold one and still be read as a value it acts on: a number or a coding
+/// with U+FFFD in it is refused as malformed, a `Location` holding one is a URL
+/// no request line can carry, and `Connection` matches `close` alone.
 fn read_line_limited<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
     // Reading one byte past the cap distinguishes a line exactly at the cap
     // from one that overruns it.
-    let read = reader.take(MAX_LINE as u64 + 1).read_line(line)?;
-    if line.len() > MAX_LINE {
+    let mut bytes = Vec::new();
+    let read = reader
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut bytes)?;
+    if bytes.len() > MAX_LINE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "a response line exceeded the length cap",
         ));
     }
+    line.push_str(&String::from_utf8_lossy(&bytes));
     Ok(read)
 }
 
@@ -1505,11 +1516,19 @@ impl Read for DeadlineReader {
         self.inner.set_read_timeout(timeout)?;
         match self.inner.read(buf) {
             // A read the deadline cut short reports the deadline, in the words
-            // every other step it bounds uses, rather than the bare `EAGAIN` a
-            // socket timeout reads as.
+            // every other step it bounds uses, and one its own timeout ended
+            // reports that, each rather than the bare `EAGAIN` a socket timeout
+            // reads as. The fetch's error names the URL around either.
             Err(err) if is_timeout(&err) && expired(self.deadline) => {
                 Err(io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED))
             }
+            Err(err) if is_timeout(&err) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "no data arrived within the read timeout{}",
+                    timeout.map_or(String::new(), |timeout| format!(" of {timeout:?}")),
+                ),
+            )),
             read => read,
         }
     }
@@ -1925,6 +1944,63 @@ mod tests {
         let err = outcome.expect_err("the peer never answers");
         assert!(err.contains(DEADLINE_ELAPSED), "{err}");
         drop(listener);
+    }
+
+    #[test]
+    fn a_read_that_outlasts_its_own_timeout_is_reported_as_one() {
+        // A peer that accepts the request and never answers, read with a
+        // timeout of its own well inside the fetch's deadline. The socket
+        // reports the timeout as `EAGAIN`, "Resource temporarily unavailable",
+        // which says nothing of a timeout to the reader of the error.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback listener binds");
+        let url = format!(
+            "http://{}/x",
+            listener.local_addr().expect("the listener is bound"),
+        );
+        let err = HttpFetch::new()
+            .timeouts(Duration::from_secs(5), Duration::from_millis(100))
+            .request_timeout(Some(Duration::from_secs(60)))
+            .fetch(&FetchRequest::new(&url), &mut Vec::new())
+            .expect_err("the peer never answers");
+        let chain = ErrorChain::new(&err).to_string();
+        assert!(chain.contains("read timeout of 100ms"), "{chain}");
+        assert!(chain.contains(&url), "{chain}");
+        assert!(!chain.contains(DEADLINE_ELAPSED), "{chain}");
+        assert!(err.is_failover(), "{err}");
+        drop(listener);
+    }
+
+    #[test]
+    fn a_field_value_outside_utf8_is_read_as_opaque_bytes() {
+        // RFC 9110 permits obs-text in a field's value and a reason phrase.
+        // None of the mirrors this client is pointed at sends any, but one
+        // that did would have failed every fetch on a header nothing reads.
+        let mut response = b"HTTP/1.1 200 Gr\xfc\xdfe\r\nX-Note: caf\xe9\r\n".to_vec();
+        response.extend_from_slice(b"Content-Length: 5\r\n\r\nfirst");
+        let (url, served) = serving(1, response);
+        let mut out = Vec::new();
+        HttpFetch::new()
+            .fetch(&FetchRequest::new(&url), &mut out)
+            .expect("the response is read");
+        assert_eq!(out, b"first");
+        served.join().expect("the server finishes");
+
+        // A field the client acts on is still refused where it holds one.
+        for field in [
+            &b"Content-Length: 5\xff"[..],
+            b"Location: http://mirror.example/caf\xe9",
+        ] {
+            let mut response = b"HTTP/1.1 301 Moved\r\n".to_vec();
+            response.extend_from_slice(field);
+            response.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+            let (url, served) = serving(1, response);
+            let err = HttpFetch::new()
+                .fetch(&FetchRequest::new(&url), &mut Vec::new())
+                .expect_err("the field is refused");
+            assert!(err.is_failover(), "{err}");
+            served.join().expect("the server finishes");
+        }
     }
 
     #[test]

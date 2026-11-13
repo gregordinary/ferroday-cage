@@ -917,6 +917,13 @@ consumer upgrading can skip it.
 - A publication, a removal or a pool publish refuses a lock path that holds
   anything but a regular file. A named pipe left at the path held the call
   waiting forever for a reader.
+- `HttpFetch` reports a read its own timeout ends as a timeout, an
+  `io::ErrorKind::TimedOut` naming the timeout, where it reported the bare
+  `EAGAIN` of the socket, "Resource temporarily unavailable".
+- `HttpFetch` reads a response whose status line or field values hold bytes
+  that are not UTF-8, the obs-text RFC 9110 permits, where any such byte failed
+  the fetch. A field the client acts on is still refused where one holds such a
+  byte.
 
 ### Internal
 
