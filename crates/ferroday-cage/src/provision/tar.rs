@@ -410,6 +410,13 @@ impl<R: Read> TarReader<R> {
 
     /// Reads from the current entry's data, returning `Ok(0)` when the
     /// data is exhausted.
+    ///
+    /// The buffer is filled as far as the entry's remaining data reaches, through
+    /// [`read_fully`], which retries a read a signal interrupted: the archive may
+    /// arrive over a pipe or a socket, in a process whose signal handlers do not
+    /// restart the calls they interrupt, and one `EINTR` is not a broken archive.
+    /// Every byte asked for is one the entry declares, so a fill that ends short
+    /// is an archive that ends inside the entry.
     pub fn read_data(&mut self, buf: &mut [u8]) -> Result<usize, ProvisionError> {
         if self.data_remaining == 0 {
             return Ok(0);
@@ -417,7 +424,7 @@ impl<R: Read> TarReader<R> {
         let want = buf
             .len()
             .min(usize::try_from(self.data_remaining).unwrap_or(usize::MAX));
-        let got = match self.inner.read(&mut buf[..want]) {
+        let got = match read_fully(&mut self.inner, &mut buf[..want]) {
             Ok(got) => got,
             Err(err) => {
                 return Err(malformed(
@@ -426,14 +433,14 @@ impl<R: Read> TarReader<R> {
                 ));
             }
         };
-        if got == 0 {
+        self.offset += got as u64;
+        self.data_remaining -= got as u64;
+        if got < want {
             return Err(malformed(
                 self.offset,
                 "the archive ends inside an entry's data",
             ));
         }
-        self.offset += got as u64;
-        self.data_remaining -= got as u64;
         Ok(got)
     }
 
@@ -453,6 +460,9 @@ impl<R: Read> TarReader<R> {
 
     /// Skips whatever remains of the current entry: unread data, then the
     /// block padding.
+    ///
+    /// Read through [`read_fully`], so an interrupted read is retried rather
+    /// than reported, as [`read_data`](Self::read_data) retries one.
     fn drain_current(&mut self) -> Result<(), ProvisionError> {
         let mut skip = self.data_remaining + self.padding;
         self.data_remaining = 0;
@@ -462,7 +472,7 @@ impl<R: Read> TarReader<R> {
             let want = scratch
                 .len()
                 .min(usize::try_from(skip).unwrap_or(usize::MAX));
-            let got = match self.inner.read(&mut scratch[..want]) {
+            let got = match read_fully(&mut self.inner, &mut scratch[..want]) {
                 Ok(got) => got,
                 Err(err) => {
                     return Err(malformed(
@@ -471,10 +481,10 @@ impl<R: Read> TarReader<R> {
                     ));
                 }
             };
-            if got == 0 {
+            self.offset += got as u64;
+            if got < want {
                 return Err(malformed(self.offset, "the archive ends inside an entry"));
             }
-            self.offset += got as u64;
             skip -= got as u64;
         }
         Ok(())
@@ -1704,6 +1714,67 @@ mod tests {
         assert!(
             err.to_string().contains("ends inside an entry's data"),
             "{err}",
+        );
+    }
+
+    /// A reader that answers every other read with `EINTR`, as a pipe or a
+    /// socket does in a process whose signal handlers do not restart the call.
+    struct Interrupting<R> {
+        inner: R,
+        interrupt: bool,
+    }
+
+    impl<R: Read> Read for Interrupting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            // A short read as well, so a fill has to come back for the rest.
+            let short = buf.len().min(100);
+            self.inner.read(&mut buf[..short])
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_rather_than_reported() {
+        // The entry's data is read once and drained once, and the headers on
+        // either side are read too: every read the reader makes meets the
+        // interruption.
+        let body = vec![b'x'; 3000];
+        let mut archive = one_file(body.len() as u64, &body);
+        let terminator = archive.split_off(archive.len() - 2 * BLOCK as usize);
+        let second = sized_header(b"second", 600, b'0');
+        archive.extend_from_slice(&second);
+        archive.extend_from_slice(&[b'y'; 600]);
+        archive.resize(archive.len().next_multiple_of(BLOCK as usize), 0);
+        archive.extend_from_slice(&terminator);
+
+        let mut reader = TarReader::new(Interrupting {
+            inner: &archive[..],
+            interrupt: false,
+        });
+        reader.next_entry().unwrap().expect("the first file");
+        let mut read = Vec::new();
+        let mut chunk = [0u8; 1000];
+        loop {
+            let got = reader
+                .read_data(&mut chunk)
+                .expect("an interruption is retried");
+            if got == 0 {
+                break;
+            }
+            read.extend_from_slice(&chunk[..got]);
+        }
+        assert_eq!(read, body);
+        let second = reader.next_entry().unwrap().expect("the second file");
+        assert_eq!(second.path, b"second");
+        // The second entry's data is left unread, so the reader drains it.
+        assert!(
+            reader
+                .next_entry()
+                .expect("the drain retries too")
+                .is_none()
         );
     }
 
