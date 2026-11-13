@@ -12,10 +12,11 @@
 //!
 //! The limits sit one level above anything the sandbox can name. The kernel
 //! creates a cgroup's files owned by the process that created it, the caller,
-//! and a sandbox's processes run as the caller's own user on the host. Joined
-//! to the cgroup that holds the limits, a command could write them, or move
-//! itself out through the parent's `cgroup.procs`, wherever it can reach the
-//! cgroup's files. In the leaf it can reach neither from its cgroup namespace:
+//! and a sandbox's root runs as the caller's own user on the host, as a
+//! restriction's command does. Joined to the cgroup that holds the limits, a
+//! command could write them, or move itself out through the parent's
+//! `cgroup.procs`, wherever it can reach the cgroup's files. In the leaf it
+//! can reach neither from its cgroup namespace:
 //! the namespace's root is the leaf, which holds no limit and whose parent is
 //! outside the namespace. A restriction shares the host's cgroup namespace,
 //! where what keeps its command from the files is the confinement its build

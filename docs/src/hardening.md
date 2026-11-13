@@ -549,8 +549,8 @@ to `fcage-<unique>` and held to its limits, and the sandbox's cgroup namespace
 is rooted at the leaf.
 
 The kernel creates a cgroup's files owned by the process that created it, the
-caller, and the sandbox's processes run as the caller's own user on the host.
-The leaf is what keeps the limits out of their reach. A sandboxed command that
+caller, and the sandbox's root runs as the caller's own user on the host. The
+leaf is what keeps the limits out of its reach. A sandboxed command that
 mounts the cgroup filesystem in a namespace of its own sees the leaf as the
 hierarchy's root, with no limit in it, and nothing above it: neither the
 limits nor the parent's `cgroup.procs`, through which it could move itself out
