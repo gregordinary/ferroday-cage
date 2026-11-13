@@ -1317,7 +1317,7 @@ mod tests {
         // A deterministic, per-name stand-in for a real SHA-256: the name's
         // bytes in hex, padded to the 64 lowercase hex characters the index
         // parser now requires.
-        let mut sha256: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+        let mut sha256 = crate::provision::digest::hex(name.as_bytes());
         sha256.truncate(64);
         while sha256.len() < 64 {
             sha256.push('0');

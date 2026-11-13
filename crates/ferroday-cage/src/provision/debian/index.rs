@@ -1543,10 +1543,7 @@ SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
         } else {
             format!("{extra}\n")
         };
-        let mut sha256: String = format!("{name}{version}")
-            .bytes()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let mut sha256 = crate::provision::digest::hex(format!("{name}{version}").as_bytes());
         sha256.truncate(64);
         while sha256.len() < 64 {
             sha256.push('0');
