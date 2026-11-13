@@ -380,7 +380,12 @@ fn start_own_session(context: &Context<'_>) -> Result<(), Failure> {
 /// Under a [`run_as`](crate::CageBuilder::run_as) identity the replica is given
 /// to that identity, as a login's terminal is given to the user logging in, so
 /// the command can open its terminal by the path `ttyname` reports. Its mode is
-/// the managed `devpts` instance's `0620`.
+/// the managed `devpts` instance's `0620`. Under a
+/// [`present_as`](crate::CageBuilder::present_as) identity there is nothing to
+/// give: the sandbox's namespace maps no id but its own root, which the
+/// replica already belongs to, and the command's nested map presents that root
+/// as the presented identity, which a matching run-as identity is. The replica
+/// is the command's as it stands.
 ///
 /// The controlling terminal is taken before the primary is sent, so the caller
 /// never holds a terminal whose setup then failed. The primary and this
@@ -392,7 +397,9 @@ fn open_terminal(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     };
     let (primary, replica) = crate::terminal::allocate(terminal)
         .map_err(|errno| (SetupStep::AllocateTerminal, errno, 0))?;
-    if let Some(run_as) = &context.plan.run_as {
+    if let Some(run_as) = &context.plan.run_as
+        && context.plan.present_as.is_none()
+    {
         fs::fchown(&replica, Some(run_as.uid), Some(run_as.gid))
             .map_err(|errno| (SetupStep::AllocateTerminal, errno, 0))?;
     }

@@ -22,7 +22,7 @@ mod common;
 
 use std::path::Path;
 
-use ferroday_cage::{Cage, Identity, Output, PresentedIdentity};
+use ferroday_cage::{Cage, Identity, Output, PresentedIdentity, Terminal};
 // Identity maps and the run-as identity are exercised only by the range-map
 // tests, all of which are gated on the `subid` delegate.
 #[cfg(feature = "subid")]
@@ -220,6 +220,40 @@ fn run_as_the_presented_identity_launches() {
     assert!(output.status.success(), "{stdout}");
     assert_eq!(fields(&stdout, "Uid:"), ["1000"; 4], "{stdout}");
     assert_eq!(fields(&stdout, "Gid:"), ["100"; 4], "{stdout}");
+}
+
+/// The same combination on a terminal of the sandbox's own. The replica is the
+/// command's without a change of owner: the sandbox's namespace maps no id but
+/// its root, which the replica belongs to, and the command's map presents that
+/// root as the presented identity.
+#[test]
+fn run_as_the_presented_identity_launches_on_a_terminal() {
+    use std::io::Read as _;
+
+    let Some(rootfs) = rootfs() else { return };
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "grep -E '^(Uid|Gid):' /proc/self/status; echo tty $(stat -c '%u %g' $(tty))",
+        ])
+        .present_as(PRESENTED)
+        .run_as(Identity::new(1000, 100))
+        .build()
+        .expect("the sandbox should build");
+    let (mut running, mut pty) = cage
+        .spawn_terminal(&Terminal::new())
+        .expect("the sandbox should launch on a terminal");
+    let mut written = Vec::new();
+    pty.read_to_end(&mut written)
+        .expect("the terminal drains to its end");
+    let status = running.wait().expect("the outcome is collected");
+    let stdout = String::from_utf8_lossy(&written);
+    assert!(status.success(), "{status}: {stdout}");
+    assert_eq!(fields(&stdout, "Uid:"), ["1000"; 4], "{stdout}");
+    assert_eq!(fields(&stdout, "Gid:"), ["100"; 4], "{stdout}");
+    assert_eq!(fields(&stdout, "tty"), ["1000", "100"], "{stdout}");
 }
 
 /// A keep set carries its capabilities across the `execve` of a presented
