@@ -301,16 +301,7 @@ impl Pins {
 mod tests {
     use super::*;
     use crate::provision::alpine::index;
-
-    /// A control identity of the shape a record carries, distinct per `seed`.
-    fn identity(seed: &str) -> String {
-        let mut value = String::from("Q1");
-        for byte in seed.bytes().cycle().take(27) {
-            value.push(char::from(b'a' + byte % 26));
-        }
-        value.push('=');
-        value
-    }
+    use crate::provision::alpine::sign::identity_for_test as identity;
 
     /// A merged index over `records`, each a `(name, version, identity seed)`
     /// triple, under `pins`.

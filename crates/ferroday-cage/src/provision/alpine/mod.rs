@@ -3760,7 +3760,7 @@ mod tests {
             .expect("the bootstrap configures")
             .resolve()
             .expect("busybox resolves");
-        plan.packages[0].control_identity = "Q1".to_string() + &"a".repeat(27) + "=";
+        plan.packages[0].control_identity = sign::identity_for_test("other bytes");
         let err = provisioner(&["busybox"])
             .pin(plan)
             .build()
@@ -4331,11 +4331,10 @@ mod tests {
         let base = scratch.join(tag);
         std::fs::create_dir_all(base.join("lib/apk/db")).expect("the tree is creatable");
         let mut database = String::new();
-        let alphabet = "abcdefghijklmnopqrstuvwxyz".repeat(2);
         for (at, (name, version, fields)) in records.iter().enumerate() {
             // A distinct well-formed control identity per record, which the
             // reader checks the shape of and nothing here reads.
-            let identity = format!("Q1{}=", &alphabet[at..at + 27]);
+            let identity = sign::identity_for_test(&format!("{at} {name}"));
             database.push_str(&format!(
                 "C:{identity}\nP:{name}\nV:{version}\nA:x86_64\nS:1024\nI:2048\n{fields}\n",
             ));

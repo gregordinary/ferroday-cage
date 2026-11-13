@@ -1187,11 +1187,7 @@ mod tests {
     /// One record, spelled as an index spells it: the fields every record
     /// carries, then whatever the case is about.
     fn record(name: &str, version: &str, fields: &str) -> String {
-        let mut identity = String::from("Q1");
-        for byte in name.bytes().cycle().take(27) {
-            identity.push(char::from(b'a' + byte % 26));
-        }
-        identity.push('=');
+        let identity = crate::provision::alpine::sign::identity_for_test(name);
         format!("C:{identity}\nP:{name}\nV:{version}\nA:x86_64\nS:1024\n{fields}\n")
     }
 

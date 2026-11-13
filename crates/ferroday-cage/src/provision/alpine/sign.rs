@@ -92,6 +92,27 @@ pub(super) fn identity(digest: &[u8]) -> String {
     format!("{IDENTITY_PREFIX}{}", base64::encode(digest))
 }
 
+/// The SHA-1 a `Q1` spelling names, or `None` for anything but
+/// [`IDENTITY_PREFIX`] and the padded base64 of twenty bytes.
+///
+/// The inverse of [`identity`], and as strict as it is: [`base64::decode`]
+/// refuses a pad character standing for bits that are not zero, so a digest has
+/// the one spelling [`identity`] writes. A lenient reader decodes `...IHJ=` as
+/// it decodes `...IHI=`, and a value compared as text would then be refused as
+/// a mismatch long after it was admitted.
+pub(super) fn identity_digest(spelled: &str) -> Option<Vec<u8>> {
+    let digest = base64::decode(spelled.strip_prefix(IDENTITY_PREFIX)?)?;
+    (digest.len() == size_of::<<Sha1 as HashFunction>::Output>()).then_some(digest)
+}
+
+/// A well-formed control identity, distinct per `seed`, for a test that needs
+/// one a record, a database or a plan can carry and has no package to compute
+/// it over.
+#[cfg(test)]
+pub(super) fn identity_for_test(seed: &str) -> String {
+    identity(&Sha1::digest(seed.as_bytes()))
+}
+
 /// The same identity in hexadecimal: `X1` and the SHA-1.
 ///
 /// The installed database's `scripts.tar` names each member
@@ -416,6 +437,25 @@ mod tests {
                 })
                 .expect_err("nothing verifies");
             crate::failure::hostile::assert_escaped(&refused.to_string());
+        }
+    }
+
+    #[test]
+    fn a_q1_spelling_is_read_back_as_the_digest_it_spells_and_only_as_written() {
+        let digest = identity_digest("Q1G2xQQm08BlbpxaVnpaWWAcf0MHo=").expect("the spelling reads");
+        assert_eq!(identity(&digest), "Q1G2xQQm08BlbpxaVnpaWWAcf0MHo=");
+        // `o` and `p` differ in the two bits past the digest's last byte, which
+        // the padding says are zero: only `o` is the spelling of this digest.
+        for spelled in [
+            "Q1G2xQQm08BlbpxaVnpaWWAcf0MHp=",
+            "Q1G2xQQm08BlbpxaVnpaWWAcf0MHo",
+            "Q1G2xQQm08BlbpxaVnpaWWAcf0MH==",
+            "Q1G2xQQm08BlbpxaVnpaWWAcf0MHoAAA",
+            "X1G2xQQm08BlbpxaVnpaWWAcf0MHo=",
+            "Q1",
+            "",
+        ] {
+            assert_eq!(identity_digest(spelled), None, "{spelled}");
         }
     }
 

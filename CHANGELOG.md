@@ -833,6 +833,12 @@ consumer upgrading can skip it.
   own spelling and the second a line of the base's `triggers` file, which the
   base's own scripts can rewrite; each reached the terminal raw, control
   characters included.
+- An Alpine index record, a plan, or a base layer's database stating a control
+  identity whose last base64 character carries bits past the digest is refused
+  as it is read, with `AlpineError::Index`, `AlpineError::PlanDocument` or
+  `AlpineError::Config`. The identity was admitted and could never equal the
+  one computed over the package, so the refusal came at download as an
+  `AlpineError::Digest`, worded as a mirror serving another package.
 
 ### Internal
 

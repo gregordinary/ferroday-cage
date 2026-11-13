@@ -33,10 +33,6 @@ use crate::provision::Available;
 /// `arch`, and a plan's `Architecture`.
 pub(super) const NOARCH: &str = "noarch";
 
-/// The length of a `C:` value: [`IDENTITY_PREFIX`] and the base64 of twenty
-/// bytes.
-const IDENTITY_LENGTH: usize = IDENTITY_PREFIX.len() + 28;
-
 /// One package's record, as much of it as the reader has a use for.
 #[derive(Debug, Clone)]
 pub(super) struct Record {
@@ -239,30 +235,30 @@ pub(super) fn is_package_name(name: &str) -> bool {
 /// malformed rather than merely unfamiliar. A plan document is held to this
 /// too, in [`PlannedPackage::unaddressable`](super::plan::PlannedPackage::unaddressable).
 ///
-/// The padding is where it has to be rather than merely allowed: twenty bytes
-/// of base64 is twenty-seven alphabet characters and exactly one `=`, so a value
-/// with padding anywhere else is one [`sign::identity`](super::sign) can never
-/// render. Admitting it would put the refusal in the wrong place — a fetch-time
-/// digest mismatch, worded as a mirror serving something else, for an index that
-/// was malformed before anything was fetched.
+/// The value is read as [`sign::identity_digest`] reads it, which admits only
+/// the spelling [`sign::identity`] writes: twenty bytes of base64 is
+/// twenty-seven alphabet characters and exactly one `=`, and the two bits the
+/// last character carries past the digest are zero. A value spelled any other
+/// way is one the recomputed identity can never equal, and admitting it would
+/// put the refusal in the wrong place — a fetch-time digest mismatch, worded as
+/// a mirror serving something else, for an index that was malformed before
+/// anything was fetched. `apk.static` 3.0.9 reads a spelling whose last bits
+/// are not zero as the digest it decodes to, installs the package, and records
+/// the spelling its encoder writes; no encoder writes the other, so it is
+/// refused here with the rest of what a mirror serving something else looks
+/// like.
 ///
 /// The whole index is refused rather than the record dropped, which is stricter
 /// than `apk`: `apk.static` silently skips a record whose `C:` will not decode
-/// and uses the rest of the index. A mirror that
-/// serves a malformed record has served something this reader cannot account
-/// for, and a root assembled from the remainder would be missing whatever that
-/// record named, without saying so.
+/// and uses the rest of the index. A mirror that serves a malformed record has
+/// served something this reader cannot account for, and a root assembled from
+/// the remainder would be missing whatever that record named, without saying
+/// so.
+///
+/// [`sign::identity_digest`]: super::sign::identity_digest
+/// [`sign::identity`]: super::sign::identity
 pub(super) fn is_control_identity(value: &str) -> bool {
-    let Some(encoded) = value.strip_prefix(IDENTITY_PREFIX) else {
-        return false;
-    };
-    let Some(digest) = encoded.strip_suffix('=') else {
-        return false;
-    };
-    value.len() == IDENTITY_LENGTH
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    super::sign::identity_digest(value).is_some()
 }
 
 /// Parses an `APKINDEX` into its records.
@@ -561,16 +557,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A control identity of the shape a record carries, distinct per `name`.
-    fn identity(name: &str) -> String {
-        let mut value = String::from(IDENTITY_PREFIX);
-        for byte in name.bytes().cycle().take(27) {
-            value.push(char::from(b'a' + byte % 26));
-        }
-        value.push('=');
-        value
-    }
+    use crate::provision::alpine::sign::identity_for_test as identity;
 
     #[test]
     fn a_record_an_index_malforms_is_refused_with_its_control_characters_escaped() {
@@ -714,13 +701,18 @@ mod tests {
     fn a_control_identity_that_is_not_one_is_refused() {
         // It is recomputed and compared when the package is fetched, so a
         // record carrying anything else is malformed rather than unfamiliar.
-        let right_length_wrong_alphabet = format!("{}!", &identity("a")[..IDENTITY_LENGTH - 1]);
+        let length = identity("a").len();
+        let right_length_wrong_alphabet = format!("{}!", &identity("a")[..length - 1]);
         // Twenty bytes of base64 is twenty-seven alphabet characters and one
         // trailing `=`, so padding anywhere else is a value the encoder can
         // never produce. Admitting it would move the refusal to fetch time and
         // word it as a mirror serving the wrong bytes.
         let padded_throughout = format!("{IDENTITY_PREFIX}{}", "=".repeat(28));
-        let padded_early = format!("{}={}", &identity("a")[..IDENTITY_LENGTH - 2], "A");
+        let padded_early = format!("{}={}", &identity("a")[..length - 2], "A");
+        // So is a last character whose bits past the digest are not zero: it
+        // decodes, under a lenient reader, to the digest a different spelling
+        // names.
+        let unpadded_bits = "Q1G2xQQm08BlbpxaVnpaWWAcf0MHp=";
         for value in [
             "",
             "Q1",
@@ -728,6 +720,7 @@ mod tests {
             &right_length_wrong_alphabet,
             &padded_throughout,
             &padded_early,
+            unpadded_bits,
             &format!("{}x", identity("a")),
         ] {
             let text = format!("C:{value}\nP:musl\nV:1.0-r0\nA:x86_64\n");
