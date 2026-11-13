@@ -720,6 +720,12 @@ consumer upgrading can skip it.
   refused below Landlock ABI 9 with `ConfigError::LandlockResolveUnixUnenforceable`.
   It was refused with `ConfigError::RestrictionLandlockUnenforceable`, whose
   message names a network grant.
+- `Pool::publish` indexes a package whose control file ends in lines holding no
+  field. Those lines were carried into the index with the control stanza, and
+  the `Filename`, `Size` and `SHA256` the pool appends landed after them, in a
+  paragraph naming no package, so the package was published and missing from
+  the index. The pool now carries the control file's one stanza, and reads the
+  index it extends a stanza at a time as every other reader of it does.
 
 ### Internal
 

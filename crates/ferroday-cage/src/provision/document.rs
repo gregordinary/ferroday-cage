@@ -166,6 +166,19 @@ impl<'a> Stanza<'a> {
         self.spelled().map(|(name, value)| (name, value.unfolded()))
     }
 
+    /// The stanza as the document wrote it: its lines, each with its line
+    /// ending, from its first line to its last, with no blank line on either
+    /// side.
+    ///
+    /// For a reader that carries a stanza on whole rather than taking fields
+    /// out of it, as a Debian pool keeps the entries of the index it extends.
+    /// What it carries is what a reader of the document finds there: a run of
+    /// lines holding no field is no stanza, so it is in none of these.
+    #[cfg_attr(not(feature = "debian"), allow(dead_code))]
+    pub(crate) fn text(&self) -> &'a str {
+        self.text
+    }
+
     /// Every field, each value as the stanza spells it.
     fn spelled(&self) -> Spelled<'a> {
         Spelled { rest: self.text }

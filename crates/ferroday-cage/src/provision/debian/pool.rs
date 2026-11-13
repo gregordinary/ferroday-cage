@@ -82,7 +82,7 @@ use crate::ErrorChain;
 use crate::provision::cache;
 use crate::provision::coordinate::Nesting;
 use crate::provision::digest::{self, Algorithm, Digest};
-use crate::provision::document;
+use crate::provision::document::{self, Stanza};
 use crate::provision::rooted::Rooted;
 use crate::provision::{Staged, file_url, write_atomically};
 
@@ -571,8 +571,8 @@ fn write_pool<P: AsRef<Path>>(
     let mut by_name: BTreeMap<String, Entry> = BTreeMap::new();
     let packages_path = binary_dir.join("Packages");
     if let Some(existing) = read_if_present(&tree, &binary_rel.join("Packages"), &packages_path)? {
-        for block in split_paragraphs(&existing) {
-            if let Some(entry) = Entry::from_stanza(block) {
+        for stanza in document::parse(&existing) {
+            if let Some(entry) = Entry::from_stanza(&stanza) {
                 insert_highest(&mut by_name, entry);
             }
         }
@@ -741,16 +741,15 @@ struct Entry {
 }
 
 impl Entry {
-    /// Builds an entry from an existing `Packages` paragraph, reading its name
-    /// and version and keeping the paragraph text verbatim. Returns `None` for a
-    /// paragraph missing either field, which is dropped rather than carried
+    /// Builds an entry from a stanza of an existing `Packages` file, reading its
+    /// name and version and keeping its text verbatim. Returns `None` for a
+    /// stanza missing either field, which is dropped rather than carried
     /// forward malformed.
-    fn from_stanza(text: String) -> Option<Entry> {
-        let stanza = document::parse(&text).next()?;
+    fn from_stanza(stanza: &Stanza<'_>) -> Option<Entry> {
         Some(Entry {
             name: stanza.get("Package")?.to_string(),
             version: stanza.get("Version")?.to_string(),
-            text,
+            text: stanza.text().trim_end().to_string(),
         })
     }
 }
@@ -1036,10 +1035,19 @@ struct Placed {
 /// its first occurrence and reads an entry from the paragraph that carries
 /// `Filename`, so either shape would let the package decide what the index says
 /// about it.
+///
+/// What is carried is the control file's one stanza as [`document::parse`]
+/// reads it, and not the file whole. A run of lines holding no field after the
+/// stanza is no paragraph to [`identity`], and carried on, it would separate
+/// the appended fields from the stanza: they would land in a paragraph naming
+/// no package, and the package would drop out of the index.
 fn stanza_text(control: &str, rel: &str, size: u64, digest: &Digest) -> String {
+    let stanza = document::parse(control)
+        .next()
+        .map_or("", |stanza| stanza.text());
     format!(
         "{}\nFilename: {rel}\nSize: {size}\nSHA256: {}",
-        control.trim_end(),
+        stanza.trim_end(),
         digest.hex(),
     )
 }
@@ -1611,30 +1619,6 @@ fn gzip(bytes: &[u8]) -> Result<Vec<u8>, DebianError> {
         })
 }
 
-/// Splits a `Packages` file into its deb822 paragraphs, each returned as its
-/// field lines joined by newlines with no trailing blank line, ready to re-emit.
-fn split_paragraphs(text: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut current = String::new();
-    for line in text.lines() {
-        // Whitespace-only separates paragraphs, as it does for every other
-        // deb822 reader; only a space followed by content continues a field.
-        if line.trim().is_empty() {
-            if !current.trim().is_empty() {
-                blocks.push(current.trim_end().to_string());
-            }
-            current.clear();
-            continue;
-        }
-        current.push_str(line);
-        current.push('\n');
-    }
-    if !current.trim().is_empty() {
-        blocks.push(current.trim_end().to_string());
-    }
-    blocks
-}
-
 /// Reads the index the pool already holds at `rel` as text, returning `None`
 /// when there is none. `path` is its host path, which a failure names.
 ///
@@ -1855,17 +1839,6 @@ mod tests {
         assert_eq!(filename_version("1.0-1"), "1.0-1");
         assert_eq!(filename_version("2:1:3-1"), "1:3-1");
         assert_eq!(filename_version("weird:1.0"), "weird:1.0");
-    }
-
-    #[test]
-    fn paragraphs_split_on_blank_lines_and_drop_trailing_newlines() {
-        let text = "Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n\n";
-        assert_eq!(
-            split_paragraphs(text),
-            ["Package: a\nVersion: 1", "Package: b\nVersion: 2"],
-        );
-        // An empty index yields no paragraphs.
-        assert!(split_paragraphs("").is_empty());
     }
 
     #[test]
@@ -2238,6 +2211,53 @@ mod tests {
             .component("main/debian-installer")
             .publish::<&Path>([])
             .expect("a slashed component publishes");
+    }
+
+    #[test]
+    fn a_control_file_ending_in_lines_that_hold_no_field_is_indexed_whole() {
+        // A run of lines holding no field is no paragraph, so the control file
+        // is one stanza; carried on whole, it would put the fields the pool
+        // appends in a paragraph of their own, naming no package. A second
+        // publish reads the index back and keeps the entry as it was written.
+        let dir = Scratch::for_test("pool", "trailing-run");
+        let data = ferroday_cage_testkit::tar::Tar::new().finish();
+        let controls = [
+            (
+                "tool",
+                "Package: tool\nVersion: 1.0\nArchitecture: amd64\n\n  stray\nnot a field\n",
+            ),
+            (
+                "other",
+                "Package: other\nVersion: 1.0\nArchitecture: amd64\n",
+            ),
+        ];
+        let pool = Pool::at(&dir)
+            .suite("local")
+            .architecture("amd64")
+            .date(1_700_000_000);
+        for (name, control) in controls {
+            let deb = dir.join(format!("{name}.deb"));
+            std::fs::write(
+                &deb,
+                ferroday_cage_testkit::deb::deb_with_control(control, &data),
+            )
+            .expect("the package is written");
+            pool.publish([&deb]).expect("the package is published");
+        }
+
+        let packages =
+            std::fs::read_to_string(dir.join("dists/local/main/binary-amd64/Packages")).unwrap();
+        assert!(!packages.contains("stray"), "{packages}");
+        let index = super::super::index::Index::parse(&packages, "amd64");
+        for (name, _) in controls {
+            let entry = index
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: {packages}"));
+            assert_eq!(
+                entry.filename,
+                format!("pool/main/{}/{name}/{name}_1.0_amd64.deb", &name[..1])
+            );
+        }
     }
 
     #[test]
