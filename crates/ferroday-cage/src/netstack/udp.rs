@@ -86,8 +86,8 @@ fn deliverable(mtu: usize, destination: &IpEndpoint) -> usize {
 ///
 /// A host peer can send replies faster than this loop forwards them, and
 /// nothing about a socket read makes it stop. Without a cap the pump would stay
-/// inside the drain indefinitely, never returning to its `poll` — so the stop
-/// pipe would go unserviced and shutting the stack down would block. The cap
+/// inside the drain indefinitely, never returning to its `poll` — so a stop
+/// would go unanswered and shutting the stack down would block. The cap
 /// makes the drain bounded like every sibling in the pump (the tap read batch,
 /// the service rounds, the TCP copies): a pass moves at most one transmit ring's
 /// worth, and the next poll cycle picks up the rest.

@@ -2,11 +2,11 @@
 //!
 //! One thread owns everything: the tap descriptor, the smoltcp interface
 //! that terminates the guest's flows, and the host sockets those flows are
-//! forwarded onto. Each iteration sleeps in a single `poll` over the stop
-//! pipe, the tap, and the host sockets that currently want attention, then
-//! ingests tap frames, lets the interface process them, and services the
-//! flows until nothing moves — bounded, so a busy connection cannot starve
-//! the loop.
+//! forwarded onto. Each iteration sleeps in a single `poll` over the eventfd
+//! a [`Stop`] writes to, the tap, and the host sockets that currently want
+//! attention, then ingests tap frames, lets the interface process them, and
+//! services the flows until nothing moves — bounded, so a busy connection
+//! cannot starve the loop.
 //!
 //! Ingestion classifies every frame before queueing it for the interface
 //! ([`sniff`]): a TCP connection attempt admitted by [`host_target`]
