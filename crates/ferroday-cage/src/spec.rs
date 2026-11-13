@@ -139,12 +139,13 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 ///   guest, and the host's own services where the host runs vsock loopback.
 /// - `io_uring_setup` is refused with `ENOSYS`. A ring creates sockets of its
 ///   own, which no syscall filter sees.
-/// - On x86, socket creation through `socketcall` is refused with `ENOSYS`.
-///   `socketcall` passes the address family by pointer, where a filter cannot
-///   read it, and 64-bit code reaches it through `int 0x80`. A 32-bit glibc
-///   program creates every socket that way, so it creates none in such a
-///   sandbox. A musl program tries the direct call first, and a 64-bit program
-///   always makes it, so both create sockets as usual.
+/// - On x86, socket creation through `socketcall` is refused with
+///   `EAFNOSUPPORT`, whatever the family. `socketcall` passes the address
+///   family by pointer, where a filter cannot read it, and 64-bit code reaches
+///   it through `int 0x80`. A 32-bit glibc program creates every socket that
+///   way, so it creates none in such a sandbox, and reads each family as one
+///   the kernel does not offer. A musl program tries the direct call first,
+///   and a 64-bit program always makes it, so both create sockets as usual.
 ///
 /// Each answer is the one a kernel without the facility gives, so a program
 /// that probes for one reads it as absent. Every other address family is the

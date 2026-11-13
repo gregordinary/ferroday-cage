@@ -323,15 +323,16 @@ fn an_isolated_network_closes_the_32_bit_entry_points() {
             Err(libc::EAFNOSUPPORT),
             "{network:?}"
         );
-        // socketcall hides the family, so no socket is created through it.
+        // socketcall hides the family, so no socket is created through it,
+        // and each family reads as one the kernel does not offer.
         assert_eq!(
             outcome(&filtered, "i386-socketcall-vsock"),
-            Err(libc::ENOSYS),
+            Err(libc::EAFNOSUPPORT),
             "{network:?}"
         );
         assert_eq!(
             outcome(&filtered, "i386-socketcall-unix"),
-            Err(libc::ENOSYS),
+            Err(libc::EAFNOSUPPORT),
             "{network:?}"
         );
         // The direct 32-bit call still creates every other family.

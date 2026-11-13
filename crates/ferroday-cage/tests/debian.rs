@@ -2799,6 +2799,52 @@ fn a_bootstrap_dated_in_the_first_day_of_1970_records_no_date() {
     provision::remove(&rootfs).expect("the removal succeeds");
 }
 
+/// An i386 bootstrap on an amd64 host, which runs the target natively, under
+/// the network filter every wave carries.
+///
+/// A 32-bit glibc program creates its sockets through `socketcall`, which the
+/// filter answers as a family the kernel does not offer, and the shadow
+/// suite's account tools read that answer as auditing being absent.
+/// uuid-runtime's script creates a system account with them, so the package
+/// configures and the account exists.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_i386_bootstrap_creates_the_accounts_its_scripts_ask_for() {
+    if !network_enabled() {
+        return;
+    }
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    let rootfs = common::scratch_dir("debian-i386").join("rootfs");
+    let mut debian = Debian::builder("trixie")
+        .architecture("i386")
+        .include(["uuid-runtime"])
+        .cache_dir(common::download_cache("debian"))
+        .build()
+        .expect("the builder validates");
+    if let Err(error) = provision::ensure(&rootfs, &mut debian) {
+        let chain = ferroday_cage::ErrorChain::new(&error).to_string();
+        // ENOEXEC: a kernel built or booted without IA32 emulation executes
+        // no 32-bit binary at all.
+        if chain.contains("os error 8") {
+            common::require::premise_unmet(format!("this host runs no i386 binary: {chain}"));
+            return;
+        }
+        panic!("the i386 bootstrap runs: {chain}");
+    }
+
+    let passwd =
+        std::fs::read_to_string(rootfs.join("etc/passwd")).expect("the account database reads");
+    assert!(
+        passwd.lines().any(|line| line.starts_with("uuidd:")),
+        "uuid-runtime's script created its account: {passwd}"
+    );
+}
+
 /// A payload for a fixture package: one file under `/usr/bin` named for it.
 fn payload(name: &str) -> Vec<u8> {
     deb(&Tar::new()

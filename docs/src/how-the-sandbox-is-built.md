@@ -193,7 +193,7 @@ its nested user namespace:
 | --- | --- | --- |
 | `socket` with `AF_VSOCK` | vsock reaches the hypervisor's host from a virtual machine guest, and the host's own services where the host runs vsock loopback, whatever the namespace | `EAFNOSUPPORT` |
 | `io_uring_setup` | A ring creates and connects sockets itself, out of any syscall filter's sight | `ENOSYS` |
-| `socketcall` creating a socket, on x86 | The call passes the address family by pointer, which a filter cannot read, and 64-bit code reaches it through `int 0x80` | `ENOSYS` |
+| `socketcall` creating a socket, on x86 | The call passes the address family by pointer, which a filter cannot read, and 64-bit code reaches it through `int 0x80` | `EAFNOSUPPORT` |
 
 Each answer is the one a kernel without the facility gives. A program that
 probes for vsock or io_uring therefore reads it as absent. The filter compares
@@ -209,6 +209,12 @@ a Unix-domain socket included. A program built against musl tries the direct
 `socket` call first, and a 64-bit program always makes it, so neither is
 affected. A 32-bit glibc userland that needs sockets runs under `Network::Host`,
 which carries no filter.
+
+The refusal answers `EAFNOSUPPORT`, as `socket` does for a family the kernel
+does not offer, so a program that opens a socket only for an optional facility
+carries on without it. The shadow suite's account tools open the kernel's audit
+socket that way. A 32-bit Debian bootstrap therefore still creates the system
+accounts its packages' scripts ask for.
 
 The launch sets no-new-privileges only where the hardening layer asks for it, so
 the filter is installed without it. Creating the nested user namespace grants

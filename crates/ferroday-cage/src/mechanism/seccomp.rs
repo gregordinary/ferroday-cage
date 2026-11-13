@@ -162,7 +162,7 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 ///   [12] io_uring_setup: to [21]
 ///   [13] allow
 ///   [14] A = the low half of args[0]    socketcall's call number
-///   [15] SYS_SOCKET: to [21]
+///   [15] SYS_SOCKET: to [20]
 ///   [16] allow
 ///   [17] A = the low half of args[0]    socket's address family
 ///   [18] AF_VSOCK: to [20]
@@ -186,7 +186,7 @@ const X86_FILTER: [SockFilter; 22] = [
     jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 8, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
-    jump(bpf::JMP_JEQ_K, SYS_SOCKET, 5, 0),
+    jump(bpf::JMP_JEQ_K, SYS_SOCKET, 4, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
     jump(bpf::JMP_JEQ_K, AF_VSOCK, 1, 0),
@@ -334,11 +334,16 @@ const fn program_for(family: Family) -> &'static [SockFilter] {
 /// - **socketcall.** 32-bit x86 code creates sockets through `socketcall`,
 ///   which passes the family by pointer, where a filter cannot read it. A
 ///   64-bit process reaches the call too, through `int 0x80`. Its socket
-///   creation is answered `ENOSYS` whatever the family, so a 32-bit glibc
-///   program, which creates every socket that way, creates none in such a
-///   sandbox. musl tries the direct call first and is unaffected, as is every
-///   64-bit program. 32-bit arm's `socketcall` is out of reach, as
-///   [`ARM_FILTER`] states, and no other architecture has the call.
+///   creation is answered `EAFNOSUPPORT` whatever the family. That is the
+///   answer `socket` gives for a family the kernel does not offer, which a
+///   program probing for an optional facility reads as the facility being
+///   absent: `useradd` opens the kernel's audit socket this way, and on this
+///   answer goes on without auditing where another would abort it. A 32-bit
+///   glibc program creates every socket through `socketcall`, so it creates
+///   none in such a sandbox. musl tries the direct call first and is
+///   unaffected, as is every 64-bit program. 32-bit arm's `socketcall` is out
+///   of reach, as [`ARM_FILTER`] states, and no other architecture has the
+///   call.
 ///
 /// Every entry point a kernel of the build's family presents is checked: the
 /// 64-bit ABI, x32 under x86_64's audit architecture, and the 32-bit compat
@@ -588,7 +593,8 @@ mod tests {
     #[test]
     fn socketcall_cannot_create_a_socket() {
         // The family is behind the pointer in args[1], so every socket
-        // creation is refused; the other calls socketcall carries run.
+        // creation is refused, with the answer `socket` gives for a family
+        // the kernel does not offer; the other calls socketcall carries run.
         for family in FAMILIES {
             let program = program_for(family);
             for (arch, _, socketcall) in entry_points(family) {
@@ -599,12 +605,12 @@ mod tests {
                     let call = Call::new(arch, socketcall, &[u64::from(SYS_SOCKET), pointer]);
                     assert_eq!(
                         run(program, &call),
-                        ret_errno(ENOSYS),
+                        ret_errno(EAFNOSUPPORT),
                         "pointer {pointer:#x}"
                     );
                 }
                 let high = Call::new(arch, socketcall, &[1 << 32 | u64::from(SYS_SOCKET), 0]);
-                assert_eq!(run(program, &high), ret_errno(ENOSYS));
+                assert_eq!(run(program, &high), ret_errno(EAFNOSUPPORT));
                 // SYS_BIND through SYS_SENDMMSG.
                 for call_number in 2..=20 {
                     let call = Call::new(arch, socketcall, &[call_number, 0x0804_8000]);
