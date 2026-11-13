@@ -1,0 +1,46 @@
+# The syscalls a launch makes that a container runtime's default seccomp
+# profile refuses to a container without CAP_SYS_ADMIN, and what the launch
+# makes each one for. Moby's default profile allows the first eleven only to a
+# container holding CAP_SYS_ADMIN, and refuses the last two to every container.
+#
+# tools/seccomp-profile.py adds these to whatever default profile a runtime
+# uses, and the guide's "Running inside a container" chapter includes this file.
+
+[unshare]
+for = "the sandbox's namespaces, and the nested user and mount namespaces its command enters"
+
+[setns]
+for = "the helper that joins the sandbox's user and network namespaces, for the network stack's device and a loopback listener"
+
+[mount]
+for = "the procfs, devpts and tmpfs a sandbox mounts, and making its mount tree private"
+
+[umount2]
+for = "detaching the caller's mount tree once the sandbox's root is in place"
+
+[fsopen]
+for = "the tmpfs an empty root is"
+
+[fsconfig]
+for = "the tmpfs an empty root is"
+
+[fsmount]
+for = "the tmpfs an empty root is"
+
+[open_tree]
+for = "the detached copy of a tree a bind mount attaches"
+
+[move_mount]
+for = "attaching a bind mount's tree, and an empty root's tmpfs"
+
+[mount_setattr]
+for = "making a mount read-only, nosuid or nodev, with its submounts"
+
+[sethostname]
+for = "the sandbox's hostname, where one is set"
+
+[pivot_root]
+for = "making the sandbox's root its root"
+
+[keyctl]
+for = "the session keyring of the sandbox's own"

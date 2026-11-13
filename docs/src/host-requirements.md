@@ -41,7 +41,7 @@ common configurations disable it:
 | `user.max_user_namespaces = 0` | Denies creation outright by setting the namespace limit to zero. |
 | `user.max_user_namespaces = 1` | Admits the sandbox's own user namespace and refuses the nested one its command enters. Every launch holds two; see [The nested user namespace](how-the-sandbox-is-built.md#the-nested-user-namespace). |
 | `kernel.apparmor_restrict_unprivileged_userns = 1` | Restricts creation to programs granted the capability by an AppArmor profile. The default on Ubuntu 23.10 and later. |
-| Container seccomp profiles | Container runtimes commonly deny `unshare` with `EPERM` in their default seccomp profiles, so sandboxes nested inside such containers fail unless the profile permits it. |
+| Container seccomp profiles | Container runtimes commonly deny `unshare` with `EPERM` in their default seccomp profiles, so sandboxes nested inside such containers fail unless the profile permits it. [Running inside a container](running-in-a-container.md) gives the profile's additions. |
 
 ## How a blocked host surfaces
 
@@ -110,6 +110,8 @@ answers the same question before a launch. It forks a short-lived child that
 mounts a procfs in namespaces of its own, as a launch does. A mount table cannot
 answer it alone, since the rule also weighs the existing procfs's read-only and
 access-time flags. It then reads the mount table to name the mounts in the way.
+[Running inside a container](running-in-a-container.md) gives each runtime's
+configuration.
 
 ## Where the rootfs lives
 

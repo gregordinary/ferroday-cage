@@ -51,6 +51,7 @@ chapters! {
     "provisioning.md" => provisioning,
     "quick-start.md" => quick_start,
     "restriction-fallback.md" => restriction_fallback,
+    "running-in-a-container.md" => running_in_a_container,
     "stability.md" => stability,
     "streaming.md" => streaming,
     "terminal.md" => terminal,

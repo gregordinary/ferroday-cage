@@ -232,6 +232,12 @@ consumer upgrading can skip it.
   `ConfigError::NestedUsernsNeedsProcfs` where the only procfs that could serve
   the nested user namespace's identity map is read-only, naming where it is
   mounted.
+- The guide's "Running inside a container" chapter: what a container runtime's
+  default seccomp profile, AppArmor profile, masked procfs and host sysctls
+  each refuse a sandbox, and the remedies for Docker and for Kubernetes.
+  `tools/seccomp-additions.toml` lists the syscalls a launch makes that a
+  runtime's default seccomp profile refuses, and `tools/seccomp-profile.py`
+  adds them to the runtime's own default profile.
 
 ### Changed
 
@@ -435,6 +441,9 @@ consumer upgrading can skip it.
 
 ### Internal
 
+- CI runs `fcage` inside Docker, from a stock image, under the generated
+  seccomp profile, Docker's own profiles, and an unmasked procfs, and asserts
+  what the container chapter says of each.
 - The classic-BPF vocabulary, the seccomp install, and the unit tests'
   interpreter of a seccomp program moved from the hardening layer to
   `mechanism::seccomp`, which the network filter and the hardening layer share.

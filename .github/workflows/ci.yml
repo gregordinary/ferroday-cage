@@ -380,6 +380,118 @@ jobs:
         # linker, so nothing here runs.
         run: cargo clippy --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
 
+  container:
+    name: Inside a container
+    # A launch inside a container started with its runtime's defaults meets the
+    # runtime's seccomp profile, its AppArmor profile, and its masked procfs.
+    # This runs `fcage` inside Docker against each, and asserts what the guide's
+    # "Running inside a container" chapter says of it: the diagnosis a default
+    # launch fails with, and each remedy the chapter gives.
+    runs-on: ubuntu-latest
+    env:
+      # The default profile the generated one is built from: moby's, at a
+      # release of its profiles repository, held to the digest that release
+      # published.
+      MOBY_PROFILE: https://raw.githubusercontent.com/moby/profiles/seccomp/v0.3.0/seccomp/default.json
+      MOBY_PROFILE_SHA256: 6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6
+      # A stock image, by digest. `fcage` is built static, so the image's own
+      # C library does not have to match the runner's.
+      IMAGE: debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (pinned, plus the static target)
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build fcage
+        run: cargo build --release --locked -p ferroday-cage-cli --target x86_64-unknown-linux-musl
+      - name: Lift the host's user-namespace restriction
+        # A container cannot change a host sysctl, and Ubuntu's restriction
+        # covers every unconfined process on the host, a container started
+        # with `apparmor=unconfined` among them. The chapter names it as the
+        # node's to set.
+        run: sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Generate the seccomp profile
+        run: |
+          curl -sSLf -o "$RUNNER_TEMP/default.json" "$MOBY_PROFILE"
+          echo "${MOBY_PROFILE_SHA256}  $RUNNER_TEMP/default.json" | sha256sum --check --strict
+          python3 tools/seccomp-profile.py "$RUNNER_TEMP/default.json" > "$RUNNER_TEMP/fcage-seccomp.json"
+      - name: Pull the image
+        run: docker pull "$IMAGE"
+      - name: Launch under each configuration
+        run: |
+          fcage="$PWD/target/x86_64-unknown-linux-musl/release/fcage"
+          profile="$RUNNER_TEMP/fcage-seccomp.json"
+          # The image's own userland, read-only, on an empty root. Its /bin,
+          # /lib, /lib64 and /sbin are links into /usr.
+          userland=(--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib
+            --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin)
+          failed=0
+          # launch EXPECTED_CODE EXPECTED_TEXT -- DOCKER_OPTIONS... -- FCAGE_OPTIONS...
+          # Runs `/bin/true` in a sandbox inside the image and checks the exit
+          # code, and that standard error holds EXPECTED_TEXT where one is given.
+          launch() {
+            local want=$1 text=$2
+            shift 3
+            local docker=()
+            while [ "$1" != -- ]; do docker+=("$1"); shift; done
+            shift
+            local code=0
+            docker run --rm -v "$fcage:/fcage:ro" "${docker[@]}" "$IMAGE" \
+              /fcage --empty-rootfs "${userland[@]}" "$@" -- /bin/true 2> stderr.txt || code=$?
+            echo "docker ${docker[*]} / fcage $* exited $code"
+            sed 's/^/  stderr: /' stderr.txt
+            if [ "$code" != "$want" ]; then
+              echo "::error::expected exit $want, got $code"
+              failed=1
+            elif [ -n "$text" ] && ! grep -qF -- "$text" stderr.txt; then
+              echo "::error::standard error does not hold: $text"
+              failed=1
+            fi
+          }
+          seccomp=(--security-opt "seccomp=$profile")
+          unconfined=(--security-opt apparmor=unconfined)
+
+          echo "::group::The masked procfs refuses a fresh one, with the remedies named"
+          launch 125 "mounting a fresh procfs" -- "${seccomp[@]}" "${unconfined[@]}" --
+          grep -qF "systempaths=unconfined" stderr.txt || { echo "::error::no remedy named"; failed=1; }
+          echo "::endgroup::"
+
+          echo "::group::Sharing the PID namespace launches"
+          launch 0 "" -- "${seccomp[@]}" "${unconfined[@]}" -- --share-pid
+          launch 0 "" -- "${seccomp[@]}" "${unconfined[@]}" --user 1000:1000 -- --share-pid
+          echo "::endgroup::"
+
+          echo "::group::An unmasked procfs launches"
+          launch 0 "" -- "${seccomp[@]}" "${unconfined[@]}" --security-opt systempaths=unconfined --
+          echo "::endgroup::"
+
+          echo "::group::The runtime's own seccomp profile refuses the namespaces"
+          launch 125 "user namespace" -- "${unconfined[@]}" -- --share-pid
+          echo "::endgroup::"
+
+          echo "::group::The runtime's own AppArmor profile, with the generated seccomp profile"
+          # docker-default denies mount; what a launch reports under it is
+          # recorded here rather than asserted beyond its failing.
+          launch 125 "" -- "${seccomp[@]}" --security-opt systempaths=unconfined --
+          echo "::endgroup::"
+
+          echo "::group::The container's cgroup filesystem"
+          docker run --rm "$IMAGE" sh -c 'grep " /sys/fs/cgroup " /proc/self/mountinfo || true' | tee cgroup.txt
+          echo "::endgroup::"
+          {
+            echo "### The container's cgroup filesystem"
+            echo
+            echo '```'
+            cat cgroup.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
+
   book:
     name: Guide
     runs-on: ubuntu-latest

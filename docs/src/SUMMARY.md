@@ -5,6 +5,7 @@
 - [Quick start](quick-start.md)
 - [Cargo features](features.md)
 - [Host requirements](host-requirements.md)
+- [Running inside a container](running-in-a-container.md)
 - [How the sandbox is built](how-the-sandbox-is-built.md)
 - [The process model](process-model.md)
 - [Identity maps](identity-maps.md)
