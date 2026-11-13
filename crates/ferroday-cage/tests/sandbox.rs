@@ -1406,6 +1406,35 @@ fn a_launch_that_fails_after_the_mounts_leaves_no_placeholder_behind() {
     );
 }
 
+#[test]
+fn a_file_target_beneath_a_hide_of_nothing_leaves_no_placeholder_behind() {
+    let Some(rootfs) = common::scratch_rootfs("hidden-nothing-residue") else {
+        return;
+    };
+    let source = common::scratch_dir("hidden-nothing-source").join("file");
+    std::fs::write(&source, b"caller content\n").unwrap();
+    assert!(!rootfs.join("srv/hidden").exists());
+
+    // Nothing is at the hidden path, so the hide mounts nothing and the bind
+    // creates its target in the root itself.
+    let output = Cage::builder()
+        .rootfs(&rootfs)
+        .hide("/srv/hidden")
+        .bind_ro(&source, "/srv/hidden/config")
+        .command("/bin/cat")
+        .args(["/srv/hidden/config"])
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox launches");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"caller content\n");
+    assert!(
+        !rootfs.join("srv/hidden/config").exists(),
+        "the bind's target outlived the sandbox",
+    );
+}
+
 /// Binds the fixture's userland read-only into whatever root `builder` names.
 fn fixture_userland(
     builder: ferroday_cage::CageBuilder,

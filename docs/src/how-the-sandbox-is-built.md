@@ -392,7 +392,8 @@ sandbox's own, mounted `nosuid`, `nodev` and `noexec`, and made read-only once
 the profile is in place, so a later mount can still land beneath it. A file is
 covered with an empty regular file bound from a tmpfs of its own, read-only from
 the start. A path with nothing at it hides nothing, so one list serves hosts
-that hold different subsets of it.
+that hold different subsets of it. A later mount beneath such a path lands
+where it would with no hide.
 [`read_only`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.read_only)
 binds the tree at a path onto itself, read-only, mounts beneath it included. It
 protects a path inside a writable bind, such as a working tree's `.git/hooks`,

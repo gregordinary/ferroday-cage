@@ -616,6 +616,14 @@ consumer upgrading can skip it.
   command had run to completion, and with a PID namespace the sandbox ran on
   with no handle. The launch now asks the supervisor to end the sandbox over
   the control socket, and returns once the launch stage has exited.
+- A file bind beneath a hidden path with nothing at it no longer leaves its
+  target in the root. The hide mounts nothing there, so the launch created the
+  target in the root itself, and the build had counted it as created inside
+  the hide's own tmpfs and kept it from the targets removed once the sandbox is
+  gone. A hidden path now covers a later target only where the root holds an
+  entry at it when the sandbox is built. On the host's own root, such a target
+  is refused at build with `ConfigError::MountTargetMissing` where the host
+  lacks it, rather than failing the launch.
 
 ### Internal
 

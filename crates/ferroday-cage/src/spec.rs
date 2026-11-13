@@ -928,9 +928,12 @@ impl Symlink {
 /// wherever the file's permissions, `0644` to the sandbox's root, admit one.
 ///
 /// A path with nothing at it hides nothing and is not an error, so one list of
-/// paths serves hosts that hold different subsets of them. A symbolic link at
-/// the path is followed inside the root, as every mount target is, and what it
-/// names is hidden.
+/// paths serves hosts that hold different subsets of them. A mount declared
+/// after it, beneath that path, lands where it would with no hide: in the root,
+/// where a file target the launch creates is removed once the sandbox is gone,
+/// or, on the host's own root, at a target the host must already hold. A
+/// symbolic link at the path is followed inside the root, as every mount target
+/// is, and what it names is hidden.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -5008,25 +5011,35 @@ impl Lowering {
 /// mount or a read-only path brought is not looked into; the launch fails at
 /// the target if it is missing.
 ///
-/// A hidden path and a read-only one create nothing, and are left alone.
+/// A hidden path and a read-only one create nothing. A hidden path is looked up
+/// as a target is, and one missing there hides nothing at launch, so it covers
+/// nothing beneath it here either: a target beneath it is the host's to hold.
 fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
+    // The ops that bring nothing to rest at launch: a hide of a missing path.
+    let mut hides_nothing = vec![false; ops.len()];
     for at in 0..ops.len() {
         let target = match &ops[at].action {
-            MountAction::Hide { .. } | MountAction::ReadOnly { .. } => continue,
+            MountAction::ReadOnly { .. } => continue,
             MountAction::Symlink { parent, leaf, .. } => join_target(parent, leaf),
-            MountAction::Tmpfs { target, .. }
+            MountAction::Hide { target }
+            | MountAction::Tmpfs { target, .. }
             | MountAction::Procfs { target }
             | MountAction::Devpts { target, .. }
             | MountAction::Bind { target, .. }
             | MountAction::Raw { target, .. } => target.clone(),
         };
-        let cover = ops[..at].iter().rev().find_map(|earlier| {
-            earlier
-                .action
-                .arrival()
-                .filter(|(over, _)| covers(over, &target))
-                .map(|(over, arrival)| (over.to_owned(), arrival, &earlier.action))
-        });
+        let cover = ops[..at]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(index, _)| !hides_nothing[*index])
+            .find_map(|(_, earlier)| {
+                earlier
+                    .action
+                    .arrival()
+                    .filter(|(over, _)| covers(over, &target))
+                    .map(|(over, arrival)| (over.to_owned(), arrival, &earlier.action))
+            });
         let host_path = match &cover {
             Some((over, Arrival::Fresh, _)) => {
                 let beneath = |path: &CStr| path != over.as_c_str() && covers(over, path);
@@ -5047,6 +5060,15 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
             Some((_, Arrival::Tree, _)) => None,
             None => Some(Path::new("/").join(OsStr::from_bytes(target.as_bytes()))),
         };
+        // A hide follows a link at its path, as the launch's lookup does, and
+        // what is not found hides nothing. Anything else found, or a lookup
+        // that fails otherwise, is left for the launch to hide or fail on.
+        if let MountAction::Hide { .. } = ops[at].action {
+            hides_nothing[at] = host_path.is_some_and(|path| {
+                std::fs::metadata(path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+            });
+            continue;
+        }
         let op = &mut ops[at];
         op.dirs.clear();
         op.create_file = None;
@@ -5119,7 +5141,13 @@ enum RootLayers<'a> {
 ///   merged view shows; see [`merged_presence`];
 /// - one under the target of an earlier op, which is created inside that mount
 ///   — a tmpfs that vanishes with the namespace, or a caller's own bind source
-///   — rather than in the root directory on the host.
+///   — rather than in the root directory on the host. A hide mounts nothing
+///   over a path with nothing at it, so a hidden path counts only where the
+///   root holds an entry there when this asks. A root that changes between
+///   the build and the launch can make that answer wrong either way, and
+///   neither way removes what the launch did not create: a target counted as
+///   covered is not removed, and one counted as the root's is removed only
+///   where the name still holds the file the launch reported creating.
 ///
 /// Directories the launch creates are not placeholders: a mount point directory
 /// is part of what a launch contributes to a tree, created at the mode of the
@@ -5140,20 +5168,23 @@ fn created_file_targets(ops: &[MountOp], root: &RootLayers<'_>) -> ManagedPlaceh
     };
     let overlay = matches!(root, RootLayers::Overlay { .. });
 
+    let presence = |path: &CStr| {
+        let relative = Path::new(OsStr::from_bytes(path.to_bytes()));
+        if overlay {
+            merged_presence(&layers, relative)
+        } else {
+            layer_presence(layers[0].as_ref(), relative)
+        }
+    };
+
     let mut mounted: Vec<&CStr> = Vec::new();
     let mut paths = Vec::new();
     let mut whiteouts = Vec::new();
     for op in ops {
         if let Some(file) = &op.create_file {
             let relative = Path::new(OsStr::from_bytes(file.to_bytes()));
-            let covered = mounted.iter().any(|mount| covers(mount, file));
-            let presence = if overlay {
-                merged_presence(&layers, relative)
-            } else {
-                layer_presence(layers[0].as_ref(), relative)
-            };
-            if !covered {
-                match presence {
+            if !mounted.iter().any(|mount| covers(mount, file)) {
+                match presence(file) {
                     Presence::Absent => paths.push(relative.to_path_buf()),
                     Presence::WhitedOut => {
                         paths.push(relative.to_path_buf());
@@ -5164,7 +5195,15 @@ fn created_file_targets(ops: &[MountOp], root: &RootLayers<'_>) -> ManagedPlaceh
             }
         }
         if let Some((target, _)) = op.action.arrival() {
-            mounted.push(target);
+            // A hide in the root itself, of a path the root holds nothing at,
+            // brings nothing to rest. One beneath an earlier mount is covered
+            // by that mount whatever it brings.
+            let hides_nothing = matches!(op.action, MountAction::Hide { .. })
+                && !mounted.iter().any(|mount| covers(mount, target))
+                && matches!(presence(target), Presence::Absent | Presence::WhitedOut);
+            if !hides_nothing {
+                mounted.push(target);
+            }
         }
     }
     ManagedPlaceholders {
@@ -8380,6 +8419,79 @@ mod tests {
             .command("/bin/sh")
             .bind_ro(dir.join("host-etc"), "/mnt/data");
         assert!(placeholders(cage).is_empty());
+    }
+
+    #[test]
+    fn a_hide_covers_a_file_target_only_where_the_root_holds_the_hidden_path() {
+        let dir = Scratch::new("hide-placeholder");
+        let rootfs = dir.join("rootfs");
+        let source = dir.join("source");
+        std::fs::create_dir_all(rootfs.join("root")).unwrap();
+        std::fs::write(&source, b"contents").unwrap();
+        let hidden = || {
+            Cage::builder()
+                .rootfs(&rootfs)
+                .command("/bin/sh")
+                .hide("/root/.config")
+                .bind_ro(&source, "/root/.config/git/config")
+                .build()
+                .unwrap()
+                .plan
+                .managed_placeholders
+        };
+
+        // Nothing at the hidden path: the hide mounts nothing, and the bind
+        // creates its target in the root itself, which the root never held.
+        assert_eq!(hidden().paths, [Path::new("root/.config/git/config")]);
+
+        // A directory there: the hide's tmpfs takes the target, and the target
+        // goes with the namespace.
+        std::fs::create_dir_all(rootfs.join("root/.config")).unwrap();
+        assert!(hidden().is_empty());
+    }
+
+    #[test]
+    fn a_hide_of_a_path_the_host_lacks_covers_nothing_on_the_host_root() {
+        const ABSENT: &str = "/ferroday-cage-test-hidden-absent";
+        assert!(
+            std::fs::symlink_metadata(ABSENT).is_err(),
+            "{ABSENT} is free on this host"
+        );
+        let err = Cage::builder()
+            .host_rootfs()
+            .hide(ABSENT)
+            .bind_ro("/etc/passwd", format!("{ABSENT}/passwd"))
+            .command("/bin/true")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Config(ConfigError::MountTargetMissing { target, .. })
+                    if *target == Path::new(ABSENT).join("passwd")
+            ),
+            "{err:?}"
+        );
+
+        // A hidden path the host holds is the sandbox's own tmpfs, which the
+        // target is created in.
+        let cage = Cage::builder()
+            .host_rootfs()
+            .hide("/usr/share")
+            .bind_ro("/etc/passwd", "/usr/share/ferroday-cage-test/passwd")
+            .command("/bin/true")
+            .build()
+            .expect("a target beneath a hidden directory the host holds");
+        let at = cage
+            .plan
+            .op_labels
+            .iter()
+            .position(|label| label.contains("/usr/share/ferroday-cage-test/passwd"))
+            .expect("the bind is planned");
+        assert_eq!(
+            cage.plan.ops[at].create_file.as_deref(),
+            Some(c"usr/share/ferroday-cage-test/passwd")
+        );
     }
 
     #[test]
