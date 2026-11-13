@@ -37,9 +37,10 @@
 //!   discriminant, errno, detail index. A successful `execve` closes the last
 //!   write end, so end-of-file with no failure means the command is running.
 //!   See [`read_report`].
-//! - the **status pipe** carries the command's wait status as one 8-byte
-//!   record — kind, value, little-endian — written by the supervisor when
-//!   the command terminates.
+//! - the **status pipe** carries the command's outcome as one record of
+//!   [`STATUS_RECORD_LEN`] bytes, little-endian: how it ended, the exit code
+//!   or signal, and what it used. The supervisor writes it once it has
+//!   collected the command's exit; see [`encode_status`].
 //! - the **control socket** (a seqpacket pair) first delivers the
 //!   supervisor's pidfd and host pid to the caller, then carries control
 //!   requests toward the supervisor; its hangup is the caller-exit signal
@@ -1425,9 +1426,10 @@ pub(crate) struct Launched {
 /// its map gate, alive, so the number names this process while the delegate
 /// uses it.
 ///
-/// Every child the caller side forks is held as one of these: the launch stage,
-/// and the export, copy-in, removal, overlay-probe, seccomp-probe and network
-/// stack helpers.
+/// Every child the caller side forks is held as one of these: the launch stage;
+/// the export, copy-in and removal helpers; the overlay, procfs, cgroup-join and
+/// seccomp probes; and the helper that works in a sandbox's network namespace,
+/// for the network stack's tap and for a pending launch's listener.
 #[derive(Debug)]
 pub(crate) struct Forked {
     /// The process's pid, for a delegate.
@@ -2058,14 +2060,8 @@ pub(crate) fn reap_via_pidfd(pidfd: BorrowedFd<'_>) -> Result<Option<i32>, Errno
 /// so its exit is read rather than collected: a pidfd turns readable once its
 /// process has exited, reaped or not.
 pub(crate) fn await_exit(pidfd: BorrowedFd<'_>) -> Result<(), Errno> {
-    loop {
-        let mut fds = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
-        match rustix::event::poll(&mut fds, None) {
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => continue,
-            Err(errno) => return Err(errno),
-        }
-    }
+    let mut fds = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
+    frame::retry_on_intr!(rustix::event::poll(&mut fds, None)).map(drop)
 }
 
 /// Whether the process a pidfd refers to has exited, asked without waiting.
