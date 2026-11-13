@@ -300,25 +300,17 @@ impl Pins {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provision::alpine::index;
+    use crate::provision::alpine::index::fixture;
     use crate::provision::alpine::sign::identity_for_test as identity;
 
     /// A merged index over `records`, each a `(name, version, identity seed)`
     /// triple, under `pins`.
     fn merged(records: &[(&str, &str, &str)], pins: &Pins) -> Index {
-        let text: String = records
+        let records: Vec<String> = records
             .iter()
-            .map(|(name, version, seed)| {
-                format!(
-                    "C:{}\nP:{name}\nV:{version}\nA:x86_64\nS:1024\n",
-                    identity(seed),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed = index::parse("the index", &text, 0)
-            .unwrap_or_else(|err| panic!("the index parses: {err}"));
-        Index::merge([parsed], "x86_64", pins)
+            .map(|(name, version, seed)| fixture::record(name, version, "x86_64", seed, ""))
+            .collect();
+        fixture::merged(&records, pins)
     }
 
     /// A plan holding exactly the given packages, as a pin is read from.

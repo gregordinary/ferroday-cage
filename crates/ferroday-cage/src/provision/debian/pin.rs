@@ -402,16 +402,13 @@ impl Pins {
 
 #[cfg(test)]
 mod tests {
-    use super::super::index::{Package, sources};
+    use super::super::index::{Package, fixture, sources};
     use super::*;
     use crate::provision::digest::Algorithm;
 
     /// A one-package index stanza at `version` with `sha256`.
     fn stanza(name: &str, version: &str, sha256: &str) -> String {
-        format!(
-            "Package: {name}\nVersion: {version}\nArchitecture: amd64\n\
-             Filename: pool/{name}_{version}_amd64.deb\nSHA256: {sha256}\n\n",
-        )
+        fixture::stanza(name, version, sha256, "")
     }
 
     /// A plan holding exactly the given packages, as a pin is read from.

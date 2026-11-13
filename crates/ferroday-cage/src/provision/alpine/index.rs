@@ -592,6 +592,44 @@ impl Index {
     }
 }
 
+/// Index records for the layer's unit tests, as an `APKINDEX` spells them.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::{Index, parse};
+    use crate::provision::alpine::pin::Pins;
+    use crate::provision::alpine::sign::identity_for_test;
+
+    /// A record offering `name` at `version` for `architecture`, its control
+    /// identity derived from `seed`, with `fields` after it, one or more lines,
+    /// where there are any. Each field ends its line, and records are
+    /// separated by a blank line where they are joined.
+    pub(crate) fn record(
+        name: &str,
+        version: &str,
+        architecture: &str,
+        seed: &str,
+        fields: &str,
+    ) -> String {
+        let mut text = format!(
+            "C:{}\nP:{name}\nV:{version}\nA:{architecture}\nS:1024\n",
+            identity_for_test(seed),
+        );
+        if !fields.is_empty() {
+            text.push_str(fields);
+            text.push('\n');
+        }
+        text
+    }
+
+    /// An x86_64 index of `records`, read as one repository's and merged
+    /// under `pins`.
+    pub(crate) fn merged(records: &[String], pins: &Pins) -> Index {
+        let parsed = parse("the index", &records.join("\n"), 0)
+            .unwrap_or_else(|err| panic!("the index parses: {err}"));
+        Index::merge([parsed], "x86_64", pins)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,16 +656,14 @@ mod tests {
         }
     }
 
-    /// A record, spelled the way an index spells one.
+    /// A record, spelled the way an index spells one, providing `provides`
+    /// where it is not empty.
     fn record(name: &str, version: &str, architecture: &str, provides: &str) -> String {
-        let mut text = format!(
-            "C:{}\nP:{name}\nV:{version}\nA:{architecture}\nS:1024\n",
-            identity(name),
-        );
-        if !provides.is_empty() {
-            text.push_str(&format!("p:{provides}\n"));
-        }
-        text
+        let provides = match provides {
+            "" => String::new(),
+            provides => format!("p:{provides}"),
+        };
+        fixture::record(name, version, architecture, name, &provides)
     }
 
     /// The records of `text`, or a panic naming the refusal.

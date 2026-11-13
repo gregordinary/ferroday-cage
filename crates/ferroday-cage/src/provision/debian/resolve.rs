@@ -1256,7 +1256,7 @@ fn add(selected: &mut BTreeMap<String, Package>, queue: &mut VecDeque<String>, p
 
 #[cfg(test)]
 mod tests {
-    use super::super::index::Priority;
+    use super::super::index::{Priority, fixture};
     use super::super::pin::Pins;
     use super::*;
 
@@ -1313,26 +1313,10 @@ mod tests {
         packages.iter().map(|p| p.name.clone()).collect()
     }
 
+    /// A stanza offering `name` at 1.0 with `deps` as its `Depends` and
+    /// `extra` fields after them.
     fn stanza(name: &str, deps: &str, extra: &str) -> String {
-        // A deterministic, per-name stand-in for a real SHA-256: the name's
-        // bytes in hex, padded to the 64 lowercase hex characters the index
-        // parser now requires.
-        let mut sha256 = crate::provision::digest::hex(name.as_bytes());
-        sha256.truncate(64);
-        while sha256.len() < 64 {
-            sha256.push('0');
-        }
-        let mut text = format!(
-            "Package: {name}\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/{name}.deb\n\
-             Size: 1\nSHA256: {sha256}\nDepends: {deps}\n"
-        );
-        if !extra.is_empty() {
-            text.push_str(extra);
-            text.push('\n');
-        }
-        // A blank line terminates the stanza.
-        text.push('\n');
-        text
+        stanza_at(name, "1.0", deps, extra)
     }
 
     #[test]
@@ -1488,7 +1472,11 @@ mod tests {
     /// [`stanza`] at a chosen version, for the cases where the archive's
     /// version is what decides the outcome.
     fn stanza_at(name: &str, version: &str, deps: &str, extra: &str) -> String {
-        stanza(name, deps, extra).replace("\nVersion: 1.0\n", &format!("\nVersion: {version}\n"))
+        let fields = match extra {
+            "" => format!("Depends: {deps}"),
+            extra => format!("Depends: {deps}\n{extra}"),
+        };
+        fixture::stanza(name, version, &fixture::digest_of(name), &fields)
     }
 
     /// The `Unsatisfiable` rendering of a refused resolve, or a panic naming

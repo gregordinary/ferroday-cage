@@ -1181,26 +1181,22 @@ impl Selection {
 mod tests {
     use super::*;
     use crate::provision::alpine::AlpineError;
-    use crate::provision::alpine::index;
+    use crate::provision::alpine::index::{self, fixture};
     use crate::provision::alpine::pin::{Pins, UnheldReason};
 
     /// One record, spelled as an index spells it: the fields every record
     /// carries, then whatever the case is about.
     fn record(name: &str, version: &str, fields: &str) -> String {
-        let identity = crate::provision::alpine::sign::identity_for_test(name);
-        format!("C:{identity}\nP:{name}\nV:{version}\nA:x86_64\nS:1024\n{fields}\n")
+        fixture::record(name, version, "x86_64", name, fields)
     }
 
     /// An index over `records`, each a `(name, version, fields)` triple.
     fn merged(records: &[(&str, &str, &str)]) -> Index {
-        let text: String = records
+        let records: Vec<String> = records
             .iter()
             .map(|(name, version, fields)| record(name, version, fields))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed = index::parse("the index", &text, 0)
-            .unwrap_or_else(|err| panic!("the index parses: {err}"));
-        Index::merge([parsed], "x86_64", &Pins::none())
+            .collect();
+        fixture::merged(&records, &Pins::none())
     }
 
     /// The names the closure of `world` holds, or a panic naming the refusal.

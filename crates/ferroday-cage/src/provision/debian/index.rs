@@ -1036,6 +1036,39 @@ fn os_and_cpu(architecture: &str) -> (&str, &str) {
     (os, cpu)
 }
 
+/// Index stanzas for the layer's unit tests, as an archive's `Packages`
+/// spells them.
+#[cfg(test)]
+pub(crate) mod fixture {
+    /// A stanza offering `name` at `version` for amd64, whose SHA-256 is
+    /// `sha256`, with `fields` after it, one or more lines, where there are
+    /// any, and the blank line that ends a stanza.
+    pub(crate) fn stanza(name: &str, version: &str, sha256: &str, fields: &str) -> String {
+        let mut text = format!(
+            "Package: {name}\nVersion: {version}\nArchitecture: amd64\n\
+             Filename: pool/{name}_{version}_amd64.deb\nSHA256: {sha256}\n"
+        );
+        if !fields.is_empty() {
+            text.push_str(fields);
+            text.push('\n');
+        }
+        text.push('\n');
+        text
+    }
+
+    /// A digest standing in for a real SHA-256: `seed`'s bytes in hex, cut or
+    /// padded with zeros to the 64 lowercase hex characters the index takes.
+    /// The same seed gives the same digest, and two short seeds two digests.
+    pub(crate) fn digest_of(seed: &str) -> String {
+        let mut digest = crate::provision::digest::hex(seed.as_bytes());
+        digest.truncate(64);
+        while digest.len() < 64 {
+            digest.push('0');
+        }
+        digest
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::pin::UnheldReason;
@@ -1536,22 +1569,11 @@ SHA256: 6e65770000000000000000000000000000000000000000000000000000000000
         assert_eq!(pkg.origin, 1);
     }
 
-    /// A one-stanza index offering `name` at `version`, with `extra` fields.
+    /// A one-stanza index offering `name` at `version`, with `extra` fields,
+    /// its digest distinct for each name and version.
     fn offer(name: &str, version: &str, extra: &str) -> String {
-        let extra = if extra.is_empty() {
-            String::new()
-        } else {
-            format!("{extra}\n")
-        };
-        let mut sha256 = crate::provision::digest::hex(format!("{name}{version}").as_bytes());
-        sha256.truncate(64);
-        while sha256.len() < 64 {
-            sha256.push('0');
-        }
-        format!(
-            "Package: {name}\nVersion: {version}\nArchitecture: amd64\n\
-             Filename: pool/{name}_{version}.deb\nSHA256: {sha256}\n{extra}\n"
-        )
+        let digest = fixture::digest_of(&format!("{name}{version}"));
+        fixture::stanza(name, version, &digest, extra)
     }
 
     /// An index over the primary trixie (origin 0) and, at origins 1 and 2, a
