@@ -83,6 +83,12 @@ wire_enum! {
     /// The steps of the helper's work, in wire form: a failure report names the
     /// step and the errno. The explicit discriminants are the record encoding
     /// between the helper and its parent within one build.
+    ///
+    /// A configuration step's phrase is what [`NetStackError::TapConfigure`]
+    /// carries as its `detail`, and a namespace join's what
+    /// [`NetStackError::NamespaceJoin`] carries as its `which`, so each reads
+    /// after the words those errors render it behind. The other steps fail as
+    /// errors of their own, whose phrases name nothing further.
     enum Step {
         /// Close the inherited descriptors this process does not own.
         SweepFds = 1 => "closing the tap helper's inherited descriptors",
@@ -97,25 +103,25 @@ wire_enum! {
         /// Open the IPv4 configuration socket.
         OpenInet = 6 => "opening the IPv4 configuration socket",
         /// Set the hardware address.
-        SetHwaddr = 7 => "setting the tap interface's hardware address",
+        SetHwaddr = 7 => "setting the hardware address",
         /// Set the MTU.
-        SetMtu = 8 => "setting the tap interface's MTU",
+        SetMtu = 8 => "setting the MTU",
         /// Assign the IPv4 address.
-        SetV4Addr = 9 => "assigning the tap interface's IPv4 address",
+        SetV4Addr = 9 => "assigning the IPv4 address",
         /// Set the IPv4 netmask.
-        SetV4Mask = 10 => "setting the tap interface's IPv4 netmask",
+        SetV4Mask = 10 => "setting the IPv4 netmask",
         /// Read the interface flags.
-        ReadFlags = 11 => "reading the tap interface's flags",
+        ReadFlags = 11 => "reading the interface flags",
         /// Bring the interface up.
-        RaiseFlags = 12 => "bringing the tap interface up",
+        RaiseFlags = 12 => "bringing the interface up",
         /// Add the IPv4 default route.
         AddV4Route = 13 => "adding the IPv4 default route",
         /// Read the interface index.
-        ReadIndex = 14 => "reading the tap interface's index",
+        ReadIndex = 14 => "reading the interface index",
         /// Open the IPv6 configuration socket.
         OpenInet6 = 15 => "opening the IPv6 configuration socket",
         /// Assign the IPv6 address.
-        SetV6Addr = 16 => "assigning the tap interface's IPv6 address",
+        SetV6Addr = 16 => "assigning the IPv6 address",
         /// Add the IPv6 default route.
         AddV6Route = 17 => "adding the IPv6 default route",
         /// Send the tap descriptor back to the caller.
@@ -385,21 +391,13 @@ fn build_tap(context: &HelperContext<'_>) -> Result<OwnedFd, (Step, Errno)> {
 /// Maps a reported step failure onto the public error.
 fn step_error(step: Step, errno: i32, plan: &Plan) -> NetStackError {
     let source = || std::io::Error::from_raw_os_error(errno);
-    let configure = |detail| NetStackError::TapConfigure {
-        detail,
-        source: source(),
-    };
     match step {
         // The helper never reached its work: it could not read its own
         // descriptor table, which is a failure to start rather than a failure
         // of the tap.
         Step::SweepFds => NetStackError::Spawn { source: source() },
-        Step::JoinUser => NetStackError::NamespaceJoin {
-            which: "joining the sandbox's user namespace",
-            source: Some(source()),
-        },
-        Step::JoinNet => NetStackError::NamespaceJoin {
-            which: "joining the sandbox's network namespace",
+        Step::JoinUser | Step::JoinNet => NetStackError::NamespaceJoin {
+            which: step.describe(),
             source: Some(source()),
         },
         Step::OpenTun => NetStackError::TapOpen { source: source() },
@@ -407,18 +405,21 @@ fn step_error(step: Step, errno: i32, plan: &Plan) -> NetStackError {
             name: plan.interface.clone(),
             source: source(),
         },
-        Step::OpenInet => configure("opening the IPv4 configuration socket"),
-        Step::SetHwaddr => configure("setting the hardware address"),
-        Step::SetMtu => configure("setting the MTU"),
-        Step::SetV4Addr => configure("assigning the IPv4 address"),
-        Step::SetV4Mask => configure("setting the IPv4 netmask"),
-        Step::ReadFlags => configure("reading the interface flags"),
-        Step::RaiseFlags => configure("bringing the interface up"),
-        Step::AddV4Route => configure("adding the IPv4 default route"),
-        Step::ReadIndex => configure("reading the interface index"),
-        Step::OpenInet6 => configure("opening the IPv6 configuration socket"),
-        Step::SetV6Addr => configure("assigning the IPv6 address"),
-        Step::AddV6Route => configure("adding the IPv6 default route"),
+        Step::OpenInet
+        | Step::SetHwaddr
+        | Step::SetMtu
+        | Step::SetV4Addr
+        | Step::SetV4Mask
+        | Step::ReadFlags
+        | Step::RaiseFlags
+        | Step::AddV4Route
+        | Step::ReadIndex
+        | Step::OpenInet6
+        | Step::SetV6Addr
+        | Step::AddV6Route => NetStackError::TapConfigure {
+            detail: step.describe(),
+            source: source(),
+        },
         // Not a configuration failure: the interface is built and working, and
         // only the handoff of its descriptor failed.
         Step::SendTap => NetStackError::TapHandoff { source: source() },

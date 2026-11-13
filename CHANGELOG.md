@@ -751,6 +751,8 @@ consumer upgrading can skip it.
 - A socket of an address's family is opened through one
   `mechanism::netns::socket_for`, which the network stack's flows and the
   listener `Pending::listen` makes share.
+- The network stack's tap helper's errors take their wording from the phrases
+  its step enum declares.
 
 ## [0.5.2] - 2026-11-10
 
