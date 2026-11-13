@@ -1055,18 +1055,18 @@ mod tests {
         // does depends on either, so their absence is reported rather than
         // dropping a package the install needs.
         let base = format!(
-            "Package: p\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\nSHA256: {}\n",
+            "Package: pp\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\nSHA256: {}\n",
             "a".repeat(64),
         );
         let index = Index::parse(&base, "amd64");
-        let package = index.get("p").expect("the stanza parses");
+        let package = index.get("pp").expect("the stanza parses");
         assert_eq!(package.installed_size, None);
         assert_eq!(package.size, None);
         assert_eq!(package.source, None);
 
         let malformed = format!("{base}Installed-Size: unknown\nSize: huge\n");
         let index = Index::parse(&malformed, "amd64");
-        let package = index.get("p").expect("the stanza still parses");
+        let package = index.get("pp").expect("the stanza still parses");
         assert_eq!(package.installed_size, None);
         assert_eq!(package.size, None);
     }
@@ -1075,18 +1075,18 @@ mod tests {
     fn a_malformed_digest_or_pool_path_drops_the_stanza() {
         // A stanza whose digest is not 64 hex characters, or whose pool path
         // could traverse out of a mirror root, is dropped rather than parsed.
-        let base = "Package: p\nVersion: 1.0\nArchitecture: amd64\n";
+        let base = "Package: pp\nVersion: 1.0\nArchitecture: amd64\n";
         let traversing = format!(
             "{base}Filename: pool/../../../etc/passwd\nSHA256: {}\n",
             "a".repeat(64)
         );
-        assert!(Index::parse(&traversing, "amd64").get("p").is_none());
+        assert!(Index::parse(&traversing, "amd64").get("pp").is_none());
 
         let bad_digest = format!("{base}Filename: pool/p.deb\nSHA256: ../../../etc/foo\n");
-        assert!(Index::parse(&bad_digest, "amd64").get("p").is_none());
+        assert!(Index::parse(&bad_digest, "amd64").get("pp").is_none());
 
         let good = format!("{base}Filename: pool/p.deb\nSHA256: {}\n", "a".repeat(64));
-        assert!(Index::parse(&good, "amd64").get("p").is_some());
+        assert!(Index::parse(&good, "amd64").get("pp").is_some());
     }
 
     #[test]

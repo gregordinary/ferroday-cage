@@ -401,27 +401,27 @@ mod tests {
     fn a_pin_selects_its_version_rather_than_the_highest() {
         // The whole of what a pin does to a resolution: the archive has
         // published 2.0 since the pin was taken, and the pin still resolves 1.0.
-        let text = format!("{}{}", stanza("p", "1.0", A), stanza("p", "2.0", B));
-        let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+        let text = format!("{}{}", stanza("pp", "1.0", A), stanza("pp", "2.0", B));
+        let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).expect("the plan has no duplicate");
         let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
-        assert_eq!(index.get("p").expect("p is in the index").version, "1.0");
+        assert_eq!(index.get("pp").expect("pp is in the index").version, "1.0");
         pins.check(&index).expect("the pinned version is offered");
     }
 
     #[test]
     fn an_unpinned_name_still_resolves_to_the_highest() {
-        let text = format!("{}{}", stanza("p", "1.0", A), stanza("q", "2.0", B));
-        let higher = stanza("q", "3.0", A);
-        let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+        let text = format!("{}{}", stanza("pp", "1.0", A), stanza("qq", "2.0", B));
+        let higher = stanza("qq", "3.0", A);
+        let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).expect("the plan has no duplicate");
         let index = Index::merge(
             sources([(0, text.as_str()), (1, higher.as_str())]),
             "amd64",
             &pins,
         );
 
-        assert_eq!(index.get("p").expect("p is pinned").version, "1.0");
-        assert_eq!(index.get("q").expect("q is not pinned").version, "3.0");
+        assert_eq!(index.get("pp").expect("pp is pinned").version, "1.0");
+        assert_eq!(index.get("qq").expect("qq is not pinned").version, "3.0");
     }
 
     #[test]
@@ -429,11 +429,11 @@ mod tests {
         // The pin selects across the merged union, so it must not depend on
         // whether the pinned version was seen before or after a higher one.
         for order in [["1.0", "2.0"], ["2.0", "1.0"]] {
-            let text = format!("{}{}", stanza("p", order[0], A), stanza("p", order[1], A));
-            let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+            let text = format!("{}{}", stanza("pp", order[0], A), stanza("pp", order[1], A));
+            let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).expect("the plan has no duplicate");
             let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
             assert_eq!(
-                index.get("p").expect("p is in the index").version,
+                index.get("pp").expect("pp is in the index").version,
                 "1.0",
                 "offered in the order {order:?}",
             );
@@ -442,8 +442,8 @@ mod tests {
 
     #[test]
     fn a_version_the_archives_have_moved_past_names_what_they_offer() {
-        let text = stanza("p", "2.0", A);
-        let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+        let text = stanza("pp", "2.0", A);
+        let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).expect("the plan has no duplicate");
         let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         // The fallback keeps the highest so the failure can say what is there,
@@ -451,7 +451,7 @@ mod tests {
         match pins.check(&index) {
             Err(DebianError::Pin { unheld }) => {
                 assert_eq!(unheld.len(), 1, "{unheld:?}");
-                assert_eq!(unheld[0].package, "p");
+                assert_eq!(unheld[0].package, "pp");
                 assert_eq!(unheld[0].version, "1.0");
                 assert_eq!(
                     unheld[0].reason,
@@ -466,8 +466,8 @@ mod tests {
 
     #[test]
     fn a_package_the_archives_dropped_is_reported_as_absent() {
-        let text = stanza("q", "1.0", A);
-        let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+        let text = stanza("qq", "1.0", A);
+        let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).expect("the plan has no duplicate");
         let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         match pins.check(&index) {
@@ -484,8 +484,8 @@ mod tests {
         // The event a recorded digest exists to catch: the archive republished
         // the same version over different bytes. The version matches, so only
         // the digest says so.
-        let text = stanza("p", "1.0", B);
-        let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+        let text = stanza("pp", "1.0", B);
+        let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).expect("the plan has no duplicate");
         let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
         match pins.check(&index) {
@@ -508,15 +508,15 @@ mod tests {
         // otherwise resolves to the earlier repository, which would refuse a pin
         // the later repository can hold. Whichever order they are offered in,
         // the entry with the pinned bytes is the one kept.
-        let rebuilt = stanza("p", "1.0", B);
-        let original = stanza("p", "1.0", A);
-        let pins = Pins::of(&plan_of(&[("p", "1.0", A)])).expect("the plan has no duplicate");
+        let rebuilt = stanza("pp", "1.0", B);
+        let original = stanza("pp", "1.0", A);
+        let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).expect("the plan has no duplicate");
         for inputs in [
             [(0, rebuilt.as_str()), (1, original.as_str())],
             [(0, original.as_str()), (1, rebuilt.as_str())],
         ] {
             let index = Index::merge(sources(inputs), "amd64", &pins);
-            let kept = index.get("p").expect("p is in the index");
+            let kept = index.get("pp").expect("pp is in the index");
             assert_eq!(kept.sha256, A, "offered as {inputs:?}");
             pins.check(&index)
                 .expect("a repository holds the pinned bytes");
@@ -525,7 +525,7 @@ mod tests {
         // A pinned version with the pinned bytes nowhere is still the version a
         // merge keeps over a higher one, so the refusal names the digest rather
         // than another version.
-        let higher = stanza("p", "2.0", A);
+        let higher = stanza("pp", "2.0", A);
         let index = Index::merge(
             sources([(0, higher.as_str()), (1, rebuilt.as_str())]),
             "amd64",
@@ -547,7 +547,7 @@ mod tests {
         // comparison. A digest spelled any other way is a malformed pin, and
         // saying so is a better answer than a mismatch report naming an archive
         // that published exactly what the pin asked for.
-        let shouted = plan_of(&[("p", "1.0", &A.to_uppercase())]);
+        let shouted = plan_of(&[("pp", "1.0", &A.to_uppercase())]);
         match super::super::validate_pin(&shouted, "trixie", "amd64", false) {
             Err(DebianError::Config { reason }) => {
                 assert!(reason.contains("lowercase hex"), "{reason}");
@@ -560,11 +560,11 @@ mod tests {
     fn a_pin_written_with_an_explicit_zero_epoch_matches_an_index_without_one() {
         // Debian version comparison, not string comparison: `0:1.0` and `1.0`
         // are the same version, and a hand-written pin may spell either.
-        let text = stanza("p", "1.0", A);
-        let pins = Pins::of(&plan_of(&[("p", "0:1.0", A)])).expect("the plan has no duplicate");
+        let text = stanza("pp", "1.0", A);
+        let pins = Pins::of(&plan_of(&[("pp", "0:1.0", A)])).expect("the plan has no duplicate");
         let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
-        assert_eq!(index.get("p").expect("p is in the index").version, "1.0");
+        assert_eq!(index.get("pp").expect("pp is in the index").version, "1.0");
         pins.check(&index).expect("the epoch is not a difference");
     }
 
@@ -572,11 +572,11 @@ mod tests {
     fn every_package_that_could_not_be_held_is_reported_at_once_in_name_order() {
         // An archive publish moves many packages together, so reporting one at
         // a time would be a queue of rebuilds rather than one answer.
-        let text = format!("{}{}", stanza("b", "2.0", A), stanza("c", "1.0", B));
+        let text = format!("{}{}", stanza("bb", "2.0", A), stanza("cc", "1.0", B));
         let pins = Pins::of(&plan_of(&[
-            ("c", "1.0", A),
-            ("a", "1.0", A),
-            ("b", "1.0", A),
+            ("cc", "1.0", A),
+            ("aa", "1.0", A),
+            ("bb", "1.0", A),
         ]))
         .expect("the plan has no duplicate");
         let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
@@ -584,7 +584,7 @@ mod tests {
         match pins.check(&index) {
             Err(DebianError::Pin { unheld }) => {
                 let names: Vec<_> = unheld.iter().map(|u| u.package.as_str()).collect();
-                assert_eq!(names, ["a", "b", "c"]);
+                assert_eq!(names, ["aa", "bb", "cc"]);
                 assert_eq!(unheld[0].reason, UnheldReason::Absent);
                 assert_eq!(
                     unheld[1].reason,
@@ -604,10 +604,10 @@ mod tests {
 
     #[test]
     fn a_plan_naming_one_package_twice_is_refused() {
-        match Pins::of(&plan_of(&[("p", "1.0", A), ("p", "2.0", A)])) {
+        match Pins::of(&plan_of(&[("pp", "1.0", A), ("pp", "2.0", A)])) {
             Err(DebianError::Config { reason }) => {
                 assert!(reason.contains("twice"), "{reason}");
-                assert!(reason.contains('p'), "{reason}");
+                assert!(reason.contains("the package pp twice"), "{reason}");
             }
             other => panic!("expected a duplicate refusal, got {other:?}"),
         }
@@ -615,11 +615,11 @@ mod tests {
 
     #[test]
     fn no_pin_leaves_the_resolution_alone() {
-        let text = format!("{}{}", stanza("p", "1.0", A), stanza("p", "2.0", B));
+        let text = format!("{}{}", stanza("pp", "1.0", A), stanza("pp", "2.0", B));
         let pins = Pins::none();
         let index = Index::merge(sources([(0, text.as_str())]), "amd64", &pins);
 
-        assert_eq!(index.get("p").expect("p is in the index").version, "2.0");
+        assert_eq!(index.get("pp").expect("pp is in the index").version, "2.0");
         pins.check(&index).expect("an empty pin holds vacuously");
     }
 }

@@ -956,24 +956,24 @@ mod tests {
     fn closure_follows_depends_and_pre_depends() {
         let text = format!(
             "{}{}{}",
-            stanza("a", "b", "Pre-Depends: c"),
-            stanza("b", "", ""),
-            stanza("c", "", ""),
+            stanza("aa", "bb", "Pre-Depends: cc"),
+            stanza("bb", "", ""),
+            stanza("cc", "", ""),
         );
-        let selected = resolve(&index(&text), &["a".into()], &[], &[]).into_packages();
-        assert_eq!(names(&selected), ["a", "b", "c"]);
+        let selected = resolve(&index(&text), &["aa".into()], &[], &[]).into_packages();
+        assert_eq!(names(&selected), ["aa", "bb", "cc"]);
     }
 
     #[test]
     fn first_alternative_is_taken() {
         let text = format!(
             "{}{}{}",
-            stanza("a", "x | y", ""),
-            stanza("x", "", ""),
-            stanza("y", "", "")
+            stanza("aa", "xx | yy", ""),
+            stanza("xx", "", ""),
+            stanza("yy", "", "")
         );
-        let selected = resolve(&index(&text), &["a".into()], &[], &[]).into_packages();
-        assert_eq!(names(&selected), ["a", "x"]);
+        let selected = resolve(&index(&text), &["aa".into()], &[], &[]).into_packages();
+        assert_eq!(names(&selected), ["aa", "xx"]);
     }
 
     #[test]
@@ -1021,16 +1021,16 @@ mod tests {
 
     #[test]
     fn an_unknown_include_is_an_error() {
-        let text = stanza("a", "", "");
+        let text = stanza("aa", "", "");
         let err = resolve(&index(&text), &[], &["nonesuch".into()], &[]).into_refusal();
         assert!(matches!(err, Refusal::PackageNotFound { name } if name == "nonesuch"));
     }
 
     #[test]
     fn a_cycle_terminates() {
-        let text = format!("{}{}", stanza("a", "b", ""), stanza("b", "a", ""));
-        let selected = resolve(&index(&text), &["a".into()], &[], &[]).into_packages();
-        assert_eq!(names(&selected), ["a", "b"]);
+        let text = format!("{}{}", stanza("aa", "bb", ""), stanza("bb", "aa", ""));
+        let selected = resolve(&index(&text), &["aa".into()], &[], &[]).into_packages();
+        assert_eq!(names(&selected), ["aa", "bb"]);
     }
 
     #[test]
@@ -1050,54 +1050,55 @@ mod tests {
 
     #[test]
     fn an_exclude_selects_the_other_alternative() {
-        // `a` depends on `x | y`; excluding `x` resolves the group to `y`
+        // `aa` depends on `xx | yy`; excluding `xx` resolves the group to `yy`
         // rather than pulling the excluded first alternative.
         let text = format!(
             "{}{}{}",
-            stanza("a", "x | y", ""),
-            stanza("x", "", ""),
-            stanza("y", "", ""),
+            stanza("aa", "xx | yy", ""),
+            stanza("xx", "", ""),
+            stanza("yy", "", ""),
         );
-        let selected = resolve(&index(&text), &["a".into()], &[], &["x".into()]).into_packages();
-        assert_eq!(names(&selected), ["a", "y"]);
+        let selected = resolve(&index(&text), &["aa".into()], &[], &["xx".into()]).into_packages();
+        assert_eq!(names(&selected), ["aa", "yy"]);
     }
 
     #[test]
     fn an_excluded_hard_dependency_is_refused() {
-        // `a` depends on `x` with no alternative; excluding `x` would leave the
+        // `aa` depends on `xx` with no alternative; excluding `xx` would leave the
         // dependency unmet, so the resolution fails naming both packages.
-        let text = format!("{}{}", stanza("a", "x", ""), stanza("x", "", ""));
-        let err = resolve(&index(&text), &["a".into()], &[], &["x".into()]).into_refusal();
+        let text = format!("{}{}", stanza("aa", "xx", ""), stanza("xx", "", ""));
+        let err = resolve(&index(&text), &["aa".into()], &[], &["xx".into()]).into_refusal();
         assert!(matches!(
             err,
             Refusal::ExcludedButRequired { package, required_by }
-                if package == "x" && required_by == "a"
+                if package == "xx" && required_by == "aa"
         ));
     }
 
     #[test]
     fn an_exclude_defers_to_a_virtual_provider() {
-        // `a` depends on the virtual `awk`, provided by both gawk and mawk.
+        // `aa` depends on the virtual `awk`, provided by both gawk and mawk.
         // Providers are held sorted, so gawk is the default pick; excluding it
         // resolves the group through mawk, proving the exclusion redirected the
         // choice rather than the default coinciding with it.
         let text = format!(
             "{}{}{}",
-            stanza("a", "awk", ""),
+            stanza("aa", "awk", ""),
             stanza("gawk", "", "Provides: awk"),
             stanza("mawk", "", "Provides: awk"),
         );
-        let selected = resolve(&index(&text), &["a".into()], &[], &["gawk".into()]).into_packages();
-        assert_eq!(names(&selected), ["a", "mawk"]);
+        let selected =
+            resolve(&index(&text), &["aa".into()], &[], &["gawk".into()]).into_packages();
+        assert_eq!(names(&selected), ["aa", "mawk"]);
     }
 
     #[test]
     fn an_include_that_is_also_excluded_is_refused() {
-        let text = stanza("a", "", "");
-        let err = resolve(&index(&text), &[], &["a".into()], &["a".into()]).into_refusal();
+        let text = stanza("aa", "", "");
+        let err = resolve(&index(&text), &[], &["aa".into()], &["aa".into()]).into_refusal();
         assert!(matches!(
             err,
-            Refusal::ExcludedAndIncluded { name } if name == "a"
+            Refusal::ExcludedAndIncluded { name } if name == "aa"
         ));
     }
 
@@ -1139,59 +1140,59 @@ mod tests {
 
     #[test]
     fn an_assumed_dependency_is_not_reselected() {
-        // `a` depends on `b`; the base already carries `b`, so resolving the
-        // increment selects only `a` and leaves `b` to the base.
-        let text = format!("{}{}", stanza("a", "b", ""), stanza("b", "", ""));
-        let selected = resolve_seeded(&index(&text), &[], &["a".into()], &[], &assumed(&["b"]))
+        // `aa` depends on `bb`; the base already carries `bb`, so resolving the
+        // increment selects only `aa` and leaves `bb` to the base.
+        let text = format!("{}{}", stanza("aa", "bb", ""), stanza("bb", "", ""));
+        let selected = resolve_seeded(&index(&text), &[], &["aa".into()], &[], &assumed(&["bb"]))
             .into_packages();
-        assert_eq!(names(&selected), ["a"]);
+        assert_eq!(names(&selected), ["aa"]);
     }
 
     #[test]
     fn an_assumed_virtual_satisfies_a_dependency() {
-        // `a` depends on the virtual `awk`; the base carries a provider, so the
+        // `aa` depends on the virtual `awk`; the base carries a provider, so the
         // base's set includes the virtual name and the group is satisfied without
         // pulling any provider into the increment.
         let text = format!(
             "{}{}",
-            stanza("a", "awk", ""),
+            stanza("aa", "awk", ""),
             stanza("gawk", "", "Provides: awk"),
         );
         let selected = resolve_seeded(
             &index(&text),
             &[],
-            &["a".into()],
+            &["aa".into()],
             &[],
             &assumed(&["gawk", "awk"]),
         )
         .into_packages();
-        assert_eq!(names(&selected), ["a"]);
+        assert_eq!(names(&selected), ["aa"]);
     }
 
     #[test]
     fn an_assumed_include_selects_nothing() {
         // A requested package the base already supplies is satisfied by the base:
         // the increment is empty.
-        let text = stanza("a", "", "");
-        let selected = resolve_seeded(&index(&text), &[], &["a".into()], &[], &assumed(&["a"]))
+        let text = stanza("aa", "", "");
+        let selected = resolve_seeded(&index(&text), &[], &["aa".into()], &[], &assumed(&["aa"]))
             .into_packages();
         assert!(selected.is_empty());
     }
 
     #[test]
     fn only_the_assumed_dependency_is_omitted() {
-        // `a` depends on `b` and `c`; the base carries `b` but not `c`, so the
-        // increment is `a` and `c` — the assume-installed set omits exactly what
+        // `aa` depends on `bb` and `cc`; the base carries `bb` but not `cc`, so the
+        // increment is `aa` and `cc` — the assume-installed set omits exactly what
         // the base supplies and no more.
         let text = format!(
             "{}{}{}",
-            stanza("a", "b, c", ""),
-            stanza("b", "", ""),
-            stanza("c", "", ""),
+            stanza("aa", "bb, cc", ""),
+            stanza("bb", "", ""),
+            stanza("cc", "", ""),
         );
-        let selected = resolve_seeded(&index(&text), &[], &["a".into()], &[], &assumed(&["b"]))
+        let selected = resolve_seeded(&index(&text), &[], &["aa".into()], &[], &assumed(&["bb"]))
             .into_packages();
-        assert_eq!(names(&selected), ["a", "c"]);
+        assert_eq!(names(&selected), ["aa", "cc"]);
     }
 
     #[test]

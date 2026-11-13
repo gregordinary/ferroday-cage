@@ -3975,7 +3975,7 @@ mod tests {
         // A partial mirror or a caching proxy carries the named index and not
         // the by-hash copies. apt asks for the digest first and the name last,
         // and so does this.
-        let index = b"Package: p\nVersion: 1\nArchitecture: amd64\nFilename: pool/p.deb\n\
+        let index = b"Package: pp\nVersion: 1\nArchitecture: amd64\nFilename: pool/p.deb\n\
                       SHA256: 0000000000000000000000000000000000000000000000000000000000000000\n";
         let named = "https://mirror.example/debian/dists/trixie/main/binary-amd64/Packages";
         let by_hash = format!(
@@ -3984,7 +3984,7 @@ mod tests {
         );
         let (mut debian, asked) = by_hash_archive(index, &[(named.to_string(), index.to_vec())]);
         let available = debian.available().expect("the index is served by name");
-        assert!(available.contains("p"));
+        assert!(available.contains("pp"));
         assert_eq!(
             asked.lock().unwrap()[1..],
             [by_hash.clone(), named.to_string()],
