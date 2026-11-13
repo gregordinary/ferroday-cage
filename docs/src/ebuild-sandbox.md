@@ -62,7 +62,7 @@ processes; the boundary it needs is the cage's namespaces and private root, not
 a syscall filter layered over the top. Portage's `sandbox`, `usersandbox`, and
 `*-sandbox` features exist to build that boundary when there is none — inside
 the cage there already is one, and nesting the two fights the cage's own
-namespaces. A `--env FEATURES=...` overrides the default when a build genuinely
+namespaces. `--env FEATURES '...'` overrides the default when a build genuinely
 needs a portage feature back.
 
 ## Portage and the identity map

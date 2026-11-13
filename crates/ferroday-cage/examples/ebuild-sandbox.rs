@@ -95,7 +95,7 @@ const EMERGE: &str = "/usr/bin/emerge";
 /// `userpriv` is enabled: under the subordinate range map the `portage`
 /// user exists, so builds drop to it exactly as on a host (`userfetch` is
 /// on by default and needs no mention). Set as an environment default so a
-/// `--env FEATURES=...` from the caller replaces it.
+/// `--env FEATURES '...'` from the caller replaces it.
 const FEATURES: &str = "-sandbox -usersandbox -ipc-sandbox -network-sandbox -pid-sandbox userpriv";
 
 /// The architecture `--variant` is published under unless the caller says
