@@ -335,6 +335,27 @@ file makes `dbus-uuidgen` fail, and the system bus with it.
 A sandbox has no boot, so a program that asks for the machine id inside one finds
 none until `dbus-uuidgen --ensure=/etc/machine-id` runs in the root.
 
+## Two packages, one path
+
+A path two packages both ship is settled as `apk` settles it. Where both ship a
+file:
+
+- The later package takes it where both were built from one source package.
+- The earlier package keeps it where its `replaces` names the later one more
+  strongly than the later names it back.
+- Otherwise the later package takes it where its `replaces` names the earlier
+  one.
+- Anything else fails the bootstrap with `AlpineError::Collision`. `apk` warns
+  and marks the package broken instead, which leaves a root whose contents
+  depend on the install order.
+
+A directory and an entry that is not one never share a path. That holds
+whichever is laid down first and whatever either package's `replaces` says,
+since `apk` cannot lay the second of them down either. The exception is a link
+that resolves to a directory, which a later directory entry passes through.
+`alpine-baselayout` ships `var/run` as a link to `../run`, so a package that
+ships `var/run/` lays its files in `run`.
+
 ## Layered build roots
 
 `base_layer`, `resolve_layer` and `stage_layer` work as [the Debian layer's
@@ -396,7 +417,8 @@ forced it: an increment installs over a base rather than replacing part of one.
 
 A file the increment ships over one the base owns simply wins in the merged view.
 The base is read-only, and the shadow lives in the disposable upper. A collision
-*within* the increment is refused exactly as a full bootstrap refuses one.
+*within* the increment is refused exactly as a full bootstrap refuses one, as
+[Two packages, one path](#two-packages-one-path) describes.
 
 Files land where the merged view puts them. Where the base links a directory
 elsewhere, as `/var/run` to `../run`, the increment's files land at the link's

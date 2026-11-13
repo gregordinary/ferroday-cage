@@ -106,6 +106,7 @@ pub mod ferroday_cage::provision::alpine
 pub ferroday_cage::provision::alpine::AlpineError::Cancelled
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Collision
 pub ferroday_cage::provision::alpine::AlpineError::Collision::claimant: alloc::string::String
+pub ferroday_cage::provision::alpine::AlpineError::Collision::directory: core::option::Option<alloc::string::String>
 pub ferroday_cage::provision::alpine::AlpineError::Collision::owner: alloc::string::String
 pub ferroday_cage::provision::alpine::AlpineError::Collision::path: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::alpine::AlpineError::Config

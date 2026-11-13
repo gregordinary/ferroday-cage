@@ -89,7 +89,7 @@ use crate::failure::path_io_error;
 use crate::{ErrorChain, IdMapper, IdentityMap};
 use bootstrap::{Declared, ScriptSubject};
 use index::{Index, Record};
-use installed::{Carried, Claim, Database};
+use installed::{Carried, Claim, Database, Shape};
 use pin::Pins;
 
 /// The default mirror: the Alpine content-delivery front end.
@@ -2259,6 +2259,7 @@ fn lay_down(
     // written at a path is the one on disk, so it is the one whose owner holds,
     // and an entry stating root clears an earlier one's.
     let mut stated: HashMap<Vec<u8>, Declared> = HashMap::new();
+    let tree = Rooted::open(staging).map_err(|err| ProvisionError::io("opening", staging, err))?;
 
     for at in order {
         let held = &mut acquired[*at];
@@ -2290,22 +2291,19 @@ fn lay_down(
             .seek(std::io::SeekFrom::Start(held.package.data_at))
             .map_err(|err| ProvisionError::io("reading the package", &held.path, err))?;
         let mut archive = TarReader::new(apk::data_reader(&mut held.file));
-
-        let mut collision = None;
-        extraction.extract(&mut archive, &mut |entry, components| {
-            let placement = record_entry(&mut database, at, entry, components, &mut collision)?;
-            if placement == Placement::Write {
-                let path = components.join(&b'/');
+        lay_package(
+            &mut extraction,
+            &tree,
+            &mut database,
+            at,
+            &mut archive,
+            &mut |entry, path| {
                 match stated_owner(at, entry, &path) {
                     Some(declared) => stated.insert(path, declared),
                     None => stated.remove(&path),
                 };
-            }
-            Ok(placement)
-        })?;
-        if let Some(collision) = collision {
-            return Err(wrap(collision));
-        }
+            },
+        )?;
 
         subjects.push(ScriptSubject {
             name: held.package.info.name.clone(),
@@ -2333,7 +2331,6 @@ fn lay_down(
     // Each entry's device and inode as it was laid down, read through the same
     // in-root resolution the extraction placed it by. They are what the
     // configure wave tells the entry apart from a replacement by.
-    let tree = Rooted::open(staging).map_err(|err| ProvisionError::io("opening", staging, err))?;
     let mut stated: Vec<Declared> = stated.into_values().collect();
     stated.sort_by(|a, b| a.path.cmp(&b.path));
     for mut declared in stated {
@@ -2377,6 +2374,54 @@ fn stated_owner(at: usize, entry: &crate::provision::tar::Entry, path: &[u8]) ->
     })
 }
 
+/// Lays one package's file tree into `tree` through the collision policy,
+/// recording each entry against the package numbered `at`.
+///
+/// `written` hears each entry the extraction writes, with its root-relative
+/// path, after the record has it.
+///
+/// A directory laid where an earlier package's link is
+/// ([`Claim::Through`]) is the one claim the record cannot settle alone,
+/// because whether the link resolves to a directory is a fact about the tree.
+/// The extraction keeps a link that does and replaces one that does not, so
+/// once the package is laid down a path that holds a real directory where a
+/// link was is a link replaced, and refused as `apk` refuses it. Asking the
+/// tree afterwards rather than resolving the link here keeps that rule in one
+/// place, the extraction's.
+fn lay_package<R: std::io::Read>(
+    extraction: &mut Extraction,
+    tree: &Rooted,
+    database: &mut Database,
+    at: usize,
+    archive: &mut TarReader<R>,
+    written: &mut dyn FnMut(&crate::provision::tar::Entry, Vec<u8>),
+) -> Result<(), ProvisionError> {
+    let mut through = Vec::new();
+    extraction.extract(archive, &mut |entry, components| {
+        let placement = record_entry(database, at, entry, components, &mut through)?;
+        if placement == Placement::Write {
+            written(entry, components.join(&b'/'));
+        }
+        Ok(placement)
+    })?;
+    for (path, owner) in through {
+        let relative = Path::new(OsStr::from_bytes(&path));
+        let stat = tree
+            .stat(relative)
+            .map_err(|err| ProvisionError::io("inspecting", tree.path(relative), err))?;
+        if stat.is_some_and(|stat| rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir()) {
+            let claimant = database.record(at).name.clone();
+            return Err(wrap(AlpineError::Collision {
+                owner,
+                directory: Some(claimant.clone()),
+                claimant,
+                path: String::from_utf8_lossy(&path).into_owned(),
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Records one archive entry against the package laying it down, and decides
 /// whether it may.
 ///
@@ -2388,44 +2433,57 @@ fn stated_owner(at: usize, entry: &crate::provision::tar::Entry, path: &[u8]) ->
 /// package's bytes sat on disk would leave the finished root disagreeing with its
 /// own `Z:` digest.
 ///
-/// A contested claim is stashed rather than returned for the same reason it
-/// cannot be an error here, and reported by the caller once the entry boundary
-/// has passed.
+/// A contested claim is a collision, returned before the entry is written, so
+/// the extraction stops at the entry boundary and nothing of it reaches the
+/// tree. A directory over an earlier package's link is pushed onto `through`,
+/// with the package that laid the link, for [`lay_package`] to settle against
+/// the tree.
 fn record_entry(
     database: &mut Database,
     at: usize,
     entry: &crate::provision::tar::Entry,
     components: &[Vec<u8>],
-    collision: &mut Option<AlpineError>,
+    through: &mut Vec<(Vec<u8>, String)>,
 ) -> Result<Placement, ProvisionError> {
     let path = components.join(&b'/');
     // Root, which is what the extraction leaves every entry owned by. An entry
     // whose package states another owner is given it, and the record told so,
     // in the configure wave.
     let (uid, gid) = (0, 0);
-    if entry.typeflag == b'5' {
-        // Directories are shared by construction — every package ships the ones
-        // it writes into — so they are recorded rather than contested.
-        database.record(at).directory(&path, uid, gid, entry.mode);
-        return Ok(Placement::Write);
-    }
+    let shape = match entry.typeflag {
+        b'5' => Shape::Directory,
+        b'2' => Shape::Link,
+        _ => Shape::File,
+    };
+    let collision = |database: &mut Database, owner, directory| {
+        wrap(AlpineError::Collision {
+            owner,
+            claimant: database.record(at).name.clone(),
+            path: String::from_utf8_lossy(&path).into_owned(),
+            directory,
+        })
+    };
 
-    match database.claim(at, &path) {
+    match database.claim(at, &path, shape) {
         Claim::Free | Claim::Replaces => {}
         Claim::Kept => return Ok(Placement::Skip),
-        Claim::Contested { owner } => {
-            collision.get_or_insert(AlpineError::Collision {
-                owner,
-                claimant: database.record(at).name.clone(),
-                path: String::from_utf8_lossy(&path).into_owned(),
-            });
-            return Ok(Placement::Skip);
+        Claim::Through { owner } => through.push((path.clone(), owner)),
+        Claim::Contested { owner } => return Err(collision(database, owner, None)),
+        Claim::Unlike { owner, directory } => {
+            return Err(collision(database, owner, Some(directory)));
         }
     }
 
-    database
-        .record(at)
-        .file(&path, uid, gid, entry.mode, entry.checksum_sha1);
+    match shape {
+        // Directories are shared by construction — every package ships the
+        // ones it writes into — so every package that ships one records it.
+        Shape::Directory => database.record(at).directory(&path, uid, gid, entry.mode),
+        Shape::Link | Shape::File => {
+            database
+                .record(at)
+                .file(&path, uid, gid, entry.mode, entry.checksum_sha1);
+        }
+    }
     Ok(Placement::Write)
 }
 
@@ -2558,12 +2616,18 @@ pub enum AlpineError {
         reason: String,
     },
     /// Two packages ship the same path and neither says it may take it from
-    /// the other.
+    /// the other, or one ships it as a directory and the other as an entry that
+    /// is not one.
     ///
-    /// `apk` warns, skips the file, and records the package as broken. A root
-    /// is something a caller goes on to build on, so this layer refuses instead
-    /// rather than publish a tree whose contents depend on which package was
-    /// unpacked first.
+    /// For two files, `apk` warns, skips the file, and records the package as
+    /// broken. A root is something a caller goes on to build on, so this layer
+    /// refuses instead rather than publish a tree whose contents depend on
+    /// which package was unpacked first. A directory and an entry that is not
+    /// one are refused whichever comes first and whatever either package's
+    /// `replaces` says, as `apk` fails to lay the second of them down: no
+    /// package can take a directory another one's files lie in. A link that
+    /// resolves to a directory satisfies a later directory entry, which is not
+    /// a collision.
     #[non_exhaustive]
     Collision {
         /// The package that laid the path down.
@@ -2572,6 +2636,10 @@ pub enum AlpineError {
         claimant: String,
         /// The path both ship.
         path: String,
+        /// Where the two ship the path as different kinds of entry, whichever
+        /// of them ships it as a directory; `None` where neither does. The two
+        /// may be one package, shipping the path both ways.
+        directory: Option<String>,
     },
     /// An install script did not succeed.
     #[non_exhaustive]
@@ -2723,11 +2791,34 @@ impl fmt::Display for AlpineError {
                 owner,
                 claimant,
                 path,
+                directory: None,
             } => write!(
                 f,
                 "{claimant} and {owner} both ship {path}, and neither declares that it replaces \
                  the other",
             ),
+            AlpineError::Collision {
+                owner,
+                claimant,
+                path,
+                directory: Some(_),
+            } if owner == claimant => write!(
+                f,
+                "{claimant} ships {path} both as a directory and as an entry that is not one",
+            ),
+            AlpineError::Collision {
+                owner,
+                claimant,
+                path,
+                directory: Some(directory),
+            } => {
+                let other = if directory == owner { claimant } else { owner };
+                write!(
+                    f,
+                    "{directory} ships {path} as a directory and {other} as an entry that is not \
+                     one, which no replaces settles",
+                )
+            }
             AlpineError::Script {
                 package,
                 script,
@@ -4994,35 +5085,224 @@ mod tests {
         installed::Record::open(&info, "x86_64", 1024, format!("Q1{name}"), name.to_string())
     }
 
-    /// Lays `packages` — each a name, its extra `.PKGINFO` lines, and the
-    /// contents it ships at `CONTESTED` — down in order into a fresh tree, and
-    /// returns that tree with the database written over it.
+    /// Lays `packages` — each a name, its extra `.PKGINFO` lines, and its data
+    /// segment — down in order into a fresh tree, and returns that tree with
+    /// the database written over it, or the failure that stopped it.
     ///
-    /// Drives the real [`Extraction`] and the real [`record_entry`], which is
-    /// the pairing the collision policy lives in: `claim` alone cannot say
+    /// Drives the real [`Extraction`] through the real [`lay_package`], which
+    /// is the pairing the collision policy lives in: `claim` alone cannot say
     /// whether the tree agrees with the record of it.
-    fn lay_contested(packages: &[(&str, &str, &[u8])]) -> (Scratch, Database) {
-        const CONTESTED: &str = "usr/bin/tool";
+    fn lay(packages: &[(&str, &str, Vec<u8>)]) -> (Scratch, Result<Database, ProvisionError>) {
         let scratch = Scratch::new("alpine-collision");
         let staging = scratch.join("root");
         std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
 
         let mut extraction = Extraction::new(&staging).expect("the root opens");
+        let tree = Rooted::open(&staging).expect("the root opens");
         let mut database = Database::default();
-        for (name, extra, contents) in packages {
+        for (name, extra, archive) in packages {
             let at = database.add(record_of(name, extra));
-            let archive = one_file_archive(CONTESTED, contents);
             let mut reader = TarReader::new(&archive[..]);
-            let mut collision = None;
-            extraction
-                .extract(&mut reader, &mut |entry, components| {
-                    record_entry(&mut database, at, entry, components, &mut collision)
-                })
-                .expect("the archive extracts");
-            assert!(collision.is_none(), "{name}: {collision:?}");
+            if let Err(err) = lay_package(
+                &mut extraction,
+                &tree,
+                &mut database,
+                at,
+                &mut reader,
+                &mut |_, _| {},
+            ) {
+                return (scratch, Err(err));
+            }
         }
         extraction.finalize(&staging).expect("the metadata applies");
-        (scratch, database)
+        (scratch, Ok(database))
+    }
+
+    /// Lays `packages` — each a name, its extra `.PKGINFO` lines, and the
+    /// contents it ships at `usr/bin/tool` — down in order, none of them
+    /// colliding.
+    fn lay_contested(packages: &[(&str, &str, &[u8])]) -> (Scratch, Database) {
+        let packages: Vec<(&str, &str, Vec<u8>)> = packages
+            .iter()
+            .map(|(name, extra, contents)| {
+                (*name, *extra, one_file_archive("usr/bin/tool", contents))
+            })
+            .collect();
+        let (scratch, laid) = lay(&packages);
+        (scratch, laid.expect("nothing collides"))
+    }
+
+    /// The collision that stopped `laid`, as its owner, claimant, and the
+    /// package that ships the path as a directory.
+    fn collision_of(laid: Result<Database, ProvisionError>) -> (String, String, Option<String>) {
+        let err = laid.err().expect("the two collide");
+        let Some(AlpineError::Collision {
+            owner,
+            claimant,
+            directory,
+            path,
+        }) = std::error::Error::source(&err).and_then(|source| source.downcast_ref())
+        else {
+            panic!("expected a collision, got {err:?}");
+        };
+        assert_eq!(path, "usr/lib/thing", "{err}");
+        (owner.clone(), claimant.clone(), directory.clone())
+    }
+
+    /// A package shipping `usr/lib/thing` as a file.
+    fn as_file() -> Vec<u8> {
+        ferroday_cage_testkit::tar::Tar::new()
+            .dir("usr", 0o755)
+            .dir("usr/lib", 0o755)
+            .file("usr/lib/thing", 0o644, b"a file")
+            .finish()
+    }
+
+    /// A package shipping `usr/lib/thing` as a directory, holding `inside` where
+    /// it is given.
+    fn as_directory(inside: Option<&str>) -> Vec<u8> {
+        let mut tar = ferroday_cage_testkit::tar::Tar::new();
+        tar.dir("usr", 0o755)
+            .dir("usr/lib", 0o755)
+            .dir("usr/lib/thing", 0o755);
+        if let Some(name) = inside {
+            tar.file(&format!("usr/lib/thing/{name}"), 0o644, b"inside");
+        }
+        tar.finish()
+    }
+
+    /// A package shipping `usr/lib/thing` as a link to `target`, and
+    /// `usr/lib/real` as a directory.
+    fn as_link(target: &str) -> Vec<u8> {
+        ferroday_cage_testkit::tar::Tar::new()
+            .dir("usr", 0o755)
+            .dir("usr/lib", 0o755)
+            .dir("usr/lib/real", 0o755)
+            .symlink("usr/lib/thing", target)
+            .finish()
+    }
+
+    #[test]
+    fn a_directory_and_a_file_at_one_path_collide_whichever_is_laid_first() {
+        // The extraction alone would let the later one win, silently: a
+        // directory entry replaces a file, and a file replaces an empty
+        // directory. Which survived depended on the unpack order, and the
+        // earlier package's record went on describing what was gone.
+        // `replaces` does not settle it, as it does not for apk.
+        for replaces in ["", "replaces = file\nreplaces = directory\n"] {
+            for inside in [Some("child"), None] {
+                let (_, laid) = lay(&[
+                    ("file", replaces, as_file()),
+                    ("directory", replaces, as_directory(inside)),
+                ]);
+                assert_eq!(
+                    collision_of(laid),
+                    (
+                        "file".to_string(),
+                        "directory".to_string(),
+                        Some("directory".to_string())
+                    ),
+                    "the file first, {inside:?}, {replaces:?}",
+                );
+                let (_, laid) = lay(&[
+                    ("directory", replaces, as_directory(inside)),
+                    ("file", replaces, as_file()),
+                ]);
+                assert_eq!(
+                    collision_of(laid),
+                    (
+                        "directory".to_string(),
+                        "file".to_string(),
+                        Some("directory".to_string())
+                    ),
+                    "the directory first, {inside:?}, {replaces:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_to_a_directory_satisfies_a_later_directory_entry() {
+        // The merged-usr shape, and `var/run -> ../run`: the later package's
+        // files land through the link, which stays the earlier package's.
+        let (scratch, laid) = lay(&[
+            ("link", "", as_link("real")),
+            ("directory", "", as_directory(Some("child"))),
+        ]);
+        laid.expect("a link to a directory is not a collision");
+        let thing = scratch.join("root/usr/lib/thing");
+        assert!(
+            std::fs::symlink_metadata(&thing)
+                .expect("the link is there")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(scratch.join("root/usr/lib/real/child")).expect("the file landed"),
+            b"inside",
+        );
+    }
+
+    #[test]
+    fn a_link_that_is_not_to_a_directory_collides_with_a_directory_either_way() {
+        // A dangling link is replaced by the extraction, which the tree shows
+        // afterwards. A link laid where a directory is collides at once.
+        let (_, laid) = lay(&[
+            ("link", "", as_link("nowhere")),
+            ("directory", "", as_directory(Some("child"))),
+        ]);
+        assert_eq!(
+            collision_of(laid),
+            (
+                "link".to_string(),
+                "directory".to_string(),
+                Some("directory".to_string())
+            ),
+        );
+        let (_, laid) = lay(&[
+            ("directory", "", as_directory(Some("child"))),
+            ("link", "", as_link("real")),
+        ]);
+        assert_eq!(
+            collision_of(laid),
+            (
+                "directory".to_string(),
+                "link".to_string(),
+                Some("directory".to_string())
+            ),
+        );
+    }
+
+    #[test]
+    fn a_collision_reads_as_what_it_is() {
+        let file = AlpineError::Collision {
+            owner: "one".to_string(),
+            claimant: "two".to_string(),
+            path: "usr/bin/tool".to_string(),
+            directory: None,
+        };
+        assert!(file.to_string().contains("neither declares"), "{file}");
+        let kinds = AlpineError::Collision {
+            owner: "one".to_string(),
+            claimant: "two".to_string(),
+            path: "usr/lib/thing".to_string(),
+            directory: Some("two".to_string()),
+        };
+        assert_eq!(
+            kinds.to_string(),
+            "two ships usr/lib/thing as a directory and one as an entry that is not one, which \
+             no replaces settles",
+        );
+        let itself = AlpineError::Collision {
+            owner: "one".to_string(),
+            claimant: "one".to_string(),
+            path: "usr/lib/thing".to_string(),
+            directory: Some("one".to_string()),
+        };
+        assert_eq!(
+            itself.to_string(),
+            "one ships usr/lib/thing both as a directory and as an entry that is not one",
+        );
     }
 
     #[test]

@@ -514,17 +514,36 @@ pub(super) struct Carried {
 #[derive(Default)]
 pub(super) struct Database {
     records: Vec<Record>,
-    /// The record that laid each path down, for the collision policy.
-    owner: HashMap<Vec<u8>, usize>,
+    /// The record that laid each path down as an entry that is not a
+    /// directory, and which kind of entry it laid, for the collision policy.
+    owner: HashMap<Vec<u8>, (usize, Shape)>,
+    /// The record that first laid each path down as a directory. A directory
+    /// is shared, so this names the first of the packages that ship it, which
+    /// is the one a collision with it is reported against.
+    directory: HashMap<Vec<u8>, usize>,
     /// What a base layer already held, for a database an increment writes.
     /// Empty for a full bootstrap, which has no base.
     carried: Carried,
 }
 
+/// The kind of entry a package lays a path down as, as far as the collision
+/// policy tells kinds apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Shape {
+    /// A directory, which every package writing into it ships, so it is
+    /// shared rather than contested.
+    Directory,
+    /// A symbolic link, which a later directory entry may resolve through.
+    Link,
+    /// Anything else: a file, a hard link, or a named pipe.
+    File,
+}
+
 /// What a package may do with a path another package has already laid down.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Claim {
-    /// Nothing has this path: lay it down.
+    /// Nothing has this path, or a directory shares it with this one: lay it
+    /// down.
     Free,
     /// The later package's metadata says it may take it.
     Replaces,
@@ -533,6 +552,21 @@ pub(super) enum Claim {
     /// Neither says anything, so the two disagree about who owns the file.
     Contested {
         /// The package that laid the path down first.
+        owner: String,
+    },
+    /// One of the two lays the path down as a directory and the other as an
+    /// entry that is not one, which no `replaces` settles.
+    Unlike {
+        /// The package that laid the path down first.
+        owner: String,
+        /// Whichever of the two laid it down as a directory.
+        directory: String,
+    },
+    /// A directory where an earlier package laid a link, which the link
+    /// satisfies where it resolves to a directory. Only the tree can say
+    /// whether it does, so the caller asks it once the entry is laid down.
+    Through {
+        /// The package that laid the link down.
         owner: String,
     },
 }
@@ -561,14 +595,24 @@ impl Database {
         &mut self.records[at]
     }
 
-    /// Whether the package numbered `at` may lay `path` down, and records it as
-    /// the owner where it may.
+    /// Whether the package numbered `at` may lay `path` down as an entry of
+    /// kind `shape`, and records it as the owner where it may.
     ///
-    /// This is `apk`'s own rule, checked in `apk`'s order, with the cases a
-    /// bootstrap cannot reach removed: nothing is being upgraded, so no two
-    /// records share a name, and nothing is being removed. What is left is
-    /// where the two packages came from and what their `replaces` say about
-    /// each other:
+    /// A directory and an entry that is not one never share a path, whichever
+    /// is laid down first and whatever either package's `replaces` says: that
+    /// is [`Claim::Unlike`], one package shipping both included. `apk` cannot
+    /// lay the second of them down either, and fails the package. The one
+    /// exception is a directory laid where a link is, which is
+    /// [`Claim::Through`]: a link that resolves to a directory satisfies a
+    /// directory entry, as it does for `apk` and for the extraction, and a link
+    /// laid where a directory is stays [`Claim::Unlike`]. Two directories share
+    /// a path freely, since every package writing into one ships it.
+    ///
+    /// Two entries that are not directories follow `apk`'s own rule, checked in
+    /// `apk`'s order, with the cases a bootstrap cannot reach removed: nothing
+    /// is being upgraded, so no two records share a name, and nothing is being
+    /// removed. What is left is where the two packages came from and what their
+    /// `replaces` say about each other:
     ///
     /// - they were built from one source package: the later takes the file,
     ///   whatever either one's `replaces` says, since one build shipping a path
@@ -591,15 +635,36 @@ impl Database {
     /// file can be on disk — `apk audit` reports the other as modified. Which
     /// of the two `apk` would read is a function of the order it happens to walk
     /// the records in, which is not a thing a finished root should depend on.
-    pub(super) fn claim(&mut self, at: usize, path: &[u8]) -> Claim {
-        let Some(&owner) = self.owner.get(path) else {
-            self.owner.insert(path.to_vec(), at);
+    pub(super) fn claim(&mut self, at: usize, path: &[u8], shape: Shape) -> Claim {
+        let name = |at: usize| self.records[at].name.clone();
+        if shape == Shape::Directory {
+            return match self.owner.get(path) {
+                Some(&(owner, Shape::Link)) => Claim::Through { owner: name(owner) },
+                Some(&(owner, _)) => Claim::Unlike {
+                    owner: name(owner),
+                    directory: name(at),
+                },
+                None => {
+                    self.directory.entry(path.to_vec()).or_insert(at);
+                    Claim::Free
+                }
+            };
+        }
+        if let Some(&holder) = self.directory.get(path) {
+            return Claim::Unlike {
+                owner: name(holder),
+                directory: name(holder),
+            };
+        }
+        let Some(&(owner, _)) = self.owner.get(path) else {
+            self.owner.insert(path.to_vec(), (at, shape));
             return Claim::Free;
         };
         if owner == at {
             // The same package shipping one path twice, which tar permits. The
             // later entry is the one on disk, as it is for the extraction, and
             // `Record::file` describes it again rather than twice.
+            self.owner.insert(path.to_vec(), (at, shape));
             return Claim::Replaces;
         }
 
@@ -618,7 +683,7 @@ impl Database {
             }
         };
         if claim == Claim::Replaces {
-            self.owner.insert(path.to_vec(), at);
+            self.owner.insert(path.to_vec(), (at, shape));
             self.records[owner].remove_file(path);
         }
         claim
@@ -1150,8 +1215,11 @@ mod tests {
         let mut database = Database::default();
         let first = database.add(record(&info("first", "1-r0", earlier)));
         let second = database.add(record(&info("second", "2-r0", later)));
-        assert_eq!(database.claim(first, b"usr/bin/tool"), Claim::Free);
-        database.claim(second, b"usr/bin/tool")
+        assert_eq!(
+            database.claim(first, b"usr/bin/tool", Shape::File),
+            Claim::Free
+        );
+        database.claim(second, b"usr/bin/tool", Shape::File)
     }
 
     #[test]
@@ -1225,7 +1293,90 @@ mod tests {
         // the file that survives.
         let mut database = Database::default();
         let only = database.add(record(&info("a", "1-r0", "")));
-        assert_eq!(database.claim(only, b"usr/bin/tool"), Claim::Free);
-        assert_eq!(database.claim(only, b"usr/bin/tool"), Claim::Replaces);
+        assert_eq!(
+            database.claim(only, b"usr/bin/tool", Shape::File),
+            Claim::Free
+        );
+        assert_eq!(
+            database.claim(only, b"usr/bin/tool", Shape::Link),
+            Claim::Replaces
+        );
+    }
+
+    /// The claim the second of two packages makes on one path, the first
+    /// having laid it down as `first` and the second laying it as `second`.
+    fn kinds(first: Shape, second: Shape, earlier: &str, later: &str) -> Claim {
+        let mut database = Database::default();
+        let one = database.add(record(&info("first", "1-r0", earlier)));
+        let two = database.add(record(&info("second", "2-r0", later)));
+        assert_eq!(database.claim(one, b"usr/lib/thing", first), Claim::Free);
+        database.claim(two, b"usr/lib/thing", second)
+    }
+
+    #[test]
+    fn a_directory_and_an_entry_that_is_not_one_never_share_a_path() {
+        // Whichever is laid down first, and whatever `replaces` says: apk
+        // cannot lay the second down either.
+        for replaces in ["", "replaces = first\n"] {
+            for other in [Shape::File, Shape::Link] {
+                assert_eq!(
+                    kinds(Shape::Directory, other, "", replaces),
+                    Claim::Unlike {
+                        owner: "first".to_string(),
+                        directory: "first".to_string(),
+                    },
+                    "{other:?} over a directory, {replaces:?}",
+                );
+            }
+            assert_eq!(
+                kinds(Shape::File, Shape::Directory, "", replaces),
+                Claim::Unlike {
+                    owner: "first".to_string(),
+                    directory: "second".to_string(),
+                },
+                "a directory over a file, {replaces:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_over_a_link_is_the_tree_s_to_settle() {
+        assert_eq!(
+            kinds(Shape::Link, Shape::Directory, "", ""),
+            Claim::Through {
+                owner: "first".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn directories_share_a_path_and_a_file_beside_them_is_still_contested() {
+        assert_eq!(
+            kinds(Shape::Directory, Shape::Directory, "", ""),
+            Claim::Free
+        );
+        assert_eq!(
+            kinds(Shape::File, Shape::Link, "", ""),
+            Claim::Contested {
+                owner: "first".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn one_package_shipping_a_path_as_a_directory_and_a_file_is_refused() {
+        let mut database = Database::default();
+        let only = database.add(record(&info("a", "1-r0", "")));
+        assert_eq!(
+            database.claim(only, b"usr/lib/thing", Shape::File),
+            Claim::Free
+        );
+        assert_eq!(
+            database.claim(only, b"usr/lib/thing", Shape::Directory),
+            Claim::Unlike {
+                owner: "a".to_string(),
+                directory: "a".to_string(),
+            },
+        );
     }
 }
