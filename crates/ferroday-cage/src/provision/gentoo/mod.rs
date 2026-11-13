@@ -3059,6 +3059,16 @@ impl GentooBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    use pgp::composed::SignedSecretKey;
+    use pgp::types::KeyDetails as _;
+
+    use super::*;
+    use crate::provision::digest::Algorithm;
+    use crate::provision::openpgp::fixture;
+    use crate::scratch::Scratch;
 
     /// A planned package weighing `size`, otherwise minimal.
     fn weighing(size: u64) -> PlannedPackage {
@@ -3086,16 +3096,6 @@ mod tests {
         );
         assert_eq!(planned_bytes(&[]), 0);
     }
-    use std::collections::HashMap;
-    use std::io::Write;
-
-    use pgp::composed::SignedSecretKey;
-    use pgp::types::KeyDetails as _;
-
-    use super::*;
-    use crate::provision::digest::Algorithm;
-    use crate::provision::openpgp::fixture;
-    use crate::scratch::Scratch;
 
     /// The architecture every test below reads.
     const ARCH: &str = "amd64";
@@ -3106,10 +3106,9 @@ mod tests {
     /// A transport serving a fixed set of URLs and nothing else.
     ///
     /// Each layer keeps its own rather than sharing one from the test kit: that
-    /// crate is a dev-dependency whose features forward to this one's, so
-    /// reaching for it from a unit test would unify those features into every
-    /// `cargo test` of the library and take the meaning out of the featureless
-    /// and powerset checks.
+    /// crate links the library as a separate crate, so a transport it defined
+    /// would implement that copy's `Fetch`, and a unit test hands a provisioner
+    /// this one's.
     struct Canned {
         served: HashMap<String, Vec<u8>>,
         /// The most bytes one write to the sink carries.
@@ -4498,7 +4497,6 @@ mod tests {
         gentoo
     }
 
-    /// A fresh, empty root under `scratch`.
     /// A root holding what the fixture package requires of one, as a stage3
     /// holds it, and nothing else.
     fn supplied_root(scratch: &Scratch, name: &str) -> PathBuf {

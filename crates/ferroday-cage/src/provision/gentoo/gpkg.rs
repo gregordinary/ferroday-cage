@@ -639,7 +639,6 @@ impl Manifest {
             // alphabet as every digest in the crate is held, so a comparison
             // with it is a plain `==`.
             let mut sha512 = None;
-            let mut fields = fields.peekable();
             while let (Some(algorithm), Some(hex)) = (fields.next(), fields.next()) {
                 if algorithm == SHA512 {
                     sha512 = Some(hex);
