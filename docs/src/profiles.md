@@ -100,7 +100,9 @@ work = "/srv/scratch/run-1-work"       # optional; defaults beside the upper
 The first `lower` is the base the overlay mounts over and the rest stack on it,
 base first — the reverse of the kernel's own option order, so the array reads
 the way the layers were built. `upper` is where the sandbox's writes land, and
-discarding it reverts them. Note that a `RestrictedProfile` refuses an overlay
+discarding it reverts them. The upper and the work directory lie outside every
+lower, and no lower lies inside another. `build` refuses an overlap before it
+creates anything on the host. Note that a `RestrictedProfile` refuses an overlay
 root outright, for the reason [below](#untrusted-profiles).
 
 `empty-rootfs = true` roots the sandbox on an [empty

@@ -197,7 +197,9 @@ wire_enum! {
 /// before the mount, so a failure preparing one has to say which it was. The
 /// rootfs is the overlay's first lower and keeps its own
 /// [`RootfsUnusable`](ConfigError::RootfsUnusable) reporting; `Lower` names the
-/// stacked layers beneath it.
+/// stacked layers beneath it, except in an
+/// [`OverlayLayersOverlap`](ConfigError::OverlayLayersOverlap), where it names
+/// any lower, the rootfs included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum OverlayLayer {
@@ -734,6 +736,31 @@ rendered as text.
         /// The offending path.
         path: PathBuf,
     },
+    /// Two of an overlay's layers are not disjoint: one is the other, or lies
+    /// beneath it.
+    ///
+    /// The kernel mounts an upper or a work directory beneath a lower, and
+    /// every write the sandbox makes then lands inside that lower, so the build
+    /// refuses it before it creates anything. It refuses the overlaps the kernel
+    /// refuses at mount too, rather than leave them to an `ELOOP` or `EINVAL`
+    /// from a mount the caller never issued: a lower that is, or lies beneath,
+    /// the upper or the work directory; the upper and the work directory the
+    /// same or nested; and two lowers the same or nested. The paths are
+    /// compared as the mount options name them, with every symbolic link above
+    /// a layer resolved. A directory a bind mount presents at a second path is
+    /// not recognised there.
+    #[non_exhaustive]
+    OverlayLayersOverlap {
+        /// The layer that is, or lies beneath, the other. A lower is any of the
+        /// overlay's lowers, the rootfs included.
+        layer: OverlayLayer,
+        /// That layer's path, as the mount options name it.
+        path: PathBuf,
+        /// The layer it is, or lies beneath.
+        within: OverlayLayer,
+        /// That layer's path, as the mount options name it.
+        within_path: PathBuf,
+    },
     /// An overlay-rooted cage was requested on a host that cannot establish an
     /// unprivileged overlay mount.
     ///
@@ -1021,6 +1048,34 @@ impl fmt::Display for ConfigError {
                  sandbox's writes wherever it pointed",
                 path.display(),
             ),
+            ConfigError::OverlayLayersOverlap {
+                layer,
+                path,
+                within,
+                within_path,
+            } => {
+                match (path == within_path, layer == within) {
+                    (true, true) => {
+                        write!(
+                            f,
+                            "the overlay names {} as two of its {layer}s",
+                            path.display()
+                        )
+                    }
+                    (true, false) => write!(
+                        f,
+                        "the overlay names {} as both its {within} and its {layer}",
+                        path.display(),
+                    ),
+                    (false, _) => write!(
+                        f,
+                        "the overlay's {layer} {} lies inside its {within} {}",
+                        path.display(),
+                        within_path.display(),
+                    ),
+                }?;
+                f.write_str("; an overlay's layers must be disjoint")
+            }
             ConfigError::OverlayLayerIsRoot { layer, path } => write!(
                 f,
                 "cannot use {} as the overlay {layer} directory: it names no directory inside a \

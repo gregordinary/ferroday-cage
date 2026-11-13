@@ -1606,6 +1606,11 @@ pub ferroday_cage::ConfigError::OverlayDirUnusable::source: core::io::error::Err
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayLayerIsRoot
 pub ferroday_cage::ConfigError::OverlayLayerIsRoot::layer: ferroday_cage::OverlayLayer
 pub ferroday_cage::ConfigError::OverlayLayerIsRoot::path: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ConfigError::OverlayLayersOverlap
+pub ferroday_cage::ConfigError::OverlayLayersOverlap::layer: ferroday_cage::OverlayLayer
+pub ferroday_cage::ConfigError::OverlayLayersOverlap::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::OverlayLayersOverlap::within: ferroday_cage::OverlayLayer
+pub ferroday_cage::ConfigError::OverlayLayersOverlap::within_path: std::path::PathBuf
 pub ferroday_cage::ConfigError::OverlayLowerMissing
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayOptionsTooLong
 pub ferroday_cage::ConfigError::OverlayOptionsTooLong::length: usize

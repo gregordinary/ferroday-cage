@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode};
@@ -954,6 +954,24 @@ impl Mount {
 ///
 /// [`ConfigError::OverlayDirUnowned`]: crate::ConfigError::OverlayDirUnowned
 ///
+/// # Disjoint layers
+///
+/// Every layer lies outside every other: no lower, upper, or work directory is
+/// another, or lies beneath one. The kernel mounts an upper or a work
+/// directory beneath a lower, and every write the sandbox makes then lands in
+/// that lower, so [`build`](CageBuilder::build) refuses the overlap with
+/// [`ConfigError::OverlayLayersOverlap`] before it creates anything on the
+/// host. It refuses the overlaps the kernel itself refuses at mount as well.
+///
+/// The comparison is between the paths the mount options name. Every lower is
+/// canonicalized, and the upper and the work directory are their parent's
+/// canonical path joined with their own name, a parent that does not exist yet
+/// resolved as it will be once created. A symbolic link above a layer is
+/// therefore followed, and two spellings of one directory compare equal. A
+/// directory a bind mount presents at a second path is not recognised there.
+///
+/// [`ConfigError::OverlayLayersOverlap`]: crate::ConfigError::OverlayLayersOverlap
+///
 /// # Layer order
 ///
 /// Lowers stack base-first, the way image layers do: the first added is the
@@ -1409,11 +1427,13 @@ impl CageBuilder {
     /// increment` over a shared, unmodified base.
     ///
     /// `lower` must exist and be a directory, exactly as [`rootfs`](Self::rootfs)
-    /// requires. `upper` is created if absent, along with a sibling work
-    /// directory the overlay requires on the same filesystem; both persist on the
-    /// host after the sandbox exits and are the caller's to keep or discard, and
-    /// both should live under a directory the calling user controls rather than a
-    /// world-writable one, for the reason `rootfs` gives and for the one in
+    /// requires, and `upper` must lie outside it, as
+    /// [Disjoint layers](Overlay#disjoint-layers) sets out. `upper` is created
+    /// if absent, along with a sibling work directory the overlay requires on
+    /// the same filesystem; both persist on the host after the sandbox exits
+    /// and are the caller's to keep or discard, and both should live under a
+    /// directory the calling user controls rather than a world-writable one,
+    /// for the reason `rootfs` gives and for the one in
     /// [Where the upper lives](Overlay#where-the-upper-lives). The
     /// overlay's work area holds a directory the kernel creates mode `0`, which
     /// the calling user cannot read into: discard the upper and its work
@@ -1455,7 +1475,8 @@ impl CageBuilder {
     /// [`host::overlay_blocker`](crate::host::overlay_blocker) reports what is
     /// missing. The upper and work directories should live under a directory the
     /// calling user controls; see
-    /// [Where the upper lives](Overlay#where-the-upper-lives).
+    /// [Where the upper lives](Overlay#where-the-upper-lives). No layer may lie
+    /// within another; see [Disjoint layers](Overlay#disjoint-layers).
     pub fn overlay(mut self, overlay: Overlay) -> Self {
         self.rootfs = None;
         self.empty_rootfs = false;
@@ -3549,10 +3570,12 @@ pub(crate) fn validate_workdir(path: &Path) -> Result<Option<CString>, Error> {
 /// work directory, which the overlay requires empty and on the upper's
 /// filesystem, is a hidden sibling of the upper unless the caller named one.
 ///
-/// Everything that can be refused without creating a layer directory is checked
-/// before one is created: the lowers, the presence of an upper, whether the
-/// option string can carry every layer path, and whether the host can mount an
-/// unprivileged overlay at all, through
+/// Everything that can be refused without creating a directory is checked
+/// before one is created: the lowers, the presence of an upper, whether every
+/// layer is disjoint from every other, and whether the option string can carry
+/// every layer path. The missing directories above the upper and the work
+/// directory are created next, and then the host's support for an unprivileged
+/// overlay is probed in the upper's parent, through
 /// [`overlay_blocker`](crate::host::overlay_blocker). A refusal after that
 /// removes the directories this call created, so a refused build leaves the host
 /// as it found it.
@@ -3583,20 +3606,21 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         return Err(ConfigError::OverlayUpperMissing.into());
     };
 
-    let mut created = CreatedDirs::default();
-    let upper = layer_path(OverlayLayer::Upper, upper, &mut created)?;
+    let upper = layer_path(OverlayLayer::Upper, upper)?;
     // The work directory sits beside the upper, on the same filesystem, so the
     // overlay can move files between them. A hidden sibling keyed to the upper's
     // name keeps it out of the way and distinct per upper; a caller may name its
     // own instead.
     let work = match overlay.work.as_deref() {
-        Some(work) => layer_path(OverlayLayer::Work, work, &mut created)?,
+        Some(work) => layer_path(OverlayLayer::Work, work)?,
         None => LayerPath {
             parent: upper.parent.clone(),
             name: overlay_work_name(&upper.name),
         },
     };
     let (upper_path, work_path) = (upper.path(), work.path());
+
+    check_layers_disjoint(&lowers, &upper_path, &work_path)?;
 
     let options =
         crate::mechanism::overlay_options(&lowers, &upper_path, &work_path).map_err(|refusal| {
@@ -3609,6 +3633,13 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
                 }
             }
         })?;
+
+    let mut created = CreatedDirs::default();
+    for (layer, at) in [(OverlayLayer::Upper, &upper), (OverlayLayer::Work, &work)] {
+        created
+            .create_all(&at.parent)
+            .map_err(|err| overlay_io(layer, &at.parent, err))?;
+    }
 
     // Refuse a host that cannot establish an unprivileged overlay whose upper
     // lives on this filesystem, before any fork — the same fail-early posture
@@ -3702,18 +3733,17 @@ impl LayerPath {
     }
 }
 
-/// Resolves where the layer directory `path` goes, creating the directories
-/// above it that are missing, and not the layer directory itself.
+/// Resolves where the layer directory `path` goes, creating nothing.
 ///
-/// Ancestors above the leaf are created as `create_dir_all` creates them: the
-/// caller named them, so reaching them through a symbolic link is the caller's
-/// business, the same position `provision::containment::open_dir` takes. Each
-/// one created is recorded in `created`.
-fn layer_path(
-    layer: OverlayLayer,
-    path: &Path,
-    created: &mut CreatedDirs,
-) -> Result<LayerPath, Error> {
+/// The parent is resolved through symbolic links, as
+/// [`std::fs::canonicalize`] resolves a path: the caller named it, so reaching
+/// it through a link is the caller's business, the same position
+/// `provision::containment::open_dir` takes. A parent that does not exist yet
+/// resolves to the path it will have once its missing directories are created;
+/// see [`canonical_once_created`]. The layer directory itself is never resolved:
+/// [`create_layer_dir`] creates it, or adopts a directory the calling user owns,
+/// never a link.
+fn layer_path(layer: OverlayLayer, path: &Path) -> Result<LayerPath, Error> {
     // A path with no file name is `/` or one ending in `..`; neither names a
     // directory this can create inside a parent.
     let Some(name) = path.file_name() else {
@@ -3724,13 +3754,92 @@ fn layer_path(
         .into());
     };
     let parent = crate::path::parent_of(path);
-    created
-        .create_all(parent)
-        .map_err(|err| overlay_io(layer, parent, err))?;
     Ok(LayerPath {
-        parent: std::fs::canonicalize(parent).map_err(|err| overlay_io(layer, parent, err))?,
+        parent: canonical_once_created(parent).map_err(|err| overlay_io(layer, parent, err))?,
         name: name.to_os_string(),
     })
+}
+
+/// The canonical path `dir` will have once [`CreatedDirs::create_all`] has
+/// created whatever of it is missing.
+///
+/// [`std::fs::canonicalize`] answers for the longest leading part of `dir` that
+/// exists. Each missing component after that part is a plain directory once it
+/// is created, so it is appended by name, and a `..` among them steps back over
+/// the one before it, as it does once that one exists. A failure other than a
+/// missing entry, such as a permission refusal or a file where a directory
+/// belongs, is returned.
+fn canonical_once_created(dir: &Path) -> std::io::Result<PathBuf> {
+    // Each missing component by name, outermost last, or `None` for a `..`.
+    let mut missing: Vec<Option<&OsStr>> = Vec::new();
+    let mut existing = dir;
+    let mut resolved = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(resolved) => break resolved,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(match existing.components().next_back() {
+                    Some(Component::Normal(name)) => Some(name),
+                    Some(Component::ParentDir) => None,
+                    // A `.` or a root that is missing has nothing above it to
+                    // resolve instead.
+                    _ => return Err(err),
+                });
+                existing = crate::path::parent_of(existing);
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    for name in missing.into_iter().rev() {
+        match name {
+            Some(name) => resolved.push(name),
+            None => {
+                resolved.pop();
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Refuses an overlay whose layers are not disjoint: a layer that is another
+/// one, or that lies beneath it.
+///
+/// The kernel refuses some overlaps at mount and accepts others. An upper or a
+/// work directory beneath a lower mounts, and every write the sandbox makes
+/// then lands inside that lower, so it is refused here, before the build
+/// creates anything. The overlaps the kernel refuses are refused here as well,
+/// naming the two layers rather than leaving an `ELOOP` or an `EINVAL` from a
+/// mount the caller never issued.
+///
+/// The paths compared are the ones the mount options name: every lower
+/// canonicalized, and the upper and the work directory as their canonicalized
+/// parent and their own name. A symbolic link anywhere above a layer is
+/// therefore resolved before the comparison, and two spellings of one directory
+/// compare equal. A directory a bind mount presents at a second path is not
+/// recognised there.
+fn check_layers_disjoint(lowers: &[PathBuf], upper: &Path, work: &Path) -> Result<(), ConfigError> {
+    let layers: Vec<(OverlayLayer, &Path)> = lowers
+        .iter()
+        .map(|lower| (OverlayLayer::Lower, lower.as_path()))
+        .chain([(OverlayLayer::Upper, upper), (OverlayLayer::Work, work)])
+        .collect();
+    for (index, &(layer, path)) in layers.iter().enumerate() {
+        for &(earlier, earlier_path) in &layers[..index] {
+            let (inner, outer) = if path.starts_with(earlier_path) {
+                ((layer, path), (earlier, earlier_path))
+            } else if earlier_path.starts_with(path) {
+                ((earlier, earlier_path), (layer, path))
+            } else {
+                continue;
+            };
+            return Err(ConfigError::OverlayLayersOverlap {
+                layer: inner.0,
+                path: inner.1.to_path_buf(),
+                within: outer.0,
+                within_path: outer.1.to_path_buf(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Creates an overlay layer directory if it is absent, refusing to adopt an
@@ -6985,6 +7094,300 @@ mod tests {
         );
     }
 
+    /// Builds an overlay-rooted cage and returns the overlap it is refused for:
+    /// the layer, its path, the layer it lies within, and that one's path.
+    fn overlap_refusal(overlay: Overlay) -> (OverlayLayer, PathBuf, OverlayLayer, PathBuf) {
+        match Cage::builder().overlay(overlay).command("/bin/sh").build() {
+            Err(Error::Config(ConfigError::OverlayLayersOverlap {
+                layer,
+                path,
+                within,
+                within_path,
+            })) => (layer, path, within, within_path),
+            other => panic!("expected the layers to be refused as overlapping: {other:?}"),
+        }
+    }
+
+    /// A scratch tree holding a base lower with one file in it, and the base's
+    /// canonical path.
+    fn overlap_scratch(name: &str) -> (Scratch, PathBuf) {
+        let scratch = Scratch::new(name);
+        let base = scratch.join("base");
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::write(base.join("etc/hostname"), b"base\n").unwrap();
+        let canonical = std::fs::canonicalize(&base).unwrap();
+        (scratch, canonical)
+    }
+
+    /// The names a directory holds, sorted, to show a refusal created nothing.
+    fn entries(dir: &Path) -> Vec<OsString> {
+        let mut names: Vec<OsString> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The kernel mounts an upper beneath a lower, and every write the sandbox
+    /// made would land in the lower, so the build refuses it before it creates
+    /// the upper, its work directory, or the missing directories above them.
+    #[test]
+    fn an_upper_beneath_a_lower_is_refused_before_anything_is_created() {
+        let (_scratch, base) = overlap_scratch("overlap-upper-in-lower");
+        let before = entries(&base);
+        for upper in [base.join("up"), base.join("new/deeper/up")] {
+            assert_eq!(
+                overlap_refusal(Overlay::new().lower(&base).upper(&upper)),
+                (
+                    OverlayLayer::Upper,
+                    upper,
+                    OverlayLayer::Lower,
+                    base.clone()
+                ),
+            );
+            assert_eq!(entries(&base), before, "the lower is untouched");
+        }
+    }
+
+    #[test]
+    fn an_upper_that_is_a_lower_is_refused() {
+        let (scratch, base) = overlap_scratch("overlap-upper-is-lower");
+        let patches = scratch.join("patches");
+        std::fs::create_dir(&patches).unwrap();
+        let patches = std::fs::canonicalize(&patches).unwrap();
+        assert_eq!(
+            overlap_refusal(Overlay::new().lower(&base).lower(&patches).upper(&patches)),
+            (
+                OverlayLayer::Upper,
+                patches.clone(),
+                OverlayLayer::Lower,
+                patches
+            ),
+        );
+    }
+
+    #[test]
+    fn a_work_directory_beneath_a_lower_is_refused() {
+        let (scratch, base) = overlap_scratch("overlap-work-in-lower");
+        let before = entries(&base);
+        let upper = scratch.join("upper");
+        assert_eq!(
+            overlap_refusal(
+                Overlay::new()
+                    .lower(&base)
+                    .upper(&upper)
+                    .work(base.join("work"))
+            ),
+            (
+                OverlayLayer::Work,
+                base.join("work"),
+                OverlayLayer::Lower,
+                base.clone()
+            ),
+        );
+        assert_eq!(entries(&base), before, "the lower is untouched");
+        assert!(!upper.exists(), "nor is the upper created");
+    }
+
+    #[test]
+    fn a_lower_beneath_the_upper_is_refused() {
+        let (scratch, base) = overlap_scratch("overlap-lower-in-upper");
+        let upper = std::fs::canonicalize(&*scratch).unwrap().join("upper");
+        std::fs::create_dir_all(upper.join("patches")).unwrap();
+        assert_eq!(
+            overlap_refusal(
+                Overlay::new()
+                    .lower(&base)
+                    .lower(upper.join("patches"))
+                    .upper(&upper)
+            ),
+            (
+                OverlayLayer::Lower,
+                upper.join("patches"),
+                OverlayLayer::Upper,
+                upper
+            ),
+        );
+    }
+
+    #[test]
+    fn a_lower_beneath_the_work_directory_is_refused() {
+        let (scratch, base) = overlap_scratch("overlap-lower-in-work");
+        let work = std::fs::canonicalize(&*scratch).unwrap().join("work");
+        std::fs::create_dir_all(work.join("patches")).unwrap();
+        assert_eq!(
+            overlap_refusal(
+                Overlay::new()
+                    .lower(&base)
+                    .lower(work.join("patches"))
+                    .upper(scratch.join("upper"))
+                    .work(&work)
+            ),
+            (
+                OverlayLayer::Lower,
+                work.join("patches"),
+                OverlayLayer::Work,
+                work
+            ),
+        );
+    }
+
+    #[test]
+    fn an_upper_and_a_work_directory_that_overlap_are_refused() {
+        let (scratch, base) = overlap_scratch("overlap-upper-work");
+        let root = std::fs::canonicalize(&*scratch).unwrap();
+        let (upper, work) = (root.join("upper"), root.join("work"));
+        for (upper, work, expected) in [
+            // The work directory beneath the upper.
+            (
+                &upper,
+                upper.join("work"),
+                (
+                    OverlayLayer::Work,
+                    upper.join("work"),
+                    OverlayLayer::Upper,
+                    upper.clone(),
+                ),
+            ),
+            // The upper beneath the work directory.
+            (
+                &work.join("upper"),
+                work.clone(),
+                (
+                    OverlayLayer::Upper,
+                    work.join("upper"),
+                    OverlayLayer::Work,
+                    work.clone(),
+                ),
+            ),
+            // The two the same.
+            (
+                &upper,
+                upper.clone(),
+                (
+                    OverlayLayer::Work,
+                    upper.clone(),
+                    OverlayLayer::Upper,
+                    upper.clone(),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                overlap_refusal(Overlay::new().lower(&base).upper(upper).work(&work)),
+                expected,
+            );
+        }
+        assert!(!upper.exists() && !work.exists(), "nothing is created");
+    }
+
+    #[test]
+    fn two_lowers_that_overlap_are_refused() {
+        let (_scratch, base) = overlap_scratch("overlap-lowers");
+        let upper = base.parent().unwrap().join("upper");
+        assert_eq!(
+            overlap_refusal(
+                Overlay::new()
+                    .lower(&base)
+                    .lower(base.join("etc"))
+                    .upper(&upper)
+            ),
+            (
+                OverlayLayer::Lower,
+                base.join("etc"),
+                OverlayLayer::Lower,
+                base.clone()
+            ),
+        );
+        assert_eq!(
+            overlap_refusal(Overlay::new().lower(&base).lower(&base).upper(&upper)),
+            (OverlayLayer::Lower, base.clone(), OverlayLayer::Lower, base),
+        );
+    }
+
+    /// The comparison is between the paths the mount names, so a symbolic link
+    /// above a layer is resolved, and so is a `..` among directories the build
+    /// would create.
+    #[test]
+    fn an_overlap_through_a_link_or_a_dot_dot_is_refused() {
+        let (scratch, base) = overlap_scratch("overlap-spelled");
+        let before = entries(&base);
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert_eq!(
+            overlap_refusal(Overlay::new().lower(&base).upper(link.join("up"))),
+            (
+                OverlayLayer::Upper,
+                base.join("up"),
+                OverlayLayer::Lower,
+                base.clone()
+            ),
+        );
+        assert_eq!(
+            overlap_refusal(
+                Overlay::new()
+                    .lower(&base)
+                    .upper(scratch.join("missing/../base/up"))
+            ),
+            (
+                OverlayLayer::Upper,
+                base.join("up"),
+                OverlayLayer::Lower,
+                base.clone()
+            ),
+        );
+        assert_eq!(entries(&base), before, "the lower is untouched");
+        assert!(!scratch.join("missing").exists(), "nothing is created");
+    }
+
+    /// Paths compare by whole components, so a sibling whose name begins with a
+    /// lower's is disjoint from it.
+    #[test]
+    fn a_sibling_sharing_a_lowers_name_as_a_prefix_is_disjoint() {
+        let (_scratch, base) = overlap_scratch("overlap-prefix");
+        let mut sibling = base.clone().into_os_string();
+        sibling.push("-upper");
+        let sibling = PathBuf::from(sibling);
+        check_layers_disjoint(
+            std::slice::from_ref(&base),
+            &sibling,
+            &base.with_file_name(".base-upper.work"),
+        )
+        .expect("a sibling is disjoint");
+    }
+
+    /// A directory that does not exist yet resolves to the path it will have
+    /// once its missing directories are created.
+    #[test]
+    fn a_missing_directory_resolves_to_where_it_will_be_created() {
+        let scratch = Scratch::new("canonical-once-created");
+        let root = std::fs::canonicalize(&*scratch).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        for (dir, expected) in [
+            (root.join("real"), root.join("real")),
+            (root.join("link"), root.join("real")),
+            (root.join("link/a/b"), root.join("real/a/b")),
+            (root.join("a/b/../c"), root.join("a/c")),
+            (root.join("a/../../x"), root.parent().unwrap().join("x")),
+            (root.join("real/./a"), root.join("real/a")),
+        ] {
+            assert_eq!(canonical_once_created(&dir).unwrap(), expected, "{dir:?}");
+        }
+        // A relative path starts from the working directory, missing in whole.
+        let missing = format!("fcage-missing-{}/a", crate::host::unique_hex());
+        assert_eq!(
+            canonical_once_created(Path::new(&missing)).unwrap(),
+            std::fs::canonicalize(std::env::current_dir().unwrap())
+                .unwrap()
+                .join(&missing),
+        );
+        // A file where a directory belongs is reported, not walked past.
+        std::fs::write(root.join("file"), b"").unwrap();
+        assert!(canonical_once_created(&root.join("file/a")).is_err());
+        assert!(!root.join("a").exists(), "nothing is created");
+    }
+
     #[test]
     fn a_target_created_over_a_whiteout_puts_the_whiteout_back() {
         // The build records a target whose name the upper had whited out, and
@@ -8259,7 +8662,10 @@ read-only = true
     /// keeping whatever it creates.
     fn prepare_layer(layer: OverlayLayer, path: &Path) -> Result<PathBuf, Error> {
         let mut created = CreatedDirs::default();
-        let at = layer_path(layer, path, &mut created)?;
+        let at = layer_path(layer, path)?;
+        created
+            .create_all(&at.parent)
+            .map_err(|err| overlay_io(layer, &at.parent, err))?;
         create_layer_dir(layer, &at, &mut created)?;
         created.keep();
         Ok(at.path())
@@ -8381,9 +8787,11 @@ read-only = true
         // The layer directories are the one thing a build creates on the host,
         // so they are created once everything else has been accepted.
         let scratch = Scratch::new("overlay-refused");
+        let base = scratch.join("base");
+        std::fs::create_dir(&base).unwrap();
         let upper = scratch.join("fresh/parent/upper");
         let err = Cage::builder()
-            .overlay_rootfs(&*scratch, &upper)
+            .overlay_rootfs(&base, &upper)
             .command("/bin/sh")
             .hostname("")
             .build()
@@ -8411,7 +8819,7 @@ read-only = true
         let err = Cage::builder()
             .overlay(
                 Overlay::new()
-                    .lower(&*scratch)
+                    .lower(&base)
                     .lower(&first)
                     .lower(&second)
                     .upper(&upper),
@@ -8453,11 +8861,13 @@ read-only = true
             return;
         }
         let elsewhere = other.join(format!("fcage-exdev-{}", crate::host::unique_hex()));
+        let base = scratch.join("base");
+        std::fs::create_dir(&base).unwrap();
         let upper = scratch.join("fresh/upper");
         let built = Cage::builder()
             .overlay(
                 Overlay::new()
-                    .lower(&*scratch)
+                    .lower(&base)
                     .upper(&upper)
                     .work(elsewhere.join("work")),
             )
