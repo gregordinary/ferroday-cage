@@ -1113,9 +1113,9 @@ const FLAGS: &[Flag] = &[
         long: "--gentoo-keyring-horizon",
         section: Section::Provisioning,
         help: &[
-            "Print the vendored Gentoo keyring: every certificate,",
-            "whether it can still sign, and when its authority",
-            "lapses. Reaches no network",
+            "Print the Gentoo release certificates the vendored",
+            "keyring trusts: each one, whether it can still sign,",
+            "and when its authority lapses. Reaches no network",
         ],
         mode: Mode::GentooKeyring,
         selects: true,
@@ -2272,8 +2272,8 @@ enum Invocation {
     GentooInstalled {
         root: PathBuf,
     },
-    /// Print what each certificate of the vendored Gentoo keyring can still be
-    /// trusted to do, and until when.
+    /// Print what each Gentoo release certificate the vendored keyring trusts
+    /// can still be trusted to do, and until when.
     GentooKeyring,
     /// Write a provisioned rootfs to a tar archive, under the identity map it
     /// was written under.
@@ -6500,8 +6500,8 @@ fn gentoo_installed(root: &Path) -> ExitCode {
     })
 }
 
-/// Prints what each certificate of the vendored Gentoo keyring can still be
-/// trusted to do, and until when.
+/// Prints what each Gentoo release certificate the vendored keyring trusts can
+/// still be trusted to do, and until when.
 fn gentoo_keyring_horizon() -> ExitCode {
     use ferroday_cage::provision::gentoo::{Expiry, Gentoo};
 

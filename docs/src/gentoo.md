@@ -571,7 +571,7 @@ records each path as the package ships it, as portage does.
 The stage3 chain has three links, and the first is not fetched at all:
 
 ```text
-vendored service keyring
+vendored release certificates
   -> latest-stage3.txt      (cleartext-signed)  the variants, their sizes
   -> <tarball>.DIGESTS      (cleartext-signed)  the tarball's SHA-512
   -> <tarball>              (bytes)             verified, then extracted
@@ -581,7 +581,8 @@ Both documents are cleartext-signed OpenPGP messages, verified by the same
 machinery the [Debian layer](debian.md#trust) uses for an `InRelease`. Three
 things must hold:
 
-- The signature verifies against a certificate in the keyring.
+- The signature verifies against one of Gentoo's release certificates in the
+  keyring, which [the keyring](#the-keyring) names.
 - The key that made it is in force now. A key that has since expired or been
   revoked vouches for nothing, whenever it signed.
 - The algorithms involved are ones this crate rests a trust decision on.
@@ -609,7 +610,7 @@ Reading it would leave the chain resting on an unauthenticated file.
 A binary package's chain is shorter and it is anchored to the same key:
 
 ```text
-vendored service keyring
+vendored release certificates
   -> <package>.gpkg.tar/Manifest   (cleartext-signed)  each member's SHA-512
   -> the members                   (bytes)             verified, then read
 ```
@@ -717,13 +718,16 @@ mirrored whole. Vendoring is the security property rather than a saved round
 trip. An anchor fetched over the same channel as the artifact authenticates
 nothing: whoever can serve a forged stage3 can serve the key that signs it.
 
-It is mirrored mechanically, certificates this layer never meets included. An
-unusable key in an anchor weakens nothing, since nothing rests on a key until it
-produces a signature that passes the gates. A curated subset would be a judgment
-a later reader has to reconstruct rather than a rule they can check.
+It is mirrored mechanically, certificates this layer never meets included, so a
+drift check can compare it byte for byte with what Gentoo publishes. Of those,
+the layer trusts the four Gentoo's own tooling trusts for what it reads. They
+are the certificates `sec-keys/openpgp-keys-gentoo-release` installs as
+`gentoo-release.asc`. `getuto` sets portage up to verify binary packages against
+them, and the handbook verifies a stage3 against them. The rest of the bundle
+signs security advisories and infrastructure. A signature by one of those on a
+stage3 or a package is refused, as Gentoo's own tools refuse it.
 
-A vendored anchor has a shelf life, and Gentoo's certificates do not share one
-expiry:
+A vendored anchor has a shelf life:
 
 ```rust
 use ferroday_cage::provision::gentoo::Gentoo;
@@ -742,35 +746,28 @@ for held in gentoo.keyring_horizon() {
 # }
 ```
 
-The report is per certificate, and there is no single date it reduces to. Two of
-the eleven lapse about twenty months before the rest. One number would therefore
-say the keyring is nearly stale while the certificate the archive currently
-signs with is good for years.
+The report is per certificate, and there is no single date it reduces to. Every
+certificate it reports is an equally trusted anchor, and the layer accepts a
+signature from any of them that can sign. Which one signs a given document is
+therefore the archive's choice, and not something the keyring records. A
+short-dated certificate the archive happens not to use would pull any
+earliest-expiry number down to itself. That is the reading the per-certificate
+report exists to avoid.
 
-`signs` separates a second case. Seven of the eleven certificates can sign
-nothing. One is a DSA-1024 release key from 2004, which the public-key floor
-refuses, and whose expiry and user id this crate cannot read. Its `expires` is
-`Expiry::Unknown`, which `fcage --gentoo-keyring-horizon` prints as `unknown`.
-
-The other six are certify-only primaries with no signing subkey: the authority
-keys and two infrastructure keys. Each of the six reports an expiry like every
-other certificate's. A primary signs a document only where its own
-self-signatures grant it the signing flag, as GnuPG and Sequoia require.
-
-What rules out a reduction is that every certificate in the keyring is an
-equally trusted anchor. This layer accepts a signature from any of them that can
-sign. Which certificate signs a given document is therefore the archive's
-choice, and not something the keyring records. `signs` says a certificate
-*could* produce an accepted signature, never that anything rests on it today. A
-short-dated certificate the archive happens not to use pulls any earliest-expiry
-number down to itself. That is the reading the per-certificate report exists to avoid.
+`signs` separates a second case. One of the four can sign nothing: a DSA-1024
+release key from 2004, which the public-key floor refuses. This crate cannot
+read its expiry or its user id either. Its `expires` is `Expiry::Unknown`, which
+`fcage --gentoo-keyring-horizon` prints as `unknown`. A primary signs a document
+only where its own self-signatures grant it the signing flag, as GnuPG and
+Sequoia require.
 
 The date your own provisioning depends on is the one on the certificate that
-verified a document you actually read. This layer reads two: the stage3 pointer
-and a binary package's Manifest. Both are signed today by a subkey of the
-Release Engineering automated weekly key, which runs to 2028-07-01. That is an
-observation about the archive rather than a rule. Gentoo can sign with another
-anchor without telling anyone, and the keyring will still verify it.
+verified a document you actually read. This layer reads three kinds: the stage3
+pointer, its digest document, and a binary package's Manifest. All are signed
+today by a subkey of the Release Engineering automated weekly key, which runs to
+2028-07-01. That is an observation about the archive rather than a rule. Gentoo
+can sign with another of its release certificates without telling anyone, and
+the layer will still verify it.
 
 Nothing refreshes the keyring at run time, and nothing is meant to. Fetching a
 trust anchor at provisioning time would hand the network the power to replace
@@ -992,9 +989,9 @@ amd64-openrc	20260810T204554Z	495865168
 ...
 
 $ fcage --gentoo-keyring-horizon
-13EBBDBEDE7A12775DFDB1BABB572E0E2D182910	signs	1846022400	Gentoo Linux Release Engineering (Automated Weekly Release Key) <releng@gentoo.org>
 ...
-11 certificates, 4 can sign	expiring between 1795718963 and 1846022400
+13EBBDBEDE7A12775DFDB1BABB572E0E2D182910	signs	1846022400	Gentoo Linux Release Engineering (Automated Weekly Release Key) <releng@gentoo.org>
+4 certificates, 3 can sign	all expiring 1846022400
 ```
 
 `--gentoo-variants` reads the signed enumeration. It takes `--gentoo-mirror`,

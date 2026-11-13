@@ -25,15 +25,19 @@
 //! One key, vouching for cleartext-signed documents that vouch for the bytes:
 //!
 //! ```text
-//! vendored service keyring
+//! vendored release certificates
 //!   -> latest-stage3.txt      (cleartext-signed)  the variants, their sizes
 //!   -> <tarball>.DIGESTS      (cleartext-signed)  the tarball's SHA-512
 //!   -> <tarball>              (bytes)             verified, then extracted
 //!
-//! vendored service keyring
+//! vendored release certificates
 //!   -> <package>/Manifest     (cleartext-signed)  each member's SHA-512
 //!   -> the members            (bytes)             verified, then read
 //! ```
+//!
+//! The release certificates are the part of Gentoo's vendored service-key
+//! bundle that Gentoo's own tooling trusts for these documents
+//! ([`RELEASE_CERTIFICATES`]).
 //!
 //! The subkey that signs a package's `Manifest` is the one that signs the
 //! pointer and the digest documents, so the binary-package half adds no trust
@@ -251,12 +255,39 @@ const STAGE3_CACHE: &str = ".fcage-stage3";
 /// artifact it authenticates authenticates nothing, because whoever can serve a
 /// forged stage3 can serve the key that signs it.
 ///
-/// Mirrored mechanically, certificates this layer never meets included. An
-/// unusable key in the anchor weakens nothing — nothing rests on a key until it
-/// produces a signature that passes the gates — while a hand-picked subset would
-/// be a judgement a later reader has to reconstruct instead of a rule they can
-/// check.
+/// Mirrored mechanically, certificates this layer never meets included, so a
+/// drift check can compare it byte for byte with what Gentoo publishes. What
+/// the layer trusts of it is [`RELEASE_CERTIFICATES`], and that is Gentoo's
+/// own rule rather than a selection made here.
 const EMBEDDED_KEYRING: &[u8] = include_bytes!("keyring/service-keys.gpg");
+
+/// The certificates of [`EMBEDDED_KEYRING`] whose signatures vouch for what
+/// this layer reads, by primary fingerprint: Gentoo's release certificates.
+///
+/// Gentoo's own tooling trusts these for the documents this layer reads, and
+/// no others: they are what `sec-keys/openpgp-keys-gentoo-release` installs as
+/// `gentoo-release.asc`. `getuto` sets portage up to verify a binary package
+/// against them, and the handbook verifies a stage3 against them. Gentoo's
+/// release media signatures page lists the same four as what its releases are
+/// signed with. The service-key bundle holds others besides, which sign
+/// security advisories and infrastructure, and a signature by one of those on
+/// a stage3 or a package is one Gentoo's own tools refuse, so this layer
+/// refuses it too.
+///
+/// The pointer, a digest document and a binary package's `Manifest` are all
+/// signed today by a subkey of the first. The second and third sign the ebuild
+/// repository's snapshots and its mirrors, and the fourth is the 2004 DSA
+/// release key, which can sign nothing this crate accepts.
+const RELEASE_CERTIFICATES: [&str; 4] = [
+    // Gentoo Linux Release Engineering (Automated Weekly Release Key)
+    "13EBBDBEDE7A12775DFDB1BABB572E0E2D182910",
+    // Gentoo ebuild repository signing key (Automated Signing Key)
+    "DCD05B71EAB94199527F44ACDB6B8C1F96D8BF6D",
+    // Gentoo repository mirrors (automated git signing key)
+    "EF9538C9E8E64311A52CDEDFA13D0EF1914E7A72",
+    // Gentoo Linux Release Engineering (Gentoo Linux Release Signing Key)
+    "D99EAC7379A850BCE47DA5F29E6438C817072058",
+];
 
 /// A failure provisioning a Gentoo rootfs.
 #[derive(Debug)]
@@ -587,21 +618,22 @@ impl From<GentooError> for super::ProvisionError {
     }
 }
 
-/// What one certificate of the keyring can still be trusted to do, and until
-/// when.
+/// What one certificate this layer trusts can still be trusted to do, and
+/// until when.
 ///
-/// The vendored keyring is a trust anchor with a shelf life, and Gentoo's
-/// certificates do not share one date: two of the eleven lapse well before the
-/// rest. Reporting per certificate rather than as a single earliest expiry is
-/// what keeps a keyring whose signing key is good for years from reading as
-/// nearly expired because a certificate it never meets is.
+/// The vendored keyring is a trust anchor with a shelf life, and nothing makes
+/// its certificates lapse together. Reporting per certificate rather than as a
+/// single earliest expiry is what keeps a keyring whose signing key is good for
+/// years from reading as nearly expired because a certificate it never meets
+/// is.
 ///
-/// There is no sound reduction of the list to one date. Every certificate is an
-/// equally trusted anchor and this layer accepts a signature from any of them,
-/// so which one the archive signs with is not recorded here, and an
-/// earliest-expiry number is pulled down by whichever short-dated certificate
-/// the keyring happens to hold. A caller wanting the date its own provisioning
-/// rests on reads it from the certificate that verified a document it fetched.
+/// There is no sound reduction of the list to one date. Every certificate
+/// reported is an equally trusted anchor and this layer accepts a signature
+/// from any of them, so which one the archive signs with is not recorded here,
+/// and an earliest-expiry number is pulled down by whichever short-dated
+/// certificate the set happens to hold. A caller wanting the date its own
+/// provisioning rests on reads it from the certificate that verified a document
+/// it fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CertificateHorizon {
@@ -631,10 +663,10 @@ pub struct CertificateHorizon {
     /// Whether any key under the certificate could make a signature this crate
     /// would accept.
     ///
-    /// `false` for a certificate that is in the keyring but can vouch for
-    /// nothing: its primary rests on an algorithm this crate refuses and it
-    /// delegates to no signing subkey that does. Gentoo's keyring holds one such
-    /// certificate, a DSA-1024 release key from 2004. It is harmless — nothing
+    /// `false` for a certificate that is trusted but can vouch for nothing: its
+    /// primary rests on an algorithm this crate refuses and it delegates to no
+    /// signing subkey that does. Gentoo's release certificates include one
+    /// such, a DSA-1024 release key from 2004. It is harmless — nothing
     /// rests on a key until it produces a signature that passes the gates — but
     /// its expiry says nothing about how long the keyring remains usable.
     ///
@@ -917,11 +949,18 @@ impl Gentoo {
         &self.architecture
     }
 
-    /// What each certificate of the keyring can still be trusted to do, and
+    /// What each certificate this layer trusts can still be trusted to do, and
     /// until when, in the order the keyring holds them.
     ///
-    /// Gentoo publishes no deadline on the keyring itself, and its certificates
-    /// expire on several different dates, so this is how a caller learns the
+    /// The certificates are Gentoo's release certificates, those
+    /// `sec-keys/openpgp-keys-gentoo-release` installs, which are the ones
+    /// Gentoo's own tooling verifies its releases and binary packages against.
+    /// The vendored keyring holds Gentoo's whole service-key bundle, and a
+    /// signature by any other certificate in it is refused, so none is
+    /// reported.
+    ///
+    /// Gentoo publishes no deadline on the keyring itself, and nothing makes
+    /// its certificates lapse together, so this is how a caller learns the
     /// anchor is ageing before an archive fetch tells them. The judgement is the
     /// verification's own rather than a second reading of the same certificates,
     /// so what is reported here is what a signature would actually be held to.
@@ -2977,7 +3016,8 @@ impl GentooBuilder {
             }
         }
         let keyring = Keyring::parse(EMBEDDED_KEYRING)
-            .map_err(|err| GentooError::signature("the vendored Gentoo keyring", err))?;
+            .map_err(|err| GentooError::signature("the vendored Gentoo keyring", err))?
+            .retaining(|fingerprint| RELEASE_CERTIFICATES.contains(&fingerprint));
         // The walk list is the primary followed by its backstops, composed
         // here so that neither method can undo the other.
         let mut mirrors = Vec::with_capacity(1 + self.fallbacks.len());
@@ -3216,7 +3256,62 @@ mod tests {
         // the count is what asserts every certificate Gentoo publishes is one
         // irongall reads. It is also the shape of the published set: a refresh
         // that changes it is a change worth seeing in a diff.
-        assert_eq!(gentoo().keyring_horizon().len(), 11);
+        assert_eq!(bundle().horizon().len(), 11);
+    }
+
+    /// The vendored keyring whole, before the layer keeps its release
+    /// certificates.
+    fn bundle() -> Keyring {
+        Keyring::parse(EMBEDDED_KEYRING).expect("the vendored keyring parses")
+    }
+
+    #[test]
+    fn only_the_release_certificates_vouch_for_what_the_layer_reads() {
+        // Every release certificate is in the bundle, and they are what a
+        // provisioner trusts: no other is reported, and none other verifies.
+        let mut trusted: Vec<String> = gentoo()
+            .keyring_horizon()
+            .into_iter()
+            .map(|held| held.fingerprint)
+            .collect();
+        trusted.sort();
+        let mut release = RELEASE_CERTIFICATES.map(str::to_string).to_vec();
+        release.sort();
+        assert_eq!(trusted, release);
+
+        // The one certificate besides them that could sign is GLSAMaker's,
+        // whose subkey signs security advisories. A refresh of the bundle that
+        // adds another fails here, which is the moment to ask whether Gentoo's
+        // release package installs it.
+        let others: Vec<String> = bundle()
+            .horizon()
+            .into_iter()
+            .filter(|held| held.signs && !RELEASE_CERTIFICATES.contains(&held.fingerprint.as_str()))
+            .map(|held| held.fingerprint)
+            .collect();
+        assert_eq!(others, ["BA9A03F6BE9C0CA405C17BFE079BA8929AF1275A"]);
+
+        // A certificate left out vouches for nothing, as one never held does.
+        let release = fixture::signing_key("releng <releng@test.invalid>");
+        let advisories = fixture::signing_key("advisories <glsa@test.invalid>");
+        let keyring = fixture::keyring_of([release.to_public_key(), advisories.to_public_key()]);
+        let kept = keyring
+            .verify(fixture::clearsign(&release, "kept\n").as_bytes(), true)
+            .expect("the kept certificate verifies")
+            .certificate;
+        let keyring = keyring.retaining(|fingerprint| fingerprint == kept);
+        keyring
+            .verify(fixture::clearsign(&release, "kept\n").as_bytes(), true)
+            .expect("the kept certificate still verifies");
+        assert!(
+            keyring
+                .verify(
+                    fixture::clearsign(&advisories, "left out\n").as_bytes(),
+                    true
+                )
+                .is_err(),
+            "a certificate left out verified",
+        );
     }
 
     #[test]
@@ -3268,14 +3363,22 @@ mod tests {
 
     #[test]
     fn a_certificate_that_can_vouch_for_nothing_says_so() {
-        // Seven of the eleven certificates can sign nothing. The 2004 release
-        // signing key is DSA-1024, which the public-key floor refuses. The
-        // other six are certify-only primaries with no signing subkey: the
+        // Seven of the bundle's eleven certificates can sign nothing. The 2004
+        // release signing key is DSA-1024, which the public-key floor refuses.
+        // The other six are certify-only primaries with no signing subkey: the
         // authority keys, and the two infrastructure keys whose only subkeys
         // encrypt. Each of the six reports an expiry like every other
         // certificate's, so without this flag it is indistinguishable from a
-        // working anchor.
-        let horizon = gentoo().keyring_horizon();
+        // working anchor. Of the release certificates the layer trusts, the
+        // DSA key is the one.
+        let trusted: Vec<String> = gentoo()
+            .keyring_horizon()
+            .into_iter()
+            .filter(|held| !held.signs)
+            .map(|held| held.fingerprint)
+            .collect();
+        assert_eq!(trusted, ["D99EAC7379A850BCE47DA5F29E6438C817072058"]);
+        let horizon = bundle().horizon();
         let unusable: Vec<&str> = horizon
             .iter()
             .filter(|held| !held.signs)
@@ -3297,13 +3400,13 @@ mod tests {
 
     #[test]
     fn the_certificates_do_not_share_one_expiry() {
-        // The finding the per-certificate report exists for. Two certificates
-        // lapse about twenty months before the rest, and the archive signs with
-        // neither today, so a single earliest-expiry number would report a
-        // keyring as nearly stale while the key that matters is good for years.
-        // Which certificate the archive signs with is not something the keyring
-        // records, so no reduction over this list can be the one to act on.
-        let horizon = gentoo().keyring_horizon();
+        // The finding the per-certificate report exists for, read over the
+        // whole bundle. Two certificates lapse about twenty months before the
+        // rest, and the archive signs with neither, so a single earliest-expiry
+        // number over a set holding them would report it as nearly stale while
+        // the key that matters is good for years. The release certificates
+        // share one date today, and nothing makes them keep doing so.
+        let horizon = bundle().horizon();
         let mut dates: Vec<i64> = horizon
             .iter()
             .filter_map(|held| held.expires.epoch())

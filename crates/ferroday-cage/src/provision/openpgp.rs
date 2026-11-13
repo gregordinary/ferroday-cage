@@ -165,6 +165,26 @@ impl Keyring {
         Ok(Keyring { certificates })
     }
 
+    /// The certificates of this keyring whose primary key's fingerprint,
+    /// uppercase hex as [`Verified::certificate`] spells one, `keep` accepts.
+    ///
+    /// For an anchor vendored whole, so that it can be compared byte for byte
+    /// with what its distribution publishes, of which a layer trusts a part for
+    /// the documents it reads. A signature from a certificate left out is
+    /// ignored, as one from a key the keyring never held is.
+    #[cfg(feature = "gentoo")]
+    pub(crate) fn retaining(self, keep: impl Fn(&str) -> bool) -> Keyring {
+        Keyring {
+            certificates: self
+                .certificates
+                .certificates()
+                .iter()
+                .filter(|certificate| keep(&certificate.primary().fingerprint().to_string()))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Verifies a cleartext-signed document and returns its body.
     ///
     /// The signature must verify against at least one certificate in the
