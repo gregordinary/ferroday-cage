@@ -67,22 +67,26 @@ impl Pins {
     /// answer to which governs. A plan this library resolved cannot contain
     /// one; a hand-written document can.
     pub(super) fn of(plan: &Plan) -> Result<Pins, DebianError> {
-        let mut by_name: HashMap<String, Pinned> = HashMap::with_capacity(plan.packages.len());
-        for package in &plan.packages {
-            let pinned = Pinned {
-                version: package.version.clone(),
-                digest: package.digest.clone(),
-            };
-            if let Some(first) = by_name.insert(package.name.clone(), pinned) {
-                return Err(DebianError::Config {
-                    reason: format!(
-                        "the pin names the package {} twice, at {} and at {}, so there is no \
-                         version to hold it at",
-                        package.name, first.version, package.version,
-                    ),
-                });
-            }
+        if let Some((first, again)) = plan.named_twice() {
+            return Err(DebianError::Config {
+                reason: format!(
+                    "the pin names the package {} twice, at {} and at {}, so there is no \
+                     version to hold it at",
+                    again.name, first.version, again.version,
+                ),
+            });
         }
+        let by_name = plan
+            .packages
+            .iter()
+            .map(|package| {
+                let pinned = Pinned {
+                    version: package.version.clone(),
+                    digest: package.digest.clone(),
+                };
+                (package.name.clone(), pinned)
+            })
+            .collect();
         Ok(Pins { by_name })
     }
 

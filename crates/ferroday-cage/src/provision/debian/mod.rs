@@ -398,6 +398,16 @@ fn validate_plan(
             ));
         }
     }
+    // Installed twice, a package's files would be extracted twice, the later
+    // version's over the earlier's, into a root whose database records one
+    // package of each name.
+    if let Some((first, again)) = plan.named_twice() {
+        return contradiction(format!(
+            "the plan names the package {} twice, at {} and at {}, and a root holds one package \
+             of each name",
+            again.name, first.version, again.version,
+        ));
+    }
     Ok(())
 }
 
@@ -1074,9 +1084,10 @@ impl DebianBuilder {
     /// silent precedence: [`include`](Self::include), [`exclude`](Self::exclude),
     /// and [`base_priority`](Self::base_priority). A plan whose suite or
     /// architecture disagrees with the builder's is refused the same way, as is
-    /// one naming more archives than there are repositories to fetch them from.
-    /// Where the builder names no architecture the plan's is adopted, since a
-    /// plan states which architecture it is for.
+    /// one naming more archives than there are repositories to fetch them from,
+    /// and one naming a package twice, since a root holds one package of a
+    /// name. Where the builder names no architecture the plan's is adopted,
+    /// since a plan states which architecture it is for.
     ///
     /// Everything that shapes *how* rather than *what* still applies:
     /// [`cache_dir`](Self::cache_dir), [`identity_map`](Self::identity_map),
@@ -5374,6 +5385,28 @@ mod tests {
                 .is_none()
         );
         assert!(own.join(&name).is_file(), "the caller's cache stays");
+    }
+
+    #[test]
+    fn a_plan_naming_one_package_twice_is_refused() {
+        // Two versions of one name would both be extracted, the later one's
+        // files over the earlier's, into a root that registers one of them.
+        let mut plan = one_package_plan(&"0".repeat(64), None);
+        let mut again = plan.packages[0].clone();
+        again.version = "2".to_string();
+        again.filename = "pool/one-2.deb".to_string();
+        plan.packages.push(again);
+        let refused = Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror("https://mirror.example/debian")
+            .trust_unsigned(true)
+            .plan(plan)
+            .build();
+        assert!(
+            matches!(&refused, Err(DebianError::Config { reason })
+                if reason.contains("names the package one twice, at 1 and at 2")),
+            "{refused:?}",
+        );
     }
 
     /// A plan installing one package, `pool/one.deb` at `sha256`, from one

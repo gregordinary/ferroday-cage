@@ -11,6 +11,7 @@
 //! and installing once, and nothing else.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use super::DebianError;
 use super::digests::RECORDED;
@@ -309,6 +310,23 @@ fn unpermitted_name(name: &str) -> Option<String> {
 }
 
 impl Plan {
+    /// The first package this plan names twice, as its two entries, or `None`
+    /// where every name appears once.
+    ///
+    /// A root holds one package of a name, and everything that reads a plan
+    /// keys it by name: a pin holds each name to one version, and dpkg
+    /// registers one package per name. So two entries for one name are a plan
+    /// with no single reading, whether or not they agree. A plan this library
+    /// resolved cannot contain one; a hand-written document or an edited
+    /// `Plan` can.
+    pub(super) fn named_twice(&self) -> Option<(&PlannedPackage, &PlannedPackage)> {
+        let mut seen: HashMap<&str, &PlannedPackage> = HashMap::with_capacity(self.packages.len());
+        self.packages.iter().find_map(|package| {
+            seen.insert(&package.name, package)
+                .map(|first| (first, package))
+        })
+    }
+
     /// Renders the plan as a deb822 document.
     ///
     /// The document is the plan and nothing else: one header stanza, one stanza

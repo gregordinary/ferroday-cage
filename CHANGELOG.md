@@ -733,6 +733,10 @@ consumer upgrading can skip it.
   endings and no final newline, which matched no file the mirror serves and
   differed from what the same release recorded unsigned. A repository trusted
   unsigned records the digest of its `Release` file, as before.
+- A Debian plan naming one package twice is refused at `build` with
+  `DebianError::Config`, as an Alpine plan naming one twice is. Both entries
+  were installed, the later version's files extracted over the earlier's, into
+  a root whose database registers one package of a name.
 
 ### Internal
 
