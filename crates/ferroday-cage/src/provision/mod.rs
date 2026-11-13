@@ -454,6 +454,10 @@ pub enum ProvisionError {
     /// [`source`](std::error::Error::source).
     #[non_exhaustive]
     Archive {
+        /// The archive, as the caller named it: its file, or a stand-in for a
+        /// stream that has none. Empty for an archive held in memory, which a
+        /// caller names in an error of its own.
+        path: PathBuf,
         /// The archive offset of the offending block, in bytes of the
         /// uncompressed stream.
         offset: u64,
@@ -707,9 +711,20 @@ impl fmt::Display for ProvisionError {
             ProvisionError::Io { op, path, .. } => {
                 write!(f, "provisioning failed while {op} {path:?}")
             }
-            ProvisionError::Archive { offset, reason, .. } => {
+            ProvisionError::Archive {
+                path,
+                offset,
+                reason,
+                ..
+            } if path.as_os_str().is_empty() => {
                 write!(f, "malformed archive at offset {offset}: {reason}")
             }
+            ProvisionError::Archive {
+                path,
+                offset,
+                reason,
+                ..
+            } => write!(f, "malformed archive {path:?} at offset {offset}: {reason}"),
             ProvisionError::EntryUnsafe { path, reason } => write!(
                 f,
                 "the archive entry {path:?} reaches outside the extraction root: {reason}",

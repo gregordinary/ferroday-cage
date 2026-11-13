@@ -789,8 +789,14 @@ fn truncation_is_reported_as_malformed() {
     tar.file("f", 0o644, b"some content");
     let mut bytes = tar.finish();
     bytes.truncate(600); // inside f's data block
-    let err = provision_err("extract-truncated", &bytes);
-    assert!(matches!(err, ProvisionError::Archive { .. }), "{err}");
+    let (err, dest) = provision_err_at("extract-truncated", &bytes);
+    // The refusal names the archive it refuses.
+    let archive = dest.with_file_name("archive.tar");
+    assert!(
+        matches!(&err, ProvisionError::Archive { path, .. } if *path == archive),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains(&format!("{archive:?}")), "{err}");
 }
 
 #[test]

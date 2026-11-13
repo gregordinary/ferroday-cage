@@ -326,16 +326,15 @@ impl<R: Read> TarReader<R> {
                 // of nothing publishes an empty rootfs as a finished tree.
                 if header_offset == 0 {
                     self.not_a_tar = true;
-                    return Err(malformed(0, "the stream holds no archive"));
+                    return Err(self.malformed(0, "the stream holds no archive"));
                 }
                 // EOF at a later header boundary. GNU tar tolerates a missing
                 // two-block terminator, and so do we — unless metadata was
                 // left dangling.
                 if gnu_longname.is_some() || gnu_longlink.is_some() || pax_entry.is_some() {
-                    return Err(malformed(
-                        header_offset,
-                        "the archive ends after a metadata entry",
-                    ));
+                    return Err(
+                        self.malformed(header_offset, "the archive ends after a metadata entry")
+                    );
                 }
                 self.finished = true;
                 return Ok(None);
@@ -347,10 +346,9 @@ impl<R: Read> TarReader<R> {
                 // it is at the end of the stream: the two are one archive
                 // ending in one place, spelled with and without its marker.
                 if gnu_longname.is_some() || gnu_longlink.is_some() || pax_entry.is_some() {
-                    return Err(malformed(
-                        header_offset,
-                        "the archive ends after a metadata entry",
-                    ));
+                    return Err(
+                        self.malformed(header_offset, "the archive ends after a metadata entry")
+                    );
                 }
                 self.finished = true;
                 return Ok(None);
@@ -360,7 +358,7 @@ impl<R: Read> TarReader<R> {
                 Ok(entry) => entry,
                 Err(flaw) => {
                     self.not_a_tar = header_offset == 0 && flaw == HeaderFlaw::NotATarHeader;
-                    return Err(malformed(header_offset, &flaw.describe()));
+                    return Err(self.malformed(header_offset, &flaw.describe()));
                 }
             };
             self.set_current(&entry);
@@ -379,7 +377,7 @@ impl<R: Read> TarReader<R> {
                 b'x' => {
                     let data = self.read_metadata()?;
                     let records =
-                        parse_pax(&data).map_err(|reason| malformed(header_offset, reason))?;
+                        parse_pax(&data).map_err(|reason| self.malformed(header_offset, reason))?;
                     pax_entry = Some(match pax_entry {
                         Some(prior) => prior.overlaid(&records),
                         None => records,
@@ -402,7 +400,7 @@ impl<R: Read> TarReader<R> {
                     // header is a malformed archive rather than a block read
                     // past without looking.
                     let data = self.read_metadata()?;
-                    parse_pax(&data).map_err(|reason| malformed(header_offset, reason))?;
+                    parse_pax(&data).map_err(|reason| self.malformed(header_offset, reason))?;
                 }
                 _ => {
                     // A concrete file entry: fold in the accumulated
@@ -473,7 +471,7 @@ impl<R: Read> TarReader<R> {
                         // bytes from disagreeing, which is the shape a tar
                         // parser differential takes.
                         if entry.size != 0 {
-                            return Err(malformed(
+                            return Err(self.malformed(
                                 header_offset,
                                 "an entry names a directory and declares data",
                             ));
@@ -510,10 +508,7 @@ impl<R: Read> TarReader<R> {
         self.offset += got as u64;
         self.data_remaining -= got as u64;
         if got < want {
-            return Err(malformed(
-                self.offset,
-                "the archive ends inside an entry's data",
-            ));
+            return Err(self.malformed(self.offset, "the archive ends inside an entry's data"));
         }
         Ok(got)
     }
@@ -550,7 +545,7 @@ impl<R: Read> TarReader<R> {
                 .map_err(|err| self.failure(err))?;
             self.offset += got as u64;
             if got < want {
-                return Err(malformed(self.offset, "the archive ends inside an entry"));
+                return Err(self.malformed(self.offset, "the archive ends inside an entry"));
             }
             skip -= got as u64;
         }
@@ -570,10 +565,7 @@ impl<R: Read> TarReader<R> {
                 // Fewer bytes than one header holds: no archive, if these were
                 // all the stream had.
                 self.not_a_tar = first;
-                Err(malformed(
-                    self.offset,
-                    "the archive ends inside a header block",
-                ))
+                Err(self.malformed(self.offset, "the archive ends inside a header block"))
             }
         }
     }
@@ -609,7 +601,7 @@ impl<R: Read> TarReader<R> {
             };
             self.offset += got;
             remaining = remaining.checked_sub(got).ok_or_else(|| {
-                malformed(
+                self.malformed(
                     self.offset,
                     &format!("more than {limit} bytes follow the end of the archive"),
                 )
@@ -635,7 +627,7 @@ impl<R: Read> TarReader<R> {
     pub(crate) fn read_entry(&mut self, limit: u64) -> Result<Vec<u8>, ProvisionError> {
         let declared = self.data_remaining;
         if declared > limit {
-            return Err(malformed(
+            return Err(self.malformed(
                 self.offset,
                 &format!("an entry of {declared} bytes is more than the {limit} accepted for it"),
             ));
@@ -664,6 +656,17 @@ impl<R: Read> TarReader<R> {
     fn failure(&self, err: io::Error) -> ProvisionError {
         read_failure(&self.path, self.offset, err)
     }
+
+    /// [`ProvisionError::Archive`] for a refusal of what the archive declares,
+    /// which nothing beneath it caused, naming the archive.
+    fn malformed(&self, offset: u64, reason: &str) -> ProvisionError {
+        ProvisionError::Archive {
+            path: self.path.clone(),
+            offset,
+            reason: reason.to_string(),
+            source: None,
+        }
+    }
 }
 
 /// A failed read beneath the archive at `path`, `offset` bytes into it, as the
@@ -687,6 +690,7 @@ pub(crate) fn read_failure(path: &Path, offset: u64, err: io::Error) -> Provisio
     }
     match Refusal::of(err) {
         Ok(refusal) => ProvisionError::Archive {
+            path: path.to_path_buf(),
             offset,
             reason: refusal.what().to_string(),
             source: Some(refusal.into_cause()),
@@ -737,16 +741,6 @@ impl std::error::Error for Carried {
 /// Every entry read whole is a few kilobytes in practice, so this covers the
 /// real ones in one allocation, and a larger one grows past it as it is read.
 const RESERVE: usize = 64 * 1024;
-
-/// Builds [`ProvisionError::Archive`] for a refusal of what the archive
-/// declares, which nothing beneath it caused.
-fn malformed(offset: u64, reason: &str) -> ProvisionError {
-    ProvisionError::Archive {
-        offset,
-        reason: reason.to_string(),
-        source: None,
-    }
-}
 
 /// Removes trailing NUL bytes (long-name data is NUL-terminated).
 fn trim_trailing_nuls(bytes: &mut Vec<u8>) {
@@ -1814,8 +1808,8 @@ mod tests {
         );
         assert_eq!(
             crate::ErrorChain::new(&err).to_string(),
-            "malformed archive at offset 0: the xz stream does not decode: the dictionary is \
-             larger than the bound",
+            "malformed archive \"/srv/rootfs.tar.xz\" at offset 0: the xz stream does not \
+             decode: the dictionary is larger than the bound",
         );
         assert!(
             !reader.not_a_tar(),
@@ -1873,6 +1867,7 @@ mod tests {
         // as such rather than as a source of its own that failed.
         let outer = || {
             into_io(ProvisionError::Archive {
+                path: PathBuf::from("/srv/package.gpkg.tar"),
                 offset: 9216,
                 reason: "the archive ends inside an entry's data".to_string(),
                 source: None,

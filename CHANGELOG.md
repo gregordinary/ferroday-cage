@@ -497,6 +497,11 @@ consumer upgrading can skip it.
   named a member or a package as though it were the path. `Pool::publish`
   reports a `.deb` it cannot read as `DebianError::Io`, the OS error its cause,
   where it was `DebianError::Deb` with the error flattened into the reason.
+- `ProvisionError::Archive` names the archive it refuses, in the variant's new
+  `path` field: a tarball's file or the stand-in a stream is given, a `.deb`, a
+  gpkg container. Its message names it quoted, and leaves it out for an
+  archive held in memory. A `.deb` the Debian bootstrap refused was named by
+  nothing but an offset.
 - **Breaking.** A Gentoo binary package whose container cannot be read is
   reported as `GentooError::Io`, the OS error its cause, as the layer documents.
   It was `GentooError::Container` with the error flattened into the reason.

@@ -314,6 +314,7 @@ mod tests {
                 os_error(),
             ))),
             Box::new(ProvisionError::Archive {
+                path: PathBuf::from("/srv/rootfs.tar.gz"),
                 offset: 512,
                 reason: "the gzip stream does not decode".to_string(),
                 source: Some(os_error()),

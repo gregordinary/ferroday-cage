@@ -1142,6 +1142,7 @@ impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::FetchEr
 #[non_exhaustive] pub enum ferroday_cage::provision::ProvisionError
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::Archive
 pub ferroday_cage::provision::ProvisionError::Archive::offset: u64
+pub ferroday_cage::provision::ProvisionError::Archive::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::Archive::reason: alloc::string::String
 pub ferroday_cage::provision::ProvisionError::Archive::source: core::option::Option<core::io::error::Error>
 pub ferroday_cage::provision::ProvisionError::Cancelled

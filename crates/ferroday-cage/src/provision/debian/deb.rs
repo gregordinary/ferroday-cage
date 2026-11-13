@@ -148,12 +148,13 @@ fn seek_to_member<R: Read + Seek>(
     let mut magic = [0u8; AR_MAGIC.len()];
     deb.read_exact(&mut magic).map_err(|err| match err.kind() {
         io::ErrorKind::UnexpectedEof => {
-            refused(0, "the .deb is shorter than an ar archive's magic")
+            refused(path, 0, "the .deb is shorter than an ar archive's magic")
         }
         _ => io(err),
     })?;
     if magic != AR_MAGIC {
         return Err(refused(
+            path,
             0,
             "the .deb is not an ar archive: its magic is wrong",
         ));
@@ -173,6 +174,7 @@ fn seek_to_member<R: Read + Seek>(
                 break;
             }
             return Err(refused(
+                path,
                 offset,
                 "the .deb's ar container ends inside a member header",
             ));
@@ -182,6 +184,7 @@ fn seek_to_member<R: Read + Seek>(
         deb.read_exact(&mut header).map_err(io)?;
         if &header[58..60] != b"`\n" {
             return Err(refused(
+                path,
                 offset,
                 "a member header of the .deb's ar container lacks its magic",
             ));
@@ -189,6 +192,7 @@ fn seek_to_member<R: Read + Seek>(
         let name = ar_name(&header[0..16]);
         let size: u64 = ascii_field(&header[48..58]).parse().map_err(|_| {
             refused(
+                path,
                 offset,
                 "a member size in the .deb's ar container is not a number",
             )
@@ -198,6 +202,7 @@ fn seek_to_member<R: Read + Seek>(
             None if name == "debian-binary" => false,
             None => {
                 return Err(refused(
+                    path,
                     offset,
                     format!(
                         "the .deb's first member is {name:?}, where the format requires \
@@ -210,6 +215,7 @@ fn seek_to_member<R: Read + Seek>(
             Some(member) => {
                 let suffix = name.strip_prefix(member.stem()).ok_or_else(|| {
                     refused(
+                        path,
                         offset,
                         format!(
                             "the .deb holds {name:?} where its {} belongs",
@@ -219,6 +225,7 @@ fn seek_to_member<R: Read + Seek>(
                 })?;
                 if !SUFFIXES.contains(&suffix) {
                     return Err(refused(
+                        path,
                         offset,
                         format!(
                             "the .deb's member {name:?} names a compression this reader does \
@@ -231,6 +238,7 @@ fn seek_to_member<R: Read + Seek>(
         };
         if let Some(limit) = limit.filter(|limit| is_wanted && size > *limit) {
             return Err(refused(
+                path,
                 offset,
                 format!(
                     "the .deb's {} member declares {size} bytes, more than the {limit} accepted \
@@ -245,6 +253,7 @@ fn seek_to_member<R: Read + Seek>(
             .filter(|end| *end <= length)
             .ok_or_else(|| {
                 refused(
+                    path,
                     offset,
                     "a member of the .deb's ar container runs past its end",
                 )
@@ -267,7 +276,11 @@ fn seek_to_member<R: Read + Seek>(
         deb.seek(SeekFrom::Start(offset)).map_err(io)?;
     }
     let missing = next.map_or("debian-binary", Member::stem);
-    Err(refused(length, format!("the .deb has no {missing} member")))
+    Err(refused(
+        path,
+        length,
+        format!("the .deb has no {missing} member"),
+    ))
 }
 
 /// Refuses a `.deb` whose `debian-binary` member, `size` bytes at `at`, does
@@ -300,6 +313,7 @@ fn check_format<R: Read + Seek>(
     });
     if !format_two {
         return Err(refused(
+            path,
             at,
             "the .deb's debian-binary does not begin with a format 2 version line",
         ));
@@ -307,10 +321,11 @@ fn check_format<R: Read + Seek>(
     Ok(())
 }
 
-/// Builds [`ProvisionError::Archive`] for a `.deb` refused for what it
-/// declares, `offset` bytes into it.
-fn refused(offset: u64, reason: impl Into<String>) -> ProvisionError {
+/// Builds [`ProvisionError::Archive`] for the `.deb` at `path`, refused for
+/// what it declares `offset` bytes into it.
+fn refused(path: &Path, offset: u64, reason: impl Into<String>) -> ProvisionError {
     ProvisionError::Archive {
+        path: path.to_path_buf(),
         offset,
         reason: reason.into(),
         source: None,
@@ -366,9 +381,13 @@ fn control_from_tar(path: &Path, at: u64, member: &[u8]) -> Result<String, Provi
         }
         let bytes = archive.read_entry(CONTROL_MEMBER_LIMIT)?;
         return String::from_utf8(bytes)
-            .map_err(|_| refused(at, "the .deb's control file is not UTF-8"));
+            .map_err(|_| refused(path, at, "the .deb's control file is not UTF-8"));
     }
-    Err(refused(at, "the .deb's control.tar has no control file"))
+    Err(refused(
+        path,
+        at,
+        "the .deb's control.tar has no control file",
+    ))
 }
 
 /// Trims an `ar` member name: trailing spaces and the GNU terminator slash.
@@ -462,6 +481,35 @@ mod tests {
                 other => panic!("{good}: expected the host's failure, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_refused_deb_is_named_by_its_path_in_the_rendered_chain() {
+        // A bootstrap extracts hundreds of packages, and a refusal that named
+        // no `.deb` left whoever read it to guess which one. The path is the
+        // caller's and may hold anything a file name can, so it is quoted.
+        let root = crate::scratch::Scratch::for_test("deb", "named-refusal");
+        let mut extraction = Extraction::new(&root).expect("the root opens");
+        let path = std::path::PathBuf::from(format!(
+            "/var/cache/archives/{}.deb",
+            crate::failure::hostile::TEXT,
+        ));
+        let misordered =
+            ferroday_cage_testkit::deb::ar(&[("control.tar", b""), ("debian-binary", b"2.0\n")]);
+        let err = extract_deb(
+            &path,
+            &mut Cursor::new(&misordered),
+            &mut extraction,
+            &mut |_, _| Ok(crate::provision::extract::Placement::Write),
+        )
+        .expect_err("a .deb that does not begin with debian-binary is refused");
+        assert!(
+            matches!(&err, ProvisionError::Archive { path: named, .. } if *named == path),
+            "{err:?}",
+        );
+        let rendered = ErrorChain::new(&err).to_string();
+        assert!(rendered.contains(&format!("{path:?}")), "{rendered}");
+        crate::failure::hostile::assert_escaped(&rendered);
     }
 
     #[test]

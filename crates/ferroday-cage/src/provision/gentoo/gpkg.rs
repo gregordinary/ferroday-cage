@@ -1304,6 +1304,7 @@ mod tests {
             }
         }
         let cut = ProvisionError::Archive {
+            path: path.to_path_buf(),
             offset: 9216,
             reason: "the archive ends inside an entry's data".to_string(),
             source: None,

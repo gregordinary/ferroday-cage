@@ -703,8 +703,8 @@ returns that as `Provisioned::Existing` without consulting the source again.
 A source that fails to deliver what it holds, a file that cannot be read or a
 stream whose connection resets, fails the run with `ProvisionError::Io` naming
 the archive, wherever in the stream the failure comes. A compressed stream its
-decoder refuses fails with `ProvisionError::Archive`, the decoder's own failure
-its cause. A caller that retries a transport failure tells the two apart by the
+decoder refuses fails with `ProvisionError::Archive`, which names the archive
+too, the decoder's own failure its cause. A caller that retries a transport failure tells the two apart by the
 variant, since retrying a malformed archive fetches the same bytes again.
 
 The stream is read to its end, past the archive's end marker. A gzip member
