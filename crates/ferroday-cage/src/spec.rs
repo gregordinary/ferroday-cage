@@ -3758,8 +3758,10 @@ fn build_nested_plan(
 /// of. Where a profile mounts more than one, the last still visible is taken —
 /// any of them would serve. An op that brings no mount to rest, such as a
 /// remount or a propagation change, hides nothing; see
-/// [`MountAction::arrival`]. A remount can still make a procfs unusable, by
-/// leaving it read-only, and one that does drops it as a cover would.
+/// [`MountAction::arrival`]. Nor does a path made read-only, which binds the
+/// tree it finds onto itself, a procfs within it included. Either can still
+/// make a procfs unusable, by leaving it read-only, and one that does drops it
+/// as a cover would.
 fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
     standing_procfs(ops, needs_fresh, Writable::Required)
 }
@@ -3805,11 +3807,15 @@ fn standing_procfs(ops: &[MountOp], needs_fresh: bool, writable: Writable) -> Op
             continue;
         };
         let later = &ops[at + 1..];
+        // A path made read-only brings the tree it finds back to rest where it
+        // stood, the procfs with it, so it covers nothing; it leaves the
+        // procfs read-only instead.
         let covered = later
             .iter()
+            .filter(|later| !matches!(later.action, MountAction::ReadOnly { .. }))
             .filter_map(|later| later.action.arrival())
             .any(|(over, _)| covers(over, target));
-        let read_only = writable == Writable::Required && remounted_read_only(later, target);
+        let read_only = writable == Writable::Required && left_read_only(later, target);
         if !covered && !read_only {
             return Some(target);
         }
@@ -3817,13 +3823,14 @@ fn standing_procfs(ops: &[MountOp], needs_fresh: bool, writable: Writable) -> Op
     None
 }
 
-/// Whether the last remount among `later` that acts on the mount at `target`
-/// leaves it read-only.
+/// Whether the last op among `later` that sets the read-only flag of the mount
+/// at `target` leaves it read-only.
 ///
 /// A remount acts on the mount standing at exactly its target, and sets the
-/// read-only flag to what it names, so the last one decides. A remount at
-/// another path leaves this mount as it was.
-fn remounted_read_only(later: &[MountOp], target: &CStr) -> bool {
+/// flag to what it names. A path made read-only at `target` or above it makes
+/// every mount within its tree read-only, this one included. The last of them
+/// decides; a remount at another path leaves this mount as it was.
+fn left_read_only(later: &[MountOp], target: &CStr) -> bool {
     later
         .iter()
         .rev()
@@ -3835,6 +3842,7 @@ fn remounted_read_only(later: &[MountOp], target: &CStr) -> bool {
                 (flags & mechanism::MS_REMOUNT != 0)
                     .then_some(flags & MountFlags::RDONLY.bits() != 0)
             }
+            MountAction::ReadOnly { target: at } if covers(at, target) => Some(true),
             _ => None,
         })
         .unwrap_or(false)
@@ -6793,6 +6801,23 @@ mod tests {
                 "a read-only remount",
             );
         }
+        // A path made read-only at the procfs leaves it where it stood,
+        // read-only, and so does one above it.
+        read_only(sh_in("/tmp").read_only("/proc"), "a read-only /proc");
+        let err = sh_in("/tmp")
+            .mount_proc(false)
+            .raw_mount(RawMount::new("/sys/proc").fstype("proc"))
+            .read_only("/sys")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Config(ConfigError::NestedUsernsProcfsReadOnly { target })
+                    if target == Path::new("/sys/proc")
+            ),
+            "a read-only path above the procfs: {err}",
+        );
         // A read-only procfs a later mount covers is gone, not read-only.
         refused(
             opted_out()
@@ -6818,11 +6843,16 @@ mod tests {
             .raw_mount(RawMount::new("/proc").flags(MS_REMOUNT))
             .build()
             .expect("a procfs remounted writable serves");
-        // A read-only remount elsewhere leaves this one as it was.
+        // A read-only remount elsewhere leaves this one as it was, and so does
+        // a path made read-only within the procfs.
         sh_in("/tmp")
             .raw_mount(RawMount::new("/tmp").flags(MS_REMOUNT | MS_RDONLY))
             .build()
             .expect("a remount of another mount leaves the procfs writable");
+        sh_in("/tmp")
+            .read_only("/proc/sys")
+            .build()
+            .expect("a read-only tree within the procfs leaves its root writable");
         opted_out()
             .bind("/proc", "/proc")
             .build()

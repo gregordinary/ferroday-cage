@@ -651,7 +651,10 @@ rendered as text.
     /// The map files are written, and named from a procfs's root, so a procfs
     /// that cannot take the write does not count. That is one that ends up
     /// read-only, through a read-only bind, `MS_RDONLY` on a raw mount, a later
-    /// read-only remount, or a source mounted read-only. It is also a bind of a
+    /// read-only remount, a path made read-only at or above it, or a source
+    /// mounted read-only, which
+    /// [`NestedUsernsProcfsReadOnly`](Self::NestedUsernsProcfsReadOnly) reports
+    /// where it is the only reason. It is also a bind of a
     /// tree inside a procfs, such as `/proc/sys`, rather than of its root.
     ///
     /// Reachable only from a profile that opts out of the managed mounts with
@@ -878,8 +881,9 @@ rendered as text.
     /// The [`NestedUsernsNeedsProcfs`](Self::NestedUsernsNeedsProcfs) refusal,
     /// where read-only is the one reason the procfs at `target` does not count:
     /// the identity map of the nested user namespace is written through it.
-    /// A procfs bound read-only, a fresh one mounted read-only, and one a later
-    /// remount makes read-only are each such a procfs.
+    /// A procfs bound read-only, a fresh one mounted read-only, one a later
+    /// remount makes read-only, and one beneath a path made read-only are each
+    /// such a procfs.
     #[non_exhaustive]
     NestedUsernsProcfsReadOnly {
         /// Where the read-only procfs is mounted inside the sandbox.
@@ -1288,8 +1292,8 @@ impl fmt::Display for ConfigError {
             ConfigError::NestedUsernsProcfsReadOnly { target } => write!(
                 f,
                 "the procfs at {target:?} is read-only, and the nested user namespace that locks \
-                 the sandbox's mount flags writes its identity map through it; mount it writable, \
-                 or leave the managed profile's own procfs in place",
+                 the sandbox's mount flags writes its identity map through it; keep one procfs \
+                 writable, neither mounted read-only nor beneath a path made read-only",
             ),
         }
     }

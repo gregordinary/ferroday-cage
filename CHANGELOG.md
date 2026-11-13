@@ -957,6 +957,10 @@ consumer upgrading can skip it.
   bits a parent collects of a process's exit. It took an `i32`, so it made
   statuses no process can exit with: `ExitStatus::exited(256)` reported failure
   while its `shell_code()` was 0. `ExitStatus::code` still answers an `i32`.
+- A procfs a path made read-only covers, such as `read_only("/proc")`, is
+  refused as `ConfigError::NestedUsernsProcfsReadOnly`, naming it. It was
+  refused as `ConfigError::NestedUsernsNeedsProcfs`, which says the sandbox
+  mounts no procfs at all.
 
 ### Internal
 
