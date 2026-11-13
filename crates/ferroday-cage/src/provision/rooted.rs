@@ -208,9 +208,9 @@ impl Rooted {
     /// a symbolic link a package shipped in place of one of them names a
     /// directory of the tree rather than of the host.
     pub(crate) fn create_dir_all(&self, relative: impl AsRef<Path>) -> io::Result<()> {
-        let mut owed = Vec::new();
-        self.create_dirs(&components(relative.as_ref())?, &mut owed)?;
-        self.settle(&owed)
+        let mut made = Chain::default();
+        self.create_dirs(&components(relative.as_ref())?, &mut made)?;
+        self.settle(made)
     }
 
     /// Reads the file at `relative`, refusing one that holds more than `limit`
@@ -620,11 +620,11 @@ impl Rooted {
     /// Renames `from` to `to` within the tree, replacing whatever occupies the
     /// destination. Both paths resolve against the tree's root.
     pub(crate) fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-        let mut owed = Vec::new();
+        let mut made = Chain::default();
         let (from_parent, from_leaf) = self.parent_of(from.as_ref(), Parents::Require)?;
-        let (to_parent, to_leaf) = self.parent_of(to.as_ref(), Parents::Create(&mut owed))?;
+        let (to_parent, to_leaf) = self.parent_of(to.as_ref(), Parents::Create(&mut made))?;
         rustix::fs::renameat(&from_parent, &from_leaf, &to_parent, &to_leaf)?;
-        self.settle(&owed)
+        self.settle(made)
     }
 
     /// Creates a symbolic link at `relative` holding `target` verbatim,
@@ -634,12 +634,12 @@ impl Rooted {
     /// whatever later follows the link, inside the tree.
     pub(crate) fn symlink(&self, target: &str, relative: impl AsRef<Path>) -> io::Result<()> {
         let target = CString::new(target).map_err(|_| Errno::INVAL)?;
-        let mut owed = Vec::new();
-        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Create(&mut owed))?;
+        let mut made = Chain::default();
+        let (parent, leaf) = self.parent_of(relative.as_ref(), Parents::Create(&mut made))?;
         containment::replacing(&parent, &leaf, || {
             rustix::fs::symlinkat(&target, &parent, &leaf)
         })?;
-        self.settle(&owed)
+        self.settle(made)
     }
 
     /// Creates the file at `relative` holding `contents`, at `mode`.
@@ -650,8 +650,8 @@ impl Rooted {
     /// its own leaves. The mode is applied through the descriptor, so it lands
     /// on the file this created and on nothing else.
     fn create(&self, relative: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
-        let mut owed = Vec::new();
-        let (parent, leaf) = self.parent_of(relative, Parents::Create(&mut owed))?;
+        let mut made = Chain::default();
+        let (parent, leaf) = self.parent_of(relative, Parents::Create(&mut made))?;
         let fd = containment::replacing(&parent, &leaf, || {
             rustix::fs::openat(
                 &parent,
@@ -663,17 +663,23 @@ impl Rooted {
         let mut file = File::from(fd);
         file.write_all(contents)?;
         rustix::fs::fchmod(&file, Mode::from_raw_mode(mode))?;
-        self.settle(&owed)
+        self.settle(made)
     }
 
-    /// Gives each directory a write carried up from the base the ownership the
-    /// base holds it at, through the map the tree is owned through.
+    /// Gives each directory a write created its mode, deepest first, and then
+    /// each one it carried up from the base the ownership the base holds it at,
+    /// through the map the tree is owned through.
     ///
-    /// Called once the write has landed, as an extraction gives it once every
-    /// entry has: a directory given to another id could refuse the calling user
-    /// the write beneath it.
-    fn settle(&self, owed: &[Owed]) -> io::Result<()> {
-        reown(&self.root, owed, &self.ownership).map_err(io::Error::other)
+    /// Called once the write has landed, as an extraction applies both once
+    /// every entry has: a mode denying the owner write or search, `0555` from a
+    /// base's directory, would refuse the calling user the write beneath it,
+    /// and so would a directory given to another id. The modes go first, while
+    /// the calling user still owns every directory and may set one.
+    fn settle(&self, made: Chain) -> io::Result<()> {
+        for (dir, mode) in made.modes.iter().rev() {
+            rustix::fs::fchmod(dir, Mode::from_raw_mode(*mode))?;
+        }
+        reown(&self.root, &made.owed, &self.ownership).map_err(io::Error::other)
     }
 
     /// Opens the parent directory of `relative` and returns it with the leaf
@@ -688,7 +694,7 @@ impl Rooted {
         let leaf = CString::new(*leaf).map_err(|_| Errno::INVAL)?;
         let parent = match parents {
             Parents::Require => self.open_dir(parent)?,
-            Parents::Create(owed) => self.create_dirs(parent, owed)?,
+            Parents::Create(chain) => self.create_dirs(parent, chain)?,
         };
         Ok((parent, leaf))
     }
@@ -723,30 +729,26 @@ impl Rooted {
     }
 
     /// Opens `components` as a directory, creating the missing links of the
-    /// chain at [`DIR_MODE`].
+    /// chain at [`DIR_MODE`], or at the base's own mode for a directory carried
+    /// up from it.
     ///
     /// [`containment::create_dirs`] is the walk, preceded over a base by
     /// [`containment::copy_up`]; what is here is the mode this side leaves a
-    /// directory at, applied through the descriptor of the one just made. The
-    /// ownership a directory carried up from the base is owed is added to
-    /// `owed`, for the caller to [`settle`](Self::settle) once its write is in.
-    #[cfg_attr(
-        not(feature = "tarball"),
-        expect(
-            unused_variables,
-            clippy::ptr_arg,
-            reason = "only a walk over a base carries a directory up, and only a build with a \
-                      provisioner walks over one"
-        )
-    )]
-    fn create_dirs(&self, components: &[&[u8]], owed: &mut Vec<Owed>) -> Result<OwnedFd, Errno> {
+    /// directory at. It is recorded in `chain` with a descriptor of the
+    /// directory just made, as is the ownership a directory carried up from the
+    /// base is owed, for the caller to [`settle`](Self::settle) once its write
+    /// is in.
+    fn create_dirs(&self, components: &[&[u8]], chain: &mut Chain) -> Result<OwnedFd, Errno> {
         let mut made = |made: containment::Made<'_>| {
             #[cfg(feature = "tarball")]
             if let Some(record) = containment::owed(&made)? {
-                owed.push(record);
+                chain.owed.push(record);
             }
             let mode = made.copied.map_or(DIR_MODE, |below| below.st_mode & 0o7777);
-            rustix::fs::fchmod(made.dir, Mode::from_raw_mode(mode))
+            chain
+                .modes
+                .push((rustix::io::fcntl_dupfd_cloexec(made.dir, 0)?, mode));
+            Ok(())
         };
         #[cfg(feature = "tarball")]
         if let Some(lower) = &self.lower {
@@ -769,11 +771,23 @@ impl Rooted {
 
 /// Whether a missing parent directory is created or is a failure.
 enum Parents<'o> {
-    /// Create the missing links of the chain, adding to the list the ownership
-    /// each directory carried up from a base is owed.
-    Create(&'o mut Vec<Owed>),
+    /// Create the missing links of the chain, recording in the [`Chain`] what
+    /// each directory it made is owed.
+    Create(&'o mut Chain),
     /// Fail with the kernel's own `ENOENT`.
     Require,
+}
+
+/// What the directories a write created are owed once the write has landed:
+/// their modes and, for one carried up from a base, its ownership. See
+/// [`Rooted::settle`].
+#[derive(Default)]
+struct Chain {
+    /// Each directory made, in the order it was made, held open read-only
+    /// without following a link, with the mode it keeps.
+    modes: Vec<(OwnedFd, u32)>,
+    /// The ownership the directories carried up from a base are owed.
+    owed: Vec<Owed>,
 }
 
 /// Splits a tree-relative path into its components.
@@ -968,6 +982,51 @@ mod tests {
         );
         assert_eq!(mode("etc/apt/sources.list"), FILE_MODE);
         assert_eq!(mode("etc/shadow"), 0o640);
+    }
+
+    #[cfg(feature = "tarball")]
+    #[test]
+    fn a_base_directory_its_owner_cannot_write_is_carried_up_and_written_beneath() {
+        // A write over a base carries the base's directories up first, and a
+        // carried directory keeps the base's mode, 0555 here. Given that mode
+        // as it is carried, the directory refuses the write the carry was for,
+        // so it is given once the write has landed.
+        if rustix::process::geteuid().is_root() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "the test needs a caller other than root, whom a directory's mode does not bind",
+            );
+            return;
+        }
+        let (scratch, upper) = tree("read-only-base");
+        let base = scratch.join("base");
+        std::fs::create_dir_all(base.join("srv/www")).unwrap();
+        std::fs::set_permissions(base.join("srv"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let below = Rooted::open(&base).unwrap();
+        let written = upper
+            .over(Some(&below))
+            .unwrap()
+            .write("srv/www/index", b"served\n");
+        std::fs::set_permissions(base.join("srv"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        written.expect("the write lands");
+
+        let root = scratch.join("tree");
+        let mode = |path: &str| {
+            std::fs::symlink_metadata(root.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(
+            mode("srv"),
+            0o555,
+            "the carried directory keeps the base's mode"
+        );
+        assert_eq!(
+            std::fs::read(root.join("srv/www/index")).unwrap(),
+            b"served\n"
+        );
+        std::fs::set_permissions(root.join("srv"), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

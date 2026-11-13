@@ -957,8 +957,12 @@ fn openat_nofollow(
 /// Every entry name `dir` holds, `.` and `..` left out.
 ///
 /// Read from a descriptor rather than from a path, so the directory listed is
-/// the directory the walk holds open. `subject` names it in a failure.
-fn read_names(dir: BorrowedFd<'_>, subject: &Path) -> Result<Vec<Vec<u8>>, ProvisionError> {
+/// the directory the walk holds open. `subject` names it in a failure. The
+/// pre-configure overlay's walk lists its source directories through this too.
+pub(super) fn read_names(
+    dir: BorrowedFd<'_>,
+    subject: &Path,
+) -> Result<Vec<Vec<u8>>, ProvisionError> {
     // A `Dir` takes a descriptor of its own and consumes its offset, so this
     // opens `.` relative to the walk's: the caller goes on resolving every
     // entry against the descriptor it already holds.

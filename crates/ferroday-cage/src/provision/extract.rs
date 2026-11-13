@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(any(feature = "debian", feature = "alpine"))]
-use std::fs;
+use std::ffi::{CStr, OsStr};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -49,6 +49,8 @@ use rustix::io::Errno;
 use crate::path::{self, LeadingSlash, Refused};
 
 use super::ProvisionError;
+#[cfg(any(feature = "debian", feature = "alpine"))]
+use super::compress::read_fully;
 use super::containment::{self, Made, Reached};
 use super::copyin::{Owed, reown};
 use super::identity::Ownership;
@@ -492,24 +494,22 @@ struct Parent {
 ///
 /// A directory created here is a parent the archive implied but never named,
 /// and gets the conventional `0755`, or, where it stands in for one of the
-/// base's, the base's own mode and modification time. `dir_meta` is the
-/// deferred-metadata map of a caller that applies directory modes in a later
-/// pass, which records the metadata rather than applying it: an implied
-/// parent's contents are still to be created, and it is created `0700` until
-/// they are. A caller with no such pass passes `None` and has the mode applied
-/// at once, through the descriptor of the directory just made, so an implied
-/// parent is never left at the creation mode.
+/// base's, the base's own mode and modification time. Both are recorded in
+/// `dir_meta`, the deferred-metadata map the caller applies once every entry is
+/// written, rather than applied: the parent's contents are still to be
+/// created, and a mode denying its owner write or search would refuse them. It
+/// is created `0700` until they are.
 fn open_parent(
     tree: Tree<'_>,
     components: &[Vec<u8>],
     entry_path: &[u8],
-    mut dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
+    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<Parent, ProvisionError> {
     let parent = &components[..components.len() - 1];
     let mut lower = None;
     if let Some(base) = tree.lower {
         let walked = containment::copy_up(tree.root, base, parent, CONTAINMENT, &mut |made| {
-            place_made(made, dir_meta.as_deref_mut(), tree.owed)
+            place_made(made, dir_meta, tree.owed)
         });
         match walked {
             Ok(Reached::Directory(found)) => lower = found,
@@ -518,26 +518,24 @@ fn open_parent(
         }
     }
     let dir = containment::create_dirs(tree.root, parent, CONTAINMENT, &mut |made| {
-        place_made(made, dir_meta.as_deref_mut(), tree.owed)
+        place_made(made, dir_meta, tree.owed)
     })
     .map_err(|errno| parent_error(errno, entry_path))?;
     Ok(Parent { dir, lower })
 }
 
-/// States the mode of a directory a chain walk made: recorded for the
-/// deferred pass where the caller keeps one, applied through the directory's
-/// own descriptor at once where it does not.
+/// Records the mode of a directory a chain walk made for the deferred pass.
 ///
 /// An implied directory gets [`IMPLIED_DIR_MODE`]. One carried up from a
 /// layered extraction's base keeps the base's mode and modification time,
-/// which is what the merged view showed before the root held it; only the
-/// deferred pass restores the time, since a directory's time moves as its
-/// contents are written. The base's owner and group, where they are not the
-/// ones the carry gave it, are recorded in `owed` for the caller to give once
-/// its writes are done.
+/// which is what the merged view showed before the root held it; the deferred
+/// pass restores the time last, since a directory's time moves as its contents
+/// are written. The base's owner and group, where they are not the ones the
+/// carry gave it, are recorded in `owed` for the caller to give once its
+/// writes are done.
 fn place_made(
     made: Made<'_>,
-    dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
+    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
     owed: &RefCell<Vec<Owed>>,
 ) -> Result<(), Errno> {
     if let Some(record) = containment::owed(&made)? {
@@ -553,13 +551,8 @@ fn place_made(
             mtime: None,
         },
     };
-    match dir_meta {
-        Some(dir_meta) => {
-            dir_meta.entry(made.path.to_vec()).or_insert(meta);
-            Ok(())
-        }
-        None => rustix::fs::fchmod(made.dir, Mode::from_raw_mode(meta.mode)),
-    }
+    dir_meta.entry(made.path.to_vec()).or_insert(meta);
+    Ok(())
 }
 
 /// Maps a failure to open or create an entry's parent chain onto the typed
@@ -601,13 +594,13 @@ fn prepare_dir(
     tree: Tree<'_>,
     components: &[Vec<u8>],
     entry_path: &[u8],
-    mut dir_meta: Option<&mut HashMap<Vec<u8>, DirMeta>>,
+    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
     let Some(base) = tree.lower else {
         return Ok(());
     };
     match containment::copy_up(tree.root, base, components, CONTAINMENT, &mut |made| {
-        place_made(made, dir_meta.as_deref_mut(), tree.owed)
+        place_made(made, dir_meta, tree.owed)
     }) {
         Ok(_) | Err(Errno::NOTDIR) => Ok(()),
         Err(errno) => Err(parent_error(errno, entry_path)),
@@ -775,7 +768,7 @@ fn extract_file<R: Read>(
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
@@ -829,9 +822,9 @@ fn extract_dir(
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
-    prepare_dir(tree, components, &entry.path, Some(dir_meta))?;
+    prepare_dir(tree, components, &entry.path, dir_meta)?;
 
     match rustix::fs::mkdirat(&parent.dir, &leaf, Mode::from_raw_mode(0o700)) {
         Ok(()) => {}
@@ -884,7 +877,7 @@ fn extract_symlink(
     // malformed entry rather than a reach for anything outside the root.
     let target = CString::new(entry.link_target.clone())
         .map_err(|_| entry_refused(&entry.path, "the symlink target contains a NUL byte"))?;
-    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
@@ -938,7 +931,7 @@ fn extract_hardlink(
         .map_err(|errno| resolve_error(errno, &entry.path))?;
     let target_leaf = component_cstr(target_components.last().expect("non-empty"), &entry.path)?;
 
-    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
@@ -966,7 +959,7 @@ fn extract_fifo(
     components: &[Vec<u8>],
     dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(tree, components, &entry.path, Some(dir_meta))?;
+    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
 
@@ -1179,6 +1172,10 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// it, an absolute one included: an overlay's `var/run/` lands in `run/` where
 /// the root links `var/run` to `/run`, and the link stays a link.
 ///
+/// A directory's mode is applied once the walk has written everything beneath
+/// it, as an extraction applies one, so a source directory its owner cannot
+/// write, `0555` or `0500`, is laid with its contents and then given its mode.
+///
 /// `over` is the base `root` is an overlay upper over, in a layered build, with
 /// the identity map `root` is owned through. The base is consulted as
 /// [`Extraction::over`] consults it: an overlay directory where the base links
@@ -1197,7 +1194,11 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// owner, mode, or modification time. A symbolic link resolving inside the root
 /// to a directory, an absolute one included, is merged through and never
 /// replaced. Anything else at a directory's name is replaced, as a file
-/// replaces what occupies its own name.
+/// replaces what occupies its own name. They walk the source the same way too:
+/// by descriptor, each name resolved against the directory that holds it and
+/// never through a link, and each file opened with
+/// [`containment::open_typed_file`], so the entry the walk inspected is the one
+/// it reads.
 ///
 /// Where they differ, the job differs. This runs in the provisioner's own
 /// process between two dpkg or apk waves, writing as the calling user, whom the
@@ -1208,8 +1209,9 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// writing, as the rest of a bootstrap does; an export's `clamp_mtime` is what
 /// makes the root reproducible, where a `CopyIn` carries the source's times
 /// because it mirrors an export. And it lays only what configuration for the
-/// scripts that run next consists of, with no report of the rest, where a
-/// `CopyIn` copies any tree and names what it leaves out.
+/// scripts that run next consists of, its extended attributes left behind, with
+/// no report of the rest, where a `CopyIn` copies any tree and names what it
+/// leaves out.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 pub(crate) fn overlay_tree(
     root: &Path,
@@ -1218,115 +1220,166 @@ pub(crate) fn overlay_tree(
 ) -> Result<(), ProvisionError> {
     let root_fd = open_root(root)?;
     let lower_fd = over.map(|(lower, _)| open_root(lower)).transpose()?;
+    let source_fd = open_root(source)?;
     let owed = RefCell::new(Vec::new());
     let tree = Tree {
         root: root_fd.as_fd(),
         lower: lower_fd.as_ref().map(AsFd::as_fd),
         owed: &owed,
     };
-    overlay_dir(tree, source)?;
+    let mut dir_meta = HashMap::new();
+    overlay_dir(tree, source_fd, source, &mut dir_meta)?;
+    apply_dir_meta(root_fd.as_fd(), dir_meta)?;
     match over {
         Some((_, ownership)) => reown(root, &owed.into_inner(), ownership),
         None => Ok(()),
     }
 }
 
-/// One item of the overlay walk's stack.
+/// One source directory the overlay walk is inside.
 #[cfg(any(feature = "debian", feature = "alpine"))]
-enum OverlayStep {
-    /// Copy this source entry in beneath the current destination directory.
-    Visit(PathBuf),
-    /// The children pushed above this marker are done: step back out of their
-    /// directory.
-    Leave,
+struct OverlayLevel {
+    /// The directory, held open so every name in it resolves against it.
+    dir: OwnedFd,
+    /// Its host path, which names an entry in a failure and resolves nothing.
+    path: PathBuf,
+    /// The names still to visit, in name order.
+    names: std::vec::IntoIter<Vec<u8>>,
 }
 
-/// Copies the entries of `source_dir` into the tree.
+/// Copies the entries of the source directory `source` into the tree.
+///
+/// The walk is [`CopyIn`](super::CopyIn)'s: each source directory is held open,
+/// each name is typed with `fstatat` against it without following a link, and
+/// what was typed is then read through the same descriptor, a directory opened
+/// `O_NOFOLLOW`, a file through [`containment::open_typed_file`], which neither
+/// waits on a named pipe that took the name nor reads anything but the file
+/// typed. A source entry swapped for a link mid-walk is refused rather than
+/// followed. `source_path` names the source in a failure.
 ///
 /// A directory is created before it is descended into, so a parent is always
-/// in place when a child beneath it is written, and the deferred-metadata pass
-/// the archive extractor needs is unnecessary: each directory's mode is set as
-/// it is created.
+/// in place when a child beneath it is written. Its mode is recorded in
+/// `dir_meta` rather than applied, for the caller's pass once the walk is
+/// done: a mode denying its owner write or search would refuse the children.
 ///
-/// The walk carries its own stack rather than recursing, so an arbitrarily deep
-/// source tree costs heap rather than call frames. `components` names the
-/// destination directory relative to the root, empty at the top; each directory
-/// pushes a [`OverlayStep::Leave`] marker beneath its children, which pops that
-/// name back off once they are all done.
+/// The walk carries its own stack rather than recursing, so an arbitrarily
+/// deep source tree costs heap rather than call frames. `components` names the
+/// destination entry relative to the root; each directory's name stays on it
+/// while its children are visited. Names are visited in sorted order, since
+/// a directory's own order is the filesystem's and the walk must be
+/// deterministic.
 #[cfg(any(feature = "debian", feature = "alpine"))]
-fn overlay_dir(tree: Tree<'_>, source_dir: &Path) -> Result<(), ProvisionError> {
+fn overlay_dir(
+    tree: Tree<'_>,
+    source: OwnedFd,
+    source_path: &Path,
+    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+) -> Result<(), ProvisionError> {
     let mut components: Vec<Vec<u8>> = Vec::new();
-    let mut pending = Vec::new();
-    push_children(source_dir, &mut pending)?;
+    let mut stack = vec![overlay_level(source, source_path.to_path_buf())?];
 
-    while let Some(step) = pending.pop() {
-        let OverlayStep::Visit(source_path) = step else {
+    while let Some(level) = stack.last_mut() {
+        let Some(name) = level.names.next() else {
+            stack.pop();
+            // The source's own level has no component of its own.
             components.pop();
             continue;
         };
-        let kind = fs::symlink_metadata(&source_path)
-            .map_err(|err| ProvisionError::io("inspecting the overlay entry", &source_path, err))?
-            .file_type();
+        let entry = level.path.join(OsStr::from_bytes(&name));
+        let leaf = CString::new(name.clone())
+            .map_err(|_| entry_refused(&name, "the entry name carries a NUL"))?;
+        let stat =
+            rustix::fs::statat(&level.dir, &leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| {
+                ProvisionError::io("inspecting the overlay entry", &entry, errno.into())
+            })?;
+        let mode = stat.st_mode & 0o7777;
 
-        // read_dir never yields `.` or `..`, and a name is a single component,
-        // so the pushed component is always a safe leaf.
-        let name = source_path.file_name().expect("an entry of a directory");
-        components.push(name.as_bytes().to_vec());
-        if kind.is_symlink() {
-            overlay_symlink(tree, &source_path, &components)?;
-        } else if kind.is_dir() {
-            overlay_mkdir(tree, &source_path, &components)?;
-            // The marker goes on first, so it resurfaces only once every child
-            // pushed above it has been visited.
-            pending.push(OverlayStep::Leave);
-            push_children(&source_path, &mut pending)?;
-            continue;
-        } else if kind.is_file() {
-            overlay_file(tree, &source_path, &components)?;
+        // A name a directory listing returns is a single component other than
+        // `.` or `..`, so the pushed component is always a safe leaf.
+        components.push(name);
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Symlink => {
+                let target =
+                    rustix::fs::readlinkat(&level.dir, &leaf, Vec::new()).map_err(|errno| {
+                        ProvisionError::io("reading the overlay symlink", &entry, errno.into())
+                    })?;
+                overlay_symlink(tree, &target, &components, dir_meta)?;
+            }
+            FileType::Directory => {
+                overlay_mkdir(tree, mode, &components, dir_meta)?;
+                let dir = rustix::fs::openat(
+                    &level.dir,
+                    &leaf,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|errno| {
+                    ProvisionError::io("reading the overlay directory", &entry, errno.into())
+                })?;
+                stack.push(overlay_level(dir, entry)?);
+                continue;
+            }
+            FileType::RegularFile => {
+                let file =
+                    containment::open_typed_file(level.dir.as_fd(), &leaf, &stat, OFlags::RDONLY)
+                        .map_err(|errno| match errno {
+                        Errno::STALE => ProvisionError::SourceChanged {
+                            path: entry.clone(),
+                            recorded: stat.st_size as u64,
+                        },
+                        errno => {
+                            ProvisionError::io("reading the overlay file", &entry, errno.into())
+                        }
+                    })?;
+                overlay_file(tree, File::from(file), &entry, mode, &components, dir_meta)?;
+            }
+            _ => {}
         }
         components.pop();
     }
     Ok(())
 }
 
-/// Pushes the entries of `dir` onto the overlay walk's stack.
+/// The walk's level for the source directory `dir`, its names read and sorted.
 ///
-/// They go on in reverse so they pop in name order: `read_dir` order is
-/// filesystem-dependent, and the walk must be deterministic.
+/// The names are read through the descriptor, so the directory listed is the
+/// one the walk holds open whatever has happened to its path since.
 #[cfg(any(feature = "debian", feature = "alpine"))]
-fn push_children(dir: &Path, pending: &mut Vec<OverlayStep>) -> Result<(), ProvisionError> {
-    let read = |err| ProvisionError::io("reading the overlay directory", dir, err);
-    let mut children: Vec<PathBuf> = fs::read_dir(dir)
-        .map_err(read)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(read)?;
-    children.sort();
-    pending.extend(children.into_iter().rev().map(OverlayStep::Visit));
-    Ok(())
+fn overlay_level(dir: OwnedFd, path: PathBuf) -> Result<OverlayLevel, ProvisionError> {
+    let mut names = super::copyin::read_names(dir.as_fd(), &path)?;
+    names.sort();
+    Ok(OverlayLevel {
+        dir,
+        path,
+        names: names.into_iter(),
+    })
 }
 
 /// Creates the overlay directory named by `components`, or merges into one
 /// already present, replacing a non-directory in the way.
+///
+/// A directory this creates has `mode` recorded in `dir_meta` for the pass
+/// after the walk.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_mkdir(
     tree: Tree<'_>,
-    source_path: &Path,
+    mode: u32,
     components: &[Vec<u8>],
+    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
     let path = join(components);
-    let parent = open_parent(tree, components, &path, None)?;
+    let parent = open_parent(tree, components, &path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
-    let mode = source_mode(source_path)?;
-    prepare_dir(tree, components, &path, None)?;
+    prepare_dir(tree, components, &path, dir_meta)?;
 
-    // A newly created directory gets its mode set explicitly, since mkdirat
-    // honors the umask; an existing directory is merged into and keeps its own
-    // mode, since the overlay describes the files it carries, not the modes of
-    // directories a package already created. A merged-usr alias (`/lib ->
-    // usr/lib`) is treated as an existing directory too — merged through,
-    // never replaced — so an overlay directory cannot orphan the linker any
-    // more than a package entry can.
+    // A newly created directory is given its mode in the pass after the walk,
+    // since mkdirat honors the umask and the mode may deny its owner the
+    // writes beneath it; an existing directory is merged into and keeps its
+    // own mode, since the overlay describes the files it carries, not the
+    // modes of directories a package already created. A merged-usr alias
+    // (`/lib -> usr/lib`) is treated as an existing directory too — merged
+    // through, never replaced — so an overlay directory cannot orphan the
+    // linker any more than a package entry can.
     let created = match rustix::fs::mkdirat(&parent.dir, &leaf, Mode::from_raw_mode(0o700)) {
         Ok(()) => true,
         Err(Errno::EXIST) => {
@@ -1348,36 +1401,27 @@ fn overlay_mkdir(
         }
     };
     if created {
-        // Through a descriptor for the directory just made: `O_NOFOLLOW` and
-        // `O_DIRECTORY` refuse whatever a racer put at the name since.
-        let setting = |errno: Errno| {
-            ProvisionError::io("setting the mode of", bytes_to_path(&path), errno.into())
-        };
-        let dir = rustix::fs::openat(
-            &parent.dir,
-            &leaf,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(setting)?;
-        rustix::fs::fchmod(&dir, Mode::from_raw_mode(mode)).map_err(setting)?;
+        dir_meta.insert(path, DirMeta { mode, mtime: None });
     }
     Ok(())
 }
 
-/// Copies the overlay file named by `components`, replacing whatever occupies
-/// the name; the leaf is created `O_NOFOLLOW`, so a symlink in the way is
-/// replaced rather than written through.
+/// Copies the overlay file `source` to the name `components` gives, replacing
+/// whatever occupies the name; the leaf is created `O_NOFOLLOW`, so a symlink
+/// in the way is replaced rather than written through. `entry` is the source's
+/// host path, for a failure.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_file(
     tree: Tree<'_>,
-    source_path: &Path,
+    mut source: File,
+    entry: &Path,
+    mode: u32,
     components: &[Vec<u8>],
+    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
     let path = join(components);
-    let parent = open_parent(tree, components, &path, None)?;
+    let parent = open_parent(tree, components, &path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
-    let mode = source_mode(source_path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &path)?;
 
     let fd = create_replacing(
@@ -1394,49 +1438,44 @@ fn overlay_file(
         &leaf,
     )?;
 
-    let mut source = File::open(source_path)
-        .map_err(|err| ProvisionError::io("reading the overlay file", source_path, err))?;
     let mut dest = File::from(fd);
-    io::copy(&mut source, &mut dest)
-        .map_err(|err| ProvisionError::io("writing", bytes_to_path(&path), err))?;
+    let mut buf = [0u8; 65536];
+    loop {
+        let got = read_fully(&mut source, &mut buf)
+            .map_err(|err| ProvisionError::io("reading the overlay file", entry, err))?;
+        if got == 0 {
+            break;
+        }
+        dest.write_all(&buf[..got])
+            .map_err(|err| ProvisionError::io("writing", bytes_to_path(&path), err))?;
+    }
     rustix::fs::fchmod(&dest, Mode::from_raw_mode(mode)).map_err(|errno| {
         ProvisionError::io("setting the mode of", bytes_to_path(&path), errno.into())
     })?;
     Ok(())
 }
 
-/// Recreates the overlay symlink named by `components`, its target stored
+/// Recreates the overlay symlink named by `components`, its `target` stored
 /// verbatim and never resolved, replacing whatever occupies the name.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 fn overlay_symlink(
     tree: Tree<'_>,
-    source_path: &Path,
+    target: &CStr,
     components: &[Vec<u8>],
+    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
 ) -> Result<(), ProvisionError> {
     let path = join(components);
-    let target = fs::read_link(source_path)
-        .map_err(|err| ProvisionError::io("reading the overlay symlink", source_path, err))?;
-    let target = CString::new(target.as_os_str().as_bytes())
-        .map_err(|_| entry_refused(&path, "the symlink target contains a NUL byte"))?;
-    let parent = open_parent(tree, components, &path, None)?;
+    let parent = open_parent(tree, components, &path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &path)?;
     refuse_superseding_a_base_directory(&parent, &leaf, &path)?;
 
     create_replacing(
         &path,
-        || rustix::fs::symlinkat(&target, &parent.dir, &leaf),
+        || rustix::fs::symlinkat(target, &parent.dir, &leaf),
         &parent.dir,
         &leaf,
     )?;
     Ok(())
-}
-
-/// The permission bits of `path`, without following a final symlink.
-#[cfg(any(feature = "debian", feature = "alpine"))]
-fn source_mode(path: &Path) -> Result<u32, ProvisionError> {
-    let stat = rustix::fs::statat(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|errno| ProvisionError::io("inspecting the overlay entry", path, errno.into()))?;
-    Ok(stat.st_mode & 0o7777)
 }
 
 // The overlay tests exercise the Debian pre-configure overlay, which only
@@ -1445,6 +1484,7 @@ fn source_mode(path: &Path) -> Result<u32, ProvisionError> {
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     #[test]
     fn overlay_lays_files_and_dirs_and_preserves_modes() {
@@ -1479,43 +1519,91 @@ mod tests {
         assert_eq!(mode, 0o640, "the file mode is preserved");
     }
 
+    /// The permission bits of `path`, without following a link at it.
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Gives every directory under `dir` its owner's write permission back, so
+    /// the scratch tree can be removed.
+    fn writable(dir: &Path) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                writable(&path);
+            }
+        }
+    }
+
     #[test]
-    fn an_implied_parent_is_traversable_without_a_deferred_mode_pass() {
-        // `open_parent` creates a missing directory 0700 and leaves widening it
-        // to the caller's later mode pass. A caller with no such pass — the
-        // overlay walk — asks for the mode at once instead, or the directory
-        // would keep a mode that only its owner can traverse.
-        let base = Scratch::for_test("overlay", "implied-parent");
+    fn a_source_directory_its_owner_cannot_write_is_laid_with_its_contents() {
+        // A tree copied from a read-only store, a Nix store path among them,
+        // holds directories at 0555 and 0500. Given that mode as it is created,
+        // such a directory refuses its owner the children still to be written;
+        // given it once they are, it is laid whole.
+        if rustix::process::geteuid().is_root() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "the test needs a caller other than root, whom a directory's mode does not bind",
+            );
+            return;
+        }
+        let base = Scratch::for_test("overlay", "read-only-source");
         let root = base.join("root");
+        let source = base.join("source");
         fs::create_dir_all(&root).unwrap();
-        let fd = rustix::fs::open(
-            &root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
+        fs::create_dir_all(source.join("store/locked")).unwrap();
+        fs::write(source.join("store/locked/secret"), b"kept\n").unwrap();
+        fs::write(source.join("store/readme"), b"read only\n").unwrap();
+        fs::set_permissions(
+            source.join("store/locked"),
+            fs::Permissions::from_mode(0o500),
         )
         .unwrap();
+        fs::set_permissions(source.join("store"), fs::Permissions::from_mode(0o555)).unwrap();
 
-        let components: Vec<Vec<u8>> = [&b"usr"[..], b"lib", b"file"]
-            .iter()
-            .map(|name| name.to_vec())
-            .collect();
-        let owed = std::cell::RefCell::new(Vec::new());
-        let tree = Tree {
-            root: fd.as_fd(),
-            lower: None,
-            owed: &owed,
-        };
-        open_parent(tree, &components, b"usr/lib/file", None)
-            .expect("the implied parents are created");
+        let laid = overlay_tree(&root, &source, None);
+        writable(&source);
+        laid.expect("the overlay applies");
+        assert_eq!(mode_of(&root.join("store")), 0o555);
+        assert_eq!(mode_of(&root.join("store/locked")), 0o500);
+        fs::set_permissions(root.join("store/locked"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            fs::read(root.join("store/locked/secret")).unwrap(),
+            b"kept\n"
+        );
+        assert_eq!(fs::read(root.join("store/readme")).unwrap(), b"read only\n");
+        writable(&root);
+    }
 
-        for path in ["usr", "usr/lib"] {
-            let mode = fs::symlink_metadata(root.join(path))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777;
-            assert_eq!(mode, 0o755, "{path} kept its creation mode");
+    #[test]
+    fn a_base_directory_its_owner_cannot_write_is_carried_up_and_written_beneath() {
+        // A layered overlay carries a base directory up before it writes beneath
+        // it, and the base's mode, 0555 here, is what the carried directory
+        // keeps. Applied as the directory is carried, it refuses the write the
+        // carry was for.
+        if rustix::process::geteuid().is_root() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "the test needs a caller other than root, whom a directory's mode does not bind",
+            );
+            return;
         }
+        let scratch = Scratch::for_test("overlay", "read-only-base");
+        let lower = scratch.join("base");
+        let upper = scratch.join("upper");
+        let source = scratch.join("source");
+        fs::create_dir_all(lower.join("srv")).unwrap();
+        fs::create_dir_all(&upper).unwrap();
+        fs::create_dir_all(source.join("srv")).unwrap();
+        fs::write(source.join("srv/conf"), b"setting\n").unwrap();
+        fs::set_permissions(lower.join("srv"), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let laid = overlay_tree(&upper, &source, Some((&lower, &Ownership::default())));
+        writable(&lower);
+        laid.expect("the overlay applies");
+        assert_eq!(mode_of(&upper.join("srv")), 0o555);
+        assert_eq!(fs::read(upper.join("srv/conf")).unwrap(), b"setting\n");
+        writable(&upper);
     }
 
     #[test]
@@ -2248,6 +2336,66 @@ mod layered_tests {
         for name in ["system.posix_acl_access", "system.posix_acl_default"] {
             assert_eq!(xattr(&journal, name), None, "{name} was not the base's");
         }
+    }
+
+    #[test]
+    fn a_carried_access_control_list_that_denies_its_owner_writing_still_takes_the_increment() {
+        // An access control list's owner entry is the owner's mode. Carried up
+        // as the base holds it, a list whose owner entry is `r-x` refuses the
+        // calling user the entry the carry was made for; it is the base's again
+        // once the increment is written.
+        if rustix::process::geteuid().is_root() {
+            ferroday_cage_testkit::require::premise_unmet(
+                "the test needs a caller other than root, whom a directory's mode does not bind",
+            );
+            return;
+        }
+        let scratch = Scratch::for_test("extract-layered", "acl-owner-read-only");
+        let base = scratch.join("base");
+        let shared = base.join("srv/shared");
+        fs::create_dir_all(&shared).unwrap();
+        // user::r-x, user:4242:rwx, group::r-x, mask::rwx, other::r-x.
+        let mut list = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 5u16, u32::MAX),
+            (0x02, 7, 4242),
+            (0x04, 5, u32::MAX),
+            (0x10, 7, u32::MAX),
+            (0x20, 5, u32::MAX),
+        ] {
+            list.extend_from_slice(&tag.to_le_bytes());
+            list.extend_from_slice(&perm.to_le_bytes());
+            list.extend_from_slice(&id.to_le_bytes());
+        }
+        if rustix::fs::lsetxattr(
+            &shared,
+            "system.posix_acl_access",
+            &list,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_err()
+        {
+            ferroday_cage_testkit::require::premise_unmet(
+                "this filesystem holds no POSIX access control lists",
+            );
+            return;
+        }
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+        let mut tar = Tar::new();
+        tar.file("srv/shared/note", 0o644, b"a note\n");
+        let extracted = extract_over(&upper, &base, &tar.finish());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        extracted.expect("the increment extracts beneath the carried directory");
+
+        let carried = upper.join("srv/shared");
+        assert_eq!(fs::read(carried.join("note")).unwrap(), b"a note\n");
+        assert_eq!(
+            xattr(&carried, "system.posix_acl_access"),
+            Some(list),
+            "the carried directory's list is the base's",
+        );
+        fs::set_permissions(&carried, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// The proof that matters for ownership: a base whose directory a range map

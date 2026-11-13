@@ -162,7 +162,7 @@ pub(crate) fn open_dir_path(
 pub(super) struct Made<'a> {
     /// Where the directory is, as a slash-joined path from the anchor.
     // Read by an extraction alone, for its deferred pass: the host-side steps
-    // state each mode at once.
+    // keep the descriptor instead.
     #[cfg_attr(not(feature = "tarball"), allow(dead_code))]
     pub(super) path: &'a [u8],
     /// The directory itself, opened `O_RDONLY | O_NOFOLLOW`, so a mode applied
@@ -187,10 +187,12 @@ pub(super) struct Made<'a> {
 /// the resolve before it returned.
 ///
 /// Every directory this creates is made at [`CREATION_MODE`] and handed to
-/// `made`, which is where the caller states the mode it keeps: applied through
-/// the descriptor at once, or recorded for a pass after the chain's contents
-/// are written. Nothing here sets a mode by name, so no symbolic link a racer
-/// leaves at the name can redirect one.
+/// `made`, which is where the caller states the mode it keeps. Every caller
+/// applies it once the chain's contents are written, since a mode denying the
+/// owner write or search would refuse them: through a descriptor it keeps, or
+/// recorded for a pass that opens the directory again without following a
+/// link. Nothing here sets a mode by name, so no symbolic link a racer leaves
+/// at the name can redirect one.
 ///
 /// A name in the chain held by something that does not resolve to a directory
 /// — a file, or a link that dangles — fails with `ENOTDIR`, whatever the kernel
@@ -352,7 +354,7 @@ mod layered {
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
     use rustix::fs::{
-        AtFlags, FileType, OFlags, ResolveFlags, Stat, Timespec, Timestamps, XattrFlags,
+        AtFlags, FileType, Mode, OFlags, ResolveFlags, Stat, Timespec, Timestamps, XattrFlags,
     };
     use rustix::io::Errno;
 
@@ -631,6 +633,13 @@ mod layered {
         let lower = lower_dir(below.as_fd(), leaf)?;
         let dir = make_dir(top.upper.as_fd(), leaf)?;
         carry_xattrs(below.as_fd(), leaf, dir.as_fd())?;
+        // An access control list's owner entry is the owner's mode, so one the
+        // carry gave the directory can deny its owner the writes still to be
+        // made beneath it. It goes back to the creation mode until the caller
+        // states the one it keeps; that mode puts the list's owner, mask, and
+        // other entries back as the base's mode shows them, and the named
+        // entries are never touched by a mode.
+        rustix::fs::fchmod(&dir, Mode::from_raw_mode(super::CREATION_MODE))?;
         let path = level_path(stack, &name);
         made(Made {
             path: &path,
