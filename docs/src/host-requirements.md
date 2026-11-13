@@ -7,6 +7,18 @@ user to create user namespaces. The 5.6 floor comes from `openat2`, which
 the sandbox uses to confine mount-target resolution to the rootfs and the
 tarball provisioner uses to confine extraction to its destination.
 
+The default network posture also needs seccomp filtering. A sandbox with a
+network namespace of its own installs a filter, which closes the routes out that
+the namespace does not cover. [The network
+filter](how-the-sandbox-is-built.md#the-network-filter) describes it.
+
+A kernel built without `CONFIG_SECCOMP_FILTER` fails such a launch at
+`SetupStep::InstallNetworkFilter`. So does a container runtime whose seccomp
+profile refuses the `seccomp` syscall.
+[`host::seccomp_available`](https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.seccomp_available.html)
+reports whether the kernel offers seccomp. `Network::Host` installs no filter
+and needs none.
+
 Two opt-in capabilities have host requirements of their own. A [uid/gid range
 map](identity-maps.md) requested by an unprivileged caller needs the shadow
 suite's `newuidmap` and `newgidmap` helpers and a subordinate-id allocation,
@@ -142,6 +154,14 @@ are the architectures it states them for. The build fails on any other. The
 binaries inside the rootfs must be ones the host CPU executes — its own
 architecture, or one it runs natively, such as i386 on an amd64 host — or a
 matching `qemu-user` binfmt handler must be registered for them.
+
+An i386 userland runs on an amd64 host as it would on its own, with one
+exception. Under a network posture with a namespace of its own, a 32-bit
+program built against glibc creates no socket. That C library creates every
+socket through `socketcall`, which [the network
+filter](how-the-sandbox-is-built.md#the-network-filter) refuses. A userland
+emulated through `qemu-user` is unaffected: the emulator makes the host's own
+`socket` call.
 
 A full Debian bootstrap for an architecture the host does not run natively runs
 that architecture's dpkg and maintainer scripts, so the `qemu-user` handler must

@@ -103,11 +103,12 @@ sequence itself.
     When the step completes, the host filesystem is no longer reachable
     from the sandbox's view.
 13. **Fork and exec.** After changing to the configured working directory,
-    the init forks the command process — PID 2 — which wires its standard
+    the init forks the command process — PID 2. The command wires its standard
     streams per the configuration, applies the configured [resource
-    limits](hardening.md#resource-limits), enters a nested user namespace
-    (below), applies any hardening, and calls `execve`, resolved inside the new
-    root. The hardening layer applies in two halves around the switch to the
+    limits](hardening.md#resource-limits), and enters a nested user namespace
+    (below). It then installs the [network filter](#the-network-filter) where
+    the sandbox has its own network namespace, applies any hardening, and calls
+    `execve`, resolved inside the new root. The hardening layer applies in two halves around the switch to the
     configured [run-as
     identity](identity-maps.md#running-as-a-non-root-identity), when one is
     set: securebits, no-new-privileges, and Landlock before it, the
@@ -177,6 +178,44 @@ initial namespace. [`host::userns_blocker`](host-requirements.md) reports a
 necessary and not sufficient. A host whose ceiling is four with three namespaces
 already live fails the same way. The launch itself therefore reports a refused
 namespace as `Error::NamespaceLimitReached`, naming the limits.
+
+## The network filter
+
+Under `Network::Isolated` and `Network::None`, the sandbox has a network
+namespace of its own. The namespace governs every address family that routes
+through it, and three routes out do not pass through a network namespace at all.
+The command closes them with a seccomp filter, installed right after it enters
+its nested user namespace:
+
+| Route | Why the namespace misses it | Answer |
+| --- | --- | --- |
+| `socket` with `AF_VSOCK` | vsock reaches the hypervisor's host from a virtual machine guest, and the host's own services where the host runs vsock loopback, whatever the namespace | `EAFNOSUPPORT` |
+| `io_uring_setup` | A ring creates and connects sockets itself, out of any syscall filter's sight | `ENOSYS` |
+| `socketcall` creating a socket, on x86 | The call passes the address family by pointer, which a filter cannot read, and 64-bit code reaches it through `int 0x80` | `ENOSYS` |
+
+Each answer is the one a kernel without the facility gives. A program that
+probes for vsock or io_uring therefore reads it as absent. The filter compares
+only the low 32 bits of a socket's family, because the kernel reads it as an
+`int`. A family with high bits set is still `AF_VSOCK`, and is refused. The
+filter checks every entry point the host's kernel presents: the 64-bit ABI, x32,
+and the 32-bit compat layer. A syscall under any other architecture kills the
+process, and no kernel the build runs on makes one.
+
+The `socketcall` refusal has a cost. A 32-bit x86 program built against glibc
+creates every socket through `socketcall`, so in such a sandbox it creates none,
+a Unix-domain socket included. A program built against musl tries the direct
+`socket` call first, and a 64-bit program always makes it, so neither is
+affected. A 32-bit glibc userland that needs sockets runs under `Network::Host`,
+which carries no filter.
+
+The launch sets no-new-privileges only where the hardening layer asks for it, so
+the filter is installed without it. Creating the nested user namespace grants
+the capability the kernel requires in its place. A [seccomp
+policy](hardening.md#seccomp-syscall-filters) is installed after the filter.
+Where both refuse a syscall with an errno, the command sees the policy's. A host
+that cannot install the filter fails the launch at
+`SetupStep::InstallNetworkFilter`. [Host requirements](host-requirements.md)
+covers the hosts that cannot.
 
 ## The session keyring
 

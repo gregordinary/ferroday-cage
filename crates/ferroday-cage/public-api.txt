@@ -2016,6 +2016,7 @@ pub ferroday_cage::SetupStep::EnterRootfs = 9
 pub ferroday_cage::SetupStep::Exec = 21
 pub ferroday_cage::SetupStep::ForkCommand = 28
 pub ferroday_cage::SetupStep::ForkInit = 23
+pub ferroday_cage::SetupStep::InstallNetworkFilter = 58
 pub ferroday_cage::SetupStep::InstallSeccomp = 36
 pub ferroday_cage::SetupStep::LandlockAddRule = 34
 pub ferroday_cage::SetupStep::LandlockCreateRuleset = 33

@@ -6,10 +6,11 @@
 //! request was compiled and frozen by [`CageBuilder::build`], so this path
 //! only opens paths and issues syscalls over the frozen data.
 //!
-//! Capabilities go through rustix. Landlock and the seccomp filter install use
-//! syscalls rustix does not expose, issued through the `syscalls` crate — a
-//! libc-free, allocation-free inline-assembly conduit — over kernel `uapi`
-//! structs defined and size-checked here.
+//! Capabilities go through rustix. Landlock uses syscalls rustix does not
+//! expose, issued through the `syscalls` crate — a libc-free, allocation-free
+//! inline-assembly conduit — over kernel `uapi` structs defined and
+//! size-checked here. The seccomp filter goes through [`seccomp::install`],
+//! which installs every filter the launch carries.
 //!
 //! Everything here runs *after* the command has entered its nested user
 //! namespace, and that ordering is a requirement rather than a preference.
@@ -44,6 +45,7 @@ use rustix::thread::{CapabilitiesSecureBits, CapabilitySet, CapabilitySets};
 use syscalls::Sysno;
 
 use super::HardeningPlan;
+use super::seccomp;
 use super::sys::errno;
 use crate::error::SetupStep;
 use crate::hardening::{fs_access, fs_access_for_abi, net_access_for_abi, scope_for_abi};
@@ -118,9 +120,10 @@ pub(super) fn apply_post_switch(plan: &HardeningPlan) -> Result<(), Failure> {
 
     // Seccomp last: once installed the filter is active, so nothing but the
     // exec runs under it — the identity switch already happened outside its
-    // governance.
+    // governance. No-new-privileges, set before the switch, is what admits the
+    // install once the switch has left the command without CAP_SYS_ADMIN.
     if let Some(program) = &plan.seccomp {
-        install_seccomp(program).map_err(|errno| (SetupStep::InstallSeccomp, errno, 0))?;
+        seccomp::install(program).map_err(|errno| (SetupStep::InstallSeccomp, errno, 0))?;
     }
 
     Ok(())
@@ -438,49 +441,4 @@ fn restrict_self(ruleset: BorrowedFd<'_>) -> Result<(), Errno> {
     unsafe { syscalls::syscall!(Sysno::landlock_restrict_self, ruleset.as_raw_fd(), 0usize) }
         .map(|_| ())
         .map_err(errno)
-}
-
-/// `SECCOMP_SET_MODE_FILTER`: install a classic BPF filter.
-const SECCOMP_SET_MODE_FILTER: usize = 1;
-
-/// The kernel's `struct sock_fprog`: a filter program's length and pointer.
-#[repr(C)]
-struct SockFprog {
-    len: u16,
-    filter: *const super::SockFilter,
-}
-
-// The layout must match the kernel's, or the install would read a program
-// length and a program address the caller never wrote. The size is stated
-// against the pointer's own, since the padding between the two fields is the
-// pointer's alignment: sixteen bytes on a 64-bit target, eight on a 32-bit
-// one. The offsets pin the fields inside it, so a field added or widened
-// fails the build even where the total happens to come out the same.
-const _: () = {
-    let pointer = size_of::<*const super::SockFilter>();
-    assert!(size_of::<SockFprog>() == 2 * pointer);
-    assert!(std::mem::offset_of!(SockFprog, len) == 0);
-    assert!(std::mem::offset_of!(SockFprog, filter) == pointer);
-};
-
-/// Installs the compiled seccomp filter on the command process.
-fn install_seccomp(program: &[super::SockFilter]) -> Result<(), Errno> {
-    // The program length fits a u16: `compile_seccomp` rejected anything over
-    // `BPF_MAXINSNS` (4096) at build time, so this narrowing cannot wrap.
-    let fprog = SockFprog {
-        len: program.len() as u16,
-        filter: program.as_ptr(),
-    };
-    // SAFETY: the fprog points at the frozen program for the call's duration;
-    // no-new-privileges was set above, so the unprivileged install is allowed.
-    unsafe {
-        syscalls::syscall!(
-            Sysno::seccomp,
-            SECCOMP_SET_MODE_FILTER,
-            0usize,
-            &fprog as *const SockFprog
-        )
-    }
-    .map(|_| ())
-    .map_err(errno)
 }

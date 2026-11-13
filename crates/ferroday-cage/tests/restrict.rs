@@ -32,7 +32,7 @@ fn grant_system_trees(mut builder: RestrictionBuilder) -> RestrictionBuilder {
 
 #[test]
 fn a_directory_on_a_standard_stream_is_refused() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // A restriction swaps no root, but a directory descriptor still hands the
@@ -247,7 +247,7 @@ fn landlock_write_grant_gates_file_creation() {
 
 #[test]
 fn curated_seccomp_allows_an_ordinary_command() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let status = Restriction::builder()
@@ -265,7 +265,7 @@ fn curated_seccomp_allows_an_ordinary_command() {
 
 #[test]
 fn a_denied_syscall_kills_the_command() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // Denying write with a process kill: the command dies with SIGSYS the
@@ -288,7 +288,7 @@ fn a_denied_syscall_kills_the_command() {
 
 #[test]
 fn an_argument_condition_kills_only_a_matching_call() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // Kill write only when its first argument, the file descriptor, is 1.
@@ -313,7 +313,7 @@ fn an_argument_condition_kills_only_a_matching_call() {
 
 #[test]
 fn an_argument_condition_spares_a_nonmatching_call() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // The same policy, but conditioned on descriptor 2. echo writes to
@@ -337,7 +337,7 @@ fn an_argument_condition_spares_a_nonmatching_call() {
 
 #[test]
 fn no_new_privileges_is_always_set() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // A seccomp-only restriction leaves the filesystem unrestricted, so the
@@ -363,7 +363,7 @@ fn no_new_privileges_is_always_set() {
 
 #[test]
 fn capabilities_are_dropped() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // A restriction always drops to the empty capability set. The command
@@ -402,7 +402,7 @@ fn capabilities_are_dropped() {
 
 #[test]
 fn the_environment_is_the_base_plus_overrides() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let output = Restriction::builder()
@@ -430,7 +430,7 @@ fn the_environment_is_the_base_plus_overrides() {
 
 #[test]
 fn the_working_directory_applies() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let output = Restriction::builder()
@@ -447,7 +447,7 @@ fn the_working_directory_applies() {
 
 #[test]
 fn the_working_directory_defaults_to_the_root() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // The default is `/`, not whatever directory the caller happened to be in:
@@ -467,7 +467,7 @@ fn the_working_directory_defaults_to_the_root() {
 
 #[test]
 fn the_handle_kills_a_running_command() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let restriction = Restriction::builder()
@@ -491,7 +491,7 @@ fn the_handle_kills_a_running_command() {
 
 #[test]
 fn the_restrictions_supervisor_outlives_the_signals_sent_to_its_group() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // A restriction's command is supervised from outside by the launch stage,
@@ -624,7 +624,7 @@ fn run_scoped(script: &str, scopes: Option<&[LandlockScope]>) -> bool {
 
 #[test]
 fn a_restriction_cannot_signal_a_process_outside_it() {
-    if !common::seccomp() || !common::landlock_scope() {
+    if !common::require::seccomp() || !common::landlock_scope() {
         return;
     }
     // A restriction shares the host's PID space and runs as the calling user,
@@ -649,7 +649,7 @@ fn a_restriction_cannot_signal_a_process_outside_it() {
 
 #[test]
 fn a_restriction_cannot_reach_an_abstract_socket_outside_it() {
-    if !common::seccomp() || !common::landlock_scope() {
+    if !common::require::seccomp() || !common::landlock_scope() {
         return;
     }
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
@@ -683,7 +683,7 @@ fn a_restriction_cannot_reach_an_abstract_socket_outside_it() {
 
 #[test]
 fn a_scoped_restriction_cannot_read_an_outside_process_environment() {
-    if !common::seccomp() || !common::landlock_scope() {
+    if !common::require::seccomp() || !common::landlock_scope() {
         return;
     }
     // Any Landlock domain refuses the ptrace access checks on a process outside
@@ -702,7 +702,7 @@ fn a_scoped_restriction_cannot_read_an_outside_process_environment() {
 
 #[test]
 fn a_syscall_answered_with_its_own_errno_reports_it() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
@@ -749,7 +749,7 @@ fn a_syscall_answered_with_its_own_errno_reports_it() {
 
 #[test]
 fn the_curated_policy_denies_a_namespace_and_starts_threads_and_processes() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let Some(python) = ["/usr/bin/python3", "/bin/python3"]
@@ -810,7 +810,7 @@ fn the_curated_policy_denies_a_namespace_and_starts_threads_and_processes() {
 
 #[test]
 fn a_missing_command_is_an_exec_setup_error() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let result = Restriction::builder()
@@ -827,7 +827,7 @@ fn a_missing_command_is_an_exec_setup_error() {
 
 #[test]
 fn a_restriction_directs_its_output_streams() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // A restriction's command inherits the caller's descriptors exactly as a
@@ -880,7 +880,7 @@ fn a_restriction_directs_its_output_streams() {
 
 #[test]
 fn a_restriction_runs_on_a_terminal_of_its_own() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // A host-allocated pseudoterminal needs no devpts instance, so the fallback
@@ -921,7 +921,7 @@ fn a_restriction_runs_on_a_terminal_of_its_own() {
 
 #[test]
 fn a_restricted_terminal_launch_is_refused_against_a_directed_stream() {
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let restriction = Restriction::builder()

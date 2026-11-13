@@ -270,6 +270,14 @@ on the `x86_64`, `aarch64`, and `riscv64` architectures; a policy on any other
 is a build error. [`host::seccomp_available`] reports whether the kernel offers
 seccomp at all.
 
+A sandbox with a network namespace of its own already carries a filter of the
+launch's own. It refuses vsock, io_uring, and socket creation through x86's
+`socketcall`, as [The network
+filter](how-the-sandbox-is-built.md#the-network-filter) describes. A policy here
+is installed after it. Where both refuse a syscall with an errno, the command
+sees the policy's. Under the curated policy, `io_uring_setup` therefore fails
+with `EPERM` rather than the network filter's `ENOSYS`.
+
 A root filesystem for a foreign architecture, run through `qemu-user`, is
 filtered correctly: the task making each syscall is the emulator, a host binary
 making host syscalls. What differs is the set it makes. An allowlist written
@@ -316,7 +324,9 @@ it would let the command return to the mapped uid 0.
 
 Beyond the default isolated network — a namespace whose loopback is brought up,
 so the sandbox can talk to itself — [`Network::None`] leaves loopback down. The
-command has no connectivity at all, not even to `127.0.0.1`.
+command has no connectivity at all, not even to `127.0.0.1`. Both postures carry
+[the network filter](how-the-sandbox-is-built.md#the-network-filter), which
+closes the routes out that a namespace does not cover.
 
 ```rust,no_run
 # use ferroday_cage::{Cage, Network};
@@ -469,6 +479,10 @@ in full. A library built without the `hardening` feature refuses a profile that
 configures it, rather than dropping the restrictions silently.
 
 ## Order and interaction
+
+A sandbox with a network namespace of its own installs the network filter first.
+It does so right after the command enters its nested user namespace, before
+anything on this page.
 
 The restrictions are applied to the command in a fixed order, wrapped around
 the identity switch: the securebits are locked (when a non-root identity keeps

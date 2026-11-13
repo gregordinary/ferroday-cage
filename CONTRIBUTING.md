@@ -315,7 +315,8 @@ therefore replaces the crate page with that line's metadata.
   the terminal relay's signals. The relay's signals block the relayed set and
   open the descriptor those signals arrive on. `fcage` has none. The only other
   `unsafe` is in test code that drives the kernel directly: `tests/keyring.rs`,
-  `tests/relay.rs`, and the testkit's pseudoterminal harness.
+  `tests/relay.rs`, `tests/network_filter.rs`, and the testkit's pseudoterminal
+  harness.
 - **Every `unsafe` block states its invariant.** Every crate in the workspace
   denies `unsafe` by default. Each block that needs it carries a `SAFETY:`
   comment stating the invariant it relies on, which
@@ -486,6 +487,8 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | What does the single-identity map write? | `idmap::single_identity_lines` |
 | Validate the command a sandbox or a restriction executes | `spec::validate_command` |
 | Which syscall number, or which errno, does a name spell for a seccomp policy? | `SeccompRules::syscall`, `SeccompRules::errno` |
+| Write a classic-BPF seccomp program by hand, or install one | `mechanism::seccomp`: its `bpf` opcodes and offsets, its audit architectures, and `seccomp::install` |
+| Run a seccomp program over a syscall in a unit test | `mechanism::seccomp::eval` |
 | Can this kernel enforce a Landlock request that is a reach's only bound? | `mechanism::HardeningPlan::ensure_sandbox_enforceable` for a sandbox, and `HardeningPlan::ensure_landlock_enforceable` with `hardening::ensure_scopes_enforceable` for a restriction |
 | Compose an overlay's mount options | `mechanism::overlay_options` |
 | What does a mount op bring to rest on its target, if anything? | `mechanism::MountAction::arrival`, or `Arrival::of_raw` for a raw mount's flags |

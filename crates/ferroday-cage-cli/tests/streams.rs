@@ -47,7 +47,7 @@ fn cage_sh(rootfs: &Path, extra: &[&str], script: &str) -> Command {
 /// `fcage --restrict --seccomp curated -- /bin/sh -c <script>`, when the
 /// kernel offers seccomp to confine it with.
 fn restricted_sh(script: &str) -> Option<Command> {
-    if !common::require::seccomp(ferroday_cage::host::seccomp_available()) {
+    if !common::require::seccomp() {
         return None;
     }
     let mut command = Command::new(FCAGE);

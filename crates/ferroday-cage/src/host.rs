@@ -119,9 +119,16 @@ pub fn landlock_abi() -> Option<i32> {
 
 /// Whether the running kernel offers seccomp syscall filtering.
 ///
-/// `false` means the kernel was built without `CONFIG_SECCOMP` and a seccomp
-/// policy would fail to install.
-#[cfg(feature = "hardening")]
+/// `false` means the kernel was built without `CONFIG_SECCOMP`. A sandbox with
+/// a network namespace of its own, [`Network::Isolated`] or [`Network::None`],
+/// then fails to launch, since the filter that closes the routes out such a
+/// namespace does not cover cannot be installed. A seccomp policy of the
+/// hardening layer would fail to install too. [`Network::Host`] needs no
+/// filter.
+///
+/// [`Network::Isolated`]: crate::Network::Isolated
+/// [`Network::None`]: crate::Network::None
+/// [`Network::Host`]: crate::Network::Host
 pub fn seccomp_available() -> bool {
     // PR_GET_SECCOMP answers with the current mode when seccomp is compiled
     // in, and errors when it is not. The probe changes no state.

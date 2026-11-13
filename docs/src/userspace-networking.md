@@ -420,6 +420,12 @@ external helper. A stack that needs the sandbox to reach it over loopback finds
 loopback already up under [`Network::Isolated`]; one that configures every
 interface itself can start from the bare namespace of [`Network::None`].
 
+A stack carries what routes through the namespace and nothing else. Whichever
+stack is attached, the command keeps [the network
+filter](how-the-sandbox-is-built.md#the-network-filter), which refuses vsock and
+the other routes out that a namespace does not cover. The stack itself runs
+outside the sandbox and is not filtered.
+
 [`Network::Host`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
 [`Network::Isolated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html
 [`Network::None`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Network.html

@@ -99,6 +99,7 @@ mod harden;
 mod overlay;
 mod remove;
 pub(crate) mod resolve;
+pub(crate) mod seccomp;
 pub(crate) mod sys;
 
 #[cfg(feature = "hardening")]
@@ -591,10 +592,16 @@ pub(crate) struct LaunchPlan {
 
 /// A single BPF instruction, the unit of a compiled seccomp program.
 ///
-/// Layout-compatible with the kernel's `struct sock_filter`. A caller
-/// building a program with an external compiler passes a `Vec<SockFilter>`
-/// through [`SeccompPolicy::Program`](crate::SeccompPolicy::Program).
-#[cfg(feature = "hardening")]
+/// Layout-compatible with the kernel's `struct sock_filter`.
+#[cfg_attr(
+    feature = "hardening",
+    doc = "A caller building a program with an external compiler passes a \
+           `Vec<SockFilter>` through \
+           [`SeccompPolicy::Program`](crate::SeccompPolicy::Program)."
+)]
+// Every build carries the type, since every sandbox with a network namespace
+// of its own installs `seccomp::NETWORK_FILTER`. Only the `hardening` feature
+// exports it, and only there does a caller have a program to hand the crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct SockFilter {
@@ -611,7 +618,6 @@ pub struct SockFilter {
 // The kernel reads a program as an array of these, so a layout that drifts
 // from `struct sock_filter` must fail the build rather than misissue every
 // instruction of every filter.
-#[cfg(feature = "hardening")]
 const _: () = assert!(size_of::<SockFilter>() == 8);
 
 /// One frozen Landlock grant: an absolute sandbox path and the kernel

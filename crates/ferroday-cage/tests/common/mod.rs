@@ -101,13 +101,6 @@ pub fn landlock_scope() -> bool {
     require::landlock_scope(ferroday_cage::host::landlock_abi())
 }
 
-/// Whether the kernel offers seccomp filtering.
-#[cfg(feature = "hardening")]
-#[track_caller]
-pub fn seccomp() -> bool {
-    require::seccomp(ferroday_cage::host::seccomp_available())
-}
-
 /// Builders for hermetic Debian fixtures: tar streams, `.deb` archives, and a
 /// `file://` repository, all with correct digests, so the Debian provisioner
 /// can be tested end to end without a network.

@@ -25,6 +25,31 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Security
+
+- **Breaking.** A sandbox with a network namespace of its own, under
+  `Network::Isolated` (the default) or `Network::None`, installs a seccomp
+  filter that refuses the routes out such a namespace does not cover. An
+  `AF_VSOCK` socket is refused with `EAFNOSUPPORT`, `io_uring_setup` with
+  `ENOSYS`, and on x86, socket creation through `socketcall` with `ENOSYS`. A
+  sandboxed command could previously open a vsock socket, which reaches a
+  virtual machine guest's hypervisor host, and the host's own services where the
+  host runs vsock loopback. A consumer must act on three consequences. io_uring
+  is unavailable in such a sandbox. A 32-bit x86 program built against glibc
+  creates no socket there. A host that cannot install a seccomp filter fails the
+  launch at the new `SetupStep::InstallNetworkFilter`. `Network::Host` is
+  unchanged.
+
+### Changed
+
+- `host::seccomp_available` is available without the `hardening` feature.
+
+### Internal
+
+- The classic-BPF vocabulary, the seccomp install, and the unit tests'
+  interpreter of a seccomp program moved from the hardening layer to
+  `mechanism::seccomp`, which the network filter and the hardening layer share.
+
 ## [0.5.2] - 2026-11-10
 
 `fcage` 0.6.1, which requires library 0.5.2 and changes nothing else.

@@ -79,6 +79,7 @@ use syscalls::Sysno;
 
 use super::frame;
 use super::resolve;
+use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
     IdentityPlan, LaunchPlan, MountAction, MountOp, STATUS_EXITED, STATUS_SIGNALED, StdioPlan,
@@ -628,6 +629,25 @@ fn exec_command(
     // any depth.
     if let Err((step, errno, detail)) = enter_nested_namespace(context, nested_gate) {
         report(context.report_fd, step, errno, detail);
+        sys::exit_group(127)
+    }
+
+    // The network filter, wherever the sandbox has a network namespace of its
+    // own: it refuses the routes out that a network namespace does not cover,
+    // and it is not opt-in, since without it the namespace's isolation is not
+    // what the network posture says it is. See `seccomp::NETWORK_FILTER`.
+    //
+    // Installed here, after the nested user namespace is entered: creating one
+    // grants the CAP_SYS_ADMIN that an install without no-new-privileges
+    // requires, and a launch sets no-new-privileges only where the hardening
+    // layer asks for it. A filter survives every step below, including the
+    // identity switch and the exec. Installed before the hardening layer, so a
+    // caller's own policy stacks on top of it and, where both answer a syscall
+    // with an errno, answers with its own.
+    if context.plan.unshare.contains(thread::UnshareFlags::NEWNET)
+        && let Err(errno) = seccomp::install(seccomp::NETWORK_FILTER)
+    {
+        report(context.report_fd, SetupStep::InstallNetworkFilter, errno, 0);
         sys::exit_group(127)
     }
 

@@ -124,6 +124,34 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 ];
 
 /// The sandbox's network posture.
+///
+/// [`Isolated`](Self::Isolated) and [`None`](Self::None) give the sandbox a
+/// network namespace of its own. Some routes out of a sandbox do not pass
+/// through a network namespace, so a sandbox under either posture also carries
+/// a seccomp filter that refuses them:
+///
+/// - An `AF_VSOCK` socket is refused with `EAFNOSUPPORT`. From any network
+///   namespace, vsock reaches the hypervisor's host from a virtual machine
+///   guest, and the host's own services where the host runs vsock loopback.
+/// - `io_uring_setup` is refused with `ENOSYS`. A ring creates sockets of its
+///   own, which no syscall filter sees.
+/// - On x86, socket creation through `socketcall` is refused with `ENOSYS`.
+///   `socketcall` passes the address family by pointer, where a filter cannot
+///   read it, and 64-bit code reaches it through `int 0x80`. A 32-bit glibc
+///   program creates every socket that way, so it creates none in such a
+///   sandbox. A musl program tries the direct call first, and a 64-bit program
+///   always makes it, so both create sockets as usual.
+///
+/// Each answer is the one a kernel without the facility gives, so a program
+/// that probes for one reads it as absent. Every other address family is the
+/// namespace's to govern. A seccomp policy of the hardening layer is installed
+/// after the filter. Where both refuse a syscall with an errno, the command
+/// sees the policy's.
+///
+/// A host that cannot install the filter fails the launch at
+/// [`SetupStep::InstallNetworkFilter`](crate::SetupStep::InstallNetworkFilter).
+/// [`host::seccomp_available`](crate::host::seccomp_available) reports whether
+/// the kernel offers seccomp at all. [`Host`](Self::Host) carries no filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -133,17 +161,19 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 )]
 pub enum Network {
     /// A new network namespace whose only interface is loopback, brought up
-    /// during setup. The sandbox has no external connectivity. This is the
-    /// default.
+    /// during setup, and the filter the type's documentation describes. The
+    /// sandbox has no external connectivity. This is the default.
     #[default]
     Isolated,
     /// Share the host's network namespace. The sandbox sees the host's
     /// interfaces, and the host's `resolv.conf` is bound read-only into the
-    /// rootfs unless disabled with [`CageBuilder::resolv_conf`].
+    /// rootfs unless disabled with [`CageBuilder::resolv_conf`]. No network
+    /// filter is installed: the host's network includes its vsock.
     Host,
     /// A new network namespace with no interface brought up, not even
-    /// loopback. The sandbox has no connectivity at all — unlike
-    /// [`Isolated`](Self::Isolated), it cannot even reach `127.0.0.1`.
+    /// loopback, and the same filter as [`Isolated`](Self::Isolated). The
+    /// sandbox has no connectivity at all. Unlike `Isolated`, it cannot even
+    /// reach `127.0.0.1`.
     None,
 }
 
@@ -1465,7 +1495,8 @@ impl CageBuilder {
     /// Selects the sandbox's network posture.
     ///
     /// The default is [`Network::Isolated`]: a new network namespace whose
-    /// only interface is loopback.
+    /// only interface is loopback, and a filter refusing the routes out that a
+    /// network namespace does not cover. [`Network`] lists them.
     pub fn network(mut self, network: Network) -> Self {
         self.network = network;
         self

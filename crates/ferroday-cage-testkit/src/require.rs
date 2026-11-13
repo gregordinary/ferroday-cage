@@ -15,9 +15,8 @@
 //! [`premise_unmet`] is the one skip no variable governs.
 //!
 //! The probes themselves stay with the tests where they need a library feature
-//! (`host::landlock_abi` and `host::seccomp_available` are the hardening
-//! layer's), and their results are handed in. The probes a featureless library
-//! answers are here.
+//! (`host::landlock_abi` is the hardening layer's), and their results are
+//! handed in. The probes a featureless library answers are here.
 
 use std::fmt::Display;
 use std::path::Path;
@@ -227,11 +226,14 @@ pub fn landlock_scope(abi: Option<i32>) -> bool {
     }
 }
 
-/// Whether the kernel offers seccomp filtering, given what
-/// `host::seccomp_available` reported.
+/// Whether the kernel offers seccomp filtering, which a hardening policy and
+/// every sandbox with a network namespace of its own install.
 #[track_caller]
-pub fn seccomp(available: bool) -> bool {
-    SECCOMP.holds(available, "the kernel offers no seccomp support")
+pub fn seccomp() -> bool {
+    SECCOMP.holds(
+        ferroday_cage::host::seccomp_available(),
+        "the kernel offers no seccomp support",
+    )
 }
 
 /// Whether a network suite runs: `gate` opts into it, and without it the suite

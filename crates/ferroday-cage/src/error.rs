@@ -179,6 +179,10 @@ wire_enum! {
         AllocateTerminal = 56 => "allocating the sandbox's pseudoterminal",
         /// Hand the primary of the sandbox's pseudoterminal back to the caller.
         SendTerminal = 57 => "handing the sandbox's pseudoterminal to the caller",
+        /// Install the seccomp filter a sandbox with a network namespace of its
+        /// own carries, which refuses the routes out that the namespace does
+        /// not cover. See [`Network::Isolated`](crate::Network::Isolated).
+        InstallNetworkFilter = 58 => "installing the network namespace's seccomp filter",
     }
 }
 

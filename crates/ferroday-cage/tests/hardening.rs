@@ -457,7 +457,7 @@ fn landlock_net_denies_an_ungranted_bind() {
 #[test]
 fn curated_seccomp_allows_an_ordinary_command() {
     let Some(rootfs) = rootfs() else { return };
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     let status = Cage::builder()
@@ -480,7 +480,7 @@ fn curated_seccomp_denies_a_listed_syscall() {
     let Some(rootfs) = rootfs() else {
         return;
     };
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // mount is on the curated denylist, denied with EPERM. The cage command is
@@ -527,7 +527,7 @@ fn curated_seccomp_denies_creating_a_namespace() {
     let Some(rootfs) = rootfs() else {
         return;
     };
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // The command is root in its own user namespace, so a new user namespace
@@ -617,7 +617,7 @@ fn an_errno_no_failed_syscall_reports_is_refused_at_build() {
 #[test]
 fn a_denied_syscall_kills_the_command() {
     let Some(rootfs) = rootfs() else { return };
-    if !common::seccomp() {
+    if !common::require::seccomp() {
         return;
     }
     // Denying write with a process kill: the command dies with SIGSYS the

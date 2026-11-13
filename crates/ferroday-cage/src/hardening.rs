@@ -32,6 +32,9 @@ use std::str::FromStr;
 use rustix::thread::CapabilitySet;
 
 use crate::error::ConfigError;
+use crate::mechanism::seccomp::{
+    AUDIT_ARCH_AARCH64, AUDIT_ARCH_RISCV64, AUDIT_ARCH_X86_64, ENOSYS, X32_SYSCALL_BIT, bpf,
+};
 use crate::mechanism::{HardeningPlan, LandlockNetRule, LandlockRule, SockFilter};
 use crate::roster::roster_enum;
 
@@ -743,13 +746,6 @@ impl SeccompAction {
 
 /// `EPERM`, the error a denied syscall reports by default.
 const EPERM: u16 = 1;
-
-/// `ENOSYS`, the error a kernel answers a syscall it does not implement with.
-///
-/// The generic number, which every architecture with seccomp support here
-/// shares. A filter answers with it where the caller should read a refusal as
-/// absence: the x32 guard, and `clone3` in the curated policy.
-const ENOSYS: u16 = 38;
 
 /// The largest errno a syscall can fail with. The C library reads a raw result
 /// in `-4095..=-1` as a failure with that errno, and any other as a value.
@@ -1930,42 +1926,6 @@ fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigErro
     Ok(program)
 }
 
-/// Classic-BPF opcodes and `seccomp_data` field offsets for the hand-emitted
-/// fragments: the x32 guard and the per-syscall errno prologue. Named here
-/// rather than pulled from a binding so the crate's raw BPF is self-contained
-/// and reviewable.
-mod bpf {
-    /// `BPF_LD | BPF_W | BPF_ABS`: load a 32-bit word from a fixed offset in
-    /// `seccomp_data` into the accumulator.
-    pub(super) const LD_W_ABS: u16 = 0x20;
-    /// `BPF_JMP | BPF_JEQ | BPF_K`: branch on the accumulator equalling `k`.
-    pub(super) const JMP_JEQ_K: u16 = 0x15;
-    /// `BPF_JMP | BPF_JSET | BPF_K`: branch on the accumulator sharing any bit
-    /// with `k`.
-    pub(super) const JMP_JSET_K: u16 = 0x45;
-    /// `BPF_JMP | BPF_JA`: jump forward `k` instructions unconditionally.
-    pub(super) const JMP_JA: u16 = 0x05;
-    /// `BPF_RET | BPF_K`: return `k` as the seccomp action.
-    pub(super) const RET_K: u16 = 0x06;
-
-    /// Byte offset of `seccomp_data.nr`, the syscall number.
-    pub(super) const OFF_NR: u32 = 0;
-    /// Byte offset of `seccomp_data.arch`, the AUDIT_ARCH of the syscall.
-    pub(super) const OFF_ARCH: u32 = 4;
-}
-
-/// `AUDIT_ARCH_X86_64`: the audit architecture the x32 ABI shares with 64-bit
-/// x86_64, which is why an x32 syscall passes an x86_64 arch gate.
-///
-/// Only a denylist needs to care: an allowlist's default-deny already refuses
-/// the x32 numbers, so the guard this constant serves — [`x32_deny_prologue`] —
-/// is emitted for a permissive default alone, in [`compile_filter`].
-const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
-/// `AUDIT_ARCH_AARCH64`.
-const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
-/// `AUDIT_ARCH_RISCV64`.
-const AUDIT_ARCH_RISCV64: u32 = 0xC000_00F3;
-
 /// The audit architecture a filter for `arch` gates on.
 ///
 /// seccompiler gates its own program on the same value and keeps it private,
@@ -1978,18 +1938,6 @@ fn audit_arch(arch: seccompiler::TargetArch) -> u32 {
     }
 }
 
-/// `__X32_SYSCALL_BIT`: set on every syscall number issued through the x32 ABI.
-///
-/// Adding it to a syscall number gives the x32 alias of the same call, which is
-/// what lets an x32 caller slip past a denylist that names only the 64-bit
-/// numbers; see [`AUDIT_ARCH_X86_64`].
-///
-/// It is also the ceiling on a syscall number a policy may name, on every
-/// architecture: no architecture's own table reaches it, and on x86_64 a number
-/// at or above it is an x32 alias, which [`x32_deny_prologue`] refuses
-/// wholesale and the crate does not otherwise support.
-const X32_SYSCALL_BIT: u32 = 0x4000_0000;
-
 /// The raw `SECCOMP_RET_*` value a BPF `ret` returns for `action`.
 ///
 /// The fragments emitted ahead of seccompiler's program return an action
@@ -2000,6 +1948,11 @@ fn ret_value(action: SeccompAction) -> u32 {
 
 /// Refuses a syscall number no filter can name: a negative one, and one at or
 /// above [`X32_SYSCALL_BIT`].
+///
+/// That bit is the ceiling on every architecture: no architecture's own table
+/// reaches it, and on x86_64 a number at or above it is an x32 alias, which
+/// [`x32_deny_prologue`] refuses wholesale and the crate does not otherwise
+/// support.
 ///
 /// The compiler backend narrows every number to the 32 bits a BPF comparison
 /// holds and would panic on one that does not fit, so this runs before it.
@@ -2084,6 +2037,10 @@ fn errno_prologue(arch: u32, errnos: &BTreeMap<i64, u16>) -> Vec<SockFilter> {
 /// A five-instruction classic-BPF prologue answering every syscall carrying
 /// `__X32_SYSCALL_BIT` with `ENOSYS`, for prepending to a denylist compiled
 /// for x86_64.
+///
+/// Only a denylist needs it: an allowlist's denying default already refuses
+/// the x32 numbers, so [`compile_filter`] emits this for a permissive default
+/// alone.
 ///
 /// A denylist gates on AUDIT_ARCH_X86_64 and then matches raw syscall numbers.
 /// The x32 ABI shares that arch but sets `__X32_SYSCALL_BIT` on every number,
@@ -2907,68 +2864,16 @@ pub(crate) mod serde_request {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mechanism::seccomp::eval::{self, Call};
 
-    /// The `seccomp_data` a filter is run over: the syscall number, the audit
-    /// architecture, and the six arguments.
-    struct Call {
-        arch: u32,
-        nr: u32,
-        args: [u64; 6],
-    }
-
-    impl Call {
-        /// A call of `syscall` on the host's architecture, with `args` and then
-        /// zeroes.
-        fn host(syscall: i64, args: &[u64]) -> Call {
-            let mut all = [0; 6];
-            all[..args.len()].copy_from_slice(args);
-            Call {
-                arch: audit_arch(host_target_arch().unwrap()),
-                nr: u32::try_from(syscall).unwrap(),
-                args: all,
-            }
-        }
-    }
-
-    /// Runs a classic BPF filter over `call` as the kernel does, returning the
-    /// `SECCOMP_RET_*` value it answers.
-    ///
-    /// Only the instructions this crate's fragments and seccompiler's backend
-    /// emit are interpreted. Any other fails the test, so a program that
-    /// starts using one is not misread.
-    fn run_filter(program: &[SockFilter], call: &Call) -> u32 {
-        let mut data = [0u8; 64];
-        data[0..4].copy_from_slice(&call.nr.to_ne_bytes());
-        data[4..8].copy_from_slice(&call.arch.to_ne_bytes());
-        for (index, arg) in call.args.iter().enumerate() {
-            let at = 16 + 8 * index;
-            data[at..at + 8].copy_from_slice(&arg.to_ne_bytes());
-        }
-        let mut accumulator = 0u32;
-        let mut next = 0usize;
-        loop {
-            let insn = program[next];
-            next += 1;
-            let k = insn.k;
-            let branch = |taken: bool| usize::from(if taken { insn.jt } else { insn.jf });
-            match insn.code {
-                bpf::LD_W_ABS => {
-                    let at = k as usize;
-                    accumulator = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
-                }
-                // BPF_ALU | BPF_AND | BPF_K
-                0x54 => accumulator &= k,
-                bpf::JMP_JA => next += k as usize,
-                bpf::JMP_JEQ_K => next += branch(accumulator == k),
-                // BPF_JMP | BPF_JGT | BPF_K
-                0x25 => next += branch(accumulator > k),
-                // BPF_JMP | BPF_JGE | BPF_K
-                0x35 => next += branch(accumulator >= k),
-                bpf::JMP_JSET_K => next += branch(accumulator & k != 0),
-                bpf::RET_K => return k,
-                code => panic!("instruction {code:#06x} at {} is not interpreted", next - 1),
-            }
-        }
+    /// A call of `syscall` on the host's architecture, with `args` and then
+    /// zeroes.
+    fn host_call(syscall: i64, args: &[u64]) -> Call {
+        Call::new(
+            audit_arch(host_target_arch().unwrap()),
+            u32::try_from(syscall).unwrap(),
+            args,
+        )
     }
 
     #[test]
@@ -3343,8 +3248,8 @@ mod tests {
         let program = compile_seccomp(&SeccompPolicy::Rules(rules)).unwrap();
         let enosys = ret_value(SeccompAction::Errno(ENOSYS));
         for syscall in [libc::SYS_keyctl, libc::SYS_ptrace, libc::SYS_getpid] {
-            let x32 = Call::host(syscall | i64::from(X32_SYSCALL_BIT), &[]);
-            assert_eq!(run_filter(&program, &x32), enosys, "x32 syscall {syscall}");
+            let x32 = host_call(syscall | i64::from(X32_SYSCALL_BIT), &[]);
+            assert_eq!(eval::run(&program, &x32), enosys, "x32 syscall {syscall}");
         }
         // The 64-bit calls keep the answers the policy gives them.
         for (syscall, action) in [
@@ -3352,14 +3257,13 @@ mod tests {
             (libc::SYS_ptrace, SeccompAction::Log),
             (libc::SYS_getpid, SeccompAction::Allow),
         ] {
-            let call = Call::host(syscall, &[]);
-            assert_eq!(run_filter(&program, &call), ret_value(action), "{syscall}");
+            let call = host_call(syscall, &[]);
+            assert_eq!(eval::run(&program, &call), ret_value(action), "{syscall}");
         }
     }
 
     #[test]
-    fn enosys_is_the_kernels() {
-        assert_eq!(i32::from(ENOSYS), libc::ENOSYS);
+    fn eperm_is_the_kernels() {
         assert_eq!(i32::from(EPERM), libc::EPERM);
     }
 
@@ -3383,18 +3287,18 @@ mod tests {
         // Every namespace flag, alone or beside others, refuses the call.
         for flag in new {
             for flags in [flag, flag | sigchld, flag | libc::CLONE_NEWUSER as u64] {
-                let clone = Call::host(libc::SYS_clone, &[flags]);
-                assert_eq!(run_filter(&program, &clone), eperm, "clone {flags:#x}");
-                let unshare = Call::host(libc::SYS_unshare, &[flags]);
-                assert_eq!(run_filter(&program, &unshare), eperm, "unshare {flags:#x}");
+                let clone = host_call(libc::SYS_clone, &[flags]);
+                assert_eq!(eval::run(&program, &clone), eperm, "clone {flags:#x}");
+                let unshare = host_call(libc::SYS_unshare, &[flags]);
+                assert_eq!(eval::run(&program, &unshare), eperm, "unshare {flags:#x}");
             }
         }
-        let new_time = Call::host(libc::SYS_unshare, &[libc::CLONE_NEWTIME as u64]);
-        assert_eq!(run_filter(&program, &new_time), eperm);
+        let new_time = host_call(libc::SYS_unshare, &[libc::CLONE_NEWTIME as u64]);
+        assert_eq!(eval::run(&program, &new_time), eperm);
         // Bits above the low 32 hide nothing: `clone` never reads them, and
         // `unshare` refuses them itself.
-        let high = Call::host(libc::SYS_unshare, &[1 << 32 | libc::CLONE_NEWUSER as u64]);
-        assert_eq!(run_filter(&program, &high), eperm);
+        let high = host_call(libc::SYS_unshare, &[1 << 32 | libc::CLONE_NEWUSER as u64]);
+        assert_eq!(eval::run(&program, &high), eperm);
 
         // A process or a thread starts as usual. glibc's thread flags, its
         // fork's, and a vfork-style spawn are all flags without a namespace.
@@ -3410,22 +3314,22 @@ mod tests {
         let fork = (libc::CLONE_CHILD_SETTID | libc::CLONE_CHILD_CLEARTID) as u64 | sigchld;
         let spawn = (libc::CLONE_VM | libc::CLONE_VFORK) as u64 | sigchld;
         for flags in [thread, fork, spawn] {
-            let clone = Call::host(libc::SYS_clone, &[flags]);
-            assert_eq!(run_filter(&program, &clone), allow, "clone {flags:#x}");
+            let clone = host_call(libc::SYS_clone, &[flags]);
+            assert_eq!(eval::run(&program, &clone), allow, "clone {flags:#x}");
         }
         // Unsharing what is not a namespace stays allowed. The exit signal's
         // byte is `clone`'s, so a signal number sharing `CLONE_NEWTIME`'s bit
         // is not mistaken for it.
-        let files = Call::host(libc::SYS_unshare, &[libc::CLONE_FILES as u64]);
-        assert_eq!(run_filter(&program, &files), allow);
-        let signal = Call::host(libc::SYS_clone, &[libc::CLONE_NEWTIME as u64 | sigchld]);
-        assert_eq!(run_filter(&program, &signal), allow);
+        let files = host_call(libc::SYS_unshare, &[libc::CLONE_FILES as u64]);
+        assert_eq!(eval::run(&program, &files), allow);
+        let signal = host_call(libc::SYS_clone, &[libc::CLONE_NEWTIME as u64 | sigchld]);
+        assert_eq!(eval::run(&program, &signal), allow);
 
         // `clone3` is answered ENOSYS, whatever it was asked, so the C library
         // falls back to `clone`.
-        let clone3 = Call::host(libc::SYS_clone3, &[0, 88]);
+        let clone3 = host_call(libc::SYS_clone3, &[0, 88]);
         assert_eq!(
-            run_filter(&program, &clone3),
+            eval::run(&program, &clone3),
             ret_value(SeccompAction::Errno(ENOSYS))
         );
     }
