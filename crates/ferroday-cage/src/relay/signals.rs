@@ -37,9 +37,9 @@ use crate::mechanism::sys::{self, How, SigSet};
 /// restoration discipline holds from the background as it does from the
 /// foreground. The same block would let a session *started* in the background
 /// rewrite the terminal of the shell that holds it, which is why raw mode is
-/// entered only from the foreground. `SIGTTIN` is deliberately *not* blocked: a
-/// backgrounded relay stopping when it tries to read the terminal is the
-/// conventional behavior, and the one the caller's shell reports.
+/// entered only from the foreground. `SIGTTIN` is not blocked, and the relay
+/// does not raise it: it leaves the caller's input unread while it is in the
+/// background, for the reason the relay's own module documentation gives.
 pub(super) const RELAYED: [Signal; 8] = [
     Signal::WINCH,
     Signal::INT,

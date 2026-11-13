@@ -100,7 +100,7 @@
 //! stops. A deadline or an interrupt therefore ends the session however long a
 //! descendant keeps the terminal.
 //!
-//! # Raw mode belongs to the foreground
+//! # Raw mode and the input belong to the foreground
 //!
 //! Raw mode is entered only while the relaying process is in the foreground
 //! process group of the terminal it was given. A relay started in the
@@ -110,6 +110,13 @@
 //! the foreground, which is what `fg` sends. A terminal that is not the
 //! process's controlling terminal has no foreground to defer to, and raw mode
 //! applies at once.
+//!
+//! The caller's input follows the same rule. In the background the relay
+//! neither watches nor reads it, so a line typed at the shell is the shell's,
+//! and the relay never stops on the `SIGTTIN` a background read raises. It
+//! keeps relaying the sandbox's output, and a deadline or an interrupt from
+//! outside binds it as in the foreground. The input is watched again from the
+//! continue that brings the session forward.
 //!
 //! # The two directions are not symmetric
 //!
@@ -419,8 +426,9 @@ impl<'fd> Relay<'fd> {
             };
             // The caller's input is watched only while there is room to put what
             // it produces: with a full pending buffer, reading more would grow
-            // it without bound.
-            let watch_input = input_open && pending.is_empty();
+            // it without bound. And only while it may be read at all; see
+            // `reads_input`.
+            let watch_input = input_open && pending.is_empty() && self.reads_input();
             let mut primary_events = PollFlags::IN;
             if !pending.is_empty() {
                 primary_events |= PollFlags::OUT;
@@ -475,9 +483,11 @@ impl<'fd> Relay<'fd> {
             // hung up, in error, or naming no open description at all. The last
             // is a caller started with its input closed, which reports
             // `POLLNVAL` and would otherwise be ready forever without anything
-            // acting on it.
+            // acting on it. Asked again before the read, because a continue
+            // handled above may have left this process in the background.
             if ready[INPUT]
                 .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
+                && self.reads_input()
             {
                 match rustix::io::read(self.input, &mut buf) {
                     // End of input. There is no way to close a
@@ -531,6 +541,22 @@ impl<'fd> Relay<'fd> {
                 return self.drain(pty, &mut buf);
             }
         }
+    }
+
+    /// Whether the caller's input may be read now: unless it is this process's
+    /// controlling terminal and the process is in the background.
+    ///
+    /// A read from the background stops the process with `SIGTTIN`. The `fg`
+    /// that continues it restarts the read before the continue is handled, so
+    /// the read finds the terminal as the background left it: cooked, since raw
+    /// mode waits for the foreground too, and likely emptied of the line that
+    /// woke the poll by the shell that read it. The read then blocks until
+    /// another line is typed, and nothing is relayed in the meantime, a deadline
+    /// or an interrupt from outside included. So the input is left unread, and
+    /// out of the poll, for as long as the session is in the background, and the
+    /// continue that brings it forward is what wakes the loop to watch it again.
+    fn reads_input(&self) -> bool {
+        raw::in_foreground(self.input)
     }
 
     /// Delivers what the sandbox's terminal holds once the command has exited,

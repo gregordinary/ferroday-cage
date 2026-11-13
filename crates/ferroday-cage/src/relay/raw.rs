@@ -309,17 +309,18 @@ impl Drop for RawMode<'_> {
     }
 }
 
-/// Whether this process may change `fd`'s terminal settings without taking
-/// them from a foreground job: it is in the terminal's foreground process
-/// group, or the terminal is not its controlling terminal at all.
+/// Whether this process may change `fd`'s terminal settings, or read from it,
+/// without taking it from a foreground job: it is in the terminal's foreground
+/// process group, or `fd` is not its controlling terminal at all.
 ///
 /// The second case is a terminal no job control governs. A pseudoterminal a
 /// program opened for itself is one, and so is a terminal reached from another
-/// session. The kernel answers `ENOTTY` for those, and no `SIGTTOU` would ever
-/// apply to a write, so there is no foreground to defer to. The same reading
-/// covers a controlling terminal whose foreground group has gone, which the
-/// kernel lets anyone in the session write.
-fn in_foreground(fd: BorrowedFd<'_>) -> bool {
+/// session. The kernel answers `ENOTTY` for those, as it does for a descriptor
+/// that is no terminal, and no `SIGTTOU` or `SIGTTIN` would ever apply, so
+/// there is no foreground to defer to. The same reading covers a controlling
+/// terminal whose foreground group has gone, which the kernel lets anyone in
+/// the session write.
+pub(super) fn in_foreground(fd: BorrowedFd<'_>) -> bool {
     match termios::tcgetpgrp(fd) {
         Ok(foreground) => foreground == rustix::process::getpgrp(),
         Err(_) => true,

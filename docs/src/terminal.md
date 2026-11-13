@@ -455,7 +455,7 @@ shared flags. `SIGWINCH` resizes the sandbox's terminal;
 second one kills it, while a typed `^C` is a byte the sandbox's own line
 discipline acts on; `SIGTSTP` restores and stops; `SIGCONT` re-enters raw mode
 and re-reads the size. The module's own documentation carries the whole table,
-including why `SIGTTOU` is blocked and `SIGTTIN` deliberately is not.
+including why `SIGTTOU` is blocked and why `SIGTTIN` never arises.
 
 Raw mode is entered only while the relaying process is in the foreground process
 group of its terminal. With `SIGTTOU` blocked, nothing else would stop a session
@@ -464,6 +464,13 @@ of the shell that holds the terminal. Such a session relays without raw mode,
 and enters it on the first `SIGCONT` that finds it in the foreground, which is
 what `fg` sends. A continue from `bg` leaves it in the background and changes
 nothing.
+
+The caller's input waits for the foreground the same way. A session in the
+background neither watches nor reads its terminal, so what is typed there is the
+shell's. The session keeps relaying the sandbox's output, and a timeout or a
+`SIGTERM` still ends it. A read from the background would stop the session with
+`SIGTTIN`, and the `fg` that continued it would find the read waiting for a line
+in a cooked terminal, with nothing relayed until one came.
 
 The two directions are not symmetric: the caller-bound one is a plain blocking
 write, outside the poll. Making it symmetric would need `O_NONBLOCK` on the

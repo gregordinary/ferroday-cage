@@ -10,7 +10,9 @@
 //! flag advertises. The interactive one allocates a pseudoterminal of the test's
 //! own, puts `fcage` in a session of its own with the replica on all three
 //! standard descriptors, and drives it as a user would — which is the only way
-//! to reach raw mode, the size copy, `SIGWINCH`, and the restoration.
+//! to reach raw mode, the size copy, `SIGWINCH`, and the restoration. Job
+//! control takes one more process: the session is led by this test binary,
+//! playing the shell, and `fcage` runs in it as a job.
 //!
 //! Every test skips explicitly, on stderr, on a host that cannot create
 //! unprivileged user namespaces; `FERRODAY_CAGE_REQUIRE_USERNS` turns each skip
@@ -337,6 +339,201 @@ fn a_stop_restores_the_terminal_and_a_continue_re_enters_raw_mode() {
     let status = session.finish();
     assert!(status.success(), "{status}");
     pty::assert_restored(&cooked, &session.settings());
+}
+
+/// Names the role this test binary plays when it runs itself as the shell of
+/// [`a_session_in_the_background_leaves_the_input_to_its_shell`].
+const BACKGROUND_SHELL: &str = "FERRODAY_CAGE_TEST_BACKGROUND_SHELL";
+
+/// What the background session's command prints, through the relay, once it
+/// runs.
+const BACKGROUND_READY: &str = "background-session-ready";
+
+/// A session in the background leaves the terminal's input to the shell in the
+/// foreground, and relays again once `fg` brings it forward.
+///
+/// A read of the terminal from the background raises `SIGTTIN`, which stops the
+/// session. The `fg` that continues it restarts that read before the relay sees
+/// the continue, in a terminal still cooked and emptied of the line by the
+/// shell, so the session would sit in the read with nothing relayed and a
+/// `SIGTERM` unanswered.
+///
+/// Job control needs a shell, and a job whose shell is in its session: a read
+/// from a process group with no parent in its session, the orphaned group a
+/// session leader's job would be, gets `EIO` instead of the stop. So this test
+/// binary runs itself as that shell, in a session of its own on a fresh
+/// pseudoterminal, and starts `fcage` as a background job of its own; see
+/// [`helper_shell_with_a_background_session`]. This test plays the user, and
+/// types a line at the shell while the session is in the background.
+#[test]
+fn a_session_in_the_background_leaves_the_input_to_its_shell() {
+    let Some(_) = common::fixture_rootfs() else {
+        return;
+    };
+    let (primary, replica) = pty::pair(24, 80);
+    let mut command = Command::new(std::env::current_exe().expect("the test binary has a path"));
+    command
+        .args([
+            "--exact",
+            "helper_shell_with_a_background_session",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(BACKGROUND_SHELL, "1");
+    let mut child = pty::spawn_controlled(&mut command, &replica);
+    // The test's own copy goes, so the helper's exit hangs the primary up.
+    drop(replica);
+
+    // The marker is the sandbox's, relayed from the background; nothing has
+    // been typed that the terminal could have echoed instead.
+    let mut seen = String::new();
+    let ready = pty::read_until(
+        &primary,
+        BACKGROUND_READY,
+        Instant::now() + Duration::from_secs(10),
+        &mut seen,
+    );
+    if ready {
+        pty::send(&primary, "typed at the shell\n");
+    }
+
+    // Drained throughout, so neither the helper's report nor the session's
+    // output can fill the terminal and stall the helper.
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the helper can be waited for") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the helper did not finish; the terminal showed:\n{seen}");
+        }
+        pty::drain_until(
+            &primary,
+            Instant::now() + Duration::from_millis(50),
+            &mut seen,
+        );
+    };
+    while pty::drain_until(
+        &primary,
+        Instant::now() + Duration::from_millis(100),
+        &mut seen,
+    ) {}
+    assert!(
+        ready,
+        "the background session never ran; the terminal showed:\n{seen}"
+    );
+    assert!(
+        status.success(),
+        "the helper failed; the terminal showed:\n{seen}"
+    );
+}
+
+/// Not a test of its own: when [`BACKGROUND_SHELL`] is set, this plays a shell
+/// that starts `fcage --terminal` as a background job, reads a line typed while
+/// the job is in the background, brings the job forward with `fg`, and then
+/// ends it with a `SIGTERM`. Without the variable it does nothing.
+///
+/// Its process leads a session whose controlling terminal is its standard
+/// input, and holds the terminal's foreground, as an interactive shell does.
+/// The job is a process group of its own, started by this process, so a stop is
+/// reported to this process as the job's parent, as a shell learns of one.
+#[test]
+fn helper_shell_with_a_background_session() {
+    use std::os::unix::process::CommandExt as _;
+
+    use rustix::process::{Pid, Signal, WaitOptions};
+
+    if std::env::var_os(BACKGROUND_SHELL).is_none() {
+        return;
+    }
+    let rootfs =
+        common::fixture_rootfs().expect("the parent runs the helper only where sandboxes launch");
+    let terminal = rustix::stdio::stdin();
+    let mut job = Command::new(FCAGE)
+        .args(["--rootfs", rootfs.to_str().unwrap(), "--terminal", "--"])
+        .args([
+            "/bin/sh",
+            "-c",
+            &format!("echo {BACKGROUND_READY}; exec sleep 60"),
+        ])
+        .process_group(0)
+        .spawn()
+        .expect("the job starts");
+    let pid = Pid::from_raw(job.id() as i32).expect("a live pid");
+
+    // The user types a line at the shell. In canonical mode a line counts as
+    // queued once it is whole.
+    let typed_by = Instant::now() + PATIENCE;
+    while rustix::io::ioctl_fionread(terminal).expect("the terminal reports its queue") == 0 {
+        assert!(Instant::now() < typed_by, "nothing was typed at the shell");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The line waits in the terminal while the session is in the background. A
+    // session that read it would stop on SIGTTIN. Asked of `waitpid` directly,
+    // since the handle cannot report a stop, and a stop report reaps nothing.
+    let mut stopped = false;
+    let window = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < window {
+        if let Some((_, status)) =
+            rustix::process::waitpid(Some(pid), WaitOptions::UNTRACED | WaitOptions::NOHANG)
+                .expect("the job can be waited for")
+        {
+            assert!(
+                status.stopped(),
+                "the session ended in the background: {status:?}"
+            );
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The shell reads its line, then `fg`: the foreground moves to the job's
+    // group, then the continue.
+    let mut line = [0u8; 64];
+    let read = rustix::io::read(terminal, &mut line).expect("the shell reads its line");
+    termios::tcsetpgrp(terminal, pid).expect("the job's group takes the foreground");
+    rustix::process::kill_process(pid, Signal::CONT).expect("the job is continued");
+    let raw_by = Instant::now() + Duration::from_secs(5);
+    let mut raw = false;
+    while !raw && Instant::now() < raw_by {
+        raw = termios::tcgetattr(terminal).is_ok_and(|settings| pty::is_raw(&settings));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // An interrupt from outside ends the session.
+    rustix::process::kill_process(pid, Signal::TERM).expect("the job is signalled");
+    let end_by = Instant::now() + Duration::from_secs(10);
+    let mut ended = job.try_wait().expect("the job can be waited for");
+    while ended.is_none() && Instant::now() < end_by {
+        std::thread::sleep(Duration::from_millis(20));
+        ended = job.try_wait().expect("the job can be waited for");
+    }
+    if ended.is_none() {
+        let _ = job.kill();
+        let _ = job.wait();
+    }
+
+    assert!(
+        !stopped,
+        "the session read the terminal from the background and stopped on SIGTTIN",
+    );
+    assert_eq!(
+        &line[..read],
+        b"typed at the shell\n",
+        "the shell read the line typed at it",
+    );
+    assert!(
+        raw,
+        "brought to the foreground, the session never entered raw mode"
+    );
+    assert!(
+        ended.is_some(),
+        "the session did not end on the termination request"
+    );
 }
 
 // -- Helpers ------------------------------------------------------------------
