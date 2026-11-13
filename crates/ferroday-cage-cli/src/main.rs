@@ -5656,12 +5656,65 @@ impl Launch {
                 relay,
             );
         }
-        let outcome = builder
-            .build()
-            .and_then(|cage| cage.spawn())
-            .and_then(|running| wait_with_deadline(running, timeout, kill_after));
-        finish(relay, outcome.map_err(Failure::from))
+        let outcome = start(builder, Cage::spawn)
+            .and_then(|running| Ok(wait_with_deadline(running, timeout, kill_after)?));
+        finish(relay, outcome)
     }
+}
+
+/// A launch builder as [`start`] drives one: [`CageBuilder`] or
+/// [`RestrictionBuilder`], built, and asked what the build records.
+trait Launcher {
+    /// What the builder builds: a [`Cage`] or a [`Restriction`].
+    type Built;
+
+    /// Builds the launch.
+    fn build(self) -> Result<Self::Built, Error>;
+
+    /// What the build resolved its inputs to.
+    fn resolved_inputs(built: &Self::Built) -> ResolvedInputs;
+}
+
+impl Launcher for CageBuilder {
+    type Built = Cage;
+
+    fn build(self) -> Result<Cage, Error> {
+        CageBuilder::build(self)
+    }
+
+    fn resolved_inputs(built: &Cage) -> ResolvedInputs {
+        built.resolved_inputs()
+    }
+}
+
+impl Launcher for RestrictionBuilder {
+    type Built = Restriction;
+
+    fn build(self) -> Result<Restriction, Error> {
+        RestrictionBuilder::build(self)
+    }
+
+    fn resolved_inputs(built: &Restriction) -> ResolvedInputs {
+        built.resolved_inputs()
+    }
+}
+
+/// Builds a launch, says on standard error what the build leaves unapplied,
+/// and starts it with `spawn`.
+///
+/// Every launch `fcage` makes passes through here, whichever builder it is and
+/// however it starts: plain, on a terminal, or held at the pending seam. What a
+/// build records as unapplied is therefore said on every path, rather than on
+/// the paths that remember to say it. A reader of the notice that has gone
+/// stops the launch before anything is started.
+fn start<B: Launcher, T>(
+    builder: B,
+    spawn: impl FnOnce(&B::Built) -> Result<T, Error>,
+) -> Result<T, Failure> {
+    let built = builder.build()?;
+    say_unapplied_cgroup(&B::resolved_inputs(&built))
+        .map_err(|output::ReaderGone| Failure::ReaderGone)?;
+    Ok(spawn(&built)?)
 }
 
 /// The host's `TERM`, where a launch passes it to the command.
@@ -5811,12 +5864,12 @@ fn run_on_a_terminal(
         Ok(signals) => signals,
         Err(error) => return conclude(Err(error.into())),
     };
-    let launched = builder
-        .build()
-        .and_then(|cage| cage.spawn_terminal(&terminal::terminal_for_caller()));
+    let launched = start(builder, |cage| {
+        cage.spawn_terminal(&terminal::terminal_for_caller())
+    });
     let (running, pty) = match launched {
         Ok(launched) => launched,
-        Err(error) => return conclude(Err(error.into())),
+        Err(failure) => return conclude(Err(failure)),
     };
     conclude(terminal::relay(running, pty, signals, timeout, kill_after).map_err(Failure::from))
 }
@@ -5885,14 +5938,6 @@ fn run_pending(
     } else {
         None
     };
-    let cage = match builder.build() {
-        Ok(cage) => cage,
-        Err(error) => return finish(relay, Err(error.into())),
-    };
-    if say_unapplied_cgroup(&cage.resolved_inputs()).is_err() {
-        return finish(relay, Err(Failure::ReaderGone));
-    }
-
     // Hold the command at the gate, attach the stack to the sandbox's
     // namespace and make the listeners on its loopback, then release the
     // command. A failure drops the pending launch, which tears the sandbox
@@ -5902,15 +5947,17 @@ fn run_pending(
     // `proceed`: the sandbox allocates the pseudoterminal and sends its primary
     // before the command reaches the gate, so the stack is attached with the
     // primary already in hand.
-    let held = if terminal {
-        cage.spawn_pending_terminal(&terminal::terminal_for_caller())
-            .map(|(pending, pty)| (pending, Some(pty)))
-    } else {
-        cage.spawn_pending().map(|pending| (pending, None))
-    };
+    let held = start(builder, |cage| {
+        if terminal {
+            cage.spawn_pending_terminal(&terminal::terminal_for_caller())
+                .map(|(pending, pty)| (pending, Some(pty)))
+        } else {
+            cage.spawn_pending().map(|pending| (pending, None))
+        }
+    });
     let (pending, pty) = match held {
         Ok(held) => held,
-        Err(error) => return finish(relay, Err(error.into())),
+        Err(failure) => return finish(relay, Err(failure)),
     };
     let handle = match stack.map(|stack| stack.attach(&pending)).transpose() {
         Ok(handle) => handle,
@@ -6141,17 +6188,12 @@ fn run_restricted(options: Options) -> ExitCode {
             Ok(signals) => signals,
             Err(error) => return conclude(Err(error.into())),
         };
-        let restriction = match builder.build() {
-            Ok(restriction) => restriction,
-            Err(error) => return conclude(Err(error.into())),
-        };
-        if say_unapplied_cgroup(&restriction.resolved_inputs()).is_err() {
-            return conclude(Err(Failure::ReaderGone));
-        }
-        let launched = restriction.spawn_terminal(&terminal::terminal_for_caller());
+        let launched = start(builder, |restriction| {
+            restriction.spawn_terminal(&terminal::terminal_for_caller())
+        });
         let (running, pty) = match launched {
             Ok(launched) => launched,
-            Err(error) => return conclude(Err(error.into())),
+            Err(failure) => return conclude(Err(failure)),
         };
         return conclude(
             terminal::relay(running, pty, signals, options.timeout, options.kill_after)
@@ -6167,17 +6209,14 @@ fn run_restricted(options: Options) -> ExitCode {
         Ok(relayed) => relayed,
         Err(code) => return code,
     };
-    let restriction = match builder.build() {
-        Ok(restriction) => restriction,
-        Err(error) => return finish(relay, Err(error.into())),
-    };
-    if say_unapplied_cgroup(&restriction.resolved_inputs()).is_err() {
-        return finish(relay, Err(Failure::ReaderGone));
-    }
-    let outcome = restriction
-        .spawn()
-        .and_then(|running| wait_with_deadline(running, options.timeout, options.kill_after));
-    finish(relay, outcome.map_err(Failure::from))
+    let outcome = start(builder, Restriction::spawn).and_then(|running| {
+        Ok(wait_with_deadline(
+            running,
+            options.timeout,
+            options.kill_after,
+        )?)
+    });
+    finish(relay, outcome)
 }
 
 /// Says on standard error that the cgroup limits are not applied, where the
@@ -6185,7 +6224,8 @@ fn run_restricted(options: Options) -> ExitCode {
 /// apply them beneath.
 ///
 /// The record a build resolves to reports the limits as unapplied; this is
-/// where a reader of `fcage`'s output learns it.
+/// where a reader of `fcage`'s output learns it. [`start`] says it for every
+/// launch.
 fn say_unapplied_cgroup(inputs: &ResolvedInputs) -> Result<(), output::ReaderGone> {
     match &inputs.cgroup {
         Some(ResolvedCgroup::NotApplied { .. }) => output::say(format_args!(
