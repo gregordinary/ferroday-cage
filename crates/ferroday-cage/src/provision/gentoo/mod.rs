@@ -1868,6 +1868,17 @@ impl Gentoo {
         };
         // The cache pass, before anything is fetched: the paths a merge will
         // read, and which of them are not there yet.
+        //
+        // This flow is the layer's own rather than `cache::acquire`'s, which
+        // checks each entry before announcing and fetching what is missing.
+        // Here the check is the merge's: a container is held to the targets
+        // the root's packages were built for, which the wave settles as it
+        // goes, so it is verified as it is merged, and one that does not
+        // verify there is removed and fetched again. Nothing is announced,
+        // since this layer has no download event. `is_file` follows a symbolic
+        // link at the entry, which is harmless: the merge opens the entry
+        // through `cache::open_entry`, which refuses a link, and verifies what
+        // it reads through that descriptor.
         let mut cached: Vec<PathBuf> = Vec::with_capacity(plan.packages.len());
         for planned in &plan.packages {
             let path = cache_entry(cache.path(), &directory, planned);

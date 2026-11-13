@@ -736,6 +736,127 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
     Ok(verified)
 }
 
+/// A package a run acquires through the cache: what it is called, the entry it
+/// fills, and the mirrors that serve it, the first asked first.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Package<'a> {
+    /// Its name, for the announcement of its download.
+    pub(crate) name: &'a str,
+    /// The entry it fills.
+    pub(crate) entry: Entry<'a>,
+    /// The mirrors that serve it.
+    pub(crate) mirrors: &'a [String],
+}
+
+/// Acquires every one of `packages` into the cache, answering what `check`
+/// made of each, in order.
+///
+/// Four steps, the same for every layer that downloads packages one entry
+/// apiece:
+///
+/// 1. The cache pass, before anything is fetched. An entry `check` accepts is
+///    the package; one that is absent, unreadable, not a regular file, cut
+///    short, or altered is a download waiting to happen rather than a refusal,
+///    and the download replaces it by renaming over it.
+/// 2. The announcement, through `announce`, of each package still missing, by
+///    its position among them and their count. It is made over what is
+///    actually being fetched, once the cache has been asked about every
+///    package: a position among all the packages would count the ones already
+///    cached, and show a fetch of three packages as reaching nine of ten. It
+///    precedes the batch, because the batch fetches several at once, which is
+///    the shape a fetch event has throughout this crate.
+/// 3. A [batch](prefetch) from each missing package's first mirror, which is
+///    the one the walk would ask first too.
+/// 4. A [walk](download) over every mirror for each package the batch did not
+///    deliver. The walk asks `watch` at each mirror and on every write of the
+///    body, so a cancelled run stops within one package's worth of bytes, and
+///    what has been published by then is complete and checked.
+///
+/// `url_of` composes the URL of the package at an index on a mirror. `check`
+/// is the layer's own, the one a cache hit and a download both go through,
+/// handed the package's index, its file from the start, and what names the
+/// bytes in a refusal: the URL they arrived from, or the entry's path for a
+/// cache hit.
+///
+/// # Errors
+///
+/// Returns [`Failure`] for the first package no mirror served or whose
+/// download `check` refused, for a cancellation, and for a host failure on the
+/// cache.
+#[cfg(any(feature = "debian", feature = "alpine"))]
+pub(crate) fn acquire<T, E, W: Watch + ?Sized>(
+    fetcher: &mut dyn Fetch,
+    packages: &[Package<'_>],
+    watch: &mut W,
+    announce: impl Fn(&mut W, &str, usize, usize),
+    url_of: impl Fn(usize, &str) -> String,
+    mut check: impl FnMut(usize, File, &str) -> Result<T, E>,
+) -> Result<Vec<T>, Failure<E>> {
+    let mut held: Vec<Option<T>> = Vec::with_capacity(packages.len());
+    let mut missing = Vec::new();
+    for (at, package) in packages.iter().enumerate() {
+        if watch.cancelled() {
+            return Err(Failure::Cancelled);
+        }
+        let path = package.entry.path;
+        let cached = open_entry(path)
+            .ok()
+            .and_then(|file| check(at, file, &path.display().to_string()).ok());
+        if cached.is_none() {
+            missing.push(at);
+        }
+        held.push(cached);
+    }
+
+    for (position, &at) in missing.iter().enumerate() {
+        announce(watch, packages[at].name, position + 1, missing.len());
+    }
+
+    let (batched, jobs): (Vec<usize>, Vec<Job<'_>>) = missing
+        .iter()
+        .filter_map(|&at| {
+            let package = &packages[at];
+            let mirror = package.mirrors.first()?;
+            let job = Job {
+                url: url_of(at, mirror),
+                entry: package.entry,
+            };
+            Some((at, job))
+        })
+        .unzip();
+    let delivered = prefetch(fetcher, &jobs, watch, |job, file| {
+        check(batched[job], file, &jobs[job].url)
+    })?;
+    for (at, delivered) in batched.into_iter().zip(delivered) {
+        if delivered.is_some() {
+            held[at] = delivered;
+        }
+    }
+
+    for at in missing {
+        if held[at].is_some() {
+            continue;
+        }
+        let package = &packages[at];
+        let acquired = download(
+            fetcher,
+            package.mirrors,
+            |mirror| url_of(at, mirror),
+            package.entry,
+            watch,
+            |file, url, _| check(at, file, url),
+            || super::fetch::no_mirror(package.name),
+        )?;
+        held[at] = Some(acquired);
+    }
+
+    Ok(held
+        .into_iter()
+        .map(|held| held.expect("the cache, the batch or the walk acquired every package"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;

@@ -2405,17 +2405,10 @@ impl Failover for DebianError {
 /// mirror list on a missing or failed URL, so a version that has rotated off a
 /// live pool is served by the repository's snapshot backstop.
 ///
-/// What is *missing* from the cache is fetched in batches first, through
-/// [`cache::prefetch`], so a transport that can overlap several requests does.
-/// That step is an optimization and nothing more: a package it does not deliver
-/// is downloaded by the walk below exactly as though the batch had not run.
-/// Either way a download is published only once its digest has matched
-/// ([`verify_deb`]), so the cache never holds a `.deb` that was not checked.
-///
-/// The cache pass asks [`is_cached`] rather than whether a file exists. An
-/// entry left short by a crash, or altered since, is therefore downloaded again,
-/// and a package the batch could not deliver reaches every mirror rather than
-/// stopping at a corrupt entry.
+/// The cache pass, the batch and the walk are [`cache::acquire`]'s, with
+/// [`verify_deb`] as the check: a cached entry is the package only where its
+/// digests match, and a download is published only once they have, so the
+/// cache never holds a `.deb` that was not checked.
 fn acquire_debs(
     fetcher: &mut dyn Fetch,
     repositories: &[Repository],
@@ -2425,82 +2418,37 @@ fn acquire_debs(
 ) -> Result<Vec<Installable>, ProvisionError> {
     cache::create(archives_host)?;
 
-    // The cache pass, before anything is fetched: what a caller is told it is
-    // downloading is what a batch and the walk between them go on to fetch, in
-    // the order the plan names them.
-    let mut missing = Vec::new();
-    for package in packages {
-        if observer.cancelled() {
-            return Err(ProvisionError::Cancelled);
-        }
-        let dest = archives_host.join(cache_name(&package.digests));
-        if !is_cached(&dest, &package.digests) {
-            missing.push((package, dest));
-        }
-    }
-
-    // Announced over what is actually being fetched, once the cache has been
-    // asked about every package: a position among the plan's packages counts
-    // the ones already cached, so an observer reporting `index` of `total` would
-    // show a fetch of three packages as reaching nine of ten. The announcement
-    // precedes the batch because the batch fetches several at once, which is
-    // the shape a fetch event has throughout this crate.
-    for (position, (package, _)) in missing.iter().enumerate() {
-        observer.progress(DebianEvent::Downloading {
-            package: &package.name,
-            index: position + 1,
-            total: missing.len(),
-        });
-    }
-
-    // Every job asks the package's own repository's first mirror, which is the
-    // one the walk would ask first too.
-    let (batched, jobs): (Vec<usize>, Vec<cache::Job<'_>>) = missing
+    let entries: Vec<PathBuf> = packages
         .iter()
-        .enumerate()
-        .filter_map(|(at, (package, dest))| {
-            let mirror = repositories[package.origin].mirrors.first()?;
-            let job = cache::Job {
-                url: mirror_url(mirror, &package.filename),
-                entry: cache::Entry {
-                    path: dest,
-                    size: package.size,
-                },
-            };
-            Some((at, job))
-        })
-        .unzip();
-    let delivered = cache::prefetch(fetcher, &jobs, observer, |job, mut file| {
-        let (package, dest) = &missing[batched[job]];
-        verify_deb(&mut file, dest, &jobs[job].url, &package.digests)
-    })
-    .map_err(|failure| failure.into_provision(wrap))?;
-    let mut acquired = vec![false; missing.len()];
-    for (at, delivered) in batched.into_iter().zip(delivered) {
-        acquired[at] = delivered.is_some();
-    }
-
-    for ((package, dest), acquired) in missing.iter().zip(acquired) {
-        if acquired {
-            continue;
-        }
-        // The walk asks the observer at each mirror and on every write of the
-        // body, so a cancelled run stops within one package's worth of bytes,
-        // and what has been published by then is complete and verified.
-        cache::download(
-            fetcher,
-            &repositories[package.origin].mirrors,
-            |mirror| mirror_url(mirror, &package.filename),
-            cache::Entry {
-                path: dest,
+        .map(|package| archives_host.join(cache_name(&package.digests)))
+        .collect();
+    let wanted: Vec<cache::Package<'_>> = packages
+        .iter()
+        .zip(&entries)
+        .map(|(package, path)| cache::Package {
+            name: &package.name,
+            entry: cache::Entry {
+                path,
                 size: package.size,
             },
-            observer,
-            |mut file, url, _| verify_deb(&mut file, dest, url, &package.digests),
-            || FetchError::not_found(&package.filename),
-        )
-        .map_err(|failure| failure.into_provision(wrap))?;
-    }
+            mirrors: &repositories[package.origin].mirrors,
+        })
+        .collect();
+    cache::acquire(
+        fetcher,
+        &wanted,
+        observer,
+        |observer, package, index, total| {
+            observer.progress(DebianEvent::Downloading {
+                package,
+                index,
+                total,
+            });
+        },
+        |at, mirror| mirror_url(mirror, &packages[at].filename),
+        |at, mut file, subject| verify_deb(&mut file, &entries[at], subject, &packages[at].digests),
+    )
+    .map_err(|failure| failure.into_provision(wrap))?;
 
     Ok(packages
         .iter()
@@ -2519,25 +2467,13 @@ fn cache_name(digests: &Digests) -> String {
     format!("{}.deb", digests.planned().hex())
 }
 
-/// Whether the cache entry at `dest` holds the package whose digests are
-/// `digests`, decided by streaming them.
-///
-/// Validating a cached kernel package costs the memory of validating a shell
-/// script, which is the property every read and write of a `.deb` in this
-/// crate keeps. An entry that is absent, unreadable, not a regular file,
-/// truncated, or altered answers `false`, and a download replaces it: a rename
-/// onto the name is what publishes the replacement.
-fn is_cached(dest: &Path, digests: &Digests) -> bool {
-    cache::open_entry(dest).is_ok_and(|mut file| {
-        verify_deb(&mut file, dest, &dest.display().to_string(), digests).is_ok()
-    })
-}
-
 /// Holds a `.deb` to every digest its index recorded, reading `file` once from
 /// its start.
 ///
 /// The one check a package is held to, whichever produced the file: a cache
 /// hit, a download before it is published, and the copy a run installs from.
+/// It streams the digests, so validating a cached kernel package costs the
+/// memory of validating a shell script.
 /// `entry` is where the package is or is about to be, for a read that fails;
 /// `subject` names the bytes in a refusal, the URL they were fetched from or the
 /// path they were read at.

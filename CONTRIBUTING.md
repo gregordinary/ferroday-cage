@@ -515,7 +515,7 @@ report name a package and its version bare.
 | Name a local path as a `file://` URL | `provision::file_url` |
 | Decode a URL's percent escapes | `provision::fetch::percent_decode` |
 | Where does a run keep its downloads, and is that directory its own? | `provision::cache::PackageCache`, and `PackageCache::is_derived` for whether a directory a caller named is the run's own |
-| Download into a package cache, checked before it is published there | `provision::cache::download`, or `cache::prefetch` for a batch |
+| Download into a package cache, checked before it is published there | `provision::cache::download`, or `cache::prefetch` for a batch, and `cache::acquire` for a run's packages: the cache pass, the announcement, the batch and the walk |
 | Create a package cache, or open the regular file at a path in a directory others write, a cache entry or a build's output | `provision::cache::create`, `cache::open_entry` |
 | What time is it, as a Unix timestamp? | `provision::now_epoch` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |

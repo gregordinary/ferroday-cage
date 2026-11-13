@@ -1874,8 +1874,9 @@ fn joined(carried: &[String], mine: impl IntoIterator<Item = String>) -> Vec<Str
 /// signature, the control identity the index recorded, and the `datahash`
 /// binding its file tree — all of which this reads anyway.
 ///
-/// A download is held to the same read ([`read_acquired`]) before it is
-/// published, so the cache never holds a package that was not checked, and the
+/// The cache pass, the batch and the walk are [`cache::acquire`]'s. A download
+/// is held to the same read ([`read_acquired`]) before it is published, so the
+/// cache never holds a package that was not checked, and the
 /// [`Acquired`] that check produced is the one the root is laid down from. Each
 /// package is read once, whichever produced it.
 ///
@@ -1898,15 +1899,11 @@ fn acquire(
     // a package names is one this resolves.
     let slots = index_slots(repositories, architecture);
 
-    // The cache pass and the announcement, before anything is fetched: what a
-    // caller is told it is downloading is what the batch and the walk between
-    // them go on to fetch, in the order the plan names them.
-    let mut acquired: Vec<Option<Acquired>> = Vec::with_capacity(plan.packages.len());
-    let mut missing: Vec<Missing<'_>> = Vec::new();
-    for (at, planned) in plan.packages.iter().enumerate() {
-        if observer.cancelled() {
-            return Err(ProvisionError::Cancelled);
-        }
+    // Where each package is: the index it was resolved from, the mirrors of
+    // the repository that publishes it, and its cache entry.
+    let mut sources: Vec<(&ResolvedIndex, &[String], PathBuf)> =
+        Vec::with_capacity(plan.packages.len());
+    for planned in &plan.packages {
         let index = plan.indexes.get(planned.index).ok_or_else(|| {
             wrap(AlpineError::Config {
                 reason: format!(
@@ -1940,123 +1937,48 @@ fn acquire(
                 ),
             })
         })?;
-        let path = cache.join(name);
-
-        // A cached entry that does not read back as this package is not an
-        // error; it is a download waiting to happen.
-        let held = cache::open_entry(&path)
-            .map_err(AlpineError::at("reading a package", &path))
-            .and_then(|file| read_acquired(file, &path, planned, architecture))
-            .map(|(held, _)| held);
-        if held.is_err() {
-            missing.push(Missing {
-                at,
-                planned,
-                index,
-                mirrors,
-                path,
-            });
-        }
-        acquired.push(held.ok());
+        sources.push((index, mirrors, cache.join(name)));
     }
 
-    // Announced over what is actually being fetched, once the cache has been
-    // asked about every package: a position among the plan's packages counts
-    // the ones already cached, so an observer reporting `index` of `total` would
-    // show a fetch of three packages as reaching nine of ten. The announcement
-    // precedes the batch because the batch fetches several at once, which is
-    // the shape a fetch event has throughout this crate.
-    for (position, entry) in missing.iter().enumerate() {
-        observer.progress(AlpineEvent::Downloading {
-            package: &entry.planned.name,
-            index: position + 1,
-            total: missing.len(),
-        });
-    }
-
-    // Every job asks the package's own first mirror, which is the one the walk
-    // would ask first too.
-    let (batched, jobs): (Vec<&Missing<'_>>, Vec<cache::Job<'_>>) = missing
+    // Each held to the index's `S:`, a length a verified source declared; an
+    // index that states none leaves the download bounded by the fetcher's own
+    // ceiling, which is weaker rather than wrong.
+    let wanted: Vec<cache::Package<'_>> = plan
+        .packages
         .iter()
-        .filter_map(|entry| {
-            let mirror = entry.mirrors.first()?;
-            let job = cache::Job {
-                url: entry.url(mirror, architecture),
-                entry: entry.cache_entry(),
-            };
-            Some((entry, job))
-        })
-        .unzip();
-    let delivered = cache::prefetch(fetcher, &jobs, observer, |job, file| {
-        let entry = batched[job];
-        read_acquired(file, &entry.path, entry.planned, architecture).map(|(held, _)| held)
-    })
-    .map_err(|failure| failure.into_provision(wrap))?;
-    for (entry, held) in batched.iter().zip(delivered) {
-        if held.is_some() {
-            acquired[entry.at] = held;
-        }
-    }
-
-    for entry in &missing {
-        if acquired[entry.at].is_some() {
-            continue;
-        }
-        // The walk asks the observer at each mirror and on every write of the
-        // body, so a cancelled run stops within one package's worth of bytes,
-        // and what has been published by then is complete and verified.
-        let held = cache::download(
-            fetcher,
-            entry.mirrors,
-            |mirror| entry.url(mirror, architecture),
-            entry.cache_entry(),
-            observer,
-            |file, _, _| {
-                read_acquired(file, &entry.path, entry.planned, architecture).map(|(held, _)| held)
+        .zip(&sources)
+        .map(|(planned, (_, mirrors, path))| cache::Package {
+            name: &planned.name,
+            entry: cache::Entry {
+                path,
+                size: planned.size,
             },
-            || FetchError::not_found(entry.planned.file_name()),
-        )
-        .map_err(|failure| failure.into_provision(wrap))?;
-        acquired[entry.at] = Some(held);
-    }
-
-    Ok(acquired
-        .into_iter()
-        .map(|held| held.expect("the cache, the batch or the walk acquired every package"))
-        .collect())
-}
-
-/// A package the cache does not hold, and where to fetch it from.
-struct Missing<'a> {
-    /// Its position in the plan.
-    at: usize,
-    planned: &'a PlannedPackage,
-    index: &'a ResolvedIndex,
-    mirrors: &'a [String],
-    /// Its entry in the cache.
-    path: PathBuf,
-}
-
-impl Missing<'_> {
-    /// The package's URL on `mirror`.
-    fn url(&self, mirror: &str, architecture: &str) -> String {
-        mirror_url(
-            &self.index.directory_under(mirror),
-            &format!("{architecture}/{}", self.planned.file_name()),
-        )
-    }
-
-    /// The cache entry the download fills, held to the index's `S:`.
-    ///
-    /// A length a verified source declared, so it travels with the request as
-    /// well as capping the writer; an index that states none leaves the download
-    /// bounded by the fetcher's own ceiling, which is weaker rather than wrong.
-    fn cache_entry(&self) -> cache::Entry<'_> {
-        cache::Entry {
-            path: &self.path,
-            size: self.planned.size,
-        }
-    }
+            mirrors,
+        })
+        .collect();
+    cache::acquire(
+        fetcher,
+        &wanted,
+        observer,
+        |observer, package, index, total| {
+            observer.progress(AlpineEvent::Downloading {
+                package,
+                index,
+                total,
+            });
+        },
+        |at, mirror| {
+            mirror_url(
+                &sources[at].0.directory_under(mirror),
+                &format!("{architecture}/{}", plan.packages[at].file_name()),
+            )
+        },
+        |at, file, _| {
+            read_acquired(file, &sources[at].2, &plan.packages[at], architecture)
+                .map(|(held, _)| held)
+        },
+    )
+    .map_err(|failure| failure.into_provision(wrap))
 }
 
 /// Reads a cached `.apk` and holds it to the plan entry it answers.
