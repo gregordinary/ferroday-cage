@@ -177,6 +177,12 @@ impl UdpTables {
         self.ports.push(UdpPort { port, handle });
     }
 
+    /// How many flows the tables hold, which is the most host sockets
+    /// [`reply_interest`](Self::reply_interest) yields.
+    pub(super) fn flow_count(&self) -> usize {
+        self.flows.len()
+    }
+
     /// The host sockets to wait on for replies, for the pump's poll set: each
     /// flow whose port socket has room for a reply right now.
     ///

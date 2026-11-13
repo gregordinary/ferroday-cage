@@ -174,6 +174,21 @@ struct Engine {
     epoch: std::time::Instant,
     /// The reusable tap read buffer, one frame large.
     read_buf: Vec<u8>,
+    /// Who each slot of the current iteration's poll set belongs to, in slot
+    /// order.
+    ///
+    /// This and the two lists after it are kept across iterations and emptied
+    /// at the start of each, since the loop runs for every batch of frames the
+    /// sandbox sends or receives and a list built anew is an allocation each
+    /// time. The poll set's descriptor list cannot be kept this way: it borrows
+    /// the descriptors it watches, so it lasts one iteration and is the one
+    /// list each iteration allocates.
+    owners: Vec<SlotOwner>,
+    /// What `poll` reported for each slot, copied out of the poll set so the
+    /// flows it borrowed can be updated.
+    events: Vec<PollFlags>,
+    /// The published ports whose listeners are readable, by index.
+    accepting: Vec<usize>,
 }
 
 impl Engine {
@@ -253,6 +268,9 @@ impl Engine {
             plan,
             epoch: std::time::Instant::now(),
             read_buf: vec![0; frame],
+            owners: Vec::new(),
+            events: Vec::new(),
+            accepting: Vec::new(),
         })
     }
 
@@ -278,11 +296,13 @@ impl Engine {
             // with nothing to wait for is left out entirely — its hangup
             // or error is discovered when it next has one.
             let timeout = self.poll_timeout();
-            let mut owners: Vec<SlotOwner> = Vec::with_capacity(2 + self.flows.len());
-            let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(2 + self.flows.len());
-            owners.push(SlotOwner::Stop);
+            let slots = self.poll_slots();
+            self.owners.clear();
+            self.owners.reserve(slots);
+            let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(slots);
+            self.owners.push(SlotOwner::Stop);
             fds.push(PollFd::new(stop, PollFlags::IN));
-            owners.push(SlotOwner::Tap);
+            self.owners.push(SlotOwner::Tap);
             fds.push(PollFd::new(self.device.tap(), PollFlags::IN));
             for (index, flow) in self.flows.iter().enumerate() {
                 let socket = self.sockets.get::<tcp_socket::Socket>(flow.handle);
@@ -293,7 +313,7 @@ impl Engine {
                 if let Some(host) = flow.host()
                     && !interest.is_empty()
                 {
-                    owners.push(SlotOwner::Tcp(index));
+                    self.owners.push(SlotOwner::Tcp(index));
                     fds.push(PollFd::new(host, interest));
                 }
             }
@@ -302,17 +322,21 @@ impl Engine {
             // stays on the host socket, which would otherwise stay readable and
             // return every poll at once. The draining itself is unconditional.
             for host in self.udp.reply_interest(&self.sockets) {
-                owners.push(SlotOwner::Udp);
+                self.owners.push(SlotOwner::Udp);
                 fds.push(PollFd::new(host, PollFlags::IN));
             }
             // A listener sitting out its backoff is left out, which is what
             // keeps a connection it cannot accept from waking the loop.
             for (index, inbound) in self.inbound.iter().enumerate() {
                 if inbound.retry_at.is_none() {
-                    owners.push(SlotOwner::Listener(index));
+                    self.owners.push(SlotOwner::Listener(index));
                     fds.push(PollFd::new(&inbound.socket, PollFlags::IN));
                 }
             }
+            debug_assert!(
+                fds.len() <= slots,
+                "the poll set holds a kind of slot `poll_slots` does not count",
+            );
 
             match rustix::event::poll(&mut fds, timeout.as_ref()) {
                 Ok(_) => {}
@@ -327,15 +351,16 @@ impl Engine {
 
             // Copy the results out before touching any flow: the poll
             // entries borrow the descriptors they watch.
-            let events: Vec<PollFlags> = fds.iter().map(|fd| fd.revents()).collect();
+            self.events.clear();
+            self.events.extend(fds.iter().map(|fd| fd.revents()));
             drop(fds);
             let mut stop_requested = false;
             let mut tap_readable = false;
-            let mut accepting = Vec::new();
+            self.accepting.clear();
             for flow in &mut self.flows {
                 flow.events = PollFlags::empty();
             }
-            for (owner, revents) in owners.iter().zip(events) {
+            for (owner, &revents) in self.owners.iter().zip(&self.events) {
                 match owner {
                     SlotOwner::Stop => stop_requested = !revents.is_empty(),
                     SlotOwner::Tap => tap_readable = !revents.is_empty(),
@@ -343,7 +368,9 @@ impl Engine {
                     // UDP draining is unconditional, so its wakeups need no
                     // per-flow bookkeeping.
                     SlotOwner::Udp => {}
-                    SlotOwner::Listener(index) if !revents.is_empty() => accepting.push(*index),
+                    SlotOwner::Listener(index) if !revents.is_empty() => {
+                        self.accepting.push(*index);
+                    }
                     SlotOwner::Listener(_) => {}
                 }
             }
@@ -354,9 +381,13 @@ impl Engine {
             if tap_readable && let Err(exit) = self.ingest_tap() {
                 return exit;
             }
-            for index in accepting {
+            // Accepting takes the whole engine, so the list is lent out for
+            // the walk and put back with its allocation.
+            let accepting = std::mem::take(&mut self.accepting);
+            for &index in &accepting {
                 self.accept(index);
             }
+            self.accepting = accepting;
 
             // Let the interface process what arrived, then alternate
             // servicing and interface polls until nothing moves.
@@ -372,6 +403,13 @@ impl Engine {
 
             self.reap(std::time::Instant::now());
         }
+    }
+
+    /// The most slots the next poll set can hold, which it is sized to up
+    /// front: the stop and the tap, then one for each TCP flow, each UDP flow,
+    /// and each published port, whether or not it wants attention this time.
+    fn poll_slots(&self) -> usize {
+        2 + self.flows.len() + self.udp.flow_count() + self.inbound.len()
     }
 
     /// How long the next poll may sleep: bounded by the interface's own
@@ -1397,10 +1435,25 @@ mod tests {
     }
 
     impl Drop for Driven {
+        /// Stops the pump and holds it to a clean exit: a pump that ended on
+        /// its own, on a broken invariant among other causes, fails the test
+        /// that drove it, which would otherwise not notice.
         fn drop(&mut self) {
             self.stop.send();
-            if let Some(pump) = self.pump.take() {
-                let _ = pump.join();
+            let Some(pump) = self.pump.take() else {
+                return;
+            };
+            let exit = pump.join();
+            if std::thread::panicking() {
+                return;
+            }
+            match exit {
+                Ok(PumpExit::Clean) => {}
+                Ok(PumpExit::Failed { op, source }) => {
+                    panic!("the pump failed {op} before it was stopped: {source:?}")
+                }
+                // The panic hook has already reported it, on the pump's thread.
+                Err(_) => panic!("the pump panicked before it was stopped"),
             }
         }
     }
