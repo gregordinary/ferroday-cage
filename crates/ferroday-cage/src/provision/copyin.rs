@@ -128,6 +128,14 @@ everything it can create — a named pipe included — and names the rest.
 /// for entry in &report.skipped {
 ///     eprintln!("not copied: {} ({})", entry.path.display(), entry.kind);
 /// }
+/// for attribute in &report.attributes {
+///     eprintln!(
+///         "not given: {} on {} ({})",
+///         attribute.name.display(),
+///         attribute.path.display(),
+///         attribute.reason,
+///     );
+/// }
 /// # Ok(())
 /// # }
 /// ```
@@ -223,7 +231,10 @@ impl CopyIn {
     /// [`ProvisionError::SourceChanged`] for a file that changed size while it
     /// was being read, or whose name stopped holding it between the walk
     /// inspecting it and opening it; and [`ProvisionError::Io`] for a failure of
-    /// the copy machinery, of the walk, or of the in-map writer.
+    /// the copy machinery, of the walk, or of the in-map writer. A destination
+    /// whose filesystem refuses an extended attribute the copy gives, one
+    /// without `user.` attributes or access control lists, is such a failure,
+    /// naming the step, rather than an attribute passed over in silence.
     pub fn run(self) -> Result<CopyReport, ProvisionError> {
         copy_in_inner(
             &self.source,

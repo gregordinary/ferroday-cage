@@ -491,6 +491,14 @@ let report = CopyIn::new("./overlay", "/srv/images/trixie")
 for entry in &report.skipped {
     eprintln!("not copied: {} ({})", entry.path.display(), entry.kind);
 }
+for attribute in &report.attributes {
+    eprintln!(
+        "not given: {} on {} ({})",
+        attribute.name.display(),
+        attribute.path.display(),
+        attribute.reason,
+    );
+}
 # Ok(())
 # }
 ```
