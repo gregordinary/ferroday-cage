@@ -70,8 +70,10 @@ pub(crate) struct Release {
     architectures: Vec<String>,
     components: Vec<String>,
     valid_until: Option<String>,
-    /// The release's own `Date:` field, as written. Read for provenance, and
-    /// held to the moment a snapshot mirror serving the release was taken
+    /// The release's own `Date:` field, as written. Read for provenance, held
+    /// to be no further ahead of the clock than apt allows
+    /// ([`check_date`](Self::check_date)), and held to the moment a snapshot
+    /// mirror serving the release was taken
     /// ([`check_snapshot`](Self::check_snapshot)); freshness is judged against
     /// `Valid-Until`.
     date: Option<String>,
@@ -221,7 +223,36 @@ impl Release {
                 ));
             }
         }
+        self.check_date()?;
         self.check_freshness(require_valid_until)?;
+        Ok(())
+    }
+
+    /// Refuses a release dated more than [`MAX_FUTURE_SECONDS`] after the
+    /// system clock, whichever mirror served it and whatever its freshness
+    /// posture, as apt's `Check-Date` refuses one.
+    ///
+    /// Measured against apt 2.8.4: a signed release, or an unsigned one a
+    /// source trusts, dated 10 seconds ahead of the clock is read, and one
+    /// dated 11 seconds ahead is refused as "not valid yet", with or without
+    /// `Check-Valid-Until`. A `Date` that is absent or does not parse is not
+    /// refused here, as apt reads such a release after a warning: it states
+    /// no moment to be ahead of the clock by.
+    fn check_date(&self) -> Result<(), Refusal> {
+        let Some(date) = self.date.as_deref() else {
+            return Ok(());
+        };
+        let Some(dated) = parse_rfc5322(date) else {
+            return Ok(());
+        };
+        let now = clock()?;
+        if dated.saturating_sub(now) > MAX_FUTURE_SECONDS {
+            return Err(format!(
+                "the release is dated {date:?}, more than {MAX_FUTURE_SECONDS} seconds after \
+                 the system clock's {}, so it is not valid yet",
+                format_rfc5322(now),
+            ));
+        }
         Ok(())
     }
 
@@ -309,11 +340,7 @@ impl Release {
         };
         let deadline = parse_rfc5322(valid_until)
             .ok_or_else(|| format!("the release Valid-Until {valid_until:?} is unparseable"))?;
-        let now = now_epoch().ok_or_else(|| {
-            "the system clock is before the Unix epoch, so release freshness cannot be \
-             established"
-                .to_string()
-        })?;
+        let now = clock()?;
         if now > deadline {
             return Err(format!("the release expired at {valid_until:?}"));
         }
@@ -378,6 +405,21 @@ impl Release {
     pub(crate) fn acquire_by_hash(&self) -> bool {
         self.acquire_by_hash
     }
+}
+
+/// How far ahead of the system clock a release's `Date` may be: apt's
+/// `Acquire::Max-FutureTime`, whose default is 10 seconds.
+const MAX_FUTURE_SECONDS: i64 = 10;
+
+/// The system clock, as a Unix timestamp, for judging a release's dates.
+///
+/// A clock before the epoch cannot judge one, and the release is refused
+/// rather than trusted blind.
+fn clock() -> Result<i64, Refusal> {
+    now_epoch().ok_or_else(|| {
+        "the system clock is before the Unix epoch, so the release's dates cannot be judged"
+            .to_string()
+    })
 }
 
 /// The moment a snapshot mirror serves its repository at, as a Unix timestamp,
@@ -1061,6 +1103,38 @@ Valid-Until: Mon, 01 Jan 1990 00:00:00 UTC
                     .is_err(),
                 "{fields:?}",
             );
+        }
+    }
+
+    #[test]
+    fn a_release_dated_ahead_of_the_clock_is_refused_past_apt_s_margin() {
+        let dated = |offset: i64| {
+            let now = now_epoch().unwrap();
+            Release::parse(&format!(
+                "Suite: sid\nDate: {}\n",
+                format_rfc5322(now + offset)
+            ))
+            .unwrap()
+        };
+        // The clock reads again inside the check, so the margin is held a
+        // second clear of either side of the boundary.
+        for offset in [-86_400, 0, MAX_FUTURE_SECONDS - 1] {
+            dated(offset)
+                .check("sid", "amd64", &[], false)
+                .unwrap_or_else(|err| panic!("{offset}: {err}"));
+        }
+        for require_valid_until in [false, true] {
+            let err = dated(MAX_FUTURE_SECONDS + 2)
+                .check("sid", "amd64", &[], require_valid_until)
+                .unwrap_err();
+            assert!(err.contains("not valid yet"), "{err}");
+        }
+        // A date apt warns about and reads is read here too.
+        for fields in ["Suite: sid\n", "Suite: sid\nDate: next week\n"] {
+            Release::parse(fields)
+                .unwrap()
+                .check("sid", "amd64", &[], false)
+                .expect(fields);
         }
     }
 

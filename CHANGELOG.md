@@ -42,6 +42,12 @@ consumer upgrading can skip it.
   `SetupStep::InstallNetworkFilter`, and a Debian or Alpine bootstrap that runs
   its packages' scripts refuses such a host before it downloads anything.
   `Network::Host` is unchanged.
+- A Debian release dated more than 10 seconds after the system clock is
+  refused with `DebianError::Release`, from every mirror and whatever its
+  freshness posture, as apt's `Check-Date` refuses it with its default
+  `Acquire::Max-FutureTime`. Such a release was read as though current, where
+  the root's own apt would refuse it. Installing a plan reads no release and is
+  unchanged.
 - A Debian release served by a mirror whose URL ends in the moment a snapshot
   was taken, `YYYYMMDDTHHMMSSZ` as `snapshot.debian.org` and
   `snapshot.ubuntu.com` spell it, must be dated no later than that moment and,

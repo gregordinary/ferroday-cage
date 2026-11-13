@@ -216,7 +216,9 @@ impl Pool {
     ///
     /// Pinning a date does not make the release expire. Expiry is
     /// `Valid-Until`, which the pool does not write; see
-    /// [`publish`](Self::publish).
+    /// [`publish`](Self::publish). A date more than 10 seconds after a
+    /// reader's clock is refused, by apt and by a bootstrap reading the pool
+    /// alike, as a release that is not valid yet.
     pub fn date(mut self, epoch: i64) -> Pool {
         self.date = Some(epoch);
         self

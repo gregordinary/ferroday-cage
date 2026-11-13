@@ -642,7 +642,8 @@ By default the field names the time of the publish. That is what makes the
 release the one part of a pool that varies between two publishes of the same
 packages. The indexes are a function of the package set, and the release is a
 function of the indexes and the date. [`Pool::date`] pins it, making a publish
-byte-reproducible.
+byte-reproducible. A date more than 10 seconds after a reader's clock is one
+apt refuses as not valid yet, and so does a bootstrap reading the pool.
 
 ```rust,no_run
 use ferroday_cage::provision::debian::Pool;
@@ -1655,6 +1656,12 @@ parseable and in the future, and the archive signature must not itself have
 expired. That refuses a stale but validly-signed release, which a mirror or an
 on-path attacker could otherwise replay to deliver superseded, potentially
 vulnerable packages.
+
+A release dated more than 10 seconds after the system clock is refused from
+every mirror, whatever its freshness posture, as apt's `Check-Date` refuses it.
+That is apt's own margin, `Acquire::Max-FutureTime`. A replayed
+[plan](#installing-a-plan-without-resolving-again) reads no release, so no date
+of one is judged.
 
 A release that omits `Valid-Until` carries no freshness bound and is accepted,
 as apt accepts it. The Debian stable suite does exactly that, so its release
