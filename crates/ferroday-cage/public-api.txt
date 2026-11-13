@@ -423,6 +423,7 @@ pub ferroday_cage::provision::debian::DebianError::Io::path: std::path::PathBuf
 pub ferroday_cage::provision::debian::DebianError::Io::source: core::io::error::Error
 pub ferroday_cage::provision::debian::DebianError::Launch(ferroday_cage::Error)
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::MalformedEntry
+pub ferroday_cage::provision::debian::DebianError::MalformedEntry::package: alloc::string::String
 pub ferroday_cage::provision::debian::DebianError::MalformedEntry::path: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::provision::debian::DebianError::NotConfigured
 pub ferroday_cage::provision::debian::DebianError::NotConfigured::packages: alloc::vec::Vec<alloc::string::String>

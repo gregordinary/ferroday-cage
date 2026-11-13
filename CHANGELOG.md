@@ -645,6 +645,10 @@ consumer upgrading can skip it.
   entry at it when the sandbox is built. On the host's own root, such a target
   is refused at build with `ConfigError::MountTargetMissing` where the host
   lacks it, rather than failing the launch.
+- `DebianError::MalformedEntry` names the package that shipped the path, in its
+  new `package` field, and quotes the path with `{:?}`. The path is the
+  package's own spelling, and its message wrote it to the terminal raw,
+  control characters included.
 
 ### Internal
 

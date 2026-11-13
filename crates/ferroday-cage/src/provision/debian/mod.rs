@@ -2721,7 +2721,7 @@ fn extract_packages(
     // ships such a path, and the signed digest chain keeps a mirror from
     // forging one, so this is defense in depth for an unreachable case: reject
     // rather than emit a line the framing cannot be trusted to contain.
-    let mut malformed: Option<Vec<Vec<u8>>> = None;
+    let mut malformed: Option<(&str, Vec<Vec<u8>>)> = None;
     for installable in installables {
         // A package boundary again: the staging tree is discarded wholesale by
         // `ensure` when this returns an error, so a partial layout is not a
@@ -2768,7 +2768,7 @@ fn extract_packages(
                         .iter()
                         .any(|component| component.contains(&b'\n'))
                     {
-                        malformed.get_or_insert_with(|| components.to_vec());
+                        malformed.get_or_insert_with(|| (&installable.name, components.to_vec()));
                         return Ok(Placement::Write);
                     }
                     statoverride.record(entry.mode, absolute_path(components));
@@ -2779,8 +2779,9 @@ fn extract_packages(
             },
         )?;
     }
-    if let Some(components) = malformed {
+    if let Some((package, components)) = malformed {
         return Err(wrap(DebianError::MalformedEntry {
+            package: package.to_string(),
             path: absolute_path(&components),
         }));
     }
@@ -3274,8 +3275,13 @@ pub enum DebianError {
     },
     /// A package shipped an entry whose path cannot be represented safely in
     /// the dpkg metadata derived from it.
+    ///
+    /// The message quotes the path with `{:?}`: it is the package's own
+    /// spelling, and one holding a newline is what this refuses.
     #[non_exhaustive]
     MalformedEntry {
+        /// The package that shipped it, by the name its index states.
+        package: String,
         /// The offending path, lossily decoded.
         path: String,
     },
@@ -3411,8 +3417,11 @@ impl fmt::Display for DebianError {
             } => {
                 write!(f, "the index {subject} is unusable: {reason}")
             }
-            DebianError::MalformedEntry { path } => {
-                write!(f, "a package entry has an unrepresentable path: {path}",)
+            DebianError::MalformedEntry { package, path } => {
+                write!(
+                    f,
+                    "the package {package} ships an unrepresentable path: {path:?}"
+                )
             }
             DebianError::Resolve { reason } => write!(f, "dependency resolution failed: {reason}"),
             DebianError::Digest {
@@ -5056,6 +5065,36 @@ mod tests {
             overrides.render(),
             "root root 755 /usr/bin/tool\nroot root 4755 /usr/sbin/helper\n",
         );
+    }
+
+    #[test]
+    fn an_unrepresentable_path_is_refused_naming_its_package_with_its_control_characters_escaped() {
+        // The path is the package's own spelling, and the newline that makes
+        // it unrepresentable in a statoverride record is a control character
+        // the refusal would otherwise write to the terminal raw, beside
+        // whatever else the path carries.
+        let hostile = crate::failure::hostile::TEXT;
+        let dir = Scratch::new("malformed-entry");
+        let archives = dir.join("archives");
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
+        let path = format!("./usr/sbin/{hostile}\nhelper");
+        let shipped = deb_of(&data_tar(&[(path.as_str(), 0o4755, 0, 42)]));
+        let install = installables(&archives, &[("shipper", shipped)]);
+
+        let Err(ProvisionError::Other { source }) =
+            extract_packages(&staging, None, "amd64", &install, &archives, &mut Silent)
+        else {
+            panic!("the path is refused");
+        };
+        let refused = source
+            .downcast_ref::<DebianError>()
+            .expect("the refusal is the layer's own");
+        assert!(
+            matches!(refused, DebianError::MalformedEntry { package, .. } if package == "shipper"),
+            "{refused:?}",
+        );
+        crate::failure::hostile::assert_escaped(&crate::ErrorChain::new(refused).to_string());
     }
 
     #[test]
