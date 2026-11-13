@@ -105,9 +105,11 @@ reply. Its bounds are the network stack's for a published port:
   connection to the target is still being made. A connection past that is
   closed at once. The first is reported on standard error, and later ones are
   not.
-- A connection the target refuses, or does not take within 30 seconds, is
-  reported on standard error and the command's connection reset. A unix
-  socket whose accept queue is full is tried again until then.
+- A connection the target refuses, or does not take within 30 seconds, has
+  the command's connection reset. The first such failure is reported on
+  standard error, and later ones are not until a connection to the target is
+  made again. A unix socket whose accept queue is full is tried again until
+  then.
 - Each direction holds at most 64 KiB on its way across, so a peer that stops
   reading stalls only the direction toward it.
 

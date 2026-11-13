@@ -401,6 +401,38 @@ fn a_target_that_refuses_is_reported_and_the_run_still_ends() {
 }
 
 #[test]
+fn a_target_that_keeps_refusing_is_reported_once() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Nothing listens at the target, so each of the command's three
+    // connections is refused, and only the first refusal is reported.
+    let dir = common::scratch_dir("fcage-forward-refused-again");
+    let (_dir, socket) = short_socket_path(&dir, "nobody.sock");
+    let mut command = Command::new(FCAGE);
+    command
+        .args(["--rootfs", rootfs.to_str().expect("a UTF-8 fixture path")])
+        .args(["--forward-loopback", "4100", &socket])
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "for i in 1 2 3; do nc 127.0.0.1 4100 </dev/null; done",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = common::run_bounded(&mut command, PATIENCE);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert_eq!(
+        stderr.matches("connecting to the target").count(),
+        1,
+        "a run of refusals is reported once: {stderr}"
+    );
+}
+
+#[test]
 fn a_target_that_resets_resets_the_command_s_connection() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;

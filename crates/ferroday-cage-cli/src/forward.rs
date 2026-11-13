@@ -27,7 +27,10 @@
 //!   keeps connecting does not flood standard error.
 //! - A connection to the target not made within [`ESTABLISH_DEADLINE`] is
 //!   abandoned: the command's connection is reset, and the failure reported,
-//!   as a target that refuses is. A TCP connect runs in the background and
+//!   as a target that refuses is. Only the first failure of a run of them is
+//!   reported, until a connection to the target is made again, so a command
+//!   that keeps connecting to a target that is down does not flood standard
+//!   error either. A TCP connect runs in the background and
 //!   reports its end as writability. A unix socket whose accept queue is full
 //!   answers a non-blocking connect with `EAGAIN` at once instead, and leaves
 //!   nothing to wait on, so the connect is made again every [`CONNECT_RETRY`].
@@ -280,6 +283,9 @@ struct Relay {
     /// Whether a connection past the budget has been closed. Only the first is
     /// reported.
     refused: bool,
+    /// Whether a connection to the target has failed since the last one was
+    /// made. Only the first failure of a run of them is reported.
+    connect_failing: bool,
     /// The connections whose connection to the target is still being made.
     connecting: Vec<Connecting>,
     /// The connections being carried.
@@ -321,6 +327,7 @@ impl Relay {
             listener_resumes: None,
             accept_failing: false,
             refused: false,
+            connect_failing: false,
             connecting: Vec::new(),
             carried: Vec::new(),
         })
@@ -450,9 +457,9 @@ impl Relay {
     fn advance(&mut self, now: Instant) {
         for mut connecting in std::mem::take(&mut self.connecting) {
             match connecting.advance(&self.target, now) {
-                Ok(true) => self.carried.push(Carried::new(connecting.sides)),
+                Ok(true) => self.carry(connecting.sides),
                 Ok(false) => self.connecting.push(connecting),
-                Err(err) => self.say_failed("connecting to the target", &err),
+                Err(err) => self.connect_failed(&err),
             }
         }
     }
@@ -500,7 +507,7 @@ impl Relay {
             Ok(started) => started,
             Err(err) => {
                 reset_on_close(&inbound);
-                self.say_failed("connecting to the target", &err);
+                self.connect_failed(&err);
                 return;
             }
         };
@@ -511,7 +518,7 @@ impl Relay {
         };
         let wait = match attempt {
             Attempt::Connected => {
-                self.carried.push(Carried::new(sides));
+                self.carry(sides);
                 return;
             }
             Attempt::InProgress => Wait::Writable,
@@ -523,6 +530,21 @@ impl Relay {
             deadline: now.checked_add(ESTABLISH_DEADLINE),
             ready: false,
         });
+    }
+
+    /// Starts carrying a connection whose connection to the target is made,
+    /// which ends a run of failures to make one.
+    fn carry(&mut self, sides: Sides) {
+        self.connect_failing = false;
+        self.carried.push(Carried::new(sides));
+    }
+
+    /// Reports a failure to make a connection to the target, where it is the
+    /// first of a run of them.
+    fn connect_failed(&mut self, err: &io::Error) {
+        if !std::mem::replace(&mut self.connect_failing, true) {
+            self.say_failed("connecting to the target", err);
+        }
     }
 
     /// Reports a failure of the forward on standard error.
@@ -885,6 +907,30 @@ mod tests {
         assert_eq!(read_to_end(command), (Vec::new(), Ending::Reset));
         drop(stop);
         joined_within(&thread, Duration::from_secs(5), "the relay");
+    }
+
+    #[test]
+    fn a_connection_made_ends_a_run_of_failures_to_make_one() {
+        // A target that comes back after a run of failures has its next
+        // failure reported again, so the report says when it went down anew.
+        let target = TcpListener::bind("127.0.0.1:0").expect("the target binds");
+        let (mut relay, address, _stop) = relay(&target);
+        relay.connect_failing = true;
+        let _command = TcpStream::connect(address).expect("the command connects");
+        relay.accept(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while relay.carried.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the target's connection was never made"
+            );
+            relay.wait().expect("the relay waits");
+            relay.step(Instant::now());
+        }
+        assert!(
+            !relay.connect_failing,
+            "a connection made left the run going"
+        );
     }
 
     #[test]
