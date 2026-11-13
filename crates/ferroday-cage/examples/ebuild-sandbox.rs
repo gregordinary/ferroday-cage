@@ -397,11 +397,7 @@ fn run(config: Config) -> ExitCode {
         .env("FEATURES", FEATURES)
         .envs(config.env);
     builder = match config.task {
-        Task::Command(argv) => {
-            let mut argv = argv.into_iter();
-            let program = argv.next().expect("a command line is never empty here");
-            builder.command(PathBuf::from(program)).args(argv)
-        }
+        Task::Command(argv) => common::with_command(builder, &argv),
         Task::Emerge(packages) => builder.command(EMERGE).arg("--oneshot").args(packages),
     };
 

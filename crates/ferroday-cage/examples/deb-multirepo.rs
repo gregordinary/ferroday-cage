@@ -355,14 +355,7 @@ fn sanitize_name(name: &str) -> String {
 
 /// Runs a command in a cage rooted at the provisioned tree.
 fn launch(rootfs: &Path, argv: &[OsString]) -> ExitCode {
-    let mut argv = argv.iter();
-    let program = argv.next().expect("a command line is never empty here");
-    let cage = match Cage::builder()
-        .rootfs(rootfs)
-        .command(PathBuf::from(program))
-        .args(argv)
-        .build()
-    {
+    let cage = match common::with_command(Cage::builder().rootfs(rootfs), argv).build() {
         Ok(cage) => cage,
         Err(error) => {
             report_launch_error(&error);

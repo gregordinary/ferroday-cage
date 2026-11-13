@@ -1,9 +1,10 @@
 //! Command-line scaffolding shared by the examples.
 //!
 //! Each example is a worked consumer of the library, so what it *shows* is the
-//! library's API. Argument parsing is not that: it is the same four functions
-//! every time, and a reader who meets them once has met them all. They live
-//! here so each example's own file is about the sandbox it builds.
+//! library's API. Argument parsing is not that: it is the same few functions
+//! every time, down to handing the command line it collected to the builder,
+//! and a reader who meets them once has met them all. They live here so each
+//! example's own file is about the sandbox it builds.
 //!
 //! Cargo builds `examples/*.rs` as binaries and leaves a subdirectory without a
 //! `main.rs` alone, so this file is included with `mod common;` rather than
@@ -30,7 +31,10 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 use std::process::ExitCode;
+
+use ferroday_cage::CageBuilder;
 
 /// Consumes the next argument as a required value.
 #[allow(dead_code)]
@@ -70,6 +74,21 @@ pub fn flag_value(arg: &OsStr, prefix: &[u8]) -> Option<OsString> {
     arg.as_bytes()
         .strip_prefix(prefix)
         .map(|value| OsString::from_vec(value.to_vec()))
+}
+
+/// Gives `builder` the command line `argv` names: its first word as the command
+/// and the rest as the command's arguments.
+///
+/// # Panics
+///
+/// Where `argv` is empty. An example's parser collects a command line only
+/// where a word follows it, so an empty one never reaches here.
+#[allow(dead_code)]
+pub fn with_command(builder: CageBuilder, argv: &[OsString]) -> CageBuilder {
+    let (program, args) = argv
+        .split_first()
+        .expect("a command line is never empty here");
+    builder.command(PathBuf::from(program)).args(args)
 }
 
 /// Prints a usage error naming `program`, and returns the usage exit code.

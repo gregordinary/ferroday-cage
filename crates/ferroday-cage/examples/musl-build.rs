@@ -300,11 +300,7 @@ fn run(config: Config) -> ExitCode {
         Task::Build => builder
             .command(SHELL)
             .args(["-e", "-u", "-c", BUILD_SCRIPT]),
-        Task::Command(argv) => {
-            let mut argv = argv.iter();
-            let program = argv.next().expect("a command line is never empty here");
-            builder.command(PathBuf::from(program)).args(argv)
-        }
+        Task::Command(argv) => common::with_command(builder, argv),
     };
 
     let cage = match builder.build() {
