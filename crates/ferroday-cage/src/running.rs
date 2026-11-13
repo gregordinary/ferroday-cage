@@ -465,11 +465,20 @@ impl<'obs> Running<'obs> {
     /// deadline has been delivered, and the wait can be resumed. The deadline
     /// does not kill anything — escalation is the caller's, per the recipe
     /// above.
+    ///
+    /// A deadline already past still serves what is ready, without blocking,
+    /// as [`try_wait`](Self::try_wait) does, and returns the outcome where
+    /// that settles it. Collecting an outcome the supervisor reported can take
+    /// two such calls: one reads the report, and the next sees the supervisor
+    /// gone.
     pub fn wait_deadline(&mut self, deadline: Instant) -> Result<Option<ExitStatus>, Error> {
         self.pump(Some(deadline), None)
     }
 
     /// [`wait_deadline`](Self::wait_deadline) with a relative timeout.
+    ///
+    /// A zero timeout serves what is ready without blocking, as
+    /// [`try_wait`](Self::try_wait) does.
     pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<ExitStatus>, Error> {
         // A timeout too large for the clock is a wait without one.
         match Instant::now().checked_add(timeout) {
@@ -519,6 +528,11 @@ impl<'obs> Running<'obs> {
             self.pass(Some(&now), None)?;
         }
         self.sync_readiness()?;
+        self.outcome_if_settled()
+    }
+
+    /// The outcome where every channel has settled, and `None` otherwise.
+    fn outcome_if_settled(&mut self) -> Result<Option<ExitStatus>, Error> {
         match self.settled() {
             true => self.resolve().map(Some),
             false => Ok(None),
@@ -710,6 +724,10 @@ impl<'obs> Running<'obs> {
     /// The pump: polls the live channels, delivers captured output, and
     /// accumulates the status record, until everything settles, the deadline
     /// passes, or `wake` becomes readable.
+    ///
+    /// Every wait makes at least one pass, so a deadline already past serves
+    /// what is ready without blocking, as [`try_wait`](Self::try_wait) does,
+    /// and makes no further pass.
     fn pump(
         &mut self,
         deadline: Option<Instant>,
@@ -719,22 +737,16 @@ impl<'obs> Running<'obs> {
             if self.settled() {
                 return self.resolve().map(Some);
             }
-
-            if deadline.is_some_and(|deadline| deadline < Instant::now()) {
-                return Ok(None);
-            }
             let timeout = deadline.map(poll::until);
-            match self.pass(timeout.as_ref(), wake)? {
+            let pass = self.pass(timeout.as_ref(), wake)?;
+            let passed = deadline.is_some_and(|deadline| deadline <= Instant::now());
+            match pass {
                 Pass::TimedOut => return Ok(None),
                 // The waiter's channel is answered after this pass's own
                 // reads, so an outcome that arrived beside it is reported
                 // rather than left for the next wait.
-                Pass::Woken => {
-                    return match self.settled() {
-                        true => self.resolve().map(Some),
-                        false => Ok(None),
-                    };
-                }
+                Pass::Woken => return self.outcome_if_settled(),
+                Pass::Served if passed => return self.outcome_if_settled(),
                 Pass::Served => {}
             }
         }
@@ -1761,6 +1773,52 @@ mod tests {
             used < IDLE_TICKS,
             "the wait spun: {used} ticks while the stream was held open"
         );
+    }
+
+    /// A wait whose deadline has already passed still serves what is ready,
+    /// so repeating a zero wait collects an outcome waiting in the status pipe
+    /// rather than reporting the deadline passed before reading anything.
+    #[test]
+    fn a_wait_whose_deadline_has_passed_serves_what_is_ready() {
+        let mut supervisor = std::process::Command::new("true")
+            .spawn()
+            .expect("a process to stand for the supervisor");
+        let pidfd = pidfd_of(&supervisor);
+        supervisor.wait().expect("the stand-in is reaped");
+        let (status, status_write) = pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        let record = mechanism::encode_status(mechanism::STATUS_EXITED, 3, None);
+        rustix::io::write(&status_write, &record).expect("the record fits the pipe");
+        drop(status_write);
+        let (control, _peer) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket pair stands in for the control channel");
+        let mut running = Running::from_launched(
+            mechanism::Launched {
+                pidfd,
+                pid: supervisor.id(),
+                control,
+                status,
+                stdout: None,
+                stderr: None,
+                reap: None,
+                foreground: None,
+            },
+            None,
+            PlaceholderGuard::default(),
+            Readiness::new().expect("an epoll set"),
+            None,
+        );
+        // One wait reads the record and the next sees the supervisor gone.
+        let outcome = (0..3).find_map(|_| {
+            running
+                .wait_timeout(Duration::ZERO)
+                .expect("the channels are served")
+        });
+        assert_eq!(outcome.and_then(|status| status.code()), Some(3));
     }
 
     /// A fork copies the descriptor table, so a process the caller forks while
