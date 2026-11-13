@@ -84,13 +84,45 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
 /// dynamic range, where no guest service is expected to listen.
 const LOCAL_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
 
-/// Runs the pump until stopped. The tap descriptor's lifetime is the
-/// attachment's: it closes when this returns, and so do the published ports'
-/// listeners.
+/// Runs the pump until `stop`, the descriptor a [`Stop`] wakes, becomes
+/// readable. The tap descriptor's lifetime is the attachment's: it closes when
+/// this returns, and so do the published ports' listeners.
 pub(super) fn run(tap: OwnedFd, stop: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> PumpExit {
     match Engine::new(tap, plan, listeners) {
         Ok(mut engine) => engine.run(&stop),
         Err(exit) => exit,
+    }
+}
+
+/// What stops a pump: an eventfd the pump polls, which its handle writes to.
+///
+/// The signal is a write rather than the close of the handle's descriptor. A
+/// fork copies the caller's whole descriptor table, so a process the caller
+/// forks while the stack runs holds a copy of the handle's descriptor: another
+/// launch's stage until it sweeps its inherited descriptors, a child of the
+/// caller's own until it executes. A close reaches the pump only once every
+/// copy has closed, and a stop, or a dropped handle, would wait on the pump for
+/// that long. A write reaches it at once. Unlike a write to a pipe whose reader
+/// has gone, a write to an eventfd raises no `SIGPIPE` where the pump has
+/// already exited on its own.
+#[derive(Debug)]
+pub(super) struct Stop(OwnedFd);
+
+impl Stop {
+    /// A stop, and the descriptor the pump it stops polls.
+    pub(super) fn new() -> std::io::Result<(Stop, OwnedFd)> {
+        let flags = rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK;
+        let stop = rustix::event::eventfd(0, flags)?;
+        let polled = rustix::io::fcntl_dupfd_cloexec(&stop, 0)?;
+        Ok((Stop(stop), polled))
+    }
+
+    /// Tells the pump to stop. Telling it again, or once it has exited, does
+    /// nothing more.
+    pub(super) fn send(&self) {
+        // The counter the write adds to would take some 2^64 sends to fill,
+        // which is the one way the write can fail.
+        let _ = rustix::io::write(&self.0, &1u64.to_ne_bytes());
     }
 }
 
@@ -110,7 +142,7 @@ struct Inbound {
 /// Who a poll slot belongs to.
 #[derive(Clone, Copy)]
 enum SlotOwner {
-    /// The stop pipe.
+    /// The descriptor a [`Stop`] wakes.
     Stop,
     /// The tap descriptor.
     Tap,
@@ -241,7 +273,7 @@ impl Engine {
                 }
             }
 
-            // Assemble the poll set: the stop pipe, the tap, and every
+            // Assemble the poll set: the stop, the tap, and every
             // flow whose host socket has an interest right now. A flow
             // with nothing to wait for is left out entirely — its hangup
             // or error is discovered when it next has one.
@@ -1320,8 +1352,8 @@ mod tests {
     struct Driven {
         /// The guest's end of the pair.
         guest: OwnedFd,
-        /// The stop pipe's write end; dropping it stops the pump.
-        stop: Option<OwnedFd>,
+        /// What stops the pump, which dropping the harness sends.
+        stop: Stop,
         /// The pump's thread.
         pump: Option<std::thread::JoinHandle<PumpExit>>,
         /// The pump thread's id, for its processor time.
@@ -1331,17 +1363,16 @@ mod tests {
     impl Driven {
         fn start(plan: Plan, listeners: Vec<Listener>) -> Driven {
             let (tap, guest) = tap_pair();
-            let (stop_read, stop_write) =
-                rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).expect("a pipe");
+            let (stop, polled) = Stop::new().expect("an eventfd");
             let (tid_send, tid_receive) = std::sync::mpsc::channel();
             let pump = std::thread::spawn(move || {
                 let _ = tid_send.send(rustix::thread::gettid().as_raw_nonzero().get());
-                run(tap, stop_read, plan, listeners)
+                run(tap, polled, plan, listeners)
             });
             let tid = tid_receive.recv().expect("the pump thread reports its id");
             Driven {
                 guest,
-                stop: Some(stop_write),
+                stop,
                 pump: Some(pump),
                 tid,
             }
@@ -1367,7 +1398,7 @@ mod tests {
 
     impl Drop for Driven {
         fn drop(&mut self) {
-            drop(self.stop.take());
+            self.stop.send();
             if let Some(pump) = self.pump.take() {
                 let _ = pump.join();
             }
@@ -1598,6 +1629,26 @@ mod tests {
                 return true;
             }
         }
+    }
+
+    /// A fork copies the descriptor table, so a process the caller forks while
+    /// the stack runs, another launch's stage before its sweep among them,
+    /// holds a copy of whatever the stack's handle holds. The handle's stop
+    /// reaches the pump all the same.
+    #[test]
+    fn a_stop_reaches_the_pump_while_a_copy_of_the_handles_end_lives() {
+        let mut driven = Driven::start(NetStack::default().plan, Vec::new());
+        let copy = driven.stop.0.try_clone().expect("a duplicate");
+        driven.stop.send();
+        let pump = driven.pump.take().expect("the pump runs");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !pump.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stopped = pump.is_finished();
+        drop(copy);
+        assert!(matches!(pump.join(), Ok(PumpExit::Clean)));
+        assert!(stopped, "the pump ran on past its stop");
     }
 
     #[test]

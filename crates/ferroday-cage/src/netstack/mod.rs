@@ -66,7 +66,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use rustix::pipe::{self, PipeFlags};
 use smoltcp::wire::IpAddress;
 
 use crate::running::Pending;
@@ -329,12 +328,8 @@ impl NetStack {
 
         let tap = tap::create(&namespaces, &self.plan)?;
 
-        // The stop pipe wakes the pump: stop() writes a byte, and a dropped
-        // handle closes the write end, which the pump sees as a hangup.
-        let (stop_read, stop_write) =
-            pipe::pipe_with(PipeFlags::CLOEXEC).map_err(|errno| NetStackError::Spawn {
-                source: errno.into(),
-            })?;
+        // What wakes the pump to stop, which stop() and a dropped handle send.
+        let (stop, polled) = pump::Stop::new().map_err(|source| NetStackError::Spawn { source })?;
         let running = Arc::new(AtomicBool::new(true));
         let running_pump = Arc::clone(&running);
         let plan = self.plan.clone();
@@ -345,7 +340,7 @@ impl NetStack {
                 // flag is cleared on every path, so the handle's view of the
                 // pump is always truthful and stop() never rethrows.
                 let exit = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    pump::run(tap, stop_read, plan, listeners)
+                    pump::run(tap, polled, plan, listeners)
                 }));
                 running_pump.store(false, Ordering::SeqCst);
                 exit.unwrap_or(PumpExit::Failed {
@@ -357,7 +352,7 @@ impl NetStack {
 
         Ok(NetStackHandle {
             pump: Some(pump),
-            stop: Some(stop_write),
+            stop,
             running,
             published,
         })
@@ -448,8 +443,8 @@ enum PumpExit {
 pub struct NetStackHandle {
     /// The pump thread; `None` only after `stop` or `drop` takes it.
     pump: Option<JoinHandle<PumpExit>>,
-    /// Write end of the stop pipe; closing it is itself a stop signal.
-    stop: Option<OwnedFd>,
+    /// What stops the pump.
+    stop: pump::Stop,
     /// Cleared by the pump on every exit path.
     running: Arc<AtomicBool>,
     /// The host addresses the published ports listen on, in publication
@@ -479,12 +474,7 @@ impl NetStackHandle {
             .pump
             .take()
             .expect("a handle owns its pump thread until stop or drop consumes it");
-        // Closing the stop pipe's write end wakes the pump's poll with a
-        // hangup, which is the whole stop signal. Dropping the descriptor here
-        // closes it. A byte-write would also wake the pump, but a pump that
-        // exited on its own has closed the read end, so the write could raise
-        // SIGPIPE; the close cannot.
-        drop(self.stop.take());
+        self.stop.send();
         match pump.join() {
             Ok(PumpExit::Clean) => Ok(()),
             Ok(PumpExit::Failed { op, source }) => Err(NetStackError::Pump { op, source }),
@@ -508,11 +498,10 @@ impl NetStackHandle {
 
 impl Drop for NetStackHandle {
     fn drop(&mut self) {
-        // Closing the stop pipe's write end hangs up the pump's read end,
-        // which the pump treats as a stop request. Join so the tap descriptor
-        // is closed — and the sandbox's namespace released — before drop
-        // returns; the outcome is discarded, stop() being the reporting path.
-        drop(self.stop.take());
+        self.stop.send();
+        // Join so the tap descriptor is closed — and the sandbox's namespace
+        // released — before drop returns; the outcome is discarded, stop()
+        // being the reporting path.
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
         }

@@ -574,7 +574,7 @@ mod tests {
     fn a_reply_drain_leaves_a_flooding_peer_for_the_next_pass() {
         // A host peer replying faster than the guest reads must not hold the
         // pump inside the drain: without a bound the pump never returns to its
-        // poll, the stop pipe goes unserviced, and shutdown blocks. One pass
+        // poll, the stop goes unserviced, and shutdown blocks. One pass
         // takes what it can and leaves the rest on the host socket.
         let mut tables = UdpTables::new(1500);
         let mut sockets = SocketSet::new(Vec::new());

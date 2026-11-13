@@ -500,6 +500,11 @@ consumer upgrading can skip it.
 - `NetStackBuilder::build` refuses an interface name holding `%`. The kernel
   took such a name as a template and named the interface itself, so the stack's
   configuration of it failed at attach with "No such device".
+- `NetStackHandle::stop`, and dropping a handle, reach the stack's pump at
+  once. The stop was the close of a pipe, which a process forked while the stack
+  ran kept open with its copy: another launch's stage until it closes the
+  descriptors it inherited, or a child of the caller's own until it executes.
+  The stop waited on the pump for that long.
 - A terminal session in the background no longer reads the caller's terminal.
   A line typed at the shell stopped it with `SIGTTIN`, and the `fg` that
   continued it left it inside a read of a cooked terminal, relaying nothing and
