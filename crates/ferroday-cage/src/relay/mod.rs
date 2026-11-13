@@ -160,7 +160,7 @@ pub(crate) mod signals;
 
 use std::io;
 use std::os::fd::BorrowedFd;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::OFlags;
@@ -446,9 +446,7 @@ impl<'fd> Relay<'fd> {
                 false => &mut slots[..INPUT],
             };
 
-            let wait = escalation
-                .deadline()
-                .map(|deadline| poll::timeout(deadline.saturating_duration_since(Instant::now())));
+            let wait = escalation.deadline().map(poll::until);
             match rustix::event::poll(watched, wait.as_ref()) {
                 Ok(_) => {}
                 Err(Errno::INTR) => continue,

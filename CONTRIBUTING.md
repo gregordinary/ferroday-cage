@@ -555,7 +555,7 @@ report name a package and its version bare.
 | Does the network stack carry the guest's traffic to this destination? | `NetStack::forwards` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
 | Declare an enum together with the roster of its own variants | `roster::roster_enum!` |
-| State a `poll` deadline | `poll::timeout` |
+| State a `poll` deadline | `poll::timeout` for a duration, `poll::until` for an instant, which is zero once the instant has passed |
 | Stop watching a channel a `poll` loop has finished with | leave it out of the polled slice, as the `poll` module states |
 | Stop watching a channel the running handle's readiness set holds | `running::Readiness::close`, which takes it out of the epoll set before closing it, since a fork's copy of the descriptor would keep the registration |
 | Report an OS failure with its operation and its subject | `failure::path_io_error!`, which declares each error type's `io` and `at` constructors |

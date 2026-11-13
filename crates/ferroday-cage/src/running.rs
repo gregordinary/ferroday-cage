@@ -720,15 +720,10 @@ impl<'obs> Running<'obs> {
                 return self.resolve().map(Some);
             }
 
-            let timeout = match deadline {
-                None => None,
-                Some(deadline) => {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        return Ok(None);
-                    };
-                    Some(poll::timeout(remaining))
-                }
-            };
+            if deadline.is_some_and(|deadline| deadline < Instant::now()) {
+                return Ok(None);
+            }
+            let timeout = deadline.map(poll::until);
             match self.pass(timeout.as_ref(), wake)? {
                 Pass::TimedOut => return Ok(None),
                 // The waiter's channel is answered after this pass's own

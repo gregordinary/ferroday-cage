@@ -1030,15 +1030,11 @@ impl Cgroup {
             if populated == Some(0) {
                 return;
             }
-            let timeout = match deadline {
-                None => None,
-                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
-                    Some(remaining) => Some(crate::poll::timeout(remaining)),
-                    None => return,
-                },
-            };
+            let timeout = deadline.map(crate::poll::until);
             let mut ready = [PollFd::new(&events, PollFlags::PRI)];
             match rustix::event::poll(&mut ready, timeout.as_ref()) {
+                // The deadline passed.
+                Ok(0) => return,
                 Ok(_) | Err(Errno::INTR) => {}
                 Err(_) => return,
             }

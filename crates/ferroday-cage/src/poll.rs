@@ -1,5 +1,5 @@
-//! The `poll` discipline: how a loop states its timeout, and how it stops
-//! watching a channel it is finished with.
+//! The `poll` discipline: how a loop states its timeout, from a duration or a
+//! deadline, and how it stops watching a channel it is finished with.
 //!
 //! Both answers are subtle enough to be worth stating once. The running
 //! handle's pump, the supervisor loop, the network stack's pump, and the
@@ -24,7 +24,7 @@
 //! socket, and the terminal relay one, the caller's input; each sits at one end
 //! of its array, so retiring it shortens the slice.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::event::Timespec;
 
@@ -41,4 +41,14 @@ pub(crate) fn timeout(duration: Duration) -> Timespec {
         tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         tv_nsec: i64::from(duration.subsec_nanos()),
     }
+}
+
+/// The `poll` timeout that ends at `deadline`: the time left until it, and
+/// zero once it has passed, so a poll with it reports what is ready without
+/// blocking.
+///
+/// A loop that must stop at its deadline reads a poll that timed out as the
+/// deadline passing, rather than asking the clock again.
+pub(crate) fn until(deadline: Instant) -> Timespec {
+    timeout(deadline.saturating_duration_since(Instant::now()))
 }
