@@ -47,7 +47,6 @@ use std::borrow::Cow;
 use super::index::{self, Record};
 use super::{GentooError, atom, version};
 use crate::provision::coordinate::{self, Nesting};
-use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Carried, Draft};
 
 /// The document's first field, naming the format and its version.
@@ -256,7 +255,7 @@ impl PlannedPackage {
         {
             return Some(reason);
         }
-        if !Algorithm::Md5.is_hex(&self.md5) {
+        if !crate::provision::digest::md5::is_hex(&self.md5) {
             return Some(format!(
                 "the plan states an MD5 of {:?} for {}, which is not one this format writes",
                 self.md5, self.name,

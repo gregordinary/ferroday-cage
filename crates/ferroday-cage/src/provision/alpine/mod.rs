@@ -72,7 +72,7 @@ pub use repository::{Repository, RepositoryBuilder};
 use super::binfmt;
 use super::cache;
 use super::coordinate::{self, Nesting};
-use super::digest::Algorithm;
+use super::digest::{Algorithm, Digest};
 use super::extract::{Extraction, Placement};
 use super::identity::Ownership;
 // `super::layer` is the shared one; this module has a `layer` of its own, which
@@ -1332,7 +1332,7 @@ fn read_index(
                     // Over the container as it arrived, signature segment
                     // included, so the value names the exact bytes whose
                     // signature was checked.
-                    sha256: Algorithm::Sha256.hex_of(&bytes),
+                    sha256: Digest::of(Algorithm::Sha256, &bytes),
                     signed_by,
                     description,
                     // A record built from a live resolution has no document
@@ -3414,7 +3414,10 @@ mod tests {
         assert_eq!(index.mirror, "http://mirror.invalid/alpine");
         assert_eq!(index.component.as_deref(), Some("main"));
         assert_eq!(index.signed_by, fixtures::ALPINE_KEY_NAME);
-        assert_eq!(index.sha256, Algorithm::Sha256.hex_of(fixtures::INDEX),);
+        assert_eq!(
+            index.sha256.hex(),
+            Algorithm::Sha256.hex_of(fixtures::INDEX)
+        );
         assert!(
             index
                 .description

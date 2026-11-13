@@ -197,12 +197,12 @@ const DBUS_MACHINE_ID: &str = "var/lib/dbus/machine-id";
 pub(crate) const ARCHIVES: &str = "/fcage-debs";
 
 /// A package to install: its name, the path to its `.deb` inside the cage, and
-/// the SHA-256 the `.deb` was acquired under, which the extraction verifies the
+/// the digests the `.deb` was acquired under, which the extraction verifies the
 /// file `dpkg` goes on to read against.
 pub(crate) struct Installable {
     pub name: String,
     pub deb_path: String,
-    pub sha256: String,
+    pub digests: super::digests::Digests,
 }
 
 /// The dpkg statoverride a bootstrap derives: one `<user> <group> <mode>

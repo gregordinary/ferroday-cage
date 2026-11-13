@@ -41,6 +41,7 @@
 mod arch;
 mod bootstrap;
 mod deb;
+mod digests;
 mod index;
 mod layer;
 mod pin;
@@ -67,7 +68,6 @@ pub use repository::{Repository, RepositoryBuilder};
 
 use super::cache;
 use super::coordinate::{self, Nesting};
-use super::digest::{self, Algorithm};
 use super::document::Carried;
 use super::extract::{Extraction, Placement};
 use super::identity::Ownership;
@@ -82,6 +82,7 @@ use crate::failure::path_io_error;
 use crate::status::ExitStatus;
 use crate::{ErrorChain, IdMapper, IdentityMap};
 use bootstrap::{Installable, StatOverride};
+use digests::Digests;
 use index::{Index, Package};
 use pin::Pins;
 
@@ -408,7 +409,7 @@ fn validate_plan(
 /// composes with it, and the repository list is free to differ from the one the
 /// pin was resolved against. What remains is a pin that cannot mean anything: a
 /// resolution that will not happen, one for a different coordinate, or one whose
-/// entries state a digest nothing an archive publishes could equal.
+/// entries a plan document's reader would refuse.
 fn validate_pin(
     pin: &Plan,
     suite: &str,
@@ -436,13 +437,10 @@ fn validate_pin(
             pin.architecture,
         ));
     }
-    // A pin holds a resolution to the digests it records, and `Pins::check`
-    // compares them against the index with a plain `==`. A digest spelled any
-    // other way could only ever mismatch, and would be reported as an archive
-    // that had published past the pin rather than as the malformed entry it is.
-    // The whole rule is applied, not the digest half alone: a pin is a plan
-    // document, read by the same reader, and one it would refuse is worth
-    // refusing here too.
+    // A pin is a plan document, read by the same reader, and an entry it would
+    // refuse is worth refusing here too. Its digest needs no check: a `Digest`
+    // is held to its algorithm's shape when it is made, so one spelled any other
+    // way, which could only ever mismatch, never reaches a pin.
     for package in &pin.packages {
         if let Some(reason) = package.unaddressable() {
             return contradiction(reason);
@@ -2005,7 +2003,7 @@ fn merged_index(
             mirror,
             suite: repository.suite.clone(),
             components: repository.components.clone(),
-            release_sha256: release.sha256().to_string(),
+            release_sha256: release.sha256().clone(),
             date: release.date().map(str::to_string),
             valid_until: release.valid_until().map(str::to_string),
             signed_by,
@@ -2247,13 +2245,13 @@ fn fetch_component_index(
     // release states each index's length beside its digest, and that length
     // travels with the fetch as its ceiling: it is signed, it is free, and it
     // bounds what a mirror can spend before the digest check runs.
-    let candidates: Vec<(String, u64, &str)> = ["Packages.xz", "Packages.gz", "Packages"]
+    let candidates: Vec<(String, u64, &Digests)> = ["Packages.xz", "Packages.gz", "Packages"]
         .iter()
         .filter_map(|suffix| {
             let rel = format!("{component}/binary-{architecture}/{suffix}");
             release
                 .digest(&rel)
-                .map(|(size, digest)| (rel, size, digest))
+                .map(|(size, digests)| (rel, size, digests))
         })
         .collect();
     if candidates.is_empty() {
@@ -2293,14 +2291,19 @@ fn fetch_component_index(
             }
             walk_mirrors(
                 &candidates,
-                |(rel, size, digest)| {
+                |(rel, size, digests)| {
                     let mut locations = Vec::with_capacity(2);
+                    // Under the strongest digest the release records, as apt
+                    // asks: an archive recording SHA-512 alone publishes its
+                    // `by-hash` copies under that algorithm alone.
                     if release.acquire_by_hash() {
+                        let (algorithm, digest) = digests.strongest();
                         locations.push(mirror_url(
                             mirror,
                             &format!(
-                                "dists/{suite}/{component}/binary-{architecture}/by-hash/SHA256/\
-                                 {digest}"
+                                "dists/{suite}/{component}/binary-{architecture}/by-hash/\
+                                 {algorithm}/{}",
+                                digest.hex()
                             ),
                         ));
                     }
@@ -2310,7 +2313,7 @@ fn fetch_component_index(
                         |url| {
                             observer.progress(DebianEvent::Fetching { url });
                             let bytes = fetch_bytes(fetcher, url, Some(*size))?;
-                            verify_digest(url, &bytes, digest)?;
+                            verify_digest(url, &bytes, digests)?;
                             decompress_index(url, &bytes, expanded)
                         },
                         not_served,
@@ -2409,8 +2412,8 @@ fn acquire_debs(
         if observer.cancelled() {
             return Err(ProvisionError::Cancelled);
         }
-        let dest = archives_host.join(format!("{}.deb", package.sha256));
-        if !is_cached(&dest, &package.sha256) {
+        let dest = archives_host.join(cache_name(&package.digests));
+        if !is_cached(&dest, &package.digests) {
             missing.push((package, dest));
         }
     }
@@ -2448,7 +2451,7 @@ fn acquire_debs(
         .unzip();
     let delivered = cache::prefetch(fetcher, &jobs, observer, |job, mut file| {
         let (package, dest) = &missing[batched[job]];
-        verify_deb(&mut file, dest, &jobs[job].url, &package.sha256)
+        verify_deb(&mut file, dest, &jobs[job].url, &package.digests)
     })
     .map_err(|failure| failure.into_provision(wrap))?;
     let mut acquired = vec![false; missing.len()];
@@ -2472,7 +2475,7 @@ fn acquire_debs(
                 size: package.size,
             },
             observer,
-            |mut file, url, _| verify_deb(&mut file, dest, url, &package.sha256),
+            |mut file, url, _| verify_deb(&mut file, dest, url, &package.digests),
             || FetchError::not_found(&package.filename),
         )
         .map_err(|failure| failure.into_provision(wrap))?;
@@ -2482,28 +2485,35 @@ fn acquire_debs(
         .iter()
         .map(|package| Installable {
             name: package.name.clone(),
-            deb_path: format!("{}/{}.deb", bootstrap::ARCHIVES, package.sha256),
-            sha256: package.sha256.clone(),
+            deb_path: format!("{}/{}", bootstrap::ARCHIVES, cache_name(&package.digests)),
+            digests: package.digests.clone(),
         })
         .collect())
 }
 
-/// Whether the cache entry at `dest` holds the package whose digest is
-/// `sha256`, decided by streaming its digest.
+/// The name a package with `digests` is cached under: its SHA-256 where the
+/// archive records one, so an entry an earlier run cached keeps its name, and
+/// otherwise its SHA-512, whose width keeps the two apart.
+fn cache_name(digests: &Digests) -> String {
+    format!("{}.deb", digests.planned().hex())
+}
+
+/// Whether the cache entry at `dest` holds the package whose digests are
+/// `digests`, decided by streaming them.
 ///
 /// Validating a cached kernel package costs the memory of validating a shell
 /// script, which is the property every read and write of a `.deb` in this
 /// crate keeps. An entry that is absent, unreadable, not a regular file,
 /// truncated, or altered answers `false`, and a download replaces it: a rename
 /// onto the name is what publishes the replacement.
-fn is_cached(dest: &Path, sha256: &str) -> bool {
+fn is_cached(dest: &Path, digests: &Digests) -> bool {
     cache::open_entry(dest).is_ok_and(|mut file| {
-        verify_deb(&mut file, dest, &dest.display().to_string(), sha256).is_ok()
+        verify_deb(&mut file, dest, &dest.display().to_string(), digests).is_ok()
     })
 }
 
-/// Holds a `.deb` to the SHA-256 its index recorded, reading `file` from its
-/// start.
+/// Holds a `.deb` to every digest its index recorded, reading `file` once from
+/// its start.
 ///
 /// The one check a package is held to, whichever produced the file: a cache
 /// hit, a download before it is published, and the copy a run installs from.
@@ -2514,19 +2524,16 @@ fn verify_deb(
     file: &mut File,
     entry: &Path,
     subject: &str,
-    sha256: &str,
+    digests: &Digests,
 ) -> Result<(), DebianError> {
-    let (actual, _) = digest::stream(Algorithm::Sha256, file)
-        .map_err(DebianError::at("reading the package", entry))?;
-    if actual == sha256 {
-        Ok(())
-    } else {
-        Err(DebianError::Digest {
+    digests
+        .check_stream(file)
+        .map_err(DebianError::at("reading the package", entry))?
+        .map_err(|mismatch| DebianError::Digest {
             subject: subject.to_string(),
-            expected: sha256.to_string(),
-            actual,
+            expected: mismatch.expected.hex().to_string(),
+            actual: mismatch.actual,
         })
-    }
 }
 
 /// Copies the packages a run installs out of a cache the caller named, into a
@@ -2560,7 +2567,7 @@ fn private_copy(
     let private = PackageCache::beside(tree, None, DEB_CACHE);
     cache::create(private.path())?;
     for installable in installables {
-        let name = format!("{}.deb", installable.sha256);
+        let name = cache_name(&installable.digests);
         let from = cache_dir.join(&name);
         copy_package(&from, &private.path().join(&name))
             .map_err(|source| ProvisionError::io("copying a package to install", &from, source))?;
@@ -2586,9 +2593,9 @@ fn copy_package(from: &Path, to: &Path) -> io::Result<()> {
 struct Wanted {
     /// The package name, for the progress report and the dpkg install order.
     name: String,
-    /// The archive-recorded SHA-256, which is both the cache key and the check
-    /// the download is held to.
-    sha256: String,
+    /// The archive-recorded digests, which name the cache entry and are the
+    /// check the download is held to.
+    digests: Digests,
     /// The pool path, relative to the mirror root.
     filename: String,
     /// The archive-recorded length of the `.deb`, which bounds what the
@@ -2603,7 +2610,7 @@ impl Wanted {
     fn from_package(package: &Package) -> Wanted {
         Wanted {
             name: package.name.clone(),
-            sha256: package.sha256.clone(),
+            digests: package.digests.clone(),
             filename: package.filename.clone(),
             size: package.size,
             origin: package.origin,
@@ -2623,7 +2630,7 @@ impl Wanted {
     fn from_planned(package: &PlannedPackage) -> Wanted {
         Wanted {
             name: package.name.clone(),
-            sha256: package.sha256.clone(),
+            digests: Digests::from(package.digest.clone()),
             filename: package.filename.clone(),
             size: package.size,
             origin: package.archive,
@@ -2735,7 +2742,7 @@ fn extract_packages(
             &mut file,
             &path,
             &path.display().to_string(),
-            &installable.sha256,
+            &installable.digests,
         )
         .map_err(wrap)?;
         deb::extract_deb(
@@ -2858,19 +2865,16 @@ fn fetch_bytes(
     Ok(bytes)
 }
 
-/// Verifies bytes against an expected SHA-256, naming the URL they were
-/// fetched from on a mismatch.
-fn verify_digest(url: &str, bytes: &[u8], expected: &str) -> Result<(), DebianError> {
-    let actual = Algorithm::Sha256.hex_of(bytes);
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(DebianError::Digest {
+/// Verifies bytes against every digest the release records for them, naming
+/// the URL they were fetched from on a mismatch.
+fn verify_digest(url: &str, bytes: &[u8], digests: &Digests) -> Result<(), DebianError> {
+    digests
+        .check_bytes(bytes)
+        .map_err(|mismatch| DebianError::Digest {
             subject: url.to_string(),
-            expected: expected.to_string(),
-            actual,
+            expected: mismatch.expected.hex().to_string(),
+            actual: mismatch.actual,
         })
-    }
 }
 
 /// The most an index may expand to when its release states no uncompressed
@@ -3196,11 +3200,12 @@ pub enum DebianEvent<'a> {
         packages: usize,
         /// How many stanzas were read and not kept, because this layer cannot
         /// act on them: a stanza missing its package's name, version,
-        /// architecture, pool path, or SHA-256, one stating its package's name
-        /// or version outside the alphabet Debian policy gives each, or one
-        /// whose pool path would leave the mirror or whose digest is not
-        /// lowercase hex. A package left out this way is one a resolution
-        /// cannot select. A live archive reports zero.
+        /// architecture, or pool path, one stating its package's name or
+        /// version outside the alphabet Debian policy gives each, one stating
+        /// neither a SHA-256 nor a SHA-512, or either other than as lowercase
+        /// hex of its width, or one whose pool path would leave the mirror. A
+        /// package left out this way is one a resolution cannot select. A live
+        /// archive reports zero.
         skipped: usize,
     },
 }
@@ -3270,14 +3275,18 @@ pub enum DebianError {
     /// Either a mirror served something other than the resource the release or
     /// the index named, or a cached package no longer holds the bytes it was
     /// acquired under.
+    ///
+    /// The bytes are held to every digest the archive recorded, SHA-256 and
+    /// SHA-512 alike, and the first that differs, SHA-256 first, is the one
+    /// named; each is as wide as its algorithm writes.
     #[non_exhaustive]
     Digest {
         /// What was checked: the URL a resource was fetched from, or the path
         /// of a cached package read back to be installed.
         subject: String,
-        /// The SHA-256 the archive recorded, lowercase hex.
+        /// The digest the archive recorded, lowercase hex.
         expected: String,
-        /// The SHA-256 the bytes actually have.
+        /// The digest the bytes actually have, under the same algorithm.
         actual: String,
     },
     /// The bootstrap's observer asked it to stop.
@@ -3484,6 +3493,7 @@ impl From<crate::Error> for DebianError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provision::digest::Algorithm;
     use crate::scratch::Scratch;
 
     #[test]
@@ -3579,7 +3589,7 @@ mod tests {
     fn wanted(name: &str, body: &[u8]) -> Wanted {
         Wanted {
             name: name.to_string(),
-            sha256: Algorithm::Sha256.hex_of(body),
+            digests: Digests::new(Some(Algorithm::Sha256.hex_of(body)), None).unwrap(),
             filename: format!("pool/{name}.deb"),
             size: Some(body.len() as u64),
             origin: 0,
@@ -3639,7 +3649,7 @@ mod tests {
         assert_eq!(asked.len(), 2, "each package was fetched once: {asked:?}");
         for package in &packages {
             assert!(
-                scratch.join(format!("{}.deb", package.sha256)).is_file(),
+                scratch.join(cache_name(&package.digests)).is_file(),
                 "{} should be in the cache",
                 package.name,
             );
@@ -3670,11 +3680,45 @@ mod tests {
             2,
             "the batch asked once and the walk asked again: {asked:?}",
         );
-        assert!(
-            scratch
-                .join(format!("{}.deb", packages[0].sha256))
-                .is_file()
-        );
+        assert!(scratch.join(cache_name(&packages[0].digests)).is_file());
+    }
+
+    #[test]
+    fn a_package_is_cached_under_its_sha256_where_there_is_one_and_held_to_every_digest() {
+        let body = b"the package the index named".to_vec();
+        let sha256 = Algorithm::Sha256.hex_of(&body);
+        let sha512 = Algorithm::Sha512.hex_of(&body);
+        let served = vec![(
+            "https://mirror.example/debian/pool/one.deb".to_string(),
+            body.clone(),
+        )];
+        let with = |sha256: Option<String>, sha512: Option<String>| Wanted {
+            digests: Digests::new(sha256, sha512).unwrap(),
+            ..wanted("one", &body)
+        };
+
+        // A SHA-512 alone names the entry, and a SHA-256 does where there is
+        // one, so an entry an earlier run cached keeps its name.
+        for (package, stem) in [
+            (with(None, Some(sha512.clone())), &sha512),
+            (with(Some(sha256.clone()), Some(sha512.clone())), &sha256),
+        ] {
+            let scratch = Scratch::new("acquire-digests");
+            let (outcome, _) = acquire(std::slice::from_ref(&package), &served, scratch.as_ref());
+            outcome.expect("the bytes are the package");
+            assert!(scratch.join(format!("{stem}.deb")).is_file());
+        }
+
+        // Either digest differing refuses the bytes, and nothing is published.
+        for package in [
+            with(Some(sha256.clone()), Some("0".repeat(128))),
+            with(Some("0".repeat(64)), Some(sha512.clone())),
+        ] {
+            let scratch = Scratch::new("acquire-digests-wrong");
+            let (outcome, _) = acquire(std::slice::from_ref(&package), &served, scratch.as_ref());
+            assert!(outcome.is_err(), "one digest differs");
+            assert!(!scratch.join(cache_name(&package.digests)).is_file());
+        }
     }
 
     #[test]
@@ -3693,7 +3737,7 @@ mod tests {
         let (outcome, asked) = acquire(std::slice::from_ref(&package), &bodies, scratch.as_ref());
         assert!(outcome.is_err(), "the bytes are not the package");
         assert!(
-            !scratch.join(format!("{}.deb", package.sha256)).is_file(),
+            !scratch.join(cache_name(&package.digests)).is_file(),
             "nothing unverified reaches the cache",
         );
         // Nothing is left staged either.
@@ -3715,7 +3759,7 @@ mod tests {
         let scratch = Scratch::new("acquire-corrupt-entry");
         let body = b"the real package".to_vec();
         let package = wanted("one", &body);
-        let dest = scratch.join(format!("{}.deb", package.sha256));
+        let dest = scratch.join(cache_name(&package.digests));
         std::fs::write(&dest, b"short").expect("the corrupt entry is writable");
         let repositories = vec![
             Repository::builder("trixie")
@@ -3774,7 +3818,7 @@ mod tests {
         let two = b"the second package".to_vec();
         let packages = vec![wanted("one", &one), wanted("two", &two)];
         // The first is cached already, the everyday state of a second run.
-        std::fs::write(scratch.join(format!("{}.deb", packages[0].sha256)), &one)
+        std::fs::write(scratch.join(cache_name(&packages[0].digests)), &one)
             .expect("the cached package is writable");
         let repositories = vec![
             Repository::builder("trixie")
@@ -4040,6 +4084,94 @@ mod tests {
             .build()
             .expect("the builder validates");
         (debian, asked)
+    }
+
+    /// A release whose one index is `index`, listed under `sections` (each
+    /// `"SHA256"` or `"SHA512"`, with the digest it states for the index), with
+    /// `Acquire-By-Hash`, and a transport answering the release and `serve`.
+    fn sectioned_archive(
+        index: &[u8],
+        sections: &[(&str, String)],
+        serve: &[(String, Vec<u8>)],
+    ) -> (Debian, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let mut release = "Suite: trixie\nArchitectures: amd64\nComponents: main\n\
+                           Acquire-By-Hash: yes\n"
+            .to_string();
+        for (section, digest) in sections {
+            release.push_str(&format!(
+                "{section}:\n {digest} {} main/binary-amd64/Packages\n",
+                index.len()
+            ));
+        }
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut bodies: std::collections::HashMap<String, Vec<u8>> =
+            serve.iter().cloned().collect();
+        bodies.insert(
+            "https://mirror.example/debian/dists/trixie/Release".to_string(),
+            release.into_bytes(),
+        );
+        let fetcher = Table {
+            bodies,
+            asked: std::sync::Arc::clone(&asked),
+        };
+        let debian = Debian::builder("trixie")
+            .architecture("amd64")
+            .mirror("https://mirror.example/debian")
+            .trust_unsigned(true)
+            .fetcher(fetcher)
+            .build()
+            .expect("the builder validates");
+        (debian, asked)
+    }
+
+    #[test]
+    fn an_index_is_held_to_every_digest_its_release_records() {
+        let index = format!(
+            "Package: pp\nVersion: 1\nArchitecture: amd64\nFilename: pool/p.deb\nSHA512: {}\n",
+            "0".repeat(128)
+        );
+        let index = index.as_bytes();
+        let sha256 = Algorithm::Sha256.hex_of(index);
+        let sha512 = Algorithm::Sha512.hex_of(index);
+        let base = "https://mirror.example/debian/dists/trixie/main/binary-amd64";
+        let named = format!("{base}/Packages");
+
+        // Listed under SHA512 alone, as Ubuntu's development series lists its
+        // indexes: asked for by that digest, and its package read by its own.
+        let by_sha512 = format!("{base}/by-hash/SHA512/{sha512}");
+        let (mut debian, asked) = sectioned_archive(
+            index,
+            &[("SHA512", sha512.clone())],
+            &[(by_sha512.clone(), index.to_vec())],
+        );
+        let available = debian
+            .available()
+            .expect("the index is read by its SHA-512");
+        assert!(available.contains("pp"));
+        assert_eq!(asked.lock().unwrap()[1..], [by_sha512]);
+
+        // Listed under both, it is asked for by the stronger, and refused if
+        // either digest differs, as apt refuses it.
+        for (stated256, stated512) in [
+            (sha256.clone(), "0".repeat(128)),
+            ("0".repeat(64), sha512.clone()),
+        ] {
+            let (mut debian, asked) = sectioned_archive(
+                index,
+                &[("SHA256", stated256), ("SHA512", stated512.clone())],
+                &[
+                    (format!("{base}/by-hash/SHA512/{stated512}"), index.to_vec()),
+                    (named.clone(), index.to_vec()),
+                ],
+            );
+            let err = debian.available().expect_err("one digest differs");
+            assert!(matches!(err, DebianError::Digest { .. }), "{err}");
+            assert!(
+                asked.lock().unwrap()[1].contains("/by-hash/SHA512/"),
+                "{:?}",
+                asked.lock().unwrap()
+            );
+        }
     }
 
     #[test]
@@ -4423,10 +4555,10 @@ mod tests {
         let (message, _) = pgp::composed::CleartextSignedMessage::from_armor(INRELEASE)
             .expect("the fixture is a cleartext-signed document");
         assert_eq!(
-            release.sha256(),
+            release.sha256().hex(),
             Algorithm::Sha256.hex_of(message.signed_text().as_bytes()),
         );
-        assert_ne!(release.sha256(), Algorithm::Sha256.hex_of(INRELEASE));
+        assert_ne!(release.sha256().hex(), Algorithm::Sha256.hex_of(INRELEASE));
 
         // And it is a property of those bytes rather than of the fetch, so a
         // second pass over the same release records the same digest.
@@ -4858,7 +4990,7 @@ mod tests {
                 Installable {
                     name: (*name).to_string(),
                     deb_path: format!("{}/{sha256}.deb", bootstrap::ARCHIVES),
-                    sha256,
+                    digests: Digests::new(Some(sha256), None).unwrap(),
                 }
             })
             .collect()
@@ -5052,7 +5184,7 @@ mod tests {
         let cache = dir.join("cache");
         let tree = dir.join("tree");
         let install = installables(&cache, &[("one", deb_of(&data_tar(&[])))]);
-        let name = format!("{}.deb", install[0].sha256);
+        let name = cache_name(&install[0].digests);
 
         let private = private_copy(&tree, Some(&cache), &install)
             .expect("the packages are copied")

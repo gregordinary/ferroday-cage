@@ -4455,7 +4455,7 @@ mod tests {
         let mut package = gpkg::fixture::planned(gpkg::fixture::CPV, 1);
         package.path = "sys-libs/zlib/zlib-1.3.2-1.gpkg.tar".to_string();
         package.size = 1_048_576;
-        package.md5 = Algorithm::Md5.hex_of(container);
+        package.md5 = digest::md5::hex_of(container);
         plan.packages.push(package);
         plan
     }
@@ -4616,7 +4616,7 @@ mod tests {
         let mut plan = plan_from(BINHOST, &first);
         let mut other = plan.packages[0].clone();
         other.path = "sys-libs/zlib/zlib-1.3.2-1.arm.gpkg.tar".to_string();
-        other.md5 = Algorithm::Md5.hex_of(&second);
+        other.md5 = digest::md5::hex_of(&second);
         plan.packages.push(other);
         let served = HashMap::from([
             (binhost_url(&plan.packages[0].path), first),

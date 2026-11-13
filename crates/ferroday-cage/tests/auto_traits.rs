@@ -131,16 +131,21 @@ const _: () = assert_send::<ferroday_cage::provision::Tarball>();
 // ---------------------------------------------------------------------------
 // What every userland provisioner shares: the transport seam, the overlay upper
 // a layered build stages into, the stream an in-cage command's output is
-// attributed to, and the names a set of repositories offers.
+// attributed to, the names a set of repositories offers, and the digest a plan
+// records.
 // ---------------------------------------------------------------------------
 
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod shared {
+    use ferroday_cage::provision::digest::{Algorithm, Digest};
     use ferroday_cage::provision::{
         Available, BuildLayer, FetchError, FetchRequest, HttpFetch, Stream,
     };
 
     use super::*;
+
+    const _: () = assert_send_sync::<Algorithm>();
+    const _: () = assert_send_sync::<Digest>();
 
     const _: () = assert_send_sync::<Available>();
     const _: () = assert_send_sync::<FetchError>();

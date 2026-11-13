@@ -452,6 +452,8 @@ report name a package and its version bare.
 | What can a package's name and version contain, as an index or a plan states them? | `provision::debian::index::is_package_name` and `debian::version::is_version`, `alpine::index::is_package_name` and `alpine::version::parse`, `gentoo::atom::is_package` and `gentoo::version::parse` |
 | What can a release, a component, or an architecture contain? | `provision::coordinate::check` |
 | What can a digest of a given algorithm contain? | `provision::digest::Algorithm::is_hex` |
+| What must a planned package hash to, and what did the release or the index a plan records? | `provision::digest::Digest`, an `Algorithm` and lowercase hex `Digest::new` held to its width; an Alpine package's `control_identity` and a Gentoo package's `md5` are not one, as its documentation says |
+| Hold a Debian index or package to every digest its archive records | `provision::debian::digests::Digests`, whose `check_bytes` and `check_stream` compare each, as apt does, and whose `planned` is the one a plan keeps |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
 | Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode` |

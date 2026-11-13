@@ -13,11 +13,11 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
+use super::digests::Digests;
 use super::pin::{PinMatch, Pins, UnheldPin};
 use super::release::ReleasePriority;
 use super::version::{self, Constraint};
 use crate::provision::Available;
-use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
 use crate::provision::fetch::percent_decode;
 use crate::roster::roster_enum;
@@ -37,7 +37,9 @@ pub(crate) struct Package {
     /// spend before its digest is checked, so it is read from the index whose
     /// own digest the verified release records.
     pub size: Option<u64>,
-    pub sha256: String,
+    /// The digests the stanza records for the `.deb`: its `SHA256`, its
+    /// `SHA512`, or both.
+    pub digests: Digests,
     pub depends: Vec<Dependency>,
     pub pre_depends: Vec<Dependency>,
     /// The virtual package names this package provides, each with the version
@@ -207,6 +209,7 @@ impl Package {
             architecture,
             filename,
             sha256,
+            sha512,
             size,
             installed_size,
             source,
@@ -221,6 +224,7 @@ impl Package {
             "Architecture",
             "Filename",
             "SHA256",
+            "SHA512",
             "Size",
             "Installed-Size",
             "Source",
@@ -239,21 +243,19 @@ impl Package {
             return None;
         }
         let architecture = architecture?.into_owned();
-        // The digest becomes a cache filename and the fetch verifier's expected
-        // value, and the pool path becomes a fetch URL and (for a `file://`
+        // A digest becomes a cache filename and a value the fetch is verified
+        // against, and the pool path becomes a fetch URL and (for a `file://`
         // mirror) a local path. Neither is trusted until the archive signature
         // is checked, so validate their shape here, at the boundary where the
-        // index is parsed, rather than at each use site: a stanza whose digest
-        // is not 64 lowercase hex characters or whose pool path could traverse
-        // out of a mirror root is malformed and dropped.
+        // index is parsed, rather than at each use site: a stanza stating no
+        // SHA-256 and no SHA-512, stating either other than as lowercase hex of
+        // its width, or whose pool path could traverse out of a mirror root is
+        // malformed and dropped.
         let filename = filename?.into_owned();
         if !is_safe_pool_path(&filename) {
             return None;
         }
-        let sha256 = sha256?.into_owned();
-        if !Algorithm::Sha256.is_hex(&sha256) {
-            return None;
-        }
+        let digests = Digests::from_fields(sha256.as_deref(), sha512.as_deref()).ok()??;
         // A stanza that states no size, or states one that does not parse,
         // leaves the download bounded by the fetcher's own ceiling rather than
         // being dropped: the digest is what decides whether the bytes are the
@@ -271,7 +273,7 @@ impl Package {
             architecture,
             filename,
             size,
-            sha256,
+            digests,
             depends: depends.as_deref().map(parse_relations).unwrap_or_default(),
             pre_depends: pre_depends
                 .as_deref()
@@ -1154,6 +1156,37 @@ mod tests {
     }
 
     #[test]
+    fn a_stanza_is_kept_under_either_digest_and_held_to_each_one_s_shape() {
+        let stanza = |digests: &str| {
+            format!(
+                "Package: held\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\n\
+                 {digests}\n"
+            )
+        };
+        let sha256 = "a".repeat(64);
+        let sha512 = "b".repeat(128);
+        let read = |digests: &str| {
+            Index::parse(&stanza(digests), "amd64")
+                .get("held")
+                .map(|package| package.digests.clone())
+        };
+        let both = read(&format!("SHA256: {sha256}\nSHA512: {sha512}")).expect("both read");
+        assert_eq!(
+            (both.sha256(), both.sha512()),
+            (Some(sha256.as_str()), Some(sha512.as_str()))
+        );
+        let alone = read(&format!("SHA512: {sha512}")).expect("a SHA-512 alone reads");
+        assert_eq!(
+            (alone.sha256(), alone.sha512()),
+            (None, Some(sha512.as_str()))
+        );
+        // Neither, or either in the wrong shape, drops the stanza.
+        assert_eq!(read("MD5sum: d41d8cd98f00b204e9800998ecf8427e"), None);
+        assert_eq!(read(&format!("SHA256: {sha256}\nSHA512: {sha256}")), None);
+        assert_eq!(read(&format!("SHA512: {}", sha512.to_uppercase())), None);
+    }
+
+    #[test]
     fn a_stanza_naming_a_package_outside_policy_is_dropped() {
         // The name goes on to progress reports and errors as written, so it is
         // held to policy's alphabet before anything reads it. The pool path is
@@ -1326,8 +1359,8 @@ SHA256: 6363630000000000000000000000000000000000000000000000000000000000
         let index = Index::parse(text, "amd64");
         assert_eq!(index.get("pkg").unwrap().version, "2.0");
         assert_eq!(
-            index.get("pkg").unwrap().sha256,
-            "6262620000000000000000000000000000000000000000000000000000000000"
+            index.get("pkg").unwrap().digests.sha256(),
+            Some("6262620000000000000000000000000000000000000000000000000000000000")
         );
         assert!(index.get("other-arch").is_none());
         // Priority carried on the retained (highest) version.
@@ -1466,8 +1499,8 @@ SHA256: 652d6e6577657200000000000000000000000000000000000000000000000000
         let shared = index.get("shared").unwrap();
         assert_eq!(shared.origin, 0);
         assert_eq!(
-            shared.sha256,
-            "702d736861726564000000000000000000000000000000000000000000000000"
+            shared.digests.sha256(),
+            Some("702d736861726564000000000000000000000000000000000000000000000000")
         );
         // A package only the second repository ships is tagged with its origin.
         assert_eq!(index.get("newer").unwrap().origin, 1);

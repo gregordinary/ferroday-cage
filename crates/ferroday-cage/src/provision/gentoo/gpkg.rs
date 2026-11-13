@@ -258,7 +258,7 @@ impl Package {
         // A pass of its own over the file, ahead of the one that reads the
         // members: the MD5 is over the whole container, padding included, and
         // the tar reader stops at the archive's end.
-        let (md5, _) = digest::stream(Algorithm::Md5, &mut container)
+        let (md5, _) = digest::md5::stream(&mut container)
             .map_err(GentooError::at("digesting the container", path))?;
         io::Seek::rewind(&mut container)
             .map_err(GentooError::at("rewinding the container", path))?;
@@ -1253,7 +1253,7 @@ pub(super) mod fixture {
     ) -> PlannedPackage {
         let bytes = std::fs::read(container).expect("the container reads");
         let mut planned = planned(cpv, build_id);
-        planned.md5 = Algorithm::Md5.hex_of(&bytes);
+        planned.md5 = digest::md5::hex_of(&bytes);
         planned
     }
 }
@@ -1292,7 +1292,7 @@ mod tests {
         let path = dir.join("package.gpkg.tar");
         built.write(&path, &key);
         let mut wanted = wanted.clone();
-        wanted.md5 = Algorithm::Md5.hex_of(&std::fs::read(&path).expect("the container reads"));
+        wanted.md5 = digest::md5::hex_of(&std::fs::read(&path).expect("the container reads"));
         Package::read(
             std::fs::File::open(&path).expect("the container opens"),
             &path,

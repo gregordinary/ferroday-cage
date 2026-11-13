@@ -36,20 +36,23 @@ A bootstrap runs in stages:
 1. **The signed release.** It fetches `InRelease` and verifies the OpenPGP
    signature against the archive keyring. It confirms the release identifies as
    the requested suite and has not expired, then reads the release, which
-   carries the digest of every package index.
+   carries the digests of every package index: SHA-256, SHA-512, or both.
 2. **The package set.** It fetches each component's `Packages` index and
-   verifies it against the release digest. A stanza the layer cannot act on is
-   left out and counted, and `DebianEvent::Index` reports how many: one stating
-   its package's name or version outside the alphabet Debian policy gives each,
-   one missing a field a package is fetched by, and one whose pool path would
-   leave the mirror or whose digest is malformed. It then resolves the install set:
-   the base system (every essential and required package the primary
-   repository marks, plus `apt`) together with the packages named by
-   `include`, closed over their dependencies.
-3. **Download and extract.** It downloads each package, verifies its digest,
-   and extracts its files into a staging tree with the same kernel-enforced
-   containment the tarball provisioner uses. The merged-usr symlink layout is
-   created first, so packages that ship `/usr`-native paths resolve correctly.
+   verifies it against every digest the release records for it, as apt does,
+   so a mismatch in either refuses the index. A stanza the layer cannot act on
+   is left out and counted, and `DebianEvent::Index` reports how many: one
+   stating its package's name or version outside the alphabet Debian policy
+   gives each, one missing a field a package is fetched by, one stating no
+   SHA-256 or SHA-512 in the shape its algorithm writes, and one whose pool
+   path would leave the mirror. It then resolves the install set: the base
+   system (every essential and required package the primary repository marks,
+   plus `apt`) together with the packages named by `include`, closed over their
+   dependencies.
+3. **Download and extract.** It downloads each package, verifies every digest
+   its stanza records, and extracts its files into a staging tree with the same
+   kernel-enforced containment the tarball provisioner uses. The merged-usr
+   symlink layout is created first, so packages that ship `/usr`-native paths
+   resolve correctly.
    The staging tree's own directory is mode `0755`, the mode `base-files`
    gives `/`. Every `.deb` describes the root it is unpacked into as well as
    its contents. Taking the root's mode from one of them would make it a
@@ -521,11 +524,12 @@ would create directories and write a file outside the pool root, as the
 publishing user.
 
 The control file must be one paragraph and must not itself carry `Filename`,
-`Size`, or `SHA256`. A pool entry is the control file verbatim with those three
-appended, and a deb822 reader resolves a field by its first occurrence. A
-package carrying one would therefore shadow the archive's value. That is a
-digest it chose rather than one taken from the bytes on disk, or a `Filename`
-naming another package's file.
+`Size`, `SHA256`, or `SHA512`. A pool entry is the control file verbatim with
+the first three appended, and a deb822 reader resolves a field by its first
+occurrence. A package carrying one would therefore shadow the archive's value,
+or in the case of `SHA512`, which the pool does not write, state one where the
+archive states none. That is a digest it chose rather than one taken from the
+bytes on disk, or a `Filename` naming another package's file.
 
 A second paragraph does the same by another route. The appended fields land on
 the last paragraph, which is then the one that reads back as the entry. It reads
@@ -720,7 +724,7 @@ nothing.
 [`resolve`] reports what a bootstrap would install without installing it. It
 runs the read half of the pipeline, meaning the signed release, the package
 index, and then dependency resolution. It returns the exact package set, each
-with its version, architecture, and archive-verified SHA-256, and downloads
+with its version, architecture, and archive-verified digest, and downloads
 nothing:
 
 ```rust,no_run
@@ -730,7 +734,7 @@ use ferroday_cage::provision::debian::Debian;
 let mut debian = Debian::builder("trixie").include(["build-essential"]).build()?;
 let plan = debian.resolve()?;
 for package in &plan.packages {
-    println!("{} {} {}", package.name, package.version, package.sha256);
+    println!("{} {} {}", package.name, package.version, package.digest.hex());
 }
 # Ok(())
 # }
@@ -962,6 +966,15 @@ from the Debian mirror.
 `Installed-Size`, `Source`, and `Size` are optional, and the stanzas above carry
 them between them to show each.
 
+A package states one digest, the one installing the plan checks it against:
+its `SHA256` where the index recorded one, and otherwise its `SHA512`. Debian's
+and Ubuntu's archives record a SHA-256 for every package, so their plans carry
+`SHA256`, as above. Ubuntu's development series records SHA-512 alone, so a
+package from it carries `SHA512` in place of `SHA256`, written after `Size`,
+since it was added after the fields a reader of 0.5 knew. Such a reader refuses
+it as missing its `SHA256`. A resolution checks a download against every digest
+the index records, as apt does; the plan keeps the one.
+
 `Installed-Size` is the archive's own figure, in the kibibytes [Debian Policy
 5.6.20](https://www.debian.org/doc/debian-policy/ch-controlfields.html#installed-size)
 defines it in rather than normalized to bytes. It can therefore be compared
@@ -1052,14 +1065,17 @@ composes rather than merely reports. A package's `Filename` is interpolated
 verbatim into the URL its `.deb` is fetched from, so it is held to the same rule
 an archive index's. That rule is a relative path, no `..` component, and
 printable ASCII only. It holds both as written and as a server that
-percent-decodes it would read it. Its `SHA256` must be 64 lowercase hex
-characters, since that is the value the fetched bytes are compared against.
+percent-decodes it would read it. Its `SHA256` or its `SHA512` must be
+lowercase hex of the algorithm's width, 64 or 128 characters, since that is the
+value the fetched bytes are compared against. A package stating both, or
+neither, is refused. A digest is a `Digest`, which cannot be made in any other
+shape, so a plan edited in memory has nothing of this to be refused for.
 
 A document is a trust anchor, so neither check is a defense against the plan
 itself. What they keep out is a plan hand-edited into something unfetchable
-being reported as a mirror that served the wrong bytes. Both are checked again
-at `build`, since a `Plan` taken from `resolve` and modified in memory reaches
-the bootstrap without passing a reader.
+being reported as a mirror that served the wrong bytes. The pool path is checked
+again at `build`, since a `Plan` taken from `resolve` and modified in memory
+reaches the bootstrap without passing a reader.
 
 ## Holding a resolution to a plan's versions
 
@@ -1117,7 +1133,10 @@ selected, and never becomes the authority for what the bytes are.
 
 A pin whose recorded digest disagrees with the archive's for the same version is
 refused rather than preferred. That is one version published twice over
-different bytes, which is the event a recorded digest exists to catch.
+different bytes, which is the event a recorded digest exists to catch. The pin's
+digest is compared with the archive's under the same algorithm, and an archive
+that no longer records one under it is refused as
+`UnheldReason::DigestNotOffered`, since the bytes cannot be compared at all.
 
 ### What composes, and what is refused
 
@@ -1134,7 +1153,8 @@ whose suite or architecture disagrees with the builder's. So is one naming the
 same package twice, which states two versions to hold it at.
 
 So is one whose entries fail the shape a plan document's do. A digest that is
-not 64 lowercase hex characters is refused as the malformed entry it is. It is
+not lowercase hex of its algorithm's width is refused as the malformed entry it
+is. It is
 not compared and reported as an archive that had published past the pin. Where
 the builder names no architecture the pin's is adopted, as a plan's is.
 
@@ -1463,8 +1483,8 @@ in through the map.
 Authenticity comes from the archive's OpenPGP signature, not the transport, so
 packages are fetched over plain HTTP by default. The `InRelease` signature is
 verified against an embedded copy of the Debian archive keyring. Every index and
-every package is then checked against a SHA-256 digest that chains back to that
-signature.
+every package is then checked against every SHA-256 and SHA-512 digest recorded
+for it, each chaining back to that signature.
 
 Nothing signed states how large the `InRelease` is, so it is held to a ceiling
 of one mebibyte, four times the largest an archive serves. Verification also

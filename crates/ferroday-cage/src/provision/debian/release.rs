@@ -4,14 +4,15 @@
 //! Authenticity rests on the OpenPGP signature over the `InRelease` file, which
 //! [`openpgp`](crate::provision::openpgp) establishes; this module reads what
 //! that signature covered. The body names the suite, the architectures and
-//! components on offer, a deadline, and the SHA-256 digest of every index — so
-//! every fetch below the release is checked against a digest that chains back to
-//! the signature.
+//! components on offer, a deadline, and the digests of every index, SHA-256,
+//! SHA-512, or both — so every fetch below the release is checked against
+//! digests that chain back to the signature.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::provision::digest::Algorithm;
+use super::digests::{Digests, RECORDED};
+use crate::provision::digest::{Algorithm, Digest};
 use crate::provision::{document, now_epoch};
 
 /// Why a release cannot be used: it is malformed, expired, or does not offer
@@ -60,8 +61,8 @@ fn quoted(values: &[String]) -> String {
 
 /// A parsed `Release` body: the index digests and the release's own claims.
 pub(crate) struct Release {
-    /// Index path (relative to `dists/<suite>/`) to `(size, sha256)`.
-    hashes: HashMap<String, (u64, String)>,
+    /// Index path (relative to `dists/<suite>/`) to its size and digests.
+    hashes: HashMap<String, (u64, Digests)>,
     acquire_by_hash: bool,
     /// How the release ranks its versions, from its `NotAutomatic` and
     /// `ButAutomaticUpgrades` fields.
@@ -82,7 +83,7 @@ pub(crate) struct Release {
     /// digest of the bytes that were verified: for a signed repository that is
     /// the cleartext the signature covers, not the `InRelease` armor around it
     /// and not a re-fetch.
-    sha256: String,
+    sha256: Digest,
 }
 
 impl Release {
@@ -103,22 +104,46 @@ impl Release {
         // The digest is checked for shape as well as presence, because it is
         // not only compared: where the release declares `Acquire-By-Hash` it
         // becomes a path segment of the URL the index is fetched from. Anything
-        // but 64 lowercase hex characters could climb out of the mirror root
-        // there, and for a repository trusted unsigned nothing has vouched for
-        // the text at all.
-        let mut hashes = HashMap::new();
-        if let Some(list) = stanza.get("SHA256") {
+        // but lowercase hex of the algorithm's width could climb out of the
+        // mirror root there, and for a repository trusted unsigned nothing has
+        // vouched for the text at all.
+        //
+        // The `SHA256` and `SHA512` sections are read alike, and an index
+        // listed in both carries both digests. One whose two sections state two
+        // sizes is dropped: one of them is wrong, and nothing says which.
+        let mut listed: HashMap<String, (u64, [Option<String>; 2])> = HashMap::new();
+        let mut conflicting = Vec::new();
+        for (at, (algorithm, section)) in RECORDED.into_iter().enumerate() {
+            let Some(list) = stanza.get(section) else {
+                continue;
+            };
             for line in list.lines() {
                 let mut fields = line.split_whitespace();
                 if let (Some(digest), Some(size), Some(path)) =
                     (fields.next(), fields.next(), fields.next())
-                    && Algorithm::Sha256.is_hex(digest)
-                    && let Ok(size) = size.parse()
+                    && algorithm.is_hex(digest)
+                    && let Ok(size) = size.parse::<u64>()
                 {
-                    hashes.insert(path.to_string(), (size, digest.to_string()));
+                    let entry = listed
+                        .entry(path.to_string())
+                        .or_insert_with(|| (size, [None, None]));
+                    if entry.0 != size {
+                        conflicting.push(path.to_string());
+                    }
+                    entry.1[at] = Some(digest.to_string());
                 }
             }
         }
+        for path in &conflicting {
+            listed.remove(path);
+        }
+        let hashes = listed
+            .into_iter()
+            .filter_map(|(path, (size, [sha256, sha512]))| {
+                let digests = Digests::from_fields(sha256.as_deref(), sha512.as_deref());
+                Some((path, (size, digests.ok()??)))
+            })
+            .collect();
 
         let marked = |field: &str| {
             stanza
@@ -142,7 +167,7 @@ impl Release {
             date: stanza.get("Date").map(|value| value.trim().to_string()),
             suite: stanza.get("Suite").map(|value| value.trim().to_string()),
             codename: stanza.get("Codename").map(|value| value.trim().to_string()),
-            sha256: Algorithm::Sha256.hex_of(body.as_bytes()),
+            sha256: Digest::of(Algorithm::Sha256, body.as_bytes()),
         })
     }
 
@@ -157,7 +182,7 @@ impl Release {
     }
 
     /// The SHA-256 of the verified body, lowercase hex.
-    pub(crate) fn sha256(&self) -> &str {
+    pub(crate) fn sha256(&self) -> &Digest {
         &self.sha256
     }
 
@@ -306,14 +331,14 @@ impl Release {
         Ok(())
     }
 
-    /// The `(size, sha256)` recorded for an index path, if any.
-    pub(crate) fn digest(&self, path: &str) -> Option<(u64, &str)> {
+    /// The size and the digests recorded for an index path, if any.
+    pub(crate) fn digest(&self, path: &str) -> Option<(u64, &Digests)> {
         self.hashes
             .get(path)
-            .map(|(size, digest)| (*size, digest.as_str()))
+            .map(|(size, digests)| (*size, digests))
     }
 
-    /// Whether the archive publishes indexes under `by-hash/SHA256/<digest>`.
+    /// Whether the archive publishes indexes under `by-hash/<algorithm>/<digest>`.
     pub(crate) fn acquire_by_hash(&self) -> bool {
         self.acquire_by_hash
     }
@@ -527,6 +552,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_index_listed_under_both_algorithms_carries_both_digests() {
+        // Ubuntu's development series lists its indexes under SHA512 alone.
+        let sha256 = "a".repeat(64);
+        let sha512 = "b".repeat(128);
+        let release = Release::parse(&format!(
+            "\
+Suite: tenacious
+SHA256:
+ {sha256} 111 main/binary-amd64/Packages
+ {sha256} 333 main/binary-amd64/Packages.gz
+SHA512:
+ {sha512} 111 main/binary-amd64/Packages
+ {sha512} 222 main/binary-amd64/Packages.xz
+ {sha512} 334 main/binary-amd64/Packages.gz
+ {sha256} 444 main/binary-arm64/Packages
+",
+        ))
+        .unwrap();
+        let listed = |path: &str| {
+            release
+                .digest(path)
+                .map(|(size, digests)| (size, digests.sha256(), digests.sha512()))
+        };
+        assert_eq!(
+            listed("main/binary-amd64/Packages"),
+            Some((111, Some(sha256.as_str()), Some(sha512.as_str())))
+        );
+        assert_eq!(
+            listed("main/binary-amd64/Packages.xz"),
+            Some((222, None, Some(sha512.as_str())))
+        );
+        // Two sizes for one index are two claims, one of them wrong.
+        assert_eq!(listed("main/binary-amd64/Packages.gz"), None);
+        // A SHA-256 is not a SHA-512 because it sits in that section.
+        assert_eq!(listed("main/binary-arm64/Packages"), None);
+    }
+
+    #[test]
     fn release_parses_hashes_and_claims() {
         let plain = "a".repeat(64);
         let compressed = "b".repeat(64);
@@ -547,8 +610,10 @@ SHA256:
         let release = Release::parse(&body).unwrap();
         assert!(release.acquire_by_hash());
         assert_eq!(
-            release.digest("main/binary-amd64/Packages.xz"),
-            Some((222, compressed.as_str())),
+            release
+                .digest("main/binary-amd64/Packages.xz")
+                .map(|(size, digests)| (size, digests.sha256())),
+            Some((222, Some(compressed.as_str()))),
         );
         // A digest that is not 64 lowercase hex characters is dropped rather
         // than carried: where the release declares Acquire-By-Hash it becomes a

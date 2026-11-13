@@ -31,9 +31,11 @@ use std::collections::HashMap;
 use std::fmt;
 
 use super::DebianError;
+use super::digests::Digests;
 use super::index::{Index, Package};
 use super::plan::Plan;
 use super::version::{self, Constraint};
+use crate::provision::digest::Digest;
 
 /// The versions and digests a pin holds a resolution to, keyed by package name.
 #[derive(Debug, Clone, Default)]
@@ -45,7 +47,7 @@ pub(super) struct Pins {
 #[derive(Debug, Clone)]
 struct Pinned {
     version: String,
-    sha256: String,
+    digest: Digest,
 }
 
 impl Pins {
@@ -69,7 +71,7 @@ impl Pins {
         for package in &plan.packages {
             let pinned = Pinned {
                 version: package.version.clone(),
-                sha256: package.sha256.clone(),
+                digest: package.digest.clone(),
             };
             if let Some(first) = by_name.insert(package.name.clone(), pinned) {
                 return Err(DebianError::Config {
@@ -103,16 +105,17 @@ impl Pins {
     /// How closely `package` answers what this pin holds its name to.
     ///
     /// A package whose name the pin does not hold answers
-    /// [`PinMatch::Neither`], as one at another version does.
+    /// [`PinMatch::Neither`], as one at another version does. The bytes are the
+    /// pinned ones where the archive records the pinned digest under its
+    /// algorithm.
     pub(super) fn matching(&self, package: &Package) -> PinMatch {
         if !self.holds(&package.name, &package.version) {
             return PinMatch::Neither;
         }
-        // A plain `==`, as in `check` below and for the same reason.
         if self
             .by_name
             .get(&package.name)
-            .is_some_and(|pinned| pinned.sha256 == package.sha256)
+            .is_some_and(|pinned| bytes_unheld(&pinned.digest, &package.digests).is_none())
         {
             PinMatch::VersionAndBytes
         } else {
@@ -127,15 +130,13 @@ impl Pins {
     /// pinned bytes, and where the pin does not hold its name. Otherwise the
     /// refusal names what the release offers instead: another version, as
     /// [`UnheldReason::Release`], or the pinned version over other bytes, as
-    /// [`UnheldReason::Digest`].
+    /// [`UnheldReason::Digest`], or with no digest under the pinned one's
+    /// algorithm, as [`UnheldReason::DigestNotOffered`].
     pub(super) fn refuse_release(&self, offered: &Package, release: &str) -> Option<UnheldPin> {
         let pinned = self.by_name.get(&offered.name)?;
         let reason = match self.matching(offered) {
             PinMatch::VersionAndBytes => return None,
-            PinMatch::Version => UnheldReason::Digest {
-                pin: pinned.sha256.clone(),
-                archive: offered.sha256.clone(),
-            },
+            PinMatch::Version => bytes_unheld(&pinned.digest, &offered.digests)?,
             PinMatch::Neither => UnheldReason::Release {
                 release: release.to_string(),
                 archive: offered.version.clone(),
@@ -196,15 +197,7 @@ impl Pins {
                         archive: offered.version.clone(),
                     })
                 }
-                // A plain `==`, as everywhere else in the crate: both sides came
-                // through `Algorithm::is_hex`, the index's on the way out of a
-                // stanza and the pin's on the way into `pin()`, so two spellings
-                // of one digest never meet here.
-                Some(offered) if offered.sha256 != pinned.sha256 => Some(UnheldReason::Digest {
-                    pin: pinned.sha256.clone(),
-                    archive: offered.sha256.clone(),
-                }),
-                Some(_) => None,
+                Some(offered) => bytes_unheld(&pinned.digest, &offered.digests),
             };
             if let Some(reason) = reason {
                 unheld.push(UnheldPin {
@@ -222,6 +215,27 @@ impl Pins {
         // against another needs them in a stable order.
         unheld.sort_by(|a, b| a.package.cmp(&b.package));
         Err(DebianError::Pin { unheld })
+    }
+}
+
+/// Why the pinned version, offered with `archive`'s digests, does not hold to
+/// the pinned digest `pin`, or `None` where it does.
+///
+/// The pin is compared with the archive's digest under the pin's own
+/// algorithm, with a plain `==`, as everywhere else in the crate: both are a
+/// [`Digest`], so two spellings of one digest never meet here. Where the
+/// archive records no digest under that algorithm, the bytes cannot be compared
+/// at all, and that is a refusal of its own rather than a match: an archive
+/// that has stopped recording the SHA-256 a pin was taken under has said
+/// nothing about whether its bytes are the pinned ones.
+fn bytes_unheld(pin: &Digest, archive: &Digests) -> Option<UnheldReason> {
+    match archive.under(pin.algorithm()) {
+        Some(offered) if offered == pin => None,
+        Some(offered) => Some(UnheldReason::Digest {
+            pin: pin.hex().to_string(),
+            archive: offered.hex().to_string(),
+        }),
+        None => Some(UnheldReason::DigestNotOffered { pin: pin.clone() }),
     }
 }
 
@@ -267,6 +281,11 @@ pub struct UnheldPin {
 /// not, as [`Release`](Self::Release), or needs a version the pinned one does
 /// not meet, as [`Requirement`](Self::Requirement). Either is resolved by
 /// changing the pin or the install list, not the mirror.
+///
+/// [`DigestNotOffered`](Self::DigestNotOffered) describes the archives again:
+/// the pinned version is offered, and its bytes cannot be compared with the
+/// pinned ones, because the archive no longer records a digest under the
+/// algorithm the pin's is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnheldReason {
@@ -278,7 +297,8 @@ pub enum UnheldReason {
     },
     /// The archives offer no version of the package at all.
     Absent,
-    /// The archives offer the pinned version, recording different bytes for it.
+    /// The archives offer the pinned version, recording different bytes for it
+    /// under the pinned digest's algorithm.
     #[non_exhaustive]
     Digest {
         /// The digest the pin records, lowercase hex.
@@ -305,6 +325,15 @@ pub enum UnheldReason {
         requirement: String,
         /// The package that declares it.
         required_by: String,
+    },
+    /// The archives offer the pinned version and record no digest for it under
+    /// the pinned digest's algorithm, so its bytes cannot be compared with the
+    /// pinned ones: a pin recording a SHA-256 against an archive that now
+    /// records a SHA-512 alone.
+    #[non_exhaustive]
+    DigestNotOffered {
+        /// The digest the pin records.
+        pin: Digest,
     },
 }
 
@@ -340,6 +369,15 @@ impl fmt::Display for UnheldPin {
                 "{} is pinned to {} and {required_by} requires {requirement:?}",
                 self.package, self.version,
             ),
+            UnheldReason::DigestNotOffered { pin } => write!(
+                f,
+                "{} {} is pinned to its {} digest and the archives record no {} for it, so its \
+                 bytes cannot be compared with the pinned ones",
+                self.package,
+                self.version,
+                pin.algorithm().name(),
+                pin.algorithm().name(),
+            ),
         }
     }
 }
@@ -358,6 +396,7 @@ impl Pins {
 mod tests {
     use super::super::index::{Package, sources};
     use super::*;
+    use crate::provision::digest::Algorithm;
 
     /// A one-package index stanza at `version` with `sha256`.
     fn stanza(name: &str, version: &str, sha256: &str) -> String {
@@ -380,7 +419,7 @@ mod tests {
                 architecture: "amd64".to_string(),
                 filename: format!("pool/{name}_{version}_amd64.deb"),
                 size: None,
-                sha256: (*sha256).to_string(),
+                digests: Digests::new(Some((*sha256).to_string()), None).unwrap(),
                 depends: Vec::new(),
                 pre_depends: Vec::new(),
                 provides: Vec::new(),
@@ -396,6 +435,62 @@ mod tests {
 
     const A: &str = "aaaa000000000000000000000000000000000000000000000000000000000000";
     const B: &str = "bbbb000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn a_pin_is_held_to_the_archive_s_digest_under_its_own_algorithm() {
+        let sha512 = |fill: &str| fill.repeat(128 / fill.len());
+        let offered = |digests: &str| {
+            format!(
+                "Package: pp\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/pp.deb\n\
+                 {digests}\n\n"
+            )
+        };
+        let check = |pins: &Pins, digests: &str| {
+            let text = offered(digests);
+            let index = Index::merge(sources([(0, text.as_str())]), "amd64", pins);
+            pins.check(&index)
+        };
+
+        // A pin taken under SHA-256 is held by an archive recording it, beside
+        // a SHA-512 or not.
+        let pins = Pins::of(&plan_of(&[("pp", "1.0", A)])).unwrap();
+        check(&pins, &format!("SHA256: {A}")).expect("the pinned digest");
+        check(&pins, &format!("SHA256: {A}\nSHA512: {}", sha512("c"))).expect("beside another");
+
+        // An archive that now records a SHA-512 alone says nothing about the
+        // pinned bytes, and the refusal says so.
+        match check(&pins, &format!("SHA512: {}", sha512("c"))) {
+            Err(DebianError::Pin { unheld }) => {
+                assert_eq!(
+                    unheld[0].reason,
+                    UnheldReason::DigestNotOffered {
+                        pin: Digest::new(Algorithm::Sha256, A).unwrap(),
+                    },
+                );
+                let rendered = unheld[0].to_string();
+                assert!(rendered.contains("its SHA-256 digest"), "{rendered}");
+                assert!(rendered.contains("record no SHA-256"), "{rendered}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // A pin taken under SHA-512, as against Ubuntu's development series, is
+        // compared under SHA-512 whatever else the archive records.
+        let mut plan = plan_of(&[("pp", "1.0", A)]);
+        plan.packages[0].digest = Digest::new(Algorithm::Sha512, &sha512("c")).unwrap();
+        let pins = Pins::of(&plan).unwrap();
+        check(&pins, &format!("SHA256: {B}\nSHA512: {}", sha512("c"))).expect("its SHA-512");
+        match check(&pins, &format!("SHA256: {A}\nSHA512: {}", sha512("d"))) {
+            Err(DebianError::Pin { unheld }) => assert_eq!(
+                unheld[0].reason,
+                UnheldReason::Digest {
+                    pin: sha512("c"),
+                    archive: sha512("d"),
+                },
+            ),
+            other => panic!("expected a digest refusal, got {other:?}"),
+        }
+    }
 
     #[test]
     fn a_pin_selects_its_version_rather_than_the_highest() {
@@ -517,7 +612,7 @@ mod tests {
         ] {
             let index = Index::merge(sources(inputs), "amd64", &pins);
             let kept = index.get("pp").expect("pp is in the index");
-            assert_eq!(kept.sha256, A, "offered as {inputs:?}");
+            assert_eq!(kept.digests.sha256(), Some(A), "offered as {inputs:?}");
             pins.check(&index)
                 .expect("a repository holds the pinned bytes");
         }
@@ -544,16 +639,11 @@ mod tests {
     #[test]
     fn a_digest_that_is_not_lowercase_hex_is_refused_before_it_is_ever_compared() {
         // Where the case question is settled: at the boundary, not at the
-        // comparison. A digest spelled any other way is a malformed pin, and
-        // saying so is a better answer than a mismatch report naming an archive
-        // that published exactly what the pin asked for.
-        let shouted = plan_of(&[("pp", "1.0", &A.to_uppercase())]);
-        match super::super::validate_pin(&shouted, "trixie", "amd64", false) {
-            Err(DebianError::Config { reason }) => {
-                assert!(reason.contains("lowercase hex"), "{reason}");
-            }
-            other => panic!("expected a configuration refusal, got {other:?}"),
-        }
+        // comparison. A digest spelled any other way cannot be made, so a pin
+        // never carries one to be reported as an archive that published past
+        // it; a document stating one is refused as it is read, which the plan
+        // document's own tests hold.
+        assert_eq!(Digest::new(Algorithm::Sha256, &A.to_uppercase()), None);
     }
 
     #[test]

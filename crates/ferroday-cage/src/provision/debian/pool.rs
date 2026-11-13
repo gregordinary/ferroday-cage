@@ -432,10 +432,11 @@ impl Pool {
     /// `all`; one whose `Package` or `Version` is outside the alphabet Debian
     /// policy gives it, since both decide where in the pool the file is written;
     /// one whose control file holds more than one paragraph or names `Filename`,
-    /// `Size`, or `SHA256`, which the pool supplies from the file it published
-    /// and a package may not claim for itself; one that was rewritten into a
-    /// different package while it was being published; and one whose bytes
-    /// would replace a pool file another index names at the bytes it holds.
+    /// `Size`, `SHA256`, or `SHA512`, which an index entry takes from the
+    /// archive and a package may not claim for itself; one that was rewritten
+    /// into a different package while it was being published; and one whose
+    /// bytes would replace a pool file another index names at the bytes it
+    /// holds.
     /// Returns [`DebianError::Io`] for a path that cannot be opened, one
     /// holding anything but a regular file included, and for a failure writing,
     /// locking, or scanning the pool.
@@ -762,12 +763,16 @@ struct Identity {
     architecture: String,
 }
 
-/// The fields the pool appends to a control stanza to make a `Packages` entry.
+/// The fields a `Packages` entry takes from the archive rather than from the
+/// package: the three the pool appends to a control stanza to make the entry,
+/// and `SHA512`, which the pool does not write and an index reader checks a
+/// package against all the same.
 ///
-/// A control member carrying one of these would shadow the appended value: the
-/// index reader resolves a field by its first occurrence, so the package's own
-/// text would win over the archive's. See [`identity`].
-const APPENDED_FIELDS: [&str; 3] = ["Filename", "Size", "SHA256"];
+/// A control member carrying one of these would shadow the archive's value, or
+/// stand where the archive states none: the index reader resolves a field by
+/// its first occurrence, so the package's own text would win over the
+/// archive's. See [`identity`].
+const ARCHIVE_FIELDS: [&str; 4] = ["Filename", "Size", "SHA256", "SHA512"];
 
 /// Reads the identity a control stanza carries, checking that the `.deb` is one
 /// the pool can index.
@@ -784,8 +789,9 @@ const APPENDED_FIELDS: [&str; 3] = ["Filename", "Size", "SHA256"];
 /// policy gives them; [`checked_name`] and [`checked_version`] say what each
 /// admits and why the path question rests on it.
 ///
-/// The control member is one stanza, and it carries none of the fields the pool
-/// appends. Both would otherwise let a `.deb` write its own index entry:
+/// The control member is one stanza, and it carries none of the fields an index
+/// entry takes from the archive. Both would otherwise let a `.deb` write its
+/// own index entry:
 /// [`Stanza::get`](crate::provision::document::Stanza::get) resolves a field by its first
 /// occurrence, so a control file carrying `SHA256` would shadow the digest taken
 /// from the bytes on disk and a control file carrying `Filename` would name any
@@ -811,11 +817,11 @@ fn identity(control: &str, architecture: &str) -> Result<Identity, String> {
             1 + more,
         ));
     }
-    for appended in APPENDED_FIELDS {
-        if stanza.get(appended).is_some() {
+    for field in ARCHIVE_FIELDS {
+        if stanza.get(field).is_some() {
             return Err(format!(
-                "its control file carries a {appended} field, which the pool supplies from the \
-                 file it published and a package may not name for itself",
+                "its control file carries a {field} field, which an index entry takes from \
+                 the archive and a package may not name for itself",
             ));
         }
     }
@@ -1026,7 +1032,7 @@ struct Placed {
 ///
 /// Appending is what preserves the control file's own folding, and it is well
 /// defined only because [`identity`] refused a control file carrying any of
-/// [`APPENDED_FIELDS`] or more than one paragraph: a reader resolves a field by
+/// [`ARCHIVE_FIELDS`] or more than one paragraph: a reader resolves a field by
 /// its first occurrence and reads an entry from the paragraph that carries
 /// `Filename`, so either shape would let the package decide what the index says
 /// about it.
@@ -1926,10 +1932,12 @@ mod tests {
         );
         // The section digest the writer recorded is the digest of the bytes.
         assert_eq!(
-            parsed.digest("main/binary-amd64/Packages"),
+            parsed
+                .digest("main/binary-amd64/Packages")
+                .map(|(size, digests)| (size, digests.sha256())),
             Some((
                 packages.len() as u64,
-                Algorithm::Sha256.hex_of(packages).as_str()
+                Some(Algorithm::Sha256.hex_of(packages).as_str())
             )),
         );
     }
@@ -1965,8 +1973,10 @@ mod tests {
         let parsed = release::Release::parse(&release).expect("the stamped Release parses");
         let empty = Algorithm::Sha256.hex_of(b"");
         assert_eq!(
-            parsed.digest("main/binary-amd64/Packages"),
-            Some((0, empty.as_str())),
+            parsed
+                .digest("main/binary-amd64/Packages")
+                .map(|(size, digests)| (size, digests.sha256())),
+            Some((0, Some(empty.as_str()))),
         );
     }
 

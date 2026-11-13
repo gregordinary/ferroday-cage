@@ -3,16 +3,17 @@
 //! Every userland layer verifies what it fetched against a digest a signed
 //! source recorded, and none of them may hold what they are verifying: a
 //! package is a file that can run to hundreds of megabytes. So the digest is
-//! taken as the bytes move — [`stream`] on a read, [`DigestWriter`] on a write
-//! — and a 90 MB kernel package costs what a shell script costs, in whichever
-//! direction it is travelling.
+//! taken as the bytes move, on a read or on a write, and a 90 MB kernel
+//! package costs what a shell script costs, in whichever direction it is
+//! travelling.
 //!
 //! Which digest is the archive's business rather than this module's, so
-//! [`Algorithm`] names it and every entry point takes one.
+//! [`Algorithm`] names it and every entry point takes one. A digest a plan
+//! records is a [`Digest`]: an algorithm and a value held to its shape.
 
 use std::io::{self, Read, Write};
 
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Sha256, Sha512};
 
 /// The chunk size the streaming reads work in.
 #[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
@@ -21,40 +22,22 @@ const CHUNK: usize = 64 * 1024;
 /// A digest algorithm an archive records its artifacts under.
 ///
 /// The archives do not agree on one. Debian records SHA-256 throughout its
-/// release chain and Alpine's apk index is defined over it; Gentoo's signed
+/// release chain, Ubuntu SHA-256 and SHA-512, and its development series
+/// SHA-512 alone; Alpine's apk index is defined over SHA-256; Gentoo's signed
 /// digest documents carry SHA-512 and BLAKE2B, and never SHA-256. So the
 /// algorithm is a parameter of the digester rather than a property of it, and
 /// one archive's choice cannot quietly become another's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Algorithm {
-    /// SHA-256, written as 64 hex characters. What the Debian release chain and
-    /// the apk index both record, and what Gentoo never publishes.
-    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+///
+/// Every trust decision in this crate is one of these. Portage's MD5, which
+/// its package database is written in and which decides nothing, is computed
+/// apart from them, so it cannot be named where a trust decision is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Algorithm {
+    /// SHA-256, written as 64 hex characters.
     Sha256,
-    /// SHA-512, written as 128 hex characters. What Gentoo's signed digest
-    /// documents record, SHA-256 not being on offer there at all.
-    #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
+    /// SHA-512, written as 128 hex characters.
     Sha512,
-    /// MD5, written as 32 hex characters. Portage's bookkeeping checksum, and
-    /// nothing this crate rests a trust decision on.
-    ///
-    /// It is here because portage's own package database is written in it: a
-    /// merged package's `CONTENTS` records an MD5 per file so portage can tell
-    /// whether a file has been edited since it was merged, and its `BINPKGMD5`
-    /// records the binary package's own. Both are notes a package manager
-    /// keeps about a root it owns.
-    ///
-    /// It is never compared to decide whether to trust bytes, and it must not
-    /// be: MD5 has been unusable for that for twenty years. Every trust
-    /// decision in this crate is SHA-256 or SHA-512, and a Gentoo binary
-    /// package's bytes are held to the SHA-512 of the cleartext-signed
-    /// `Manifest` inside it.
-    ///
-    /// The variant is gated rather than merely unused without the layer that
-    /// writes it: naming an algorithm a build cannot compute would leave a
-    /// hasher with a case it could only panic on.
-    #[cfg(feature = "gentoo")]
-    Md5,
 }
 
 impl Algorithm {
@@ -63,11 +46,8 @@ impl Algorithm {
     /// For a value small enough to hold. What a Gentoo digest document is
     /// compared against is a half-gigabyte tarball, which goes through
     /// [`stream`] instead, so a build of that layer alone has no caller.
-    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
     pub(crate) fn hex_of(self, bytes: &[u8]) -> String {
-        let mut hasher = Hasher::new(self);
-        hasher.update(bytes);
-        hasher.finish()
+        Hasher::new(self).over(bytes)
     }
 
     /// Whether `digest` has the shape this algorithm writes: exactly as many
@@ -89,15 +69,10 @@ impl Algorithm {
     ///
     /// There are two boundaries, one per way a digest arrives, and a digest that
     /// reaches a comparison came through one of them: an index stanza, as it is
-    /// parsed, and a plan document, as it is read and again when a plan is handed
-    /// to a bootstrap. A digest a plan carries for provenance alone — the one
-    /// naming the archive state a resolution happened against — is written back
-    /// verbatim and never compared, so it is not held to this.
+    /// parsed, and a plan document, as it is read, where every digest is made a
+    /// [`Digest`], which cannot be made of anything else.
     pub(crate) fn is_hex(self, digest: &str) -> bool {
-        digest.len() == self.hex_len()
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        is_lowercase_hex(digest, self.hex_len())
     }
 
     /// How many hex characters the algorithm's output is written as.
@@ -105,9 +80,89 @@ impl Algorithm {
         match self {
             Algorithm::Sha256 => 64,
             Algorithm::Sha512 => 128,
-            #[cfg(feature = "gentoo")]
-            Algorithm::Md5 => 32,
         }
+    }
+
+    /// The algorithm's name as a message names it: `SHA-256`, `SHA-512`.
+    #[cfg_attr(not(feature = "debian"), allow(dead_code))]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Algorithm::Sha256 => "SHA-256",
+            Algorithm::Sha512 => "SHA-512",
+        }
+    }
+}
+
+/// What a planned package must hash to, or what the release or the index a
+/// plan records hashed to: an [`Algorithm`] and the digest under it, as
+/// lowercase hex.
+///
+/// [`new`](Self::new) holds the value to its algorithm's shape, exactly as many
+/// lowercase hex characters as the algorithm's output is wide, and it is the
+/// only way to make one, so a value of this type is never malformed: a digest
+/// spelled any other way is refused where it arrives rather than compared and
+/// found unequal later, or carried into a cache file name or a URL.
+///
+/// It is what a Debian plan's package records (`PlannedPackage::digest`): the
+/// SHA-256 its index offers, or the SHA-512 where it offers no SHA-256. It is
+/// also what a Debian plan records for each release it resolved against
+/// (`ResolvedArchive::release_sha256`), and an Alpine plan for each index
+/// (`ResolvedIndex::sha256`), both SHA-256 of the bytes that were verified.
+///
+/// Two digests a plan carries are deliberately not this. An Alpine package's
+/// `control_identity` is `Q1` and the base64 of a SHA-1 over the package's
+/// control segment: another algorithm, another encoding, and a segment rather
+/// than the file. A Gentoo package's `md5` is portage's bookkeeping digest of
+/// the container, which decides nothing about whether to trust it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Digest {
+    /// Which algorithm the value is a digest under.
+    algorithm: Algorithm,
+    /// The digest, lowercase hex of the algorithm's width.
+    hex: Box<str>,
+}
+
+impl Digest {
+    /// The digest `hex` under `algorithm`, or `None` where `hex` is not
+    /// lowercase hex of the algorithm's width: 64 characters for SHA-256, 128
+    /// for SHA-512.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ferroday_cage::provision::digest::{Algorithm, Digest};
+    ///
+    /// let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    /// let digest = Digest::new(Algorithm::Sha256, empty).expect("a SHA-256 in lowercase hex");
+    /// assert_eq!(digest.algorithm(), Algorithm::Sha256);
+    /// assert_eq!(digest.hex(), empty);
+    /// assert_eq!(Digest::new(Algorithm::Sha512, empty), None);
+    /// assert_eq!(Digest::new(Algorithm::Sha256, &empty.to_uppercase()), None);
+    /// ```
+    pub fn new(algorithm: Algorithm, hex: &str) -> Option<Digest> {
+        algorithm.is_hex(hex).then(|| Digest {
+            algorithm,
+            hex: hex.into(),
+        })
+    }
+
+    /// The digest of `bytes` under `algorithm`.
+    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
+    pub(crate) fn of(algorithm: Algorithm, bytes: &[u8]) -> Digest {
+        Digest {
+            algorithm,
+            hex: algorithm.hex_of(bytes).into(),
+        }
+    }
+
+    /// The algorithm the value is a digest under.
+    pub fn algorithm(&self) -> Algorithm {
+        self.algorithm
+    }
+
+    /// The digest, as lowercase hex of the algorithm's width.
+    pub fn hex(&self) -> &str {
+        &self.hex
     }
 }
 
@@ -121,22 +176,28 @@ enum Hasher {
     Sha256(Sha256),
     Sha512(Sha512),
     #[cfg(feature = "gentoo")]
-    Md5(md5::Md5),
+    Md5(::md5::Md5),
 }
 
 impl Hasher {
     /// A fresh hasher for `algorithm`.
     fn new(algorithm: Algorithm) -> Hasher {
+        use sha2::Digest as _;
         match algorithm {
             Algorithm::Sha256 => Hasher::Sha256(Sha256::new()),
             Algorithm::Sha512 => Hasher::Sha512(Sha512::new()),
-            #[cfg(feature = "gentoo")]
-            Algorithm::Md5 => Hasher::Md5(md5::Md5::new()),
         }
+    }
+
+    /// The lowercase hex digest of `bytes`, consuming the hasher.
+    fn over(mut self, bytes: &[u8]) -> String {
+        self.update(bytes);
+        self.finish()
     }
 
     /// Feeds `bytes` to the digest.
     fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest as _;
         match self {
             Hasher::Sha256(hasher) => hasher.update(bytes),
             Hasher::Sha512(hasher) => hasher.update(bytes),
@@ -147,6 +208,7 @@ impl Hasher {
 
     /// Consumes the hasher and formats what it accumulated as lowercase hex.
     fn finish(self) -> String {
+        use sha2::Digest as _;
         match self {
             Hasher::Sha256(hasher) => hex(&hasher.finalize()),
             Hasher::Sha512(hasher) => hex(&hasher.finalize()),
@@ -168,21 +230,56 @@ impl Hasher {
 /// one back, so such a build has no caller.
 #[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
 pub(crate) fn stream(algorithm: Algorithm, reader: &mut impl Read) -> io::Result<(String, u64)> {
-    let mut hasher = Hasher::new(algorithm);
+    let (mut digests, size) = stream_into(vec![Hasher::new(algorithm)], reader)?;
+    Ok((
+        digests
+            .pop()
+            .expect("one algorithm asked for, one digest taken"),
+        size,
+    ))
+}
+
+/// The lowercase hex digest of everything `reader` yields under each of
+/// `algorithms`, in their order, with the number of bytes it yielded.
+///
+/// [`stream`] for a file held to more than one digest at once, as a Debian
+/// package is to every digest its archive records: the bytes are read once
+/// whatever the number of digests taken of them.
+#[cfg(feature = "debian")]
+pub(crate) fn stream_each(
+    algorithms: &[Algorithm],
+    reader: &mut impl Read,
+) -> io::Result<(Vec<String>, u64)> {
+    stream_into(
+        algorithms
+            .iter()
+            .map(|algorithm| Hasher::new(*algorithm))
+            .collect(),
+        reader,
+    )
+}
+
+/// The one streaming loop every digest of a reader goes through: feeds each of
+/// `hashers` everything `reader` yields, in fixed-size chunks, and reports what
+/// each accumulated, in their order, with the number of bytes read.
+#[cfg_attr(not(any(feature = "debian", feature = "gentoo")), allow(dead_code))]
+fn stream_into(mut hashers: Vec<Hasher>, reader: &mut impl Read) -> io::Result<(Vec<String>, u64)> {
     let mut chunk = vec![0u8; CHUNK];
     let mut size = 0u64;
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(got) => {
-                hasher.update(&chunk[..got]);
+                for hasher in &mut hashers {
+                    hasher.update(&chunk[..got]);
+                }
                 size += got as u64;
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err),
         }
     }
-    Ok((hasher.finish(), size))
+    Ok((hashers.into_iter().map(Hasher::finish).collect(), size))
 }
 
 /// A writer that digests everything written through it on its way to `inner`.
@@ -238,6 +335,66 @@ impl<W: Write> Write for DigestWriter<W> {
     }
 }
 
+/// Portage's MD5, computed apart from [`Algorithm`].
+///
+/// Portage's own package database is written in it: a merged package's
+/// `CONTENTS` records an MD5 per file so portage can tell whether a file has
+/// been edited since it was merged, and its `BINPKGMD5` records the binary
+/// package's own. Both are notes a package manager keeps about a root it owns,
+/// and a binary-package index states one per container, which a download is
+/// held to as portage holds it.
+///
+/// It is never what decides whether to trust bytes, and it must not be: MD5
+/// has been unusable for that for twenty years. A Gentoo binary package's
+/// bytes are trusted for the SHA-512 of the cleartext-signed `Manifest` inside
+/// it. That is why MD5 is not an [`Algorithm`]: a value an archive's trust
+/// rests on cannot be named in it.
+#[cfg(feature = "gentoo")]
+pub(crate) mod md5 {
+    use std::io::{self, Read};
+
+    use super::{Hasher, stream_into};
+
+    /// The width of an MD5 written as lowercase hex.
+    const HEX_LEN: usize = 32;
+
+    /// The lowercase hex MD5 of `bytes`, for a test to state what a container
+    /// or a file it builds hashes to.
+    #[cfg(test)]
+    pub(crate) fn hex_of(bytes: &[u8]) -> String {
+        hasher().over(bytes)
+    }
+
+    /// The lowercase hex MD5 of everything `reader` yields, with the number of
+    /// bytes it yielded, as [`stream`](super::stream) takes another digest.
+    pub(crate) fn stream(reader: &mut impl Read) -> io::Result<(String, u64)> {
+        let (mut digests, size) = stream_into(vec![hasher()], reader)?;
+        Ok((digests.pop().expect("one digest taken"), size))
+    }
+
+    /// Whether `digest` is an MD5 as lowercase hex, held to the rule
+    /// [`Algorithm::is_hex`](super::Algorithm::is_hex) holds every other digest
+    /// to.
+    pub(crate) fn is_hex(digest: &str) -> bool {
+        super::is_lowercase_hex(digest, HEX_LEN)
+    }
+
+    /// A fresh MD5 hasher.
+    fn hasher() -> Hasher {
+        use ::md5::Digest as _;
+        Hasher::Md5(::md5::Md5::new())
+    }
+}
+
+/// Whether `digest` is exactly `len` lowercase hex characters: the shape every
+/// digest this crate compares is held to, whatever its algorithm.
+fn is_lowercase_hex(digest: &str, len: usize) -> bool {
+    digest.len() == len
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Formats a digest as lowercase hex.
 pub(crate) fn hex(digest: &[u8]) -> String {
     let mut text = String::with_capacity(digest.len() * 2);
@@ -265,10 +422,7 @@ mod tests {
              47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
         );
         #[cfg(feature = "gentoo")]
-        assert_eq!(
-            Algorithm::Md5.hex_of(b""),
-            "d41d8cd98f00b204e9800998ecf8427e"
-        );
+        assert_eq!(md5::hex_of(b""), "d41d8cd98f00b204e9800998ecf8427e");
     }
 
     #[test]

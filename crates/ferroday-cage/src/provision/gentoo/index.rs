@@ -40,7 +40,6 @@ use std::borrow::Cow;
 use super::atom::{self, Dependency};
 use super::version;
 use crate::provision::coordinate::{self, Nesting};
-use crate::provision::digest::Algorithm;
 use crate::provision::document::{self, Stanza};
 
 /// The binary-package generation the archive publishes under.
@@ -545,7 +544,7 @@ fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
     // it, so a plan projected from such a record would be a document this
     // crate emits and will not read back.
     let md5 = md5?;
-    if !Algorithm::Md5.is_hex(&md5) {
+    if !crate::provision::digest::md5::is_hex(&md5) {
         return None;
     }
     let build_id = build_id?.parse().ok()?;

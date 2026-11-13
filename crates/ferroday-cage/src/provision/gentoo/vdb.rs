@@ -67,7 +67,7 @@ use super::plan::PlannedPackage;
 use super::{COUNTER_FILE, DB_DIR, GentooError, MAX_CONTENTS_ENTRIES};
 use crate::path;
 use crate::provision::ProvisionError;
-use crate::provision::digest::{self, Algorithm};
+use crate::provision::digest;
 use crate::provision::extract::{Extraction, Placement};
 use crate::provision::rooted::Rooted;
 
@@ -319,7 +319,7 @@ fn render_contents(root: &Path, rooted: &Rooted, laid: &[Laid]) -> Result<String
                 let mut file = rooted.reader(path).map_err(|err| {
                     GentooError::io("digesting a merged file", root.join(path), err)
                 })?;
-                let (md5, _) = digest::stream(Algorithm::Md5, &mut file).map_err(|err| {
+                let (md5, _) = digest::md5::stream(&mut file).map_err(|err| {
                     GentooError::io("digesting a merged file", root.join(path), err)
                 })?;
                 let _ = writeln!(out, "obj /{path} {md5} {mtime}");
@@ -468,7 +468,7 @@ mod tests {
         let container = std::fs::read(dir.join("package.gpkg.tar")).expect("the container");
         assert_eq!(
             read(&dir, "BINPKGMD5"),
-            format!("{}\n", Algorithm::Md5.hex_of(&container)),
+            format!("{}\n", digest::md5::hex_of(&container)),
         );
         assert_eq!(read(&dir, "COUNTER"), "42");
         // And the root's own counter advances with it, so the next merge --

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use super::AlpineError;
 use super::index::{NOARCH, Record};
 use super::version;
+use crate::provision::digest::{Algorithm, Digest};
 use crate::provision::document::{self, Carried, Draft};
 use crate::provision::mirror_url;
 
@@ -127,13 +128,14 @@ pub struct ResolvedIndex {
     /// The component this index publishes, or `None` for a repository that
     /// publishes none — the `<release>/<architecture>` layout.
     pub component: Option<String>,
-    /// The SHA-256 of the index container as it was fetched, lowercase hex.
+    /// The SHA-256 of the index container as it was fetched.
     ///
     /// The whole `APKINDEX.tar.gz`, signature segment included, so it
     /// identifies the exact bytes whose signature was checked. An apk
     /// repository publishes no signed release above its indexes, so this is the
-    /// most an archive state can be pinned to.
-    pub sha256: String,
+    /// most an archive state can be pinned to. Always a SHA-256, taken of the
+    /// container here rather than read from anywhere.
+    pub sha256: Digest,
     /// The name of the key whose signature over this index verified.
     ///
     /// The name the repository publishes the key under, which is what the
@@ -382,7 +384,7 @@ impl Plan {
             // repository that publishes no component and one that publishes an
             // unnamed one are not the same repository.
             stanza.put_optional("Component", index.component.as_deref());
-            stanza.put("SHA256", &index.sha256);
+            stanza.put("SHA256", index.sha256.hex());
             stanza.put("Signed-By", &index.signed_by);
             stanza.put_optional("Description", index.description.as_deref());
             stanza.put_carried(&index.carried);
@@ -438,7 +440,8 @@ impl Plan {
     ///
     /// [`AlpineError::PlanDocument`] for a document with no header, a format
     /// version this library does not read, a stanza missing a field the plan
-    /// cannot do without, a malformed number, a package naming an index the
+    /// cannot do without, a malformed number, an index whose `SHA256` is not a
+    /// SHA-256 in lowercase hex, a package naming an index the
     /// document does not carry, or a package an apk index for the plan's
     /// architecture could not have published. That last is a name or a version
     /// outside the format's grammar, a control identity of any shape but a
@@ -523,7 +526,15 @@ impl Plan {
                 mirror: required(stanza.get("Mirror"), "Mirror", &at_index)?,
                 release: required(stanza.get("Release"), "Release", &at_index)?,
                 component: stanza.get("Component").map(Cow::into_owned),
-                sha256: required(stanza.get("SHA256"), "SHA256", &at_index)?,
+                sha256: {
+                    let value = required(stanza.get("SHA256"), "SHA256", &at_index)?;
+                    Digest::new(Algorithm::Sha256, &value).ok_or_else(|| {
+                        plan_document(format!(
+                            "{at_index} states the SHA256 {value:?}, which is not a SHA-256 \
+                             digest in lowercase hex"
+                        ))
+                    })?
+                },
                 signed_by: required(stanza.get("Signed-By"), "Signed-By", &at_index)?,
                 description: stanza.get("Description").map(Cow::into_owned),
                 carried: document::carried(&stanza, INDEX_FIELDS),
@@ -628,7 +639,7 @@ mod tests {
                     mirror: "http://dl-cdn.alpinelinux.org/alpine".to_string(),
                     release: "v3.23".to_string(),
                     component: Some("main".to_string()),
-                    sha256: "9f3a".repeat(16),
+                    sha256: Digest::new(Algorithm::Sha256, &"9f3a".repeat(16)).unwrap(),
                     signed_by: "alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub".to_string(),
                     description: Some("v3.23.5-111-g2a2e55ba802".to_string()),
                     carried: Carried::new(),
@@ -639,7 +650,7 @@ mod tests {
                     mirror: "http://mirror.postmarketos.org/postmarketos".to_string(),
                     release: "v26.06".to_string(),
                     component: None,
-                    sha256: "1c0f".repeat(16),
+                    sha256: Digest::new(Algorithm::Sha256, &"1c0f".repeat(16)).unwrap(),
                     signed_by: "build.postmarketos.org.rsa.pub".to_string(),
                     description: None,
                     carried: Carried::new(),
@@ -916,6 +927,29 @@ Origin: postmarketos-base
                 assert!(reason.contains("not a number"), "{reason}");
             }
             other => panic!("expected a size refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_index_digest_in_another_shape_is_refused_rather_than_carried() {
+        // The digest is a `Digest`, which only its algorithm's lowercase hex
+        // makes; the refusal quotes the value, since nothing has admitted it.
+        let hostile = crate::failure::hostile::TEXT;
+        for written in ["9F3A".repeat(16), "9f3a".repeat(15), hostile.to_string()] {
+            let document = sample()
+                .to_document()
+                .unwrap()
+                .replace(&"9f3a".repeat(16), &written);
+            match Plan::parse_document(&document) {
+                Err(AlpineError::PlanDocument { reason }) => {
+                    assert!(reason.contains("index 0"), "{reason}");
+                    assert!(reason.contains("not a SHA-256"), "{reason}");
+                    if written == hostile {
+                        crate::failure::hostile::assert_escaped(&reason);
+                    }
+                }
+                other => panic!("expected a digest refusal, got {other:?}"),
+            }
         }
     }
 

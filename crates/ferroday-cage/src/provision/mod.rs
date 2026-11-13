@@ -69,9 +69,10 @@ mod extract;
 // each of them rather than gaining a feature of their own — a feature nothing
 // could enable on purpose would only widen the powerset the `features` job
 // walks. Each such gate names all three layers, and gains the next one the same
-// way.
+// way. The digesting is public for the one thing a caller holds of it: the
+// `Digest` a plan records.
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
-mod digest;
+pub mod digest;
 // The plan document's syntax, which every userland layer's plan is written in
 // -- and, for Gentoo, the syntax its archive publishes its binary-package index
 // in as well.

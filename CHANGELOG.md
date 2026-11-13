@@ -307,6 +307,31 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking.** The Debian layer reads a package's or an index's SHA-512 beside
+  its SHA-256, in a release and in an index stanza, and holds an index and a
+  download to every one the archive records, refusing the bytes where any
+  differs, as apt does. Either alone suffices, and a stanza stating neither is
+  left out and counted in `DebianEvent::Index`. Ubuntu's development series
+  records SHA-512 alone, and its release was refused as listing no index.
+  `PlannedPackage::sha256` is replaced by `PlannedPackage::digest`, a `Digest`:
+  the SHA-256 where the index records one, and otherwise the SHA-512, which is
+  what installing the plan checks the package against and names its cache entry
+  by. A plan document states one of `SHA256` and `SHA512`, refusing a package
+  stating both or neither; Debian's and Ubuntu's archives record a SHA-256, so
+  their plans are written as before. The format stays `ferroday-cage-plan 2`,
+  and 0.5 refuses a package stating `SHA512` as missing its `SHA256`. A pin is
+  compared with the archive's digest under the pinned one's algorithm, and is
+  refused with the new `UnheldReason::DigestNotOffered` where the archive no
+  longer records one. `Pool::publish` refuses a control file naming `SHA512`, as
+  it refuses one naming `SHA256`.
+- **Breaking.** `provision::digest` is public, with `Algorithm`, `Sha256` or
+  `Sha512` and `#[non_exhaustive]`, and `Digest`, an algorithm and a value that
+  `Digest::new` holds to the algorithm's lowercase hex, so a digest a plan
+  records can never be malformed. Every such digest is one:
+  `debian::PlannedPackage::digest`, `debian::ResolvedArchive::release_sha256`,
+  and `alpine::ResolvedIndex::sha256`, the last two a `String` before. A plan
+  document stating a release's or an index's SHA-256 in another shape is now
+  refused rather than carried. Neither layer's plan document changes.
 - **Breaking.** The base environment carries `HOME=/root` only for a command
   that runs as uid 0 of its namespace. A command under `CageBuilder::present_as`,
   or a `run_as` identity naming another uid, gets `PATH` alone, and a program

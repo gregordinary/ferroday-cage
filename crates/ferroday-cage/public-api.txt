@@ -362,7 +362,7 @@ pub ferroday_cage::provision::alpine::ResolvedIndex::component: core::option::Op
 pub ferroday_cage::provision::alpine::ResolvedIndex::description: core::option::Option<alloc::string::String>
 pub ferroday_cage::provision::alpine::ResolvedIndex::mirror: alloc::string::String
 pub ferroday_cage::provision::alpine::ResolvedIndex::release: alloc::string::String
-pub ferroday_cage::provision::alpine::ResolvedIndex::sha256: alloc::string::String
+pub ferroday_cage::provision::alpine::ResolvedIndex::sha256: ferroday_cage::provision::digest::Digest
 pub ferroday_cage::provision::alpine::ResolvedIndex::signed_by: alloc::string::String
 impl core::marker::Freeze for ferroday_cage::provision::alpine::ResolvedIndex
 impl core::marker::Send for ferroday_cage::provision::alpine::ResolvedIndex
@@ -506,6 +506,8 @@ pub ferroday_cage::provision::debian::UnheldReason::Absent
 #[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Digest
 pub ferroday_cage::provision::debian::UnheldReason::Digest::archive: alloc::string::String
 pub ferroday_cage::provision::debian::UnheldReason::Digest::pin: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::DigestNotOffered
+pub ferroday_cage::provision::debian::UnheldReason::DigestNotOffered::pin: ferroday_cage::provision::digest::Digest
 #[non_exhaustive] pub ferroday_cage::provision::debian::UnheldReason::Release
 pub ferroday_cage::provision::debian::UnheldReason::Release::archive: alloc::string::String
 pub ferroday_cage::provision::debian::UnheldReason::Release::release: alloc::string::String
@@ -635,10 +637,10 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::
 #[non_exhaustive] pub struct ferroday_cage::provision::debian::PlannedPackage
 pub ferroday_cage::provision::debian::PlannedPackage::architecture: alloc::string::String
 pub ferroday_cage::provision::debian::PlannedPackage::archive: usize
+pub ferroday_cage::provision::debian::PlannedPackage::digest: ferroday_cage::provision::digest::Digest
 pub ferroday_cage::provision::debian::PlannedPackage::filename: alloc::string::String
 pub ferroday_cage::provision::debian::PlannedPackage::installed_size: core::option::Option<u64>
 pub ferroday_cage::provision::debian::PlannedPackage::name: alloc::string::String
-pub ferroday_cage::provision::debian::PlannedPackage::sha256: alloc::string::String
 pub ferroday_cage::provision::debian::PlannedPackage::size: core::option::Option<u64>
 pub ferroday_cage::provision::debian::PlannedPackage::source: core::option::Option<alloc::string::String>
 pub ferroday_cage::provision::debian::PlannedPackage::version: alloc::string::String
@@ -704,7 +706,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::debian::
 pub ferroday_cage::provision::debian::ResolvedArchive::components: alloc::vec::Vec<alloc::string::String>
 pub ferroday_cage::provision::debian::ResolvedArchive::date: core::option::Option<alloc::string::String>
 pub ferroday_cage::provision::debian::ResolvedArchive::mirror: alloc::string::String
-pub ferroday_cage::provision::debian::ResolvedArchive::release_sha256: alloc::string::String
+pub ferroday_cage::provision::debian::ResolvedArchive::release_sha256: ferroday_cage::provision::digest::Digest
 pub ferroday_cage::provision::debian::ResolvedArchive::signed_by: alloc::vec::Vec<alloc::string::String>
 pub ferroday_cage::provision::debian::ResolvedArchive::signing_key: alloc::vec::Vec<alloc::string::String>
 pub ferroday_cage::provision::debian::ResolvedArchive::suite: alloc::string::String
@@ -738,6 +740,29 @@ pub fn F::progress(&mut self, ferroday_cage::provision::debian::DebianEvent<'_>)
 pub fn ferroday_cage::provision::debian::build_depend_names(&str, &str) -> alloc::vec::Vec<alloc::string::String>
 pub fn ferroday_cage::provision::debian::foreign_interpreter(&str) -> core::option::Option<ferroday_cage::provision::debian::Interpreter>
 pub fn ferroday_cage::provision::debian::host_architecture() -> alloc::string::String
+pub mod ferroday_cage::provision::digest
+#[non_exhaustive] pub enum ferroday_cage::provision::digest::Algorithm
+pub ferroday_cage::provision::digest::Algorithm::Sha256
+pub ferroday_cage::provision::digest::Algorithm::Sha512
+impl core::marker::Freeze for ferroday_cage::provision::digest::Algorithm
+impl core::marker::Send for ferroday_cage::provision::digest::Algorithm
+impl core::marker::Sync for ferroday_cage::provision::digest::Algorithm
+impl core::marker::Unpin for ferroday_cage::provision::digest::Algorithm
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::digest::Algorithm
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::digest::Algorithm
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::digest::Algorithm
+pub struct ferroday_cage::provision::digest::Digest
+impl ferroday_cage::provision::digest::Digest
+pub fn ferroday_cage::provision::digest::Digest::algorithm(&self) -> ferroday_cage::provision::digest::Algorithm
+pub fn ferroday_cage::provision::digest::Digest::hex(&self) -> &str
+pub fn ferroday_cage::provision::digest::Digest::new(ferroday_cage::provision::digest::Algorithm, &str) -> core::option::Option<ferroday_cage::provision::digest::Digest>
+impl core::marker::Freeze for ferroday_cage::provision::digest::Digest
+impl core::marker::Send for ferroday_cage::provision::digest::Digest
+impl core::marker::Sync for ferroday_cage::provision::digest::Digest
+impl core::marker::Unpin for ferroday_cage::provision::digest::Digest
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::digest::Digest
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::digest::Digest
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::digest::Digest
 pub mod ferroday_cage::provision::gentoo
 #[non_exhaustive] pub enum ferroday_cage::provision::gentoo::Expiry
 pub ferroday_cage::provision::gentoo::Expiry::At(i64)

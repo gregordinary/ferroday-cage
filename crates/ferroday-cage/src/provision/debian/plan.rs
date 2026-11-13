@@ -13,8 +13,9 @@
 use std::borrow::Cow;
 
 use super::DebianError;
+use super::digests::RECORDED;
 use super::index::Package;
-use crate::provision::digest::Algorithm;
+use crate::provision::digest::{Algorithm, Digest};
 use crate::provision::document::{self, Carried, Draft};
 
 /// The document's first field, naming the format and its version.
@@ -30,6 +31,13 @@ use crate::provision::document::{self, Carried, Draft};
 /// required: `Signed-By` names the verifying certificate, where version 1 named
 /// the key that made the signature. A reader accepting both would hand back a
 /// fingerprint without saying which of the two questions it answers.
+///
+/// A package's `SHA512` was added under version 2, in place of its `SHA256`
+/// where the archive records no SHA-256 for it, and a package states exactly
+/// one of the two. A reader that predates it, 0.5 and earlier, refuses a
+/// package stating the `SHA512` as missing its `SHA256` rather than misreading
+/// it, so it needed no new version. A package whose archive records a SHA-256
+/// states it as before, so such a plan is written as it always was.
 const FORMAT: &str = "ferroday-cage-plan 2";
 
 /// The packages a [`Debian`](super::Debian) bootstrap resolves for its suite,
@@ -116,12 +124,13 @@ pub struct ResolvedArchive {
     pub suite: String,
     /// The components resolved from this repository.
     pub components: Vec<String>,
-    /// The SHA-256 of the release body that was verified, lowercase hex.
+    /// The SHA-256 of the release body that was verified.
     ///
     /// For a signed repository this is the digest of the cleartext the
     /// signature covers, so it identifies the exact archive state the
-    /// signature vouched for.
-    pub release_sha256: String,
+    /// signature vouched for. Always a SHA-256, whichever digests the release
+    /// itself records for its indexes: this one is taken of the release.
+    pub release_sha256: Digest,
     /// The release's `Date` field, as written, when it carries one.
     pub date: Option<String>,
     /// The release's `Valid-Until` field, as written, when it carries one.
@@ -172,8 +181,14 @@ pub struct PlannedPackage {
     pub version: String,
     /// The package's architecture: the target architecture, or `all`.
     pub architecture: String,
-    /// The SHA-256 the archive records for the `.deb`, as lowercase hex.
-    pub sha256: String,
+    /// What the `.deb` must hash to: the SHA-256 the archive records for it,
+    /// or its SHA-512 where the archive records no SHA-256, as Ubuntu's
+    /// development series does.
+    ///
+    /// A resolution checks a download against every digest the index offers,
+    /// as apt does; a plan records this one, and installing the plan checks
+    /// the bytes against it and names the cache entry by it.
+    pub digest: Digest,
     /// The pool path of the `.deb`, relative to the mirror root.
     pub filename: String,
     /// Which of [`Plan::archives`] this package's winning version came from,
@@ -248,9 +263,8 @@ impl PlannedPackage {
     /// `.deb` is fetched from and, for a `file://` mirror, into a local path, so
     /// one holding a `..`, a leading slash, or a byte a request line ends on
     /// would fetch from somewhere other than the mirror root. And
-    /// [`sha256`](Self::sha256) is what the fetched bytes are compared against,
-    /// with a plain `==` against a lowercase-hex digest, so one spelled any
-    /// other way can only ever mismatch.
+    /// Its [`digest`](Self::digest) is held to its algorithm's shape by its
+    /// type, so it has nothing to be refused for here.
     ///
     /// A package resolved from an index passed
     /// [`index::is_package_name`](super::index::is_package_name),
@@ -275,12 +289,6 @@ impl PlannedPackage {
             return Some(format!(
                 "the plan fetches {} from {:?}, which is not a path a mirror can be asked for",
                 self.name, self.filename,
-            ));
-        }
-        if !Algorithm::Sha256.is_hex(&self.sha256) {
-            return Some(format!(
-                "the plan states {} at digest {:?}, which is not 64 lowercase hex characters",
-                self.name, self.sha256,
             ));
         }
         None
@@ -330,7 +338,7 @@ impl Plan {
             stanza.put("Mirror", &archive.mirror);
             stanza.put("Suite", &archive.suite);
             stanza.put_list("Components", &archive.components);
-            stanza.put("Release-SHA256", &archive.release_sha256);
+            stanza.put("Release-SHA256", archive.release_sha256.hex());
             stanza.put_optional("Date", archive.date.as_deref());
             stanza.put_optional("Valid-Until", archive.valid_until.as_deref());
             // Written even when empty: an unsigned repository is a fact about
@@ -355,7 +363,10 @@ impl Plan {
             stanza.put("Package", &package.name);
             stanza.put("Version", &package.version);
             stanza.put("Architecture", &package.architecture);
-            stanza.put("SHA256", &package.sha256);
+            // The field the package's digest is spelled under, and only it.
+            let digest =
+                |algorithm| (package.digest.algorithm() == algorithm).then(|| package.digest.hex());
+            stanza.put_optional("SHA256", digest(Algorithm::Sha256));
             stanza.put("Filename", &package.filename);
             stanza.put("Archive", &package.archive.to_string());
             // Written after every field the format's first readers knew, which
@@ -371,6 +382,7 @@ impl Plan {
             stanza.put_optional("Source", package.source.as_deref());
             let size = package.size.map(|bytes| bytes.to_string());
             stanza.put_optional("Size", size.as_deref());
+            stanza.put_optional("SHA512", digest(Algorithm::Sha512));
             stanza.put_carried(&package.carried);
             stanza.render(&mut out).map_err(document)?;
         }
@@ -427,7 +439,7 @@ impl Plan {
                         "Architecture",
                         &at_package,
                     )?,
-                    sha256: required(stanza.get("SHA256"), "SHA256", &at_package)?,
+                    digest: planned_digest(&stanza, &at_package)?,
                     filename: required(stanza.get("Filename"), "Filename", &at_package)?,
                     archive: at,
                     installed_size: number(
@@ -469,11 +481,16 @@ impl Plan {
                 mirror: required(stanza.get("Mirror"), "Mirror", &at_archive)?,
                 suite: required(stanza.get("Suite"), "Suite", &at_archive)?,
                 components: document::list(stanza.get("Components").as_deref()),
-                release_sha256: required(
-                    stanza.get("Release-SHA256"),
-                    "Release-SHA256",
-                    &at_archive,
-                )?,
+                release_sha256: {
+                    let value =
+                        required(stanza.get("Release-SHA256"), "Release-SHA256", &at_archive)?;
+                    Digest::new(Algorithm::Sha256, &value).ok_or_else(|| {
+                        document(format!(
+                            "{at_archive} states the Release-SHA256 {value:?}, which is not a \
+                             SHA-256 digest in lowercase hex"
+                        ))
+                    })?
+                },
                 date: stanza.get("Date").map(Cow::into_owned),
                 valid_until: stanza.get("Valid-Until").map(Cow::into_owned),
                 signed_by: document::list(stanza.get("Signed-By").as_deref()),
@@ -514,7 +531,7 @@ impl PlannedPackage {
             name: package.name.clone(),
             version: package.version.clone(),
             architecture: package.architecture.clone(),
-            sha256: package.sha256.clone(),
+            digest: package.digests.planned().clone(),
             filename: package.filename.clone(),
             // The index tags each retained package with the repository it came
             // from, which is exactly this list's ordering.
@@ -558,7 +575,34 @@ const PACKAGE_FIELDS: &[&str] = &[
     "Installed-Size",
     "Source",
     "Size",
+    "SHA512",
 ];
+
+/// Reads the one digest a package stanza states, under `SHA256` or `SHA512`.
+///
+/// A stanza stating neither has nothing to check the package's bytes against,
+/// and one stating both is not a plan this library writes: a plan records one.
+/// A value outside its algorithm's shape is quoted, since nothing has admitted
+/// it.
+fn planned_digest(stanza: &document::Stanza<'_>, at: &str) -> Result<Digest, DebianError> {
+    let mut stated = RECORDED
+        .iter()
+        .filter_map(|(algorithm, field)| Some((*algorithm, *field, stanza.get(field)?)));
+    let (algorithm, field, value) = stated
+        .next()
+        .ok_or_else(|| document(format!("{at} states neither a SHA256 nor a SHA512")))?;
+    if stated.next().is_some() {
+        return Err(document(format!(
+            "{at} states both a SHA256 and a SHA512, and a plan records one"
+        )));
+    }
+    Digest::new(algorithm, &value).ok_or_else(|| {
+        document(format!(
+            "{at} states the {field} {value:?}, which is not a {} digest in lowercase hex",
+            algorithm.name(),
+        ))
+    })
+}
 
 /// Reads a required field, reporting a refusal as this layer's document
 /// failure.
@@ -591,6 +635,11 @@ mod tests {
 
     /// A plan with two archives, a package from each, an unsigned repository,
     /// and a release carrying neither optional date.
+    /// The SHA-256 spelled by repeating `fill` to its width.
+    fn sha256(fill: &str) -> Digest {
+        Digest::new(Algorithm::Sha256, &fill.repeat(64 / fill.len())).expect("lowercase hex")
+    }
+
     fn sample() -> Plan {
         Plan {
             suite: "trixie".to_string(),
@@ -600,7 +649,7 @@ mod tests {
                     mirror: "http://deb.debian.org/debian".to_string(),
                     suite: "trixie".to_string(),
                     components: vec!["main".to_string(), "contrib".to_string()],
-                    release_sha256: "9f3a".repeat(16),
+                    release_sha256: sha256("9f3a"),
                     date: Some("Sat, 02 Aug 2026 08:14:33 UTC".to_string()),
                     valid_until: Some("Sat, 09 Aug 2026 08:14:33 UTC".to_string()),
                     // A real archive key pair: the trixie certificate, and the
@@ -613,7 +662,7 @@ mod tests {
                     mirror: "http://mirror.invalid/local".to_string(),
                     suite: "trixie".to_string(),
                     components: vec!["main".to_string()],
-                    release_sha256: "1c0f".repeat(16),
+                    release_sha256: sha256("1c0f"),
                     date: None,
                     valid_until: None,
                     signed_by: Vec::new(),
@@ -626,7 +675,7 @@ mod tests {
                     name: "base-files".to_string(),
                     version: "13.6".to_string(),
                     architecture: "arm64".to_string(),
-                    sha256: "aa".repeat(32),
+                    digest: sha256("aa"),
                     filename: "pool/main/b/base-files/base-files_13.6_arm64.deb".to_string(),
                     archive: 0,
                     installed_size: Some(340),
@@ -640,7 +689,7 @@ mod tests {
                     // An epoch, whose colon the document carries verbatim.
                     version: "1:2.4-1".to_string(),
                     architecture: "all".to_string(),
-                    sha256: "bb".repeat(32),
+                    digest: sha256("bb"),
                     filename: "pool/main/l/local-tool/local-tool_2.4-1_all.deb".to_string(),
                     archive: 1,
                     // A package the archive states no size for, which Debian
@@ -893,6 +942,36 @@ Source: local-suite
     }
 
     #[test]
+    fn a_resolution_plans_the_sha256_where_the_index_offers_one() {
+        let sha256 = "aa".repeat(32);
+        let sha512 = "cc".repeat(64);
+        let planned = |digests: &str| {
+            let text = format!(
+                "Package: held\nVersion: 1.0\nArchitecture: amd64\nFilename: pool/p.deb\n\
+                 {digests}\n"
+            );
+            let index = super::super::index::Index::parse(&text, "amd64");
+            let package = index.get("held").expect("the stanza reads").clone();
+            Plan::project("trixie", "amd64", &[package], &[]).packages[0]
+                .digest
+                .clone()
+        };
+        // As Ubuntu's archives record: the plan keeps the SHA-256, so it reads
+        // as a Debian plan does.
+        let both = planned(&format!("SHA256: {sha256}\nSHA512: {sha512}"));
+        assert_eq!(
+            (both.algorithm(), both.hex()),
+            (Algorithm::Sha256, sha256.as_str())
+        );
+        // As Ubuntu's development series records.
+        let alone = planned(&format!("SHA512: {sha512}"));
+        assert_eq!(
+            (alone.algorithm(), alone.hex()),
+            (Algorithm::Sha512, sha512.as_str())
+        );
+    }
+
+    #[test]
     fn a_package_naming_an_archive_the_document_does_not_carry_is_refused() {
         // Silently attributing a package to the wrong mirror is the failure
         // this prevents, and it is exactly what a plan is kept to avoid.
@@ -933,6 +1012,53 @@ Source: local-suite
                 }
                 other => panic!("expected a pool-path refusal for {filename:?}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn a_package_recording_a_sha512_round_trips_and_one_digest_is_read() {
+        // As Ubuntu's development series records, which states no SHA-256. The
+        // SHA-256 is the golden document.
+        let sha512 = "cc".repeat(64);
+        let mut plan = sample();
+        plan.packages[0].digest = Digest::new(Algorithm::Sha512, &sha512).unwrap();
+        let document = plan.to_document().unwrap();
+        assert!(!document.contains("\nSHA256: aa"), "{document}");
+        // Written after every field a reader before it knew.
+        assert!(
+            document.contains(&format!("Size: 69412\nSHA512: {sha512}\n")),
+            "{document}"
+        );
+        let read = Plan::parse_document(&document).expect("the document reads back");
+        assert_eq!(read, plan);
+        assert_eq!(read.to_document().unwrap(), document);
+
+        // A plan records one digest: neither is nothing to check the bytes
+        // against, and both is not a plan this library writes.
+        let golden = sample().to_document().unwrap();
+        let line = format!("SHA256: {}\n", "aa".repeat(32));
+        for (document, expected) in [
+            (golden.replace(&line, ""), "neither a SHA256 nor a SHA512"),
+            (
+                golden.replace(&line, &format!("{line}SHA512: {sha512}\n")),
+                "both a SHA256 and a SHA512",
+            ),
+        ] {
+            match Plan::parse_document(&document) {
+                Err(DebianError::PlanDocument { reason }) => {
+                    assert!(reason.contains(expected), "{reason}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        // A release's digest is held to its shape as a package's is.
+        let document = golden.replace(&"9f3a".repeat(16), &"9F3A".repeat(16));
+        match Plan::parse_document(&document) {
+            Err(DebianError::PlanDocument { reason }) => {
+                assert!(reason.contains("Release-SHA256"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

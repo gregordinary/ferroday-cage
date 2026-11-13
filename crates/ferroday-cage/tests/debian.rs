@@ -9,6 +9,7 @@ use common::deb_repo::{Pkg, Tar, deb, deb_with_control, write_repo};
 use ferroday_cage::provision::debian::{
     Debian, DebianError, DebianEvent, Plan, Pool, Repository, UnheldReason,
 };
+use ferroday_cage::provision::digest::{Algorithm, Digest};
 use ferroday_cage::provision::{self, ProvisionError, Provisioned};
 
 /// The pool the pool tests publish into: a fixed suite, component, and
@@ -291,7 +292,10 @@ fn hermetic_resolve_reports_the_plan_without_downloading() {
     assert_eq!(base_plan.architecture, "amd64");
     assert_eq!(base_plan.filename, "pool/base_1.0_amd64.deb");
     // The reported digest is the archive's, chained from the verified index.
-    assert_eq!(base_plan.sha256, common::deb_repo::sha256_hex(&base_deb));
+    assert_eq!(
+        base_plan.digest.hex(),
+        common::deb_repo::sha256_hex(&base_deb)
+    );
 
     // Resolution is deterministic: a second call yields an identical plan.
     assert_eq!(debian.resolve().expect("resolve again"), plan);
@@ -507,7 +511,10 @@ fn hermetic_published_pool_is_consumable_by_the_provisioner() {
         .expect("the custom package resolved from the pool");
     assert_eq!(custom.version, "1.0");
     assert_eq!(custom.filename, "pool/main/c/custom/custom_1.0_amd64.deb");
-    assert_eq!(custom.sha256, common::deb_repo::sha256_hex(&custom_deb));
+    assert_eq!(
+        custom.digest.hex(),
+        common::deb_repo::sha256_hex(&custom_deb)
+    );
 
     assert_eq!(
         provision::ensure(&rootfs, &mut debian).expect("the bootstrap runs"),
@@ -2030,7 +2037,7 @@ fn hermetic_a_deb_cannot_write_its_own_index_entry() {
         );
     };
 
-    for field in ["Filename", "Size", "SHA256"] {
+    for field in ["Filename", "Size", "SHA256", "SHA512"] {
         refused(
             format!(
                 "{}{field}: pool/main/o/other/other_1.0_amd64.deb\n",
@@ -3196,7 +3203,7 @@ fn a_plan_records_the_archive_state_it_resolved_against() {
     // repository is the Release file itself.
     let release = std::fs::read(repo.join("dists/trixie/Release")).unwrap();
     assert_eq!(
-        archive.release_sha256,
+        archive.release_sha256.hex(),
         common::deb_repo::sha256_hex(&release)
     );
     // Nothing verified it, so no key is named. An empty list is the record of
@@ -3711,19 +3718,19 @@ fn a_plan_refuses_every_setting_that_would_shape_a_resolution() {
     let reason = refusal(base(edited));
     assert!(reason.contains("archive 7"), "{reason}");
 
-    // Same route, and the fields that become a URL rather than an index. The
+    // Same route, and the field that becomes a URL rather than an index. The
     // pool path is interpolated verbatim into the fetch URL, so an edited one
-    // could ask a mirror for something above its root; the digest is compared
-    // with a plain `==`, so one spelled any other way could only ever mismatch.
+    // could ask a mirror for something above its root.
     let mut traversing = plan.clone();
     traversing.packages[0].filename = "../../../etc/passwd".to_string();
     let reason = refusal(base(traversing));
     assert!(reason.contains("asked for"), "{reason}");
 
-    let mut shouted = plan;
-    shouted.packages[0].sha256 = shouted.packages[0].sha256.to_uppercase();
-    let reason = refusal(base(shouted));
-    assert!(reason.contains("lowercase hex"), "{reason}");
+    // The digest is compared with a plain `==`, so one spelled any other way
+    // could only ever mismatch, and it cannot be made: a digest's shape is
+    // held when it is made rather than when a plan is handed over.
+    let shouted = plan.packages[0].digest.hex().to_uppercase();
+    assert_eq!(Digest::new(Algorithm::Sha256, &shouted), None);
 }
 
 /// A package at an explicit version, which [`Pkg::ordinary`] fixes at `1.0`.
@@ -3788,13 +3795,17 @@ fn hermetic_a_pin_selects_its_version_where_the_archive_offers_a_higher_one() {
     // digest of the version it held to, not the one it passed over.
     let mut pin = live.clone();
     pin.packages[0].version = "1.0".to_string();
-    pin.packages[0].sha256 = common::deb_repo::sha256_hex(&old);
+    pin.packages[0].digest = Digest::new(Algorithm::Sha256, &common::deb_repo::sha256_hex(&old))
+        .expect("a SHA-256 is a digest");
     pin.packages[0].filename = "pool/base_1.0_amd64.deb".to_string();
 
     let mut debian = build().pin(pin).build().expect("the pin validates");
     let held = debian.resolve().expect("the pinned version is offered");
     assert_eq!(held.packages[0].version, "1.0");
-    assert_eq!(held.packages[0].sha256, common::deb_repo::sha256_hex(&old));
+    assert_eq!(
+        held.packages[0].digest.hex(),
+        common::deb_repo::sha256_hex(&old)
+    );
 
     // And the bootstrap installs what the pin held to, not what the archive
     // would have chosen.
