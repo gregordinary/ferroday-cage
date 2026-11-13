@@ -2723,7 +2723,7 @@ impl CageBuilder {
     /// the two genuinely disagree — an explicit `true` under
     /// `managed_mounts(false)`.
     fn managed(&self, toggle: Option<bool>) -> bool {
-        self.managed_mounts.unwrap_or(true) && toggle.unwrap_or(true)
+        self.get_managed_mounts() && toggle.unwrap_or(true)
     }
 
     /// The sandbox's hostname, when one is set.
@@ -2828,17 +2828,18 @@ impl CageBuilder {
         }
 
         // The managed profile resolved to plain booleans up front, before any
-        // field is moved out of `self` below. Each is the caller's explicit
-        // choice or the documented default, and none survives opting out of
-        // the profile as a whole.
-        let profile_managed = self.managed_mounts.unwrap_or(true);
-        let mount_proc = profile_managed && self.mount_proc.unwrap_or(true);
-        let mount_dev = profile_managed && self.mount_dev.unwrap_or(true);
-        let mount_tmp = profile_managed && self.mount_tmp.unwrap_or(true);
-        // The caller's own claim on the target folds in here as well: a mount
-        // of theirs at it, or a tree of theirs over it, replaces the bind.
+        // field is moved out of `self` below, through the accessors that
+        // report it: each is the caller's explicit choice or the documented
+        // default, and none survives opting out of the profile as a whole. The
+        // `resolv.conf` bind also folds in the caller's own claim on the
+        // target: a mount of theirs at it, or a tree of theirs over it,
+        // replaces the bind.
+        let profile_managed = self.get_managed_mounts();
+        let mount_proc = self.get_mount_proc();
+        let mount_dev = self.get_mount_dev();
+        let mount_tmp = self.get_mount_tmp();
         let resolv_conf = self.get_resolv_conf();
-        let base_env = self.base_env.unwrap_or(true);
+        let base_env = self.get_base_env();
 
         // Exactly one root is in force: a plain rootfs, an overlay whose first
         // lower is the base the overlay mounts over, or an empty root, which
