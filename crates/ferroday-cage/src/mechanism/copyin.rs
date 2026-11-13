@@ -1622,19 +1622,6 @@ mod tests {
         );
     }
 
-    /// The value of the attribute `name` on `path`, `None` where it holds none.
-    fn attribute(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
-        let mut value = vec![0u8; 256];
-        match rustix::fs::lgetxattr(path, name, &mut value[..]) {
-            Ok(read) => {
-                value.truncate(read);
-                Some(value)
-            }
-            Err(Errno::NODATA) => None,
-            Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
-        }
-    }
-
     /// An attribute block gives a file its attributes after its data and
     /// metadata, gives a directory the copy created its own once it is left,
     /// and is read past for a directory the root already had, which keeps
@@ -1642,14 +1629,7 @@ mod tests {
     #[test]
     fn an_attribute_block_lands_on_the_entry_the_copy_created() {
         let dir = Scratch::new("copyin-attributes");
-        if rustix::fs::setxattr(
-            dir.path(),
-            "user.probe",
-            b"x",
-            rustix::fs::XattrFlags::empty(),
-        )
-        .is_err()
-        {
+        if !ferroday_cage_testkit::xattr::holds_user_attributes(dir.path()) {
             ferroday_cage_testkit::require::premise_unmet(
                 "this filesystem holds no user extended attributes",
             );
@@ -1674,15 +1654,18 @@ mod tests {
         assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
 
         assert_eq!(
-            attribute(&dir.join("made/file"), "user.origin").as_deref(),
+            ferroday_cage_testkit::xattr::get(&dir.join("made/file"), "user.origin").as_deref(),
             Some(&b"the file"[..]),
         );
         assert_eq!(std::fs::read(dir.join("made/file")).unwrap(), b"contents\n");
         assert_eq!(
-            attribute(&dir.join("made"), "user.origin").as_deref(),
+            ferroday_cage_testkit::xattr::get(&dir.join("made"), "user.origin").as_deref(),
             Some(&b"the directory"[..]),
         );
-        assert_eq!(attribute(&dir.join("kept"), "user.origin"), None);
+        assert_eq!(
+            ferroday_cage_testkit::xattr::get(&dir.join("kept"), "user.origin"),
+            None
+        );
     }
 
     /// A block declaring a value past the kernel's own bound, or a name that is

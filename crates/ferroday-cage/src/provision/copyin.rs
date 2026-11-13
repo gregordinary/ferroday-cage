@@ -1613,17 +1613,6 @@ mod tests {
         );
     }
 
-    /// An access control list value from `(tag, perm, id)` triples.
-    fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
-        let mut value = 2u32.to_le_bytes().to_vec();
-        for (tag, perm, id) in entries {
-            value.extend_from_slice(&tag.to_le_bytes());
-            value.extend_from_slice(&perm.to_le_bytes());
-            value.extend_from_slice(&id.to_le_bytes());
-        }
-        value
-    }
-
     /// A capability value of `revision` granting `CAP_NET_RAW`, rooted at
     /// `root` where the revision names one.
     fn capability(revision: u8, root: Option<u32>) -> Vec<u8> {
@@ -1647,9 +1636,9 @@ mod tests {
             uid: extent.clone(),
             gid: extent,
         };
-        const NONE: u32 = u32::MAX;
+        const NONE: u32 = ferroday_cage_testkit::xattr::NO_ID;
         let masked = |named: u32| {
-            acl(&[
+            ferroday_cage_testkit::xattr::acl(&[
                 (0x01, 6, NONE),
                 (0x02, 6, named),
                 (0x04, 0, NONE),
@@ -1741,7 +1730,11 @@ mod tests {
             attributes.carried,
             vec![(
                 b"system.posix_acl_default".to_vec(),
-                acl(&[(0x01, 6, NONE), (0x04, 0, NONE), (0x20, 0, NONE)]),
+                ferroday_cage_testkit::xattr::acl(&[
+                    (0x01, 6, NONE),
+                    (0x04, 0, NONE),
+                    (0x20, 0, NONE)
+                ]),
             )],
         );
         assert_eq!(
@@ -1820,11 +1813,8 @@ mod tests {
         child.finish().expect("the child gives the capability");
 
         let held = |path: &Path| {
-            let mut value = vec![0u8; 64];
-            let read = rustix::fs::lgetxattr(path, xattr::CAPABILITY, &mut value[..])
-                .expect("the file holds a capability");
-            value.truncate(read);
-            value
+            let name = xattr::CAPABILITY.to_str().expect("the name is text");
+            ferroday_cage_testkit::xattr::get(path, name).expect("the file holds a capability")
         };
         let caller = rustix::process::geteuid().as_raw();
         let staged_capability = held(&staged.join("ping"));

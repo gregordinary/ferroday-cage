@@ -1794,10 +1794,9 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         let secret = source.join("secret");
         fs::write(&secret, b"for one user\n").unwrap();
-        let none = u32::MAX;
-        let mut list = 2u32.to_le_bytes().to_vec();
-        for (tag, perm, id) in [
-            (0x01u16, 6u16, none),
+        let none = ferroday_cage_testkit::xattr::NO_ID;
+        let list = ferroday_cage_testkit::xattr::acl(&[
+            (0x01, 6, none),
             (
                 0x02,
                 6,
@@ -1806,19 +1805,12 @@ mod tests {
             (0x04, 0, none),
             (0x10, 6, none),
             (0x20, 0, none),
-        ] {
-            list.extend_from_slice(&tag.to_le_bytes());
-            list.extend_from_slice(&perm.to_le_bytes());
-            list.extend_from_slice(&id.to_le_bytes());
-        }
-        if rustix::fs::setxattr(
+        ]);
+        if !ferroday_cage_testkit::xattr::set(
             &secret,
-            "system.posix_acl_access",
+            ferroday_cage_testkit::xattr::ACCESS_ACL,
             &list,
-            rustix::fs::XattrFlags::empty(),
-        )
-        .is_err()
-        {
+        ) {
             ferroday_cage_testkit::require::premise_unmet(
                 "this filesystem holds no POSIX access control lists",
             );
@@ -2113,18 +2105,7 @@ mod list_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    const NONE: u32 = u32::MAX;
-
-    /// A list's attribute value from `(tag, perm, id)` triples.
-    fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
-        let mut value = 2u32.to_le_bytes().to_vec();
-        for (tag, perm, id) in entries {
-            value.extend_from_slice(&tag.to_le_bytes());
-            value.extend_from_slice(&perm.to_le_bytes());
-            value.extend_from_slice(&id.to_le_bytes());
-        }
-        value
-    }
+    use ferroday_cage_testkit::xattr::{self, NO_ID as NONE, acl};
 
     /// `user::rw-,user:<named>:rw-,group::---,mask::rw-,other::---`, whose
     /// mode shows the mask as the group's bits.
@@ -2164,33 +2145,6 @@ mod list_tests {
             & 0o7777
     }
 
-    fn list_of(path: &Path, name: &str) -> Option<Vec<u8>> {
-        let mut value = vec![0u8; 1024];
-        match rustix::fs::lgetxattr(path, name, &mut value[..]) {
-            Ok(read) => {
-                value.truncate(read);
-                Some(value)
-            }
-            Err(rustix::io::Errno::NODATA) => None,
-            Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
-        }
-    }
-
-    /// Whether the filesystem `dir` is on holds access control lists.
-    fn holds_lists(dir: &Path) -> bool {
-        let probe = dir.join("probe");
-        std::fs::write(&probe, b"").unwrap();
-        let held = rustix::fs::setxattr(
-            &probe,
-            "system.posix_acl_access",
-            &acl(&[(0x01, 6, NONE), (0x04, 4, NONE), (0x20, 4, NONE)]),
-            rustix::fs::XattrFlags::empty(),
-        )
-        .is_ok();
-        std::fs::remove_file(&probe).unwrap();
-        held
-    }
-
     #[test]
     fn an_access_control_list_the_archive_records_is_applied_or_narrowed() {
         // Under the single-identity map root inside is the calling user, so a
@@ -2199,7 +2153,7 @@ mod list_tests {
         // dropped: its mode's group bits are its mask, and the owning group's
         // own entry is `---`.
         let root = Scratch::for_test("extract", "access-lists");
-        if !holds_lists(&root) {
+        if !xattr::holds_acls(&root) {
             ferroday_cage_testkit::require::premise_unmet(
                 "this filesystem holds no POSIX access control lists",
             );
@@ -2236,13 +2190,13 @@ mod list_tests {
         .expect("the archive extracts");
 
         assert_eq!(
-            list_of(&root.join("shared"), "system.posix_acl_access"),
+            xattr::get(&root.join("shared"), "system.posix_acl_access"),
             Some(masked(caller)),
         );
         assert_eq!(mode_of(&root.join("shared")), 0o660);
 
         assert_eq!(
-            list_of(&root.join("narrowed"), "system.posix_acl_access"),
+            xattr::get(&root.join("narrowed"), "system.posix_acl_access"),
             None
         );
         assert_eq!(
@@ -2253,13 +2207,13 @@ mod list_tests {
 
         for name in ["system.posix_acl_access", "system.posix_acl_default"] {
             assert_eq!(
-                list_of(&root.join("dir"), name),
+                xattr::get(&root.join("dir"), name),
                 Some(masked_dir(caller)),
                 "{name}"
             );
         }
         assert_eq!(
-            list_of(&root.join("dir/inside"), "system.posix_acl_access"),
+            xattr::get(&root.join("dir/inside"), "system.posix_acl_access"),
             None
         );
         assert_eq!(mode_of(&root.join("dir/inside")), 0o644);
@@ -2291,6 +2245,7 @@ mod layered_tests {
     use super::{Extraction, Placement, TarReader};
     use crate::scratch::Scratch;
     use ferroday_cage_testkit::tar::Tar;
+    use ferroday_cage_testkit::xattr::{self, NO_ID};
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::Path;
@@ -2517,15 +2472,10 @@ mod layered_tests {
     /// Whether this filesystem holds the `user.` attributes an overlay upper
     /// needs, so the opaque cases can run; a skip says so.
     fn holds_user_xattrs(dir: &Path) -> bool {
-        let probe = dir.join("xattr-probe");
-        fs::create_dir(&probe).unwrap();
-        let opened = fs::File::open(&probe).unwrap();
-        let held =
-            rustix::fs::fsetxattr(&opened, "user.probe", b"1", rustix::fs::XattrFlags::empty())
-                .is_ok();
-        fs::remove_dir(&probe).unwrap();
-        ferroday_cage_testkit::require::OVERLAY
-            .holds(held, "this filesystem holds no user. attributes")
+        ferroday_cage_testkit::require::OVERLAY.holds(
+            xattr::holds_user_attributes(dir),
+            "this filesystem holds no user. attributes",
+        )
     }
 
     /// Makes an overlay whiteout at `path`, or answers `false` where the
@@ -2691,34 +2641,13 @@ mod layered_tests {
     /// attribute encoding: a version, then each entry's tag, permissions, and
     /// id, sorted by tag.
     fn acl(named: u32) -> Vec<u8> {
-        const UNDEFINED: u32 = u32::MAX;
-        let mut encoded = 2u32.to_le_bytes().to_vec();
-        for (tag, perm, id) in [
-            (0x01u16, 7u16, UNDEFINED),
+        xattr::acl(&[
+            (0x01, 7, NO_ID),
             (0x02, 5, named),
-            (0x04, 5, UNDEFINED),
-            (0x10, 7, UNDEFINED),
-            (0x20, 5, UNDEFINED),
-        ] {
-            encoded.extend_from_slice(&tag.to_le_bytes());
-            encoded.extend_from_slice(&perm.to_le_bytes());
-            encoded.extend_from_slice(&id.to_le_bytes());
-        }
-        encoded
-    }
-
-    /// The value of the attribute `name` on `path`, `None` where it carries
-    /// none.
-    fn xattr(path: &Path, name: &str) -> Option<Vec<u8>> {
-        let mut value = vec![0u8; 4096];
-        match rustix::fs::lgetxattr(path, name, &mut value[..]) {
-            Ok(read) => {
-                value.truncate(read);
-                Some(value)
-            }
-            Err(rustix::io::Errno::NODATA) => None,
-            Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
-        }
+            (0x04, 5, NO_ID),
+            (0x10, 7, NO_ID),
+            (0x20, 5, NO_ID),
+        ])
     }
 
     #[test]
@@ -2737,24 +2666,20 @@ mod layered_tests {
         // A directory beneath a default list, created before the default was
         // set, so it carries none of its own.
         fs::create_dir_all(base.join("var/log/journal")).unwrap();
-        let set = |path: &Path, name: &str, value: &[u8]| {
-            rustix::fs::lsetxattr(path, name, value, rustix::fs::XattrFlags::empty())
-        };
-        if set(&mail, "system.posix_acl_access", &acl(4242)).is_err() {
+        if !xattr::set(&mail, xattr::ACCESS_ACL, &acl(4242)) {
             ferroday_cage_testkit::require::premise_unmet(
                 "this filesystem holds no POSIX access control lists",
             );
             return;
         }
-        set(&mail, "system.posix_acl_default", &acl(4243)).unwrap();
-        set(&mail, "user.mime_type", b"text/plain").unwrap();
-        set(&mail, "user.overlay.redirect", b"elsewhere").unwrap();
-        set(
+        assert!(xattr::set(&mail, xattr::DEFAULT_ACL, &acl(4243)));
+        assert!(xattr::set(&mail, "user.mime_type", b"text/plain"));
+        assert!(xattr::set(&mail, "user.overlay.redirect", b"elsewhere"));
+        assert!(xattr::set(
             &base.join("var/log"),
-            "system.posix_acl_default",
-            &acl(4244),
-        )
-        .unwrap();
+            xattr::DEFAULT_ACL,
+            &acl(4244)
+        ));
 
         let upper = scratch.join("upper");
         fs::create_dir(&upper).unwrap();
@@ -2773,13 +2698,13 @@ mod layered_tests {
             "user.mime_type",
         ] {
             assert_eq!(
-                xattr(&carried, name),
-                xattr(&mail, name),
+                xattr::get(&carried, name),
+                xattr::get(&mail, name),
                 "{name} is carried up as the base holds it",
             );
         }
         assert_eq!(
-            xattr(&carried, "user.overlay.redirect"),
+            xattr::get(&carried, "user.overlay.redirect"),
             None,
             "the overlay's own bookkeeping stays with the base",
         );
@@ -2788,11 +2713,15 @@ mod layered_tests {
         // neither does its copy.
         let journal = upper.join("var/log/journal");
         assert_eq!(
-            xattr(&upper.join("var/log"), "system.posix_acl_default"),
+            xattr::get(&upper.join("var/log"), "system.posix_acl_default"),
             Some(acl(4244))
         );
         for name in ["system.posix_acl_access", "system.posix_acl_default"] {
-            assert_eq!(xattr(&journal, name), None, "{name} was not the base's");
+            assert_eq!(
+                xattr::get(&journal, name),
+                None,
+                "{name} was not the base's"
+            );
         }
     }
 
@@ -2813,26 +2742,14 @@ mod layered_tests {
         let shared = base.join("srv/shared");
         fs::create_dir_all(&shared).unwrap();
         // user::r-x, user:4242:rwx, group::r-x, mask::rwx, other::r-x.
-        let mut list = 2u32.to_le_bytes().to_vec();
-        for (tag, perm, id) in [
-            (0x01u16, 5u16, u32::MAX),
+        let list = xattr::acl(&[
+            (0x01, 5, NO_ID),
             (0x02, 7, 4242),
-            (0x04, 5, u32::MAX),
-            (0x10, 7, u32::MAX),
-            (0x20, 5, u32::MAX),
-        ] {
-            list.extend_from_slice(&tag.to_le_bytes());
-            list.extend_from_slice(&perm.to_le_bytes());
-            list.extend_from_slice(&id.to_le_bytes());
-        }
-        if rustix::fs::lsetxattr(
-            &shared,
-            "system.posix_acl_access",
-            &list,
-            rustix::fs::XattrFlags::empty(),
-        )
-        .is_err()
-        {
+            (0x04, 5, NO_ID),
+            (0x10, 7, NO_ID),
+            (0x20, 5, NO_ID),
+        ]);
+        if !xattr::set(&shared, xattr::ACCESS_ACL, &list) {
             ferroday_cage_testkit::require::premise_unmet(
                 "this filesystem holds no POSIX access control lists",
             );
@@ -2849,7 +2766,7 @@ mod layered_tests {
         let carried = upper.join("srv/shared");
         assert_eq!(fs::read(carried.join("note")).unwrap(), b"a note\n");
         assert_eq!(
-            xattr(&carried, "system.posix_acl_access"),
+            xattr::get(&carried, "system.posix_acl_access"),
             Some(list),
             "the carried directory's list is the base's",
         );

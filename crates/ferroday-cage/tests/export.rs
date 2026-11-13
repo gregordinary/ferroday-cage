@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use common::xattr;
 use ferroday_cage::IdentityMap;
 use ferroday_cage::provision;
 
@@ -163,7 +164,7 @@ fn exports_a_single_mapped_tree() {
     // not made.
     let fifo = make_fifo(&root.join("gate"));
     // A user xattr, best-effort: the filesystem may not support it.
-    let xattr_set = set_user_xattr(&root.join("etc/hostname"), b"user.test", b"present");
+    let xattr_set = xattr::set(&root.join("etc/hostname"), "user.test", b"present");
 
     let mut out = Vec::new();
     provision::export_tar(&root, &mut out, IdentityMap::Single).expect("export should succeed");
@@ -1085,13 +1086,6 @@ fn make_fifo(path: &Path) -> bool {
     mknodat(CWD, path, FileType::Fifo, Mode::from_raw_mode(0o644), 0).is_ok()
 }
 
-/// Sets a user extended attribute, returning whether it took (the filesystem
-/// may not support user xattrs).
-fn set_user_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
-    let name = std::ffi::CString::new(name).unwrap();
-    rustix::fs::setxattr(path, &*name, value, rustix::fs::XattrFlags::empty()).is_ok()
-}
-
 /// Renders bytes for an assertion message.
 fn bstr(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
@@ -1731,32 +1725,6 @@ fn a_copy_creates_a_named_pipe() {
     assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
 }
 
-/// A POSIX access control list's attribute value, from `(tag, perm, id)`
-/// triples: user-obj 0x01, user 0x02, group-obj 0x04, group 0x08, mask 0x10,
-/// other 0x20.
-fn acl_value(entries: &[(u16, u16, u32)]) -> Vec<u8> {
-    let mut value = 2u32.to_le_bytes().to_vec();
-    for (tag, perm, id) in entries {
-        value.extend_from_slice(&tag.to_le_bytes());
-        value.extend_from_slice(&perm.to_le_bytes());
-        value.extend_from_slice(&id.to_le_bytes());
-    }
-    value
-}
-
-/// The value of the attribute `name` on `path`, `None` where it holds none.
-fn xattr_of(path: &Path, name: &str) -> Option<Vec<u8>> {
-    let mut value = vec![0u8; 4096];
-    match rustix::fs::lgetxattr(path, name, &mut value[..]) {
-        Ok(read) => {
-            value.truncate(read);
-            Some(value)
-        }
-        Err(rustix::io::Errno::NODATA) => None,
-        Err(errno) => panic!("reading {name} on {}: {errno}", path.display()),
-    }
-}
-
 /// A copy gives each entry the attributes it carries, `user.` ones and access
 /// control lists, a list with a mask and named entries included, and a
 /// directory's default list. Under the single map the caller's own ids are the
@@ -1777,35 +1745,31 @@ fn a_copy_carries_user_attributes_and_access_control_lists() {
     std::fs::write(&notes, b"for the group\n").unwrap();
     let uid = rustix::process::geteuid().as_raw();
     let gid = rustix::process::getegid().as_raw();
-    const NONE: u32 = u32::MAX;
-    let access = acl_value(&[
-        (0x01, 6, NONE),
+    let access = xattr::acl(&[
+        (0x01, 6, xattr::NO_ID),
         (0x02, 4, uid),
-        (0x04, 0, NONE),
+        (0x04, 0, xattr::NO_ID),
         (0x08, 4, gid),
-        (0x10, 4, NONE),
-        (0x20, 0, NONE),
+        (0x10, 4, xattr::NO_ID),
+        (0x20, 0, xattr::NO_ID),
     ]);
-    let set = |path: &Path, name: &str, value: &[u8]| {
-        rustix::fs::lsetxattr(path, name, value, rustix::fs::XattrFlags::empty()).is_ok()
-    };
-    if !set(&notes, "system.posix_acl_access", &access) {
+    if !xattr::set(&notes, xattr::ACCESS_ACL, &access) {
         common::require::premise_unmet("this filesystem holds no POSIX access control lists");
         return;
     }
-    if !set_user_xattr(&notes, b"user.comment", b"kept") {
+    if !xattr::set(&notes, "user.comment", b"kept") {
         common::require::premise_unmet("this filesystem holds no user extended attributes");
         return;
     }
-    let default = acl_value(&[
-        (0x01, 7, NONE),
+    let default = xattr::acl(&[
+        (0x01, 7, xattr::NO_ID),
         (0x02, 5, uid),
-        (0x04, 5, NONE),
-        (0x10, 5, NONE),
-        (0x20, 0, NONE),
+        (0x04, 5, xattr::NO_ID),
+        (0x10, 5, xattr::NO_ID),
+        (0x20, 0, xattr::NO_ID),
     ]);
-    assert!(set(&shared, "system.posix_acl_default", &default));
-    assert!(set_user_xattr(&shared, b"user.purpose", b"sharing"));
+    assert!(xattr::set(&shared, xattr::DEFAULT_ACL, &default));
+    assert!(xattr::set(&shared, "user.purpose", b"sharing"));
     let rootfs = dir.join("rootfs");
     std::fs::create_dir_all(&rootfs).unwrap();
 
@@ -1816,13 +1780,17 @@ fn a_copy_carries_user_attributes_and_access_control_lists() {
     assert!(report.attributes.is_empty(), "{:?}", report.attributes);
 
     let copied = rootfs.join("shared/notes");
-    for name in ["system.posix_acl_access", "user.comment"] {
-        assert_eq!(xattr_of(&copied, name), xattr_of(&notes, name), "{name}");
-    }
-    for name in ["system.posix_acl_default", "user.purpose"] {
+    for name in [xattr::ACCESS_ACL, "user.comment"] {
         assert_eq!(
-            xattr_of(&rootfs.join("shared"), name),
-            xattr_of(&shared, name),
+            xattr::get(&copied, name),
+            xattr::get(&notes, name),
+            "{name}"
+        );
+    }
+    for name in [xattr::DEFAULT_ACL, "user.purpose"] {
+        assert_eq!(
+            xattr::get(&rootfs.join("shared"), name),
+            xattr::get(&shared, name),
             "{name}",
         );
     }
@@ -1855,22 +1823,14 @@ fn a_copy_names_a_list_it_cannot_carry_and_narrows_the_entry_instead() {
     std::fs::write(&secret, b"for one user\n").unwrap();
     // Any user but the caller is one the single map has no id for.
     let other = rustix::process::geteuid().as_raw().wrapping_add(4242);
-    const NONE: u32 = u32::MAX;
-    let access = acl_value(&[
-        (0x01, 6, NONE),
+    let access = xattr::acl(&[
+        (0x01, 6, xattr::NO_ID),
         (0x02, 6, other),
-        (0x04, 0, NONE),
-        (0x10, 6, NONE),
-        (0x20, 0, NONE),
+        (0x04, 0, xattr::NO_ID),
+        (0x10, 6, xattr::NO_ID),
+        (0x20, 0, xattr::NO_ID),
     ]);
-    if rustix::fs::lsetxattr(
-        &secret,
-        "system.posix_acl_access",
-        &access,
-        rustix::fs::XattrFlags::empty(),
-    )
-    .is_err()
-    {
+    if !xattr::set(&secret, xattr::ACCESS_ACL, &access) {
         common::require::premise_unmet("this filesystem holds no POSIX access control lists");
         return;
     }
@@ -1893,7 +1853,7 @@ fn a_copy_names_a_list_it_cannot_carry_and_narrows_the_entry_instead() {
     assert_eq!(report.attributes.len(), 1, "{:?}", report.attributes);
     let skipped = &report.attributes[0];
     assert_eq!(skipped.path, secret);
-    assert_eq!(skipped.name, "system.posix_acl_access");
+    assert_eq!(skipped.name, xattr::ACCESS_ACL);
     assert_eq!(skipped.reason, provision::AttributeSkip::UnmappedId);
     assert!(
         skipped.reason.to_string().contains("identity map"),
@@ -1902,7 +1862,7 @@ fn a_copy_names_a_list_it_cannot_carry_and_narrows_the_entry_instead() {
     );
 
     let copied = rootfs.join("secret");
-    assert_eq!(xattr_of(&copied, "system.posix_acl_access"), None);
+    assert_eq!(xattr::get(&copied, xattr::ACCESS_ACL), None);
     assert_eq!(
         std::fs::symlink_metadata(&copied)
             .unwrap()
@@ -1932,22 +1892,14 @@ fn an_exported_access_control_list_is_applied_where_the_archive_is_extracted() {
     let shared = root.join("shared");
     std::fs::write(&shared, b"for the named user\n").unwrap();
     let uid = rustix::process::geteuid().as_raw();
-    const NONE: u32 = u32::MAX;
-    let list = acl_value(&[
-        (0x01, 6, NONE),
+    let list = xattr::acl(&[
+        (0x01, 6, xattr::NO_ID),
         (0x02, 6, uid),
-        (0x04, 0, NONE),
-        (0x10, 6, NONE),
-        (0x20, 0, NONE),
+        (0x04, 0, xattr::NO_ID),
+        (0x10, 6, xattr::NO_ID),
+        (0x20, 0, xattr::NO_ID),
     ]);
-    if rustix::fs::lsetxattr(
-        &shared,
-        "system.posix_acl_access",
-        &list,
-        rustix::fs::XattrFlags::empty(),
-    )
-    .is_err()
-    {
+    if !xattr::set(&shared, xattr::ACCESS_ACL, &list) {
         common::require::premise_unmet("this filesystem holds no POSIX access control lists");
         return;
     }
@@ -1962,7 +1914,7 @@ fn an_exported_access_control_list_is_applied_where_the_archive_is_extracted() {
     .expect("the archive provisions");
 
     let landed = dest.join("shared");
-    assert_eq!(xattr_of(&landed, "system.posix_acl_access"), Some(list));
+    assert_eq!(xattr::get(&landed, xattr::ACCESS_ACL), Some(list));
     assert_eq!(
         std::fs::symlink_metadata(&landed)
             .unwrap()
@@ -1985,7 +1937,7 @@ fn an_attribute_name_holding_an_equals_sign_is_spelled_as_gnu_tar_spells_it() {
     let root = dir.join("root");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("file"), b"x").unwrap();
-    if !set_user_xattr(&root.join("file"), b"user.a=b%c", b"the value") {
+    if !xattr::set(&root.join("file"), "user.a=b%c", b"the value") {
         common::require::premise_unmet("this filesystem holds no user extended attributes");
         return;
     }

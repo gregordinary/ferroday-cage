@@ -27,6 +27,7 @@ pub use ferroday_cage_testkit::scratch::{
     RangedScratch, download_cache, force_remove_dir_all, ranged_scratch, scratch_dir,
 };
 pub use ferroday_cage_testkit::tar::Tar;
+pub use ferroday_cage_testkit::xattr;
 
 /// The signals a process can be sent that end or stop it at their default
 /// dispositions, the faults and `SIGABRT` aside: what a process group receives

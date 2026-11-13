@@ -1886,19 +1886,14 @@ mod tests {
         // An access control list naming the id is refused the same way, and
         // one naming only mapped ids is not.
         let acl = |named: u32| {
-            let mut value = 2u32.to_le_bytes().to_vec();
-            for (tag, perm, id) in [
-                (0x01u16, 6u16, u32::MAX),
+            use ferroday_cage_testkit::xattr::NO_ID;
+            ferroday_cage_testkit::xattr::acl(&[
+                (0x01, 6, NO_ID),
                 (0x08, 4, named),
-                (0x04, 4, u32::MAX),
-                (0x10, 4, u32::MAX),
-                (0x20, 0, u32::MAX),
-            ] {
-                value.extend_from_slice(&tag.to_le_bytes());
-                value.extend_from_slice(&perm.to_le_bytes());
-                value.extend_from_slice(&id.to_le_bytes());
-            }
-            value
+                (0x04, 4, NO_ID),
+                (0x10, 4, NO_ID),
+                (0x20, 0, NO_ID),
+            ])
         };
         let listed = |named| file((0, 0), &[(ACCESS_ACL.to_bytes(), acl(named))]);
         drive_frames_through(&listed(0), None, single).expect("a list naming root exports");

@@ -19,10 +19,10 @@ publish = false
 ferroday-cage = { path = "../ferroday-cage", default-features = false }
 sha2 = { version = "0.11", optional = true }
 # The process helpers wait for a child without reaping it and end a bounded run
-# by its process group, a test waits on a descriptor through `poll`, and a
-# probe closes its standard descriptors and puts them back; the pseudoterminal
-# harness takes the rest.
-rustix = { version = "1.1.4", features = ["event", "process", "stdio"] }
+# by its process group, a test waits on a descriptor through `poll`, a probe
+# closes its standard descriptors and puts them back, and a test sets and reads
+# extended attributes; the pseudoterminal harness takes the rest.
+rustix = { version = "1.1.4", features = ["event", "fs", "process", "stdio"] }
 
 [features]
 # SHA-256 hex digests, and the Debian fixture repository whose index states

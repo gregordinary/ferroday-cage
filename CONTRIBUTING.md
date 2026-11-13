@@ -586,6 +586,7 @@ report name a package and its version bare.
 | Run a host process in a test, failing the test past a deadline | `ferroday_cage_testkit::process::run_bounded`, or `spawn_grouped` then `finish_bounded` |
 | Run one test of the test binary again, as a process of its own | `ferroday_cage_testkit::process::rerun`, or `process::rerun_args` for one a sandbox starts |
 | How much processor time has a process or a thread used? | `ferroday_cage_testkit::process::cpu_ticks`, `thread_ticks` |
+| Encode a POSIX access control list, set or read an extended attribute, or ask whether a filesystem holds one, in a test | `ferroday_cage_testkit::xattr` |
 
 Two guards hold the table to the code, and each covers what the other cannot:
 
