@@ -190,6 +190,14 @@ name = "rlimit"
 flags = ["--rlimit"]
 
 [[builder.setting]]
+name = "cgroup_parent"
+flags = ["--cgroup-parent"]
+
+[[builder.setting]]
+name = "cgroup_limit"
+flags = ["--cgroup"]
+
+[[builder.setting]]
 name = "seccomp"
 flags = [
     "--seccomp",
@@ -285,6 +293,14 @@ flags = ["--base-env", "--no-base-env"]
 [[builder.setting]]
 name = "rlimit"
 flags = ["--rlimit"]
+
+[[builder.setting]]
+name = "cgroup_parent"
+flags = ["--cgroup-parent"]
+
+[[builder.setting]]
+name = "cgroup_limit"
+flags = ["--cgroup"]
 
 [[builder.setting]]
 name = "seccomp"

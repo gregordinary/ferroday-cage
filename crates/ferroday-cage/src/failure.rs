@@ -288,6 +288,11 @@ mod tests {
                 op: "binding the listening socket",
                 source: Some(os_error()),
             }),
+            Box::new(Error::Cgroup {
+                op: "creating the sandbox's cgroup beneath",
+                path: PathBuf::from("/sys/fs/cgroup/delegated"),
+                source: os_error(),
+            }),
             Box::new(Error::ProcfsRefused {
                 blocker: crate::host::ProcfsBlocker::Covered {
                     mounts: vec![PathBuf::from("/proc/kcore")],

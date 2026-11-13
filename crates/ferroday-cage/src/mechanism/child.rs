@@ -152,6 +152,9 @@ pub(super) struct Context<'a> {
     /// the setup keeps each hidden directory's tmpfs until the profile is in
     /// place and the tmpfs is made read-only. The caller's copy stays empty.
     pub(super) hidden: &'a [Cell<Option<OwnedFd>>],
+    /// The sandbox's `cgroup.procs`, when the launch has a cgroup: the launch
+    /// stage writes itself into it before anything else.
+    pub(super) cgroup_procs_fd: Option<BorrowedFd<'a>>,
 }
 
 impl Context<'_> {
@@ -202,6 +205,13 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // delivered at its default disposition before that would be discarded.
     reset_signals(&SigSet::all().without(&SUPERVISOR_FAULTS))
         .map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
+
+    // The sandbox's cgroup, before any namespace: every process forked from
+    // here on is charged there, and the cgroup namespace the unshare below
+    // creates is rooted at it. `0` names the writing process.
+    if let Some(procs) = context.cgroup_procs_fd {
+        rustix::io::write(procs, b"0").map_err(|errno| (SetupStep::JoinCgroup, errno, 0))?;
+    }
 
     // New namespaces, owned by the new user namespace, over which this
     // process holds full capabilities: the sandbox setup below is

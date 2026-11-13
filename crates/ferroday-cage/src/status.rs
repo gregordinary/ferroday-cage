@@ -209,6 +209,51 @@ pub struct ResourceUsage {
     /// without privilege can read, so a peak below the launching process's own
     /// is not one this field can show.
     pub peak_rss_bytes: u64,
+    /// Processor time the whole tree spent in user mode, read from the
+    /// sandbox's cgroup (`cpu.stat`), where the launch has one: see
+    /// [`CageBuilder::cgroup_parent`](crate::CageBuilder::cgroup_parent).
+    ///
+    /// Where [`user_time`](Self::user_time) counts the processes the sandbox
+    /// collected, this counts every process the cgroup held: without a PID
+    /// namespace, an orphan collected outside the sandbox, and a process still
+    /// running when the outcome was read, up to that moment. `None` without a
+    /// cgroup.
+    pub cgroup_user_time: Option<Duration>,
+    /// Processor time the kernel spent on the whole tree's behalf, read from
+    /// the sandbox's cgroup, as [`cgroup_user_time`](Self::cgroup_user_time)
+    /// is.
+    pub cgroup_system_time: Option<Duration>,
+    /// The most memory the whole tree held at once, in bytes: the cgroup's
+    /// `memory.peak` (Linux 5.19).
+    ///
+    /// A sum over the tree's processes at its peak, page cache it caused
+    /// included, rather than the largest one process reached. The launching
+    /// process's own pages are not charged to the cgroup, so the floor
+    /// [`peak_rss_bytes`](Self::peak_rss_bytes) carries does not apply. `None`
+    /// without a cgroup, where the parent does not offer the memory
+    /// controller, or on a kernel without the file.
+    pub cgroup_peak_memory_bytes: Option<u64>,
+    /// The most processes and threads the whole tree held at once: the
+    /// cgroup's `pids.peak`. `None` without a cgroup, where the parent does not
+    /// offer the pids controller, or on a kernel without the file.
+    pub cgroup_peak_processes: Option<u64>,
+    /// How many processes of the tree the kernel's OOM killer ended because
+    /// the cgroup reached its memory limit: `memory.events`' `oom_kill`. A
+    /// command its signal says was killed, with a count above zero here, was
+    /// most likely killed for memory. `None` where the cgroup has no memory
+    /// controller, or without a cgroup.
+    pub cgroup_oom_kills: Option<u64>,
+}
+
+impl ResourceUsage {
+    /// Takes in what the sandbox's cgroup read for the whole tree.
+    pub(crate) fn absorb(&mut self, tree: crate::cgroup::CgroupUsage) {
+        self.cgroup_user_time = tree.user_time;
+        self.cgroup_system_time = tree.system_time;
+        self.cgroup_peak_memory_bytes = tree.peak_memory_bytes;
+        self.cgroup_peak_processes = tree.peak_processes;
+        self.cgroup_oom_kills = tree.oom_kills;
+    }
 }
 
 #[cfg(test)]

@@ -252,6 +252,7 @@ mod failure;
 // named because the guide documents the whole library, and the module is a
 // test-time one either way: `doctest` collects the blocks, `test` runs the
 // chapter-list guard beside them.
+mod cgroup;
 #[cfg(all(
     any(test, doctest),
     feature = "serde",
@@ -289,6 +290,7 @@ mod status;
 mod terminal;
 mod wire;
 
+pub use cgroup::{CgroupLimit, CgroupRefusal};
 pub use error::{ConfigError, Error, ListenRefusal, OverlayLayer, SetupStep};
 pub use failure::ErrorChain;
 #[cfg(feature = "hardening")]

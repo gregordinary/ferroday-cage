@@ -3,7 +3,7 @@
 A sandbox can run inside a container, such as a build step in a CI job. A
 harness deployed as a pod can confine the tools it runs the same way. A
 container runtime's defaults refuse what a sandbox is built from, in four
-places. This chapter says what each refuses and why, then gives the remedies
+places, and a fifth refuses what a sandbox can be given. This chapter says what each refuses and why, then gives the remedies
 for Docker and for Kubernetes.
 
 ## The seccomp profile
@@ -89,6 +89,14 @@ a process no AppArmor profile grants them to. That includes a container run
 unconfined. Set it to `0` on the node, or run the container under a profile
 that grants `userns`.
 
+## A read-only cgroup filesystem
+
+A runtime mounts the container's cgroup filesystem read-only, unless the
+container is privileged. A sandbox inside then has no directory to create a
+cgroup in, so the [cgroup limits](hardening.md#limits-on-the-whole-tree) do
+not apply inside a default container. Limit the container itself instead,
+through the runtime's own resource settings.
+
 ## Docker
 
 The generated seccomp profile, no AppArmor confinement, and an unmasked procfs:
@@ -162,3 +170,5 @@ what this chapter says:
 - An unmasked procfs launches.
 - Docker's own seccomp profile refuses the sandbox's namespaces.
 - Docker's own AppArmor profile refuses the sandbox's mounts.
+
+It also records how the container's cgroup filesystem is mounted.

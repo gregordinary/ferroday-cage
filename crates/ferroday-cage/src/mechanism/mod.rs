@@ -626,6 +626,10 @@ pub(crate) struct LaunchPlan {
     /// Caller-side labels parallel to `rlimits`, naming each limit in a setup
     /// error. Never touched by the sandbox stages.
     pub(crate) rlimit_labels: Vec<String>,
+    /// The cgroup each launch creates for the sandbox, where one is asked for.
+    /// The caller creates it before the fork; the launch stage only joins it,
+    /// through a descriptor the context carries.
+    pub(crate) cgroup: Option<crate::cgroup::CgroupPlan>,
     /// The frozen hardening plan applied in the command stage before exec.
     /// Present only with the `hardening` feature.
     #[cfg(feature = "hardening")]
@@ -1328,6 +1332,11 @@ pub(crate) fn decode_status(
             user_time: Duration::from_micros(wide(12)),
             system_time: Duration::from_micros(wide(20)),
             peak_rss_bytes: wide(28).saturating_mul(1024),
+            cgroup_user_time: None,
+            cgroup_system_time: None,
+            cgroup_peak_memory_bytes: None,
+            cgroup_peak_processes: None,
+            cgroup_oom_kills: None,
         }),
         _ => return None,
     };
@@ -1678,6 +1687,7 @@ fn fork_launch(
     observe: bool,
     gated: bool,
     terminal: Option<&Terminal>,
+    cgroup_procs: Option<BorrowedFd<'_>>,
 ) -> Result<ParentSide, Error> {
     refuse_directory_streams(plan, observe, terminal.is_some())?;
     let foreground = Foreground::lend(plan, observe, terminal.is_some())?;
@@ -1808,6 +1818,7 @@ fn fork_launch(
                     .map(|(_, sandbox)| sandbox.as_fd()),
                 take_foreground: foreground.is_some(),
                 hidden: &hidden,
+                cgroup_procs_fd: cgroup_procs,
             };
             child::stage_a(&context)
         }
@@ -2048,11 +2059,12 @@ pub(crate) fn spawn(
     plan: &LaunchPlan,
     observe: bool,
     terminal: Option<&Terminal>,
+    cgroup_procs: Option<BorrowedFd<'_>>,
     progress: &mut dyn FnMut(Progress),
     created: &mut Vec<CreatedTarget>,
 ) -> Result<(Launched, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
-    let mut parent = fork_launch(plan, observe, false, terminal)?;
+    let mut parent = fork_launch(plan, observe, false, terminal, cgroup_procs)?;
     // A range map is established before the supervisor is published, so a
     // published sandbox always has a fully mapped user namespace.
     establish_identity_map(plan, &mut parent)?;
@@ -2240,11 +2252,12 @@ pub(crate) fn spawn_pending(
     plan: &LaunchPlan,
     observe: bool,
     terminal: Option<&Terminal>,
+    cgroup_procs: Option<BorrowedFd<'_>>,
     progress: &mut dyn FnMut(Progress),
     created: &mut Vec<CreatedTarget>,
 ) -> Result<(PendingLaunch, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
-    let mut parent = fork_launch(plan, observe, true, terminal)?;
+    let mut parent = fork_launch(plan, observe, true, terminal, cgroup_procs)?;
     // The map precedes the supervisor's publication, so by the time the
     // caller holds a Pending, /proc/<pid>/ns/user is fully mapped — the
     // ordering the network stack's helper relies on when it enters the

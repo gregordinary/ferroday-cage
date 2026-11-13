@@ -12,6 +12,7 @@ use rustix::io::Errno;
 use rustix::mount::MountFlags;
 use rustix::thread::UnshareFlags;
 
+use crate::cgroup::{CgroupLimit, CgroupSettings};
 use crate::error::{ConfigError, Error, OverlayLayer};
 use crate::idmap::{self, IdMapper, Identity, IdentityMap, PresentedIdentity};
 use crate::limits::{Limit, Resource};
@@ -1393,6 +1394,12 @@ pub struct CageBuilder {
         )
     )]
     rlimits: BTreeMap<Resource, (Limit, Limit)>,
+    // The `[cgroup]` table: the parent directory and the limits, each optional.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "CgroupSettings::is_unset")
+    )]
+    cgroup: CgroupSettings,
     #[cfg_attr(
         feature = "serde",
         serde(with = "serde_os::string_map", skip_serializing_if = "Vec::is_empty")
@@ -1485,6 +1492,7 @@ impl Default for CageBuilder {
             overlay: None,
             id_mapper: None,
             rlimits: BTreeMap::new(),
+            cgroup: CgroupSettings::default(),
             env: Vec::new(),
             mounts: Vec::new(),
             #[cfg(feature = "hardening")]
@@ -2288,6 +2296,82 @@ impl CageBuilder {
         self
     }
 
+    /// Places each launch in a cgroup of its own beneath `parent` (default:
+    /// none).
+    ///
+    /// `parent` is a directory of a cgroup v2 hierarchy in which the caller may
+    /// create cgroups: a delegated subtree, such as systemd's `Delegate=yes`
+    /// gives a service or a scope, or a container's own cgroup where its
+    /// runtime delegates it. The library creates no hierarchy, configures no
+    /// service manager, and needs no privilege. Each launch creates
+    /// `<parent>/fcage-<unique>`, enables the controllers its
+    /// [`cgroup_limit`](Self::cgroup_limit)s need in the parent's
+    /// `cgroup.subtree_control`, and writes them. The launch stage then moves
+    /// itself into the cgroup before it creates any namespace, so everything
+    /// the sandbox runs is charged there, and the sandbox's cgroup namespace is
+    /// rooted at it.
+    ///
+    /// The cgroup is what [`Running::kill`](crate::Running::kill) ends the
+    /// whole tree through, descendants that left the command's process tree
+    /// included, where the kernel has `cgroup.kill` (Linux 5.14).
+    /// [`ResourceUsage`](crate::ResourceUsage) reports what the whole tree
+    /// used, read from it. The handle removes the cgroup once the outcome is
+    /// known and no process is left in it. A sandbox without a PID namespace
+    /// can leave processes running, and its cgroup then stays beneath the
+    /// parent until they end.
+    ///
+    /// A cgroup with processes of its own cannot enable controllers for its
+    /// children, so a caller that runs inside `parent` moves itself into a
+    /// leaf cgroup beside the sandboxes' first. The launch fails with
+    /// [`Error::CgroupRefused`](crate::Error::CgroupRefused) where the parent is
+    /// not a cgroup v2 directory, does not offer a controller a limit needs, or
+    /// holds processes, and where the kernel lacks a limit's file: a limit is
+    /// never silently left unenforced.
+    ///
+    /// ```no_run
+    /// use ferroday_cage::{Cage, CgroupLimit};
+    ///
+    /// # fn main() -> ferroday_cage::Result<()> {
+    /// let cage = Cage::builder()
+    ///     .rootfs("/srv/rootfs/alpine")
+    ///     .command("/usr/bin/analyze")
+    ///     .cgroup_parent("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/sandboxes.scope")
+    ///     .cgroup_limit(CgroupLimit::MemoryMax(512 << 20))
+    ///     .cgroup_limit(CgroupLimit::PidsMax(64))
+    ///     .cgroup_limit(CgroupLimit::cpu_max(50_000, 100_000))
+    ///     .build()?;
+    /// # let _ = cage;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// With the `serde` feature the settings are part of the profile format, as
+    /// a `[cgroup]` table:
+    ///
+    /// ```toml
+    /// [cgroup]
+    /// parent = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/sandboxes.scope"
+    /// memory-max = 536870912
+    /// pids-max = 64
+    /// cpu-max = { quota = 50000, period = 100000 }
+    /// ```
+    pub fn cgroup_parent(mut self, parent: impl AsRef<Path>) -> Self {
+        self.cgroup.parent = Some(parent.as_ref().to_path_buf());
+        self
+    }
+
+    /// Holds the sandbox's whole process tree to `limit`, through its cgroup.
+    ///
+    /// Needs [`cgroup_parent`](Self::cgroup_parent), which
+    /// [`build`](Self::build) checks, along with the limit's value. Repeating
+    /// a kind of limit replaces the earlier one. Where
+    /// [`rlimit`](Self::rlimit) bounds each process alone, this bounds the tree
+    /// together: its memory, its count of processes, and its processor time.
+    pub fn cgroup_limit(mut self, limit: CgroupLimit) -> Self {
+        self.cgroup.set(limit);
+        self
+    }
+
     /// Controls whether `/proc` is mounted (default `true`).
     ///
     /// With the default PID namespace, `/proc` is a fresh procfs instance
@@ -2625,6 +2709,16 @@ impl CageBuilder {
             .map(|(resource, (soft, hard))| (*resource, *soft, *hard))
     }
 
+    /// The directory each launch's cgroup is created beneath, if one is set.
+    pub fn get_cgroup_parent(&self) -> Option<&Path> {
+        self.cgroup.parent.as_deref()
+    }
+
+    /// The configured cgroup limits, one of each kind, in a fixed order.
+    pub fn get_cgroup_limits(&self) -> Vec<CgroupLimit> {
+        self.cgroup.limits()
+    }
+
     /// Validates the configuration and freezes it into a [`Cage`].
     ///
     /// All fallible and allocating preparation happens here, in the calling
@@ -2718,6 +2812,7 @@ impl CageBuilder {
         // is what makes the report actionable.
         let exec_label = exec_label(&command.path, &program_search);
         let (rlimits, rlimit_labels) = lower_rlimits(&self.rlimits)?;
+        let cgroup = self.cgroup.plan()?;
         let args = self
             .args
             .iter()
@@ -3019,6 +3114,7 @@ impl CageBuilder {
                 exec_label,
                 rlimits,
                 rlimit_labels,
+                cgroup,
                 #[cfg(feature = "hardening")]
                 hardening,
             },
@@ -3252,6 +3348,9 @@ impl CageBuilder {
             // Code, never part of a profile: `serde(skip)` keeps it unset here.
             id_mapper: _,
             env: _,
+            // Examined below: a parent is a host directory a launch creates
+            // cgroups in and enables controllers on.
+            cgroup,
         } = self;
 
         if let Some(operation) = mounts.iter().find_map(restricted_mount_refusal) {
@@ -3300,6 +3399,16 @@ impl CageBuilder {
         if !pid_namespace {
             return Err(ConfigError::ProfileOperationForbidden {
                 operation: "the host PID namespace",
+            });
+        }
+        // A cgroup parent names a host directory each launch creates a cgroup
+        // in, and whose `cgroup.subtree_control` it enables controllers on,
+        // which every sibling beneath the parent then has. Reserve it for a
+        // trusted profile; the limits alone constrain only the sandbox, and
+        // without a parent `build` refuses them.
+        if cgroup.parent.is_some() {
+            return Err(ConfigError::ProfileOperationForbidden {
+                operation: "a cgroup parent",
             });
         }
         // The hardening request holds two parts a consumer's own calls add to
@@ -8394,6 +8503,14 @@ lower = ["/srv/base"]
 upper = "/var/tmp/upper"
 work = "/var/tmp/work"
 
+[cgroup]
+parent = "/sys/fs/cgroup/delegated"
+memory-max = 536870912
+memory-swap-max = 0
+pids-max = 64
+cpu-max = { quota = 50000, period = 100000 }
+cpu-weight = 100
+
 [rlimit]
 address-space = "unlimited"
 core-dump = 0
@@ -8518,9 +8635,18 @@ target = "/work/.git/hooks"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 96] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 105] = [
         "args",
         "base-env",
+        "cgroup",
+        "cgroup.cpu-max",
+        "cgroup.cpu-max.period",
+        "cgroup.cpu-max.quota",
+        "cgroup.cpu-weight",
+        "cgroup.memory-max",
+        "cgroup.memory-swap-max",
+        "cgroup.parent",
+        "cgroup.pids-max",
         "command",
         "empty-rootfs",
         "env",
@@ -8963,6 +9089,36 @@ read-only = true
         assert_eq!(builder.command.as_deref(), Some(Path::new("/bin/sh")));
     }
 
+    /// The `[cgroup]` table reads back as the limits it states, and a value the
+    /// kernel would refuse is refused at build.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn a_cgroup_table_reads_back_as_its_limits() {
+        let profile = "[cgroup]\nparent = \"/sys/fs/cgroup/delegated\"\nmemory-max = 1048576\n\
+                       cpu-max = { quota = 50000, period = 100000 }\n";
+        let builder: CageBuilder = toml::from_str(profile).expect("the table parses");
+        assert_eq!(
+            builder.get_cgroup_parent(),
+            Some(Path::new("/sys/fs/cgroup/delegated"))
+        );
+        assert_eq!(
+            builder.get_cgroup_limits(),
+            [
+                CgroupLimit::MemoryMax(1 << 20),
+                CgroupLimit::cpu_max(50_000, 100_000)
+            ],
+        );
+        assert!(toml::from_str::<CageBuilder>("[cgroup]\nmemory-limit = 1\n").is_err());
+        let unparented: CageBuilder =
+            toml::from_str("rootfs = \"/tmp\"\ncommand = \"/bin/sh\"\n[cgroup]\npids-max = 8\n")
+                .expect("the table parses");
+        let err = unparented.build().unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::CgroupLimitInvalid { .. })),
+            "a limit without a parent: {err}",
+        );
+    }
+
     /// The conversion from a builder applies the policy deserialization does,
     /// and hands the refusal back as the documented variant rather than as
     /// the serde format's text.
@@ -8983,6 +9139,10 @@ read-only = true
                 "an overlay root",
             ),
             ("pid-namespace = false\n", "the host PID namespace"),
+            (
+                "[cgroup]\nparent = \"/sys/fs/cgroup/delegated\"\n",
+                "a cgroup parent",
+            ),
         ];
         for (profile, forbidden) in cases {
             let builder: CageBuilder = toml::from_str(profile).expect("a trusted load accepts it");

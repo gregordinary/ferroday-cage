@@ -500,19 +500,112 @@ file-size = 67108864
 cpu-time = { soft = 10, hard = "unlimited" }
 ```
 
+### Limits on the whole tree
+
+An `rlimit` bounds each process alone, so it cannot bound what the sandbox's
+processes use together. A cgroup can. Its memory ceiling counts resident pages
+across the whole tree. Its process cap counts every process in it, and its
+processor limits apply to all of them together.
+[`cgroup_parent`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.cgroup_parent)
+places each launch in a cgroup of its own, beneath a directory the caller
+delegates, and
+[`cgroup_limit`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.cgroup_limit)
+sets its limits:
+
+```rust,no_run
+# use ferroday_cage::{Cage, CgroupLimit};
+# fn main() -> ferroday_cage::Result<()> {
+let output = Cage::builder()
+    .rootfs("/srv/rootfs/alpine")
+    .command("/usr/bin/analyze")
+    .cgroup_parent("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/sandboxes.scope")
+    .cgroup_limit(CgroupLimit::MemoryMax(512 << 20))
+    .cgroup_limit(CgroupLimit::MemorySwapMax(0))
+    .cgroup_limit(CgroupLimit::PidsMax(64))
+    .cgroup_limit(CgroupLimit::cpu_max(50_000, 100_000))
+    .build()?
+    .output()?;
+if let Some(usage) = output.usage {
+    println!("peak memory of the whole tree: {:?}", usage.cgroup_peak_memory_bytes);
+    println!("OOM kills: {:?}", usage.cgroup_oom_kills);
+}
+# Ok(())
+# }
+```
+
+The library creates no hierarchy and needs no privilege. The parent is a cgroup
+v2 directory the caller can create cgroups in. The scope `systemd-run --user
+--scope -p Delegate=yes` runs a command in is one. Each launch creates
+`fcage-<unique>` beneath it, enables the controllers its limits need, and
+writes them. The launch stage moves itself into the cgroup before it creates
+any namespace. Everything the sandbox runs is then charged there, and the
+sandbox's cgroup namespace is rooted at it.
+
+The cgroup does three things besides the limits:
+
+- **Whole-tree usage.** `ResourceUsage` gains the tree's processor time from
+  `cpu.stat`, its peak memory from `memory.peak`, its peak process count from
+  `pids.peak`, and its OOM kills from `memory.events`. These count every
+  process the cgroup held, an orphan collected outside the sandbox included,
+  and the launching process's own pages are not among them.
+- **A kill that reaches every process.** `Running::kill` also writes
+  `cgroup.kill`, where the kernel has it (Linux 5.14). Without a PID namespace,
+  that is what ends the descendants that left the command's process tree.
+- **Removal.** The handle removes the cgroup once the outcome is known and no
+  process is left in it. A sandbox without a PID namespace can leave processes
+  running, and its cgroup then stays beneath the parent until they end.
+
+A cgroup with processes of its own cannot enable controllers for its children.
+A caller that runs inside the parent therefore moves itself into a leaf beside
+the sandboxes' cgroups first:
+
+```sh
+systemd-run --user --scope -p Delegate=yes sh -c '
+    parent=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+    mkdir "$parent/caller"
+    echo 0 > "$parent/caller/cgroup.procs"
+    exec fcage --cgroup-parent "$parent" --cgroup memory-max=536870912 \
+        --cgroup pids-max=64 --rootfs /srv/rootfs/alpine -- /usr/bin/analyze'
+```
+
+A limit is never left silently unenforced. A launch fails with
+`Error::CgroupRefused` where the parent is outside a cgroup v2 hierarchy or
+lacks a controller a limit needs. It fails the same way where the parent holds
+processes of its own, or the kernel lacks a limit's file. A value the kernel
+would refuse is refused at build. Inside a container, the runtime mounts the
+cgroup filesystem read-only by default, which leaves a sandbox there no parent.
+[Running inside a container](running-in-a-container.md) gives the detail.
+
+The limits, in the units of the files they are written to. The name in the
+first column is what a profile's `[cgroup]` table and `fcage --cgroup` both
+spell:
+
+| Name | File | Unit |
+| --- | --- | --- |
+| `memory-max` | `memory.max` | bytes the tree uses at most |
+| `memory-swap-max` | `memory.swap.max` | bytes of swap the tree uses at most |
+| `pids-max` | `pids.max` | processes and threads at once |
+| `cpu-max` | `cpu.max` | microseconds of processor time per period |
+| `cpu-weight` | `cpu.weight` | a share against siblings, from 1 to 10000 |
+
+```toml
+[cgroup]
+parent = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/sandboxes.scope"
+memory-max = 536870912
+pids-max = 64
+cpu-max = { quota = 50000, period = 100000 }
+```
+
 ## What this boundary does not cover
 
 Three things a reader configuring the strongest posture on this page might
 reasonably assume are covered, and are not:
 
-- **Resource governance beyond the per-process axis.** The limits above are
-  `setrlimit` values, which is all an unprivileged process can set on itself.
-  CPU shares, memory ceilings that count resident rather than mapped pages,
-  I/O throttling, and PID caps that are genuinely per-sandbox all live in
-  cgroup controllers, and disk consumption lives in filesystem quotas. Both are
-  the host's to configure, and neither is something this library sets up. A
-  consumer that needs them places the calling process in a cgroup of its own
-  before launching, and the sandbox inherits it.
+- **I/O and disk consumption.** The limits above cover memory, processes and
+  processor time. I/O throttling lives in the cgroup's `io` controller, which
+  the library does not set, and disk consumption lives in filesystem quotas.
+  Both are the host's to configure. A consumer that needs them sets them on the
+  cgroup parent, or on the filesystem the root lives on.
 - **The rootfs itself.** The command is root inside the sandbox and the rootfs
   is mounted read-write, so it can modify anything in the provisioned tree that
   the calling user could modify on the host. A Landlock grant narrows this; so

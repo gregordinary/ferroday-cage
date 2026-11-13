@@ -58,11 +58,11 @@ use ferroday_cage::provision::debian::{Priority, Repository};
 use ferroday_cage::provision::{ProvisionError, ProvisionEvent, Provisioned, Provisioner};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
-    Bind, Cage, CageBuilder, Capability, Error, ErrorChain, ExitStatus, FsAccess, Hide, IdRange,
-    Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack, NetStackHandle,
-    Network, Overlay, PresentedIdentity, RawMount, ReadOnly, Resource, RestrictedProfile,
-    Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen, SeccompCompare,
-    SeccompPolicy, SeccompRules, Stdio, Symlink,
+    Bind, Cage, CageBuilder, Capability, CgroupLimit, Error, ErrorChain, ExitStatus, FsAccess,
+    Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack,
+    NetStackHandle, Network, Overlay, PresentedIdentity, RawMount, ReadOnly, Resource,
+    RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen,
+    SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
 };
 use serde::Deserialize as _;
 
@@ -1517,6 +1517,42 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--cgroup-parent",
+        section: Section::Identity,
+        placeholder: "DIR",
+        help: &[
+            "Run each launch in a cgroup of its own, created beneath",
+            "DIR: a cgroup v2 directory this process may create",
+            "cgroups in, such as a scope systemd-run --user --scope",
+            "-p Delegate=yes gives it. The cgroup accounts for and",
+            "kills the whole process tree",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.cgroup_parent = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--cgroup",
+        section: Section::Identity,
+        placeholder: "LIMIT=VALUE",
+        help: &[
+            "Hold the whole process tree to a limit, through the",
+            "--cgroup-parent cgroup. Repeatable. LIMIT is one of",
+            "memory-max and memory-swap-max (bytes), pids-max,",
+            "cpu-max (QUOTA[:PERIOD], microseconds, PERIOD default",
+            "100000), and cpu-weight (1 to 10000)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .cgroup_limits
+                .push(parse_cgroup_limit(&into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--path-lookup",
         section: Section::Command,
         help: &[
@@ -2514,6 +2550,8 @@ struct Options {
     run_as: Option<Identity>,
     present_as: Option<PresentedIdentity>,
     rlimits: Vec<(Resource, Limit, Limit)>,
+    cgroup_parent: Option<PathBuf>,
+    cgroup_limits: Vec<CgroupLimit>,
     setenv: Vec<(OsString, OsString)>,
     hostname: Option<OsString>,
     chdir: Option<PathBuf>,
@@ -3048,6 +3086,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         run_as: None,
         present_as: None,
         rlimits: Vec::new(),
+        cgroup_parent: None,
+        cgroup_limits: Vec::new(),
         setenv: Vec::new(),
         hostname: None,
         chdir: None,
@@ -4275,6 +4315,40 @@ fn parse_rlimit(spec: &str) -> Result<(Resource, Limit, Limit), String> {
     Ok((resource, soft, hard))
 }
 
+/// Parses one `--cgroup LIMIT=VALUE`: a cgroup limit named as the profile
+/// format's `[cgroup]` table names it, in the units of the file it is written
+/// to.
+fn parse_cgroup_limit(spec: &str) -> Result<CgroupLimit, String> {
+    let (name, value) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--cgroup expects LIMIT=VALUE, not {spec:?}"))?;
+    let number = |text: &str| -> Result<u64, String> {
+        text.trim()
+            .parse::<u64>()
+            .map_err(|_| format!("--cgroup {name}: {text:?} is not a number"))
+    };
+    Ok(match name.trim() {
+        "memory-max" => CgroupLimit::MemoryMax(number(value)?),
+        "memory-swap-max" => CgroupLimit::MemorySwapMax(number(value)?),
+        "pids-max" => CgroupLimit::PidsMax(number(value)?),
+        "cpu-max" => {
+            // The kernel's own default period, 100 ms, where none is given.
+            let (quota, period) = value.split_once(':').unwrap_or((value, "100000"));
+            CgroupLimit::cpu_max(number(quota)?, number(period)?)
+        }
+        "cpu-weight" => CgroupLimit::CpuWeight(
+            u16::try_from(number(value)?)
+                .map_err(|_| format!("--cgroup cpu-weight: {value:?} is out of range"))?,
+        ),
+        other => {
+            return Err(format!(
+                "--cgroup: {other:?} is not a limit; expected memory-max, memory-swap-max, \
+                 pids-max, cpu-max, or cpu-weight"
+            ));
+        }
+    })
+}
+
 /// Parses a Debian priority floor for `--debian-base-priority`.
 ///
 /// The library owns the name table — it is the same one that reads a
@@ -5401,6 +5475,12 @@ impl Launch {
         for (resource, soft, hard) in options.rlimits {
             builder = builder.rlimit(resource, soft, hard);
         }
+        if let Some(parent) = options.cgroup_parent {
+            builder = builder.cgroup_parent(parent);
+        }
+        for limit in options.cgroup_limits {
+            builder = builder.cgroup_limit(limit);
+        }
         if let Some(map) = options.identity_map {
             builder = builder.identity_map(map);
         }
@@ -5990,6 +6070,12 @@ fn run_restricted(options: Options) -> ExitCode {
     }
     for (resource, soft, hard) in options.rlimits {
         builder = builder.rlimit(resource, soft, hard);
+    }
+    if let Some(parent) = options.cgroup_parent {
+        builder = builder.cgroup_parent(parent);
+    }
+    for limit in options.cgroup_limits {
+        builder = builder.cgroup_limit(limit);
     }
     if let Some(tie) = stop_with_caller_default(options.stop_with_caller, false) {
         builder = builder.stop_with_caller(tie);

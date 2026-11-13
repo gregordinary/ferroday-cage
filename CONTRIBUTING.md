@@ -489,6 +489,7 @@ file. The Gentoo layer runs no package script, so it has nothing to clear.
 | Can the sandboxes a provisioner runs the target's binaries in install their network filter, asked before it downloads anything? | `provision::layer::network_filter_preflight`, over `host::seccomp_available` |
 | Can this process install a seccomp filter? | `host::seccomp_available`, which installs one in a forked child through `mechanism::seccomp::installable` |
 | Can a sandbox with a PID namespace of its own mount its procfs here, and why not? | `host::procfs_blocker`, which mounts one in a forked child through `mechanism::probe_procfs_mount`, and `host::procfs_refusal` for the explanation alone |
+| Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, and remove it | `cgroup::Cgroup`, which a launch creates before the fork and the launch stage joins through `cgroup.procs` |
 | Read this process's mount table | `host::MountEntry::parse`, one line of the kernel's `mountinfo` at a time |
 | Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |

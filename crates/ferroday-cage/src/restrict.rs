@@ -147,6 +147,7 @@ use std::path::Path;
 
 use rustix::thread::UnshareFlags;
 
+use crate::cgroup::{CgroupLimit, CgroupSettings};
 use crate::error::{ConfigError, Error};
 use crate::hardening::{FsAccess, LandlockScope, NetAccess, Request, SeccompPolicy};
 use crate::limits::{Limit, Resource};
@@ -336,6 +337,7 @@ pub struct RestrictionBuilder {
     stderr: Stdio,
     stop_with_caller: bool,
     rlimits: BTreeMap<Resource, (Limit, Limit)>,
+    cgroup: CgroupSettings,
     hardening: Request,
     /// Whether the caller named the scopes through
     /// [`landlock_scope`](Self::landlock_scope), rather than leaving the default
@@ -357,6 +359,7 @@ impl Default for RestrictionBuilder {
             stderr: Stdio::default(),
             stop_with_caller: false,
             rlimits: BTreeMap::new(),
+            cgroup: CgroupSettings::default(),
             hardening: {
                 // Every scope, which a restriction needs and a sandbox does not: it
                 // has no PID namespace and no network namespace to hide the
@@ -397,6 +400,27 @@ impl RestrictionBuilder {
         hard: impl Into<Limit>,
     ) -> Self {
         self.rlimits.insert(resource, (soft.into(), hard.into()));
+        self
+    }
+
+    /// Places each launch in a cgroup of its own beneath `parent`.
+    ///
+    /// The restriction's counterpart of
+    /// [`CageBuilder::cgroup_parent`](crate::CageBuilder::cgroup_parent), with
+    /// the same semantics: the launch stage joins the cgroup before it runs
+    /// anything, so the command and every process it starts are charged there,
+    /// and [`Running::kill`](crate::Running::kill) ends them all through it.
+    pub fn cgroup_parent(mut self, parent: impl AsRef<Path>) -> Self {
+        self.cgroup.parent = Some(parent.as_ref().to_path_buf());
+        self
+    }
+
+    /// Holds the command's whole process tree to `limit`, through its cgroup.
+    ///
+    /// The restriction's counterpart of
+    /// [`CageBuilder::cgroup_limit`](crate::CageBuilder::cgroup_limit).
+    pub fn cgroup_limit(mut self, limit: CgroupLimit) -> Self {
+        self.cgroup.set(limit);
         self
     }
 
@@ -705,6 +729,16 @@ impl RestrictionBuilder {
             .map(|(resource, (soft, hard))| (*resource, *soft, *hard))
     }
 
+    /// The directory each launch's cgroup is created beneath, if one is set.
+    pub fn get_cgroup_parent(&self) -> Option<&Path> {
+        self.cgroup.parent.as_deref()
+    }
+
+    /// The configured cgroup limits, one of each kind, in a fixed order.
+    pub fn get_cgroup_limits(&self) -> Vec<CgroupLimit> {
+        self.cgroup.limits()
+    }
+
     /// Validates the configuration and freezes it into a [`Restriction`].
     ///
     /// All fallible and allocating preparation happens here: the command
@@ -718,6 +752,7 @@ impl RestrictionBuilder {
         let command = spec::validate_command(self.command, None)?;
         let exec_label = spec::exec_label(&command.path, &[]);
         let (rlimits, rlimit_labels) = spec::lower_rlimits(&self.rlimits)?;
+        let cgroup = self.cgroup.plan()?;
         let args = self
             .args
             .iter()
@@ -802,6 +837,7 @@ impl RestrictionBuilder {
                 exec_label,
                 rlimits,
                 rlimit_labels,
+                cgroup,
                 hardening,
             },
         })
@@ -869,6 +905,7 @@ mod tests {
             stdout: _,
             stderr: _,
             rlimits: _,
+            cgroup: _,
             hardening: _,
             // Deliberately different in type. `CageBuilder` holds an
             // `Option<bool>` for each, because a profile that says nothing has

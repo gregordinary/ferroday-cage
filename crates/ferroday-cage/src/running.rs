@@ -18,6 +18,7 @@ use rustix::process;
 use rustix::process::Signal;
 
 use crate::Network;
+use crate::cgroup::{self, Cgroup};
 use crate::error::{Error, ListenRefusal};
 use crate::mechanism::netns::{self, ListenFailure, Namespaces};
 use crate::mechanism::{
@@ -145,6 +146,12 @@ pub struct Running<'obs> {
     ready: OwnedFd,
     /// Which channels the readiness set holds, one bit per [`Watch`].
     registered: u8,
+    /// The sandbox's cgroup, where the launch has one: read for the tree's
+    /// usage and removed once the outcome is known.
+    cgroup: Option<Cgroup>,
+    /// The cgroup's `cgroup.kill`, which a kill writes to as well, kept apart
+    /// from [`cgroup`](Self::cgroup) because a kill can follow the outcome.
+    cgroup_kill: Option<OwnedFd>,
 }
 
 /// Which channel one of the pump's poll slots watches, and where its readiness
@@ -207,6 +214,7 @@ impl<'obs> Running<'obs> {
             check_capture_composes(plan)?;
         }
         let ready = readiness()?;
+        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
         // The progress sink borrows the observer only for the launch; the
         // borrow ends with the statement, leaving the observer to move into
         // the handle for the output pump.
@@ -215,6 +223,7 @@ impl<'obs> Running<'obs> {
             plan,
             observe,
             None,
+            cgroup.as_ref().map(Cgroup::procs),
             &mut |event| {
                 if let Some(observer) = observer.as_deref_mut() {
                     observer.progress(event);
@@ -230,6 +239,7 @@ impl<'obs> Running<'obs> {
             observer,
             placeholders,
             ready,
+            cgroup,
         ))
     }
 
@@ -258,13 +268,21 @@ impl<'obs> Running<'obs> {
     ) -> Result<(Running<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
         let ready = readiness()?;
+        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
         let mut created = Vec::new();
-        let spawned = mechanism::spawn(plan, false, Some(terminal), &mut |_| {}, &mut created);
+        let spawned = mechanism::spawn(
+            plan,
+            false,
+            Some(terminal),
+            cgroup.as_ref().map(Cgroup::procs),
+            &mut |_| {},
+            &mut created,
+        );
         let (launched, primary) = guarded(plan, &created, spawned)?;
         let placeholders = PlaceholderGuard::new(plan, &created, Some(launched.pidfd.as_fd()));
         let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
         Ok((
-            Running::from_launched(launched, None, placeholders, ready),
+            Running::from_launched(launched, None, placeholders, ready, cgroup),
             Pty::new(primary),
         ))
     }
@@ -275,6 +293,7 @@ impl<'obs> Running<'obs> {
         observer: Option<&'obs mut dyn Observer>,
         placeholders: PlaceholderGuard,
         ready: OwnedFd,
+        cgroup: Option<Cgroup>,
     ) -> Running<'obs> {
         let buf = if observer.is_some() {
             vec![0; PUMP_BUF]
@@ -301,6 +320,8 @@ impl<'obs> Running<'obs> {
             foreground: launched.foreground,
             ready,
             registered: 0,
+            cgroup_kill: cgroup.as_ref().and_then(Cgroup::kill_switch),
+            cgroup,
         }
     }
 
@@ -495,7 +516,7 @@ impl<'obs> Running<'obs> {
     ///
     /// [`Error::SupervisorLost`]: crate::Error::SupervisorLost
     pub fn kill(&mut self) -> Result<(), Error> {
-        send_kill(&self.pidfd, &self.kill_sent)
+        send_kill(&self.pidfd, &self.kill_sent, self.cgroup_kill.as_ref())
     }
 
     /// Returns a handle that can terminate or kill the sandbox from another
@@ -514,6 +535,7 @@ impl<'obs> Running<'obs> {
             pidfd: duplicate(&self.pidfd)?,
             control: duplicate(&self.control)?,
             kill_sent: Arc::clone(&self.kill_sent),
+            cgroup_kill: self.cgroup_kill.as_ref().map(duplicate).transpose()?,
         })
     }
 
@@ -552,6 +574,13 @@ impl<'obs> Running<'obs> {
         // terminal it held goes back to the caller's process group.
         if let Some(foreground) = &mut self.foreground {
             foreground.hand_back();
+        }
+        // The cgroup's own account of the tree, read once the outcome is known
+        // and before the cgroup is removed, which dropping it does.
+        if let Some(cgroup) = self.cgroup.take()
+            && let Some(usage) = &mut self.usage
+        {
+            usage.absorb(cgroup.usage());
         }
         if let Some(pidfd) = self.reap.take() {
             // Reap the launch stage through its pidfd, so the wait targets
@@ -1032,6 +1061,7 @@ pub struct KillHandle {
     pidfd: OwnedFd,
     control: OwnedFd,
     kill_sent: Arc<AtomicBool>,
+    cgroup_kill: Option<OwnedFd>,
 }
 
 impl KillHandle {
@@ -1045,7 +1075,7 @@ impl KillHandle {
     /// including the note on the cross-thread kill racing a wait, which is
     /// exactly the case this handle serves.
     pub fn kill(&self) -> Result<(), Error> {
-        send_kill(&self.pidfd, &self.kill_sent)
+        send_kill(&self.pidfd, &self.kill_sent, self.cgroup_kill.as_ref())
     }
 }
 
@@ -1093,6 +1123,8 @@ pub struct Pending<'obs> {
     /// [`Running`] this becomes, or removed here once a launch that never
     /// proceeds is gone.
     placeholders: PlaceholderGuard,
+    /// The sandbox's cgroup, handed to the [`Running`] this becomes.
+    cgroup: Option<Cgroup>,
 }
 
 impl<'obs> Pending<'obs> {
@@ -1105,11 +1137,13 @@ impl<'obs> Pending<'obs> {
         if observe {
             check_capture_composes(plan)?;
         }
+        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
         let mut created = Vec::new();
         let spawned = mechanism::spawn_pending(
             plan,
             observe,
             None,
+            cgroup.as_ref().map(Cgroup::procs),
             &mut |event| {
                 if let Some(observer) = observer.as_deref_mut() {
                     observer.progress(event);
@@ -1124,6 +1158,7 @@ impl<'obs> Pending<'obs> {
             inner: Some(inner),
             observer,
             placeholders,
+            cgroup,
         })
     }
 
@@ -1139,9 +1174,16 @@ impl<'obs> Pending<'obs> {
         terminal: &Terminal,
     ) -> Result<(Pending<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
+        let cgroup = plan.cgroup.as_ref().map(Cgroup::create).transpose()?;
         let mut created = Vec::new();
-        let spawned =
-            mechanism::spawn_pending(plan, false, Some(terminal), &mut |_| {}, &mut created);
+        let spawned = mechanism::spawn_pending(
+            plan,
+            false,
+            Some(terminal),
+            cgroup.as_ref().map(Cgroup::procs),
+            &mut |_| {},
+            &mut created,
+        );
         let (inner, primary) = guarded(plan, &created, spawned)?;
         let placeholders = PlaceholderGuard::new(plan, &created, Some(inner.supervisor()));
         let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
@@ -1150,6 +1192,7 @@ impl<'obs> Pending<'obs> {
                 inner: Some(inner),
                 observer: None,
                 placeholders,
+                cgroup,
             },
             Pty::new(primary),
         ))
@@ -1312,6 +1355,7 @@ impl<'obs> Pending<'obs> {
             observer,
             std::mem::take(&mut self.placeholders),
             ready,
+            self.cgroup.take(),
         ))
     }
 }
@@ -1404,13 +1448,25 @@ fn send_terminate(control: &OwnedFd) -> Result<(), Error> {
 /// exited is not an error. The kill flag is raised only once the signal is
 /// known delivered (or moot), so an unexpected failure cannot fabricate a
 /// killed outcome.
-fn send_kill(pidfd: &OwnedFd, kill_sent: &AtomicBool) -> Result<(), Error> {
+/// Kills the supervisor through its pidfd, and every process of the sandbox's
+/// cgroup through `cgroup.kill` where the launch has one.
+///
+/// The cgroup reaches what the supervisor's death does not: without a PID
+/// namespace, the descendants that left the command's process tree. A cgroup
+/// already removed, because the outcome was known and nothing was left in it,
+/// has nothing to kill, which its `ENODEV` says.
+fn send_kill(
+    pidfd: &OwnedFd,
+    kill_sent: &AtomicBool,
+    cgroup_kill: Option<&OwnedFd>,
+) -> Result<(), Error> {
     match process::pidfd_send_signal(pidfd, Signal::KILL) {
-        Ok(()) | Err(Errno::SRCH) => {
-            kill_sent.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-        Err(errno) => Err(signal_error(errno)),
+        Ok(()) | Err(Errno::SRCH) => kill_sent.store(true, Ordering::SeqCst),
+        Err(errno) => return Err(signal_error(errno)),
+    }
+    match cgroup_kill.map(cgroup::kill_tree) {
+        None | Some(Ok(()) | Err(Errno::NODEV | Errno::NOENT)) => Ok(()),
+        Some(Err(errno)) => Err(signal_error(errno)),
     }
 }
 
@@ -1581,6 +1637,7 @@ mod tests {
             Some(&mut observer),
             PlaceholderGuard::default(),
             readiness().expect("an epoll set"),
+            None,
         );
 
         let thread = rustix::thread::gettid().as_raw_nonzero().get();

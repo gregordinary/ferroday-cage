@@ -305,6 +305,23 @@ A limit is safe in an untrusted profile and `RestrictedProfile` permits it: it
 is set on the command process, and an unprivileged `setrlimit` can only lower a
 hard limit or move a soft one within the hard limit the caller already had.
 
+A `[cgroup]` table places each launch in a cgroup of its own and holds the whole
+process tree to its limits, as the [hardening
+chapter](hardening.md#limits-on-the-whole-tree) describes:
+
+```toml
+[cgroup]
+parent = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/sandboxes.scope"
+memory-max = 536870912                        # 512 MiB for the whole tree
+pids-max = 64
+cpu-max = { quota = 50000, period = 100000 }  # half a processor
+```
+
+`RestrictedProfile` refuses a `parent`. It names a host directory each launch
+creates a cgroup in, and whose controllers it enables for every cgroup beneath
+it. A trusted caller sets the parent after loading, with
+`CageBuilder::cgroup_parent`.
+
 ## Hardening in a profile
 
 With the `hardening` feature, a profile carries the sandbox's Landlock,

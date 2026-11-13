@@ -248,6 +248,22 @@ consumer upgrading can skip it.
   `Running::try_wait` does that work without blocking and returns the outcome
   once it is known, so an event loop drives a sandbox's wait without parking a
   thread on it. The embedding chapter gives the recipe for tokio.
+- Cgroup limits and whole-tree accounting. `CageBuilder::cgroup_parent` and
+  `RestrictionBuilder::cgroup_parent` place each launch in a cgroup of its own
+  beneath a delegated cgroup v2 directory, which the launch stage joins before
+  it creates any namespace. `cgroup_limit` holds the whole tree to a
+  `CgroupLimit`: `memory.max`, `memory.swap.max`, `pids.max`, `cpu.max`, or
+  `cpu.weight`. `ResourceUsage` gains the tree's processor time, peak memory,
+  peak process count and OOM kills, read from the cgroup. `Running::kill` and
+  `KillHandle::kill` also write `cgroup.kill`, which reaches descendants that
+  left the command's process tree. The handle removes the cgroup once nothing is
+  left in it. A launch the parent cannot serve fails with `Error::CgroupRefused`
+  and a `CgroupRefusal`, a host failure preparing the cgroup with
+  `Error::Cgroup`, and a value the kernel would refuse with
+  `ConfigError::CgroupLimitInvalid`. `SetupStep::JoinCgroup` is the step that
+  joins it. Profiles take a `[cgroup]` table, which `RestrictedProfile` refuses
+  where it names a parent, and `fcage` takes `--cgroup-parent DIR` and `--cgroup
+  LIMIT=VALUE`.
 
 ### Changed
 

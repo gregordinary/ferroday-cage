@@ -37,6 +37,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::cgroup::CgroupRefusal;
 use crate::host::{ProcfsBlocker, UsernsBlocker};
 use crate::spec::is_command_name;
 use crate::wire::wire_enum;
@@ -210,6 +211,9 @@ wire_enum! {
         /// Make a path read-only where it stands; see
         /// [`CageBuilder::read_only`](crate::CageBuilder::read_only).
         ReadOnlyPath = 66 => "making a path read-only",
+        /// Move the launch stage into the sandbox's cgroup, through the
+        /// `cgroup.procs` the caller opened, before any namespace is created.
+        JoinCgroup = 67 => "joining the sandbox's cgroup",
     }
 }
 
@@ -879,6 +883,14 @@ rendered as text.
         /// Where the read-only procfs is mounted inside the sandbox.
         target: PathBuf,
     },
+    /// A cgroup setting is not one a launch can carry out: a limit without a
+    /// parent to create the sandbox's cgroup beneath, a parent that is not an
+    /// absolute path, or a value the kernel does not take.
+    #[non_exhaustive]
+    CgroupLimitInvalid {
+        /// What is wrong with it.
+        reason: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -1212,6 +1224,9 @@ impl fmt::Display for ConfigError {
                  host's own root hides /home, /root, /run, /var/run, and /var/tmp)",
                 path.display()
             ),
+            ConfigError::CgroupLimitInvalid { reason } => {
+                write!(f, "the cgroup settings cannot be carried out: {reason}")
+            }
             ConfigError::NestedUsernsProcfsReadOnly { target } => write!(
                 f,
                 "the procfs at {} is read-only, and the nested user namespace that locks the \
@@ -1465,6 +1480,27 @@ pub enum Error {
         /// The error the kernel returned for the mount, `EPERM`.
         source: io::Error,
     },
+    /// The sandbox could not be given a cgroup of its own beneath the parent
+    /// [`cgroup_parent`](crate::CageBuilder::cgroup_parent) names, for a
+    /// reason [`CgroupRefusal`] states. Nothing was launched.
+    #[non_exhaustive]
+    CgroupRefused {
+        /// The parent the caller named.
+        parent: PathBuf,
+        /// Why it cannot hold the sandbox's cgroup.
+        reason: CgroupRefusal,
+    },
+    /// Preparing the sandbox's cgroup failed for a reason of the host's, such
+    /// as a parent the caller may not write. Nothing was launched.
+    #[non_exhaustive]
+    Cgroup {
+        /// What the step was doing.
+        op: &'static str,
+        /// The cgroup directory concerned.
+        path: PathBuf,
+        /// The error the step failed with.
+        source: io::Error,
+    },
 }
 
 /// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
@@ -1630,6 +1666,16 @@ impl fmt::Display for Error {
                 "sandbox setup failed while mounting a fresh procfs for the sandbox's PID \
                  namespace ({blocker})"
             ),
+            Error::CgroupRefused { parent, reason } => write!(
+                f,
+                "the sandbox cannot be given a cgroup beneath {}: {reason}",
+                parent.display(),
+            ),
+            Error::Cgroup { op, path, .. } => write!(
+                f,
+                "the sandbox's cgroup could not be prepared while {op} {}",
+                path.display(),
+            ),
         }
     }
 }
@@ -1659,13 +1705,15 @@ impl std::error::Error for Error {
             | Error::KillHandle { source }
             | Error::Terminal { source }
             | Error::TerminalsExhausted { source }
-            | Error::ProcfsRefused { source, .. } => Some(source),
+            | Error::ProcfsRefused { source, .. }
+            | Error::Cgroup { source, .. } => Some(source),
             Error::Listen { source, .. } => source
                 .as_ref()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
             Error::SupervisorLost
             | Error::StreamIsDirectory { .. }
-            | Error::ListenRefused { .. } => None,
+            | Error::ListenRefused { .. }
+            | Error::CgroupRefused { .. } => None,
         }
     }
 }
