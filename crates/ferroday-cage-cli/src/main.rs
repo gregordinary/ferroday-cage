@@ -6940,14 +6940,22 @@ fn gentoo_installed(root: &Path) -> ExitCode {
     {
         return ExitCode::from(output::broken_pipe());
     }
-    if installed.is_empty()
-        && output::say(format_args!(
+    // Where entries were left out, the database is there and holds entries, so
+    // the note says that none of them names a package rather than that it is
+    // empty or absent.
+    let said = match (installed.is_empty(), installed.skipped()) {
+        (false, _) => Ok(()),
+        (true, 0) => output::say(format_args!(
             "fcage: no packages are installed at {}: its package database is empty or \
              absent, and an absent one is what a root that is not a Gentoo root looks like",
             root.display(),
-        ))
-        .is_err()
-    {
+        )),
+        (true, _) => output::say(format_args!(
+            "fcage: no packages are installed at {}: no entry of its package database names one",
+            root.display(),
+        )),
+    };
+    if said.is_err() {
         return ExitCode::from(output::broken_pipe());
     }
     output::print_stdout("the installed listing", |out| {
