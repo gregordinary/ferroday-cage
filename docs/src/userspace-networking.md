@@ -108,7 +108,8 @@ observes the sandbox's death on its own. Two rules follow:
 - **Wait, then stop.** Wait for the command to finish, then call
   [`stop`][`NetStackHandle::stop`]. `stop` signals the pump, joins it, and
   reports any error the pump ended on. Stopping before the command exits
-  simply cuts the network early.
+  simply cuts the network early. The host peer of each connection still open
+  is reset, and the guest's side is left to the guest's own timeouts.
 - **Dropping the handle is safe.** A dropped handle stops the pump the same
   way and discards its outcome. It never affects the sandbox: a running
   command merely loses connectivity. The stack is an attachment, not a
@@ -128,12 +129,12 @@ host socket are released once the exchange has closed on both sides, whichever
 closed first. A guest opening and closing connections back to back is therefore
 not throttled by the table.
 
-A connection that ends any other way ends with a reset to both peers. That
-covers a reset from either peer, a host connect that fails, and a flow the stack
-reclaims: one that has not established both sides within 30 seconds, or one
-whose guest stops reading after the host has finished and moves nothing for 100
-seconds. Neither peer is handed an end of stream for a connection that did not
-finish, so a cut-off transfer never reads as a complete one.
+A connection that ends any other way ends with a reset to each peer it has.
+That covers a reset from either peer, a host connect that fails, and a flow the
+stack reclaims: one that has not established both sides within 30 seconds, or
+one whose guest stops reading after the host has finished and moves nothing for
+100 seconds. Neither peer is handed an end of stream for a connection that did
+not finish, so a cut-off transfer never reads as a complete one.
 
 Those caps are per attachment, not per process. The pump and every host socket
 run in the caller's own process. Several attachments in one process therefore
