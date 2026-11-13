@@ -594,6 +594,7 @@ report name a package and its version bare.
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |
 | Parse an argument in an example | `examples/common` |
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
+| Hand a provisioner a transport standing in for a mirror, in a unit test | `provision::fetch::fixture`: `Canned`, `Uniform`, `Unreachable` |
 | Skip a test the host cannot run, or fail it where a `REQUIRE` variable says it must run | `ferroday_cage_testkit::require` |
 | A sandbox running a shell script in a test, with nothing else set, or one that keeps running, and an observer that keeps what it writes | `ferroday_cage_testkit::sandbox::shell`, `sandbox::sleeper`, `sandbox::Collect` |
 | Play the user at a pseudoterminal in a test | `ferroday_cage_testkit::pty` |

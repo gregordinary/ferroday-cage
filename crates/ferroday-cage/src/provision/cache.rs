@@ -862,42 +862,15 @@ mod tests {
     use std::io::Read;
 
     use super::*;
+    use crate::provision::fetch::fixture::Uniform;
     use crate::scratch::Scratch;
 
-    /// A transport that serves one fixed body to whatever it is asked for, in
-    /// writes of `chunk` bytes, counting what it was asked for.
-    struct Canned {
-        body: Vec<u8>,
-        chunk: usize,
-        asked: Vec<String>,
-    }
-
-    impl Canned {
-        fn new(body: &[u8]) -> Canned {
-            Canned {
-                body: body.to_vec(),
-                chunk: usize::MAX,
-                asked: Vec::new(),
-            }
-        }
-    }
-
-    impl Fetch for Canned {
-        fn fetch(
-            &mut self,
-            request: &FetchRequest<'_>,
-            sink: &mut dyn Write,
-        ) -> Result<(), FetchError> {
-            self.asked.push(request.url().to_string());
-            if request.url().contains("missing") {
-                return Err(FetchError::not_found(request.url()));
-            }
-            for chunk in self.body.chunks(self.chunk.max(1)) {
-                sink.write_all(chunk)
-                    .map_err(|err| FetchError::io("writing the body", request.url(), err))?;
-            }
-            Ok(())
-        }
+    /// A transport serving one body for every URL but one naming `missing`.
+    fn serving(body: &[u8]) -> Uniform {
+        let mut fetcher = Uniform::new(body);
+        fetcher.chunk = usize::MAX;
+        fetcher.missing = Some("missing");
+        fetcher
     }
 
     /// A watch that records what it heard and cancels once asked `allowed`
@@ -986,7 +959,7 @@ mod tests {
             size: None,
         };
 
-        let mut fetcher = Canned::new(b"not what the archive recorded");
+        let mut fetcher = serving(b"not what the archive recorded");
         let refused = download(
             &mut fetcher,
             &mirrors(),
@@ -1006,7 +979,7 @@ mod tests {
         // The first mirror did not serve it and the second served the wrong
         // bytes; the walk advanced past the first and stopped at the second.
         assert_eq!(
-            fetcher.asked,
+            fetcher.asked(),
             [
                 "http://missing.example/package",
                 "http://serves.example/package"
@@ -1015,7 +988,7 @@ mod tests {
 
         let mut watch = Watching::patient();
         let held = download(
-            &mut Canned::new(b"the recorded bytes"),
+            &mut serving(b"the recorded bytes"),
             &mirrors(),
             |mirror| format!("{mirror}/package"),
             entry,
@@ -1045,7 +1018,7 @@ mod tests {
         let dir = Scratch::new("cache-capped");
         let path = dir.join("package");
         let body = [b'x'; 4096];
-        let mut fetcher = Canned::new(&body);
+        let mut fetcher = serving(&body);
         let err = download(
             &mut fetcher,
             &serving_mirrors(),
@@ -1065,7 +1038,7 @@ mod tests {
         );
         // A body past its size is what that mirror served, so the walk asks
         // the next one.
-        assert_eq!(fetcher.asked.len(), 2, "{:?}", fetcher.asked);
+        assert_eq!(fetcher.asked().len(), 2, "{:?}", fetcher.asked());
         assert!(
             entries_of(&dir).is_empty(),
             "left behind: {:?}",
@@ -1074,7 +1047,7 @@ mod tests {
 
         // At the size exactly, it is accepted.
         download(
-            &mut Canned::new(&body),
+            &mut serving(&body),
             &["http://serves.example".to_string()],
             |mirror| format!("{mirror}/package"),
             Entry {
@@ -1095,7 +1068,7 @@ mod tests {
         // it has, and leaves neither the partial body nor an entry.
         let dir = Scratch::new("cache-cancelled");
         let path = dir.join("package");
-        let mut fetcher = Canned::new(&[b'x'; 64 * 1024]);
+        let mut fetcher = serving(&[b'x'; 64 * 1024]);
         fetcher.chunk = 512;
         let mut watch = Watching {
             fetched: Vec::new(),
@@ -1191,7 +1164,7 @@ mod tests {
         let file_too_large = Some(rustix::io::Errno::FBIG.raw_os_error());
 
         let path = dir.join("package");
-        let mut fetcher = Canned::new(&body);
+        let mut fetcher = serving(&body);
         fetcher.chunk = 4096;
         let err = download(
             &mut fetcher,
@@ -1211,7 +1184,7 @@ mod tests {
         };
         assert_eq!(source.raw_os_error(), file_too_large, "{source}");
         assert_eq!(
-            fetcher.asked,
+            fetcher.asked(),
             ["http://first.example/package"],
             "the walk stops at the first mirror",
         );
@@ -1227,7 +1200,7 @@ mod tests {
                 entry: Entry { path, size: None },
             })
             .collect();
-        let mut fetcher = Canned::new(&body);
+        let mut fetcher = serving(&body);
         fetcher.chunk = 4096;
         let outcome = prefetch(&mut fetcher, &jobs, &mut Watching::patient(), |_, _| {
             Ok::<(), ()>(())
@@ -1258,7 +1231,7 @@ mod tests {
             .collect();
         let mut watch = Watching::patient();
         let verified = prefetch(
-            &mut Canned::new(b"a body"),
+            &mut serving(b"a body"),
             &jobs,
             &mut watch,
             |at, mut file| {
@@ -1292,7 +1265,7 @@ mod tests {
                 entry: Entry { path, size: None },
             })
             .collect();
-        let mut fetcher = Canned::new(b"a body");
+        let mut fetcher = serving(b"a body");
         let outcome = prefetch(&mut fetcher, &jobs, &mut Watching::patient(), |_, _| {
             Ok::<(), ()>(())
         });
@@ -1301,7 +1274,10 @@ mod tests {
         };
         assert_eq!(path, &unstaged);
         assert_eq!(source.kind(), io::ErrorKind::NotFound, "{source}");
-        assert!(fetcher.asked.is_empty(), "nothing of the batch was fetched");
+        assert!(
+            fetcher.asked().is_empty(),
+            "nothing of the batch was fetched"
+        );
         assert!(entries_of(&dir).is_empty(), "left: {:?}", entries_of(&dir));
     }
 
@@ -1316,7 +1292,7 @@ mod tests {
                 size: None,
             },
         }];
-        let mut fetcher = Canned::new(b"a body");
+        let mut fetcher = serving(b"a body");
         let mut watch = Watching {
             fetched: Vec::new(),
             asked: 0,
@@ -1324,7 +1300,7 @@ mod tests {
         };
         let outcome = prefetch(&mut fetcher, &jobs, &mut watch, |_, _| Ok::<(), ()>(()));
         assert!(matches!(outcome, Err(Failure::Cancelled)));
-        assert!(fetcher.asked.is_empty(), "nothing was fetched");
+        assert!(fetcher.asked().is_empty(), "nothing was fetched");
         assert!(entries_of(&dir).is_empty());
     }
 

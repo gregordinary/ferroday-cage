@@ -2747,25 +2747,8 @@ mod tests {
     use super::*;
     use crate::ErrorChain;
     use crate::provision::FetchRequest;
+    use crate::provision::fetch::fixture::{Canned, Unreachable};
     use crate::scratch::Scratch;
-
-    /// A transport serving a fixed set of URLs and nothing else.
-    struct Canned(HashMap<String, Vec<u8>>);
-
-    impl Fetch for Canned {
-        fn fetch(
-            &mut self,
-            request: &FetchRequest<'_>,
-            sink: &mut dyn Write,
-        ) -> Result<(), FetchError> {
-            match self.0.get(request.url()) {
-                Some(body) => sink
-                    .write_all(body)
-                    .map_err(FetchError::at("writing the body", request.url())),
-                None => Err(FetchError::not_found(request.url())),
-            }
-        }
-    }
 
     /// A transport that refuses one mirror's URLs the way the built-in client
     /// refuses one it cannot parse or whose scheme it does not speak, and
@@ -2791,7 +2774,7 @@ mod tests {
     /// A transport serving the two published index fixtures at the paths their
     /// repositories publish them under.
     fn canned() -> Canned {
-        Canned(HashMap::from([
+        Canned::new(HashMap::from([
             (
                 "http://mirror.invalid/alpine/v3.23/main/x86_64/APKINDEX.tar.gz".to_string(),
                 fixtures::INDEX.to_vec(),
@@ -2935,7 +2918,7 @@ mod tests {
 
     /// A transport serving `index` at `release`'s `main` index and nothing else.
     fn serving(release: &str, index: &[u8]) -> Canned {
-        Canned(HashMap::from([(
+        Canned::new(HashMap::from([(
             format!("http://mirror.invalid/alpine/{release}/main/x86_64/APKINDEX.tar.gz"),
             index.to_vec(),
         )]))
@@ -2989,7 +2972,7 @@ mod tests {
             .build()
             .expect("the repository validates");
         let mut fetcher = canned();
-        fetcher.0.insert(
+        fetcher.served.insert(
             "http://mirror.invalid/pmos/v25.12/x86_64/APKINDEX.tar.gz".to_string(),
             fixtures::POSTMARKETOS_INDEX.to_vec(),
         );
@@ -3040,7 +3023,7 @@ mod tests {
             .architecture("aarch64")
             .mirror("http://mirror.invalid/alpine")
             .keys(KeySet::alpine("x86_64").expect("x86_64 is in the bundle"))
-            .fetcher(Canned(HashMap::from([(
+            .fetcher(Canned::new(HashMap::from([(
                 "http://mirror.invalid/alpine/v3.23/main/aarch64/APKINDEX.tar.gz".to_string(),
                 fixtures::INDEX.to_vec(),
             )])))
@@ -4946,20 +4929,6 @@ mod tests {
         // `available` both stop between one mirror and the next.
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
-        /// Answers every URL with a 503, recording what it was asked for.
-        struct Unavailable(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-        impl Fetch for Unavailable {
-            fn fetch(
-                &mut self,
-                request: &FetchRequest<'_>,
-                _sink: &mut dyn Write,
-            ) -> Result<(), FetchError> {
-                self.0.lock().unwrap().push(request.url().to_string());
-                Err(FetchError::status(request.url(), 503))
-            }
-        }
-
         /// Stops once it has heard one fetch announced.
         struct StopAfterOne(usize);
 
@@ -4981,7 +4950,9 @@ mod tests {
                 .mirror("http://first.invalid/alpine")
                 .mirror_fallback("http://second.invalid/alpine")
                 .include(["musl"])
-                .fetcher(Unavailable(std::sync::Arc::clone(&asked)))
+                .fetcher(Unreachable {
+                    asked: std::sync::Arc::clone(&asked),
+                })
                 .build()
                 .expect("the bootstrap configures")
         };

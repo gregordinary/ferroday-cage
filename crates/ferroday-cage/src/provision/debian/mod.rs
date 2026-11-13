@@ -3279,7 +3279,7 @@ impl From<crate::Error> for DebianError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provision::FetchRequest;
+    use crate::provision::fetch::fixture::{Canned, Uniform};
     use crate::scratch::Scratch;
 
     #[test]
@@ -3304,48 +3304,6 @@ mod tests {
             unnamed.to_string(),
             "the dpkg unpack step exited with exit code 2",
         );
-    }
-
-    /// A transport that serves one fixed body to whatever it is asked for.
-    struct Canned(&'static [u8]);
-
-    impl Fetch for Canned {
-        fn fetch(
-            &mut self,
-            request: &FetchRequest<'_>,
-            sink: &mut dyn std::io::Write,
-        ) -> Result<(), FetchError> {
-            sink.write_all(self.0)
-                .map_err(|err| FetchError::io("writing the body", request.url(), err))
-        }
-    }
-
-    /// A transport that answers each URL from a table, counting every call.
-    ///
-    /// The count is what the acquisition tests are about: whether a package the
-    /// batch delivered is asked for a second time by the walk behind it.
-    struct Table {
-        bodies: std::collections::HashMap<String, Vec<u8>>,
-        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl Fetch for Table {
-        fn fetch(
-            &mut self,
-            request: &FetchRequest<'_>,
-            sink: &mut dyn std::io::Write,
-        ) -> Result<(), FetchError> {
-            self.asked
-                .lock()
-                .expect("the record is not poisoned")
-                .push(request.url().to_string());
-            match self.bodies.get(request.url()) {
-                Some(body) => sink
-                    .write_all(body)
-                    .map_err(|err| FetchError::io("writing the body", request.url(), err)),
-                None => Err(FetchError::not_found(request.url())),
-            }
-        }
     }
 
     /// One package to acquire, and what the mirror will answer for it.
@@ -3377,10 +3335,7 @@ mod tests {
                 .expect("the repository builds"),
         ];
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut fetcher = Table {
-            bodies: bodies.iter().cloned().collect(),
-            asked: std::sync::Arc::clone(&asked),
-        };
+        let mut fetcher = Canned::recording(bodies.iter().cloned().collect(), &asked);
         let outcome = acquire_debs(&mut fetcher, &repositories, packages, archives, &mut Silent);
         let urls = asked.lock().expect("the record is not poisoned").clone();
         (outcome, urls)
@@ -3535,15 +3490,15 @@ mod tests {
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         // The live mirror has rotated the version out, so the batch, which asks
         // the first mirror only, does not deliver it.
-        let mut fetcher = Table {
-            bodies: [(
+        let mut fetcher = Canned::recording(
+            [(
                 "https://snapshot.example/debian/pool/one.deb".to_string(),
                 body.clone(),
             )]
             .into_iter()
             .collect(),
-            asked: std::sync::Arc::clone(&asked),
-        };
+            &asked,
+        );
 
         acquire_debs(
             &mut fetcher,
@@ -3590,15 +3545,14 @@ mod tests {
                 .build()
                 .expect("the repository builds"),
         ];
-        let mut fetcher = Table {
-            bodies: [(
+        let mut fetcher = Canned::new(
+            [(
                 "https://mirror.example/debian/pool/two.deb".to_string(),
                 two,
             )]
             .into_iter()
             .collect(),
-            asked: std::sync::Arc::default(),
-        };
+        );
 
         let mut announced: Vec<(String, usize, usize)> = Vec::new();
         let mut sink = |event: DebianEvent<'_>| {
@@ -3646,8 +3600,8 @@ mod tests {
             index.len(),
         );
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let fetcher = Table {
-            bodies: [
+        let fetcher = Canned::recording(
+            [
                 (
                     "https://mirror.example/debian/dists/trixie/Release".to_string(),
                     release.into_bytes(),
@@ -3660,8 +3614,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            asked: std::sync::Arc::clone(&asked),
-        };
+            &asked,
+        );
         let debian = Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
@@ -3884,10 +3838,7 @@ mod tests {
             "https://mirror.example/debian/dists/trixie/Release".to_string(),
             release.into_bytes(),
         );
-        let fetcher = Table {
-            bodies,
-            asked: std::sync::Arc::clone(&asked),
-        };
+        let fetcher = Canned::recording(bodies, &asked);
         let debian = Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
@@ -3922,10 +3873,7 @@ mod tests {
             "https://mirror.example/debian/dists/trixie/Release".to_string(),
             release.into_bytes(),
         );
-        let fetcher = Table {
-            bodies,
-            asked: std::sync::Arc::clone(&asked),
-        };
+        let fetcher = Canned::recording(bodies, &asked);
         let debian = Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
@@ -4080,8 +4028,8 @@ mod tests {
             &key,
             &release_of("experimental", "NotAutomatic: yes\n", &experimental),
         );
-        let fetcher = Table {
-            bodies: [
+        let fetcher = Canned::new(
+            [
                 (
                     "https://deb.example/debian/dists/trixie/Release".to_string(),
                     release_of("trixie", "", &primary).into_bytes(),
@@ -4103,8 +4051,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            asked: std::sync::Arc::default(),
-        };
+        );
         Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://deb.example/debian")
@@ -4230,8 +4177,8 @@ mod tests {
             Algorithm::Sha256.hex_of(&text),
             text.len() / 2,
         );
-        let fetcher = Table {
-            bodies: [
+        let fetcher = Canned::new(
+            [
                 (
                     "https://mirror.example/debian/dists/trixie/Release".to_string(),
                     release.into_bytes(),
@@ -4244,8 +4191,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            asked: std::sync::Arc::default(),
-        };
+        );
         let mut debian = Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
@@ -4267,15 +4213,14 @@ mod tests {
         // The release offers the component and states no index for it, which is
         // the release not offering what was asked rather than an index failing.
         let release = "Suite: trixie\nArchitectures: amd64\nComponents: main\nSHA256:\n";
-        let fetcher = Table {
-            bodies: [(
+        let fetcher = Canned::new(
+            [(
                 "https://mirror.example/debian/dists/trixie/Release".to_string(),
                 release.as_bytes().to_vec(),
             )]
             .into_iter()
             .collect(),
-            asked: std::sync::Arc::default(),
-        };
+        );
         let mut debian = Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
@@ -4304,8 +4249,8 @@ mod tests {
             index.len(),
         );
         let archive = |components: &[&str]| {
-            let fetcher = Table {
-                bodies: [
+            let fetcher = Canned::new(
+                [
                     (
                         "https://mirror.example/debian/dists/local/Release".to_string(),
                         release.clone().into_bytes(),
@@ -4318,8 +4263,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                asked: std::sync::Arc::default(),
-            };
+            );
             Debian::builder("local")
                 .architecture("amd64")
                 .components(components.iter().copied())
@@ -4356,15 +4300,14 @@ mod tests {
         const LIVE: &str = "http://live.example/debian";
         const SNAPSHOT: &str = "http://snapshot.example/debian/20260721T000000Z";
         let answering = |mirror: &str, snapshot: bool| {
-            let fetcher = Table {
-                bodies: [(
+            let fetcher = Canned::new(
+                [(
                     format!("{mirror}/dists/forky/InRelease"),
                     INRELEASE.to_vec(),
                 )]
                 .into_iter()
                 .collect(),
-                asked: std::sync::Arc::default(),
-            };
+            );
             let builder = Debian::builder("forky")
                 .architecture("amd64")
                 .mirror(LIVE)
@@ -4422,8 +4365,9 @@ mod tests {
             .build()
             .expect("the repository validates");
 
-        let (release, served) = fetch_release(&mut Canned(INRELEASE), &repository, &mut Silent)
-            .expect("the embedded keyring verifies a real Debian release");
+        let (release, served) =
+            fetch_release(&mut Uniform::new(INRELEASE), &repository, &mut Silent)
+                .expect("the embedded keyring verifies a real Debian release");
 
         assert_eq!(served.mirror, "https://deb.example/debian");
         assert_eq!(served.signed_by.len(), 1, "{:?}", served.signed_by);
@@ -5033,15 +4977,14 @@ mod tests {
             .plan(plan)
             .extract_only(true)
             .cache_dir(cache)
-            .fetcher(Table {
-                bodies: [(
+            .fetcher(Canned::new(
+                [(
                     "https://mirror.example/debian/pool/one.deb".to_string(),
                     deb,
                 )]
                 .into_iter()
                 .collect(),
-                asked: std::sync::Arc::default(),
-            })
+            ))
             .build()
             .expect("the builder validates")
     }

@@ -2895,9 +2895,10 @@ mod tests {
 
     use super::*;
     use crate::ErrorChain;
+    use crate::provision::ProvisionEvent;
     use crate::provision::digest::Algorithm;
+    use crate::provision::fetch::fixture::{Canned, Unreachable};
     use crate::provision::openpgp::fixture;
-    use crate::provision::{FetchRequest, ProvisionEvent};
     use crate::scratch::Scratch;
 
     /// A planned package weighing `size`, otherwise minimal.
@@ -2932,62 +2933,6 @@ mod tests {
 
     /// The build the fixture pointer names.
     const BUILD: &str = "20260810T204554Z";
-
-    /// A transport serving a fixed set of URLs and nothing else.
-    ///
-    /// Each layer keeps its own rather than sharing one from the test kit: that
-    /// crate links the library as a separate crate, so a transport it defined
-    /// would implement that copy's `Fetch`, and a unit test hands a provisioner
-    /// this one's.
-    struct Canned {
-        served: HashMap<String, Vec<u8>>,
-        /// The most bytes one write to the sink carries.
-        ///
-        /// A real transport delivers a body in read-sized pieces, and the
-        /// download consults the run's cancellation on each of them, so a
-        /// fixture that wrote every body in a single call could not exercise a
-        /// stop part way through one.
-        chunk: usize,
-    }
-
-    impl Canned {
-        /// A transport serving `served`, in pieces no real body would exceed.
-        fn new(served: HashMap<String, Vec<u8>>) -> Canned {
-            Canned {
-                served,
-                chunk: 64 * 1024,
-            }
-        }
-    }
-
-    impl Fetch for Canned {
-        fn fetch(
-            &mut self,
-            request: &FetchRequest<'_>,
-            sink: &mut dyn Write,
-        ) -> Result<(), FetchError> {
-            match self.served.get(request.url()) {
-                Some(body) => body
-                    .chunks(self.chunk)
-                    .try_for_each(|chunk| sink.write_all(chunk))
-                    .map_err(FetchError::at("writing the body", request.url())),
-                None => Err(FetchError::not_found(request.url())),
-            }
-        }
-    }
-
-    /// A transport that refuses everything the way an unreachable mirror does.
-    struct Unreachable;
-
-    impl Fetch for Unreachable {
-        fn fetch(
-            &mut self,
-            request: &FetchRequest<'_>,
-            _sink: &mut dyn Write,
-        ) -> Result<(), FetchError> {
-            Err(FetchError::status(request.url(), 503))
-        }
-    }
 
     /// A one-file tar archive, as the layer will extract it.
     fn tarball_bytes() -> Vec<u8> {
@@ -3502,7 +3447,7 @@ mod tests {
         );
 
         // The archive no longer has the build, and the pin still provisions.
-        let mut later = provisioner(&key, Box::new(Unreachable));
+        let mut later = provisioner(&key, Box::new(Unreachable::default()));
         later.build_id = Some(BUILD.to_string());
         later.cache_dir = Some(cache.clone());
         assert_eq!(
@@ -3526,7 +3471,7 @@ mod tests {
         let mut forged = std::fs::read_to_string(&kept).expect("the copy reads");
         forged = forged.replace(&tarball_sha512(), &"d".repeat(128));
         std::fs::write(&kept, forged).expect("the copy is altered");
-        let mut refused = provisioner(&key, Box::new(Unreachable));
+        let mut refused = provisioner(&key, Box::new(Unreachable::default()));
         refused.build_id = Some(BUILD.to_string());
         refused.cache_dir = Some(cache.clone());
         let err = refused
@@ -3555,7 +3500,7 @@ mod tests {
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let (_, mut resolved) = current();
         let stage3 = resolved.resolve().expect("the archive resolves");
-        let mut carried = provisioner(&key, Box::new(Unreachable));
+        let mut carried = provisioner(&key, Box::new(Unreachable::default()));
         carried.stage3 = Some(stage3.clone());
         assert_eq!(carried.resolve().expect("the answer is carried"), stage3);
     }
@@ -3620,7 +3565,7 @@ mod tests {
 
         // Every mirror unreachable reports the transport failure rather than a
         // signature one, so a caller can tell an outage from an attack.
-        let mut lost = provisioner(&key, Box::new(Unreachable));
+        let mut lost = provisioner(&key, Box::new(Unreachable::default()));
         assert!(matches!(
             lost.resolve().expect_err("no mirror answered"),
             GentooError::Fetch(_),
@@ -4690,7 +4635,7 @@ mod tests {
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let root = supplied_root(&scratch, "root");
         registered(&root, "sys-libs", "zlib-1.3.2", "0/1", &[]);
-        let mut gentoo = provisioner(&key, Box::new(Unreachable));
+        let mut gentoo = provisioner(&key, Box::new(Unreachable::default()));
         // No container is read, so the digest the plan records is never asked.
         gentoo.plan = Some(plan_from(BINHOST, &[]));
         gentoo.cache_dir = Some(scratch.join("cache"));

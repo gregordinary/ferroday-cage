@@ -808,6 +808,171 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Transports the layers' unit tests hand a provisioner in place of a mirror.
+///
+/// Every layer's tests need the same few: one serving the bodies it holds and
+/// answering any other URL as missing, one serving a single body for every
+/// URL, and one answering every URL as an unreachable mirror does. They live
+/// beside the trait rather than in the test kit, which links the library as a
+/// crate of its own: a transport defined there would implement that copy's
+/// `Fetch`, and a provisioner in a unit test takes this one's.
+///
+/// Each records the URLs it is asked for, in order, through a list a test keeps
+/// a handle to once the transport has been handed to a builder.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::{Fetch, FetchError, FetchRequest};
+
+    /// The URLs a transport was asked for, in order.
+    pub(crate) type Asked = Arc<Mutex<Vec<String>>>;
+
+    /// The most bytes one write to a sink carries, unless a test sets
+    /// another.
+    ///
+    /// A real transport delivers a body in read-sized pieces, and a download
+    /// consults the run's cancellation on each of them, so a transport that
+    /// wrote every body in one call could not exercise a stop part way
+    /// through one.
+    const CHUNK: usize = 64 * 1024;
+
+    /// Records `request`'s URL in `asked`.
+    fn record(asked: &Asked, request: &FetchRequest<'_>) {
+        asked
+            .lock()
+            .expect("the record is not poisoned")
+            .push(request.url().to_string());
+    }
+
+    /// Writes `body` to `sink` in pieces of at most `chunk` bytes.
+    fn deliver(
+        body: &[u8],
+        chunk: usize,
+        request: &FetchRequest<'_>,
+        sink: &mut dyn Write,
+    ) -> Result<(), FetchError> {
+        body.chunks(chunk.max(1))
+            .try_for_each(|piece| sink.write_all(piece))
+            .map_err(FetchError::at("writing the body", request.url()))
+    }
+
+    /// A transport serving the bodies it holds, each at its URL, and answering
+    /// any other URL as missing.
+    pub(crate) struct Canned {
+        /// What it serves, by URL.
+        pub(crate) served: HashMap<String, Vec<u8>>,
+        /// The most bytes one write to the sink carries.
+        pub(crate) chunk: usize,
+        /// The URLs it was asked for.
+        pub(crate) asked: Asked,
+    }
+
+    impl Canned {
+        /// A transport serving `served`, in pieces no real body would exceed.
+        pub(crate) fn new(served: HashMap<String, Vec<u8>>) -> Canned {
+            Canned::recording(served, &Asked::default())
+        }
+
+        /// [`new`](Self::new), recording the URLs it is asked for in `asked`.
+        pub(crate) fn recording(served: HashMap<String, Vec<u8>>, asked: &Asked) -> Canned {
+            Canned {
+                served,
+                chunk: CHUNK,
+                asked: Arc::clone(asked),
+            }
+        }
+    }
+
+    impl Fetch for Canned {
+        fn fetch(
+            &mut self,
+            request: &FetchRequest<'_>,
+            sink: &mut dyn Write,
+        ) -> Result<(), FetchError> {
+            record(&self.asked, request);
+            match self.served.get(request.url()) {
+                Some(body) => deliver(body, self.chunk, request, sink),
+                None => Err(FetchError::not_found(request.url())),
+            }
+        }
+    }
+
+    /// A transport serving one body for every URL, but those holding
+    /// [`missing`](Self::missing), which it answers as missing.
+    pub(crate) struct Uniform {
+        /// What it serves.
+        pub(crate) body: Vec<u8>,
+        /// The most bytes one write to the sink carries.
+        pub(crate) chunk: usize,
+        /// What a URL it answers as missing holds, where there is one.
+        pub(crate) missing: Option<&'static str>,
+        /// The URLs it was asked for.
+        pub(crate) asked: Asked,
+    }
+
+    impl Uniform {
+        /// A transport serving `body` for every URL, in pieces no real body
+        /// would exceed.
+        pub(crate) fn new(body: &[u8]) -> Uniform {
+            Uniform {
+                body: body.to_vec(),
+                chunk: CHUNK,
+                missing: None,
+                asked: Asked::default(),
+            }
+        }
+
+        /// The URLs it was asked for so far.
+        pub(crate) fn asked(&self) -> Vec<String> {
+            self.asked
+                .lock()
+                .expect("the record is not poisoned")
+                .clone()
+        }
+    }
+
+    impl Fetch for Uniform {
+        fn fetch(
+            &mut self,
+            request: &FetchRequest<'_>,
+            sink: &mut dyn Write,
+        ) -> Result<(), FetchError> {
+            record(&self.asked, request);
+            if self
+                .missing
+                .is_some_and(|missing| request.url().contains(missing))
+            {
+                return Err(FetchError::not_found(request.url()));
+            }
+            deliver(&self.body, self.chunk, request, sink)
+        }
+    }
+
+    /// A transport answering every URL as an unreachable mirror does, with a
+    /// 503. The Alpine and Gentoo layers' tests use it, and a build of the
+    /// Debian layer alone does not.
+    #[derive(Default)]
+    #[cfg_attr(not(any(feature = "alpine", feature = "gentoo")), allow(dead_code))]
+    pub(crate) struct Unreachable {
+        /// The URLs it was asked for.
+        pub(crate) asked: Asked,
+    }
+
+    impl Fetch for Unreachable {
+        fn fetch(
+            &mut self,
+            request: &FetchRequest<'_>,
+            _sink: &mut dyn Write,
+        ) -> Result<(), FetchError> {
+            record(&self.asked, request);
+            Err(FetchError::status(request.url(), 503))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
