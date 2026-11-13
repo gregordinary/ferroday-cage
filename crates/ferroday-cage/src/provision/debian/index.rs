@@ -75,12 +75,11 @@ pub(crate) struct Package {
 /// satisfies it. `a | b` parses to two atoms; a plain dependency to one.
 pub(crate) type Dependency = Vec<DepAtom>;
 
-/// One alternative within a dependency: a package name and, when the
-/// relationship declares one, the version constraint it must meet.
+/// One alternative within a dependency: a package name, what its
+/// architecture qualifier leaves it naming, and, when the relationship
+/// declares one, the version constraint it must meet.
 ///
-/// The architecture qualifier (`libc6:arm64`, `python3:any`) is parsed away —
-/// a bootstrap installs one architecture, so a qualifier never selects between
-/// two candidates — as are build-profile restriction lists, which say *when* a
+/// Build-profile restriction lists are parsed away, since they say *when* a
 /// dependency applies rather than what satisfies it.
 ///
 /// The constraint itself is [`version::Constraint`], which lives beside the
@@ -92,9 +91,74 @@ pub(crate) type Dependency = Vec<DepAtom>;
 #[derive(Debug, Clone)]
 pub(crate) struct DepAtom {
     pub name: String,
+    /// What the architecture qualifier (`python3:any`, `libc6:i386`) leaves the
+    /// name meaning.
+    pub qualifier: Qualifier,
     /// The declared version constraint, when there is one. `None` is an
     /// unversioned dependency, which any version of the name satisfies.
     pub constraint: Option<Constraint>,
+}
+
+impl fmt::Display for DepAtom {
+    /// Writes the alternative as a relation field states it, `perl:any (>=
+    /// 5.36)`, with a qualifier naming the native architecture left out.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)?;
+        match &self.qualifier {
+            Qualifier::Native => {}
+            Qualifier::Any => f.write_str(":any")?,
+            Qualifier::Foreign(arch) => write!(f, ":{arch}")?,
+        }
+        match &self.constraint {
+            Some(constraint) => write!(f, " ({constraint})"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// What an architecture qualifier leaves a relation entry naming, in a
+/// resolution of one architecture, as apt 2.8.4 reads it.
+///
+/// Measured with `apt-get --simulate install` for `Depends`, for a
+/// `Provides` answering one, and for `Conflicts` and `Breaks`: the native
+/// architecture's own name and `:native` name what an unqualified entry
+/// names, `:any` names only a package `Multi-Arch: allowed`, whether the name
+/// is its own or one it provides (`foreign` does not answer it), and any other
+/// architecture, `all` included, names nothing such a resolution holds. A
+/// dependency on `libc6:i386` is therefore one nothing answers, and a
+/// `Conflicts` on it one nothing breaks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Qualifier {
+    /// No qualifier, `:native`, or the native architecture's name.
+    #[default]
+    Native,
+    /// `:any`.
+    Any,
+    /// Any other architecture, as written.
+    Foreign(String),
+}
+
+impl Qualifier {
+    /// Reads the qualifier of the entry `text`, for a resolution installing
+    /// the `native` architecture.
+    fn of(text: &str, native: &str) -> Qualifier {
+        match qualifier(text) {
+            None | Some("native") => Qualifier::Native,
+            Some("any") => Qualifier::Any,
+            Some(arch) if arch == native => Qualifier::Native,
+            Some(arch) => Qualifier::Foreign(arch.to_string()),
+        }
+    }
+
+    /// Whether an entry so qualified names a package that does, or does not,
+    /// declare `Multi-Arch: allowed`, by its own name or by one it provides.
+    pub(crate) fn admits(&self, multi_arch_allowed: bool) -> bool {
+        match self {
+            Qualifier::Native => true,
+            Qualifier::Any => multi_arch_allowed,
+            Qualifier::Foreign(_) => false,
+        }
+    }
 }
 
 /// A virtual package name a real package provides, and the version it provides
@@ -133,9 +197,6 @@ pub(crate) struct Clash {
     pub field: ClashField,
     /// The name, and the versions of it, the entry names.
     pub atom: DepAtom,
-    /// Whether the entry is qualified `:any`, which apt answers with a package
-    /// `Multi-Arch: allowed` alone.
-    pub any: bool,
 }
 
 /// The field a [`Clash`] is stated in.
@@ -158,18 +219,9 @@ impl ClashField {
 }
 
 impl fmt::Display for Clash {
-    /// Writes the entry as its field states it, `Breaks: libfoo (<< 2)`, with
-    /// the architecture qualifier left out except for `:any`, the one that
-    /// still decides what it names.
+    /// Writes the entry as its field states it, `Breaks: libfoo (<< 2)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.field.as_str(), self.atom.name)?;
-        if self.any {
-            f.write_str(":any")?;
-        }
-        match &self.atom.constraint {
-            Some(constraint) => write!(f, " ({constraint})"),
-            None => Ok(()),
-        }
+        write!(f, "{}: {}", self.field.as_str(), self.atom)
     }
 }
 
@@ -359,10 +411,13 @@ impl Package {
             filename,
             size,
             digests,
-            depends: depends.as_deref().map(parse_relations).unwrap_or_default(),
+            depends: depends
+                .as_deref()
+                .map(|value| parse_relations(value, native))
+                .unwrap_or_default(),
             pre_depends: pre_depends
                 .as_deref()
-                .map(parse_relations)
+                .map(|value| parse_relations(value, native))
                 .unwrap_or_default(),
             provides: provides.as_deref().map(parse_provides).unwrap_or_default(),
             clashes: parse_clashes(conflicts.as_deref(), breaks.as_deref(), native),
@@ -924,7 +979,7 @@ fn mentions(stanza: &Stanza<'_>) -> Vec<String> {
         names.extend(
             value
                 .split([',', '|'])
-                .filter_map(parse_atom)
+                .filter_map(|text| parse_atom(text, ""))
                 .map(|atom| atom.name),
         );
     }
@@ -970,12 +1025,20 @@ pub(crate) fn sources<'a>(
 }
 
 /// Parses a `Depends`/`Pre-Depends` value into a list of relationships, as an
-/// index states one or a status database records it.
-pub(super) fn parse_relations(value: &str) -> Vec<Dependency> {
+/// index states one or a status database records it, each alternative's
+/// qualifier read for a resolution installing the `native` architecture.
+///
+/// An alternative a foreign qualifier leaves naming nothing is kept, as one
+/// nothing answers, rather than dropped: a group of it alone would otherwise
+/// vanish, and a dependency apt cannot meet would be met by nothing at all.
+pub(super) fn parse_relations(value: &str, native: &str) -> Vec<Dependency> {
     value
         .split(',')
         .filter_map(|group| {
-            let atoms: Vec<DepAtom> = group.split('|').filter_map(parse_atom).collect();
+            let atoms: Vec<DepAtom> = group
+                .split('|')
+                .filter_map(|text| parse_atom(text, native))
+                .collect();
             (!atoms.is_empty()).then_some(atoms)
         })
         .collect()
@@ -989,9 +1052,11 @@ pub(super) fn parse_relations(value: &str) -> Vec<Dependency> {
 /// provide rather than as a constraint, which is the conservative reading: it
 /// satisfies unversioned dependencies and no versioned one.
 pub(crate) fn parse_provides(value: &str) -> Vec<Provided> {
+    // A qualifier means nothing on a name a package provides, so the one it
+    // would be read against is immaterial.
     value
         .split(',')
-        .filter_map(parse_atom)
+        .filter_map(|text| parse_atom(text, ""))
         .map(|atom| Provided {
             name: atom.name,
             version: atom
@@ -1007,14 +1072,10 @@ pub(crate) fn parse_provides(value: &str) -> Vec<Provided> {
 /// installed beside, as an index states them or a status database records
 /// them, for a bootstrap installing the `native` architecture.
 ///
-/// An entry's architecture qualifier is read as apt 2.8 reads it in a
-/// resolution of one architecture: `:native` and the native architecture's own
-/// name name what an unqualified entry names, `:any` names only a package
-/// `Multi-Arch: allowed` ([`Clash::any`]), and any other architecture, `:all`
-/// included, names no package such a resolution holds, so the entry is left
-/// out. Neither field admits alternatives, and dpkg refuses a `|` in either; an
-/// entry written with one is read as each of its alternatives, which is the
-/// reading that keeps every package it names out.
+/// An entry's architecture qualifier is read as a dependency's is
+/// ([`Qualifier`]). Neither field admits alternatives, and dpkg refuses a `|`
+/// in either; an entry written with one is read as each of its alternatives,
+/// which is the reading that keeps every package it names out.
 pub(super) fn parse_clashes(
     conflicts: Option<&str>,
     breaks: Option<&str>,
@@ -1030,16 +1091,9 @@ pub(super) fn parse_clashes(
             continue;
         };
         for text in value.split([',', '|']) {
-            let Some(atom) = parse_atom(text) else {
-                continue;
-            };
-            let any = match qualifier(text) {
-                None | Some("native") => false,
-                Some("any") => true,
-                Some(arch) if arch == native => false,
-                Some(_) => continue,
-            };
-            clashes.push(Clash { field, atom, any });
+            if let Some(atom) = parse_atom(text, native) {
+                clashes.push(Clash { field, atom });
+            }
         }
     }
     clashes
@@ -1082,8 +1136,9 @@ fn source_name(value: &str, package: &str) -> Option<String> {
     (!name.is_empty() && name != package).then_some(name)
 }
 
-/// Parses one dependency alternative into its package name and version
-/// constraint, dropping the architecture qualifier and any restriction lists.
+/// Parses one dependency alternative into its package name, its architecture
+/// qualifier as a resolution installing `native` reads it, and its version
+/// constraint, dropping any restriction lists.
 ///
 /// A constraint that cannot be read — an operator dpkg does not define, or a
 /// parenthesis with no version in it — yields `None` for the constraint rather
@@ -1091,7 +1146,7 @@ fn source_name(value: &str, package: &str) -> Option<String> {
 /// alternative would be to drop the whole atom, which turns a malformed
 /// constraint into a silently missing dependency; the resolver's job is to
 /// report what it cannot satisfy, not to lose the relationship.
-fn parse_atom(text: &str) -> Option<DepAtom> {
+fn parse_atom(text: &str, native: &str) -> Option<DepAtom> {
     let text = text.trim();
     let name: String = text
         .chars()
@@ -1101,7 +1156,11 @@ fn parse_atom(text: &str) -> Option<DepAtom> {
         return None;
     }
     let constraint = parse_constraint(text);
-    Some(DepAtom { name, constraint })
+    Some(DepAtom {
+        name,
+        qualifier: Qualifier::of(text, native),
+        constraint,
+    })
 }
 
 /// Reads the `(<relation> <version>)` clause of a dependency atom, when it has
@@ -1176,7 +1235,7 @@ pub fn build_depend_names(control: &str, architecture: &str) -> Vec<String> {
                 .split('|')
                 .filter(|alternative| applies_to(alternative, architecture));
             for alternative in alternatives {
-                let Some(atom) = parse_atom(alternative) else {
+                let Some(atom) = parse_atom(alternative, architecture) else {
                     continue;
                 };
                 if seen.insert(atom.name.clone()) {
@@ -1575,7 +1634,7 @@ Version: 1.0
 
     #[test]
     fn relations_parse_alternatives_and_keep_constraints() {
-        let deps = parse_relations("libc6 (>= 2.41), mawk | gawk | awk, foo:any");
+        let deps = parse_relations("libc6 (>= 2.41), mawk | gawk | awk, foo:any", "amd64");
         assert_eq!(deps.len(), 3);
         assert_eq!(deps[0][0].name, "libc6");
         // The constraint is carried, not stripped: it is the question a layered
@@ -1594,6 +1653,40 @@ Version: 1.0
         // An architecture qualifier is not a version clause.
         assert_eq!(deps[2][0].name, "foo");
         assert!(deps[2][0].constraint.is_none());
+        assert_eq!(deps[2][0].qualifier, Qualifier::Any);
+    }
+
+    #[test]
+    fn a_dependency_s_qualifier_is_read_against_the_native_architecture() {
+        let read = |text: &str| -> Vec<(String, Qualifier)> {
+            parse_relations(text, "amd64")
+                .into_iter()
+                .flatten()
+                .map(|atom| (atom.to_string(), atom.qualifier))
+                .collect()
+        };
+        assert_eq!(
+            read("perl:any (>= 5.36), libc6:amd64, gcc:native, zlib1g:i386, data:all | plain"),
+            [
+                ("perl:any (>= 5.36)".to_string(), Qualifier::Any),
+                ("libc6".to_string(), Qualifier::Native),
+                ("gcc".to_string(), Qualifier::Native),
+                (
+                    "zlib1g:i386".to_string(),
+                    Qualifier::Foreign("i386".to_string())
+                ),
+                (
+                    "data:all".to_string(),
+                    Qualifier::Foreign("all".to_string())
+                ),
+                ("plain".to_string(), Qualifier::Native),
+            ],
+        );
+        // A group whose one alternative names nothing is kept, for nothing to
+        // answer.
+        assert_eq!(parse_relations("libc6:i386", "amd64").len(), 1);
+        assert!(Qualifier::Any.admits(true) && !Qualifier::Any.admits(false));
+        assert!(!Qualifier::Foreign("i386".to_string()).admits(true));
     }
 
     #[test]
@@ -1610,10 +1703,8 @@ Version: 1.0
 
     #[test]
     fn conflicts_and_breaks_read_their_qualifiers_as_apt_does() {
-        // Measured against apt 2.8.4 resolving for amd64 alone: the native
-        // architecture and `:native` name what an unqualified entry does,
-        // `:any` only a `Multi-Arch: allowed` package, and any other
-        // architecture, `all` included, nothing.
+        // Read as a dependency's qualifier is: an entry naming another
+        // architecture is kept, and names nothing.
         let clashes = parse_clashes(
             Some("plain, old (<< 2), here:amd64, self:native, there:i386, indep:all"),
             Some("ma:any (>= 1.0), alt1 | alt2"),
@@ -1627,12 +1718,15 @@ Version: 1.0
                 "Conflicts: old (<< 2)",
                 "Conflicts: here",
                 "Conflicts: self",
+                "Conflicts: there:i386",
+                "Conflicts: indep:all",
                 "Breaks: ma:any (>= 1.0)",
                 "Breaks: alt1",
                 "Breaks: alt2",
             ],
         );
-        assert!(clashes[4].any && !clashes[0].any);
+        assert_eq!(clashes[6].atom.qualifier, Qualifier::Any);
+        assert!(!clashes[4].atom.qualifier.admits(true));
         assert!(parse_clashes(None, None, "amd64").is_empty());
     }
 

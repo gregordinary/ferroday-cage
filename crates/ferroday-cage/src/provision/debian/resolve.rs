@@ -107,7 +107,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use super::index::{Clash, DepAtom, Dependency, Index, Package, Provided};
+use super::index::{Clash, DepAtom, Dependency, Index, Package, Provided, Qualifier};
 use super::layer::{Installed, InstalledSet, Supply};
 use super::pin::{UnheldPin, UnheldReason};
 use super::version::Constraint;
@@ -700,6 +700,7 @@ pub(crate) fn resolve_seeded(
 fn unversioned(name: &str) -> DepAtom {
     DepAtom {
         name: name.to_string(),
+        qualifier: Qualifier::Native,
         constraint: None,
     }
 }
@@ -1066,8 +1067,7 @@ impl<'a> Candidates<'a> {
             let met = group.iter().any(|atom| {
                 self.base_supplies(atom)
                     || self.of(&atom.name).is_some_and(|candidate| {
-                        meets(atom.constraint.as_ref(), &candidate.version)
-                            && self.installable(candidate, excluded)
+                        answers_by_name(atom, candidate) && self.installable(candidate, excluded)
                     })
                     || first_available_provider(self, atom, excluded).is_some_and(|provider| {
                         self.of(&provider)
@@ -1087,7 +1087,9 @@ impl<'a> Candidates<'a> {
                 let Ok(Some(version)) = self.index.in_release(&atom.name, release) else {
                     continue;
                 };
-                if !constraint.satisfied_by(&version.version) {
+                if !constraint.satisfied_by(&version.version)
+                    || !atom.qualifier.admits(version.multi_arch_allowed)
+                {
                     continue;
                 }
                 let switched = self.targeted.get(&atom.name).is_some_and(|held| {
@@ -1114,9 +1116,9 @@ impl<'a> Candidates<'a> {
                 group.iter().any(|atom| {
                     self.base_supplies(atom)
                         || (!excluded.contains(atom.name.as_str())
-                            && self.of(&atom.name).is_some_and(|candidate| {
-                                meets(atom.constraint.as_ref(), &candidate.version)
-                            }))
+                            && self
+                                .of(&atom.name)
+                                .is_some_and(|candidate| answers_by_name(atom, candidate)))
                         || first_available_provider(self, atom, excluded).is_some()
                 })
             })
@@ -1216,7 +1218,7 @@ fn resolve_group(
             // When it does not, this alternative is no answer and the search
             // continues — a provider may still supply the name at a version
             // that is, and a later alternative may too.
-            if meets(atom.constraint.as_ref(), &package.version) {
+            if answers_by_name(atom, package) {
                 if fits(candidates, excluded, selected, package) {
                     add(selected, queue, package);
                     return None;
@@ -1292,6 +1294,24 @@ fn resolve_group(
     }
 }
 
+/// Whether `package` answers `atom` by its own name: its architecture
+/// qualifier admits the package ([`Qualifier::admits`]) and its constraint
+/// the package's version.
+fn answers_by_name(atom: &DepAtom, package: &Package) -> bool {
+    atom.qualifier.admits(package.multi_arch_allowed)
+        && meets(atom.constraint.as_ref(), &package.version)
+}
+
+/// Whether a base supply answers `atom`: the qualifier admits the package
+/// supplying it, and the constraint the version it is supplied at.
+fn supply_answers(installed: &InstalledSet, supply: &Supply, atom: &DepAtom) -> bool {
+    let multi_arch_allowed = installed
+        .package(&supply.provider)
+        .is_some_and(|package| package.multi_arch_allowed);
+    atom.qualifier.admits(multi_arch_allowed)
+        && answers(supply.version.as_deref(), atom.constraint.as_ref())
+}
+
 /// Whether `version` meets `constraint`. An absent constraint is met by any
 /// version, which is what an unversioned dependency asks.
 fn meets(constraint: Option<&Constraint>, version: &str) -> bool {
@@ -1342,8 +1362,7 @@ fn base_satisfies(
     selected: &BTreeMap<String, Package>,
     atom: &DepAtom,
 ) -> bool {
-    kept(installed, selected, &atom.name)
-        .any(|supply| answers(supply.version.as_deref(), atom.constraint.as_ref()))
+    kept(installed, selected, &atom.name).any(|supply| supply_answers(installed, supply, atom))
 }
 
 /// The base packages `selected` replaces that supplied one of `group`'s names
@@ -1357,7 +1376,7 @@ fn replacements(
     let mut replaced: BTreeMap<&str, Replacement> = BTreeMap::new();
     for atom in group {
         for supply in installed.supplied(&atom.name) {
-            if !answers(supply.version.as_deref(), atom.constraint.as_ref()) {
+            if !supply_answers(installed, supply, atom) {
                 continue;
             }
             let Some(package) = selected.get(&supply.provider) else {
@@ -1398,7 +1417,7 @@ fn selected_answers<'s>(
 ) -> impl Iterator<Item = &'s Package> {
     let real = selected
         .get(&atom.name)
-        .filter(|package| meets(atom.constraint.as_ref(), &package.version));
+        .filter(|package| answers_by_name(atom, package));
     let providers = index
         .providers(&atom.name)
         .iter()
@@ -1414,13 +1433,14 @@ fn selected_satisfies(index: &Index, selected: &BTreeMap<String, Package>, atom:
 }
 
 /// Whether `package`'s `Provides` supplies `atom`'s name at a version the
-/// constraint accepts.
+/// constraint accepts, the qualifier admitting the package.
 fn provides_satisfies(package: &Package, atom: &DepAtom) -> bool {
-    package
-        .provides
-        .iter()
-        .filter(|provided| provided.name == atom.name)
-        .any(|provided| answers(provided.version.as_deref(), atom.constraint.as_ref()))
+    atom.qualifier.admits(package.multi_arch_allowed)
+        && package
+            .provides
+            .iter()
+            .filter(|provided| provided.name == atom.name)
+            .any(|provided| answers(provided.version.as_deref(), atom.constraint.as_ref()))
 }
 
 /// Renders a dependency group the way its package declares it, so the error
@@ -1428,10 +1448,7 @@ fn provides_satisfies(package: &Package, atom: &DepAtom) -> bool {
 fn render_group(group: &Dependency) -> String {
     group
         .iter()
-        .map(|atom| match atom.constraint.as_ref() {
-            Some(constraint) => format!("{} ({constraint})", atom.name),
-            None => atom.name.clone(),
-        })
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -1621,7 +1638,7 @@ impl<'r> Member<'r> {
     fn named_by(&self, clash: &Clash) -> bool {
         let atom = &clash.atom;
         let constraint = atom.constraint.as_ref();
-        (!clash.any || self.multi_arch_allowed)
+        atom.qualifier.admits(self.multi_arch_allowed)
             && ((self.name == atom.name && answers(self.version, constraint))
                 || self.provides.iter().any(|provided| {
                     provided.name == atom.name && answers(provided.version.as_deref(), constraint)
@@ -2118,6 +2135,82 @@ mod tests {
         );
         let selected = install(&index(&format!("{zz}{text}")), &["aa"]).into_packages();
         assert_eq!(names(&selected), ["aa", "p2"]);
+    }
+
+    #[test]
+    fn a_dependency_s_qualifier_is_answered_as_apt_answers_it() {
+        // Each as `apt-get --simulate install` answered it for amd64 alone.
+        let text = format!(
+            "{}{}{}{}{}{}{}{}",
+            stanza("plain", "", ""),
+            stanza("allowed", "", "Multi-Arch: allowed"),
+            stanza("foreign", "", "Multi-Arch: foreign"),
+            stanza("pn", "", "Provides: vn"),
+            stanza("pa", "", "Provides: va\nMulti-Arch: allowed"),
+            stanza("pf", "", "Provides: vf\nMulti-Arch: foreign"),
+            stanza("yy", "", ""),
+            stanza("aa", "plain:any | yy", ""),
+        );
+        let index = index(&text);
+        let resolves = |dependency: &str| {
+            let wanting = super::super::index::fixture::stanza(
+                "wanting",
+                "1.0",
+                &fixture::digest_of("wanting"),
+                &format!("Depends: {dependency}"),
+            );
+            let index = Index::parse(&format!("{text}{wanting}"), "amd64");
+            let (packages, refusals) = install(&index, &["wanting"]);
+            refusals.is_empty().then(|| names(&packages))
+        };
+        // `:any` is answered by a package `Multi-Arch: allowed`, by its own
+        // name or by one it provides, and by no other.
+        assert_eq!(
+            resolves("allowed:any"),
+            Some(vec!["allowed".into(), "wanting".into()])
+        );
+        assert_eq!(
+            resolves("va:any"),
+            Some(vec!["pa".into(), "wanting".into()])
+        );
+        for refused in ["plain:any", "foreign:any", "vn:any", "vf:any"] {
+            assert_eq!(resolves(refused), None, "{refused}");
+        }
+        // The native architecture's name and `:native` are no qualifier; any
+        // other architecture names nothing.
+        assert_eq!(
+            resolves("plain:amd64"),
+            Some(vec!["plain".into(), "wanting".into()])
+        );
+        assert_eq!(
+            resolves("plain:native"),
+            Some(vec!["plain".into(), "wanting".into()])
+        );
+        assert_eq!(
+            resolves("vn:amd64"),
+            Some(vec!["pn".into(), "wanting".into()])
+        );
+        assert_eq!(resolves("plain:i386"), None);
+        // An alternative the qualifier rules out passes to the next.
+        let selected = install(&index, &["aa"]).into_packages();
+        assert_eq!(names(&selected), ["aa", "yy"]);
+        // A base package answers as one in the index does.
+        let mut base = InstalledSet::default();
+        base.install("plain", Some("1.0"), Vec::new());
+        base.install("allowed", Some("1.0"), Vec::new());
+        base.clash("allowed", Vec::new(), true);
+        let wanting = |dependency: &str| Index::parse(&stanza("wanting", dependency, ""), "amd64");
+        resolve_seeded(
+            &wanting("allowed:any"),
+            &[],
+            &["wanting".into()],
+            &[],
+            &base,
+        )
+        .expecting("the base's allowed answers allowed:any");
+        let refusal = resolve_seeded(&wanting("plain:any"), &[], &["wanting".into()], &[], &base)
+            .into_refusal();
+        assert_eq!(refusal.requirement(), "plain:any");
     }
 
     #[test]
@@ -2620,7 +2713,7 @@ mod tests {
             set.install(
                 name,
                 Some(version),
-                super::super::index::parse_relations(depends),
+                super::super::index::parse_relations(depends, "amd64"),
             );
         }
         set

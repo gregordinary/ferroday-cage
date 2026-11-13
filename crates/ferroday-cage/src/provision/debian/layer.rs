@@ -207,7 +207,7 @@ impl InstalledSet {
 /// its dependencies and what it cannot be installed beside, and the virtual
 /// packages those packages provide, each with the version it supplies and the
 /// package supplying it. The base's `architecture` is what an architecture
-/// qualifier on a `Conflicts` or `Breaks` entry is read against.
+/// qualifier on a relation is read against.
 ///
 /// The set seeds a delta resolution, so the increment [`Debian::stage_layer`]
 /// resolves closes only over packages the base does not carry, except where it
@@ -292,7 +292,7 @@ pub(super) fn read_installed_set(
             let relations = [pre_depends, depends]
                 .into_iter()
                 .flatten()
-                .flat_map(|value| parse_relations(&value))
+                .flat_map(|value| parse_relations(&value, architecture))
                 .collect();
             installed.install(&name, version, relations);
             installed.clash(
@@ -420,8 +420,8 @@ mod tests {
     fn a_configured_package_records_its_pre_depends_then_its_depends() {
         // What a package the base keeps needs of the merged root, read with the
         // index's own relation grammar: alternatives, constraints, and an
-        // architecture qualifier parsed away. A package short of configured
-        // records nothing.
+        // architecture qualifier read apart from the name. A package short of
+        // configured records nothing.
         let dir = Scratch::for_test("layer", "relations");
         base_with_status(
             &dir,
@@ -464,7 +464,11 @@ mod tests {
         let clashes: Vec<String> = postfix.clashes.iter().map(ToString::to_string).collect();
         assert_eq!(
             clashes,
-            ["Conflicts: mail-transport-agent", "Breaks: libfoo1 (<< 2)"],
+            [
+                "Conflicts: mail-transport-agent",
+                "Conflicts: exim4:arm64",
+                "Breaks: libfoo1 (<< 2)",
+            ],
         );
         assert!(postfix.multi_arch_allowed);
         assert_eq!(postfix.provides[0].name, "mail-transport-agent");

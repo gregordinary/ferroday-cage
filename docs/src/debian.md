@@ -153,6 +153,13 @@ point them all at a single cache.
 The install set is the base system, plus the packages `include` names, closed
 over their dependencies, minus the packages `exclude` removes.
 
+An architecture qualifier on a dependency, or on a `Conflicts` or `Breaks` entry,
+is read as apt reads it for one architecture. The bootstrap's own architecture
+and `:native` name what an unqualified entry names. `:any`, as in `perl:any`,
+names only a package that is `Multi-Arch: allowed`, by its own name or by a name
+it provides. Any other architecture names nothing the install set holds, so a
+dependency on `libc6:i386` is one nothing satisfies.
+
 A dependency on a virtual name several packages provide takes the provider apt
 would. One already selected answers it. Otherwise apt's ranking decides: an
 essential provider first, then one marked `Important` or `Protected`, then the
@@ -251,11 +258,8 @@ dependency on the same name would: by name at a version its constraint accepts,
 or by a `Provides`, so an unversioned `Conflicts: mail-transport-agent` names
 every provider of it. A package never conflicts with itself, which is what the
 idiom `Conflicts`, `Provides` and `Replaces` of one virtual name relies on to
-keep out every other provider. An architecture qualifier is read as apt reads
-it for one architecture. The bootstrap's own architecture and `:native` name
-what an unqualified entry names, and `:any` names only a package that is
-`Multi-Arch: allowed`. Any other architecture names nothing the install set
-holds.
+keep out every other provider. An architecture qualifier is read as it is on a
+dependency, below.
 
 A choice is where a conflict is avoided, so what is selected when a group is met
 decides it, and the resolution meets groups in the order apt does. It selects

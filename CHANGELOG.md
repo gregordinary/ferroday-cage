@@ -455,6 +455,13 @@ consumer upgrading can skip it.
 - The network stack resets a connection past a published port's budget of 128
   on the host side, as it resets one the guest refuses. It closed the
   connection, so the peer read an empty reply where it had been refused.
+- **Breaking.** A Debian dependency's architecture qualifier is read as apt 2.8
+  reads it, as a `Conflicts` or `Breaks` entry's already was: `:any` is
+  answered only by a package `Multi-Arch: allowed`, by its own name or a name it
+  provides, and an architecture other than the bootstrap's by nothing. The
+  qualifier was dropped, so `perl:any` was answered by any `perl`, and
+  `libc6:i386` by an amd64 `libc6`. A refusal names the qualifier the
+  dependency states.
 - **Breaking.** A Debian dependency on a virtual name several packages provide,
   where none is selected yet, takes the provider apt 2.8 takes: an essential
   one, then one `Important` or `Protected`, then the more essential `Priority`,
