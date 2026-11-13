@@ -48,8 +48,9 @@ use rustix::fs::{OFlags, ResolveFlags};
 use rustix::io::Errno;
 
 use super::atom::{self, Atom, Candidate, Dependency};
+use super::index::{self, MAX_FLAGS_BYTES, MAX_SLOT_BYTES};
 use super::version;
-use super::{COUNTER_FILE, DB_DIR, GentooError, MAX_METADATA_BYTES};
+use super::{COUNTER_FILE, DB_DIR, GentooError};
 use crate::provision::containment;
 use crate::provision::rooted::Rooted;
 
@@ -90,6 +91,28 @@ const RUNTIME_DEPENDENCY_FILES: [&str; 2] = ["RDEPEND", "PDEPEND"];
 /// portage's own and says exactly what the directory is, and a root that has
 /// one is a root a merge was interrupted in rather than a malformed one.
 const MERGING_PREFIX: &str = "-MERGING-";
+
+/// The most reading one root's package database may cost, in bytes.
+///
+/// Nothing signs a root's database: it is what anything run in the root left
+/// there, a sandbox rooted on the overlay an increment is later staged into
+/// among them. So what reading it costs is bounded as what an index nothing
+/// signs costs is. Each entry is charged as it is listed and read: every file
+/// read at its length, the entry at what holding one costs, and every blocker
+/// it keeps at what a parsed atom costs, which is several times the four bytes
+/// `!a/b` takes to write one. Each file is read only to what is left, so the
+/// read that would pass the bound is the one refused.
+///
+/// The files are held to the lengths an index record's are as well, which
+/// bounds one entry: [`index::read_class`] its dependency classes,
+/// [`MAX_SLOT_BYTES`] its slot and [`MAX_FLAGS_BYTES`] its flag lists. This
+/// bounds how many of them there are.
+///
+/// An `amd64-openrc` stage3's 306 entries cost 264,329 bytes. This is over
+/// two hundred and fifty times that, and ten times what a root holding every
+/// one of the 7,440 package slots the binhost publishes would cost at the
+/// stage3's average.
+const MAX_DATABASE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One package a root already has.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,17 +405,65 @@ pub fn installed(root: impl AsRef<Path>) -> Result<Installed, GentooError> {
 ///
 /// `at` names the root in a failure; nothing resolves through it.
 fn read_database(rooted: &Rooted, at: &Path) -> Result<Vec<InstalledPackage>, GentooError> {
-    entries(rooted, at)?
+    let mut budget = Budget::new();
+    entries(rooted, at, &mut budget)?
         .iter()
-        .map(|(category, pf)| read_entry(&Layers::Plain(rooted), at, category, pf))
+        .map(|(category, pf)| read_entry(&Layers::Plain(rooted), at, category, pf, &mut budget))
         .collect()
+}
+
+/// What reading one root's package database may still cost, charged as it
+/// is read; see [`MAX_DATABASE_BYTES`].
+struct Budget {
+    /// The bytes left.
+    left: u64,
+}
+
+impl Budget {
+    /// A whole budget, for one read of a database, both layers of an overlay
+    /// included.
+    fn new() -> Budget {
+        Budget {
+            left: MAX_DATABASE_BYTES,
+        }
+    }
+
+    /// Charges `cost` bytes, or refuses the database read from `at` where
+    /// they are more than is left.
+    fn charge(&mut self, cost: usize, at: &Path) -> Result<(), GentooError> {
+        match self.left.checked_sub(cost as u64) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(Budget::spent(at)),
+        }
+    }
+
+    /// The refusal of a database whose read costs more than
+    /// [`MAX_DATABASE_BYTES`], read from `at`.
+    fn spent(at: &Path) -> GentooError {
+        GentooError::database(
+            at,
+            format!(
+                "reading its package database costs more than the {MAX_DATABASE_BYTES} bytes \
+                 this layer reads of one, far past what a root holding every package the \
+                 binhost publishes costs"
+            ),
+        )
+    }
 }
 
 /// Every entry directory the database holds, as its category and its `PF`, in
 /// a stable order.
 ///
-/// An interrupted merge's entry is skipped: see [`MERGING_PREFIX`].
-fn entries(rooted: &Rooted, at: &Path) -> Result<Vec<(String, String)>, GentooError> {
+/// An interrupted merge's entry is skipped: see [`MERGING_PREFIX`]. Each one
+/// listed is charged to `budget` at what holding its two names costs.
+fn entries(
+    rooted: &Rooted,
+    at: &Path,
+    budget: &mut Budget,
+) -> Result<Vec<(String, String)>, GentooError> {
     let mut found = Vec::new();
     let categories = rooted
         .directories(DB_DIR)
@@ -420,6 +491,10 @@ fn entries(rooted: &Rooted, at: &Path) -> Result<Vec<(String, String)>, GentooEr
             if pf.starts_with(MERGING_PREFIX) {
                 continue;
             }
+            budget.charge(
+                size_of::<(String, String)>() + category.len() + pf.len(),
+                at,
+            )?;
             found.push((category.clone(), pf));
         }
     }
@@ -448,18 +523,19 @@ enum Layers<'a> {
 }
 
 impl Layers<'_> {
-    /// The file at `path`, or `None` where the entry holds none.
+    /// The file at `path`, or `None` where the entry holds none, refused as
+    /// [`Rooted::read`] refuses one where it holds more than `limit` bytes.
     ///
     /// A whiteout in the upper is the file removed, so the base's copy beneath
     /// it is not read; [`Rooted::is_whiteout`] tells one from a file.
-    fn read(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
+    fn read(&self, path: &str, limit: u64) -> io::Result<Option<Vec<u8>>> {
         match *self {
-            Layers::Plain(tree) => tree.read_if_present(path, MAX_METADATA_BYTES),
+            Layers::Plain(tree) => tree.read_if_present(path, limit),
             Layers::Over { upper, lower } => match upper.stat(path)? {
                 Some(stat) if Rooted::is_whiteout(&stat) => Ok(None),
-                Some(_) => upper.read_if_present(path, MAX_METADATA_BYTES),
+                Some(_) => upper.read_if_present(path, limit),
                 None => match lower {
-                    Some(lower) => lower.read_if_present(path, MAX_METADATA_BYTES),
+                    Some(lower) => lower.read_if_present(path, limit),
                     None => Ok(None),
                 },
             },
@@ -468,12 +544,14 @@ impl Layers<'_> {
 }
 
 /// Reads one entry: its name and version from the two directory names, its slot
-/// and flags from the files inside, each read through `layers`.
+/// and flags from the files inside, each read through `layers` and charged to
+/// `budget`.
 fn read_entry(
     layers: &Layers<'_>,
     at: &Path,
     category: &str,
     pf: &str,
+    budget: &mut Budget,
 ) -> Result<InstalledPackage, GentooError> {
     let dir = format!("{DB_DIR}/{category}/{pf}");
     // The entry's own two directory names spell a `CPV`, and splitting that is
@@ -497,14 +575,19 @@ fn read_entry(
             format!("{dir:?} names a package the package manager specification does not permit"),
         ));
     }
-    // Each file of an entry is one of a binary package's metadata files, which
-    // a container holds to `MAX_METADATA_BYTES` together; one past that alone
-    // is not one portage wrote.
+    budget.charge(size_of::<InstalledPackage>(), at)?;
+    // Each file is read only to what the budget has left, so a file past that
+    // is refused unread rather than held and then refused.
     let field = |file: &str| -> Result<Option<String>, GentooError> {
-        layers
-            .read(&format!("{dir}/{file}"))
-            .map(|bytes| bytes.as_deref().map(field_text))
-            .map_err(|err| GentooError::io("reading a package database entry", at, err))
+        match layers.read(&format!("{dir}/{file}"), budget.left) {
+            Ok(bytes) => {
+                let bytes = bytes.as_deref();
+                budget.charge(bytes.map_or(0, <[u8]>::len), at)?;
+                Ok(bytes.map(field_text))
+            }
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => Err(Budget::spent(at)),
+            Err(err) => Err(GentooError::io("reading a package database entry", at, err)),
+        }
     };
     // What an installed package requires is the state the root arrived in,
     // and not this layer's to hold it to.
@@ -518,9 +601,18 @@ fn read_entry(
                 Unreadable::Dependencies { file, reason } => {
                     format!("{dir:?} states a {file} that cannot be read: {reason}")
                 }
+                Unreadable::Overlong {
+                    file,
+                    length,
+                    bound,
+                } => format!(
+                    "{dir:?} states a {file} of {length} bytes, past the {bound} a package \
+                     states one in"
+                ),
             },
         )
     })?;
+    budget.charge(package.blockers.len() * size_of::<Atom>(), at)?;
     Ok(package)
 }
 
@@ -565,6 +657,14 @@ impl InstalledPackage {
                 Unreadable::Dependencies { file, reason } => {
                     format!("states a {file} in its metadata that cannot be read: {reason}")
                 }
+                Unreadable::Overlong {
+                    file,
+                    length,
+                    bound,
+                } => format!(
+                    "states a {file} in its metadata of {length} bytes, past the {bound} a \
+                     package states one in"
+                ),
             },
         )
     }
@@ -584,12 +684,22 @@ pub(super) fn field_text(bytes: &[u8]) -> String {
 enum Unreadable {
     /// No `SLOT`: what tells an entry from something merely shaped like one.
     NoSlot,
-    /// A runtime dependency class that does not parse.
+    /// A runtime dependency class that does not parse, or is longer than
+    /// [`index::read_class`] reads one.
     Dependencies {
         /// Which of [`RUNTIME_DEPENDENCY_FILES`].
         file: &'static str,
-        /// Why the grammar refused it.
+        /// Why it was refused.
         reason: String,
+    },
+    /// A slot or a flag list longer than an index record may state one.
+    Overlong {
+        /// The file that states it.
+        file: &'static str,
+        /// How long it is, in bytes.
+        length: usize,
+        /// The most it may be.
+        bound: usize,
     },
 }
 
@@ -601,18 +711,36 @@ enum Unreadable {
 /// The one reading of a package's files, whether they sit in a root's database
 /// or in a binary package not yet merged: the merge writes the second out as the
 /// first, so two readings would be two answers to what one set of files says.
+///
+/// Each file is held to the length an index record states its field in: the
+/// slot to [`MAX_SLOT_BYTES`], the flag lists to [`MAX_FLAGS_BYTES`], and the
+/// dependency classes through [`index::read_class`]. A container's metadata
+/// states what the index did, and the merge writes it out as the entry, so a
+/// longer one is neither a build the index offered nor an entry portage wrote.
 fn read_package<E>(
     name: String,
     version: &str,
-    field: impl Fn(&str) -> Result<Option<String>, E>,
+    mut field: impl FnMut(&str) -> Result<Option<String>, E>,
     refuse: impl Fn(Unreadable) -> E,
 ) -> Result<(InstalledPackage, Vec<Dependency>), E> {
+    let overlong = |file, text: &str, bound| {
+        (text.len() > bound).then(|| {
+            refuse(Unreadable::Overlong {
+                file,
+                length: text.len(),
+                bound,
+            })
+        })
+    };
     // A missing `SLOT` is what tells an entry directory from something else
     // that happens to be shaped like one: portage writes the file for every
     // package it merges, and so does this layer.
     let Some(slot) = field(SLOT_FILE)? else {
         return Err(refuse(Unreadable::NoSlot));
     };
+    if let Some(refused) = overlong(SLOT_FILE, &slot, MAX_SLOT_BYTES) {
+        return Err(refused);
+    }
     // A package with no runtime dependencies may carry neither file, so their
     // absence is no blockers. One that does not parse is a gap in what the
     // root forbids, and resolving past it could install what it blocks.
@@ -620,7 +748,7 @@ fn read_package<E>(
     let mut requires = Vec::new();
     for file in RUNTIME_DEPENDENCY_FILES {
         let class = field(file)?.unwrap_or_default();
-        let parsed = atom::parse_class(&class)
+        let parsed = index::read_class(&class)
             .map_err(|reason| refuse(Unreadable::Dependencies { file, reason }))?;
         for dependency in parsed {
             match dependency {
@@ -629,18 +757,25 @@ fn read_package<E>(
             }
         }
     }
+    // A package built with no flags writes an empty `USE`, and portage does
+    // not always write the file at all, so its absence is no flags rather than
+    // a malformed entry.
+    let use_flags = field(USE_FILE)?.unwrap_or_default();
+    let (iuse_file, iuse) = match field(IUSE_EFFECTIVE_FILE)? {
+        Some(effective) => (IUSE_EFFECTIVE_FILE, effective),
+        None => (IUSE_FILE, field(IUSE_FILE)?.unwrap_or_default()),
+    };
+    for (file, flags) in [(USE_FILE, &use_flags), (iuse_file, &iuse)] {
+        if let Some(refused) = overlong(file, flags, MAX_FLAGS_BYTES) {
+            return Err(refused);
+        }
+    }
     let package = InstalledPackage {
         name,
         version: version.to_string(),
         slot,
-        // A package built with no flags writes an empty `USE`, and portage does
-        // not always write the file at all, so its absence is no flags rather
-        // than a malformed entry.
-        use_flags: field(USE_FILE)?.unwrap_or_default(),
-        iuse: match field(IUSE_EFFECTIVE_FILE)? {
-            Some(effective) => effective,
-            None => field(IUSE_FILE)?.unwrap_or_default(),
-        },
+        use_flags,
+        iuse,
         blockers,
         counter: field(COUNTER_FILE)?.and_then(|text| text.parse().ok()),
         chost: field(CHOST_FILE)?.filter(|chost| !chost.is_empty()),
@@ -683,21 +818,28 @@ pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooErro
             .map(|hidden| !hidden)
             .map_err(|err| GentooError::io("reading the overlay upper", upper, err))
     };
-    let held: BTreeSet<(String, String)> = entries(&top, upper)?.into_iter().collect();
+    let mut budget = Budget::new();
+    let held: BTreeSet<(String, String)> = entries(&top, upper, &mut budget)?.into_iter().collect();
 
     let mut packages = Vec::new();
-    for (category, pf) in entries(&base, lower)? {
+    for (category, pf) in entries(&base, lower, &mut budget)? {
         if held.contains(&(category.clone(), pf.clone())) || !shows(&category, &pf)? {
             continue;
         }
-        packages.push(read_entry(&Layers::Plain(&base), lower, &category, &pf)?);
+        packages.push(read_entry(
+            &Layers::Plain(&base),
+            lower,
+            &category,
+            &pf,
+            &mut budget,
+        )?);
     }
     for (category, pf) in &held {
         let layers = Layers::Over {
             upper: &top,
             lower: shows(category, pf)?.then_some(&base),
         };
-        let above = read_entry(&layers, upper, category, pf)?;
+        let above = read_entry(&layers, upper, category, pf, &mut budget)?;
         packages.retain(|below| {
             !(below.name == above.name && slot_of(&below.slot) == slot_of(&above.slot))
         });
@@ -935,6 +1077,72 @@ mod tests {
         let err = installed(&*dir).expect_err("an entry with no SLOT is refused");
         assert!(matches!(err, GentooError::Database { .. }), "{err:?}");
         assert!(err.to_string().contains("SLOT"), "{err}");
+    }
+
+    #[test]
+    fn an_entry_stating_a_field_longer_than_an_index_record_may_is_refused() {
+        // Each file is held to the length an index record states its field in,
+        // so one entry cannot make the read parse or hold more than a record
+        // could.
+        let class = "!a/b ".repeat(index::MAX_CLASS_BYTES / 5 + 1);
+        let flags = "f ".repeat(MAX_FLAGS_BYTES / 2 + 1);
+        let slot = "s".repeat(MAX_SLOT_BYTES + 1);
+        for (file, text, refusal) in [
+            ("RDEPEND", class.as_str(), "past the 65536"),
+            ("PDEPEND", class.as_str(), "past the 65536"),
+            ("USE", flags.as_str(), "past the 16384"),
+            (IUSE_EFFECTIVE_FILE, flags.as_str(), "past the 16384"),
+            (SLOT_FILE, slot.as_str(), "past the 256"),
+        ] {
+            let dir = Scratch::for_test("gentoo-installed", "overlong");
+            entry(&dir, "sys-apps", "openrc-0.62", Some("0"), "amd64");
+            std::fs::write(
+                dir.join(DB_DIR).join("sys-apps/openrc-0.62").join(file),
+                text,
+            )
+            .expect("the file is written");
+            let err = installed(&*dir).expect_err("the entry is refused");
+            assert!(
+                matches!(err, GentooError::Database { .. }),
+                "{file}: {err:?}"
+            );
+            assert!(err.to_string().contains(refusal), "{file}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_database_costing_more_than_the_bound_is_refused_before_it_is_held() {
+        // Every entry within the bounds of one, and together stating more
+        // blockers than a read of the database holds: each blocker is charged
+        // what a parsed atom costs rather than the five bytes that state it.
+        let class = "!a/b ".repeat(index::MAX_CLASS_BYTES / 5);
+        let per_entry = 2 * (class.len() / 5) * size_of::<Atom>();
+        let entries = MAX_DATABASE_BYTES as usize / per_entry + 1;
+        let dir = Scratch::for_test("gentoo-installed", "costly");
+        let add = |at: usize| {
+            let pf = format!("pkg{at}-1");
+            entry(&dir, "app-misc", &pf, Some("0"), "amd64");
+            let path = dir.join(DB_DIR).join("app-misc").join(&pf);
+            for file in RUNTIME_DEPENDENCY_FILES {
+                std::fs::write(path.join(file), &class).expect("the class is written");
+            }
+        };
+
+        // One entry fewer than that is read whole.
+        for at in 1..entries {
+            add(at);
+        }
+        let read = installed(&*dir).expect("the database is within the bound");
+        assert_eq!(read.len(), entries - 1);
+
+        add(0);
+        let err = installed(&*dir).expect_err("the database is refused");
+        assert!(matches!(err, GentooError::Database { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains(&format!("costs more than the {MAX_DATABASE_BYTES} bytes")),
+            "{err}",
+        );
     }
 
     #[test]

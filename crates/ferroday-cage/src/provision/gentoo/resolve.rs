@@ -226,7 +226,9 @@ pub(super) struct Refusals {
 /// Each bounds what an index nothing signs can make a run spend before any
 /// signature is consulted, and each is set well past what resolving against
 /// the whole archive spends. A resolution reaching one is resolving against an
-/// index this layer does not resolve against, so it stops and refuses.
+/// index this layer does not resolve against, so it stops and refuses. The
+/// comparison bounds hold a replayed plan's admission too, where what decides
+/// their number is the root, whose database nothing signs either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Bound {
     /// The closure grew past [`MAX_CLOSURE`] builds.
@@ -280,14 +282,14 @@ impl Refusals {
             )),
             Some(Bound::Comparisons) => parts.push(format!(
                 "the resolution held atoms against more than {MAX_COMPARISONS} candidate builds, \
-                 far more than resolving the whole archive takes, so the index is not one this \
-                 layer resolves against",
+                 far more than resolving the whole archive takes, so the index or the root is \
+                 not one this layer resolves against",
             )),
             Some(Bound::ComparedBytes) => parts.push(format!(
                 "holding atoms against candidate builds would read more than \
                  {MAX_COMPARED_BYTES} bytes of their versions, slots and USE flags, far more \
-                 than resolving the whole archive reads, so the index is not one this layer \
-                 resolves against",
+                 than resolving the whole archive reads, so the index or the root is not one \
+                 this layer resolves against",
             )),
             Some(Bound::Refusals) => parts.push(format!(
                 "the resolution stopped after {MAX_REFUSALS} refusals, more than asking for every \
@@ -571,13 +573,6 @@ impl Comparisons {
     /// [`MAX_COMPARED_BYTES`] between them to make.
     fn bounded() -> Comparisons {
         Comparisons::up_to(MAX_COMPARISONS, MAX_COMPARED_BYTES)
-    }
-
-    /// None made, and as many to make as there are.
-    ///
-    /// For holding a caller's own plan to a root, which no mirror composed.
-    fn unbounded() -> Comparisons {
-        Comparisons::up_to(usize::MAX, usize::MAX)
     }
 
     /// None made, and at most `most` comparisons reading at most `most_read`
@@ -1260,13 +1255,19 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
     let mut refusals = Refusals::default();
     let mut admitted = Builds::default();
     let mut blockers = Vec::new();
-    // Nothing here is a mirror's to compose: the plan is the caller's own
-    // document and the blockers are the signed metadata's, so what admitting
-    // them costs is not bounded.
-    let mut compared = Comparisons::unbounded();
+    // The plan is the caller's own document and the builds' metadata is
+    // signed, but the root they are held to is neither: its database is what
+    // anything run in it left there, and how many packages it holds under one
+    // name, and how many blockers they state, is its to decide. So admitting a
+    // plan is bounded as a resolution is, and stops where the bound is reached.
+    let mut compared = Comparisons::bounded();
     let plan: Rc<str> = Rc::from("the plan");
     for build in arriving {
-        if let Some((held, in_root)) = occupant(&build, &admitted, installed, &mut compared) {
+        let occupied = occupant(&build, &admitted, installed, &mut compared);
+        if compared.spent() {
+            break;
+        }
+        if let Some((held, in_root)) = occupied {
             if refusals.has_room() {
                 refusals.occupied.push(Occupied {
                     name: build.name().to_string(),
@@ -1292,14 +1293,21 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
         );
         admitted.push(build);
     }
-    conflicts(
-        &blockers,
-        installed,
-        &admitted,
-        &mut compared,
-        &mut refusals,
-    );
-    requirements(installed, &admitted, &mut compared, &mut refusals);
+    if !compared.spent() {
+        conflicts(
+            &blockers,
+            installed,
+            &admitted,
+            &mut compared,
+            &mut refusals,
+        );
+    }
+    if !compared.spent() {
+        requirements(installed, &admitted, &mut compared, &mut refusals);
+    }
+    if refusals.exceeded.is_none() {
+        refusals.exceeded = compared.exceeded();
+    }
     refusals
 }
 
@@ -1311,13 +1319,17 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
 /// the cycles the archive's runtime graph has. An any-of group is answered by
 /// any one of its alternatives, every atom of it that names something to
 /// install answered, as [`Resolution::any_of`] reads one.
+///
+/// Each candidate an atom is held against is charged to `compared`, and where
+/// that reaches a bound the check stops there, recording nothing for the
+/// dependency it was part way through.
 fn requirements(
     installed: &Installed,
     admitted: &Builds<Arriving>,
     compared: &mut Comparisons,
     refusals: &mut Refusals,
 ) {
-    let mut answered = |atom: &Atom| {
+    let answered = |atom: &Atom, compared: &mut Comparisons| {
         installed
             .under(atom.name())
             .any(|package| compared.charge(atom.reads(package)) && atom.matches(package))
@@ -1331,17 +1343,20 @@ fn requirements(
             let (met, atom) = match dependency {
                 // A blocker binds through `conflicts`, and answers nothing.
                 Dependency::One(atom) if atom.blocker().is_some() => continue,
-                Dependency::One(atom) => (answered(atom), atom.to_string()),
+                Dependency::One(atom) => (answered(atom, compared), atom.to_string()),
                 Dependency::AnyOf(alternatives) => (
                     alternatives.iter().any(|together| {
                         together
                             .iter()
                             .filter(|atom| atom.blocker().is_none())
-                            .all(&mut answered)
+                            .all(|atom| answered(atom, compared))
                     }),
                     written(alternatives),
                 ),
             };
+            if compared.spent() {
+                return;
+            }
             if met {
                 continue;
             }
@@ -2987,6 +3002,48 @@ USE: amd64 compat
         let refusals = admit(&root, without);
         assert_eq!(refusals.unsatisfied.len(), 1, "{}", refusals.describe());
         assert_eq!(refusals.unsatisfied[0].atom, "a/x or a/y");
+    }
+
+    #[test]
+    fn a_replayed_plan_held_to_a_root_past_the_comparisons_is_refused_where_it_stands() {
+        // The root's database decides how many packages it holds under one
+        // name: here four thousand slots of one, none of them the slot a
+        // plan's build asks for over a thousand times. Each atom costs every
+        // slot, past the bound a resolution is held to.
+        const SLOTS: usize = 4_096;
+        const ATOMS: usize = MAX_COMPARISONS / SLOTS + 64;
+        let root = Installed::of(
+            (0..SLOTS)
+                .map(|slot| {
+                    (
+                        "a/b".to_string(),
+                        "1".to_string(),
+                        format!("s{slot}"),
+                        String::new(),
+                    )
+                })
+                .collect(),
+        );
+        let rdepend = vec!["a/b:none"; ATOMS].join(" ");
+        let plan = vec![arriving(
+            "x/y-1",
+            1,
+            &[("SLOT", "0\n"), ("RDEPEND", rdepend.as_str())],
+        )];
+        let refusals = admit(&root, plan);
+        assert_eq!(refusals.exceeded, Some(Bound::Comparisons));
+        // The dependency the bound was reached in is neither answered nor
+        // refused, so what is recorded is what was settled before it.
+        assert!(
+            refusals.unsatisfied.len() < ATOMS,
+            "{}",
+            refusals.unsatisfied.len()
+        );
+        assert!(
+            refusals.describe().contains("the index or the root"),
+            "{}",
+            refusals.describe(),
+        );
     }
 
     #[test]

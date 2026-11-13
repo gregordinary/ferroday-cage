@@ -664,6 +664,16 @@ consumer upgrading can skip it.
   failed its digest check, which ends the walk: a live mirror with a snapshot
   backstop failed the bootstrap with `DebianError::Digest` after a transient
   failure of the live release.
+- A Gentoo root's package database is read within the bounds the binhost index
+  is read within. An entry's dependency classes, slot and flag lists are held
+  to the lengths an index record may state them in, and the whole read to 64
+  MiB, counting each blocker an entry keeps at what a parsed atom costs. A
+  database past either is refused with `GentooError::Database`. A file of an
+  entry was read to 16 MiB and parsed whole, so ten entries of blockers, which
+  a sandbox rooted on an overlay can write into the upper, made the next
+  `stage_layer` into it hold gigabytes. Holding a replayed plan to the root it
+  lands in is bounded as a resolution is, and refused where it reaches the
+  bound.
 
 ### Internal
 
