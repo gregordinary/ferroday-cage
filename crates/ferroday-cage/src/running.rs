@@ -1264,9 +1264,24 @@ impl<'obs> Pending<'obs> {
     /// A socket keeps its network namespace alive, so the listener keeps the
     /// sandbox's namespace in being until the caller closes it, whatever has
     /// become of the sandbox. Once the sandbox has exited no connection can
-    /// arrive, and an `accept` waits forever: the caller closes the listener
-    /// once its wait returns, and a thread of its own that accepts is
-    /// released by a `shutdown` of the listener's socket.
+    /// arrive, and a blocking `accept` waits forever. The caller drops the
+    /// listener once its wait returns.
+    ///
+    /// A thread blocked in `accept` is not released by another thread dropping
+    /// the listener, and the caller cannot connect to it to wake it, since the
+    /// address is the sandbox's. Two shapes stop such a thread:
+    ///
+    /// - **Accepting only when a poll reports a connection.** The listener is
+    ///   made non-blocking, with
+    ///   [`set_nonblocking`](TcpListener::set_nonblocking), and polled beside a
+    ///   descriptor the caller makes readable to stop, such as a pipe, or this
+    ///   handle's own readiness descriptor, which [`Running`] implements
+    ///   [`AsFd`] for.
+    /// - **Shutting the socket down for reading.** `shutdown(2)` with
+    ///   `SHUT_RD` on the listener's descriptor makes a blocked `accept` fail
+    ///   with `EINVAL`. The standard library's `TcpListener` has no method for
+    ///   it; rustix spells it `rustix::net::shutdown(&listener,
+    ///   rustix::net::Shutdown::Read)`.
     ///
     /// # Landlock
     ///
