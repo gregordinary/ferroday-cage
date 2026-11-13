@@ -1838,8 +1838,11 @@ impl CageBuilder {
     /// A presented identity sets no-new-privileges, as a run-as identity does.
     /// A run-as identity may name the presented identity, which the command
     /// already holds, and no other. A range map refuses a presented identity
-    /// at build time, and so does a uid or gid of `u32::MAX`, which no
-    /// identity map can carry.
+    /// at build time. So does a uid of 0, with
+    /// [`ConfigError::PresentAsRoot`](crate::ConfigError::PresentAsRoot): the
+    /// command would be root inside, with every capability. That includes
+    /// [`PresentedIdentity::Own`] for a caller that is the host's root. A uid or
+    /// gid of `u32::MAX`, which no identity map can carry, is refused too.
     ///
     /// # Example
     ///
@@ -2929,6 +2932,18 @@ fn restricted_mount_refusal(mount: &Mount) -> Option<&'static str> {
 /// Resolves a presented identity and checks it, through [`present_plan`].
 fn validate_present_as(presented: PresentedIdentity) -> Result<PresentPlan, Error> {
     let (uid, gid) = presented.resolve();
+    present_plan(presented, uid, gid)
+}
+
+/// Checks the ids `presented` resolved to, and freezes them.
+///
+/// The ids become the inside ids of the command's nested map, and the kernel
+/// refuses the id `(u32)-1` in any map, so it is refused here, as the
+/// identity-map error it would otherwise surface as at launch. A uid of 0 is
+/// refused too, with [`ConfigError::PresentAsRoot`]: the nested map would then
+/// read `0 0 1`, and the command would be root inside with every capability
+/// across its `execve`.
+fn present_plan(presented: PresentedIdentity, uid: u32, gid: u32) -> Result<PresentPlan, Error> {
     for (id, space) in [(uid, "uid"), (gid, "gid")] {
         if id == u32::MAX {
             return Err(ConfigError::IdentityMapInvalid {
@@ -2936,6 +2951,12 @@ fn validate_present_as(presented: PresentedIdentity) -> Result<PresentPlan, Erro
             }
             .into());
         }
+    }
+    if uid == 0 {
+        return Err(ConfigError::PresentAsRoot {
+            identity: presented,
+        }
+        .into());
     }
     Ok(PresentPlan { uid, gid })
 }
@@ -6333,6 +6354,59 @@ mod tests {
                 matches!(err, Error::Config(ConfigError::IdentityMapInvalid { .. })),
                 "{err}"
             );
+        }
+    }
+
+    /// A presented uid of 0 would make the nested map `0 0 1`, and the command
+    /// root inside with every capability, so it is refused at build. A gid of 0
+    /// carries no capability, and is presented.
+    #[test]
+    fn a_presented_identity_of_uid_0_is_refused() {
+        for gid in [0, 100] {
+            let presented = PresentedIdentity::ids(0, gid);
+            let err = sh_in("/tmp").present_as(presented).build().unwrap_err();
+            let Error::Config(err @ ConfigError::PresentAsRoot { identity }) = &err else {
+                panic!("expected the refusal, got {err:?}");
+            };
+            assert_eq!(*identity, presented);
+            assert!(err.to_string().contains("has uid 0"), "{err}");
+        }
+        let cage = sh_in("/tmp")
+            .present_as(PresentedIdentity::ids(1000, 0))
+            .build()
+            .expect("a presented gid of 0 is accepted");
+        let presented = cage.plan.present_as.unwrap();
+        assert_eq!((presented.uid, presented.gid), (1000, 0));
+    }
+
+    /// `own` is the caller's own uid, which is 0 for the host's root, and is
+    /// refused there as a uid of 0 given outright is.
+    #[test]
+    fn own_resolving_to_uid_0_is_refused() {
+        let err = present_plan(PresentedIdentity::Own, 0, 0).unwrap_err();
+        let Error::Config(
+            err @ ConfigError::PresentAsRoot {
+                identity: PresentedIdentity::Own,
+            },
+        ) = &err
+        else {
+            panic!("expected the refusal, got {err:?}");
+        };
+        assert!(
+            err.to_string().contains("`own` is the caller's uid, 0"),
+            "{err}"
+        );
+        assert!(present_plan(PresentedIdentity::Own, 1000, 0).is_ok());
+
+        // And through the build, against whoever runs the test.
+        let built = sh_in("/tmp").present_as(PresentedIdentity::Own).build();
+        if rustix::process::geteuid().is_root() {
+            assert!(matches!(
+                built,
+                Err(Error::Config(ConfigError::PresentAsRoot { .. }))
+            ));
+        } else {
+            built.expect("a non-root caller presents as itself");
         }
     }
 

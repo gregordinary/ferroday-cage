@@ -581,6 +581,21 @@ rendered as text.
     /// ids of its own, and [`run_as`](crate::CageBuilder::run_as) switches the
     /// command to one of them.
     PresentAsWithRangeMap,
+    /// A presented identity's uid is 0.
+    ///
+    /// The command runs as the presented uid in a user namespace it is the
+    /// creator of, so uid 0 there is root inside the sandbox with every
+    /// capability across its `execve`, which is what a sandbox with no
+    /// presented identity already gives it. [`PresentedIdentity::Own`]
+    /// resolves to 0 for a caller that is the host's root. A presented gid of 0
+    /// carries no capability and is accepted.
+    ///
+    /// [`PresentedIdentity::Own`]: crate::PresentedIdentity::Own
+    #[non_exhaustive]
+    PresentAsRoot {
+        /// The presented identity as it was configured.
+        identity: crate::PresentedIdentity,
+    },
     /// A run-as identity names supplementary groups under the
     /// single-identity map's gid map: the caller's own gid alone.
     ///
@@ -945,6 +960,20 @@ impl fmt::Display for ConfigError {
                 "a presented identity applies only to the single-identity map; under a range \
                  map, run the command as one of the map's own ids instead",
             ),
+            ConfigError::PresentAsRoot { identity } => {
+                match identity {
+                    crate::PresentedIdentity::Own => {
+                        f.write_str("the presented identity `own` is the caller's uid, 0")?
+                    }
+                    crate::PresentedIdentity::Ids { .. } => {
+                        write!(f, "the presented identity {identity} has uid 0")?
+                    }
+                }
+                f.write_str(
+                    ", which is root inside the sandbox with every capability; present a \
+                     non-root uid, or none for a root command",
+                )
+            }
             ConfigError::RunAsGroupsWithSingleMap => f.write_str(
                 "run-as supplementary groups require a gid map wider than the caller's own gid; \
                  a gid map of that gid alone, the single-identity map's, denies setgroups",

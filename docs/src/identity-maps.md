@@ -340,9 +340,11 @@ write of it, because the one-id exception constrains only the outside id.
 
 The command runs as that identity from its first instruction, with no switch. `id`
 reports it, and files the caller owns read as its own. Nothing maps uid 0, so
-the command cannot become root inside. It holds no capability across its
-`execve` beyond a kept set, which the ambient set carries. A presented identity
-sets no-new-privileges, as a run-as identity does.
+the command cannot become root inside. `build` refuses a presented uid of 0 with
+`ConfigError::PresentAsRoot`, and that includes `own` for a caller that is the
+host's root. The command holds no capability across its `execve` beyond a kept
+set, which the ambient set carries. A presented identity sets
+no-new-privileges, as a run-as identity does.
 
 This is a presentation, not a boundary. On the host the command is still the
 caller. It owns every file the caller owns, a root filesystem the caller

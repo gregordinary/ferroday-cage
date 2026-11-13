@@ -243,9 +243,11 @@ impl Identity {
 /// It is a presentation, not a boundary. On the host the command is still the
 /// caller, so it owns every file the caller owns, a rootfs the caller
 /// provisioned among them. Nothing maps uid 0, so the command cannot become
-/// root inside. Separating the command from the rootfs by ownership needs a
-/// second id, which a range map provides, and
-/// [`run_as`](crate::CageBuilder::run_as) switches the command to it.
+/// root inside: a presented uid of 0 is refused when the sandbox is built, and
+/// so is [`Own`](Self::Own) for a caller that is the host's root. Separating
+/// the command from the rootfs by ownership needs a second id, which a range
+/// map provides, and [`run_as`](crate::CageBuilder::run_as) switches the
+/// command to it.
 ///
 /// It renders and parses as `own` or `UID:GID`, the form a profile's
 /// `present-as` key and the command line take.
@@ -270,6 +272,8 @@ pub enum PresentedIdentity {
     ///
     /// The command then sees the ids the host knows the caller by, so a
     /// layout that binds the host's `/etc` finds the caller's account there.
+    /// A caller that is the host's root has uid 0 to present, which the build
+    /// refuses.
     Own,
     /// The given uid and gid.
     ///

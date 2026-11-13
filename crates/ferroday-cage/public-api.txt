@@ -1614,6 +1614,8 @@ pub ferroday_cage::ConfigError::OverlayPathInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::OverlayUnavailable
 pub ferroday_cage::ConfigError::OverlayUnavailable::blocker: ferroday_cage::host::OverlayBlocker
 pub ferroday_cage::ConfigError::OverlayUpperMissing
+#[non_exhaustive] pub ferroday_cage::ConfigError::PresentAsRoot
+pub ferroday_cage::ConfigError::PresentAsRoot::identity: ferroday_cage::PresentedIdentity
 pub ferroday_cage::ConfigError::PresentAsWithRangeMap
 #[non_exhaustive] pub ferroday_cage::ConfigError::ProfileOperationForbidden
 pub ferroday_cage::ConfigError::ProfileOperationForbidden::operation: &'static str

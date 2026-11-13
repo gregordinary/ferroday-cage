@@ -1418,7 +1418,8 @@ const FLAGS: &[Flag] = &[
             "Under the single identity map, show yourself to the",
             "command as UID:GID rather than as root, or as your own",
             "ids with 'own'. The command runs as that identity and",
-            "holds no capability, but on the host it is still you",
+            "holds no capability beyond a --keep-caps set, but on",
+            "the host it is still you. A uid of 0 is refused",
         ],
         take: Take::One(|options, flag, value| {
             let text = into_string(flag, value)?;
