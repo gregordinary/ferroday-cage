@@ -687,30 +687,57 @@ mod tests {
 
     #[test]
     fn a_reaped_child_s_processor_time_is_counted() {
+        // The processor time the child is charged before it is killed, in the
+        // clock ticks its `/proc` record counts in.
+        const CHARGED_TICKS: u64 = 5;
+        // A clock tick in microseconds: `USER_HZ` is 100 on every architecture
+        // the crate builds for.
+        const TICK_MICROS: u64 = 10_000;
+        // How long the child may take to be charged that much, however loaded
+        // the host or however small its share of a processor. It bounds a
+        // broken accounting, and is not what the assertion measures.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
         // Other tests reap children of this process concurrently, so the
         // counters only grow past what this test adds; the assertion is a floor.
         let before = children_usage().expect("the usage is read");
-        let spin = std::time::Duration::from_millis(200);
-        // SAFETY: the child reads the monotonic clock, which takes no lock and
-        // allocates nothing, and calls `exit_group`.
-        match unsafe { fork() }.expect("the fork succeeds") {
-            Fork::Child => {
-                let started = std::time::Instant::now();
-                while started.elapsed() < spin {
-                    std::hint::spin_loop();
-                }
-                exit_group(0)
+        // SAFETY: the child spins, calling nothing, until it is killed.
+        let child = match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
+            PidfdFork::Child => loop {
+                std::hint::spin_loop();
+            },
+            PidfdFork::ParentOf(child) => child,
+        };
+        // The work is measured in processor time, not wall time: a preempted
+        // child, or one under a processor quota, is charged less than the time
+        // it spends, however long that is. So the parent watches the child's
+        // own account, and kills it once that holds the target.
+        let pid = child.pid().as_raw_nonzero().get() as u32;
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let charged = loop {
+            let ticks = ferroday_cage_testkit::process::cpu_ticks(pid)
+                .expect("the child is there until it is killed");
+            if ticks >= CHARGED_TICKS {
+                break ticks;
             }
-            Fork::ParentOf(child) => {
-                rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty())
-                    .expect("the child is collected");
+            if std::time::Instant::now() >= deadline {
+                child.kill();
+                let _ = child.reap();
+                panic!("the child was charged {ticks} ticks in {PATIENCE:?}");
             }
-        }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        child.kill();
+        assert_eq!(child.reap(), Ok(None), "the child ends by its kill");
         let after = children_usage().expect("the usage is read");
         let used = (after.utime.micros() + after.stime.micros())
             .saturating_sub(before.utime.micros() + before.stime.micros());
-        // A tenth of the spin, so a loaded host's preemption does not fail it.
-        assert!(used >= 20_000, "the child's spin counted {used} µs");
+        // The kernel's account of a process only grows, so what the reaped
+        // child is counted at is at least what its record held before the kill.
+        assert!(
+            used >= charged * TICK_MICROS,
+            "the child was charged {charged} ticks and counted {used} µs"
+        );
         assert!(after.maxrss > 0, "a reaped child has a resident set");
     }
 

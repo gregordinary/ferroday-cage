@@ -593,6 +593,9 @@ consumer upgrading can skip it.
 - A digest the crate takes of a stream, through `digest::stream`,
   `digest::stream_each` or a `DigestWriter`, is a `Digest`, as one of bytes in
   hand through `Digest::of` is.
+- The test of a reaped child's processor time measures the child's work in
+  processor time, as its own `/proc` record states it, rather than in wall
+  time, which a preempted or throttled child is charged less than.
 
 ## [0.5.2] - 2026-11-10
 
