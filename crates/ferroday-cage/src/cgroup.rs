@@ -66,12 +66,15 @@ pub enum CgroupLimit {
     /// the tree out of swap. The kernel offers it only where swap is accounted.
     MemorySwapMax(u64),
     /// `pids.max`: the most processes and threads the tree may hold at once. A
-    /// `fork` past it fails with `EAGAIN`.
+    /// `fork` past it fails with `EAGAIN`. At most 4,194,304, the most process
+    /// ids a 64-bit kernel allocates. A tree with no cap on its processes is
+    /// one without this limit.
     PidsMax(u64),
     /// `cpu.max`: at most `quota_micros` of processor time in each period of
     /// `period_micros`, both in microseconds. A quota above the period spans
     /// more than one processor. The period runs from 1,000 to 1,000,000, and
-    /// the quota is at least 1,000.
+    /// the quota from 1,000 to 17,592,186,044,415, 2^44 - 1. A tree with no cap on its processor
+    /// time is one without this limit.
     #[non_exhaustive]
     CpuMax {
         /// The processor time the tree may use in each period.
@@ -546,9 +549,15 @@ impl CgroupSettings {
     /// `None` where no parent is named, which is no cgroup at all. A limit
     /// without a parent is refused, since it would hold nothing, unless the
     /// limits are not [required](Self::required): the launch then runs
-    /// without them, and [`unapplied`](Self::unapplied) names them.
+    /// without them, and [`unapplied`](Self::unapplied) names them. A limit's
+    /// value is held to what the kernel takes either way, so a configuration
+    /// does not build on one host and fail on the next for want of a parent.
     pub(crate) fn plan(&self) -> Result<Option<CgroupPlan>, crate::ConfigError> {
         let limits = self.limits();
+        let writes = limits
+            .iter()
+            .map(|limit| LimitWrite::of(*limit))
+            .collect::<Result<Vec<_>, _>>()?;
         let Some(parent) = &self.parent else {
             return match limits.is_empty() || !self.required() {
                 true => Ok(None),
@@ -559,17 +568,13 @@ impl CgroupSettings {
                 }),
             };
         };
-        if !parent.is_absolute() {
+        if crate::path::absolute_components(parent).is_err() {
             return Err(crate::ConfigError::CgroupLimitInvalid {
                 reason: format!(
-                    "the cgroup parent {} is not an absolute path",
+                    "the cgroup parent {} is not an absolute path of plain components",
                     parent.display()
                 ),
             });
-        }
-        let mut writes = Vec::new();
-        for limit in &limits {
-            writes.push(LimitWrite::of(*limit)?);
         }
         Ok(Some(CgroupPlan {
             parent: parent.clone(),
@@ -604,6 +609,16 @@ pub(crate) fn serialize_limits<S: serde::Serializer>(
     serde::Serialize::serialize(&table, serializer)
 }
 
+/// The most `pids.max` takes: `PID_MAX_LIMIT`, the most process ids a 64-bit
+/// kernel allocates. A 32-bit kernel takes no more than 32,768, and refuses a
+/// larger value at launch.
+const PIDS_MAX_LIMIT: u64 = 4_194_304;
+
+/// The largest quota `cpu.max` takes, in microseconds: the kernel refuses one
+/// that would overflow its bandwidth arithmetic, which keeps the quota in
+/// nanoseconds shifted left 20 bits.
+const CPU_QUOTA_LIMIT: u64 = (1 << 44) - 1;
+
 /// One limit, as the write that sets it.
 #[derive(Debug, Clone)]
 struct LimitWrite {
@@ -631,11 +646,19 @@ impl LimitWrite {
                 file: "memory.swap.max",
                 value: bytes.to_string(),
             },
-            CgroupLimit::PidsMax(count) => LimitWrite {
-                controller: "pids",
-                file: "pids.max",
-                value: count.to_string(),
-            },
+            CgroupLimit::PidsMax(count) => {
+                if count > PIDS_MAX_LIMIT {
+                    return Err(invalid(format!(
+                        "the pids-max {count} is above the {PIDS_MAX_LIMIT} the kernel takes; a \
+                         tree with no cap on its processes sets no pids-max"
+                    )));
+                }
+                LimitWrite {
+                    controller: "pids",
+                    file: "pids.max",
+                    value: count.to_string(),
+                }
+            }
             CgroupLimit::CpuMax {
                 quota_micros,
                 period_micros,
@@ -650,6 +673,13 @@ impl LimitWrite {
                     return Err(invalid(format!(
                         "the cpu-max quota of {quota_micros} microseconds is below the 1000 the \
                          kernel takes"
+                    )));
+                }
+                if quota_micros > CPU_QUOTA_LIMIT {
+                    return Err(invalid(format!(
+                        "the cpu-max quota of {quota_micros} microseconds is above the \
+                         {CPU_QUOTA_LIMIT} the kernel takes; a tree with no cap on its processor \
+                         time sets no cpu-max"
                     )));
                 }
                 LimitWrite {
@@ -883,17 +913,18 @@ impl Cgroup {
             .and_then(kept)
             .map_err(io_error("opening the sandbox's cgroup", &path))?;
             for write in &plan.writes {
+                let limit = path.join(write.file);
                 let file = open_write(&dir, write.file).map_err(|errno| match errno {
                     Errno::NOENT => refused(CgroupRefusal::LimitUnsupported { file: write.file }),
                     errno => failed(
                         Step::OpenFile,
                         "opening a limit of the sandbox's cgroup",
-                        &path,
+                        &limit,
                     )(errno),
                 })?;
                 rustix::io::write(&file, write.value.as_bytes())
                     .map(drop)
-                    .map_err(io_error("writing a limit to the sandbox's cgroup", &path))?;
+                    .map_err(io_error("writing a limit to the sandbox's cgroup", &limit))?;
             }
             // The leaf enables no controller for children of its own, so what
             // runs in it, or beneath it, is charged to this cgroup and held to
@@ -1253,6 +1284,11 @@ mod tests {
             CgroupLimit::cpu_max(50_000, 999),
             CgroupLimit::cpu_max(50_000, 1_000_001),
             CgroupLimit::cpu_max(999, 100_000),
+            CgroupLimit::cpu_max(CPU_QUOTA_LIMIT + 1, 100_000),
+            // The kernel reads this quota as `max`, which is no limit.
+            CgroupLimit::cpu_max(u64::MAX, 100_000),
+            CgroupLimit::PidsMax(PIDS_MAX_LIMIT + 1),
+            CgroupLimit::PidsMax(u64::MAX),
             CgroupLimit::CpuWeight(0),
             CgroupLimit::CpuWeight(10_001),
         ] {
@@ -1263,6 +1299,24 @@ mod tests {
                 ),
                 "{limit:?}",
             );
+        }
+        // The bounds themselves are values the kernel takes.
+        for limit in [
+            CgroupLimit::cpu_max(CPU_QUOTA_LIMIT, 100_000),
+            CgroupLimit::PidsMax(PIDS_MAX_LIMIT),
+            CgroupLimit::PidsMax(0),
+        ] {
+            assert!(LimitWrite::of(limit).is_ok(), "{limit:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_is_held_to_what_the_kernel_takes_with_or_without_a_parent() {
+        let mut settings = CgroupSettings::default();
+        settings.set(CgroupLimit::PidsMax(u64::MAX));
+        for required in [true, false] {
+            settings.required = Some(required);
+            assert!(settings.plan().is_err(), "required {required}");
         }
     }
 
@@ -1341,8 +1395,10 @@ mod tests {
         assert!(settings.plan().expect("nothing set").is_none());
         settings.set(CgroupLimit::PidsMax(8));
         assert!(settings.plan().is_err(), "a limit without a parent");
-        settings.parent = Some(PathBuf::from("relative"));
-        assert!(settings.plan().is_err(), "a relative parent");
+        for parent in ["relative", "/sys/fs/cgroup/../delegated"] {
+            settings.parent = Some(PathBuf::from(parent));
+            assert!(settings.plan().is_err(), "{parent}");
+        }
         settings.parent = Some(PathBuf::from("/sys/fs/cgroup/delegated"));
         let plan = settings.plan().expect("a valid plan").expect("a cgroup");
         assert_eq!(plan.writes.len(), 1);

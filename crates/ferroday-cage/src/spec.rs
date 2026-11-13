@@ -2393,8 +2393,10 @@ impl CageBuilder {
     /// Holds the sandbox's whole process tree to `limit`, through its cgroup.
     ///
     /// Needs [`cgroup_parent`](Self::cgroup_parent), which
-    /// [`build`](Self::build) checks, along with the limit's value. Repeating
-    /// a kind of limit replaces the earlier one. Where
+    /// [`build`](Self::build) checks unless the limits are not
+    /// [required](Self::cgroup_required), and holds the limit's value to what
+    /// the kernel takes either way. Repeating a kind of limit replaces the
+    /// earlier one. Where
     /// [`rlimit`](Self::rlimit) bounds each process alone, this bounds the tree
     /// together: its memory, its count of processes, and its processor time.
     pub fn cgroup_limit(mut self, limit: CgroupLimit) -> Self {
