@@ -15,12 +15,16 @@ pub fn cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FERRODAY_CAGE_FIXTURE_DIR") {
         return PathBuf::from(dir);
     }
-    // The test binary lives at target/<profile>/deps/<name>; the fixture cache
-    // sits beside the profile directories.
+    // The fixture cache sits in the target directory, beside the profile
+    // directories. Where the test binary lies beneath it depends on Cargo's
+    // layout, `<profile>/deps/` before 1.100 and `<profile>/build/<package>/`
+    // from it, so the target directory is found by the `CACHEDIR.TAG` Cargo
+    // writes at its root, and at the root of each `<triple>/` a cross build
+    // uses, rather than by counting levels.
     let exe = std::env::current_exe().expect("the test binary has a path");
     exe.ancestors()
-        .nth(3)
-        .expect("the test binary lives under target/")
+        .find(|dir| dir.join("CACHEDIR.TAG").is_file())
+        .expect("the test binary lives under a target directory")
         .join("test-fixtures")
 }
 
