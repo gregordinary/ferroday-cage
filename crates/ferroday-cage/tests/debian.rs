@@ -1893,12 +1893,7 @@ fn hermetic_a_failed_stage_layer_disposes_of_the_upper_it_created() {
         !dir.join("upper.fcage-debs").exists(),
         "a failed staging left its package cache behind",
     );
-    let mut left: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    left.sort();
-    assert_eq!(left, ["base", "repo"]);
+    assert_eq!(common::entries(&dir), ["base", "repo"]);
 }
 
 #[test]
@@ -2280,12 +2275,7 @@ fn hermetic_a_failed_bootstrap_leaves_no_package_cache_behind() {
     );
     // And nothing else either: what is left is the repository the test wrote
     // and the publication lock, which `provision::remove` clears.
-    let mut left: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    left.sort();
-    assert_eq!(left, ["repo", "rootfs.lock"]);
+    assert_eq!(common::entries(&dir), ["repo", "rootfs.lock"]);
 }
 
 #[test]

@@ -59,6 +59,26 @@ pub fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// The names `dir` holds, sorted: what a test asserts a run left behind.
+///
+/// # Panics
+///
+/// Where the directory cannot be read.
+pub fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("{} cannot be read: {err}", dir.display()))
+        .map(|entry| {
+            entry
+                .expect("the directory's entries can be read")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Removes a directory tree the way the library removes one, best effort.
 ///
 /// This is [`Remove`] under the single-identity map, declining the lock, which

@@ -916,16 +916,6 @@ mod tests {
         }
     }
 
-    /// The names a directory holds, sorted.
-    fn entries_of(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir)
-            .expect("the directory is readable")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
     fn mirrors() -> Vec<String> {
         vec![
             "http://missing.example".to_string(),
@@ -972,9 +962,9 @@ mod tests {
         .expect_err("a body the check refuses is not published");
         assert!(matches!(refused, Failure::Refused(_)), "{refused:?}");
         assert!(
-            entries_of(&dir).is_empty(),
+            ferroday_cage_testkit::scratch::entries(&dir).is_empty(),
             "left behind: {:?}",
-            entries_of(&dir)
+            ferroday_cage_testkit::scratch::entries(&dir)
         );
         // The first mirror did not serve it and the second served the wrong
         // bytes; the walk advanced past the first and stopped at the second.
@@ -999,7 +989,7 @@ mod tests {
         .expect("a body the check accepts is published");
         assert_eq!(held, b"the recorded bytes");
         assert_eq!(fs::read(&path).unwrap(), b"the recorded bytes");
-        assert_eq!(entries_of(&dir), ["package"]);
+        assert_eq!(ferroday_cage_testkit::scratch::entries(&dir), ["package"]);
         assert_eq!(
             watch.fetched,
             [
@@ -1040,9 +1030,9 @@ mod tests {
         // the next one.
         assert_eq!(fetcher.asked().len(), 2, "{:?}", fetcher.asked());
         assert!(
-            entries_of(&dir).is_empty(),
+            ferroday_cage_testkit::scratch::entries(&dir).is_empty(),
             "left behind: {:?}",
-            entries_of(&dir)
+            ferroday_cage_testkit::scratch::entries(&dir)
         );
 
         // At the size exactly, it is accepted.
@@ -1092,9 +1082,9 @@ mod tests {
         assert!(matches!(err, Failure::Cancelled), "{err:?}");
         assert_eq!(watch.asked, 5, "the body itself asked, and stopped at once");
         assert!(
-            entries_of(&dir).is_empty(),
+            ferroday_cage_testkit::scratch::entries(&dir).is_empty(),
             "left behind: {:?}",
-            entries_of(&dir)
+            ferroday_cage_testkit::scratch::entries(&dir)
         );
     }
 
@@ -1152,7 +1142,11 @@ mod tests {
             String::from_utf8_lossy(&child.stderr),
         );
         // A child that matched no test would succeed having asserted nothing.
-        assert_eq!(entries_of(&dir), ["done"], "the child ran the test");
+        assert_eq!(
+            ferroday_cage_testkit::scratch::entries(&dir),
+            ["done"],
+            "the child ran the test"
+        );
     }
 
     /// The child's half of the file-size test, in a cache under `dir`.
@@ -1188,7 +1182,11 @@ mod tests {
             ["http://first.example/package"],
             "the walk stops at the first mirror",
         );
-        assert!(entries_of(dir).is_empty(), "left: {:?}", entries_of(dir));
+        assert!(
+            ferroday_cage_testkit::scratch::entries(dir).is_empty(),
+            "left: {:?}",
+            ferroday_cage_testkit::scratch::entries(dir)
+        );
 
         // A batch stops at the same failure rather than leaving each job to
         // the walk, which would meet it again.
@@ -1209,7 +1207,11 @@ mod tests {
             panic!("a refused write ends the batch: {outcome:?}");
         };
         assert_eq!(source.raw_os_error(), file_too_large, "{source}");
-        assert!(entries_of(dir).is_empty(), "left: {:?}", entries_of(dir));
+        assert!(
+            ferroday_cage_testkit::scratch::entries(dir).is_empty(),
+            "left: {:?}",
+            ferroday_cage_testkit::scratch::entries(dir)
+        );
     }
 
     #[test]
@@ -1246,7 +1248,7 @@ mod tests {
         )
         .unwrap_or_else(|_| panic!("nothing cancelled the batch"));
         assert_eq!(verified, [Some((0, "a body".to_string())), None, None],);
-        assert_eq!(entries_of(&dir), ["good"]);
+        assert_eq!(ferroday_cage_testkit::scratch::entries(&dir), ["good"]);
         assert_eq!(watch.fetched.len(), 3, "every job was announced");
     }
 
@@ -1278,7 +1280,11 @@ mod tests {
             fetcher.asked().is_empty(),
             "nothing of the batch was fetched"
         );
-        assert!(entries_of(&dir).is_empty(), "left: {:?}", entries_of(&dir));
+        assert!(
+            ferroday_cage_testkit::scratch::entries(&dir).is_empty(),
+            "left: {:?}",
+            ferroday_cage_testkit::scratch::entries(&dir)
+        );
     }
 
     #[test]
@@ -1301,7 +1307,7 @@ mod tests {
         let outcome = prefetch(&mut fetcher, &jobs, &mut watch, |_, _| Ok::<(), ()>(()));
         assert!(matches!(outcome, Err(Failure::Cancelled)));
         assert!(fetcher.asked().is_empty(), "nothing was fetched");
-        assert!(entries_of(&dir).is_empty());
+        assert!(ferroday_cage_testkit::scratch::entries(&dir).is_empty());
     }
 
     #[test]

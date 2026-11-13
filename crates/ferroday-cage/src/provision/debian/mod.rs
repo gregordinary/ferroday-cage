@@ -4848,9 +4848,9 @@ mod tests {
             let install = installables(&archives, &[("hostile", deb_of(data))]);
             let outcome = stage_extract(&staging, "amd64", &install, &archives, &mut Silent);
             assert!(
-                entries_of(&outside).is_empty(),
+                ferroday_cage_testkit::scratch::entries(&outside).is_empty(),
                 "{tag}: the bootstrap wrote outside the tree: {:?}",
-                entries_of(&outside),
+                ferroday_cage_testkit::scratch::entries(&outside),
             );
             (staging, outcome)
         };
@@ -5040,15 +5040,5 @@ mod tests {
             &dir.join("cache"),
         );
         crate::provision::ensure(dir.join("root"), &mut debian).expect("the plan installs");
-    }
-
-    /// The names a directory holds, sorted.
-    fn entries_of(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .expect("the directory is readable")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
     }
 }

@@ -24,7 +24,7 @@ pub use ferroday_cage_testkit::pty;
 pub use ferroday_cage_testkit::require;
 pub use ferroday_cage_testkit::sandbox::{Collect, shell, sleeper};
 pub use ferroday_cage_testkit::scratch::{
-    RangedScratch, download_cache, force_remove_dir_all, ranged_scratch, scratch_dir,
+    RangedScratch, download_cache, entries, force_remove_dir_all, ranged_scratch, scratch_dir,
 };
 pub use ferroday_cage_testkit::tar::Tar;
 pub use ferroday_cage_testkit::xattr;
