@@ -3229,11 +3229,20 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             ),
             (options.provision_tar.is_some(), "--provision-tar"),
             (options.provision_debian.is_some(), "--provision-debian"),
-            (has_debian_modifiers(&options), "the --debian-* options"),
+            (
+                family_given(&applied, DEBIAN_FLAGS),
+                "the --debian-* options",
+            ),
             (options.provision_alpine.is_some(), "--provision-alpine"),
-            (has_alpine_modifiers(&options), "the --alpine-* options"),
+            (
+                family_given(&applied, ALPINE_FLAGS),
+                "the --alpine-* options",
+            ),
             (options.provision_gentoo.is_some(), "--provision-gentoo"),
-            (has_gentoo_modifiers(&options), "the --gentoo-* options"),
+            (
+                family_given(&applied, GENTOO_FLAGS),
+                "the --gentoo-* options",
+            ),
             (
                 options
                     .mounts
@@ -3292,7 +3301,10 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             (options.present_as.is_some(), "--present-as"),
             (options.path_lookup.is_some(), "the path-lookup options"),
             (options.netstack, "--netstack"),
-            (has_netstack_modifiers(&options), "the --netstack-* options"),
+            (
+                family_given(&applied, NETSTACK_FLAGS),
+                "the --netstack-* options",
+            ),
             (!options.forwards.is_empty(), "--forward-loopback"),
         ];
         for (given, name) in conflicts {
@@ -3330,7 +3342,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     if options.netstack && options.network == Some(Network::Host) {
         return Err("--netstack cannot be used with --share-net".to_string());
     }
-    if !options.netstack && has_netstack_modifiers(&options) {
+    if !options.netstack && family_given(&applied, NETSTACK_FLAGS) {
         return Err("the --netstack-* options require --netstack".to_string());
     }
     // A forward listens on the isolated network's loopback, which neither of
@@ -3415,13 +3427,13 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     {
         return Err(format!("{only} requires --rootfs to name the destination"));
     }
-    if options.provision_debian.is_none() && has_debian_modifiers(&options) {
+    if options.provision_debian.is_none() && family_given(&applied, DEBIAN_FLAGS) {
         return Err("the --debian-* options require --provision-debian".to_string());
     }
-    if options.provision_alpine.is_none() && has_alpine_modifiers(&options) {
+    if options.provision_alpine.is_none() && family_given(&applied, ALPINE_FLAGS) {
         return Err("the --alpine-* options require --provision-alpine".to_string());
     }
-    if options.provision_gentoo.is_none() && has_gentoo_modifiers(&options) {
+    if options.provision_gentoo.is_none() && family_given(&applied, GENTOO_FLAGS) {
         return Err("the --gentoo-* options require --provision-gentoo".to_string());
     }
     // A plan is a resolution that already happened, so a flag that shapes a
@@ -3511,8 +3523,9 @@ fn plan_alone(plan: &str, given: bool, shaping: &[(bool, &str)]) -> Result<(), S
 
 /// Whether `flag` configures the provisioning rather than the launch.
 ///
-/// The provisioning vocabulary is short enough to name; everything else shapes a
-/// sandbox, which a provision-and-exit run never builds.
+/// The provisioning vocabulary is short enough to name: the destination, the
+/// four provisioners, and each provisioner's family of modifiers. Everything
+/// else shapes a sandbox, which a provision-and-exit run never builds.
 fn provisions(flag: &str) -> bool {
     matches!(
         flag,
@@ -3521,9 +3534,28 @@ fn provisions(flag: &str) -> bool {
             | "--provision-debian"
             | "--provision-alpine"
             | "--provision-gentoo"
-    ) || flag.starts_with("--debian-")
-        || flag.starts_with("--alpine-")
-        || flag.starts_with("--gentoo-")
+    ) || [DEBIAN_FLAGS, ALPINE_FLAGS, GENTOO_FLAGS]
+        .iter()
+        .any(|family| flag.starts_with(family))
+}
+
+/// The name prefix of the Debian bootstrap's modifier flags.
+///
+/// A family of modifiers is its prefix, here as in [`provisions`], so a flag
+/// added to one counts as given, and as a provisioning flag, without a list
+/// learning of it.
+const DEBIAN_FLAGS: &str = "--debian-";
+/// The name prefix of the Alpine bootstrap's modifier flags.
+const ALPINE_FLAGS: &str = "--alpine-";
+/// The name prefix of the Gentoo bootstrap's modifier flags.
+const GENTOO_FLAGS: &str = "--gentoo-";
+/// The name prefix of the native network stack's modifier flags.
+const NETSTACK_FLAGS: &str = "--netstack-";
+
+/// Whether a flag of the family `prefix` names, such as [`DEBIAN_FLAGS`], is
+/// among the flags `applied`.
+fn family_given(applied: &[&str], prefix: &str) -> bool {
+    applied.iter().any(|flag| flag.starts_with(prefix))
 }
 
 /// Records the profile to load, refusing a mix of the two trust models.
@@ -3971,61 +4003,6 @@ fn parse_source_date_epoch(flag: &str, value: &str) -> Result<i64, String> {
     Ok(epoch)
 }
 
-/// Whether any `--debian-*` modifier flag was given.
-fn has_debian_modifiers(options: &Options) -> bool {
-    options.debian_arch.is_some()
-        || options.debian_mirror.is_some()
-        || !options.debian_components.is_empty()
-        || !options.debian_include.is_empty()
-        || !options.debian_exclude.is_empty()
-        || options.debian_plan.is_some()
-        || options.debian_pin.is_some()
-        || options.debian_extract_only
-        || options.debian_cache.is_some()
-        || options.debian_keyring.is_some()
-        || !options.debian_mirror_fallback.is_empty()
-        || options.debian_base_priority.is_some()
-        || options.debian_trust_unsigned
-        || options.debian_allow_stale_release
-        || options.debian_pre_configure_overlay.is_some()
-        || options.debian_source_date_epoch.is_some()
-        || options.debian_identity_map.is_some()
-        || !options.debian_repositories.is_empty()
-}
-
-/// Whether any `--alpine-*` modifier flag was given.
-fn has_alpine_modifiers(options: &Options) -> bool {
-    options.alpine_arch.is_some()
-        || options.alpine_mirror.is_some()
-        || !options.alpine_components.is_empty()
-        || !options.alpine_include.is_empty()
-        || !options.alpine_exclude.is_empty()
-        || options.alpine_plan.is_some()
-        || options.alpine_pin.is_some()
-        || options.alpine_extract_only
-        || options.alpine_cache.is_some()
-        || options.alpine_keys.is_some()
-        || !options.alpine_mirror_fallback.is_empty()
-        || options.alpine_pre_configure_overlay.is_some()
-        || options.alpine_identity_map.is_some()
-        || options.alpine_source_date_epoch.is_some()
-        || !options.alpine_repositories.is_empty()
-}
-
-/// Whether any `--gentoo-*` modifier flag was given.
-fn has_gentoo_modifiers(options: &Options) -> bool {
-    options.gentoo_variant.is_some()
-        || options.gentoo_binhost.is_some()
-        || !options.gentoo_install.is_empty()
-        || !options.gentoo_prefer_use.is_empty()
-        || options.gentoo_plan.is_some()
-        || options.gentoo_build_id.is_some()
-        || options.gentoo_mirror.is_some()
-        || !options.gentoo_mirror_fallback.is_empty()
-        || options.gentoo_cache.is_some()
-        || options.gentoo_max_pointer_age.is_some()
-}
-
 /// Parses `--gentoo-max-pointer-age`: a count of days, or `none` for no bound.
 fn parse_pointer_age(value: &str) -> Result<Option<u64>, String> {
     if value == "none" {
@@ -4035,19 +4012,6 @@ fn parse_pointer_age(value: &str) -> Result<Option<u64>, String> {
         format!("--gentoo-max-pointer-age expects a number of days or 'none', not {value:?}")
     })?;
     Ok(Some(days))
-}
-
-/// Whether any `--netstack-*` modifier flag was given.
-fn has_netstack_modifiers(options: &Options) -> bool {
-    options.netstack_cidr.is_some()
-        || options.netstack_cidr6.is_some()
-        || options.netstack_no_ipv4
-        || options.netstack_no_ipv6
-        || options.netstack_interface.is_some()
-        || options.netstack_mtu.is_some()
-        || options.netstack_host_loopback
-        || !options.netstack_host_ports.is_empty()
-        || !options.netstack_publish.is_empty()
 }
 
 /// Parses the address a listener of `fcage`'s binds: the host half of
