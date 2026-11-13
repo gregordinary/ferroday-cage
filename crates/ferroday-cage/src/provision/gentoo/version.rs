@@ -389,15 +389,31 @@ pub(super) fn version_hyphen(text: &str) -> Option<usize> {
         .find(|&at| at > 0 && parse(&text[at + 1..]).is_some())
 }
 
+/// The longest `category/name-version` this layer reads, in bytes.
+///
+/// Nothing signs the binary-package index, and a `CPV` is read out of it twice
+/// over: as a record's own, and as the package and version an atom with a
+/// version operator names. A version is parsed again for every candidate such
+/// an atom is held to, so its length is what one comparison costs, on both
+/// sides of it. The longest the live index states is 77 bytes, a GNOME Shell
+/// extension's, and its longest atom is 167 bytes, USE dependencies included;
+/// this is over six times the first. A database entry's own `CPV` is two
+/// directory names, which a filesystem holds to less than this.
+pub(super) const MAX_CPV_BYTES: usize = 512;
+
 /// Splits `cpv` into its category, package name and version.
 ///
 /// A `CPV` is `category/name-version`, and the separator between the name and
 /// the version is a hyphen the name may also contain. The split is nonetheless
 /// unambiguous, and [`version_hyphen`] says why and finds it.
 ///
-/// Returns `None` for a value that is not one — no category separator, an empty
-/// part, or no hyphen with a version after it.
+/// Returns `None` for a value that is not one — longer than
+/// [`MAX_CPV_BYTES`], no category separator, an empty part, or no hyphen with
+/// a version after it.
 pub(super) fn split_cpv(cpv: &str) -> Option<(&str, &str, &str)> {
+    if cpv.len() > MAX_CPV_BYTES {
+        return None;
+    }
     let (category, rest) = cpv.split_once('/')?;
     if category.is_empty() || rest.is_empty() || category.contains('/') {
         return None;
@@ -704,16 +720,23 @@ mod tests {
         // square of its length, which at this size is hours. Asked of the last
         // two, it is the length of the line.
         let run = "-".repeat(1 << 20);
-        assert!(split_cpv(&format!("a/b{run}")).is_none());
+        assert!(version_hyphen(&format!("b{run}")).is_none());
         // A digit after every hyphen, which a test of the first character after
         // a hyphen alone would not turn away.
         let digits = "-1".repeat(1 << 19);
-        assert!(split_cpv(&format!("a/b{digits}-")).is_none());
+        assert!(version_hyphen(&format!("b{digits}-")).is_none());
+        let text = format!("b{digits}");
         assert_eq!(
-            split_cpv(&format!("a/b{digits}")).map(|(_, _, version)| version),
+            version_hyphen(&text).map(|at| &text[at + 1..]),
             Some("1"),
             "the last hyphen is the one a whole version follows",
         );
+        // A `CPV` that long is not one this layer splits at all.
+        assert!(split_cpv(&format!("a/{text}")).is_none());
+        let longest = format!("a/b-1{}", ".1".repeat((MAX_CPV_BYTES - "a/b-1".len()) / 2));
+        assert!(longest.len() <= MAX_CPV_BYTES);
+        assert!(split_cpv(&longest).is_some());
+        assert!(split_cpv(&format!("{longest}.1")).is_none());
     }
 
     #[test]

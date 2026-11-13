@@ -141,13 +141,24 @@ pub(super) trait Candidate {
     /// The slot, which the caller defaults where its source states none. A
     /// `slot/subslot` compound is carried whole and split here.
     fn slot(&self) -> &str;
+    /// The two space-separated flag lists a USE dependency is answered from:
+    /// the flags the candidate was built with, and the flags it knows.
+    ///
+    /// What fills the second is each side's own: an index record's `IUSE`, or
+    /// what a root's database entry knows. [`use_flag`](Self::use_flag) reads
+    /// both by the one rule.
+    fn flag_lists(&self) -> (&str, &str);
+
     /// Whether `flag` is enabled, disabled, or unknown to the candidate.
     ///
     /// `None` is what the atom's `(+)` and `(-)` defaults answer, and it is the
     /// common case rather than an edge: a package's `IUSE` names the flags it
     /// was written with, and an atom routinely asks about one another package
     /// defines.
-    fn use_flag(&self, flag: &str) -> Option<bool>;
+    fn use_flag(&self, flag: &str) -> Option<bool> {
+        let (flags, iuse) = self.flag_lists();
+        use_flag(flags, iuse, flag)
+    }
 
     /// The candidate as `category/name-version`, which is how a refusal or a
     /// report names it, whichever side of resolution it comes from.
@@ -198,6 +209,37 @@ impl Atom {
         self.version_matches(candidate.version())
             && self.slot_matches(candidate.slot())
             && self.use_matches(candidate)
+    }
+
+    /// The most bytes holding `candidate` to the atom reads, by
+    /// [`matches`](Self::matches) or [`unmet_by`](Self::unmet_by).
+    ///
+    /// The two versions, where the atom states an operator, since both are
+    /// parsed to be compared. The candidate's slot, where the atom states a slot
+    /// dependency. And for each USE dependency the candidate's two flag lists,
+    /// since [`use_flag`] scans them. That last is the large term: up to
+    /// [`MAX_USE_DEPS`] times the length of the candidate's lists, which for an
+    /// index record is two MiB.
+    ///
+    /// An upper bound rather than what a particular comparison reads, which a
+    /// failed version test cuts short, so it can be asked before the comparison
+    /// is made: a caller holding the work to a bound refuses the comparison
+    /// that would take it past, rather than noticing afterwards.
+    pub(super) fn reads(&self, candidate: &impl Candidate) -> usize {
+        let version = match (self.operator, &self.version) {
+            (Some(_), Some(wanted)) => wanted.len().saturating_add(candidate.version().len()),
+            _ => 0,
+        };
+        let slot = match self.slot {
+            Some(_) => candidate.slot().len(),
+            None => 0,
+        };
+        let (flags, iuse) = candidate.flag_lists();
+        let flags = self
+            .use_deps
+            .len()
+            .saturating_mul(flags.len().saturating_add(iuse.len()));
+        version.saturating_add(slot).saturating_add(flags)
     }
 
     /// Which part of the atom `candidate` fails, or `None` where it answers.
@@ -385,6 +427,12 @@ pub(super) fn parse(text: &str) -> Result<Atom, String> {
             return refuse("opens a USE dependency that nothing closes");
         };
         for entry in close[open + 1..].split(',') {
+            if use_deps.len() == MAX_USE_DEPS {
+                return refuse(&format!(
+                    "states more than {MAX_USE_DEPS} USE dependencies, more than any atom is \
+                     matched by"
+                ));
+            }
             use_deps.push(parse_use_dep(entry).map_err(|reason| {
                 format!("the atom {text:?} states a USE dependency that {reason}")
             })?);
@@ -412,6 +460,16 @@ pub(super) fn parse(text: &str) -> Result<Atom, String> {
         }
         None => None,
     };
+
+    // What is left names a package, and a version where there is an operator,
+    // which is what a record's `CPV` names. One longer than any `CPV` this
+    // layer reads answers nothing, and costs its length in every comparison.
+    if rest.len() > version::MAX_CPV_BYTES {
+        return refuse(&format!(
+            "names a package and version longer than the {} bytes a `CPV` may run to",
+            version::MAX_CPV_BYTES,
+        ));
+    }
 
     // A trailing `*` belongs to the `=` operator and to no other, so it is read
     // before the version is split off.
@@ -657,6 +715,16 @@ impl Dependency {
     }
 }
 
+/// The most USE dependencies one atom may state.
+///
+/// Each is answered by scanning the two flag lists of every candidate the atom
+/// is held to, so this is what one comparison costs, multiplied by the length
+/// of those lists ([`Atom::reads`]). Nothing else bounds it but the dependency
+/// class the atom is written in, which leaves room for ten thousand. The most
+/// any atom in the live index states is thirteen, `dev-qt/qtbase:6`'s; this is
+/// nearly five times that.
+const MAX_USE_DEPS: usize = 64;
+
 /// How deeply one group may nest inside others in a dependency class.
 ///
 /// The index is USE-evaluated, so the conditionals that would nest one group in
@@ -822,10 +890,11 @@ mod tests {
         name: &'static str,
         version: &'static str,
         slot: &'static str,
-        /// The flags the build was compiled with.
-        use_flags: &'static [&'static str],
-        /// The flags the package knows, whether or not they are enabled.
-        iuse: &'static [&'static str],
+        /// The flags the build was compiled with, space-separated.
+        use_flags: &'static str,
+        /// The flags the package knows, whether or not they are enabled,
+        /// space-separated.
+        iuse: &'static str,
     }
 
     impl Candidate for Record {
@@ -841,14 +910,8 @@ mod tests {
             self.slot
         }
 
-        fn use_flag(&self, flag: &str) -> Option<bool> {
-            if self.use_flags.contains(&flag) {
-                Some(true)
-            } else if self.iuse.contains(&flag) {
-                Some(false)
-            } else {
-                None
-            }
+        fn flag_lists(&self) -> (&str, &str) {
+            (self.use_flags, self.iuse)
         }
     }
 
@@ -859,8 +922,8 @@ mod tests {
             name: "dev-vcs/git",
             version: "2.54.0",
             slot: "0",
-            use_flags: &["curl", "perl"],
-            iuse: &["curl", "perl", "keyring", "cgi"],
+            use_flags: "curl perl",
+            iuse: "curl perl keyring cgi",
         }
     }
 
@@ -917,8 +980,8 @@ mod tests {
             name: "dev-libs/openssl",
             version: "3.5.4",
             slot: "0/3",
-            use_flags: &[],
-            iuse: &[],
+            use_flags: "",
+            iuse: "",
         };
         for text in [
             "dev-libs/openssl:0",
@@ -1105,8 +1168,8 @@ mod tests {
             name: "dev-lang/python",
             version,
             slot: "3.1",
-            use_flags: &[],
-            iuse: &[],
+            use_flags: "",
+            iuse: "",
         };
         for version in ["3.1", "3.1.4", "3.1_rc1", "3.1-r2", "3.1a"] {
             assert!(
@@ -1147,6 +1210,38 @@ mod tests {
         let any_of = |depth: usize| format!("{}a-b/c{}", "|| ( ".repeat(depth), " )".repeat(depth));
         alternatives(&any_of(MAX_GROUP_DEPTH), 1);
         assert!(parse_class(&any_of(MAX_GROUP_DEPTH + 1)).is_err());
+    }
+
+    #[test]
+    fn an_atom_is_as_long_as_its_bounds_and_no_longer() {
+        // What one comparison reads is the two versions and, for every USE
+        // dependency, the candidate's flag lists, so both are bounded where the
+        // atom is read rather than left to the dependency class it is in.
+        let deps = |count: usize| {
+            (0..count)
+                .map(|at| format!("f{at}(+)"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let at = parse(&format!("dev-vcs/git[{}]", deps(MAX_USE_DEPS))).expect("at the bound");
+        assert_eq!(at.use_deps.len(), MAX_USE_DEPS);
+        let past =
+            parse(&format!("dev-vcs/git[{}]", deps(MAX_USE_DEPS + 1))).expect_err("past the bound");
+        assert!(past.contains("more than 64 USE dependencies"), "{past}");
+
+        // The package and version an operator names are a `CPV`'s, held to a
+        // `CPV`'s length; so is a name with no version.
+        let longest = format!("a/b-1{}", ".1".repeat((version::MAX_CPV_BYTES - 5) / 2));
+        assert!(longest.len() <= version::MAX_CPV_BYTES);
+        let at = parse(&format!(">={longest}[x]")).expect("at the bound");
+        assert_eq!(at.version.as_deref(), Some(&longest["a/b-".len()..]));
+        for past in [
+            format!(">={longest}.1"),
+            format!("a/{}", "b".repeat(version::MAX_CPV_BYTES)),
+        ] {
+            let reason = parse(&past).expect_err("past the bound");
+            assert!(reason.contains("longer than the 512 bytes"), "{reason}");
+        }
     }
 
     #[test]

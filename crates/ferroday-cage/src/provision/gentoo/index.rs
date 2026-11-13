@@ -67,6 +67,31 @@ const DEFAULT_SLOT: &str = "0";
 /// stating a longer one is not one this layer can act on.
 pub(super) const MAX_CLASS_BYTES: usize = 64 * 1024;
 
+/// The longest `SLOT` a record may state, in bytes.
+///
+/// Nothing signs the index, so every text field a record keeps is held to a
+/// length, as its dependency classes are to [`MAX_CLASS_BYTES`] and its `CPV`
+/// to [`version::MAX_CPV_BYTES`]. A refusal of a contended slot names it. The
+/// longest the live index states is 26 bytes; this is nearly ten times that.
+pub(super) const MAX_SLOT_BYTES: usize = 256;
+
+/// The longest flag list, `USE` or `IUSE`, a record may state, in bytes.
+///
+/// A USE dependency is answered by scanning both lists of the candidate it is
+/// held to, so their length is what one such comparison reads. The longest
+/// the live index states are 1,827 bytes of `USE`, `media-gfx/sane-backends`',
+/// and 2,795 of `IUSE`, `www-servers/apache`'s; this is over five times the
+/// longer.
+pub(super) const MAX_FLAGS_BYTES: usize = 16 * 1024;
+
+/// The longest `PATH` a record may state, in bytes.
+///
+/// It becomes a URL and a cache entry's path. The longest the live index
+/// states is 145 bytes; this is seven times that, and short enough that the
+/// cache directory a caller names leaves room for it beneath a filesystem's
+/// own limit on a path.
+pub(super) const MAX_PATH_BYTES: usize = 1024;
+
 /// One published build: what the resolver chooses between, and what the merge
 /// needs to fetch and register it.
 ///
@@ -83,6 +108,12 @@ pub(super) const MAX_CLASS_BYTES: usize = 64 * 1024;
 /// allocation, and its dependency classes are kept as the index writes them
 /// and parsed when a resolution chooses the build: a parsed atom is several
 /// times the four bytes `a/b ` takes to write one.
+///
+/// Each kept field is held to a length as well: the `CPV` to
+/// [`version::MAX_CPV_BYTES`], and the rest to [`MAX_SLOT_BYTES`],
+/// [`MAX_FLAGS_BYTES`], [`MAX_PATH_BYTES`] and [`MAX_CLASS_BYTES`]. That
+/// bounds what anything copied out of one record costs, and a resolution
+/// copies the `CPV` and the slot into what it reports.
 #[derive(Debug, Clone)]
 pub(super) struct Record {
     /// The text fields, end to end, in the order [`Text`] names them.
@@ -264,8 +295,8 @@ impl atom::Candidate for Record {
         Record::slot(self)
     }
 
-    fn use_flag(&self, flag: &str) -> Option<bool> {
-        atom::use_flag(self.use_flags(), self.iuse(), flag)
+    fn flag_lists(&self) -> (&str, &str) {
+        (self.use_flags(), self.iuse())
     }
 }
 
@@ -286,6 +317,32 @@ pub(super) fn read_class(text: &str) -> Result<Vec<Dependency>, String> {
         ));
     }
     atom::parse_class(text)
+}
+
+/// The first of a build's text fields that is longer than a record may state
+/// it, as the index names the field, its length and its bound; or `None` where
+/// none is.
+///
+/// The fields a record keeps besides its dependency classes, which
+/// [`read_class`] holds, and its MD5, which is a fixed length: the `CPV`, given
+/// as its length, the slot, the two flag lists, and the path. A plan states
+/// each of them where an index would have, so it is held to the same.
+pub(super) fn overlong(
+    cpv: usize,
+    slot: &str,
+    use_flags: &str,
+    iuse: &str,
+    path: &str,
+) -> Option<(&'static str, usize, usize)> {
+    [
+        ("CPV", cpv, version::MAX_CPV_BYTES),
+        ("SLOT", slot.len(), MAX_SLOT_BYTES),
+        ("USE", use_flags.len(), MAX_FLAGS_BYTES),
+        ("IUSE", iuse.len(), MAX_FLAGS_BYTES),
+        ("PATH", path.len(), MAX_PATH_BYTES),
+    ]
+    .into_iter()
+    .find(|(_, length, max)| length > max)
 }
 
 /// What the index's preamble says about itself.
@@ -468,6 +525,15 @@ fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
         "SIZE",
     ]);
     let cpv = cpv?;
+    let slot = slot.unwrap_or(Cow::Borrowed(DEFAULT_SLOT));
+    let use_flags = use_flags.unwrap_or_default();
+    let iuse = iuse.unwrap_or_default();
+    let path = path?;
+    // Before anything parses a field, so splitting the `CPV` is no more work
+    // than its bound allows.
+    if overlong(cpv.len(), &slot, &use_flags, &iuse, &path).is_some() {
+        return None;
+    }
     let (category, package, version) = version::split_cpv(&cpv)?;
     let name = format!("{category}/{package}");
     if !atom::is_package(&name) {
@@ -493,19 +559,10 @@ fn read_record(stanza: &Stanza<'_>) -> Option<Record> {
     // classes of the builds it chooses, and those alone.
     read_class(&rdepend).ok()?;
     read_class(&pdepend).ok()?;
-    let path = path?;
     let size = size?.parse().ok()?;
     Record::compose(
         [
-            &name,
-            version,
-            slot.as_deref().unwrap_or(DEFAULT_SLOT),
-            &use_flags.unwrap_or_default(),
-            &iuse.unwrap_or_default(),
-            &rdepend,
-            &pdepend,
-            &path,
-            &md5,
+            &name, version, &slot, &use_flags, &iuse, &rdepend, &pdepend, &path, &md5,
         ],
         build_id,
         build_time,
@@ -942,6 +999,56 @@ SIZE: 1
         assert_eq!(index.skipped(), 1);
         assert_eq!(index.records()[0].runtime().len(), MAX_CLASS_BYTES / 4);
         assert!(read_class(&past_bound).is_err());
+    }
+
+    #[test]
+    fn a_field_past_its_bound_is_left_out_and_counted() {
+        // Nothing signs the index, so each field a record keeps is held to a
+        // length before anything parses it: what a record costs, and what a
+        // resolution copies out of one into a refusal, cannot be a mirror's to
+        // decide. A field at its bound is kept; one byte past it is not.
+        let stanza = |cpv: &str, slot: &str, flags: &str, iuse: &str, path: &str| {
+            format!(
+                "BUILD_ID: 1\nCPV: {cpv}\nIUSE: {iuse}\nMD5: d41d8cd98f00b204e9800998ecf8427e\n\
+                 PATH: {path}\nSIZE: 1\nSLOT: {slot}\nUSE: {flags}\n\n"
+            )
+        };
+        let cpv = |length: usize| format!("a/b-1{}", "0".repeat(length - "a/b-1".len()));
+        let text = |length: usize| "f".repeat(length);
+        let path = |length: usize| format!("a/b/{}", "c".repeat(length - "a/b/".len()));
+        let at = |field: &str, length: usize| {
+            stanza(
+                &cpv(if field == "CPV" { length } else { 8 }),
+                &text(if field == "SLOT" { length } else { 1 }),
+                &text(if field == "USE" { length } else { 1 }),
+                &text(if field == "IUSE" { length } else { 1 }),
+                &path(if field == "PATH" { length } else { 16 }),
+            )
+        };
+        for (field, max) in [
+            ("CPV", version::MAX_CPV_BYTES),
+            ("SLOT", MAX_SLOT_BYTES),
+            ("USE", MAX_FLAGS_BYTES),
+            ("IUSE", MAX_FLAGS_BYTES),
+            ("PATH", MAX_PATH_BYTES),
+        ] {
+            let index = Index::parse(&format!(
+                "TIMESTAMP: 1\n\n{}{}",
+                at(field, max),
+                at(field, max + 1),
+            ));
+            assert_eq!(index.records().len(), 1, "{field}");
+            assert_eq!(index.skipped(), 1, "{field}");
+            let kept = &index.records()[0];
+            let length = match field {
+                "CPV" => kept.name().len() + 1 + kept.version().len(),
+                "SLOT" => kept.slot().len(),
+                "USE" => kept.use_flags().len(),
+                "IUSE" => kept.iuse().len(),
+                _ => kept.path().len(),
+            };
+            assert_eq!(length, max, "{field}: the one at its bound is the one kept");
+        }
     }
 
     #[test]

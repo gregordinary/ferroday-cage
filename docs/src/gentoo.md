@@ -621,14 +621,22 @@ failing the whole index.
 
 Reading it costs time and memory in proportion to its length, however a mirror
 lays it out. Stanzas are read one at a time, and a record keeps only the fields
-the layer reads. A dependency class is checked as it is read, up to 64 KiB long
-and 16 groups deep. It is parsed again only for a build a resolution chooses.
+the layer reads. Each field has a length far past the longest the archive
+publishes. A `CPV` runs to 512 bytes, a slot to 256, a flag list to 16 KiB and a
+path to 1 KiB. A dependency class is checked as it is read, up to 64 KiB long
+and 16 groups deep. Each atom in it names a package and version no longer than
+a `CPV`, with at most 64 USE dependencies.
 
 A resolution against it is bounded as well, each bound far past what resolving
 the whole archive needs. It chooses at most 16,384 builds and reads at most
 262,144 dependency atoms from them. It holds atoms against at most 4,194,304
-candidate builds, and works out what the index offers for an atom once per
-spelling. Reaching a bound stops the resolution, which refuses the index.
+candidate builds, reading at most 128 MiB of their versions, slots and flags.
+Each comparison is charged what it reads before it is made, since one atom can
+cost thousands of times another. It records at most 16,384 refusals.
+
+Reaching a bound stops the resolution, which refuses. What the index offers for
+an atom is worked out once per spelling. A dependency class is parsed again only
+for a build a resolution chooses.
 
 It also decides each download's declared size, which is why the layer keeps a
 ceiling of its own beside it. The index's `SIZE` bounds a fetch, and an

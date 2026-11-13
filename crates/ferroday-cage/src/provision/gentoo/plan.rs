@@ -217,6 +217,27 @@ impl PlannedPackage {
     /// and the bytes land there before the signed `Manifest` inside them is
     /// ever read.
     pub(super) fn unusable(&self) -> Option<String> {
+        // First, so nothing below parses a field longer than an index record
+        // may state it, and a refusal naming the package names a bounded one.
+        if let Some((field, length, max)) = index::overlong(
+            self.name.len() + 1 + self.version.len(),
+            &self.slot,
+            &self.use_flags,
+            &self.iuse,
+            &self.path,
+        ) {
+            return Some(match field {
+                "CPV" => format!(
+                    "the plan names a package and version {length} bytes long, past the {max} \
+                     an index record may state",
+                ),
+                _ => format!(
+                    "the plan states {length} bytes of {field} for {}, past the {max} an index \
+                     record may state",
+                    self.name,
+                ),
+            });
+        }
         if !atom::is_package(&self.name) {
             return Some(format!(
                 "the plan names {:?}, which is not a package a binhost can publish",
@@ -358,7 +379,8 @@ impl Plan {
     /// cannot do without, a malformed number, or a package this layer could not
     /// address — a name that is not a package, a version this format does not
     /// define, a path that would not stay inside the archive, an MD5 that is
-    /// not one, or dependencies the index reader could not have read. The
+    /// not one, dependencies the index reader could not have read, or a field
+    /// longer than an index record may state it. The
     /// document is the only thing behind a plan read this way, so the shape an
     /// index would have guaranteed is checked here.
     pub fn parse_document(text: &str) -> Result<Plan, GentooError> {
@@ -655,7 +677,15 @@ mod tests {
             "Rdepend: {}",
             "a/b ".repeat(index::MAX_CLASS_BYTES / 4 + 1).trim_end()
         );
+        // So is every other field an index record is held to a length in, and
+        // a plan stating one longer is refused before its fields are parsed.
+        let iuse_past = format!("Iuse: {}", "f".repeat(index::MAX_FLAGS_BYTES + 1));
+        let slot_past = format!("Slot: {}", "s".repeat(index::MAX_SLOT_BYTES + 1));
+        let version_past = format!("Version: 1{}", ".1".repeat(version::MAX_CPV_BYTES / 2));
         let cases = [
+            (iuse_past.as_str(), "16385 bytes of IUSE for"),
+            (slot_past.as_str(), "257 bytes of SLOT for"),
+            (version_past.as_str(), "bytes long, past the 512"),
             ("Path: ../../../etc/passwd", "outside the archive"),
             ("Package: zlib", "not a package"),
             ("Version: not-a-version", "not a version"),

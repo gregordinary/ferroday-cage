@@ -186,8 +186,8 @@ impl Candidate for InstalledPackage {
         &self.slot
     }
 
-    fn use_flag(&self, flag: &str) -> Option<bool> {
-        // The index's records answer through the same function, which is what
+    fn flag_lists(&self) -> (&str, &str) {
+        // The index's records answer through the same rule, which is what
         // keeps the two ends of resolution reading one grammar.
         //
         // What is this end's own is which file fills `iuse`. Reading
@@ -198,7 +198,7 @@ impl Candidate for InstalledPackage {
         // in its `USE` and all of them in its `IUSE_EFFECTIVE`. Without the
         // second file the atom cannot be answered, and a root that already has
         // perl installs it again.
-        atom::use_flag(&self.use_flags, &self.iuse, flag)
+        (&self.use_flags, &self.iuse)
     }
 }
 
