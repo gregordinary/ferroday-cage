@@ -1113,22 +1113,18 @@ fn restricted_shell(script: &str) -> Option<ferroday_cage::Restriction> {
     // `/dev/null`, read-write, before `main`, and aborts where it cannot. A
     // script that closes its terminal and then runs `sleep` meets that where
     // the coreutils are uutils, as Ubuntu's are.
-    let mut builder = ferroday_cage::Restriction::builder()
+    let builder = ferroday_cage::Restriction::builder()
         .command("/bin/sh")
         .args(["-c", script])
         .landlock_fs(
             ferroday_cage::FsAccess::READ | ferroday_cage::FsAccess::WRITE,
             "/dev/null",
         );
-    for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
-        if std::path::Path::new(tree).exists() {
-            builder = builder.landlock_fs(
-                ferroday_cage::FsAccess::READ | ferroday_cage::FsAccess::EXECUTE,
-                tree,
-            );
-        }
-    }
-    Some(builder.build().expect("a valid restriction configuration"))
+    Some(
+        common::grant_system_trees(builder)
+            .build()
+            .expect("a valid restriction configuration"),
+    )
 }
 
 // -- Raw mode and the foreground ----------------------------------------------

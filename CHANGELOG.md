@@ -628,6 +628,8 @@ consumer upgrading can skip it.
   time, which a preempted or throttled child is charged less than.
 - Every test skip is also appended to the file `FERRODAY_CAGE_SKIP_LOG` names,
   one line each, and CI lists the skips its test steps logged.
+- The restriction suites take the grants a host binary runs under from one
+  `common::grant_system_trees`.
 
 ## [0.5.2] - 2026-11-10
 

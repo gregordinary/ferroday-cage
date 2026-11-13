@@ -195,8 +195,6 @@ fn a_sandbox_does_not_possess_the_callers_session_keys() {
 #[cfg(feature = "hardening")]
 #[test]
 fn a_restriction_does_not_possess_the_callers_session_keys() {
-    use std::path::Path;
-
     use ferroday_cage::{FsAccess, Restriction};
 
     if !common::landlock() {
@@ -208,16 +206,11 @@ fn a_restriction_does_not_possess_the_callers_session_keys() {
     // A restriction has to confine something; read and execute beneath the
     // system trees and read beneath `/proc` is what a host shell and its
     // listing need.
-    let mut builder = Restriction::builder()
+    let builder = Restriction::builder()
         .command("/bin/sh")
         .args(["-c", &key.absence_script()])
         .landlock_fs(FsAccess::READ, "/proc");
-    for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
-        if Path::new(tree).exists() {
-            builder = builder.landlock_fs(FsAccess::READ | FsAccess::EXECUTE, tree);
-        }
-    }
-    let status = builder
+    let status = common::grant_system_trees(builder)
         .build()
         .expect("a valid restriction configuration")
         .run()

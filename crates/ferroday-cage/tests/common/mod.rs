@@ -104,6 +104,23 @@ pub fn host_userland() -> ferroday_cage::CageBuilder {
     builder
 }
 
+/// Adds the grants that make a dynamically linked host binary runnable under a
+/// restriction: read and execute beneath the standard system trees, granting
+/// only the ones this host has.
+#[cfg(feature = "hardening")]
+pub fn grant_system_trees(
+    mut builder: ferroday_cage::RestrictionBuilder,
+) -> ferroday_cage::RestrictionBuilder {
+    use ferroday_cage::FsAccess;
+
+    for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+        if std::path::Path::new(tree).exists() {
+            builder = builder.landlock_fs(FsAccess::READ | FsAccess::EXECUTE, tree);
+        }
+    }
+    builder
+}
+
 /// Whether the kernel offers Landlock. The probe is the hardening layer's,
 /// and the skip goes through [`require`].
 #[cfg(feature = "hardening")]

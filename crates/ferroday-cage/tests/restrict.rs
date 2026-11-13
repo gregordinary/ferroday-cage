@@ -16,25 +16,13 @@ use std::time::Duration;
 
 mod common;
 
-use common::scratch_dir as scratch;
+use common::{grant_system_trees, scratch_dir as scratch};
 use ferroday_cage::{
-    Error, FsAccess, LandlockScope, NetAccess, Restriction, RestrictionBuilder, SeccompPolicy,
-    SeccompRules, SetupStep, Stdio, Terminal,
+    Error, FsAccess, LandlockScope, NetAccess, Restriction, SeccompPolicy, SeccompRules, SetupStep,
+    Stdio, Terminal,
 };
 #[cfg(target_pointer_width = "64")]
 use ferroday_cage::{SeccompAction, SeccompArg};
-
-/// Adds the grants that make a dynamically linked host binary runnable:
-/// read and execute beneath the standard system trees, granting only the
-/// ones this host has.
-fn grant_system_trees(mut builder: RestrictionBuilder) -> RestrictionBuilder {
-    for tree in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
-        if Path::new(tree).exists() {
-            builder = builder.landlock_fs(FsAccess::READ | FsAccess::EXECUTE, tree);
-        }
-    }
-    builder
-}
 
 #[test]
 fn a_directory_on_a_standard_stream_is_refused() {
