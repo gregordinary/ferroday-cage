@@ -185,6 +185,13 @@ fn relayed(
 
     let after =
         termios::tcgetattr(&caller.primary).expect("the caller terminal reports its settings");
+    // Everything the relay wrote is queued in the caller terminal by the time
+    // it returns, and the user's end may not have read it yet. Closing the last
+    // replica makes the primary report end of file once that queue is empty.
+    drop(pipe_reader);
+    drop(replica);
+    let deadline = Instant::now() + PROMPTLY;
+    while pty::drain_until(&caller.primary, deadline, &mut caller.seen) {}
     Session {
         outcome,
         before,
