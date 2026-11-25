@@ -1181,8 +1181,9 @@ struct OtherIndexes<'a> {
 struct Recorded {
     /// The index's path within the pool.
     index: PathBuf,
-    /// The SHA-256 the index records for the file.
-    digest: String,
+    /// The SHA-256 the index records for the file, or `None` where what it
+    /// records is not one, which names no bytes the pool could hold.
+    digest: Option<Digest>,
 }
 
 impl OtherIndexes<'_> {
@@ -1222,7 +1223,7 @@ impl OtherIndexes<'_> {
         let (digest, _) = digest::stream(Algorithm::Sha256, &mut file).map_err(reading())?;
         let Some(Recorded { index, .. }) = naming
             .iter()
-            .find(|recorded| recorded.digest.eq_ignore_ascii_case(digest.hex()))
+            .find(|recorded| recorded.digest.as_ref() == Some(&digest))
         else {
             return Ok(());
         };
@@ -1273,7 +1274,7 @@ impl OtherIndexes<'_> {
                             .or_default()
                             .push(Recorded {
                                 index: rel.clone(),
-                                digest: digest.into_owned(),
+                                digest: Digest::new(Algorithm::Sha256, digest.trim()),
                             });
                     }
                 }
