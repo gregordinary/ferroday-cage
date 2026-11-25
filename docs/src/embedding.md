@@ -112,8 +112,10 @@ more is waiting.
 
 [`Running`] and [`Pending`] are deliberately neither `Send` nor `Sync`: they
 borrow an observer that carries no thread bounds, and the library delivers
-output on the thread that waits. So a handle cannot cross an await point, and
-the handle is exactly what holds the kill.
+output on the thread that waits. A future holding one is therefore not `Send`
+either. It runs on a `LocalSet` or a current-thread runtime, as the previous
+section says, and a handle created inside a blocking task stays there. The
+handle is exactly what holds the kill.
 
 [`KillHandle`] is the piece that does cross threads — it is `Send + Sync` — but
 it is obtained from the `Running` that is now inside the blocking task. The
@@ -126,19 +128,34 @@ use std::time::Duration;
 
 use ferroday_cage::{Cage, KillHandle};
 
+/// Kills the sandbox when the async side lets go of it, whether the future
+/// ran to its end or was dropped part-way.
+struct KillOnDrop(KillHandle);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // Killing a sandbox that has already exited is not an error.
+        let _ = self.0.kill();
+    }
+}
+
 async fn run_bounded(cage: Arc<Cage>) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = tokio::sync::oneshot::channel::<KillHandle>();
 
     let task = tokio::task::spawn_blocking(move || {
         let mut running = cage.spawn()?;
-        // Hand the killer to the runtime before blocking on the wait.
-        let _ = tx.send(running.kill_handle()?);
+        // Hand the killer to the runtime before blocking on the wait. A send
+        // fails only when the receiver is gone, and then nothing could ever
+        // cancel this sandbox, so it ends here rather than being waited on.
+        if let Err(killer) = tx.send(running.kill_handle()?) {
+            killer.kill()?;
+        }
         running.wait()
     });
 
-    let killer = rx.await?;
+    let killer = KillOnDrop(rx.await?);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    killer.kill()?; // cancel from the async context
+    killer.0.kill()?; // cancel from the async context
 
     let status = task.await??; // terminated by SIGKILL
     assert_eq!(status.signal(), Some(9));
@@ -150,6 +167,13 @@ The ordering matters: the kill handle is sent *before* the wait begins, so the
 async side holds it for the whole life of the sandbox. `kill_handle` can be
 called again later from the blocking side if a second one is wanted; each owns
 its own duplicated channel ends.
+
+Cancellation can come at either end of that hand-off, and each has an owner.
+A future dropped before the handle arrives drops the receiver, so the blocking
+task's send fails and the task kills the sandbox itself. A future dropped after
+the handle arrives drops the guard, which kills it. Either way the blocking
+task's wait then returns, and the thread is not held by a sandbox nobody
+can reach.
 
 A sandbox's [cgroup](hardening.md#limits-on-the-whole-tree), where it has one,
 is shared by the `Running` and its kill handles, and the last of them to drop

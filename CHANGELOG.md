@@ -212,6 +212,11 @@ consumer upgrading can skip it.
   permission field longer than three characters, a name beginning with
   whitespace or a `#`, and an escape of fewer than three digits, or spelling a
   NUL or a value past a byte.
+- The embedding chapter's tokio recipe for cancelling a sandbox kills it when
+  the async side is dropped, before the kill handle reaches it or after. As
+  written, a future dropped before the handle arrived left the sandbox running
+  with nothing able to kill it, and its blocking task waiting on it. The
+  chapter no longer says a handle cannot cross an await point.
 
 ### Internal
 
