@@ -159,7 +159,7 @@ mod raw;
 pub(crate) mod signals;
 
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags};

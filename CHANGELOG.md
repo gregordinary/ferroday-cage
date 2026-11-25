@@ -107,6 +107,9 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `relay::Signals` serves a poll loop of the caller's own as well as a
+  relay's: it is the descriptor the blocked signals arrive on (`AsFd`), and
+  `Signals::read` takes each pending signal by its number.
 - `host::peer_in_own_user_namespace` answers whether the process that
   connected the other end of a unix socket runs in the caller's own user
   namespace. No sandbox's process does, though its credentials are the

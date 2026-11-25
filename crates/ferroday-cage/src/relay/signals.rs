@@ -13,7 +13,7 @@
 
 use std::io;
 use std::marker::PhantomData;
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -109,6 +109,15 @@ pub(super) const RELAYED: [Signal; 8] = [
 /// program that has signal handling of its own for one of the eight should not
 /// install this, because the block is process-wide and the descriptor is where
 /// those signals go instead.
+///
+/// # Without a relay
+///
+/// A program can wait for the signals in a poll loop of its own: the handle is
+/// the descriptor they arrive on ([`AsFd`]), and [`read`](Self::read) takes
+/// each by its number. All eight are blocked all the same, so the program acts
+/// on the ones it answers and drops the rest. One it drops does nothing at
+/// all: a `^Z` that a relay would answer by stopping the session no longer
+/// stops the program.
 ///
 /// ```no_run
 /// use ferroday_cage::relay::Signals;
@@ -219,9 +228,27 @@ impl Signals {
             .map_err(RelayError::at("restoring the signal mask"))
     }
 
-    /// The descriptor, for the relay's poll set.
-    pub(super) fn as_fd(&self) -> rustix::fd::BorrowedFd<'_> {
-        rustix::fd::AsFd::as_fd(&self.fd)
+    /// Reads one signal of the set that has arrived, by its number, or `None`
+    /// once none is pending.
+    ///
+    /// For a program that waits for the signals in a poll loop of its own
+    /// rather than in a [`Relay`](super::Relay)'s, as a server waits on its
+    /// sockets and its sandbox's handle besides: the descriptor
+    /// [`as_fd`](AsFd::as_fd) returns is readable while a signal is pending,
+    /// and each call takes one, without blocking. Calling it until it answers
+    /// `None` drains a wake that carried several. A signal the program has no
+    /// use for is taken and dropped, as a relay drops `SIGWINCH` with no
+    /// terminal to resize.
+    ///
+    /// The number is the kernel's, as [`ExitStatus::signal`] gives one.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::Io`] where the descriptor cannot be read.
+    ///
+    /// [`ExitStatus::signal`]: crate::ExitStatus::signal
+    pub fn read(&self) -> Result<Option<i32>, RelayError> {
+        self.next().map(|signal| signal.map(Signal::as_raw))
     }
 
     /// Reads one pending signal, or `None` when none is pending.
@@ -258,6 +285,16 @@ impl Signals {
                 }
             }
         }
+    }
+}
+
+impl AsFd for Signals {
+    /// The descriptor the blocked signals arrive on, readable while one is
+    /// pending: for a poll set, the relay's or the caller's own. It is
+    /// non-blocking and close-on-exec, and [`read`](Signals::read) takes what
+    /// it holds.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 
@@ -480,6 +517,8 @@ fn unblock_interrupt() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// Raises `signal` at *this* thread.
@@ -518,6 +557,30 @@ mod tests {
             None,
             "one record was queued and one was read",
         );
+    }
+
+    #[test]
+    fn a_poll_loop_of_the_callers_own_reads_a_signal_by_its_number() {
+        let signals = Signals::install().expect("the signal descriptor opens");
+        let readable = |signals: &Signals| {
+            let mut fds = [PollFd::new(signals, PollFlags::IN)];
+            rustix::event::poll(&mut fds, Some(&crate::poll::timeout(Duration::ZERO)))
+                .expect("the poll succeeds")
+                > 0
+        };
+        assert!(!readable(&signals), "nothing has been raised yet");
+
+        raise_here(Signal::HUP);
+        assert!(
+            readable(&signals),
+            "a pending signal makes the descriptor readable"
+        );
+        assert_eq!(
+            signals.read().expect("the descriptor reads"),
+            Some(Signal::HUP.as_raw())
+        );
+        assert_eq!(signals.read().expect("the descriptor reads"), None);
+        assert!(!readable(&signals), "the read took the one pending");
     }
 
     /// This thread's current signal mask, read without changing it.

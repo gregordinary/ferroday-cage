@@ -1754,7 +1754,10 @@ impl<'fd> core::panic::unwind_safe::UnwindSafe for ferroday_cage::relay::Relay<'
 pub struct ferroday_cage::relay::Signals
 impl ferroday_cage::relay::Signals
 pub fn ferroday_cage::relay::Signals::install() -> core::result::Result<ferroday_cage::relay::Signals, ferroday_cage::relay::RelayError>
+pub fn ferroday_cage::relay::Signals::read(&self) -> core::result::Result<core::option::Option<i32>, ferroday_cage::relay::RelayError>
 pub fn ferroday_cage::relay::Signals::release(self) -> core::result::Result<(), ferroday_cage::relay::RelayError>
+impl std::os::fd::owned::AsFd for ferroday_cage::relay::Signals
+pub fn ferroday_cage::relay::Signals::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl core::marker::Freeze for ferroday_cage::relay::Signals
 impl core::marker::Send for ferroday_cage::relay::Signals
 impl core::marker::Sync for ferroday_cage::relay::Signals
