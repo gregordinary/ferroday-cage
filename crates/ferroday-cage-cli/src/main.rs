@@ -3517,10 +3517,14 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     }
 
     // The native stack configures the isolated network; sharing the host
-    // network is the opposite request, and the stack's sub-flags mean
-    // nothing without it.
+    // network is the opposite request, denying the network is a request for
+    // none, which a stack attached would give back, and the stack's sub-flags
+    // mean nothing without it.
     if options.netstack && options.network == Some(Network::Host) {
         return Err("--netstack cannot be used with --share-net".to_string());
+    }
+    if options.netstack && options.network == Some(Network::None) {
+        return Err("--netstack cannot be used with --deny-net".to_string());
     }
     if !options.netstack && family_given(&applied, NETSTACK_FLAGS) {
         return Err("the --netstack-* options require --netstack".to_string());
@@ -5615,22 +5619,29 @@ impl Launch {
         };
         // What the profile asked for, read before any flag is applied over it.
         let profile_sets_term = builder.get_envs().any(|(name, _)| name == "TERM");
-        let profile_network_host = builder.get_network() == Network::Host;
-
-        // The parse-time guard rejects --netstack with --share-net, but a
-        // profile can request host networking without any CLI network flag,
-        // leaving that check blind. Reconcile against the loaded profile:
-        // attaching a stack to a host-network sandbox cannot work, and the
-        // usage error belongs here.
-        if options.netstack && options.network.is_none() && profile_network_host {
-            return Err(usage_error(format_args!(
-                "--netstack cannot be used with a profile that sets network = \"host\""
-            )));
-        }
-        if !options.forwards.is_empty() && options.network.is_none() && profile_network_host {
-            return Err(usage_error(format_args!(
-                "--forward-loopback cannot be used with a profile that sets network = \"host\""
-            )));
+        // The parse-time guards reject --netstack with --share-net or
+        // --deny-net, but a profile can request either network without any CLI
+        // network flag, leaving those checks blind. Reconcile against the
+        // loaded profile: a stack attached to a host-network sandbox cannot
+        // work, one attached to a sandbox denied the network would give it
+        // one, and a forward listens on a loopback only an isolated network
+        // brings up. The usage errors belong here.
+        let profile_network = match (options.network, builder.get_network()) {
+            (None, Network::Host) => Some("host"),
+            (None, Network::None) => Some("none"),
+            _ => None,
+        };
+        if let Some(network) = profile_network {
+            for (given, flag) in [
+                (options.netstack, "--netstack"),
+                (!options.forwards.is_empty(), "--forward-loopback"),
+            ] {
+                if given {
+                    return Err(usage_error(format_args!(
+                        "{flag} cannot be used with a profile that sets network = \"{network}\""
+                    )));
+                }
+            }
         }
 
         // The seccomp flags against the profile's own policy, which is known
@@ -10637,6 +10648,47 @@ mod tests {
             err.contains("--forward-loopback cannot be used with --restrict"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_stack_or_a_forward_is_refused_where_the_network_is_denied() {
+        // Attached to a sandbox denied the network, the stack would give it
+        // one, carrying whatever no rule refuses.
+        let err = parse_error(&["--rootfs", "/r", "--deny-net", "--netstack", "/bin/true"]);
+        assert!(
+            err.contains("--netstack cannot be used with --deny-net"),
+            "{err}"
+        );
+        // A profile denies it as surely as the flag does.
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-denied-network");
+        let profile = dir.join("none.toml");
+        std::fs::write(&profile, "rootfs = \"/tmp\"\nnetwork = \"none\"\n")
+            .expect("the profile is written");
+        let profile = profile.to_str().expect("a UTF-8 scratch path");
+        let prepared = |args: &[&str]| Launch::prepare(*run_options(args)).is_ok();
+        assert!(prepared(&["--profile", profile, "/bin/true"]));
+        assert!(!prepared(&[
+            "--profile",
+            profile,
+            "--netstack",
+            "/bin/true"
+        ]));
+        assert!(!prepared(&[
+            "--profile",
+            profile,
+            "--forward-loopback",
+            "80",
+            "/run/s.sock",
+            "/bin/true"
+        ]));
+        // The command line's network is the one the launch has.
+        assert!(prepared(&[
+            "--profile",
+            profile,
+            "--isolate-net",
+            "--netstack",
+            "/bin/true"
+        ]));
     }
 
     #[test]

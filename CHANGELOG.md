@@ -423,6 +423,10 @@ consumer upgrading can skip it.
   at `CreateMountTarget` with `EACCES`; a file it cannot read is none a launch
   created, and it now binds without the lock, as it does where the lock is
   refused.
+- `fcage` refuses `--netstack` with `--deny-net`, and `--netstack` or
+  `--forward-loopback` with a profile that sets `network = "none"`. The stack
+  attached to a sandbox denied the network gave it one, carrying every
+  connection no rule refused, while `--print-resolved` said `network = "none"`.
 
 ### Internal
 
