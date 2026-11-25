@@ -530,7 +530,9 @@ The host's tree holds the user's credentials and live sockets, and a read-only
 mount does not stop a `connect` to a socket. So this root hides `/home`,
 `/root`, `/run`, `/var/run`, and `/var/tmp` by default, as the first mounts after
 the managed profile. A working tree beneath one of them is bound back in, and
-its mount point is made inside the hidden directory. The default hides are
+its mount point is made inside the hidden directory. The managed `/proc`, `/dev`
+and `/tmp` cover the host's own, and where one of them is turned off, the
+host's is hidden in its place. The default hides are
 listed in the [resolved inputs](embedding.md#recording-what-a-build-ran-under),
 [`reveal`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.reveal)
 takes one back, and `managed_mounts(false)` takes them all. Where `/var/run`

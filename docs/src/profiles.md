@@ -469,9 +469,12 @@ or past what the consumer configures after loading: the operations that map
 host resources into the sandbox, write to the host outside it, or share a host
 namespace, and the parts of `[hardening]` a consumer's own calls add to rather
 than replace. [`RestrictedProfile`] lists each, with the key that spells it and
-the reason it is refused. Everything else is admitted, so a restricted profile
-still names its root filesystem, command, environment, hidden paths, limits,
-identity, and the hardening that only removes.
+the reason it is refused. Turning a managed mount off is among them: on the
+host's own root, which a consumer can choose after loading, the managed
+`/proc`, `/dev` and `/tmp` are what keep the host's out of view. Everything
+else is admitted, so a restricted profile still names its root filesystem,
+command, environment, hidden paths, limits, identity, and the hardening that
+only removes.
 
 Deserializing a `RestrictedProfile` reports a refusal through the format's own
 error, as text. A consumer that matches on the refusal deserializes a

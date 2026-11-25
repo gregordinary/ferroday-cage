@@ -78,10 +78,18 @@ const DIR_MODE: RawMode = 0o755;
 /// where the host keeps its users' credentials and its live sockets, which a
 /// read-only mount does not stop a `connect` to.
 ///
-/// `/tmp` and `/dev/shm` are not here because the managed profile already
-/// replaces them with tmpfs instances of the sandbox's own. A
-/// [`ConfigError::RevealUnhidden`] names this list as it stands.
+/// `/proc`, `/dev` and `/tmp` are not here because the managed profile
+/// replaces each with one of the sandbox's own; [`HOST_ROOT_REPLACED`] hides
+/// the host's where it does not. A [`ConfigError::RevealUnhidden`] names both
+/// lists as they stand.
 pub(crate) const HOST_ROOT_HIDDEN: [&str; 5] = ["/home", "/root", "/run", "/var/run", "/var/tmp"];
+
+/// The paths the managed profile mounts a filesystem of the sandbox's own at,
+/// which the [host's own root](CageBuilder::host_rootfs) hides by default where
+/// the profile is in place but the mount is turned off: the host's own `/dev`
+/// carries its devices, `/dev/shm` among them, its `/tmp` the sockets a
+/// desktop session listens on, and its `/proc` every host process.
+pub(crate) const HOST_ROOT_REPLACED: [&str; 3] = ["/proc", "/dev", "/tmp"];
 
 /// The sandbox path the host's resolver configuration is bound onto, and the
 /// one a caller's own mount there replaces.
@@ -1637,7 +1645,10 @@ impl CageBuilder {
     /// read-only mount does not stop a `connect`. So this root
     /// [hides](Self::hide) `/home`, `/root`, `/run`, `/var/run`, and
     /// `/var/tmp` by default, and a working tree beneath one of them is bound
-    /// back in. Each default hide is listed in
+    /// back in. The host's own `/proc`, `/dev` or `/tmp` is hidden too where
+    /// [`mount_proc`](Self::mount_proc), [`mount_dev`](Self::mount_dev) or
+    /// [`mount_tmp`](Self::mount_tmp) turns the sandbox's own off. Each default
+    /// hide is listed in
     /// [`resolved_inputs`](Cage::resolved_inputs), [`reveal`](Self::reveal)
     /// takes one back, and [`managed_mounts(false)`](Self::managed_mounts)
     /// takes them all with the rest of the managed profile. `/sys` is the
@@ -1694,8 +1705,10 @@ impl CageBuilder {
     /// Takes back one of the paths [`host_rootfs`](Self::host_rootfs) hides by
     /// default, so the command sees the host's own there, read-only.
     ///
-    /// `path` is one of `/home`, `/root`, `/run`, `/var/run`, and `/var/tmp`.
-    /// [`build`](Self::build) refuses any other, and any at all for another
+    /// `path` is one of `/home`, `/root`, `/run`, `/var/run`, and `/var/tmp`,
+    /// or `/proc`, `/dev` or `/tmp` where the managed profile mounts none of
+    /// the sandbox's own there. [`build`](Self::build) refuses any other, and
+    /// any at all for another
     /// kind of root, with [`ConfigError::RevealUnhidden`], since a path taken
     /// back from nothing is most likely a misspelling. A hidden path is
     /// followed where it is a symbolic link, so on a host where `/var/run`
@@ -2498,6 +2511,9 @@ impl CageBuilder {
     /// [`pid_namespace(false)`](Self::pid_namespace), whose nested map is
     /// written from outside the sandbox through the host's own `/proc`: that
     /// combination reads no procfs of the profile's and needs none.
+    ///
+    /// On the [host's own root](Self::host_rootfs), turning it off hides the
+    /// host's `/proc`, as the root's other default hides are hidden.
     pub fn mount_proc(mut self, mount: bool) -> Self {
         self.mount_proc = Some(mount);
         self
@@ -2520,6 +2536,10 @@ impl CageBuilder {
     /// with `ENXIO`. See [`Stdio`] for the whole rule. Dropping this mount does
     /// not change any of that: it removes `/dev/tty` as a *name*, while an
     /// inherited terminal descriptor is still an inherited terminal.
+    ///
+    /// On the [host's own root](Self::host_rootfs), turning it off hides the
+    /// host's `/dev`, its devices and `/dev/shm` with it, as the root's other
+    /// default hides are hidden.
     pub fn mount_dev(mut self, mount: bool) -> Self {
         self.mount_dev = Some(mount);
         self
@@ -2530,6 +2550,10 @@ impl CageBuilder {
     /// The tmpfs is `mode=1777`, and a `/tmp` the sandbox has to create to
     /// mount it on is created the same way, so the mount point a rootfs is left
     /// with is the directory it stands for.
+    ///
+    /// On the [host's own root](Self::host_rootfs), turning it off hides the
+    /// host's `/tmp`, and the sockets a desktop session keeps there, as the
+    /// root's other default hides are hidden.
     pub fn mount_tmp(mut self, mount: bool) -> Self {
         self.mount_tmp = Some(mount);
         self
@@ -3070,9 +3094,19 @@ impl CageBuilder {
         // The host root's default hides, part of the managed profile, less the
         // ones the caller took back. A path taken back from nothing is refused
         // rather than ignored: it is most likely a misspelling of one that is
-        // hidden.
+        // hidden. Each of `/proc`, `/dev` and `/tmp` the profile mounts nothing
+        // of the sandbox's own at is hidden with them, or the host's would show
+        // through the read-only clone.
+        let replaced = [mount_proc, mount_dev, mount_tmp];
         let hidden_by_default = HOST_ROOT_HIDDEN
             .iter()
+            .chain(
+                HOST_ROOT_REPLACED
+                    .iter()
+                    .zip(replaced)
+                    .filter(|(_, mounted)| !mounted)
+                    .map(|(hidden, _)| hidden),
+            )
             .map(|hidden| Ok((*hidden, sandbox_target(Path::new(hidden))?)))
             .collect::<Result<Vec<_>, Error>>()?;
         let mut revealed = Vec::with_capacity(self.reveal.len());
@@ -3363,6 +3397,12 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 ///   and a path the host's root hides taken back (`reveal`), which a
 ///   consumer's own [`host_rootfs`](CageBuilder::host_rootfs) after loading
 ///   would honor.
+/// - the managed mounts turned off (`managed-mounts = false`), and the managed
+///   `/proc`, `/dev` or `/tmp` turned off (`mount-proc`, `mount-dev` or
+///   `mount-tmp = false`). Each takes back what `reveal` would, should the
+///   consumer root the sandbox on the host's own root: the managed `/proc`,
+///   `/dev` and `/tmp` are what cover the host's there, and its default hides
+///   are managed mounts too.
 /// - the host PID namespace (`pid-namespace = false`). The managed `/proc` is
 ///   then the host's own, bound in read-write, through which the command can
 ///   read and signal every host process of its user.
@@ -3389,8 +3429,8 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// read-only, the command, its arguments, environment, and working directory,
 /// path lookup, the hostname, the stream dispositions, the tie to the caller's
 /// lifetime, the resource limits and the cgroup limits, the identity map, the
-/// run-as and presented identities, the base environment, and the remaining
-/// mount toggles. So is the hardening that only removes: a seccomp policy, a
+/// run-as and presented identities, the base environment, and the managed
+/// `resolv.conf` turned off. So is the hardening that only removes: a seccomp policy, a
 /// full capability drop (`drop-caps`), the Landlock scopes, and the unix-socket
 /// restriction turned on, each of which a consumer's own call replaces.
 ///
@@ -3531,18 +3571,18 @@ impl CageBuilder {
             stdin: _,
             stdout: _,
             stderr: _,
-            mount_proc: _,
-            mount_dev: _,
-            mount_tmp: _,
+            // Examined below: each keeps the host's own out of view should
+            // the consumer root the sandbox on the host's own root.
+            mount_proc,
+            mount_dev,
+            mount_tmp,
+            managed_mounts,
             resolv_conf: _,
             // Addresses written into a file of the launch's own, which maps
             // nothing of the host in.
             nameservers: _,
-            // Both narrow the sandbox rather than widen it. Opting out of the
-            // managed mounts removes mounts; opting out of the base
-            // environment removes variables. Neither can reach a host resource
-            // the profile could not already reach.
-            managed_mounts: _,
+            // Opting out of the base environment removes variables, which
+            // reaches no host resource the profile could not already reach.
             base_env: _,
             stop_with_caller: _,
             path_lookup: _,
@@ -3600,6 +3640,27 @@ impl CageBuilder {
             return Err(ConfigError::ProfileOperationForbidden {
                 operation: "a path the host's root hides taken back (reveal)",
             });
+        }
+        // Turning a managed mount off reads as removing a mount, and on a
+        // rootfs it does. On the host's own root, which a consumer can choose
+        // after loading, the managed `/proc`, `/dev` and `/tmp` are what cover
+        // the host's, and the default hides are managed mounts too, so it
+        // takes back what `reveal` would.
+        for (toggle, operation) in [
+            (
+                managed_mounts,
+                "the managed mounts turned off (managed-mounts = false)",
+            ),
+            (
+                mount_proc,
+                "the managed /proc turned off (mount-proc = false)",
+            ),
+            (mount_dev, "the managed /dev turned off (mount-dev = false)"),
+            (mount_tmp, "the managed /tmp turned off (mount-tmp = false)"),
+        ] {
+            if *toggle == Some(false) {
+                return Err(ConfigError::ProfileOperationForbidden { operation });
+            }
         }
         // A shared host PID namespace is a host-resource mapping in disguise:
         // with `pid_namespace = false` the default `mount_proc` binds the
@@ -9313,6 +9374,22 @@ target = "/work/.git/hooks"
             "rootfs = \"/srv/rootfs\"\nreveal = [\"/run\"]\n",
             "a path the host's root hides taken back (reveal)",
         ),
+        (
+            "managed-mounts = false\n",
+            "the managed mounts turned off (managed-mounts = false)",
+        ),
+        (
+            "mount-proc = false\n",
+            "the managed /proc turned off (mount-proc = false)",
+        ),
+        (
+            "mount-dev = false\n",
+            "the managed /dev turned off (mount-dev = false)",
+        ),
+        (
+            "mount-tmp = false\n",
+            "the managed /tmp turned off (mount-tmp = false)",
+        ),
         ("pid-namespace = false\n", "the host PID namespace"),
         (
             "[cgroup]\nparent = \"/sys/fs/cgroup/delegated\"\n",
@@ -9375,7 +9452,7 @@ stdout = "inherit"
 stderr = "null"
 managed-mounts = true
 mount-proc = true
-mount-dev = false
+mount-dev = true
 mount-tmp = true
 resolv-conf = false
 base-env = false

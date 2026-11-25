@@ -54,6 +54,15 @@ consumer upgrading can skip it.
   `SetupStep::HoldReadOnlyName`. The `agent-tools` example also checks, after
   the command, that every path it holds and every directory above one is the
   entry it was, and takes nothing in otherwise.
+- `RestrictedProfile` refuses a managed mount turned off: `managed-mounts`,
+  `mount-proc`, `mount-dev` or `mount-tmp` set to `false`. On the host's own
+  root, which a consumer can choose after loading, the managed `/proc`, `/dev`
+  and `/tmp` are what cover the host's, and the root's default hides are
+  managed mounts too, so such a profile showed the host's `/tmp` with its
+  sockets, its `/dev` with its devices, or its `/home`, as a `reveal` would.
+  The host's own root also hides the host's `/proc`, `/dev` or `/tmp` wherever
+  the managed profile mounts none of its own there, and `reveal` takes such a
+  hide back.
 
 ### Added
 

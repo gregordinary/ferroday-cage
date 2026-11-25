@@ -127,6 +127,27 @@ fn a_default_hide_is_listed_and_one_taken_back_shows_the_host_s_own() {
         hides(Cage::builder().host_rootfs().reveal("/var/tmp")),
         ["/home", "/root", "/run", "/var/run"]
     );
+    // Where the managed profile mounts no `/proc`, `/dev` or `/tmp` of the
+    // sandbox's own, the host's is hidden in its place, and can be taken back.
+    assert_eq!(
+        hides(
+            Cage::builder()
+                .host_rootfs()
+                .mount_dev(false)
+                .mount_tmp(false)
+                .reveal("/run")
+        ),
+        ["/home", "/root", "/var/run", "/var/tmp", "/dev", "/tmp"]
+    );
+    assert_eq!(
+        hides(
+            Cage::builder()
+                .host_rootfs()
+                .mount_tmp(false)
+                .reveal("/tmp")
+        ),
+        ["/home", "/root", "/run", "/var/run", "/var/tmp"]
+    );
     // Opting out of the managed profile takes them with it; the procfs the
     // command's nested namespace needs is then the profile's own.
     assert!(
@@ -150,6 +171,16 @@ fn a_default_hide_is_listed_and_one_taken_back_shows_the_host_s_own() {
     );
 
     let (ok, printed) = run(
+        Cage::builder().host_rootfs().mount_tmp(false),
+        "ls -A /tmp | wc -l; touch /tmp/written || echo refused",
+    );
+    assert!(ok, "{printed}");
+    assert!(
+        printed.starts_with("0\n") && printed.contains("refused"),
+        "{printed}"
+    );
+
+    let (ok, printed) = run(
         Cage::builder().host_rootfs().reveal("/var/tmp"),
         "ls -A /var/tmp | wc -l",
     );
@@ -163,6 +194,8 @@ fn a_path_not_hidden_by_default_is_not_taken_back() {
     for builder in [
         Cage::builder().host_rootfs().reveal("/etc"),
         Cage::builder().empty_rootfs().reveal("/run"),
+        // The managed `/tmp` covers the host's, so nothing hides it.
+        Cage::builder().host_rootfs().reveal("/tmp"),
     ] {
         match builder.command("/bin/true").build() {
             Err(Error::Config(ConfigError::RevealUnhidden { .. })) => {}

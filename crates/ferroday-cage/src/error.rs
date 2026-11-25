@@ -39,7 +39,7 @@ use std::path::PathBuf;
 
 use crate::cgroup::{CgroupReach, CgroupRefusal};
 use crate::host::{Confinement, ProcfsBlocker, UsernsBlocker};
-use crate::spec::{HOST_ROOT_HIDDEN, is_command_name};
+use crate::spec::{HOST_ROOT_HIDDEN, HOST_ROOT_REPLACED, is_command_name};
 use crate::wire::wire_enum;
 
 wire_enum! {
@@ -836,8 +836,9 @@ rendered as text.
     },
     /// [`CageBuilder::reveal`](crate::CageBuilder::reveal) names a path the
     /// root does not hide by default: one outside the
-    /// [host's own root](crate::CageBuilder::host_rootfs)'s list, or any path
-    /// for another kind of root.
+    /// [host's own root](crate::CageBuilder::host_rootfs)'s list, which holds
+    /// the host's `/proc`, `/dev` or `/tmp` only where the managed profile
+    /// mounts none of its own there, or any path for another kind of root.
     #[non_exhaustive]
     RevealUnhidden {
         /// The path as it was given.
@@ -1299,7 +1300,17 @@ impl fmt::Display for ConfigError {
                     }
                     f.write_str(hidden_path)?;
                 }
-                f.write_str(")")
+                f.write_str(", and the host's own ")?;
+                let replaced = HOST_ROOT_REPLACED;
+                for (at, replaced_path) in replaced.iter().enumerate() {
+                    match at {
+                        0 => {}
+                        at if at + 1 == replaced.len() => f.write_str(" or ")?,
+                        _ => f.write_str(", ")?,
+                    }
+                    f.write_str(replaced_path)?;
+                }
+                f.write_str(" where the managed profile mounts none of its own)")
             }
             ConfigError::CgroupLimitInvalid { reason } => {
                 write!(f, "the cgroup settings cannot be carried out: {reason}")
@@ -2008,7 +2019,9 @@ mod tests {
         .to_string();
         assert!(
             message.ends_with(
-                "(the host's own root hides /home, /root, /run, /var/run, and /var/tmp)"
+                "(the host's own root hides /home, /root, /run, /var/run, and /var/tmp, and \
+                 the host's own /proc, /dev or /tmp where the managed profile mounts none of \
+                 its own)"
             ),
             "{message}"
         );
