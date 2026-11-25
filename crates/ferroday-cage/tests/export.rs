@@ -2094,11 +2094,12 @@ fn gnu_tar_applies_an_exported_access_control_list() {
     );
 }
 
-/// A pax keyword ends at its first `=`, so an attribute whose name holds one is
-/// spelled as GNU tar spells it, `%3D`, with `%` itself as `%25`, and GNU tar
-/// reads it back whole.
+/// A pax keyword ends at its first `=`, and the spelling GNU tar gives one,
+/// `%3D` with `%` itself as `%25`, is one bsdtar and Go do not decode, so an
+/// attribute whose name holds one cannot be recorded so that every reader reads
+/// it back alike, and refuses its entry.
 #[test]
-fn an_attribute_name_holding_an_equals_sign_is_spelled_as_gnu_tar_spells_it() {
+fn an_attribute_name_holding_an_equals_sign_refuses_its_entry() {
     if !common::require::userns() {
         return;
     }
@@ -2111,13 +2112,43 @@ fn an_attribute_name_holding_an_equals_sign_is_spelled_as_gnu_tar_spells_it() {
         return;
     }
     let mut out = Vec::new();
-    provision::export_tar(&root, &mut out, IdentityMap::Single).expect("the export succeeds");
-    let entries = parse_tar(&out);
-    let index = by_path(&entries);
-    assert_eq!(
-        index[&b"./file"[..]].xattrs,
-        vec![(b"user.a%3Db%25c".to_vec(), b"the value".to_vec())],
-    );
+    let err = provision::export_tar(&root, &mut out, IdentityMap::Single)
+        .expect_err("the entry is refused");
+    match &err {
+        provision::ProvisionError::EntryRefused { path, reason, .. } => {
+            assert_eq!(path, &root.join("file"));
+            assert!(reason.contains("user.a=b%c"), "{reason}");
+        }
+        other => panic!("expected the entry refused, got {other:?}"),
+    }
+}
+
+/// An attribute with an empty value, which Go reads as the record deleted and
+/// GNU tar and bsdtar set, refuses its entry, naming the file and the
+/// attribute.
+#[test]
+fn an_attribute_with_an_empty_value_refuses_its_entry() {
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("xattr-empty");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file"), b"x").unwrap();
+    if !xattr::set(&root.join("file"), "user.empty", b"") {
+        common::require::FILESYSTEM.skip("this filesystem holds no user extended attributes");
+        return;
+    }
+    let mut out = Vec::new();
+    let err = provision::export_tar(&root, &mut out, IdentityMap::Single)
+        .expect_err("the entry is refused");
+    match &err {
+        provision::ProvisionError::EntryRefused { path, reason, .. } => {
+            assert_eq!(path, &root.join("file"));
+            assert!(reason.contains("user.empty"), "{reason}");
+        }
+        other => panic!("expected the entry refused, got {other:?}"),
+    }
 }
 
 /// An entry the copy cannot create is named in the report rather than dropped

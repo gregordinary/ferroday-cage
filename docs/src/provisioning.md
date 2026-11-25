@@ -423,10 +423,11 @@ subsystem's `security.ima` and `security.evm`, and overlayfs's own `overlay.*`
 bookkeeping. They describe the host the tree sat on, and they differ between two
 hosts holding the same tree.
 
-Each attribute is a `SCHILY.xattr.` pax record. A record's keyword ends at its
-first `=`, so a name holding one is spelled as GNU `tar` spells it. An `=` is
-written `%3D` and a `%` is written `%25`, and GNU `tar` restores the name
-whole.
+Each attribute is a `SCHILY.xattr.` pax record, its name written as its bytes.
+An attribute no record writes so that every tar reader reads it back alike
+refuses its entry with `ProvisionError::EntryRefused`: a name holding `=`, which
+ends a record's keyword, or `%3D` or `%25`, which GNU `tar` decodes and `bsdtar`
+and Go do not, and an empty value, which Go reads as no attribute at all.
 
 A POSIX access control list is written twice: as its attribute's record, and as
 the text a `SCHILY.acl.access` record holds, or `SCHILY.acl.default` for a

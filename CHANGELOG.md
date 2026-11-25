@@ -692,6 +692,15 @@ consumer upgrading can skip it.
 - A list a text gives with more entries than an attribute's value holds,
   8,191, refuses its entry with `ProvisionError::EntryRefused`. Setting the
   list failed with the kernel's `E2BIG`, as an I/O error.
+- **Breaking.** `export_tar` encodes its headers with ferrotape. It refuses a
+  file with an extended attribute whose name holds `=`, a NUL, `%3D` or `%25`,
+  or whose value is empty, with `ProvisionError::EntryRefused` naming the file
+  and the attribute, where it spelled `=` and `%` as GNU tar does. It writes a
+  mode's permission bits alone, names a pax header `PaxHeader/` and the entry's
+  last component, in the entry's directory, and writes a size past 8 GiB in the
+  header block as well as in its record. An export's bytes therefore differ
+  from an earlier release's for the same tree, and so does any digest taken of
+  them. GNU tar, bsdtar and Python list the two alike.
 
 ### Fixed
 

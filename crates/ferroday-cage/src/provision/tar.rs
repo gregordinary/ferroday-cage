@@ -1151,39 +1151,19 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
     Ok(records)
 }
 
-// The writing side of the same format. The reader above and these share the
-// block size, the field offsets, and the octal encoding, so they are one
-// module: two files describing one header layout drift, and a header this
-// crate writes is one this crate reads back in `export_tar`'s round trip.
+// The writing side of the same format, which the Alpine database's scripts
+// archive is written with. The reader above and these share the block size,
+// the field offsets, and the octal encoding, so they are one module: two files
+// describing one header layout drift.
 
 /// The prefix of the pax keyword that records an extended attribute, the name
 /// following it.
 pub(crate) const XATTR_KEYWORD: &[u8] = b"SCHILY.xattr.";
 
-/// The pax keyword recording the extended attribute `name`, spelled as GNU tar
-/// spells it.
-///
-/// A pax record's keyword ends at its first `=`, so a name holding one cannot
-/// be written as it stands: the record would read back as a shorter name with
-/// the rest of the name in its value. GNU tar writes `=` as `%3D` and, so that
-/// the escape is unambiguous, `%` as `%25`, and reads both back. Spelling a name
-/// the same way means GNU tar and this crate's reader ([`xattr_name`]) restore
-/// it exactly.
-pub(crate) fn xattr_keyword(name: &[u8]) -> Vec<u8> {
-    let mut keyword = XATTR_KEYWORD.to_vec();
-    for &byte in name {
-        match byte {
-            b'%' => keyword.extend_from_slice(b"%25"),
-            b'=' => keyword.extend_from_slice(b"%3D"),
-            byte => keyword.push(byte),
-        }
-    }
-    keyword
-}
-
 /// The attribute name a `SCHILY.xattr.` keyword's remainder spells, its
-/// `%3D` and `%25` read back as GNU tar reads them ([`xattr_keyword`]). Any
-/// other `%` stands for itself.
+/// `%3D` and `%25` read back as GNU tar reads them: GNU tar writes `=`, which
+/// would end the keyword, as `%3D`, and `%` as `%25`. Any other `%` stands for
+/// itself.
 fn xattr_name(spelled: &[u8]) -> Vec<u8> {
     let mut name = Vec::with_capacity(spelled.len());
     let mut at = 0;
@@ -1207,9 +1187,6 @@ fn xattr_name(spelled: &[u8]) -> Vec<u8> {
     name
 }
 
-/// The largest size the ustar octal `size` field holds (`8^11 - 1`); a larger
-/// file needs a pax `size` record.
-pub(crate) const MAX_USTAR_SIZE: u64 = (1 << 33) - 1;
 /// The length of the ustar `name` field. A longer path is split into `prefix`
 /// and `name` at a separator, or carried in a pax `path` record when it does not
 /// split; a name with no separator in it fits or it does not.
@@ -1222,10 +1199,6 @@ pub(crate) const MAX_USTAR_PREFIX: usize = 155;
 /// carried in a pax `mtime` record instead, the ustar field holding a clamped
 /// placeholder the reader ignores, the way an oversized path or file does.
 pub(crate) const MAX_USTAR_MTIME: i64 = (1 << 33) - 1;
-/// The largest value the ustar octal `uid`/`gid` field holds (`8^7 - 1`). A
-/// larger id is carried in a pax `uid` or `gid` record, the ustar field holding
-/// a clamped placeholder the reader ignores, the way an out-of-range time does.
-pub(crate) const MAX_USTAR_ID: u32 = (1 << 21) - 1;
 
 /// A pax extended-header record, `<length> <key>=<value>` and a newline, whose
 /// length counts the whole record, its own digits included.
@@ -1381,8 +1354,9 @@ mod tests {
     #[test]
     fn octal_rejects_an_overlong_value() {
         let mut field = [0u8; 8];
-        assert!(octal(&mut field, u64::from(MAX_USTAR_ID)).is_ok());
-        assert!(octal(&mut field, u64::from(MAX_USTAR_ID) + 1).is_err());
+        // The most seven octal digits hold, and one past it.
+        assert!(octal(&mut field, 0o7777777).is_ok());
+        assert!(octal(&mut field, 0o7777777 + 1).is_err());
     }
 
     #[test]
@@ -1423,15 +1397,13 @@ mod tests {
     }
 
     #[test]
-    fn an_attribute_name_holding_an_equals_sign_survives_its_keyword() {
-        // A keyword ends at the first `=`, so a name holding one is spelled as
-        // GNU tar spells it, and read back the same way.
-        for name in [&b"user.a=b"[..], b"user.100%", b"user.%3D", b"user.plain"] {
-            let keyword = xattr_keyword(name);
-            assert!(!keyword.contains(&b'='), "{keyword:?}");
-            assert_eq!(xattr_name(&keyword[XATTR_KEYWORD.len()..]), name);
-        }
-        assert_eq!(xattr_keyword(b"user.a=b%c"), b"SCHILY.xattr.user.a%3Db%25c");
+    fn an_attribute_names_escapes_are_read_as_gnu_tar_reads_them() {
+        // A keyword ends at the first `=`, so GNU tar spells one in a name as
+        // `%3D`, and `%` as `%25`.
+        assert_eq!(xattr_name(b"user.a%3Db%25c"), b"user.a=b%c");
+        assert_eq!(xattr_name(b"user.100%"), b"user.100%");
+        assert_eq!(xattr_name(b"user.%25%3D"), b"user.%=");
+        assert_eq!(xattr_name(b"user.plain"), b"user.plain");
     }
 
     #[test]

@@ -21,7 +21,7 @@ cargo add ferroday-cage --features serde,tarball,hardening
 | Feature | What it adds | What it pulls in |
 | --- | --- | --- |
 | [`serde`](profiles.md) | The profile format: `CageBuilder` serializes and deserializes as the sandbox specification, and `RestrictedProfile` loads one from an untrusted source | `serde` |
-| [`tarball`](provisioning.md#the-tarball-provisioner) | The `Tarball` provisioner (gzip, xz, and zstd, detected by content) and `export_tar`, its ownership-preserving counterpart | `flate2`, `lzma-rust2`, `ruzstd` |
+| [`tarball`](provisioning.md#the-tarball-provisioner) | The `Tarball` provisioner (gzip, xz, and zstd, detected by content) and `export_tar`, its ownership-preserving counterpart | `flate2`, `lzma-rust2`, `ruzstd`, `ferrotape` |
 | [`debian`](debian.md) | The Debian provisioner: bootstrap a suite and architecture from the archive, with signature verification and dependency resolution. Implies `tarball` | `irongall`, `sha2`, and `tarball`'s |
 | [`alpine`](alpine.md) | The Alpine provisioner: resolve and install a package set from an apk repository, with signature verification and apk's dependency resolution. Serves postmarketOS's repositories too. Implies `tarball` | `ferrata`, `irongall`, `sha2`, and `tarball`'s |
 | [`gentoo`](gentoo.md) | The Gentoo provisioner: resolve a stage3 variant to the build the archive currently publishes and extract it, then install prebuilt packages into it from the archive's binary-package host, all verified against a vendored keyring. Implies `tarball` | `irongall`, `sha2`, `md-5`, and `tarball`'s |

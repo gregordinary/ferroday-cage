@@ -689,6 +689,7 @@ version = "0.6.0"
 dependencies = [
  "ferrata",
  "ferroday-cage-testkit",
+ "ferrotape",
  "file-acl",
  "flate2",
  "irongall",
@@ -732,6 +733,12 @@ dependencies = [
  "ruzstd",
  "sha2 0.11.1",
 ]
+
+[[package]]
+name = "ferrotape"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd6fc0c0e7e841889fb2f99b6a010d2040ba682eba22d2b46bb236f2265d8d3e"
 
 [[package]]
 name = "ff"

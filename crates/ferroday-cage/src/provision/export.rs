@@ -19,9 +19,8 @@
 //! the child holds no path to offer one and could not call a caller's code
 //! post-fork. This side answers the child instead, telling it to skip an
 //! excluded subtree and a file whose data the archive does not hold, so
-//! nothing crosses the stream that the archive leaves out. The encoder is
-//! hand-rolled, symmetric with the [reader](super::tar), and adds no tar
-//! dependency.
+//! nothing crosses the stream that the archive leaves out. ferrotape encodes
+//! each entry's headers, so that every tar reader reads them back alike.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
@@ -39,10 +38,6 @@ use file_acl::xattr::DecodeError;
 use super::containment;
 use super::copyin::Translation;
 use super::identity::compose_child_map;
-use super::tar::{
-    BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
-    pax_header_block, pax_record, ustar_block, xattr_keyword,
-};
 use super::xattr::{ACCESS_ACL, DEFAULT_ACL};
 use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
@@ -51,6 +46,7 @@ use crate::mechanism::{
     REPLY_SEND, REPLY_SKIP, StartError, asks_for_file, kill_export, start_export,
 };
 use crate::{IdMapper, IdentityMap};
+use ferrotape::{Header, HeaderError, Timestamp, WriteError, Writer};
 
 /// An ownership-preserving rootfs export, configured then written.
 ///
@@ -608,10 +604,7 @@ fn drive<W: Write>(
                 tar.symlink(&meta).map_err(|e| failed(e, &tar, &meta))?;
             }
             FRAME_LEAVE => tar.leave_dir(),
-            FRAME_END => {
-                tar.finish().map_err(write_err)?;
-                return Ok(());
-            }
+            FRAME_END => return tar.finish().map_err(write_err),
             FRAME_ERROR => {
                 let (step, errno, name) = read_error(&mut reader).map_err(read_err)?;
                 let Some(step) = ExportStep::from_wire(step) else {
@@ -748,7 +741,7 @@ struct Meta {
 /// Encodes the frame stream into a tar, maintaining the path stack and the
 /// hardlink table the post-fork child could not.
 struct TarWriter<'f, W: Write> {
-    out: W,
+    out: Writer<W>,
     /// Directory name components from the root to the current directory.
     ///
     /// A pruned directory is not pushed, so the stack always describes a path
@@ -777,18 +770,23 @@ struct TarWriter<'f, W: Write> {
     /// The ids an entry the map does not hold reads as, where the map does not
     /// hold them itself.
     overflow: Overflow,
+    /// The header of the file [`place_file`](Self::place_file) placed, which
+    /// [`file_data`](Self::file_data) writes with the data: ferrotape writes a
+    /// member's header and data together.
+    pending: Option<Header>,
 }
 
 impl<'f, W: Write> TarWriter<'f, W> {
     fn new(out: W, epoch: Option<i64>, filter: Option<&'f EntryPredicate<'f>>) -> TarWriter<'f, W> {
         TarWriter {
-            out,
+            out: Writer::new(out),
             stack: Vec::new(),
             hardlinks: HashMap::new(),
             epoch,
             filter,
             pruned: 0,
             overflow: Overflow::default(),
+            pending: None,
         }
     }
 
@@ -932,8 +930,7 @@ impl<'f, W: Write> TarWriter<'f, W> {
         let mut path = self.child_path(&meta.name);
         self.stack.push(meta.name.clone());
         path.push(b'/');
-        self.write_entry(&path, b'5', meta, 0, &[], &meta.xattrs)
-            .map_err(EncodeError::Write)
+        self.append(Header::directory(path), meta, io::empty())
     }
 
     /// Ascends out of the current directory, or out of one level of an excluded
@@ -967,14 +964,16 @@ impl<'f, W: Write> TarWriter<'f, W> {
         if meta.nlink > 1 {
             if let Some(first) = self.hardlinks.get(&(meta.dev, meta.ino)) {
                 let first = first.clone();
-                self.write_entry(&path, b'1', meta, 0, &first, &meta.xattrs)
-                    .map_err(EncodeError::Write)?;
+                let header = self.prepare(Header::hard_link(path, first), meta)?;
+                self.write(&header, io::empty())?;
                 return Ok(false);
             }
             self.hardlinks.insert((meta.dev, meta.ino), path.clone());
         }
-        self.write_entry(&path, b'0', meta, meta.size, &[], &meta.xattrs)
-            .map_err(EncodeError::Write)?;
+        // The header waits for the data the child streams once it is told to,
+        // and is encoded now, so a file no archive can record as the tree
+        // holds it is refused before the child streams anything.
+        self.pending = Some(self.prepare(Header::file(path, meta.size), meta)?);
         Ok(true)
     }
 
@@ -983,8 +982,12 @@ impl<'f, W: Write> TarWriter<'f, W> {
     ///
     /// [`place_file`]: Self::place_file
     fn file_data(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<(), EncodeError> {
-        copy_data(reader, &mut self.out, meta.size)?;
-        pad(&mut self.out, meta.size).map_err(EncodeError::Write)
+        let Some(header) = self.pending.take() else {
+            return Err(EncodeError::Write(io::Error::other(
+                "a file's data arrived with no header placed for it",
+            )));
+        };
+        self.write(&header, reader.take(meta.size))
     }
 
     /// The host path of a child named `name` in the current directory, for an
@@ -1006,62 +1009,46 @@ impl<'f, W: Write> TarWriter<'f, W> {
         }
         self.check_mapped(meta)?;
         let path = self.child_path(&meta.name);
-        self.write_entry(&path, b'2', meta, 0, &meta.link_target, &meta.xattrs)
-            .map_err(EncodeError::Write)
+        self.append(
+            Header::symlink(path, meta.link_target.clone()),
+            meta,
+            io::empty(),
+        )
     }
 
-    /// Writes two zero blocks: the archive terminator.
-    fn finish(&mut self) -> io::Result<()> {
-        self.out.write_all(&[0u8; BLOCK as usize * 2])?;
-        self.out.flush()
+    /// Ends the archive with its end marker and flushes it.
+    fn finish(self) -> io::Result<()> {
+        self.out.finish().map(drop).map_err(io::Error::from)
     }
 
-    /// Writes an entry's header(s): a pax extended header when the ustar fields
-    /// cannot hold the path, link target, size, modification time, owner,
-    /// group, or any extended attribute, then the ustar header itself.
-    fn write_entry(
-        &mut self,
-        path: &[u8],
-        typeflag: u8,
-        meta: &Meta,
-        size: u64,
-        linkname: &[u8],
-        xattrs: &[(Vec<u8>, Vec<u8>)],
-    ) -> io::Result<()> {
-        let mtime = self.clamp(meta.mtime);
-        let split = split_name(path);
-        let link_fits = linkname.len() <= 100;
-        let size_fits = size <= MAX_USTAR_SIZE;
-        let mtime_fits = (0..=MAX_USTAR_MTIME).contains(&mtime);
+    /// Writes an entry: `header`, [prepared](Self::prepare) from `meta`,
+    /// then the data its size says to read from `data`, which only a regular
+    /// file has.
+    fn append(&mut self, header: Header, meta: &Meta, data: impl Read) -> Result<(), EncodeError> {
+        let header = self.prepare(header, meta)?;
+        self.write(&header, data)
+    }
 
-        // Assemble any pax records the ustar header cannot express.
-        let mut pax = Vec::new();
-        if split.is_none() {
-            pax.extend_from_slice(&pax_record(b"path", path));
-        }
-        if !link_fits {
-            pax.extend_from_slice(&pax_record(b"linkpath", linkname));
-        }
-        if !size_fits {
-            pax.extend_from_slice(&pax_record(b"size", size.to_string().as_bytes()));
-        }
-        if !mtime_fits {
-            // A pre-1970 or far-future time the ustar field cannot hold: record
-            // the real seconds-since-epoch, negative or large, rather than
-            // clamp it silently or abort the whole export on one exotic stamp.
-            pax.extend_from_slice(&pax_record(b"mtime", mtime.to_string().as_bytes()));
-        }
-        // An id past the octal field's seven digits: a range map whose extents
-        // reach that far, or an explicit `Ranges` one. Recorded exactly, as GNU
-        // tar records it and as this crate's reader reads it back.
-        if meta.uid > MAX_USTAR_ID {
-            pax.extend_from_slice(&pax_record(b"uid", meta.uid.to_string().as_bytes()));
-        }
-        if meta.gid > MAX_USTAR_ID {
-            pax.extend_from_slice(&pax_record(b"gid", meta.gid.to_string().as_bytes()));
-        }
-        for (name, value) in xattrs {
-            pax.extend_from_slice(&pax_record(&xattr_keyword(name), value));
+    /// `header` given `meta`'s mode, owner, modification time and extended
+    /// attributes, refused where no archive can record the entry as the tree
+    /// holds it.
+    ///
+    /// ferrotape writes whatever the ustar block cannot hold exactly as a pax
+    /// record before it: a long path or link target, a size past 8 GiB, a time
+    /// before 1970 or past the octal field's reach, an id past seven octal
+    /// digits, and every extended attribute. A header it cannot write so that
+    /// every reader reads it back as set refuses the entry here, before any of
+    /// it is written: an attribute whose name holds `=`, a NUL, `%3D` or
+    /// `%25`, or whose value is empty, which the refusal names.
+    fn prepare(&self, mut header: Header, meta: &Meta) -> Result<Header, EncodeError> {
+        // The frame carries the file's whole mode, its type among it; the
+        // header's kind is the type, and its mode the permission bits.
+        header
+            .set_mode(meta.mode & 0o7777)
+            .set_owner(meta.uid, meta.gid)
+            .set_mtime(Timestamp::from_secs(self.clamp(meta.mtime)));
+        for (name, value) in &meta.xattrs {
+            header.add_xattr(name.clone(), value.clone());
         }
         // Each access control list again in its text form, which is the one
         // GNU tar and bsdtar apply: both pass over the attribute's value above.
@@ -1072,48 +1059,37 @@ impl<'f, W: Write> TarWriter<'f, W> {
             (ACCESS_ACL, &b"SCHILY.acl.access"[..]),
             (DEFAULT_ACL, b"SCHILY.acl.default"),
         ] {
-            let list = xattrs
+            let list = meta
+                .xattrs
                 .iter()
                 .find(|(name, _)| name.as_slice() == attribute.to_bytes());
             if let Some((_, value)) = list
                 && let Ok(Some(acl)) = file_acl::xattr::decode(value)
             {
-                pax.extend_from_slice(&pax_record(keyword, &text::write(&acl, Spelling::GNU_TAR)));
+                header.add_record(keyword, text::write(&acl, Spelling::GNU_TAR));
             }
         }
-
-        if !pax.is_empty() {
-            self.write_pax_header(path, mtime, pax.len())?;
-            self.out.write_all(&pax)?;
-            pad(&mut self.out, pax.len() as u64)?;
-        }
-
-        // The ustar header. When a pax record overrides a field, the ustar
-        // field holds a truncated form the reader ignores. An id is clamped
-        // rather than zeroed, so a reader that ignores pax records takes the
-        // entry for an unprivileged owner's rather than for root's.
-        let (name_field, prefix_field) =
-            split.unwrap_or((&path[..path.len().min(MAX_USTAR_NAME)], &[][..]));
-        let ustar_size = if size_fits { size } else { 0 };
-        let link_field = &linkname[..linkname.len().min(MAX_USTAR_NAME)];
-        let block = ustar_block(
-            name_field,
-            prefix_field,
-            meta.mode,
-            meta.uid.min(MAX_USTAR_ID),
-            meta.gid.min(MAX_USTAR_ID),
-            ustar_size,
-            mtime,
-            typeflag,
-            link_field,
-        )?;
-        self.out.write_all(&block)
+        header.encode().map_err(refused)?;
+        Ok(header)
     }
 
-    /// Writes the header of a pax extended-header entry (typeflag `x`).
-    fn write_pax_header(&mut self, path: &[u8], mtime: i64, size: usize) -> io::Result<()> {
-        self.out.write_all(&pax_header_block(path, mtime, size)?)
+    /// Writes `header` and the data its size says to read from `data`.
+    fn write(&mut self, header: &Header, data: impl Read) -> Result<(), EncodeError> {
+        self.out.append(header, data).map_err(|err| match err {
+            WriteError::Header(err) => refused(err),
+            WriteError::Data(err) => EncodeError::Read(err),
+            WriteError::Io(err) => EncodeError::Write(err),
+            other => EncodeError::Write(io::Error::other(other)),
+        })
     }
+}
+
+/// The refusal of an entry whose header no archive records as the tree holds
+/// it, naming what of it cannot be written.
+fn refused(err: HeaderError) -> EncodeError {
+    EncodeError::Refused(format!(
+        "an archive cannot record it as the tree holds it: {err}"
+    ))
 }
 
 /// Why the encoder stopped on an entry.
@@ -1155,21 +1131,6 @@ impl Overflow {
     }
 }
 
-/// Copies exactly `n` bytes from the stream to the archive.
-fn copy_data(reader: &mut impl Read, out: &mut impl Write, n: u64) -> Result<(), EncodeError> {
-    let mut remaining = n;
-    let mut buf = [0u8; 1 << 16];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        reader
-            .read_exact(&mut buf[..want])
-            .map_err(EncodeError::Read)?;
-        out.write_all(&buf[..want]).map_err(EncodeError::Write)?;
-        remaining -= want as u64;
-    }
-    Ok(())
-}
-
 /// Reads and discards exactly `n` bytes from the stream (a coalesced
 /// hardlink's data).
 fn discard(reader: &mut impl Read, n: u64) -> Result<(), EncodeError> {
@@ -1183,29 +1144,6 @@ fn discard(reader: &mut impl Read, n: u64) -> Result<(), EncodeError> {
         remaining -= want as u64;
     }
     Ok(())
-}
-
-/// Splits a path into the ustar `name` and `prefix` fields, joined by an
-/// implicit `/`, or `None` when no split fits and a pax `path` record is needed.
-fn split_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
-    if path.len() <= MAX_USTAR_NAME {
-        return Some((path, &[]));
-    }
-    // name = path[i+1..] must fit `name`, so i >= len-(MAX_USTAR_NAME+1);
-    // prefix = path[..i] must fit `prefix`, so i <= MAX_USTAR_PREFIX. Prefer the
-    // largest such split point.
-    let lo = path.len().saturating_sub(MAX_USTAR_NAME + 1);
-    let hi = path.len().saturating_sub(1).min(MAX_USTAR_PREFIX);
-    for i in (lo..=hi).rev() {
-        if path[i] == b'/' {
-            let (prefix, rest) = (&path[..i], &path[i + 1..]);
-            if !rest.is_empty() && rest.len() <= MAX_USTAR_NAME && prefix.len() <= MAX_USTAR_PREFIX
-            {
-                return Some((rest, prefix));
-            }
-        }
-    }
-    None
 }
 
 // Frame decoding: the little-endian shapes the child emits.
@@ -1416,14 +1354,16 @@ mod tests {
         // A range map's extents can reach past the seven octal digits a ustar
         // header has for an id. Such an id is carried in a pax record, and the
         // header's own field holds a placeholder that is not root's.
-        let large = MAX_USTAR_ID + 1;
+        // The most seven octal digits hold.
+        let largest = 0o7777777;
+        let large = largest + 1;
         let mut buf = Vec::new();
         {
             let mut tar = TarWriter::new(&mut buf, None, None);
             let mut f = meta("f", 0o644, large, u32::MAX);
             f.nlink = 1;
             tar.file(&f, &mut &b""[..]).unwrap();
-            let mut g = meta("g", 0o644, MAX_USTAR_ID, 7);
+            let mut g = meta("g", 0o644, largest, 7);
             g.nlink = 1;
             tar.file(&g, &mut &b""[..]).unwrap();
             tar.finish().unwrap();
@@ -1432,12 +1372,12 @@ mod tests {
         let file = reader.next_entry().unwrap().unwrap();
         assert_eq!((file.uid, file.gid), (large, u32::MAX));
         let within = reader.next_entry().unwrap().unwrap();
-        assert_eq!((within.uid, within.gid), (MAX_USTAR_ID, 7));
+        assert_eq!((within.uid, within.gid), (largest, 7));
         assert!(reader.next_entry().unwrap().is_none());
 
         // The header block of the first entry, after its pax header and data,
         // holds the clamped placeholder.
-        let header = &buf[2 * BLOCK as usize..3 * BLOCK as usize];
+        let header = &buf[2 * 512..3 * 512];
         assert_eq!(&header[108..116], b"7777777\0", "the clamped uid field");
     }
 
@@ -1498,26 +1438,13 @@ mod tests {
             f.name = long.as_bytes().to_vec();
             f.size = 0;
             f.nlink = 1;
-            tar.write_entry(long.as_bytes(), b'0', &f, 0, &[], &[])
+            tar.append(Header::file(long.as_bytes(), 0), &f, io::empty())
                 .unwrap();
             tar.finish().unwrap();
         }
         let mut reader = TarReader::in_memory(&buf[..]);
         let entry = reader.next_entry().unwrap().unwrap();
         assert_eq!(entry.path, long.as_bytes());
-    }
-
-    #[test]
-    fn split_name_prefers_a_fitting_split() {
-        let short = b"etc/passwd";
-        assert_eq!(split_name(short), Some((&short[..], &[][..])));
-        let long = format!("{}/{}", "a".repeat(120), "b".repeat(50));
-        let (name, prefix) = split_name(long.as_bytes()).unwrap();
-        assert_eq!(prefix.len(), 120);
-        assert_eq!(name.len(), 50);
-        // No interior slash within reach: no split.
-        let unsplittable = "c".repeat(160);
-        assert!(split_name(unsplittable.as_bytes()).is_none());
     }
 
     #[test]
@@ -1567,11 +1494,12 @@ mod tests {
                 .unwrap()
                 .mtime
         }
-        let far_future = MAX_USTAR_MTIME + 1_000;
+        // The most eleven octal digits hold, which is the ustar field's ceiling.
+        let ceiling = 0o77777777777;
+        let far_future = ceiling + 1_000;
         assert_eq!(exported_mtime(far_future), far_future);
         assert_eq!(exported_mtime(-100_000), -100_000);
-        // A time exactly at the field ceiling still fits the ustar header.
-        assert_eq!(exported_mtime(MAX_USTAR_MTIME), MAX_USTAR_MTIME);
+        assert_eq!(exported_mtime(ceiling), ceiling);
     }
 
     #[test]

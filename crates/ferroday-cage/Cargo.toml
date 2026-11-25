@@ -52,6 +52,9 @@ lzma-rust2 = { version = "0.25", optional = true, default-features = false, feat
 # the floor because 0.9.0 lets a block decode past `Block_Maximum_Size`, which
 # the window cap does not bound (RUSTSEC-2026-0344).
 ruzstd = { version = "0.9.1", optional = true, default-features = false, features = ["std", "hash"] }
+# The tar format (safe Rust, no dependencies): an export's headers are encoded
+# by it, so that every tar reader reads them back alike.
+ferrotape = { version = "0.1.0", optional = true }
 # The three userland add-ons' signature verification (safe Rust, no
 # dependencies): OpenPGP for the Debian and Gentoo archives' signed documents,
 # and RSA PKCS#1 v1.5 over SHA-1 for an apk index, whose SHA-1 the Alpine layer
@@ -94,7 +97,7 @@ smoltcp = { version = "0.14", optional = true, default-features = false, feature
 serde = ["dep:serde"]
 # The tarball rootfs provisioner: tar extraction with gzip, xz, and zstd
 # decoding, all pure Rust.
-tarball = ["dep:flate2", "dep:lzma-rust2", "dep:ruzstd"]
+tarball = ["dep:flate2", "dep:lzma-rust2", "dep:ruzstd", "dep:ferrotape"]
 # The Debian userland provisioner: bootstrap a suite/architecture rootfs and
 # install packages, talking to the archive directly. Builds on the tarball
 # extractor for the packages' data members.
