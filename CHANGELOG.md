@@ -287,6 +287,11 @@ consumer upgrading can skip it.
   library in a directory only an `/etc/env.d` `LDPATH` names is not found until
   it is, and that a path another package's entry claims is replaced rather
   than refused.
+- The `agent-tools` example's check for repositories the command made reads
+  again only the directories whose change time moved while the command ran,
+  rather than walking the whole working tree a second time. A tree whose bulk
+  the command leaves alone, a `node_modules` or a `target`, is no longer
+  listed twice.
 
 ### Fixed
 

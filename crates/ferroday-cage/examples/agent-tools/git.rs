@@ -45,7 +45,7 @@
 //! host's git never reads one: everything taken from it comes through the
 //! sandboxed `upload-pack`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
@@ -181,8 +181,10 @@ pub(crate) struct Session {
     /// Paths outside the tree bound read-only at their own paths: a linked
     /// working tree's main gitdir, under the read-only mode.
     revealed: Vec<PathBuf>,
-    /// The `.git` entries the tree held before the command, relative to it.
-    entries: BTreeSet<PathBuf>,
+    /// The `.git` entries the tree held before the command, relative to it,
+    /// and what the walk that found them read, where a later walk reads it
+    /// again.
+    walked: Walked,
     /// Each held path in the tree and each directory above it there, on the
     /// host, with the entry it named before the command; see
     /// [`Session::check_held`].
@@ -267,7 +269,7 @@ impl Session {
             repositories: Vec::new(),
             read_only: Vec::new(),
             revealed: Vec::new(),
-            entries: BTreeSet::new(),
+            walked: Walked::default(),
             held: Vec::new(),
             report,
         };
@@ -319,9 +321,9 @@ impl Session {
                 let named = configured_paths(&worktree, repository)?;
                 self.read_only.extend(named);
             }
-            self.entries = git_entries(&worktree);
+            self.walked = walk(&worktree, None, self.report);
             // Every other repository in the tree is the caller's to run git in.
-            for entry in &self.entries {
+            for entry in &self.walked.entries {
                 if !known.contains(entry) {
                     self.read_only.push(entry.clone());
                 }
@@ -898,7 +900,8 @@ impl Session {
             }
         }
         if self.report && self.mode != Mode::Isolated {
-            for entry in git_entries(&self.worktree).difference(&self.entries) {
+            let after = walk(&self.worktree, Some(&self.walked), false);
+            for entry in after.entries.difference(&self.walked.entries) {
                 eprintln!(
                     "agent-tools: the command made a repository at {}: git run there, or in \
                      the tree once it is added as a submodule, obeys the configuration the \
@@ -1411,25 +1414,87 @@ fn serve(repository: &Repository, requests: OwnedFd, replies: OwnedFd) {
     }
 }
 
-/// Every `.git` entry beneath `root`, relative to it, without descending into
-/// one or following a symbolic link.
-fn git_entries(root: &Path) -> BTreeSet<PathBuf> {
-    let mut found = BTreeSet::new();
+/// What a walk of the tree found: every `.git` entry beneath it, relative to
+/// it, and, where the walk kept them, each directory it read with its stamp
+/// and its subdirectories.
+#[derive(Default)]
+struct Walked {
+    entries: BTreeSet<PathBuf>,
+    directories: HashMap<PathBuf, (Stamp, Vec<PathBuf>)>,
+    /// When the walk began, as a change time.
+    began: (i64, i64),
+}
+
+/// What says a directory's entries are the ones a walk read: its filesystem,
+/// its inode number, and its change time in seconds and nanoseconds.
+///
+/// The change time rather than the modification time, since a process that
+/// adds an entry can set the modification time back and cannot set the change
+/// time at all: setting a time is itself a change.
+type Stamp = (u64, u64, i64, i64);
+
+/// Walks `root` for its `.git` entries, without descending into one or
+/// following a symbolic link, keeping what it read where `keep` says.
+///
+/// Given `before`, a walk that kept what it read, a directory whose stamp is
+/// the one `before` read is not listed again: it holds the entries it held,
+/// so no `.git` entry of its own is new, and its subdirectories are the ones
+/// `before` found, each walked in turn. A tree whose bulk does not change
+/// while the command runs, a `node_modules` or a `target`, is then stated
+/// rather than listed. A directory changed within a second of `before`'s start
+/// is listed whatever its stamp, since a change time is only as fine as the
+/// clock's tick, and one made in the tick `before` read it in reads as the
+/// same.
+fn walk(root: &Path, before: Option<&Walked>, keep: bool) -> Walked {
+    let mut walked = Walked {
+        began: now(),
+        ..Walked::default()
+    };
     let mut pending = vec![PathBuf::new()];
     while let Some(relative) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(root.join(&relative)) else {
+            continue;
+        };
+        let stamp = (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec());
+        let unchanged = before.and_then(|before| {
+            let (read, subdirectories) = before.directories.get(&relative)?;
+            let settled = (stamp.2, stamp.3) < (before.began.0 - 1, before.began.1);
+            (*read == stamp && settled).then_some(subdirectories)
+        });
+        if let Some(subdirectories) = unchanged {
+            pending.extend(subdirectories.iter().cloned());
+            continue;
+        }
         let Ok(entries) = fs::read_dir(root.join(&relative)) else {
             continue;
         };
+        let mut subdirectories = Vec::new();
         for entry in entries.flatten() {
             let path = relative.join(entry.file_name());
             if entry.file_name() == ".git" {
-                found.insert(path);
+                walked.entries.insert(path);
             } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                pending.push(path);
+                subdirectories.push(path);
             }
         }
+        pending.extend(subdirectories.iter().cloned());
+        if keep {
+            walked.directories.insert(relative, (stamp, subdirectories));
+        }
     }
-    found
+    walked
+}
+
+/// The time now, as a change time is read: seconds and nanoseconds since the
+/// epoch.
+fn now() -> (i64, i64) {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (
+        i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+        i64::from(since.subsec_nanos()),
+    )
 }
 
 /// Git on the host, with nothing of the caller's environment that would point
@@ -1670,5 +1735,45 @@ fn expand_home(path: &Path) -> PathBuf {
     match (path.strip_prefix("~"), std::env::var_os("HOME")) {
         (Ok(rest), Some(home)) => Path::new(&home).join(rest),
         _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repository_made_below_unchanged_directories_is_found_however_its_time_is_set() {
+        let root = ferroday_cage_testkit::scratch::scratch_dir("agent-tools-walk");
+        fs::create_dir_all(root.join("app/.git")).unwrap();
+        fs::create_dir_all(root.join("vendor/deep/er")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        // Past the tick the walk trusts a change time from.
+        std::thread::sleep(Duration::from_millis(1100));
+        let before = walk(&root, None, true);
+        assert_eq!(before.entries, BTreeSet::from([PathBuf::from("app/.git")]));
+
+        // A repository three unchanged directories down, and one whose
+        // directory's modification time is set back to hide it.
+        fs::create_dir(root.join("vendor/deep/er/.git")).unwrap();
+        let other = fs::metadata(root.join("other")).unwrap();
+        fs::create_dir(root.join("other/.git")).unwrap();
+        fs::File::open(root.join("other"))
+            .unwrap()
+            .set_modified(other.modified().unwrap())
+            .unwrap();
+
+        let after = walk(&root, Some(&before), false);
+        assert_eq!(
+            after
+                .entries
+                .difference(&before.entries)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                PathBuf::from("other/.git"),
+                PathBuf::from("vendor/deep/er/.git")
+            ],
+        );
     }
 }
