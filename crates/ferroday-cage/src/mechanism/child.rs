@@ -3008,9 +3008,23 @@ fn create_mount_file(
     }
 }
 
-/// How many times [`hold_file_target`] looks again at a target another
-/// sandbox's teardown is removing before it binds without a lock.
-const TARGET_ATTEMPTS: usize = 64;
+/// How long, in all, [`hold_file_target`] waits for another sandbox's teardown
+/// to finish removing a target before it binds without a lock.
+///
+/// A teardown holds its lock for an open, a `stat` and an unlink, so a wait
+/// this long is one the teardown's process spent descheduled on a loaded host.
+/// The bound keeps a lock held for longer, which only a process sharing the
+/// root and taking one of its own holds, from stalling the launch.
+const TARGET_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long [`hold_file_target`] sleeps between looks at a target whose lock
+/// a teardown holds.
+const TARGET_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The most looks [`hold_file_target`] takes at a target: one per
+/// [`TARGET_INTERVAL`] of [`TARGET_PATIENCE`], which also bounds a name that
+/// keeps vanishing between a create and a look.
+const TARGET_ATTEMPTS: u128 = TARGET_PATIENCE.as_nanos() / TARGET_INTERVAL.as_nanos();
 
 /// Makes sure a file bind's target exists, reports it to the caller side if
 /// this call created it, and holds a shared lock on a regular-file target for
@@ -3029,8 +3043,15 @@ const TARGET_ATTEMPTS: usize = 64;
 /// is how the second says so. A teardown takes an exclusive lock before it
 /// removes anything and leaves a target any sandbox still holds. One whose lock
 /// is refused here holds an exclusive one and is removing the target, so the
-/// target is created anew once it is gone, a bounded number of times before
-/// the bind goes ahead without a lock.
+/// target is created anew once it is gone, looked at again every
+/// [`TARGET_INTERVAL`] for up to [`TARGET_PATIENCE`] before the bind goes ahead
+/// without a lock.
+///
+/// Through an overlay, a root or one mounted at a path, the lock is taken on
+/// the overlay's own file, which a teardown does not meet: it removes the file
+/// from the upper, under a lock of the upper's file. Another sandbox's bind
+/// onto that target stands on its own overlay's entry, which removing the
+/// upper's file does not unmount, so it keeps its bind all the same.
 ///
 /// The lock lasts as long as a descriptor for the file in this process, so the
 /// descriptor is left open. The init keeps it for the sandbox's whole life. The
@@ -3045,6 +3066,10 @@ fn hold_file_target(
     op: usize,
     report_fd: BorrowedFd<'_>,
 ) -> Result<(), Errno> {
+    let interval = thread::Timespec {
+        tv_sec: i64::try_from(TARGET_INTERVAL.as_secs()).unwrap_or(0),
+        tv_nsec: TARGET_INTERVAL.subsec_nanos().into(),
+    };
     for _ in 0..TARGET_ATTEMPTS {
         if let Some(file) = create_mount_file(root, path, Mode::from_raw_mode(FILE_TARGET_MODE))? {
             // A file nobody else has opened yet: the lock cannot be refused.
@@ -3088,7 +3113,9 @@ fn hold_file_target(
                 let _ = file.into_raw_fd();
                 return Ok(());
             }
-            Err(Errno::WOULDBLOCK) => thread::sched_yield(),
+            Err(Errno::WOULDBLOCK) => {
+                let _ = thread::nanosleep(&interval);
+            }
             Err(_) => return Ok(()),
         }
     }
@@ -4996,6 +5023,49 @@ mod tests {
         assert_eq!(
             write_in_procfs(procfs.as_fd(), c"../tmp/x", b""),
             Err(Errno::XDEV),
+        );
+    }
+
+    #[test]
+    fn a_target_a_teardown_is_removing_is_waited_for_and_created_anew() {
+        // A teardown holds the target's exclusive lock while it removes it. A
+        // launch that finds the lock refused waits, and creates the target
+        // anew once it is gone, rather than bind onto a name about to go. The
+        // teardown here is held for longer than a burst of yields lasts.
+        let dir = Scratch::new("target-teardown");
+        let root = open_root(dir.path());
+        let target = dir.join("target");
+        std::fs::write(&target, b"").unwrap();
+        let removing = std::fs::File::open(&target).unwrap();
+        removing.lock().expect("the teardown's lock is taken");
+        let teardown = {
+            let target = target.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::fs::remove_file(&target).unwrap();
+                drop(removing);
+            })
+        };
+        let (read, write) = rustix::pipe::pipe().expect("the report pipe opens");
+
+        hold_file_target(root.as_fd(), c"target", 7, write.as_fd()).expect("the target is held");
+        drop(write);
+        teardown.join().unwrap();
+
+        // The created record: the tag, the op, and the inode of the file
+        // the launch made.
+        let mut record = [0u8; super::super::REPORT_CREATED_LEN];
+        assert_eq!(
+            rustix::io::read(&read, &mut record),
+            Ok(record.len()),
+            "the target was not created anew",
+        );
+        assert_eq!(record[0..4], super::super::REPORT_CREATED.to_le_bytes());
+        assert_eq!(record[4..8], 7u32.to_le_bytes());
+        let made = std::fs::metadata(&target).expect("the target was created anew");
+        assert_eq!(
+            record[8..16],
+            std::os::unix::fs::MetadataExt::ino(&made).to_le_bytes(),
         );
     }
 

@@ -1574,6 +1574,11 @@ impl Drop for PlaceholderGuard {
 /// the other then bound onto refuses the exclusive lock here while the other
 /// holds it, and stays in the root rather than unmounting the other's bind.
 ///
+/// On an overlay the other sandbox's lock is on its overlay's own file, and the
+/// lock here, on the upper's, does not meet it: the file is removed from the
+/// upper. The other sandbox's bind stands on its overlay's entry, which that
+/// removal does not unmount, so it keeps the bind regardless.
+///
 /// Best-effort, like the teardown around it. A failure leaves a file the rootfs
 /// did not ship, which is untidy but not a failure of the launch itself.
 fn remove_placeholder(root: &Rooted, placeholder: &Placeholder) {

@@ -658,7 +658,15 @@ and the second finds it. Each holds a shared lock on the file, and the handle
 removes a file only under an exclusive lock, so neither unmounts the other's
 bind. The file then stays in the root, since the sandbox that found it did not
 create it. Without a PID namespace the second sandbox holds its lock only until
-its command executes, so the protection ends there.
+its command executes, so the protection ends there. A launch that finds the
+lock refused, by a teardown removing the file, waits up to a second for it to
+go and creates the file anew.
+
+Two sandboxes on overlays sharing one upper take their locks on their own
+overlays' files, which the handle's lock on the upper's file does not meet, so
+the first sandbox's handle removes the file from the upper. The second keeps
+its bind all the same: the bind stands on its own overlay's entry, which
+removing the upper's file does not unmount.
 
 A target the root already ships is never touched, whatever kind of entry it
 is. A symbolic link is one such entry, and it is left as it is rather than

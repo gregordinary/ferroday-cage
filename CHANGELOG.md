@@ -844,6 +844,13 @@ consumer upgrading can skip it.
   which lacks `mount_setattr`, a path made read-only has only the top mount of
   its tree made read-only, as a read-only bind has, and that a mount beneath it
   keeps its own flags.
+- A launch that finds a file bind's target locked by another sandbox's teardown
+  waits up to a second for the teardown to remove it, looking again every
+  millisecond, and then creates it anew. It looked again 64 times with nothing
+  between the looks but a yield of the processor, which a teardown descheduled
+  on a loaded host outlasted, and then bound onto a name about to be removed.
+  The guide says that on overlays sharing an upper the target's lock is not seen
+  by the teardown, and that the other sandbox keeps its bind regardless.
 
 ### Internal
 
