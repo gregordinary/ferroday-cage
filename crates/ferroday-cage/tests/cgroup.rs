@@ -549,6 +549,18 @@ fn a_further_command_runs_in_a_cgroup_of_its_own_beneath_the_sandboxs() {
             theirs[0],
             "pid namespace {pid_namespace}"
         );
+        // It moved into that cgroup before it entered the sandbox's cgroup
+        // namespace, and entered it all the same.
+        let namespace = |pid: u32| {
+            std::fs::read_link(format!("/proc/{pid}/ns/cgroup"))
+                .expect("the cgroup namespace reads")
+        };
+        assert_eq!(
+            namespace(further.pid()),
+            namespace(sandbox.pid()),
+            "pid namespace {pid_namespace}: the further command is in the sandbox's cgroup \
+             namespace"
+        );
         let stage = common::process_parent(further.pid()).expect("the command has a parent");
         assert!(
             !cgroup_of(stage).starts_with(&cgroup),

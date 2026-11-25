@@ -173,8 +173,11 @@ Each sees the others in `/proc` and can signal them, unless the hardening sets
 [`LandlockScope::Signal`]. A further command's handle governs that command and
 not the sandbox, and its [`kill`] ends the command. Where the sandbox has a
 cgroup, the command runs in a cgroup of its own beneath it, held to the
-sandbox's limits. The kill then ends everything the command started. Without a
-cgroup, what it started runs on until the sandbox ends.
+sandbox's limits. It moves there before it enters the sandbox's cgroup
+namespace, which the join stage leaves it, as a kernel without the fix for
+CVE-2021-4197 requires under `nsdelegate`. The kill then ends everything the
+command started. Without a cgroup, what it started runs on until the sandbox
+ends.
 
 The sandbox ends as it always does, with its first command. With a PID
 namespace, every further command ends with it. An exec costs a fork, the join,

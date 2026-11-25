@@ -252,7 +252,9 @@ consumer upgrading can skip it.
   handle ends that command alone, and runs further commands in the same
   sandbox. Where the sandbox has a cgroup, the command runs in a cgroup of its
   own beneath the sandbox's, held to the sandbox's limits, whose `cgroup.kill`
-  its handle's kill writes and whose processor time its usage reports. A
+  its handle's kill writes and whose processor time its usage reports. It
+  moves into that cgroup before it enters the sandbox's cgroup namespace, as a
+  kernel without the fix for CVE-2021-4197 requires under `nsdelegate`. A
   sandbox that has ended answers `Error::SandboxEnded`, and a restriction's
   handle `ConfigError::ExecIntoRestriction`. The command's join stage is the
   caller's child process, which its handle's wait collects; a handle dropped

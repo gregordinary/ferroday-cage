@@ -304,9 +304,21 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
         None
     };
 
-    if let Some(target) = context.join {
-        join_sandbox(target, plan.unshare).map_err(|errno| (SetupStep::JoinSandbox, errno, 0))?;
-    }
+    // A joining command that moves into a cgroup of its own enters the
+    // sandbox's cgroup namespace itself, once it has moved; see
+    // `CGROUP_NAMESPACE_AFTER_MOVE`.
+    let deferred = if context.cgroup_procs_fd.is_some() {
+        CGROUP_NAMESPACE_AFTER_MOVE
+    } else {
+        thread::UnshareFlags::empty()
+    };
+    let mut entry = match context.join {
+        Some(target) => Some(
+            join_sandbox(target, plan.unshare, deferred)
+                .map_err(|errno| (SetupStep::JoinSandbox, errno, 0))?,
+        ),
+        None => None,
+    };
 
     // The session keyring, the one piece of the caller's session the sweep
     // cannot reach because it is a credential rather than a descriptor. Every
@@ -356,12 +368,18 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                 stage_init(context, launch_stage)
             } else {
                 // A joining command enters the sandbox's cgroup before anything
-                // else, and leaves the caller's process group as the init does
-                // for a first command, for the same reason, with every signal
-                // still blocked as the fork left it.
+                // else, then the cgroup namespace the launch stage left it, and
+                // leaves the caller's process group as the init does for a
+                // first command, for the same reason, with every signal still
+                // blocked as the fork left it.
                 if context.joins() {
                     if let Some(procs) = context.cgroup_procs_fd {
                         join_cgroup(procs)?;
+                    }
+                    if let Some(mut entry) = entry.take() {
+                        entry
+                            .enter(deferred)
+                            .map_err(|errno| (SetupStep::JoinSandbox, errno, 0))?;
                     }
                     take_process_group(context)?;
                 }
@@ -377,6 +395,9 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
             }
         }
         sys::Fork::ParentOf(child) => {
+            // The command enters what is left of the sandbox through its own
+            // copy of the entry.
+            drop(entry);
             // The terminal channel is for the stage just forked, which allocates
             // the terminal and sends the primary, and the listener channel for
             // the command stage below it; this process sends over neither.
@@ -880,11 +901,33 @@ fn join_cgroup(procs: BorrowedFd<'_>) -> Result<(), Failure> {
 /// process's children are created in, so the command is forked after this, and
 /// this process stays in the caller's, outside the sandbox's.
 ///
+/// Those of `deferred` are left out, for the command to enter once it has
+/// moved into its cgroup, through the entry this returns.
+///
 /// A holder that has exited answers `ESRCH`: the sandbox has ended. One that
 /// exits after this, before the fork, fails the fork with `ENOMEM` instead.
-fn join_sandbox(target: JoinTarget<'_>, namespaces: thread::UnshareFlags) -> Result<(), Errno> {
-    SandboxEntry::new(target, namespaces).enter(namespaces)
+fn join_sandbox<'a>(
+    target: JoinTarget<'a>,
+    namespaces: thread::UnshareFlags,
+    deferred: thread::UnshareFlags,
+) -> Result<SandboxEntry<'a>, Errno> {
+    let mut entry = SandboxEntry::new(target, namespaces);
+    entry.enter(namespaces.difference(deferred))?;
+    Ok(entry)
 }
+
+/// The namespace a joining command that moves into a cgroup of its own enters
+/// itself, once it has moved, rather than the launch stage before the fork.
+///
+/// A kernel without the fix for CVE-2021-4197, from Linux 5.16 and in the
+/// stable kernels it reached, judges a write to `cgroup.procs` by the writer's
+/// cgroup namespace rather than the opener's. Under `nsdelegate`, which systemd
+/// mounts the hierarchy with, the source and the destination cgroup must both
+/// lie beneath that namespace's root, and the command's source, the caller's
+/// cgroup, does not lie beneath the sandbox's. Moved from the caller's cgroup
+/// namespace, the command is judged by the caller's, as every kernel judges it
+/// by the opener's.
+const CGROUP_NAMESPACE_AFTER_MOVE: thread::UnshareFlags = thread::UnshareFlags::NEWCGROUP;
 
 /// The namespaces a launch unshares, each with the name of its
 /// `/proc/<pid>/ns` entry, in the order a join enters them: the user namespace
@@ -937,8 +980,13 @@ impl<'a> SandboxEntry<'a> {
     ///
     /// The first entry that falls back to the procfs opens every namespace of
     /// the sandbox's, before entering any, so a later entry still finds those
-    /// it did not enter, by the procfs that indexed the holder.
+    /// it did not enter, by the procfs that indexed the holder: the command
+    /// enters through its copy of the entry from a mount namespace in which
+    /// that procfs is no longer the one at `/proc`.
     fn enter(&mut self, namespaces: thread::UnshareFlags) -> Result<(), Errno> {
+        if namespaces.is_empty() {
+            return Ok(());
+        }
         if self.opened.iter().all(Option::is_none) {
             match thread::move_into_thread_name_spaces(
                 self.target.holder,
