@@ -47,6 +47,22 @@ use crate::spec::{self, Stdio};
 /// as [`CageBuilder::path_lookup`](crate::CageBuilder::path_lookup) finds the
 /// first command's.
 ///
+/// # A Landlock domain of its own
+///
+/// The launch's Landlock rules are its, but the domain they make is not
+/// shared: a domain is enforced by the process it confines, so the first
+/// command and each exec enforce the same rules as a domain each. The scopes
+/// and the unix-socket restriction confine a process's reach to its own
+/// domain, and so they part the commands of one sandbox from each other.
+/// Under the `Signal` scope no command signals another, under the
+/// `AbstractUnixSocket` scope none connects to an abstract socket another
+/// created, and under the unix-socket restriction none connects to a pathname
+/// socket another created, unless a grant of `FsAccess::RESOLVE_UNIX` lies
+/// above it. A process a command starts shares that command's domain, so a
+/// command's own processes reach one another as before. Without a scope or
+/// the restriction, or with a loopback TCP port, commands reach each other as
+/// any two processes of the sandbox do.
+///
 /// An `Exec` holds no live resources and is a plain description, so it is
 /// `Clone` and runs in any number of sandboxes.
 ///

@@ -594,6 +594,10 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- `Exec`'s documentation and the guide's further commands state that each
+  command of a sandbox is a Landlock domain of its own, so under the scopes and
+  the unix-socket restriction one command cannot signal another, nor connect to
+  a socket another created.
 - Where a launch both fails and loses a relayed stream, `fcage` says how the
   launch ended first and the relay's failure after it, so its last line is the
   one its exit status follows (`ferroday-cage-cli`).

@@ -160,7 +160,12 @@ each in turn. The stage forks the further command into the sandbox and
 supervises it from outside, as a launch stage does without a PID namespace. The
 command then enters a nested user and mount namespace of its own, copied from
 the sandbox's setup, and applies the hardening. It is a Landlock domain and a
-seccomp filter of its own, with the launch's rules.
+seccomp filter of its own, with the launch's rules. The scopes and the
+unix-socket restriction confine a process's reach to its own domain, so under
+them one command cannot signal another, nor connect to an abstract socket or a
+pathname socket another created, unless a grant of `FsAccess::RESOLVE_UNIX`
+lies above the path. The processes a command starts share its domain, and a
+loopback TCP port reaches across commands under any of them.
 
 The commands share the sandbox. Its root and every mount the setup made are
 theirs, and so are its processes, its network and its hostname. So are any
