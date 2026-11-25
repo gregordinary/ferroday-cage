@@ -455,6 +455,10 @@ consumer upgrading can skip it.
   tail's, as allocated and not only as filled. Its buffers grew by a `Vec`'s
   doubling past their bounds, to about twice the head and four times the tail,
   and the tail's could briefly hold three times its bound.
+- The network stack reads first bytes opened by an HTTP method of any length
+  as a request, and holds its host to the rules. It carried a request whose
+  method ran past 32 bytes unread, while Go's `net/http` takes a method of any
+  length and routes by the request's `Host`.
 
 ### Internal
 

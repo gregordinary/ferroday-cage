@@ -77,10 +77,6 @@ const ALERT_FATAL: u8 = 2;
 const ALERT_DECODE_ERROR: u8 = 50;
 const ALERT_UNRECOGNIZED_NAME: u8 = 112;
 
-/// The longest word the reader takes for an HTTP method. Past it, the bytes
-/// are not read as a request. The longest method IANA registers is 17 bytes.
-const MAX_METHOD: usize = 32;
-
 /// The lowest major version of a first record that a server does not read as
 /// TLS.
 ///
@@ -469,7 +465,9 @@ fn read_http(bytes: &[u8]) -> Reading {
         .iter()
         .take_while(|&&byte| is_token_byte(byte))
         .count();
-    if method == 0 || method > MAX_METHOD {
+    // No length bounds the method but the bytes the stack reads: Go's server
+    // takes a method of any length and routes by its `Host`.
+    if method == 0 {
         return Reading::Other;
     }
     match bytes.get(at + method) {
@@ -804,7 +802,7 @@ fn a_server_may_read_a_request(bytes: &[u8]) -> bool {
     let line = &rest[..end];
     let method = line.iter().take_while(|&&byte| is_token_byte(byte)).count();
     let spaced = line.get(method).is_some_and(|&byte| is_lenient_space(byte));
-    if !(1..=MAX_METHOD).contains(&method) || !spaced || line.contains(&0) {
+    if method == 0 || !spaced || line.contains(&0) {
         return false;
     }
     line.split(|&byte| byte == b'\r')
@@ -1370,8 +1368,11 @@ mod tests {
             );
             settles_once(bytes);
         }
-        let method = vec![b'A'; MAX_METHOD + 1];
-        assert_eq!(read(&method), Reading::Other);
+        // A method of any length is read, as Go's server reads one.
+        let method = vec![b'A'; 64];
+        let mut request = method.clone();
+        request.extend_from_slice(b" / HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+        assert_eq!(read(&request), asks(Protocol::Http, &["evil.example"]));
         // Until the bytes say, they may yet begin a request.
         for bytes in [
             &b""[..],
@@ -1389,7 +1390,7 @@ mod tests {
         ] {
             assert_eq!(read(bytes), Reading::Incomplete, "{}", bytes.escape_ascii());
         }
-        assert_eq!(read(&method[..MAX_METHOD]), Reading::Incomplete);
+        assert_eq!(read(&method), Reading::Incomplete);
     }
 
     #[test]
