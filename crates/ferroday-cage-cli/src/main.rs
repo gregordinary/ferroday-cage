@@ -2370,7 +2370,8 @@ const FLAGS: &[Flag] = &[
             "Refuse the command a connection to a pathname unix",
             "socket it did not create, except beneath a",
             "--landlock-unix path. On by default with",
-            "--host-rootfs. Needs Landlock ABI 9",
+            "--host-rootfs and --restrict where the kernel",
+            "enforces it. Needs Landlock ABI 9",
         ],
         restriction: true,
         take: Take::Bare(|options| {
@@ -2645,8 +2646,8 @@ const FLAGS: &[Flag] = &[
         section: Section::Off,
         help: &[
             "Leave the command's connections to pathname unix",
-            "sockets unrestricted, as --host-rootfs otherwise does",
-            "not",
+            "sockets unrestricted, as --host-rootfs and --restrict",
+            "otherwise do not",
         ],
         restriction: true,
         take: Take::Bare(|options| {

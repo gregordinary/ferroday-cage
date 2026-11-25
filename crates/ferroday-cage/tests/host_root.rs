@@ -548,26 +548,12 @@ fn listening_sockets(
     (dir, handle, listeners)
 }
 
-/// Whether the kernel's Landlock ABI has the unix-socket right, reporting the
-/// skip where it does not. No variable governs it: CI's kernels predate it.
-#[cfg(feature = "hardening")]
-fn landlock_resolve_unix() -> bool {
-    let present = ferroday_cage::host::landlock_enforces_fs(ferroday_cage::FsAccess::RESOLVE_UNIX);
-    if !present {
-        let abi = ferroday_cage::host::landlock_abi();
-        common::require::premise_unmet(format_args!(
-            "the unix-socket restriction needs Landlock ABI 9, and the kernel offers {abi:?}"
-        ));
-    }
-    present
-}
-
 #[cfg(feature = "hardening")]
 #[test]
 fn the_unix_socket_restriction_refuses_a_host_socket_and_admits_a_granted_one() {
     use ferroday_cage::FsAccess;
 
-    if !common::require::userns() || !landlock_resolve_unix() {
+    if !common::require::userns() || !common::landlock_resolve_unix() {
         return;
     }
     let (dir, _handle, _listeners) = listening_sockets("host-root-unix-sockets");

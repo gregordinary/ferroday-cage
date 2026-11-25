@@ -27,6 +27,24 @@ consumer upgrading can skip it.
 
 ### Security
 
+- **Breaking.** A `Restriction` applies the unix-socket restriction by default
+  where the kernel enforces it, from Landlock ABI 9, and drops the default
+  below, as it drops its default scopes. A restricted command could connect to
+  every pathname socket the calling user can name, the session bus's and the
+  user's service manager's among them, and ask either to start any command
+  outside the restriction, as `systemd-run --user` does.
+  `landlock_resolve_unix(false)` and `fcage --restrict
+  --no-landlock-resolve-unix` turn it off, and a grant of
+  `FsAccess::RESOLVE_UNIX` admits the sockets beneath a path. A restriction
+  with a cgroup also builds only where it keeps the command from every unix
+  socket created outside it: `CgroupReach` gains
+  `PathnameSocketsUnrestricted`, where the unix-socket restriction is off or
+  the kernel below ABI 9 drops it, `UnixSocketsGranted`, for a grant of
+  `FsAccess::RESOLVE_UNIX`, and `AbstractSocketsUnscoped`, without the
+  abstract-socket scope. A restriction with a cgroup therefore needs Landlock
+  ABI 9. The right is a filesystem one, under which the kernel refuses the
+  command any change to its mount tree, so a restricted command that builds a
+  sandbox of its own, `fcage` among them, needs the restriction turned off.
 - The curated seccomp roster refuses `quotactl_fd`, `quotactl`'s twin naming
   a filesystem by a descriptor; `kcmp`, which compares two processes' open
   files and memory under the check `process_vm_readv` makes; and `syslog`,

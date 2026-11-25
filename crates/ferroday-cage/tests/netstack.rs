@@ -91,7 +91,9 @@ const NO_LANDLOCK_PROBE: &str = "FERRODAY_CAGE_TEST_NETSTACK_NO_LANDLOCK";
 /// The host's kernel enforces network grants, so the probe is this test binary
 /// run again under a restriction whose seccomp policy answers
 /// `landlock_create_ruleset` with `ENOSYS`, which is how a kernel without the
-/// LSM answers. Below ABI 4 the same refusal is the unit tests'.
+/// LSM answers. Below ABI 4 the same refusal is the unit tests'. The
+/// restriction's unix-socket restriction is turned off: it is a filesystem
+/// right, under which the kernel refuses the probe's sandbox its mounts.
 #[cfg(feature = "hardening")]
 #[test]
 fn attach_refuses_a_network_grant_the_kernel_cannot_enforce() {
@@ -111,6 +113,7 @@ fn attach_refuses_a_network_grant_the_kernel_cannot_enforce() {
         .command(&exe)
         .args(common::rerun_args("probe_attach_where_landlock_is_absent"))
         .env(NO_LANDLOCK_PROBE, "1")
+        .landlock_resolve_unix(false)
         .seccomp(SeccompPolicy::Rules(
             SeccompRules::denying([]).errno_for(landlock, enosys),
         ))

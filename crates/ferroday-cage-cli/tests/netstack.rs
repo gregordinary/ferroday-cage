@@ -26,7 +26,9 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// The host's kernel enforces network grants, so the inner `fcage` runs under
 /// an outer `fcage --restrict` whose seccomp policy answers
 /// `landlock_create_ruleset` with `ENOSYS`, which is how a kernel without the
-/// LSM answers.
+/// LSM answers. The outer restriction's unix-socket restriction is turned off:
+/// it is a filesystem right, under which the kernel refuses the inner launch
+/// its mounts.
 #[test]
 fn a_network_grant_the_kernel_cannot_enforce_refuses_the_stack() {
     let Some(rootfs) = common::fixture_rootfs() else {
@@ -39,6 +41,7 @@ fn a_network_grant_the_kernel_cannot_enforce_refuses_the_stack() {
     command
         .args([
             "--restrict",
+            "--no-landlock-resolve-unix",
             "--seccomp-errno",
             "landlock_create_ruleset=ENOSYS",
         ])

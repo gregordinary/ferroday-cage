@@ -298,12 +298,16 @@ impl fmt::Display for CgroupRefusal {
 /// namespace, and the kernel gives a cgroup's files to the user that created
 /// it, so the command owns the files that hold its limits and the parent's
 /// `cgroup.procs`, which moves a process between the parent's cgroups. It has
-/// two ways to them. One is writing such a file by its path, which a Landlock
-/// domain governing file writes refuses wherever it grants none. The other is
+/// three ways out. One is writing such a file by its path, which a Landlock
+/// domain governing file writes refuses wherever it grants none. Another is
 /// `clone3` with `CLONE_INTO_CGROUP`, which starts a process in a cgroup named
 /// by a descriptor that may be opened with `O_PATH`, which Landlock does not
 /// check, and which a seccomp policy refuses by letting no call of `clone3`
-/// run. Each variant is one of those left open.
+/// run. The third is asking a service manager to start a process, over its
+/// unix socket or the session bus, which runs it in a cgroup of the manager's
+/// and outside the restriction; a Landlock domain that keeps the command from
+/// every unix socket created outside it refuses that. Each variant is one of
+/// those left open.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CgroupReach {
@@ -328,6 +332,23 @@ pub enum CgroupReach {
     /// none, it is a precompiled program, which the build does not read, or it
     /// allows or only logs some call of `clone3`.
     Clone3Allowed,
+    /// The restriction's Landlock domain does not restrict connecting to a
+    /// pathname unix socket, such as the user's service manager's or the
+    /// session bus's: the unix-socket restriction is turned off, or the kernel,
+    /// below Landlock ABI 9, cannot enforce it.
+    PathnameSocketsUnrestricted,
+    /// A filesystem grant carrying `FsAccess::RESOLVE_UNIX` opens the unix
+    /// sockets beneath it, any of which may be a service manager's.
+    #[non_exhaustive]
+    UnixSocketsGranted {
+        /// The grant's path, as the restriction's build resolved it.
+        grant: PathBuf,
+    },
+    /// The restriction's Landlock domain does not confine connecting to an
+    /// abstract unix socket, where a session bus may listen: the
+    /// abstract-socket scope is not among its scopes, or the kernel, below
+    /// Landlock ABI 6, cannot enforce it.
+    AbstractSocketsUnscoped,
 }
 
 impl fmt::Display for CgroupReach {
@@ -351,6 +372,22 @@ impl fmt::Display for CgroupReach {
             CgroupReach::Clone3Allowed => f.write_str(
                 "its seccomp policy may let clone3 run, and clone3 starts a process in any \
                  cgroup the command can name; the curated policy answers it with ENOSYS",
+            ),
+            CgroupReach::PathnameSocketsUnrestricted => f.write_str(
+                "its Landlock domain does not restrict connecting to pathname unix sockets, so \
+                 the command can ask the user's service manager to start a process outside its \
+                 cgroup; the unix-socket restriction, which needs Landlock ABI 9, closes that",
+            ),
+            CgroupReach::UnixSocketsGranted { grant } => write!(
+                f,
+                "the Landlock grant on {} opens the unix sockets beneath it, and a service \
+                 manager listening on one starts a process outside the cgroup",
+                grant.display(),
+            ),
+            CgroupReach::AbstractSocketsUnscoped => f.write_str(
+                "its Landlock domain does not confine connecting to abstract unix sockets, so \
+                 the command can ask a session bus to start a process outside its cgroup; the \
+                 abstract-socket scope closes that",
             ),
         }
     }
@@ -1485,6 +1522,11 @@ mod tests {
             },
             CgroupReach::MountTableUnread,
             CgroupReach::Clone3Allowed,
+            CgroupReach::PathnameSocketsUnrestricted,
+            CgroupReach::UnixSocketsGranted {
+                grant: PathBuf::from("/run/user/1000"),
+            },
+            CgroupReach::AbstractSocketsUnscoped,
         ] {
             let refusal = crate::ConfigError::RestrictionCgroupReachable {
                 reach: reach.clone(),

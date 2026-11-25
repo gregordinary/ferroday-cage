@@ -42,12 +42,14 @@
 //!   X server are reachable through theirs. A Landlock network grant governs TCP
 //!   alone, and a seccomp filter cannot read the address a connect names.
 //! - **Pathname sockets.** A unix socket at a path the command can name accepts
-//!   its connection: the session bus's under `/run/user`, an SSH agent's, a
-//!   container runtime's. A Landlock filesystem grant governs files, not a
-//!   `connect`, before ABI 9. From ABI 9,
-//!   [`landlock_resolve_unix`](RestrictionBuilder::landlock_resolve_unix)
-//!   confines it to the sockets the command created and those beneath a path
-//!   granted [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX).
+//!   its connection: the session bus's and the user's service manager's under
+//!   `/run/user`, an SSH agent's, a container runtime's. A Landlock filesystem
+//!   grant governs files, not a `connect`, before ABI 9. From ABI 9, the
+//!   unix-socket restriction,
+//!   [`landlock_resolve_unix`](RestrictionBuilder::landlock_resolve_unix), on
+//!   by default, confines it to the sockets the command created and those
+//!   beneath a path granted
+//!   [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX).
 //! - **Same-user `/proc` and `ptrace`.** A command with no Landlock domain can
 //!   `ptrace` the calling user's other processes, where the host's Yama policy
 //!   permits it, and read their `/proc/<pid>/{environ,mem,maps}`. Any Landlock
@@ -82,21 +84,37 @@
 //!   `dev.tty.legacy_tiocsti` sysctl, which modern kernels default to off, or a
 //!   seccomp filter on `ioctl`, which the curated denylist provides.
 //!
-//! On a kernel with Landlock ABI 6 (Linux 6.12) or later a restriction closes
-//! the first three. Its default [`landlock_scope`](RestrictionBuilder::landlock_scope)
-//! confines signals and abstract-socket connections to the processes the
-//! command started, and the scopes give every restriction a Landlock domain,
-//! grants or none. On an older kernel the default scopes are dropped, signals
-//! and abstract sockets stay open, and only a Landlock grant creates a domain;
-//! the curated seccomp denylist still blocks `ptrace` and `process_vm_*`. Scopes
+//! On a kernel with Landlock ABI 6 (Linux 6.12) or later, a restriction closes
+//! signals, other processes' limits and scheduling, abstract-socket services,
+//! and same-user `/proc` and `ptrace`. Its default
+//! [`landlock_scope`](RestrictionBuilder::landlock_scope) confines signals and
+//! abstract-socket connections to the processes the command started, the
+//! signal scope brings the process filter with it, and the scopes give every
+//! restriction a Landlock domain, grants or none. From ABI 9 it closes pathname sockets too, through the unix-socket
+//! restriction it applies by default. On an older kernel the defaults it
+//! cannot enforce are dropped and those reaches stay open, and below ABI 6
+//! only a Landlock grant creates a domain; the curated seccomp denylist still
+//! blocks `ptrace` and `process_vm_*`. Scopes and the unix-socket restriction
 //! the caller names are refused there instead, since nothing else would bound
 //! those reaches. The curated denylist also blocks `keyctl`, which is what
 //! closes the keyrings.
 //!
-//! A default sandbox closes the first three through its PID and network
-//! namespaces. Its own user namespace gives it user keyrings of its own, so of
-//! the fourth only a key whose permissions grant its owner read stays
-//! reachable, by serial number.
+//! **A reachable service manager is unconfined execution.** The user's
+//! service manager and the session bus listen on unix sockets: pathname ones
+//! under `/run/user`, and on some hosts an abstract one. A command that reaches
+//! either can ask it to start any command, as `systemd-run --user` does, and
+//! that command runs as the calling user outside the restriction, held to none
+//! of its Landlock rules, its seccomp filter, or its cgroup. A root caller's
+//! command reaches the system's service manager the same way. Wherever
+//! pathname sockets stay reachable, below ABI 9 or with the unix-socket
+//! restriction turned off, or abstract ones without the abstract-socket scope,
+//! a restriction confines a command only as far as the command does not ask.
+//!
+//! A default sandbox closes signals, abstract-socket services, pathname
+//! sockets the caller does not bind in, and same-user `/proc` and `ptrace`,
+//! through its PID, network and mount namespaces. Its own user namespace gives
+//! it user keyrings of its own, so of the user's keyrings only a key whose
+//! permissions grant its owner read stays reachable, by serial number.
 //!
 //! # The caller's terminal
 //!
@@ -185,6 +203,13 @@ use crate::status::ExitStatus;
 /// calling user, for whom `/root` would be wrong, and reading the host's
 /// `HOME` would break determinism. A caller that wants `HOME` sets it.
 const BASE_ENV: [(&str, &str); 1] = [("PATH", spec::BASE_PATH)];
+
+/// Whether a restriction applies the unix-socket restriction where its caller
+/// leaves it unset: it does, since a restriction has no root of its own to
+/// leave the host's sockets out of, and the session bus and the user's service
+/// manager among them start commands outside it. A kernel below Landlock ABI 9
+/// drops it, as it drops the default scopes.
+const RESOLVE_UNIX_BY_DEFAULT: bool = true;
 
 /// A validated, ready-to-run restriction.
 ///
@@ -448,14 +473,21 @@ impl RestrictionBuilder {
     /// `cgroup.procs`. It could also start a process in another cgroup with
     /// `clone3` and `CLONE_INTO_CGROUP`, which names the cgroup by a
     /// descriptor that may be opened with `O_PATH`, and Landlock checks no such
-    /// open. A restriction with a cgroup parent or a
-    /// [`cgroup_limit`](Self::cgroup_limit) therefore builds only where both
-    /// reaches are closed:
+    /// open, or ask the user's service manager to start one over its socket or
+    /// the session bus, as `systemd-run --user --scope` does. A restriction
+    /// with a cgroup parent or a [`cgroup_limit`](Self::cgroup_limit) therefore
+    /// builds only where each of these reaches is closed:
     ///
     /// - its Landlock domain governs file writes, which a filesystem grant
     ///   gives it, and no grant carrying [`FsAccess::WRITE`] lies at, above, or
     ///   beneath a mount of the cgroup v2 hierarchy in this process's mount
     ///   table, judged through links as the launch resolves the grant;
+    /// - its Landlock domain confines connections to unix sockets, so no
+    ///   service manager is in reach: the
+    ///   [unix-socket restriction](Self::landlock_resolve_unix) is in force,
+    ///   which takes Landlock ABI 9, no grant carries
+    ///   [`FsAccess::RESOLVE_UNIX`], and the
+    ///   [abstract-socket scope](Self::landlock_scope) is in force;
     /// - its [`seccomp`](Self::seccomp) policy lets no call of `clone3` run,
     ///   answering it with an errno, as the
     ///   [curated roster](crate::SeccompRules::curated) does with `ENOSYS`, or
@@ -753,17 +785,32 @@ impl RestrictionBuilder {
 
     /// Refuses the command a connection to a pathname unix socket created
     /// outside its Landlock domain, except beneath a path granted
-    /// [`FsAccess::RESOLVE_UNIX`] (default: off).
+    /// [`FsAccess::RESOLVE_UNIX`] (default: on, where the kernel enforces it).
     ///
     /// A restriction runs on the host, so every socket the calling user can
-    /// name is otherwise reachable: the session bus's, an agent's, a container
-    /// runtime's. See
+    /// name is otherwise reachable: the session bus's, the user's service
+    /// manager's, an agent's, a container runtime's. The first two start any
+    /// command they are asked to, outside the restriction, as [the restriction
+    /// fallback](https://gregordinary.github.io/ferroday-cage/restriction-fallback.html)
+    /// sets out. See
     /// [`CageBuilder::landlock_resolve_unix`](crate::CageBuilder::landlock_resolve_unix)
-    /// for what the right governs. It needs Landlock ABI 9, and a restriction
-    /// has nothing else behind it, so it is refused at build on an older
-    /// kernel, or one without the Landlock LSM, as
+    /// for what the right governs.
+    ///
+    /// It needs Landlock ABI 9. Left at its default, it is dropped on an older
+    /// kernel, or one without the Landlock LSM, as the default scopes are, and
+    /// those sockets stay reachable there. Turned on here, it is refused at
+    /// build on such a kernel instead, as
     /// [`ConfigError::LandlockResolveUnixUnenforceable`](crate::ConfigError::LandlockResolveUnixUnenforceable).
-    /// Like a scope, it does not count as confinement on its own.
+    /// [`host::landlock_enforces_fs`](crate::host::landlock_enforces_fs)
+    /// reports whether the running kernel enforces it. Turned off, every
+    /// socket stays reachable on every kernel. Like a scope, it does not count
+    /// as confinement on its own.
+    ///
+    /// It is a filesystem right, and under a Landlock domain that governs one,
+    /// as under a filesystem grant, the kernel refuses the command `mount`,
+    /// `pivot_root` and every other change to its mount tree. A command that
+    /// builds a sandbox of its own, `fcage` among them, therefore runs in a
+    /// restriction with it turned off and no filesystem grant.
     pub fn landlock_resolve_unix(mut self, restrict: bool) -> Self {
         self.hardening.set_resolve_unix(restrict);
         self
@@ -900,9 +947,14 @@ impl RestrictionBuilder {
         if self.hardening.is_unrestricted() {
             return Err(ConfigError::RestrictionEmpty.into());
         }
-        let mut hardening = self.hardening.lower(false)?;
+        let mut hardening = self.hardening.lower(RESOLVE_UNIX_BY_DEFAULT)?;
         let abi = crate::mechanism::probe_landlock_abi();
-        settle_landlock(&mut hardening, self.scopes_named, abi)?;
+        settle_landlock(
+            &mut hardening,
+            self.scopes_named,
+            self.hardening.resolve_unix() == Some(true),
+            abi,
+        )?;
         freeze_grants(&mut hardening, |path| std::fs::canonicalize(path))?;
         if self.cgroup.parent.is_some() || !self.cgroup.limits().is_empty() {
             let mounts = std::fs::read_to_string("/proc/self/mountinfo")
@@ -984,12 +1036,13 @@ impl RestrictionBuilder {
 /// Holds a restriction's Landlock request to what a kernel at `abi` enforces,
 /// where `abi` is `None` when the kernel offers no Landlock LSM.
 ///
-/// The unix-socket restriction comes first. A restriction applies it only where
-/// its caller asked for it, so a kernel that cannot enforce it refuses the
-/// build, and it does so under its own error: a grant of
+/// The unix-socket restriction comes first. Where its caller asked for it
+/// (`resolve_unix_named`), a kernel that cannot enforce it refuses the build,
+/// and does so under its own error: a grant of
 /// [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX) alone is masked
 /// away below ABI 9, which the grant check below would otherwise report as a
-/// grant of another kind.
+/// grant of another kind. Where it is the restriction's default, such a kernel
+/// drops it, as the default scopes are dropped.
 ///
 /// A restriction is confined only by what the host enforces, so a grant that
 /// falls outside the kernel's ABI, which would leave the command unconfined
@@ -1002,9 +1055,10 @@ impl RestrictionBuilder {
 fn settle_landlock(
     hardening: &mut HardeningPlan,
     scopes_named: bool,
+    resolve_unix_named: bool,
     abi: Option<i32>,
 ) -> Result<(), ConfigError> {
-    crate::hardening::settle_resolve_unix(hardening, true, || abi)?;
+    crate::hardening::settle_resolve_unix(hardening, resolve_unix_named, || abi)?;
     hardening.ensure_landlock_enforceable(abi)?;
     if scopes_named {
         crate::hardening::ensure_scopes_enforceable(hardening.landlock_scoped, abi)
@@ -1048,10 +1102,15 @@ fn freeze_grants(
 ///
 /// The command could write the cgroup's files unless its Landlock domain
 /// governs file writes and grants none at, above, or beneath a mount of the
-/// cgroup v2 hierarchy, and could start a process in another cgroup unless its
-/// seccomp policy lets no call of `clone3` run. Each grant is judged by the
-/// canonical path [`freeze_grants`] froze, which is the path every launch
-/// opens.
+/// cgroup v2 hierarchy. It could start a process in another cgroup unless its
+/// seccomp policy lets no call of `clone3` run, and unless its Landlock domain
+/// keeps it from every unix socket a process outside it created, through which
+/// a service manager starts one: the unix-socket restriction in force, with no
+/// grant of [`FsAccess::RESOLVE_UNIX`](crate::FsAccess::RESOLVE_UNIX), and the
+/// abstract-socket scope in force. The plan is judged as the kernel settled it,
+/// so a default the kernel cannot enforce counts as off. Each grant is judged
+/// by the canonical path [`freeze_grants`] froze, which is the path every
+/// launch opens.
 ///
 /// `mounts` is where this process's mount table mounts the hierarchy, or
 /// `None` where the table cannot be read.
@@ -1062,7 +1121,7 @@ fn ensure_cgroup_held(
 ) -> Result<(), ConfigError> {
     use std::os::unix::ffi::OsStrExt;
 
-    use crate::hardening::fs_access::WRITE_FILE;
+    use crate::hardening::fs_access::{RESOLVE_UNIX, WRITE_FILE};
 
     let refused = |reach| Err(ConfigError::RestrictionCgroupReachable { reach });
     if hardening.landlock_handled & WRITE_FILE == 0 {
@@ -1087,6 +1146,21 @@ fn ensure_cgroup_held(
     let clone3 = i64::from(syscalls::Sysno::clone3.id());
     if !seccomp.is_some_and(|policy| policy.never_runs(clone3)) {
         return refused(CgroupReach::Clone3Allowed);
+    }
+    if hardening.landlock_handled & RESOLVE_UNIX == 0 {
+        return refused(CgroupReach::PathnameSocketsUnrestricted);
+    }
+    if let Some(rule) = hardening
+        .landlock
+        .iter()
+        .find(|rule| rule.access & RESOLVE_UNIX != 0)
+    {
+        return refused(CgroupReach::UnixSocketsGranted {
+            grant: Path::new(OsStr::from_bytes(rule.path.to_bytes())).to_path_buf(),
+        });
+    }
+    if hardening.landlock_scoped & crate::hardening::scope::ABSTRACT_UNIX_SOCKET == 0 {
+        return refused(CgroupReach::AbstractSocketsUnscoped);
     }
     Ok(())
 }
@@ -1309,11 +1383,49 @@ mod tests {
     }
 
     /// Settles `builder`'s Landlock request against a kernel that reported
-    /// `abi`, returning the scopes it kept.
+    /// `abi`, as its build does.
+    fn settled(
+        builder: RestrictionBuilder,
+        abi: Option<i32>,
+    ) -> Result<HardeningPlan, ConfigError> {
+        let mut hardening = builder
+            .hardening
+            .lower(RESOLVE_UNIX_BY_DEFAULT)
+            .expect("a valid request");
+        let named = builder.hardening.resolve_unix() == Some(true);
+        settle_landlock(&mut hardening, builder.scopes_named, named, abi)?;
+        Ok(hardening)
+    }
+
+    /// The scopes [`settled`] keeps.
     fn settle(builder: RestrictionBuilder, abi: Option<i32>) -> Result<u64, ConfigError> {
-        let mut hardening = builder.hardening.lower(false).expect("a valid request");
-        settle_landlock(&mut hardening, builder.scopes_named, abi)?;
-        Ok(hardening.landlock_scoped)
+        settled(builder, abi).map(|hardening| hardening.landlock_scoped)
+    }
+
+    #[test]
+    fn a_restriction_restricts_unix_sockets_by_default_where_the_kernel_can() {
+        use crate::hardening::fs_access::RESOLVE_UNIX;
+        let restricted = |builder: RestrictionBuilder, abi| {
+            settled(builder, abi)
+                .map(|hardening| hardening.landlock_handled & RESOLVE_UNIX != 0)
+                .map_err(|err| err.to_string())
+        };
+        // On by default where the kernel enforces it, and dropped below, as the
+        // default scopes are.
+        assert_eq!(restricted(restricted_true(), Some(9)), Ok(true));
+        for abi in [None, Some(6), Some(8)] {
+            assert_eq!(restricted(restricted_true(), abi), Ok(false), "{abi:?}");
+        }
+        // Named, it is refused where the kernel cannot enforce it.
+        let named = || restricted_true().landlock_resolve_unix(true);
+        assert_eq!(restricted(named(), Some(9)), Ok(true));
+        assert!(matches!(
+            settled(named(), Some(8)),
+            Err(ConfigError::LandlockResolveUnixUnenforceable { abi: Some(8) })
+        ));
+        // Turned off, it is off on every kernel.
+        let off = restricted_true().landlock_resolve_unix(false);
+        assert_eq!(restricted(off, Some(9)), Ok(false));
     }
 
     #[test]
@@ -1561,10 +1673,23 @@ mod tests {
         builder: RestrictionBuilder,
         resolve: impl Fn(&Path) -> std::path::PathBuf,
     ) -> Option<CgroupReach> {
-        let mut hardening = builder.hardening.lower(false).expect("a valid request");
-        freeze_grants(&mut hardening, |path| Ok(resolve(path))).expect("every grant resolves");
+        let mut hardening = builder
+            .hardening
+            .lower(RESOLVE_UNIX_BY_DEFAULT)
+            .expect("a valid request");
+        reach_of(&mut hardening, builder.hardening.seccomp(), resolve)
+    }
+
+    /// The reach [`reach`] answers, of `hardening`, a request already lowered,
+    /// under `seccomp`.
+    fn reach_of(
+        hardening: &mut HardeningPlan,
+        seccomp: Option<&SeccompPolicy>,
+        resolve: impl Fn(&Path) -> std::path::PathBuf,
+    ) -> Option<CgroupReach> {
+        freeze_grants(hardening, |path| Ok(resolve(path))).expect("every grant resolves");
         let mounts = [std::path::PathBuf::from("/sys/fs/cgroup")];
-        match ensure_cgroup_held(&hardening, builder.hardening.seccomp(), Some(&mounts)) {
+        match ensure_cgroup_held(hardening, seccomp, Some(&mounts)) {
             Ok(()) => None,
             Err(ConfigError::RestrictionCgroupReachable { reach }) => Some(reach),
             Err(err) => panic!("{err:?}"),
@@ -1716,6 +1841,45 @@ mod tests {
                 "{policy:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_restriction_that_leaves_a_unix_socket_in_reach_is_refused_a_cgroup() {
+        let curated = || SeccompPolicy::Rules(SeccompRules::curated());
+        // The unix-socket restriction turned off, or dropped by a kernel below
+        // ABI 9, leaves the user's service manager in reach.
+        let off = confined(curated()).landlock_resolve_unix(false);
+        assert_eq!(
+            reach(off, as_named),
+            Some(CgroupReach::PathnameSocketsUnrestricted)
+        );
+        let builder = confined(curated());
+        let mut dropped = settled(builder.clone(), Some(8)).expect("a kernel with Landlock");
+        assert_eq!(
+            reach_of(&mut dropped, builder.hardening.seccomp(), as_named),
+            Some(CgroupReach::PathnameSocketsUnrestricted)
+        );
+        let mut kept = settled(builder.clone(), Some(9)).expect("a kernel with Landlock");
+        assert_eq!(
+            reach_of(&mut kept, builder.hardening.seccomp(), as_named),
+            None
+        );
+        // A grant opening some sockets, wherever it lies.
+        for path in ["/run/user/1000", "/tmp/agent"] {
+            let granted = confined(curated()).landlock_fs(FsAccess::RESOLVE_UNIX, path);
+            assert_eq!(
+                reach(granted, as_named),
+                Some(CgroupReach::UnixSocketsGranted { grant: path.into() }),
+                "{path}"
+            );
+        }
+        // Abstract sockets, where a session bus may listen, without their
+        // scope.
+        let unscoped = confined(curated()).landlock_scope([LandlockScope::Signal]);
+        assert_eq!(
+            reach(unscoped, as_named),
+            Some(CgroupReach::AbstractSocketsUnscoped)
+        );
     }
 
     #[test]

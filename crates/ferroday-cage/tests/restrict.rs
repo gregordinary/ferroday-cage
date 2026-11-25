@@ -659,12 +659,14 @@ fn a_link_an_earlier_run_planted_on_a_grant_fails_the_next_launch() {
 /// seccomp policy alone, with `scopes` in place of the default, and reports
 /// whether it succeeded.
 ///
-/// No Landlock grant is made, so any Landlock domain the command runs in is the
-/// one its scopes alone create.
+/// No Landlock grant is made, and the unix-socket restriction is turned off,
+/// so any Landlock domain the command runs in is the one its scopes alone
+/// create.
 fn run_scoped(script: &str, scopes: Option<&[LandlockScope]>) -> bool {
     let builder = Restriction::builder()
         .command("/bin/sh")
         .args(["-c", script])
+        .landlock_resolve_unix(false)
         .seccomp(SeccompPolicy::Rules(SeccompRules::curated()));
     let builder = match scopes {
         Some(scopes) => builder.landlock_scope(scopes.iter().copied()),
@@ -734,6 +736,61 @@ fn a_restriction_cannot_reach_an_abstract_socket_outside_it() {
     assert!(
         run_scoped(&probe, Some(&[])),
         "without the scope the same connect reaches it"
+    );
+}
+
+#[test]
+fn a_restriction_refuses_a_pathname_socket_outside_it_by_default() {
+    use std::os::fd::AsRawFd;
+
+    if !common::require::seccomp() || !common::landlock_resolve_unix() {
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        common::require::premise_unmet("no python3 on this host to make the connection with");
+        return;
+    };
+    // A socket of this test's, outside the restriction, as the session bus's
+    // and the user's service manager's are. It is bound through the
+    // directory's descriptor, and reached from the directory, since its full
+    // path may be longer than a socket address holds.
+    let dir = scratch("restrict-pathname-socket");
+    let handle = std::fs::File::open(&dir).expect("the scratch directory opens");
+    let _listener = std::os::unix::net::UnixListener::bind(format!(
+        "/proc/self/fd/{}/sock",
+        handle.as_raw_fd()
+    ))
+    .expect("the socket binds");
+    let connects = |builder: ferroday_cage::RestrictionBuilder| {
+        builder
+            .command(python)
+            .args([
+                "-c",
+                "import socket; socket.socket(socket.AF_UNIX).connect('sock')",
+            ])
+            .current_dir(&dir)
+            .stderr(Stdio::Null)
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+            .build()
+            .expect("a valid restriction configuration")
+            .run()
+            .expect("the restriction launches")
+            .success()
+    };
+    assert!(
+        !connects(Restriction::builder()),
+        "the default refuses the caller's socket"
+    );
+    assert!(
+        connects(Restriction::builder().landlock_fs(FsAccess::RESOLVE_UNIX, &dir)),
+        "a grant admits the sockets beneath it"
+    );
+    assert!(
+        connects(Restriction::builder().landlock_resolve_unix(false)),
+        "turned off, the restriction leaves the socket in reach"
     );
 }
 

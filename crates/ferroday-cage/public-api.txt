@@ -1848,8 +1848,12 @@ impl core::marker::UnsafeUnpin for ferroday_cage::CgroupLimit
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::CgroupLimit
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::CgroupLimit
 #[non_exhaustive] pub enum ferroday_cage::CgroupReach
+pub ferroday_cage::CgroupReach::AbstractSocketsUnscoped
 pub ferroday_cage::CgroupReach::Clone3Allowed
 pub ferroday_cage::CgroupReach::MountTableUnread
+pub ferroday_cage::CgroupReach::PathnameSocketsUnrestricted
+#[non_exhaustive] pub ferroday_cage::CgroupReach::UnixSocketsGranted
+pub ferroday_cage::CgroupReach::UnixSocketsGranted::grant: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::CgroupReach::WriteGranted
 pub ferroday_cage::CgroupReach::WriteGranted::grant: std::path::PathBuf
 pub ferroday_cage::CgroupReach::WriteGranted::mount: std::path::PathBuf

@@ -152,6 +152,21 @@ pub fn landlock_net() -> bool {
     )
 }
 
+/// Whether the kernel's Landlock ABI has the unix-socket right, reporting the
+/// skip where it does not. No variable governs it: CI's kernels predate it.
+#[cfg(feature = "hardening")]
+#[track_caller]
+pub fn landlock_resolve_unix() -> bool {
+    let present = ferroday_cage::host::landlock_enforces_fs(ferroday_cage::FsAccess::RESOLVE_UNIX);
+    if !present {
+        let abi = ferroday_cage::host::landlock_abi();
+        require::premise_unmet(format_args!(
+            "the unix-socket restriction needs Landlock ABI 9, and the kernel offers {abi:?}"
+        ));
+    }
+    present
+}
+
 /// Whether the kernel's Landlock enforces scopes.
 #[cfg(feature = "hardening")]
 #[track_caller]

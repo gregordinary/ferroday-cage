@@ -104,11 +104,16 @@ isolation, some host-reaching surfaces remain:
   the session bus and the X server through their abstract sockets. A Landlock
   network grant governs TCP alone, and seccomp cannot read a socket's address.
 - **Pathname sockets.** It can connect to any unix socket at a path it can name:
-  the session bus's under `/run/user`, an SSH agent's, a container runtime's. A
-  Landlock filesystem grant governs files, not a `connect`. From Landlock ABI 9,
-  [`landlock_resolve_unix`] confines it to the sockets the command created and
-  those beneath a path granted `FsAccess::RESOLVE_UNIX`, and a restriction that
-  asks for it is refused on an older kernel.
+  the session bus's and the user's service manager's under `/run/user`, an SSH
+  agent's, a container runtime's. A Landlock filesystem grant governs files, not
+  a `connect`. From Landlock ABI 9, the unix-socket restriction,
+  [`landlock_resolve_unix`], confines it to the sockets the command created and
+  those beneath a path granted `FsAccess::RESOLVE_UNIX`. A restriction applies
+  it by default, and drops the default on an older kernel. One that asks for it
+  is refused there instead. It is a filesystem right, and under one the kernel
+  refuses the command any change to its mount tree, as under a filesystem
+  grant, so a command that builds a sandbox of its own runs with it turned
+  off.
 - **Other processes' memory and environment.** Without a Landlock domain, it can
   `ptrace` the calling user's other processes and read their
   `/proc/<pid>/environ`.
@@ -121,20 +126,38 @@ isolation, some host-reaching surfaces remain:
   where it names a process other than the command's own. It stays open without
   the scope.
 
-On a kernel with Landlock ABI 6 (Linux 6.12) or later, a restriction closes all
-three. Its default [`landlock_scope`] confines signals and abstract-socket
-connections to the processes the command started. The scopes also give every
-restriction a Landlock domain, and any domain refuses ptrace access to the
+On a kernel with Landlock ABI 6 (Linux 6.12) or later, a restriction closes
+signals, other processes' limits and scheduling, abstract sockets, and other
+processes' memory and environment. Its default [`landlock_scope`] confines
+signals and abstract-socket connections to the processes the command started,
+and the signal scope brings the process filter with it. The scopes also give
+every restriction a Landlock domain, and any domain refuses ptrace access to the
 processes outside it. Name fewer scopes only for a command that needs that
-reach.
+reach. From ABI 9 it closes pathname sockets as well, through the unix-socket
+restriction it applies by default.
 
-On an older kernel the default scopes are dropped, and signals and abstract
-sockets stay open. A Landlock grant still creates a domain there, and the
-curated seccomp policy still denies `ptrace` and `process_vm_readv`. Scopes a
-restriction names itself are refused there instead, with
-[`ConfigError::LandlockScopeUnenforceable`], since nothing else bounds those
-reaches. A default sandbox closes all three through its PID and network
-namespaces.
+On a kernel below ABI 6 the default scopes are dropped, and signals, other
+processes' limits and scheduling, and abstract sockets stay open; below ABI 9 the default unix-socket restriction is
+dropped, and pathname sockets stay open. A Landlock grant still creates a domain
+there, and the curated seccomp policy still denies `ptrace` and
+`process_vm_readv`. Scopes and a unix-socket restriction that a restriction
+names itself are refused there instead, with
+[`ConfigError::LandlockScopeUnenforceable`] and
+`ConfigError::LandlockResolveUnixUnenforceable`, since nothing else bounds those
+reaches. A default sandbox closes signals, abstract sockets, the pathname
+sockets the caller does not bind in, and other processes' memory and
+environment through its PID, network and mount namespaces.
+
+A reachable service manager is unconfined execution. The user's service
+manager and the session bus listen on unix sockets: pathname ones under
+`/run/user`, and on some hosts an abstract one. A command that reaches either
+can ask it to start any command, as `systemd-run --user` does, and that command
+runs as the calling user outside the restriction, held to none of its Landlock
+rules, its seccomp filter, or its cgroup. A root caller's command reaches the
+system's service manager the same way. Wherever pathname sockets stay
+reachable, below Landlock ABI 9 or with the unix-socket restriction turned off,
+or abstract ones without the abstract-socket scope, a restriction confines a
+command only as far as the command does not ask.
 
 The caller's terminal is not among them, because it is not a namespace question:
 a controlling terminal is reached through the session, so a cage and a
@@ -233,9 +256,10 @@ to itself, the command could lift its limits by writing the files that hold
 them, or leave the tree by writing its process id to the parent's
 `cgroup.procs`. It could also start a process in another cgroup with `clone3`
 and `CLONE_INTO_CGROUP`, which names the cgroup by a descriptor that may be
-opened with `O_PATH`, an open Landlock does not check. A restriction with a
+opened with `O_PATH`, an open Landlock does not check, or ask the user's service
+manager to start one, as `systemd-run --user --scope` does. A restriction with a
 cgroup parent or a limit therefore builds only where its confinement closes
-both reaches:
+each of these reaches:
 
 - Its Landlock domain governs file writes, which any filesystem grant gives
   it, and no grant carrying write access lies at, above, or beneath a mount of
@@ -249,12 +273,16 @@ both reaches:
   `clone3`, so under another errno a program that does either fails to, and
   under a kill it ends. A precompiled program is not read, so it does not
   count.
+- Its Landlock domain keeps it from every unix socket a process outside it
+  created, so no service manager is in reach: the unix-socket restriction is in
+  force, which takes Landlock ABI 9, no grant carries `FsAccess::RESOLVE_UNIX`,
+  and the abstract-socket scope is in force. Both are a restriction's defaults.
 
 Otherwise the build fails with [`ConfigError::RestrictionCgroupReachable`], and
 a [`CgroupReach`] naming the reach left open. Limits that are not required are
 refused the same way, since what is refused is a cgroup the command could
 escape rather than a missing parent. On the command line, a restriction that
-meets both:
+meets all three:
 
 ```console
 $ fcage --restrict \
@@ -272,9 +300,11 @@ exactly as in the hardening layer. A kernel with no Landlock LSM refuses a
 restriction with any Landlock grant at build, with
 [`ConfigError::RestrictionLandlockUnenforceable`]. A kernel below ABI 4 refuses
 one with a network grant the same way. A seccomp-only restriction runs on
-either, without the default scopes a kernel below ABI 6 cannot enforce. One
+either, without the default scopes a kernel below ABI 6 cannot enforce, and
+without the default unix-socket restriction a kernel below ABI 9 cannot. One
 that names its scopes is refused there instead, with
-[`ConfigError::LandlockScopeUnenforceable`]. A restriction with a network grant
+[`ConfigError::LandlockScopeUnenforceable`]. A restriction with a cgroup needs
+the unix-socket restriction, and so ABI 9. A restriction with a network grant
 installs the network filter, which a host that cannot install a seccomp filter
 fails at launch. [`host::landlock_abi`] reports the kernel's Landlock ABI,
 [`host::landlock_enforces_scope`] and its siblings whether the kernel enforces a
@@ -297,8 +327,9 @@ $ fcage --restrict \
 
 `--landlock-scope` replaces the default scopes, and an empty list turns them
 off. Scopes named this way are refused on a kernel that cannot enforce them.
-`--landlock-resolve-unix` and `--landlock-unix PATH` restrict pathname sockets
-as they do for a sandbox. The flags that shape the command's process, its
+The unix-socket restriction is on by default where the kernel enforces it,
+`--no-landlock-resolve-unix` turns it off, and `--landlock-resolve-unix` and
+`--landlock-unix PATH` restrict pathname sockets as they do for a sandbox. The flags that shape the command's process, its
 environment, standard streams, terminal, timeout, resource limits, and cgroup,
 behave as they do for a sandbox, and `fcage --help` lists every flag
 `--restrict` takes. Resource limits matter more here than in a cage: without

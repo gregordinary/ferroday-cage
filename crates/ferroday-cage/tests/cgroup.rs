@@ -926,7 +926,9 @@ fn assert_held_to_the_limit(
 fn a_restricted_command_can_neither_lift_its_limit_nor_leave_its_tree() {
     use ferroday_cage::{FsAccess, Restriction, SeccompPolicy, SeccompRules};
 
-    if !(common::landlock() && common::require::seccomp()) {
+    // A restriction with a cgroup builds only where its unix-socket
+    // restriction keeps the user's service manager out of reach.
+    if !(common::landlock() && common::require::seccomp() && common::landlock_resolve_unix()) {
         return;
     }
     let Some(parent) = delegated() else {
@@ -935,7 +937,8 @@ fn a_restricted_command_can_neither_lift_its_limit_nor_leave_its_tree() {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let outside = parent.join(format!("fcage-test-caller-{}", std::process::id()));
     // What the build requires of a restriction with a cgroup: no write granted
-    // on the cgroup hierarchy, and clone3 answered with an errno.
+    // on the cgroup hierarchy, clone3 answered with an errno, and no unix
+    // socket a process outside it created in reach, which it has by default.
     let output = common::grant_system_trees(Restriction::builder())
         .command(&exe)
         .args(common::rerun_args("probe_reach"))
@@ -986,7 +989,9 @@ fn a_restricted_command_can_neither_lift_its_limit_nor_leave_its_tree() {
 fn a_restricted_command_killed_at_clone3_ends_in_its_cgroup() {
     use ferroday_cage::{FsAccess, Restriction, SeccompAction, SeccompPolicy, SeccompRules};
 
-    if !(common::landlock() && common::require::seccomp()) {
+    // A restriction with a cgroup builds only where its unix-socket
+    // restriction keeps the user's service manager out of reach.
+    if !(common::landlock() && common::require::seccomp() && common::landlock_resolve_unix()) {
         return;
     }
     let Some(parent) = delegated() else {
