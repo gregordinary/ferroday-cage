@@ -107,6 +107,18 @@ consumer upgrading can skip it.
 
 ### Added
 
+- What a run wrote through an overlay can be read as a list of changes:
+  `provision::ChangeSet::read` walks an `Overlay`'s upper against its lowers
+  and lists each `Change` by path, added, modified, removed or replaced
+  (`ChangeKind`), with the type of entry before and after (`EntryKind`), a
+  file's size, and whether a modified entry's content, mode, owner or extended
+  attributes differ. A directory the overlay copied up for what lies beneath
+  it, a file rewritten with the bytes it had, and a change of times alone are
+  not changes. A layer holding an overlay record the kernel would read
+  otherwise, such as a redirect, is refused with
+  `ProvisionError::EntryRefused`, an overlay naming no upper or no lower with
+  `ProvisionError::OverlayLayerMissing`, and an entry the caller cannot read
+  is listed as incomplete.
 - An overlay can be mounted at a path inside a sandbox, in a root of any kind,
   the host's own included: `CageBuilder::overlay_at` takes a target and an
   `Overlay`, a `Mount::Overlay` holds an `OverlayMount`, and a profile spells

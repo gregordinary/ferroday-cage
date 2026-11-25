@@ -56,6 +56,7 @@ mod available;
 mod binfmt;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod cache;
+mod changes;
 #[cfg(feature = "tarball")]
 mod compress;
 pub(crate) mod containment;
@@ -180,6 +181,7 @@ mod xattr;
 pub use available::Available;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub(crate) use cache::PackageCache;
+pub use changes::{Change, ChangeKind, ChangeSet, EntryKind};
 pub use copyin::{AttributeSkip, CopyIn, CopyReport, SkippedAttribute, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, ExportEntry, ExportKind, export_tar};
@@ -709,6 +711,13 @@ which arises for the same reason.
         /// The length the walk recorded for it.
         recorded: u64,
     },
+    /// An overlay names no layer of a kind a [`ChangeSet`] needs: no upper,
+    /// or no lower.
+    #[non_exhaustive]
+    OverlayLayerMissing {
+        /// The kind of layer it names none of.
+        layer: crate::OverlayLayer,
+    },
 }
 
 impl ProvisionError {
@@ -862,6 +871,9 @@ impl fmt::Display for ProvisionError {
                 "{path:?} changed while it was being read: {recorded} bytes were recorded for it, \
                  which is no longer what it holds",
             ),
+            ProvisionError::OverlayLayerMissing { layer } => {
+                write!(f, "the overlay names no {layer} layer")
+            }
             #[cfg(feature = "tarball")]
             ProvisionError::ExportUnprivileged { path, reason } => write!(
                 f,

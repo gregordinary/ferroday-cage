@@ -1133,6 +1133,30 @@ impl core::marker::Unpin for ferroday_cage::provision::AttributeSkip
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::AttributeSkip
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::AttributeSkip
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::AttributeSkip
+#[non_exhaustive] pub enum ferroday_cage::provision::ChangeKind
+pub ferroday_cage::provision::ChangeKind::Added
+pub ferroday_cage::provision::ChangeKind::Modified
+pub ferroday_cage::provision::ChangeKind::Removed
+pub ferroday_cage::provision::ChangeKind::Replaced
+impl core::marker::Freeze for ferroday_cage::provision::ChangeKind
+impl core::marker::Send for ferroday_cage::provision::ChangeKind
+impl core::marker::Sync for ferroday_cage::provision::ChangeKind
+impl core::marker::Unpin for ferroday_cage::provision::ChangeKind
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::ChangeKind
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ChangeKind
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ChangeKind
+#[non_exhaustive] pub enum ferroday_cage::provision::EntryKind
+pub ferroday_cage::provision::EntryKind::Directory
+pub ferroday_cage::provision::EntryKind::File
+pub ferroday_cage::provision::EntryKind::Other
+pub ferroday_cage::provision::EntryKind::Symlink
+impl core::marker::Freeze for ferroday_cage::provision::EntryKind
+impl core::marker::Send for ferroday_cage::provision::EntryKind
+impl core::marker::Sync for ferroday_cage::provision::EntryKind
+impl core::marker::Unpin for ferroday_cage::provision::EntryKind
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::EntryKind
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::EntryKind
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::EntryKind
 #[non_exhaustive] pub enum ferroday_cage::provision::ExportKind
 pub ferroday_cage::provision::ExportKind::Directory
 pub ferroday_cage::provision::ExportKind::File
@@ -1215,6 +1239,8 @@ pub ferroday_cage::provision::ProvisionError::Io::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::Io::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::Other
 pub ferroday_cage::provision::ProvisionError::Other::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
+#[non_exhaustive] pub ferroday_cage::provision::ProvisionError::OverlayLayerMissing
+pub ferroday_cage::provision::ProvisionError::OverlayLayerMissing::layer: ferroday_cage::OverlayLayer
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::RemoveDestInvalid
 pub ferroday_cage::provision::ProvisionError::RemoveDestInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::RemoveUnprivileged
@@ -1319,6 +1345,39 @@ impl core::marker::Unpin for ferroday_cage::provision::BuildLayer
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::BuildLayer
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::BuildLayer
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::BuildLayer
+pub struct ferroday_cage::provision::Change
+impl ferroday_cage::provision::Change
+pub fn ferroday_cage::provision::Change::attributes_differ(&self) -> bool
+pub fn ferroday_cage::provision::Change::before(&self) -> core::option::Option<ferroday_cage::provision::EntryKind>
+pub fn ferroday_cage::provision::Change::content_differs(&self) -> bool
+pub fn ferroday_cage::provision::Change::is_readable(&self) -> bool
+pub fn ferroday_cage::provision::Change::kind(&self) -> ferroday_cage::provision::ChangeKind
+pub fn ferroday_cage::provision::Change::mode_differs(&self) -> bool
+pub fn ferroday_cage::provision::Change::now(&self) -> core::option::Option<ferroday_cage::provision::EntryKind>
+pub fn ferroday_cage::provision::Change::owner_differs(&self) -> bool
+pub fn ferroday_cage::provision::Change::path(&self) -> &std::path::Path
+pub fn ferroday_cage::provision::Change::size(&self) -> core::option::Option<u64>
+impl core::marker::Freeze for ferroday_cage::provision::Change
+impl core::marker::Send for ferroday_cage::provision::Change
+impl core::marker::Sync for ferroday_cage::provision::Change
+impl core::marker::Unpin for ferroday_cage::provision::Change
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::Change
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Change
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Change
+pub struct ferroday_cage::provision::ChangeSet
+impl ferroday_cage::provision::ChangeSet
+pub fn ferroday_cage::provision::ChangeSet::changes(&self) -> &[ferroday_cage::provision::Change]
+pub fn ferroday_cage::provision::ChangeSet::get_lowers(&self) -> &[std::path::PathBuf]
+pub fn ferroday_cage::provision::ChangeSet::get_upper(&self) -> &std::path::Path
+pub fn ferroday_cage::provision::ChangeSet::is_empty(&self) -> bool
+pub fn ferroday_cage::provision::ChangeSet::read(&ferroday_cage::Overlay) -> core::result::Result<ferroday_cage::provision::ChangeSet, ferroday_cage::provision::ProvisionError>
+impl core::marker::Freeze for ferroday_cage::provision::ChangeSet
+impl core::marker::Send for ferroday_cage::provision::ChangeSet
+impl core::marker::Sync for ferroday_cage::provision::ChangeSet
+impl core::marker::Unpin for ferroday_cage::provision::ChangeSet
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::ChangeSet
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ChangeSet
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ChangeSet
 pub struct ferroday_cage::provision::CopyIn
 impl ferroday_cage::provision::CopyIn
 pub fn ferroday_cage::provision::CopyIn::id_mapper(self, impl ferroday_cage::IdMapper + 'static) -> ferroday_cage::provision::CopyIn

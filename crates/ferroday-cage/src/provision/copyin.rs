@@ -1025,7 +1025,11 @@ fn put_attributes(
 /// and the name is resolved in it as every other step of the walk resolves
 /// one. It is how a symbolic link's or a named pipe's attributes are asked
 /// for, since neither can be opened to be asked through a descriptor.
-fn by_path(dir: BorrowedFd<'_>, name: &[u8], subject: &Path) -> Result<CString, ProvisionError> {
+pub(super) fn by_path(
+    dir: BorrowedFd<'_>,
+    name: &[u8],
+    subject: &Path,
+) -> Result<CString, ProvisionError> {
     let mut path = format!("/proc/self/fd/{}/", dir.as_raw_fd()).into_bytes();
     path.extend_from_slice(name);
     CString::new(path).map_err(|_| ProvisionError::EntryRefused {
