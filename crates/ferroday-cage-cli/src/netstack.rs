@@ -6,7 +6,7 @@
 //! refusal, so the command's caller reads why a connection or a lookup failed.
 //! `--netstack-log` writes every report, carried flows and relayed questions
 //! too, which with no rules is a log of where the sandbox goes, by name. Each
-//! is one line:
+//! is one line, or on an event stream one `network` event:
 //!
 //! ```text
 //! fcage: the network stack refused tcp from 10.0.2.15:41234 to 192.0.2.1:443: no allow rule admits it
@@ -25,6 +25,7 @@ use std::thread::JoinHandle;
 
 use ferroday_cage::{NetStackReport, Reports};
 
+use crate::events::{self, Event};
 use crate::output::Reporter;
 
 /// Which of the stack's reports a run writes.
@@ -83,14 +84,19 @@ impl StackReports {
 fn hand_on(reports: &Reports<NetStackReport>, shown: Shown, reporter: &Reporter) {
     while let Ok(report) = reports.recv() {
         if shown == Shown::Every || report.is_refusal() {
-            reporter.report(format_args!("fcage: the network stack {report}"));
+            reporter.offer(events::network(&report));
         }
     }
     let dropped = reports.dropped();
     if dropped > 0 {
         let plural = if dropped == 1 { "" } else { "s" };
-        reporter.report(format_args!(
-            "fcage: the network stack dropped {dropped} report{plural} its queue had no room for"
+        reporter.offer(Event::dropped(
+            "network",
+            dropped,
+            format!(
+                "fcage: the network stack dropped {dropped} report{plural} its queue had no room \
+                 for"
+            ),
         ));
     }
 }

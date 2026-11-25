@@ -33,8 +33,13 @@ path = "src/main.rs"
 ferroday-cage = { version = "0.6.0", path = "../ferroday-cage", features = ["serde", "tarball", "debian", "alpine", "gentoo", "hardening", "netstack", "subid"] }
 toml = "1.1"
 # Resolves a `--rlimit` resource name through the library's own `Deserialize`,
-# so the flag and a profile's `[rlimit]` keys cannot drift apart.
-serde = "1.0"
+# so the flag and a profile's `[rlimit]` keys cannot drift apart. `derive`
+# declares the event stream's vocabulary, which `serde_json` writes.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Names an errno in an event, as the library's own seccomp reports name one.
+# The library already depends on it, so it adds nothing to the build.
+syscalls = { version = "0.8", default-features = false }
 # The two ambient readings `--terminal` makes of the terminal `fcage` was
 # started from: whether it is one, and what size it reports. The relay itself is
 # the library's, and needs nothing here. The rest serve the relay for a standard

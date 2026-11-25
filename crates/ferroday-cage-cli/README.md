@@ -74,6 +74,15 @@ fcage --remove-overlay-upper ./run-42 --identity-map single
 `--print-resolved` prints the inputs a launch's flags and profile resolve to,
 without starting it.
 
+For a program driving `fcage`, `--events PATH` writes what `fcage` says of its own to `PATH`
+as events, one JSON object per line. Standard error is left to the command. The command's
+start, its outcome and what it used, a failure's step and errno, and each report are events
+with their parts as members. A program passes a pipe as `/dev/fd/N`:
+
+```sh
+fcage --events /dev/fd/3 --rootfs ./root -- make test 3>events.jsonl
+```
+
 ## Confining the command
 
 The default profile is a rootless convenience for code you trust. Untrusted code calls for

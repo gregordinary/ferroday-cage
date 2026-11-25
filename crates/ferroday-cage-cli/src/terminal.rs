@@ -11,7 +11,7 @@ use std::os::fd::AsFd as _;
 use std::time::Duration;
 
 use ferroday_cage::relay::{Escalation, Relay, RelayError, Signals, install_panic_restore};
-use ferroday_cage::{ExitStatus, Pty, Running, Terminal};
+use ferroday_cage::{Pty, Running, Terminal};
 use rustix::termios;
 
 /// Whether `fcage`'s own standard input is a terminal.
@@ -68,18 +68,18 @@ impl Drop for HeldSignals {
     }
 }
 
-/// Drives an interactive session to its end and returns the command's outcome.
+/// Drives an interactive session to its end and returns how the command ended.
 ///
-/// `Ok(None)` means the timeout expired, whatever became of the command
-/// afterwards — the same convention the non-terminal path follows, because both
-/// drive the same [`Escalation`].
+/// An [`Ended`](crate::Ended) with no status means the timeout expired,
+/// whatever became of the command afterwards — the same convention the
+/// non-terminal path follows, because both drive the same [`Escalation`].
 pub fn relay(
     mut running: Running<'_>,
     pty: Pty,
     signals: HeldSignals,
     timeout: Option<Duration>,
     kill_after: Duration,
-) -> Result<Option<ExitStatus>, RelayError> {
+) -> Result<crate::Ended, RelayError> {
     let held = signals
         .0
         .as_ref()
@@ -99,8 +99,12 @@ pub fn relay(
     // error is one.
     let raw_stderr = interactive && termios::tcgetattr(rustix::stdio::stderr()).is_ok();
     let _lines = crate::output::RawLines::hold(raw_stderr);
-    Relay::new(stdin.as_fd(), stdout.as_fd())
+    let status = Relay::new(stdin.as_fd(), stdout.as_fd())
         .raw(interactive)
         .escalation(Escalation::new(timeout, kill_after))
-        .run(&mut running, &pty, held)
+        .run(&mut running, &pty, held)?;
+    Ok(crate::Ended {
+        status,
+        usage: running.usage(),
+    })
 }

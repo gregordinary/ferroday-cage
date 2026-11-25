@@ -715,6 +715,8 @@ dependencies = [
  "ferroday-cage-testkit",
  "rustix",
  "serde",
+ "serde_json",
+ "syscalls",
  "toml",
 ]
 

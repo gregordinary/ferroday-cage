@@ -2,8 +2,8 @@
 //!
 //! With `--seccomp-reports`, or `seccomp-reports = true` in a profile's
 //! `[hardening]` table, the launch reports each call its seccomp filter refuses
-//! the command, and `fcage` writes each as one line, so the command's caller
-//! reads which call failed and why:
+//! the command, and `fcage` writes each as one line, or on an event stream one
+//! `seccomp` event, so the command's caller reads which call failed and why:
 //!
 //! ```text
 //! fcage: the seccomp filter denied mount to thread 48213 (mount): EPERM
@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use ferroday_cage::{ErrorChain, Reports, Running, SeccompReport};
 
+use crate::events::{self, Event};
 use crate::output;
 
 /// How long a run waits, once the command has exited, for the last of the
@@ -110,13 +111,18 @@ impl FilterReports {
 /// dropped, where it dropped any.
 fn write_all(reports: &Reports<SeccompReport>) {
     while let Ok(report) = reports.recv() {
-        output::report(format_args!("fcage: the seccomp filter {report}"));
+        output::report_event(&events::seccomp(&report));
     }
     let dropped = reports.dropped();
     if dropped > 0 {
         let plural = if dropped == 1 { "" } else { "s" };
-        output::report(format_args!(
-            "fcage: the seccomp filter dropped {dropped} report{plural} its queue had no room for"
+        output::report_event(&Event::dropped(
+            "seccomp",
+            dropped,
+            format!(
+                "fcage: the seccomp filter dropped {dropped} report{plural} its queue had no room \
+                 for"
+            ),
         ));
     }
 }

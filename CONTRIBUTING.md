@@ -540,7 +540,7 @@ report name a package and its version bare.
 | Hold a Debian index or package to every digest its archive records | `provision::debian::digests::Digests`, whose `check_bytes` and `check_stream` compare each, as apt does, and whose `planned` is the one a plan keeps |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
-| Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode` |
+| Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode`. `fcage`'s event stream, a crate apart, spells bytes with `events::base64`, an encoder of its own |
 | Is this text a run of digits, and what number does it spell, without the leading `+` Rust's parsers take? How do two runs of digits compare? | `provision::number::is_digits`, `number::digits`, `number::digits_in` for HTTP's hexadecimal framing, `number::compare_digit_runs`. The network stack builds without the provisioners and asks of a port itself, `netstack::server_name::is_port`. Portage's merge counters, in a Gentoo root's `COUNTER` files and its counter file, are read as portage's `int()` reads them, sign included, where they are read |
 | Spell bytes as lowercase hex, or read lowercase hex back | `provision::digest::hex`, `digest::unhex`; a percent escape, which either case spells, is `fetch::percent_decode`'s to read |
 | Read a field-and-stanza document one stanza at a time, in place, or carry a stanza on whole, or write a plan document and read its header, its number fields and its list fields | `provision::document::parse`, `Stanza::get`, `Stanza::get_each`, `Stanza::text`, `document::header`, `document::number`, `document::list` |
@@ -650,7 +650,8 @@ report name a package and its version bare.
 | Name, in an error or a progress report, a string a mirror, an index, a package, or a sandbox supplied | `{:?}`, which escapes a control character, as the `failure` module states, unless an alphabet without control characters already admitted the value |
 | Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |
-| Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, `say`, `report`, and `Reports` for a thread that must not wait on standard error's reader, one per run, which the forwards and the network stack's reports share |
+| Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, `say`, `report`, `say_event` and `report_event`, which write to the run's event stream where it has one, and `Reports` for a thread that must not wait on its reader, one per run, which the forwards and the network stack's reports share |
+| Name what `fcage` says for a program to read: a report, an outcome, a failure, a setup step, an errno | the CLI's `events` module: `Event`, `Fault`, `events::error_kind`, `events::step_name`, `events::errno_name` |
 | Make a scratch tree for a test that leaves nothing to accumulate | `scratch::Scratch`, removed when it drops, or from a test suite `common::scratch_dir`, emptied when the next run reuses it, and `common::ranged_scratch` for a tree of subordinate-owned entries |
 | What happens when a run's timeout runs out? | `relay::Escalation` |
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |

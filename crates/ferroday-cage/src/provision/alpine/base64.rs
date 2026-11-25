@@ -2,9 +2,10 @@
 //!
 //! The Alpine layer spells a package's identity in it and reads a signing
 //! key's PEM in it. Written here rather than taken from a crate because it is
-//! fifty lines and this layer is the workspace's only user: irongall decodes
+//! fifty lines and this layer is the library's only user: irongall decodes
 //! the OpenPGP side's armor itself, and every other digest the crate renders is
-//! hexadecimal.
+//! hexadecimal. `fcage`, a crate apart, encodes the bytes its event stream
+//! carries with an encoder of its own.
 
 /// The alphabet, in the order of the six-bit values it spells.
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

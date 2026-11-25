@@ -590,6 +590,11 @@ path = "crates/ferroday-cage/src/failure.rs"
 count = 2
 why = "The answer."
 
+[[idiom.site]]
+path = "crates/ferroday-cage-cli/src/events.rs"
+count = 1
+why = "A second walk with another question: `fcage`'s event stream names the first errno among an error's causes, where `ErrorChain` renders them. It walks the same chain, and descends into an `io::Error` that wraps another, whose message the rendering shows as the wrapper's own."
+
 [[idiom]]
 name = "a path's directory, or `.` for a bare name"
 pattern = 'Path::new\("\."\)'

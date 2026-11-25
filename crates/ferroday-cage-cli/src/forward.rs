@@ -914,8 +914,8 @@ impl Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::Reports;
     use crate::output::tests::Kept;
+    use crate::output::{Destination, Reports};
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -954,7 +954,8 @@ mod tests {
     impl Heard {
         fn new() -> Heard {
             let written = Kept::default();
-            let reports = Reports::start_to(written.clone()).expect("the reports thread starts");
+            let reports = Reports::start_to(Destination::Lines(Box::new(written.clone())))
+                .expect("the reports thread starts");
             Heard { reports, written }
         }
 
@@ -1304,7 +1305,8 @@ mod tests {
             filled += 1;
         }
         rustix::io::ioctl_fionbio(&stderr, false).expect("the pipe blocks again");
-        let reports = Reports::start_to(stderr).expect("the reports thread starts");
+        let reports = Reports::start_to(Destination::Lines(Box::new(stderr)))
+            .expect("the reports thread starts");
         let (relay, listening, stop) = relay_reporting(address, reports.reporter());
         let thread = std::thread::spawn(move || relay.run());
 

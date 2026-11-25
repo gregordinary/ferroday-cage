@@ -43,6 +43,7 @@
 //! publishes the enumerations they print. `tools/parity.toml` records the whole
 //! comparison, setting by setting, and a check holds it to the code.
 
+mod events;
 mod forward;
 mod netstack;
 mod output;
@@ -55,6 +56,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferroday_cage::provision::alpine::{Alpine, KeySet as AlpineKeySet};
@@ -70,10 +72,12 @@ use ferroday_cage::{
     ExitStatus, FsAccess, Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount,
     NetAccess, NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Overlay,
     OverlayMount, Pending, PresentedIdentity, RawMount, ReadOnly, ResolvedCgroup, ResolvedInputs,
-    Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg,
-    SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
+    Resource, ResourceUsage, RestrictedProfile, Restriction, RestrictionBuilder, Running,
+    SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
 };
 use serde::Deserialize as _;
+
+use crate::events::{Event, Fault};
 
 /// The exit code of a command line `fcage` cannot understand.
 const USAGE: u8 = 2;
@@ -91,45 +95,59 @@ const TIMED_OUT: u8 = 124;
 /// a script reads one code for "`fcage` failed" whatever part of it failed.
 const FAILED: u8 = 125;
 
-/// Reports a failure of `fcage`'s own on standard error, and returns
-/// [`FAILED`].
+/// Reports a failure of `fcage`'s own, and returns [`FAILED`].
 fn fail(diagnostic: impl Into<Diagnostic>) -> ExitCode {
-    output::report(format_args!("fcage: {}", diagnostic.into().0));
-    ExitCode::from(FAILED)
+    fail_with(diagnostic, FAILED)
+}
+
+/// Reports a failure after which `fcage` exits `code`, and returns `code`: a
+/// line on standard error, or a `failed` event on the run's event stream.
+fn fail_with(diagnostic: impl Into<Diagnostic>, code: u8) -> ExitCode {
+    output::report_event(&Event::failed(diagnostic.into().0, code));
+    ExitCode::from(code)
 }
 
 /// What [`fail`] reports: a message of `fcage`'s own, or an error rendered with
-/// every cause beneath it.
+/// every cause beneath it, and what the event stream names of it.
 ///
 /// The library's errors, and the OS errors `fcage` meets on its own, keep their
 /// causes out of their messages and return them from `source()`. Printing one
 /// with `{}` would therefore drop the OS error underneath it, so each converts
-/// through [`ErrorChain`] instead. The conversions name each error type rather
-/// than covering every type at once, so an error type without one is refused as
-/// an argument to [`fail`] at compile time, rather than accepted as a message
-/// that has lost its cause.
-struct Diagnostic(String);
+/// through [`Fault::of`], which renders it through [`ErrorChain`] and names the
+/// errno beneath it. The conversions name each error type rather than covering
+/// every type at once, so an error type without one is refused as an argument
+/// to [`fail`] at compile time, rather than accepted as a message that has lost
+/// its cause.
+struct Diagnostic(Fault);
 
 impl From<String> for Diagnostic {
     fn from(message: String) -> Diagnostic {
-        Diagnostic(message)
+        Diagnostic(Fault::plain("fcage", message))
     }
 }
 
 impl From<std::fmt::Arguments<'_>> for Diagnostic {
     fn from(message: std::fmt::Arguments<'_>) -> Diagnostic {
-        Diagnostic(message.to_string())
+        Diagnostic(Fault::plain("fcage", message.to_string()))
+    }
+}
+
+impl From<Error> for Diagnostic {
+    /// The library's failure, by the variant, the step and the errno the
+    /// event stream names it with.
+    fn from(error: Error) -> Diagnostic {
+        Diagnostic(Fault::of_cage(&error))
     }
 }
 
 /// Declares the conversion of each error type `fcage` reports into a
-/// [`Diagnostic`], rendered through [`ErrorChain`].
+/// [`Diagnostic`], with the name the event stream gives its failures.
 macro_rules! diagnostic_from_errors {
-    ($($error:ty),+ $(,)?) => {
+    ($($error:ty => $kind:literal),+ $(,)?) => {
         $(
             impl From<$error> for Diagnostic {
                 fn from(error: $error) -> Diagnostic {
-                    Diagnostic(ErrorChain::new(&error).to_string())
+                    Diagnostic(Fault::of($kind, &error))
                 }
             }
         )+
@@ -137,14 +155,13 @@ macro_rules! diagnostic_from_errors {
 }
 
 diagnostic_from_errors!(
-    Error,
-    ferroday_cage::NetStackError,
-    ferroday_cage::provision::ProvisionError,
-    ferroday_cage::provision::alpine::AlpineError,
-    ferroday_cage::provision::debian::DebianError,
-    ferroday_cage::provision::gentoo::GentooError,
-    RelayError,
-    streams::StartError,
+    ferroday_cage::NetStackError => "netstack",
+    ferroday_cage::provision::ProvisionError => "provision",
+    ferroday_cage::provision::alpine::AlpineError => "provision",
+    ferroday_cage::provision::debian::DebianError => "provision",
+    ferroday_cage::provision::gentoo::GentooError => "provision",
+    RelayError => "relay",
+    streams::StartError => "relay",
 );
 
 /// What follows a flag's name on the command line.
@@ -1879,6 +1896,24 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--events",
+        section: Section::Command,
+        placeholder: "PATH",
+        help: &[
+            "Write what fcage says of its own to PATH as events,",
+            "one JSON object per line, and nothing of fcage's on",
+            "standard error, which carries the command's alone. A",
+            "program passes a pipe as /dev/fd/N; a file is appended",
+            "to",
+        ],
+        restriction: true,
+        take: Take::One(|options, _flag, value| {
+            options.events = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--share-net",
         section: Section::Networking,
         help: &["Share the host network (default: isolated loopback)"],
@@ -3079,6 +3114,8 @@ struct Options {
     /// `--print-resolved`: print what the build resolves to rather than
     /// launching.
     print_resolved: bool,
+    /// `--events`: where the run says what it has to say, as events.
+    events: Option<PathBuf>,
     netstack: bool,
     netstack_cidr: Option<(Ipv4Addr, u8)>,
     netstack_cidr6: Option<(Ipv6Addr, u8)>,
@@ -3632,6 +3669,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         caps: None,
         restrict: false,
         print_resolved: false,
+        events: None,
         netstack: false,
         netstack_cidr: None,
         netstack_cidr6: None,
@@ -6011,6 +6049,24 @@ fn export_rootfs(
 /// configuration is checked when the sandbox is built, over the root the
 /// provisioner published.
 fn run(options: Options) -> ExitCode {
+    // First of all, so the run says everything of its own there. A stream
+    // that cannot be opened is said on standard error, as nothing else is.
+    if let Some(path) = &options.events
+        && let Err(error) = output::open_events(path)
+    {
+        let unread = match error.raw_os_error() {
+            Some(errno) if errno == rustix::io::Errno::NXIO.raw_os_error() => {
+                " (nothing reads it: a pipe needs its reader open, and a socket cannot be \
+                 opened by name)"
+            }
+            _ => "",
+        };
+        return fail(format_args!(
+            "opening {} for the run's events{unread}: {}",
+            path.display(),
+            ErrorChain::new(&error)
+        ));
+    }
     if options.restrict {
         return run_restricted(options);
     }
@@ -6388,7 +6444,7 @@ impl Launch {
             );
         }
         let outcome = start(builder, Cage::spawn).and_then(|running| {
-            Ok(seccomp::writing_refusals(running, |running| {
+            Ok(supervise(running, |running| {
                 wait_with_deadline(running, timeout, kill_after)
             })?)
         });
@@ -6644,7 +6700,16 @@ fn passed_term(base_env: bool, named: bool, host: Option<OsString>) -> Option<Os
 
 /// Reports a usage error found once a launch's inputs are read, such as a
 /// profile that contradicts a flag, and returns [`USAGE`].
+///
+/// On an event stream it is one `failed` event, without the pointer to the
+/// help a person reads on standard error.
 fn usage_error(message: std::fmt::Arguments<'_>) -> ExitCode {
+    if output::has_events() {
+        return fail_with(
+            Diagnostic(Fault::plain("usage", message.to_string())),
+            USAGE,
+        );
+    }
     output::report(format_args!("fcage: {message}"));
     output::report(format_args!("Try 'fcage --help' for usage."));
     ExitCode::from(USAGE)
@@ -6727,39 +6792,42 @@ fn route_streams<B>(
 }
 
 /// Settles a run that relayed its streams: the relays first, then the outcome.
-fn finish(relay: streams::StreamRelay, outcome: Result<Option<ExitStatus>, Failure>) -> ExitCode {
-    let delivered = settle(relay);
-    settled_code(outcome, delivered)
+fn finish(relay: streams::StreamRelay, outcome: Result<Ended, Failure>) -> ExitCode {
+    let undelivered = settle(relay);
+    settled_code(outcome, &undelivered)
 }
 
-/// Stops the stream relays, and reports each one that failed. Returns whether
-/// every relay delivered.
+/// Stops the stream relays, and returns each one that failed, with its
+/// failure.
 ///
-/// Called before `fcage` prints anything about how the run ended, so that its
-/// own words land after the command's last bytes in a relayed file. A relay
-/// that failed lost output the command believed delivered, or could not return
-/// the input the command did not read, which is a failure of `fcage` rather
-/// than of the command.
-fn settle(relay: streams::StreamRelay) -> bool {
-    let failures = relay.finish();
-    for (streams, error) in &failures {
-        output::report(format_args!(
-            "fcage: relaying the command's {streams}: {}",
-            ErrorChain::new(error)
-        ));
-    }
-    failures.is_empty()
+/// Called before `fcage` says anything about how the run ended, so that its
+/// own words land after the command's last bytes in a relayed file.
+fn settle(relay: streams::StreamRelay) -> Vec<(&'static str, std::io::Error)> {
+    relay.finish()
 }
 
-/// Maps a settled run onto the process exit status: the outcome's own, or
-/// [`FAILED`] where a relay failed, whatever the command's status was.
-fn settled_code(outcome: Result<Option<ExitStatus>, Failure>, delivered: bool) -> ExitCode {
+/// Maps a settled run onto the process exit status, and says how it ended:
+/// the outcome first, and then each relay in `undelivered`, whose failure
+/// makes the status [`FAILED`] whatever the command's was.
+///
+/// A relay that failed lost output the command believed delivered, or could
+/// not return the input the command did not read, which is a failure of
+/// `fcage` rather than of the command. It is said after the outcome, so the
+/// last thing the run says is what decides its status.
+fn settled_code(
+    outcome: Result<Ended, Failure>,
+    undelivered: &[(&'static str, std::io::Error)],
+) -> ExitCode {
     let code = conclude(outcome);
-    if delivered {
-        code
-    } else {
-        ExitCode::from(FAILED)
+    if undelivered.is_empty() {
+        return code;
     }
+    for (streams, error) in undelivered {
+        let mut fault = Fault::of("relay", error);
+        fault.message = format!("relaying the command's {streams}: {}", fault.message);
+        output::report_event(&Event::failed(fault, FAILED));
+    }
+    ExitCode::from(FAILED)
 }
 
 /// Runs a sandbox on a pseudoterminal of its own and relays the caller's
@@ -6786,7 +6854,7 @@ fn run_on_a_terminal(
         Err(failure) => return conclude(Err(failure)),
     };
     conclude(
-        seccomp::writing_refusals(running, |running| {
+        supervise(running, |running| {
             terminal::relay(running, pty, signals, timeout, kill_after)
         })
         .map_err(Failure::from),
@@ -6912,21 +6980,17 @@ fn run_pending(
         return finish(relay, Err(failure));
     }
     // A publication that left the port to the kernel is useless until the
-    // caller knows which one it got. Said before the command is released, and
-    // before a terminal session takes the caller's terminal into raw mode. A
-    // reader that has gone is told nothing, so the command is not released:
-    // dropping the pending launch tears the sandbox down, and the stack stops
-    // with it.
+    // caller knows which one it got, so standard error says that one; an event
+    // stream says every one. Said before the command is released, and before a
+    // terminal session takes the caller's terminal into raw mode. A reader
+    // that has gone is told nothing, so the command is not released: dropping
+    // the pending launch tears the sandbox down, and the stack stops with it.
     let published = beside
         .handle
         .as_ref()
         .map_or_else(Vec::new, |handle| handle.published().to_vec());
     for ((requested, guest_port), bound) in publications.iter().zip(published) {
-        if requested.port() == 0
-            && output::say(format_args!(
-                "fcage: publishing the sandbox's port {guest_port} on {bound}"
-            ))
-            .is_err()
+        if output::say_event(&Event::published(*guest_port, bound, requested.port() == 0)).is_err()
         {
             drop(pending);
             // A stack that does not stop cleanly has nowhere left to say so.
@@ -6944,14 +7008,14 @@ fn run_pending(
 
     // The relay when a terminal was allocated, the plain wait otherwise. Both
     // return the same outcome; only the driving differs.
-    let outcome = seccomp::writing_refusals(running, |running| match (pty, signals) {
+    let outcome = supervise(running, |running| match (pty, signals) {
         (Some(pty), Some(signals)) => {
             terminal::relay(running, pty, signals, timeout, kill_after).map_err(Failure::from)
         }
         _ => wait_with_deadline(running, timeout, kill_after).map_err(Failure::from),
     });
     let stopped = beside.stop();
-    let delivered = settle(relay);
+    let undelivered = settle(relay);
     // Printed after the stream relays have delivered the command's output, so
     // it lands after that output, and after the terminal relay has restored the
     // caller's terminal, so it is not stair-stepped.
@@ -6961,7 +7025,7 @@ fn run_pending(
             ErrorChain::new(&error)
         ));
     }
-    settled_code(outcome, delivered)
+    settled_code(outcome, &undelivered)
 }
 
 /// What a run held at the pending seam starts beside the sandbox: the native
@@ -7121,7 +7185,7 @@ fn run_restricted(mut options: Options) -> ExitCode {
             Err(failure) => return conclude(Err(failure)),
         };
         return conclude(
-            seccomp::writing_refusals(running, |running| {
+            supervise(running, |running| {
                 terminal::relay(running, pty, signals, options.timeout, options.kill_after)
             })
             .map_err(Failure::from),
@@ -7137,7 +7201,7 @@ fn run_restricted(mut options: Options) -> ExitCode {
         Err(code) => return code,
     };
     let outcome = start(builder, Restriction::spawn).and_then(|running| {
-        Ok(seccomp::writing_refusals(running, |running| {
+        Ok(supervise(running, |running| {
             wait_with_deadline(running, options.timeout, options.kill_after)
         })?)
     });
@@ -7267,8 +7331,15 @@ fn withhold_from_restricted_command() -> Result<(), ExitCode> {
     )
 }
 
+/// Waits a released command out through `wait`: says that it started, and
+/// writes the seccomp filter's refusals while `wait` runs.
+fn supervise<'obs, T>(running: Running<'obs>, wait: impl FnOnce(Running<'obs>) -> T) -> T {
+    output::report_event(&Event::started(running.pid()));
+    seccomp::writing_refusals(running, wait)
+}
+
 /// Waits a launch out under the optional deadline, escalating as
-/// [`Escalation`] says. `Ok(None)` means the deadline fired.
+/// [`Escalation`] says. An [`Ended`] with no status means the deadline fired.
 ///
 /// The blocking half of the two waits `fcage` has; the terminal relay drives
 /// the same escalation from its poll loop.
@@ -7276,7 +7347,7 @@ fn wait_with_deadline(
     mut running: Running<'_>,
     timeout: Option<Duration>,
     kill_after: Duration,
-) -> Result<Option<ExitStatus>, Error> {
+) -> Result<Ended, Error> {
     let mut escalation = Escalation::new(timeout, kill_after);
     let status = loop {
         // No deadline left: either none was asked for, or the escalation has
@@ -7289,7 +7360,10 @@ fn wait_with_deadline(
             None => escalation.expire(&mut running)?,
         }
     };
-    Ok(escalation.outcome(status))
+    Ok(Ended {
+        status: escalation.outcome(status),
+        usage: running.usage(),
+    })
 }
 
 /// Why a run ended with no status of the command's to report.
@@ -7330,26 +7404,49 @@ impl From<RelayError> for Failure {
 }
 
 impl Failure {
-    /// Reports the failure on standard error and returns its exit code.
+    /// Reports the failure and returns its exit code.
     fn report(self) -> ExitCode {
         match self {
             Failure::Cage(error) => {
-                output::report(format_args!("fcage: {}", ErrorChain::new(&error)));
-                ExitCode::from(error.shell_code())
+                let code = error.shell_code();
+                fail_with(error, code)
             }
             Failure::Fcage(diagnostic) => fail(diagnostic),
-            Failure::ReaderGone => ExitCode::from(output::broken_pipe()),
+            // Standard error says nothing, since the reader that went may be
+            // its own. An event stream may still be read, and its reader is
+            // owed the run's last event.
+            Failure::ReaderGone => {
+                let code = output::broken_pipe();
+                if output::has_events() {
+                    let gone = "a reader of what the run writes went away before the run was done";
+                    return fail_with(Diagnostic(Fault::plain("reader-gone", gone.into())), code);
+                }
+                ExitCode::from(code)
+            }
         }
     }
 }
 
-/// Maps a run's outcome onto the process exit status.
-fn conclude(outcome: Result<Option<ExitStatus>, Failure>) -> ExitCode {
+/// How a launch's command ended, as `fcage` concludes it.
+struct Ended {
+    /// The command's status, or `None` where `--timeout` expired first,
+    /// whatever became of the command afterwards.
+    status: Option<ExitStatus>,
+    /// What the command and its descendants used, where anything was read.
+    usage: Option<ResourceUsage>,
+}
+
+/// Maps a run's outcome onto the process exit status, and says how the
+/// command ended on the run's event stream.
+fn conclude(outcome: Result<Ended, Failure>) -> ExitCode {
     match outcome {
-        // The timeout(1) convention: 124 announces an expired timeout,
-        // whatever became of the command afterwards.
-        Ok(None) => ExitCode::from(TIMED_OUT),
-        Ok(Some(status)) => ExitCode::from(status.shell_code()),
+        Ok(ended) => {
+            // The timeout(1) convention: 124 announces an expired timeout,
+            // whatever became of the command afterwards.
+            let code = ended.status.map_or(TIMED_OUT, |status| status.shell_code());
+            output::report_event(&Event::exited(ended.status, ended.usage.as_ref(), code));
+            ExitCode::from(code)
+        }
         Err(failure) => failure.report(),
     }
 }
@@ -7423,7 +7520,7 @@ fn provisioner(options: &Options) -> Result<Option<Selected>, ExitCode> {
 }
 
 /// Publishes a root filesystem at `rootfs` through `provisioner`, reporting its
-/// progress on standard error.
+/// progress on standard error, or on the run's event stream.
 ///
 /// An existing directory is reused as it stands. A reader of the progress that
 /// goes away stops the run at the provisioner's next clean point, which leaves
@@ -7439,6 +7536,7 @@ fn provisioner(options: &Options) -> Result<Option<Selected>, ExitCode> {
 /// goes ahead without it, and a `SIGINT` ends `fcage` as it did before.
 fn provision(rootfs: &Path, provisioner: &mut Selected) -> Result<Provisioned, ExitCode> {
     let mut progress = Progress::new(std::io::stderr());
+    progress.events = output::events();
     progress.interrupt = Interrupt::hold().ok();
     // A layer reports to the observer bound to it, which stops the run too. A
     // tarball reports nothing `fcage` prints, so its run's observer only stops
@@ -7487,9 +7585,13 @@ fn end_by_interrupt() -> ExitCode {
 /// once it is interrupted.
 ///
 /// Generic over where the report goes so that a test can hand it a pipe whose
-/// reader has gone; a run hands it standard error.
+/// reader has gone; a run hands it standard error. A run with an event stream
+/// writes there instead, each line and each output a `provision` event.
 struct Progress<W> {
     out: W,
+    /// The run's event stream, which takes the place of `out` where the run
+    /// has one.
+    events: Option<Arc<output::EventStream>>,
     /// Whether a write found the reader gone. Nothing more is written once it
     /// has, and the run is asked to stop.
     gone: bool,
@@ -7501,6 +7603,7 @@ impl<W: std::io::Write> Progress<W> {
     fn new(out: W) -> Progress<W> {
         Progress {
             out,
+            events: None,
             gone: false,
             interrupt: None,
         }
@@ -7508,7 +7611,23 @@ impl<W: std::io::Write> Progress<W> {
 
     /// Writes one line of progress.
     fn line(&mut self, line: std::fmt::Arguments<'_>) -> Result<(), output::ReaderGone> {
-        output::say_to(&mut self.out, line)
+        match &self.events {
+            Some(events) => events.write(&Event::progress(line.to_string())),
+            None => output::say_to(&mut self.out, line),
+        }
+    }
+
+    /// Writes what a command the run started wrote to `stream`, as it wrote
+    /// it.
+    fn output(
+        &mut self,
+        stream: ferroday_cage::provision::Stream,
+        bytes: &[u8],
+    ) -> Result<(), output::ReaderGone> {
+        match &self.events {
+            Some(events) => events.write(&Event::command_output(stream, bytes)),
+            None => output::pass_to(&mut self.out, bytes),
+        }
     }
 
     /// Reports one step through `write`, unless the reader has already gone.
@@ -7583,7 +7702,7 @@ impl<W: std::io::Write> Progress<W> {
                 self.line(format_args!("fcage: extracting {package}"))
             }
             // dpkg's own output passes straight through.
-            DebianEvent::CommandOutput { bytes, .. } => output::pass_to(&mut self.out, bytes),
+            DebianEvent::CommandOutput { stream, bytes, .. } => self.output(*stream, bytes),
             _ => Ok(()),
         }
     }
@@ -7628,7 +7747,7 @@ impl<W: std::io::Write> Progress<W> {
                 package, script, ..
             } => self.line(format_args!("fcage: {package}: {script}")),
             // An install script's own output passes straight through.
-            AlpineEvent::CommandOutput { bytes, .. } => output::pass_to(&mut self.out, bytes),
+            AlpineEvent::CommandOutput { stream, bytes, .. } => self.output(*stream, bytes),
             _ => Ok(()),
         }
     }
@@ -9171,6 +9290,48 @@ mod tests {
         let mut seen = String::new();
         std::io::Read::read_to_string(&mut reader, &mut seen).expect("the line arrives");
         assert_eq!(seen, "fcage: resolving the package set\n");
+    }
+
+    #[test]
+    fn a_provisioning_run_with_an_event_stream_writes_its_progress_there() {
+        use ferroday_cage::provision::Stream;
+        use ferroday_cage::provision::debian::{DebianEvent, DebianObserver as _};
+
+        let kept = output::tests::Kept::default();
+        // Standard error's stand-in, which must stay empty.
+        let (mut reader, writer) = std::io::pipe().expect("a pipe");
+        let mut progress = Progress::new(writer);
+        progress.events = Some(Arc::new(output::EventStream::new(kept.clone())));
+        progress.progress(DebianEvent::Resolving);
+        progress
+            .output(Stream::Stderr, b"dpkg: \xff not text\n")
+            .expect("the stream takes it");
+        drop(progress);
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut said).expect("the pipe closes");
+        assert_eq!(said, "", "nothing goes to standard error");
+
+        let lines: Vec<serde_json::Value> = kept
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                serde_json::json!({
+                    "event": "provision",
+                    "report": "progress",
+                    "text": "fcage: resolving the package set",
+                }),
+                serde_json::json!({
+                    "event": "provision",
+                    "report": "output",
+                    "stream": "stderr",
+                    "output": {"base64": "ZHBrZzog/yBub3QgdGV4dAo="},
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -11909,7 +12070,7 @@ mod tests {
         // launch builds from the one it builds without it. A flag that states
         // the default changes nothing alone, so it is held to overriding its
         // counterpart instead: its `--no-` form, or for a `--no-` flag the
-        // form without it. The four the launch applies around the restriction
+        // form without it. The five the launch applies around the restriction
         // stay in the options for it.
         let built = |flags: &[&str]| {
             let mut args = vec!["--restrict", "--landlock-ro", "/usr"];
@@ -11929,6 +12090,7 @@ mod tests {
             let seen = match flag.long {
                 "--terminal" => options.terminal,
                 "--print-resolved" => options.print_resolved,
+                "--events" => options.events.is_some(),
                 "--timeout" => options.timeout.is_some(),
                 "--kill-after" => options.kill_after == Duration::from_secs(1),
                 // Given beside the roster it needs, so held to that rather

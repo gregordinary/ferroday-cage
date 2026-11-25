@@ -107,6 +107,19 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `fcage --events PATH` writes everything `fcage` says of its own to `PATH` as
+  events, one JSON object per line, and nothing of its own on standard error,
+  which then carries the command's output alone. The stream begins with
+  `hello`, which carries the vocabulary's `protocol` version, and a launch's
+  ends with `exited`, with the command's status, whether its timeout expired
+  and what it used, or `failed`, naming the library's error, the setup step and
+  the errno where they apply. Between them come `started`, each `published`
+  port, the network stack's and the seccomp filter's reports as `network` and
+  `seccomp` events with their parts as members, `dropped` counts, a
+  provisioning run's `progress` and command `output`, and each `warning`. Every
+  event standard error would have carried as a line has that line as `text`.
+  Bytes that are not UTF-8 are written as `{"base64": ...}`. A program passes
+  a pipe as `/dev/fd/N`, and a file is appended to (`ferroday-cage-cli`).
 - What a run wrote through an overlay can be read as a list of changes:
   `provision::ChangeSet::read` walks an `Overlay`'s upper against its lowers
   and lists each `Change` by path, added, modified, removed or replaced
@@ -363,6 +376,9 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- Where a launch both fails and loses a relayed stream, `fcage` says how the
+  launch ended first and the relay's failure after it, so its last line is the
+  one its exit status follows (`ferroday-cage-cli`).
 - `CageBuilder::build` accepts a cage with no command, which only starts:
   `run`, `spawn` and the other launches that run the cage's command refuse it
   with `ConfigError::CommandMissing`, where the build refused it before. A

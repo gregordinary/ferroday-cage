@@ -35,16 +35,31 @@
 //! writer already holds [`QUEUED_REPORTS`] lines, the line is dropped and
 //! counted, and the writer says how many it dropped once it has written what
 //! it held, so a lost report is never a silent one.
+//!
+//! # The event stream
+//!
+//! A launch given `--events PATH` says everything of its own there instead, as
+//! the events [`crate::events`] defines, and nothing on standard error, which
+//! then carries the command's output alone. Each line of `fcage`'s is an
+//! [`Event`], whatever the run's sink: [`say_event`] and [`report_event`] write
+//! it to the stream where the run has one, and its line on standard error where
+//! it does not, and [`say`] and [`report`] say a line as a `warning`. The
+//! stream's reader going away is the same outcome as standard error's.
 
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 
 use ferroday_cage::{ErrorChain, ExitStatus};
+use rustix::fs::{Mode, OFlags};
+
+use crate::events::Event;
 
 /// The exit code of a writer whose reader went away: what a process `SIGPIPE`
 /// killed exits with, which is what a shell expects of a pipeline's early end.
@@ -52,24 +67,115 @@ pub fn broken_pipe() -> u8 {
     ExitStatus::signaled(rustix::process::Signal::PIPE.as_raw()).shell_code()
 }
 
-/// The reader of standard error has gone: a line of `fcage`'s own could not be
-/// written, because nothing reads the pipe it was written to.
+/// The reader of what `fcage` says has gone, standard error's or the event
+/// stream's: a line of `fcage`'s own could not be written, because nothing
+/// reads the pipe it was written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderGone;
 
-/// Writes one line of `fcage`'s own to standard error, while work remains.
+/// Writes one line of `fcage`'s own, while work remains: on standard error, or
+/// as a `warning` on the run's event stream.
 ///
 /// The caller stops that work on [`ReaderGone`] and exits with
 /// [`broken_pipe`].
 pub fn say(line: fmt::Arguments<'_>) -> Result<(), ReaderGone> {
-    say_to(&mut io::stderr().lock(), line)
+    say_event(&Event::warning(line.to_string()))
 }
 
-/// Writes one line of `fcage`'s own to standard error, reporting how the
-/// invocation ended. A reader gone loses the words and changes nothing else.
+/// Writes one line of `fcage`'s own, reporting how the invocation ended, as
+/// [`say`] does. A reader gone loses the words and changes nothing else.
 pub fn report(line: fmt::Arguments<'_>) {
     // The ending is the caller's exit code, which a lost line does not change.
     let _ = say(line);
+}
+
+/// Says `event` while work remains: on the run's event stream where it has
+/// one, and otherwise its line on standard error, where it has a line.
+///
+/// The caller stops that work on [`ReaderGone`], as for [`say`].
+pub fn say_event(event: &Event) -> Result<(), ReaderGone> {
+    match EVENTS.get() {
+        Some(stream) => stream.write(event),
+        None => match event.text() {
+            Some(text) => say_to(&mut io::stderr().lock(), format_args!("{text}")),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Says `event` as [`say_event`] does, reporting how the invocation ended, as
+/// [`report`] does a line.
+pub fn report_event(event: &Event) {
+    // As for `report`: the ending is the exit code's, not the words'.
+    let _ = say_event(event);
+}
+
+/// A run's event stream: one JSON object per line, each written whole, by one
+/// writer at a time, whichever thread says it.
+pub struct EventStream {
+    /// Where the lines go.
+    out: Mutex<Box<dyn Write + Send>>,
+}
+
+impl EventStream {
+    /// A stream writing to `out`.
+    pub fn new(out: impl Write + Send + 'static) -> EventStream {
+        EventStream {
+            out: Mutex::new(Box::new(out)),
+        }
+    }
+
+    /// Writes `event` as one line, answering [`ReaderGone`] where the stream's
+    /// reader has gone and dropping any other failure, as a line on standard
+    /// error does.
+    pub fn write(&self, event: &Event) -> Result<(), ReaderGone> {
+        let line = event.line();
+        // A writer that panicked left at most a line unfinished, and a reader
+        // skips a line it cannot read as it skips one it does not know.
+        let mut out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
+        gone_or_dropped(out.write_all(&line).and_then(|()| out.flush()))
+    }
+}
+
+/// The run's event stream, once [`open_events`] has opened one.
+static EVENTS: OnceLock<Arc<EventStream>> = OnceLock::new();
+
+/// Opens `path` as the run's event stream, and says `hello` on it. From here on
+/// every line of `fcage`'s own is an event there, and none goes to standard
+/// error.
+///
+/// `path` is opened for appending, and created where it does not exist, so a
+/// program hands `fcage` a pipe it reads as `/dev/fd/N` and a person names a
+/// file. Opening by name is what keeps `fcage` free of `unsafe`: a descriptor
+/// taken by its number alone would be one `fcage` claims to own without
+/// knowing that nothing else does. The open does not wait for a reader: a pipe
+/// or a named pipe that nothing reads, and a socket, which cannot be opened by
+/// name, fail with `ENXIO`.
+pub fn open_events(path: &Path) -> io::Result<()> {
+    let flags = OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::CLOEXEC;
+    let opened = rustix::fs::open(path, flags | OFlags::NONBLOCK, Mode::from_raw_mode(0o666))?;
+    // Writes wait for the reader once it is there, as they would to standard
+    // error.
+    rustix::fs::fcntl_setfl(
+        &opened,
+        rustix::fs::fcntl_getfl(&opened)?.difference(OFlags::NONBLOCK),
+    )?;
+    let stream = Arc::new(EventStream::new(File::from(opened)));
+    // A reader already gone loses this as it loses every later event.
+    let _ = stream.write(&Event::hello());
+    // A run opens its stream once, before it says anything else.
+    let _ = EVENTS.set(stream);
+    Ok(())
+}
+
+/// Whether the run says what it has to say on an event stream.
+pub fn has_events() -> bool {
+    EVENTS.get().is_some()
+}
+
+/// The run's event stream, where it has one.
+pub fn events() -> Option<Arc<EventStream>> {
+    EVENTS.get().cloned()
 }
 
 /// Writes `line` and a newline to `out`, answering [`ReaderGone`] where the
@@ -167,56 +273,98 @@ pub fn stdout_status(subject: &str, written: io::Result<()>) -> u8 {
     }
 }
 
-/// The most lines a [`Reports`] writer holds for standard error before a
-/// further one is dropped.
+/// The most events a [`Reports`] writer holds before a further one is
+/// dropped.
 ///
-/// The lines are a forward's reports, each the first of a run of failures, so
-/// a run fills this only while standard error takes nothing at all. The bound
-/// is what a reader that never reads can make `fcage` hold.
+/// The events are a forward's reports, each the first of a run of failures,
+/// and the network stack's, so a run fills this only while nothing takes what
+/// the writer writes. The bound is what a reader that never reads can make
+/// `fcage` hold.
 pub const QUEUED_REPORTS: usize = 64;
 
-/// A thread of `fcage`'s own that writes lines on standard error for threads
-/// that must not wait on its reader, and the [`Reporter`] they hand them to.
+/// A thread of `fcage`'s own that writes events for threads that must not wait
+/// on their reader, and the [`Reporter`] they hand them to.
 ///
 /// [`finish`](Self::finish) ends it once every reporter is gone.
 pub struct Reports {
     /// The reporter that [`reporter`](Self::reporter) clones.
     reporter: Reporter,
-    /// The thread writing the lines.
+    /// The thread writing the events.
     writer: JoinHandle<()>,
 }
 
-/// Where a thread that must not wait on standard error hands its lines: to the
+/// Where a thread that must not wait on its reader hands its events: to the
 /// [`Reports`] thread it came from.
 #[derive(Clone)]
 pub struct Reporter {
-    /// The lines on their way to the writer.
-    queue: SyncSender<String>,
-    /// The lines dropped since the writer last said how many it dropped.
+    /// The events on their way to the writer.
+    queue: SyncSender<Event>,
+    /// The events dropped since the writer last said how many it dropped.
     dropped: Arc<AtomicUsize>,
 }
 
-impl Reports {
-    /// Starts the thread writing on standard error.
-    pub fn start() -> io::Result<Reports> {
-        Reports::start_to(io::stderr())
+/// Where a [`Reports`] writer writes: lines for a person, or an event stream.
+pub enum Destination {
+    /// Each event's line, where it has one, as on standard error.
+    Lines(Box<dyn Write + Send>),
+    /// Each event, on an event stream.
+    Events(Arc<EventStream>),
+}
+
+impl Destination {
+    /// Where the run says what it has to say: its event stream where it has
+    /// one, and standard error otherwise.
+    pub fn of_run() -> Destination {
+        match events() {
+            Some(stream) => Destination::Events(stream),
+            None => Destination::Lines(Box::new(io::stderr())),
+        }
     }
 
-    /// Starts the thread writing on `out`.
-    pub fn start_to(out: impl Write + Send + 'static) -> io::Result<Reports> {
-        let (queue, lines) = std::sync::mpsc::sync_channel(QUEUED_REPORTS);
+    /// Writes `event`. A reader gone loses it, as [`report`] loses a line.
+    fn write(&mut self, event: &Event) {
+        match self {
+            Destination::Lines(out) => {
+                if let Some(text) = event.text() {
+                    let _ = say_to(out, format_args!("{text}"));
+                }
+            }
+            Destination::Events(stream) => {
+                let _ = stream.write(event);
+            }
+        }
+    }
+
+    /// What a dropped report was not taken by, as its count's line says.
+    fn name(&self) -> &'static str {
+        match self {
+            Destination::Lines(_) => "standard error",
+            Destination::Events(_) => "the event stream",
+        }
+    }
+}
+
+impl Reports {
+    /// Starts the thread writing where the run says what it has to say.
+    pub fn start() -> io::Result<Reports> {
+        Reports::start_to(Destination::of_run())
+    }
+
+    /// Starts the thread writing to `destination`.
+    pub fn start_to(destination: Destination) -> io::Result<Reports> {
+        let (queue, events) = std::sync::mpsc::sync_channel(QUEUED_REPORTS);
         let dropped = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&dropped);
         let writer = std::thread::Builder::new()
             .name("fcage-reports".into())
-            .spawn(move || write_reports(out, &lines, &counted))?;
+            .spawn(move || write_reports(destination, &events, &counted))?;
         Ok(Reports {
             reporter: Reporter { queue, dropped },
             writer,
         })
     }
 
-    /// A reporter whose lines this writes.
+    /// A reporter whose events this writes.
     pub fn reporter(&self) -> Reporter {
         self.reporter.clone()
     }
@@ -224,10 +372,10 @@ impl Reports {
     /// Writes what is still queued, and returns once the writer has, which is
     /// once every [`Reporter`] is gone too.
     ///
-    /// The wait is on standard error's reader, as every line `fcage` writes
-    /// there of its own waits on it; what is lost by not waiting is a report
-    /// nothing would count. `fcage` finishes the reports before it writes its
-    /// own last lines, so those follow the reports.
+    /// The wait is on the reader, as every line `fcage` writes of its own waits
+    /// on it; what is lost by not waiting is a report nothing would count.
+    /// `fcage` finishes the reports before it writes its own last lines, so
+    /// those follow the reports.
     pub fn finish(self) {
         drop(self.reporter);
         // A writer that panicked has nothing left to write.
@@ -236,56 +384,61 @@ impl Reports {
 }
 
 impl Reporter {
-    /// Hands `line` to the writer, or drops and counts it where the writer
-    /// holds [`QUEUED_REPORTS`] lines already. Never waits.
+    /// Hands `line` to the writer as a `warning`; see [`offer`](Self::offer).
     pub fn report(&self, line: fmt::Arguments<'_>) {
-        match self.queue.try_send(line.to_string()) {
+        self.offer(Event::warning(line.to_string()));
+    }
+
+    /// Hands `event` to the writer, or drops and counts it where the writer
+    /// holds [`QUEUED_REPORTS`] events already. Never waits.
+    pub fn offer(&self, event: Event) {
+        match self.queue.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
-            // The writer is gone only where it panicked; the line goes with it.
+            // The writer is gone only where it panicked; the event goes with
+            // it.
             Err(TrySendError::Disconnected(_)) => {}
         }
     }
 }
 
-/// The [`Reports`] thread: writes each line as it arrives, and says how many
+/// The [`Reports`] thread: writes each event as it arrives, and says how many
 /// were dropped each time it has written everything queued, until every
 /// [`Reporter`] is gone.
 ///
-/// A line arrives behind the ones queued before it, so the count of those
-/// dropped while the queue was full follows every line that was queued when
+/// An event arrives behind the ones queued before it, so the count of those
+/// dropped while the queue was full follows every event that was queued when
 /// they were. A reader gone loses the words, as [`report`] does.
-fn write_reports(mut out: impl Write, lines: &Receiver<String>, dropped: &AtomicUsize) {
+fn write_reports(mut destination: Destination, events: &Receiver<Event>, dropped: &AtomicUsize) {
     loop {
-        let line = match lines.try_recv() {
-            Ok(line) => line,
+        let event = match events.try_recv() {
+            Ok(event) => event,
             Err(TryRecvError::Empty) => {
-                say_dropped(&mut out, dropped);
-                match lines.recv() {
-                    Ok(line) => line,
+                say_dropped(&mut destination, dropped);
+                match events.recv() {
+                    Ok(event) => event,
                     Err(_) => break,
                 }
             }
             Err(TryRecvError::Disconnected) => break,
         };
-        let _ = say_to(&mut out, format_args!("{line}"));
+        destination.write(&event);
     }
-    say_dropped(&mut out, dropped);
+    say_dropped(&mut destination, dropped);
 }
 
-/// Says how many lines were dropped since it last said, where any were.
-fn say_dropped(out: &mut dyn Write, dropped: &AtomicUsize) {
+/// Says how many events were dropped since it last said, where any were.
+fn say_dropped(destination: &mut Destination, dropped: &AtomicUsize) {
     let count = dropped.swap(0, Ordering::Relaxed);
     if count > 0 {
         let plural = if count == 1 { "" } else { "s" };
-        let _ = say_to(
-            out,
-            format_args!(
-                "fcage: dropped {count} report{plural} while standard error was not taking them"
-            ),
+        let text = format!(
+            "fcage: dropped {count} report{plural} while {} was not taking them",
+            destination.name()
         );
+        destination.write(&Event::dropped("fcage", count as u64, text));
     }
 }
 
@@ -379,11 +532,11 @@ pub(crate) mod tests {
         let (entered, has_entered) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let written = Kept::default();
-        let reports = Reports::start_to(Gate {
+        let reports = Reports::start_to(Destination::Lines(Box::new(Gate {
             entered: Some(entered),
             release: Some(released),
             written: written.clone(),
-        })
+        })))
         .expect("the writer starts");
         let reporter = reports.reporter();
 
@@ -409,9 +562,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn on_an_event_stream_the_reports_and_their_count_are_events() {
+        let (entered, has_entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let written = Kept::default();
+        let stream = Arc::new(EventStream::new(Gate {
+            entered: Some(entered),
+            release: Some(released),
+            written: written.clone(),
+        }));
+        let reports = Reports::start_to(Destination::Events(stream)).expect("the writer starts");
+        let reporter = reports.reporter();
+
+        // As on standard error: the writer is held on the first event, the
+        // queue fills, and the rest are counted.
+        reporter.report(format_args!("fcage: the first"));
+        has_entered
+            .recv()
+            .expect("the writer takes the first event");
+        for at in 1..=QUEUED_REPORTS + 2 {
+            reporter.report(format_args!("fcage: event {at}"));
+        }
+        release.send(()).expect("the writer is waiting");
+        drop(reporter);
+        reports.finish();
+
+        let lines: Vec<serde_json::Value> = written
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+            .collect();
+        assert_eq!(lines.len(), QUEUED_REPORTS + 2);
+        assert_eq!(
+            lines[0],
+            serde_json::json!({"event": "warning", "text": "fcage: the first"})
+        );
+        assert_eq!(
+            lines.last().expect("the count"),
+            &serde_json::json!({
+                "event": "dropped",
+                "source": "fcage",
+                "count": 2,
+                "text": "fcage: dropped 2 reports while the event stream was not taking them",
+            })
+        );
+    }
+
+    #[test]
     fn finishing_writes_what_is_queued() {
         let written = Kept::default();
-        let reports = Reports::start_to(written.clone()).expect("the writer starts");
+        let reports = Reports::start_to(Destination::Lines(Box::new(written.clone())))
+            .expect("the writer starts");
         reports.reporter().report(format_args!("the last word"));
         reports.finish();
         assert_eq!(written.text(), "the last word\n");
