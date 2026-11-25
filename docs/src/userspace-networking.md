@@ -409,11 +409,12 @@ A flow is then held to the names pinned at its address:
   can be resolved to the host's own network, and a wildcard over such names
   would otherwise reach it.
 - It admits no address on the host's own networks either, as they stand when
-  the stack attaches: each network the host's routing table reaches without a
-  gateway, and the network of each of its global IPv6 addresses. That covers a
-  LAN numbered from global addresses, and the host's own public address, where
-  a service bound to every address answers. A network the host joins later is
-  not among them.
+  the stack attaches: each address the host's interfaces hold, with the
+  network its prefix makes of it, and each network the host's main routing
+  table reaches without a gateway. That covers a LAN numbered from global
+  addresses, and the host's own public address, where a service bound to every
+  address answers, whatever routes it has. A network only a routing table
+  other than main reaches, and one the host joins later, are not among them.
 - A deny name rule refuses a flow on its ports to an address pinned to a name it
   matches. It refuses both transports, unless `tcp:` qualifies it.
 

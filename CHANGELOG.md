@@ -767,6 +767,12 @@ consumer upgrading can skip it.
   refused the private ranges alone, so a name resolved to a LAN numbered from
   global addresses, or to the host's own public address, where a service bound
   to every address answers, was carried.
+- The host's own networks, which an allow name rule admits no address on,
+  include each IPv4 address the host's interfaces hold, and the network its
+  prefix makes of it, whatever routes it has. They were read from the main
+  routing table's routes without a gateway alone, which leave out a public
+  `/32` reached through an `onlink` gateway, an address added with
+  `noprefixroute`, and one whose routes are in another table.
 - A mirror at the filesystem's root, `file:///`, is joined to a path as
   `file:///debian/...`. Every trailing slash was taken from a mirror, which
   left `file:` and the path read as an authority.

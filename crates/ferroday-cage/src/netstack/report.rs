@@ -445,10 +445,10 @@ pub enum FlowRefusal {
     /// the destination, whose address is in a private range, `10.0.0.0/8`,
     /// `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` or `fc00::/7`, or on
     /// one of the host's own networks as it stood when the stack attached: one
-    /// its routing table reaches directly, or the network of one of its
-    /// global IPv6 addresses. A name rule admits no such address, since a
-    /// name anyone can register can be resolved to the host's own network. An
-    /// address rule admits one.
+    /// of its addresses, the network one of them is on, or one its main
+    /// routing table reaches directly. A name rule admits no such address,
+    /// since a name anyone can register can be resolved to the host's own
+    /// network. An address rule admits one.
     #[non_exhaustive]
     PrivateBehindName {
         /// The first allow name rule, in the order given, that matches the
