@@ -33,6 +33,11 @@ use crate::mechanism::delete_tree;
 /// anything but a directory above a protected path: a symbolic link added at
 /// `.github` would have `.github/workflows` resolve wherever it points.
 ///
+/// Names are compared without regard to ASCII case, as a directory whose
+/// filesystem looks names up case-insensitively, such as an ext4 directory
+/// with casefolding on, resolves `.GIT` to `.git`. The other folds such a
+/// directory makes, the long `ſ` to `s` among them, are not.
+///
 /// [`defaults`](Self::defaults) is the set an apply starts from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -61,6 +66,18 @@ impl Protected {
     /// - `.git`, at any depth: git reads a repository's configuration and runs
     ///   its hooks, and `git status` alone runs `core.fsmonitor`;
     /// - `.envrc`, at any depth: direnv loads it on entering the directory;
+    /// - `.husky`, at any depth: husky points git's `core.hooksPath` into it,
+    ///   so git runs what it holds at the next commit;
+    /// - mise's `mise.toml`, `.mise.toml`, `mise.local.toml` and
+    ///   `.mise.local.toml`, at any depth, and at the top its `mise`, `.mise`
+    ///   and `.config/mise` directories and `.config/mise.toml` and
+    ///   `.config/mise.local.toml`: mise reads them on entering the directory,
+    ///   and runs the hooks and tasks they define;
+    /// - lefthook's configuration at the top: `lefthook` and `lefthook-local`
+    ///   in each format it reads (`.yml`, `.yaml`, `.toml`, `.json` and
+    ///   `.jsonc`), bare, with a leading dot, and under `.config`, and its
+    ///   `.lefthook` and `.lefthook-local` script directories, which the hooks
+    ///   it installs in git run;
     /// - `.vscode` and `.idea` at the top: an editor runs the tasks they hold
     ///   on opening the project;
     /// - `.github/workflows` and `.gitlab-ci.yml` at the top: a service runs
@@ -70,8 +87,24 @@ impl Protected {
     ///   `.bash_login` and `.bash_logout`, zsh's `.zshenv`, `.zprofile`,
     ///   `.zshrc`, `.zlogin` and `.zlogout`, and fish's `.config/fish`.
     pub fn defaults() -> Vec<Protected> {
-        let names = [".git", ".envrc"].map(Protected::name);
+        let names = [
+            ".git",
+            ".envrc",
+            ".husky",
+            "mise.toml",
+            ".mise.toml",
+            "mise.local.toml",
+            ".mise.local.toml",
+        ]
+        .map(Protected::name);
         let paths = [
+            "mise",
+            ".mise",
+            ".config/mise",
+            ".config/mise.toml",
+            ".config/mise.local.toml",
+            ".lefthook",
+            ".lefthook-local",
             ".vscode",
             ".idea",
             ".github/workflows",
@@ -89,7 +122,19 @@ impl Protected {
             ".config/fish",
         ]
         .map(Protected::path);
-        names.into_iter().chain(paths).collect()
+        let lefthook = ["lefthook", "lefthook-local"].into_iter().flat_map(|stem| {
+            ["yml", "yaml", "toml", "json", "jsonc"]
+                .into_iter()
+                .flat_map(move |format| {
+                    [
+                        format!("{stem}.{format}"),
+                        format!(".{stem}.{format}"),
+                        format!(".config/{stem}.{format}"),
+                    ]
+                })
+                .map(Protected::path)
+        });
+        names.into_iter().chain(paths).chain(lefthook).collect()
     }
 
     /// Whether `change` touches this, as far as the paths alone tell: what the
@@ -103,13 +148,13 @@ impl Protected {
         let path = change.path();
         match self {
             Protected::Path(protected) => {
-                path.starts_with(protected)
-                    || (protected.starts_with(path)
+                lies_within(path, protected)
+                    || (lies_within(protected, path)
                         && (removes(change.kind()) || change.now() != Some(EntryKind::Directory)))
             }
             Protected::Name(name) => path
                 .components()
-                .any(|component| component.as_os_str() == name.as_os_str()),
+                .any(|component| same_name(component.as_os_str(), name)),
         }
     }
 
@@ -117,12 +162,30 @@ impl Protected {
     /// this or lies beneath it.
     fn holds(&self, path: &Path) -> bool {
         match self {
-            Protected::Path(protected) => path.starts_with(protected),
+            Protected::Path(protected) => lies_within(path, protected),
             Protected::Name(name) => path
                 .components()
-                .any(|component| component.as_os_str() == name.as_os_str()),
+                .any(|component| same_name(component.as_os_str(), name)),
         }
     }
+}
+
+/// Whether two names name one entry in a directory that looks names up
+/// without regard to ASCII case, as [`Protected`] compares them.
+fn same_name(a: &OsStr, b: &OsStr) -> bool {
+    a.as_bytes().eq_ignore_ascii_case(b.as_bytes())
+}
+
+/// Whether `path` is `within` or lies beneath it, component by component as
+/// [`same_name`] compares them: [`Path::starts_with`] without regard to ASCII
+/// case.
+fn lies_within(path: &Path, within: &Path) -> bool {
+    let mut components = path.components();
+    within.components().all(|wanted| {
+        components
+            .next()
+            .is_some_and(|got| same_name(got.as_os_str(), wanted.as_os_str()))
+    })
 }
 
 impl fmt::Display for Protected {
@@ -1409,6 +1472,65 @@ mod tests {
             .unwrap();
         assert_eq!(refusals.len(), 1);
         assert_eq!(refusals[0].path(), Path::new("plain"));
+    }
+
+    /// The hooks and configuration git's hook managers and mise act on are
+    /// protected by default, and a protected name in another case is the
+    /// protected name, as a case-insensitive directory looks it up.
+    #[test]
+    fn hook_managers_and_other_cases_of_a_protected_name_are_protected() {
+        let (_scratch, overlay, lower, upper) = layers("apply-protected-tools");
+        let since = after_a_tick();
+        for path in [
+            ".GIT/config",
+            "app/.husky/pre-commit",
+            "backend/mise.toml",
+            ".config/mise/config.toml",
+            ".config/lefthook-local.jsonc",
+            ".Lefthook.YML",
+            ".lefthook/pre-commit/lint",
+            "src/lib.rs",
+        ] {
+            write(upper.join(path), "run\n");
+        }
+        let changes = ChangeSet::read(&overlay).unwrap();
+        let refused: Vec<_> = changes
+            .apply(&lower)
+            .since(since)
+            .check()
+            .unwrap()
+            .into_iter()
+            .map(|refusal| {
+                (
+                    refusal.path().display().to_string(),
+                    refusal.reason().clone(),
+                )
+            })
+            .collect();
+        let protected =
+            |path: &str, by: Protected| (path.to_string(), ApplyRefusalReason::Protected(by));
+        let mise = || Protected::path(".config/mise");
+        let lefthook = || Protected::path(".lefthook");
+        assert_eq!(
+            refused,
+            [
+                protected(".GIT", Protected::name(".git")),
+                protected(".GIT/config", Protected::name(".git")),
+                protected(".Lefthook.YML", Protected::path(".lefthook.yml")),
+                protected(
+                    ".config/lefthook-local.jsonc",
+                    Protected::path(".config/lefthook-local.jsonc"),
+                ),
+                protected(".config/mise", mise()),
+                protected(".config/mise/config.toml", mise()),
+                protected(".lefthook", lefthook()),
+                protected(".lefthook/pre-commit", lefthook()),
+                protected(".lefthook/pre-commit/lint", lefthook()),
+                protected("app/.husky", Protected::name(".husky")),
+                protected("app/.husky/pre-commit", Protected::name(".husky")),
+                protected("backend/mise.toml", Protected::name("mise.toml")),
+            ]
+        );
     }
 
     /// The target is resolved without following a link, and a change whose

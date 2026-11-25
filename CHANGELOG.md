@@ -269,8 +269,10 @@ consumer upgrading can skip it.
 - A change set can be written into a tree: `ChangeSet::apply` returns an
   `Apply`, which takes a `filter`, the paths it refuses to change
   (`Protected`, a path from the target's top or a name at any depth, with
-  `Protected::defaults` covering `.git`, `.envrc`, editor and CI
-  configuration and shell startup files), and a reference time (`since`,
+  `Protected::defaults` covering `.git`, `.envrc`, husky's, lefthook's and
+  mise's hooks and configuration, editor and CI configuration and shell
+  startup files, each name compared without regard to ASCII case, as a
+  case-insensitive directory looks it up), and a reference time (`since`,
   the upper's birth time by default). `check` lists the `ApplyRefusal`s
   without writing; `run` refuses the whole apply with
   `ProvisionError::ApplyRefused` where a chosen change touches a protected

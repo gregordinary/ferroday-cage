@@ -991,11 +991,15 @@ refused refuses the whole apply, and nothing is written. `check` lists the
 refusals without writing, and a `filter` that leaves the refused paths out lets
 the rest through. A change is refused for one of these reasons:
 
-- It touches a protected path. By default those are `.git` and `.envrc` at any
-  depth, and at the top `.vscode`, `.idea`, `.github/workflows`,
-  `.gitlab-ci.yml` and the shell's startup files. A tool acts on each before
-  the user runs anything of the project's. `protect` adds a path, and
-  `protected` replaces the set.
+- It touches a protected path. By default those are `.git`, `.envrc`, husky's
+  `.husky` and mise's `mise.toml` and `mise.local.toml`, with or without a
+  leading dot, at any depth. At the top they are `.vscode`, `.idea`,
+  `.github/workflows`, `.gitlab-ci.yml`, the shell's startup files, lefthook's
+  configuration and script directories, and mise's other configuration. A tool
+  acts on each before the user runs anything of the project's. `protect` adds a
+  path, and `protected` replaces the set. A name matches without regard to
+  ASCII case, as a case-insensitive directory looks it up, so `.GIT/config`
+  touches `.git`.
 - The target changed the path after the run began. That is judged by the
   entry's change time against the upper's birth time, or a time `since` names.
 - The target lacks the directory the change lies in, or reaches it through a
