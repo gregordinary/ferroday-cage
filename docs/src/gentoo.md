@@ -661,14 +661,17 @@ the layer reads. Each field has a length far past the longest the archive
 publishes. A `CPV` runs to 512 bytes, a slot to 256, a flag list to 16 KiB and a
 path to 1 KiB. A dependency class is checked as it is read, up to 64 KiB long
 and 16 groups deep. Each atom in it names a package and version no longer than
-a `CPV`, with at most 64 USE dependencies.
+a `CPV`, with at most 64 USE dependencies, each flag no longer than 128 bytes,
+and a slot no longer than a record's.
 
 A resolution against it is bounded as well, each bound far past what resolving
 the whole archive needs. It chooses at most 16,384 builds and reads at most
 262,144 dependency atoms from them. It holds atoms against at most 4,194,304
 candidate builds, reading at most 128 MiB of their versions, slots and flags.
 Each comparison is charged what it reads before it is made, since one atom can
-cost thousands of times another. It records at most 16,384 refusals.
+cost thousands of times another. It records at most 16,384 refusals, naming at
+most 4 MiB of text between them, since a blocker that matches a thousand builds
+is a thousand refusals that each name it.
 
 Reaching a bound stops the resolution, which refuses. What the index offers for
 an atom is worked out once per spelling. A dependency class is parsed again only

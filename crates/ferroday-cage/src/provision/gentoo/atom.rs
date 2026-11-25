@@ -43,6 +43,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use super::index::MAX_SLOT_BYTES;
 use super::version;
 
 /// What a candidate's version must be for the atom to admit it.
@@ -536,6 +537,12 @@ fn parse_use_dep(entry: &str) -> Result<UseDep, String> {
     if !is_flag(rest) {
         return Err(format!("{entry:?} does not name a USE flag"));
     }
+    if rest.len() > MAX_FLAG_BYTES {
+        return Err(format!(
+            "names a USE flag of {} bytes, longer than the {MAX_FLAG_BYTES} a flag is named in",
+            rest.len()
+        ));
+    }
     Ok(UseDep {
         flag: rest.to_string(),
         wanted,
@@ -551,6 +558,14 @@ fn parse_slot(spec: &str) -> Result<SlotDep, String> {
         "*" | "=" => return Ok(SlotDep::Any),
         _ => spec.strip_suffix('=').unwrap_or(spec),
     };
+    // No build states a longer slot, so a dependency naming one answers
+    // nothing, and a refusal would name it once for every build it met.
+    if spec.len() > MAX_SLOT_BYTES {
+        return Err(format!(
+            "names a slot of {} bytes, longer than the {MAX_SLOT_BYTES} a build states one in",
+            spec.len()
+        ));
+    }
     let (slot, subslot) = match spec.split_once('/') {
         Some((slot, subslot)) => (slot, Some(subslot)),
         None => (spec, None),
@@ -721,6 +736,15 @@ impl Dependency {
 /// any atom in the live index states is thirteen, `dev-qt/qtbase:6`'s; this is
 /// nearly five times that.
 const MAX_USE_DEPS: usize = 64;
+
+/// The longest USE flag a USE dependency may name, in bytes.
+///
+/// A refusal names the atom whole, once for every build a blocker matches, so
+/// a flag's length is multiplied by how many there are. Nothing else bounds it
+/// but the class the atom is written in. A flag is a word of the profile's,
+/// such as `python_single_target_python3_13`, and this is far longer than any
+/// a profile names.
+const MAX_FLAG_BYTES: usize = 128;
 
 /// How deeply one group may nest inside others in a dependency class.
 ///
@@ -1011,6 +1035,19 @@ mod tests {
         };
         assert!(admits("dev-libs/openssl:3/3=", &three));
         assert!(!admits("dev-libs/openssl:3/0", &three));
+    }
+
+    #[test]
+    fn a_flag_or_a_slot_longer_than_any_build_states_is_refused() {
+        // Each would be named again in every refusal the atom makes.
+        let flag = "f".repeat(MAX_FLAG_BYTES);
+        assert!(parse(&format!("app-test/foo[{flag}]")).is_ok());
+        let err = parse(&format!("app-test/foo[{flag}f(+)]")).unwrap_err();
+        assert!(err.contains("names a USE flag of 129 bytes"), "{err}");
+        let slot = "s".repeat(MAX_SLOT_BYTES);
+        assert!(parse(&format!("app-test/foo:{slot}")).is_ok());
+        let err = parse(&format!("app-test/foo:{slot}/s")).unwrap_err();
+        assert!(err.contains("names a slot of 258 bytes"), "{err}");
     }
 
     #[test]

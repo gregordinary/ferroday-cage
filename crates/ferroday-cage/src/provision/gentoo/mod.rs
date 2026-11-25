@@ -160,8 +160,8 @@ const MAX_DIGESTS_BYTES: u64 = 64 * 1024;
 /// text and a few words, so that is a small multiple of this however a mirror
 /// lays the text out. A resolution against it holds the builds it chooses, the
 /// atoms they state and the refusals it meets, each held to a bound of the
-/// resolver's own, and a refusal copies only fields a record holds to a
-/// length.
+/// resolver's own, and the text the refusals name is held to one too, since one
+/// blocker matching many builds is named again in each refusal it makes.
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The ceiling on a binary package's metadata archive, which the container

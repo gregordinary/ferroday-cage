@@ -380,6 +380,12 @@ consumer upgrading can skip it.
   root held at the version, so a replay over a root holding the same version
   built with other flags installed nothing for it and reported the plan
   installed. Another build of the version is now refused as occupying its slot.
+- A Gentoo resolution's refusals name at most 4 MiB of text between them, and
+  an atom's USE flag is held to 128 bytes and its slot to 256, the longest a
+  build states. A hostile index of about a megabyte, whose blockers each
+  matched a thousand builds through an atom tens of kilobytes long, made a
+  resolution's refusals name about a gigabyte. A conflict shares its blocker's
+  text with the others the blocker makes.
 
 ### Internal
 

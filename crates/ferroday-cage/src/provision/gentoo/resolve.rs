@@ -171,8 +171,9 @@ pub(super) struct Unsatisfied {
 
 /// A blocker that matched something the root has or the resolution chose.
 pub(super) struct Conflict {
-    /// The blocker atom, as it was written.
-    pub atom: String,
+    /// The blocker atom, as it was written, shared with every other conflict
+    /// the same blocker makes.
+    pub atom: Rc<str>,
     /// The package that states it, as `category/name-version`, shared with
     /// every other conflict a blocker it states makes.
     pub stated_by: Rc<str>,
@@ -227,6 +228,10 @@ pub(super) struct Refusals {
     pub occupied: Vec<Occupied>,
     /// The bound the resolution reached, which stopped it where it stood.
     pub exceeded: Option<Bound>,
+    /// The bytes of text the refusals recorded name, as
+    /// [`describe`](Self::describe) renders them, held to
+    /// [`MAX_REFUSAL_TEXT`].
+    text: usize,
 }
 
 /// A bound one resolution reached.
@@ -250,6 +255,9 @@ pub(super) enum Bound {
     ComparedBytes,
     /// The resolution met a refusal past the [`MAX_REFUSALS`] it records.
     Refusals,
+    /// The refusals the resolution met would name more than
+    /// [`MAX_REFUSAL_TEXT`] bytes.
+    RefusalText,
 }
 
 impl Refusals {
@@ -258,12 +266,67 @@ impl Refusals {
     /// Where it may not, the resolution has met more than [`MAX_REFUSALS`],
     /// which is recorded as the bound it reached.
     fn has_room(&mut self) -> bool {
+        if self.exceeded == Some(Bound::RefusalText) {
+            return false;
+        }
         let recorded = self.unsatisfied.len() + self.conflicts.len() + self.occupied.len();
         if recorded < MAX_REFUSALS {
             return true;
         }
         self.exceeded.get_or_insert(Bound::Refusals);
         false
+    }
+
+    /// Whether `text` more bytes of refusal fit [`MAX_REFUSAL_TEXT`], charging
+    /// them where they do. Where they do not, the resolution has met refusals
+    /// naming more, which is recorded as the bound it reached, and
+    /// [`has_room`](Self::has_room) answers no from then on.
+    fn fits(&mut self, text: usize) -> bool {
+        match self.text.checked_add(text) {
+            Some(total) if total <= MAX_REFUSAL_TEXT => {
+                self.text = total;
+                true
+            }
+            _ => {
+                self.exceeded.get_or_insert(Bound::RefusalText);
+                false
+            }
+        }
+    }
+
+    /// Records an atom nothing answers, where its text fits.
+    fn record_unsatisfied(&mut self, refusal: Unsatisfied) {
+        if self.fits(refusal.atom.len() + refusal.wanted_by.len() + refusal.reason.len()) {
+            self.unsatisfied.push(refusal);
+        }
+    }
+
+    /// Records a blocker that matched, where its text fits. The blocker and
+    /// what states it are shared between conflicts, but each conflict names
+    /// them again, so each is charged for them.
+    fn record_conflict(&mut self, refusal: Conflict) {
+        let text = refusal.atom.len() + refusal.stated_by.len() + 2 * refusal.blocks.len();
+        if self.fits(text) {
+            self.conflicts.push(refusal);
+        }
+    }
+
+    /// Records a build contending for a slot, where its text fits.
+    fn record_occupied(&mut self, refusal: Occupied) {
+        let text = [
+            &refusal.name,
+            &refusal.slot,
+            &refusal.held,
+            &refusal.second,
+            &refusal.atom,
+        ]
+        .iter()
+        .map(|field| field.len())
+        .sum::<usize>()
+            + refusal.wanted_by.len();
+        if self.fits(text) {
+            self.occupied.push(refusal);
+        }
     }
 
     /// Whether the resolution can be acted on.
@@ -302,6 +365,11 @@ impl Refusals {
             Some(Bound::Refusals) => parts.push(format!(
                 "the resolution stopped after {MAX_REFUSALS} refusals, more than asking for every \
                  package the archive publishes meets, and these are the ones it met",
+            )),
+            Some(Bound::RefusalText) => parts.push(format!(
+                "the resolution stopped once the refusals it met named {MAX_REFUSAL_TEXT} bytes, \
+                 far more than asking for every package the archive publishes names, and these \
+                 are the ones it met",
             )),
         }
         for unmet in &self.unsatisfied {
@@ -441,6 +509,17 @@ const MAX_COMPARED_BYTES: usize = 128 * 1024 * 1024;
 /// Asking for every package name the live index publishes at once, over an
 /// empty root, meets 1,544. This is over ten times that.
 const MAX_REFUSALS: usize = 16 * 1024;
+
+/// The most text the refusals one resolution records may name, in bytes.
+///
+/// [`MAX_REFUSALS`] bounds how many there are, and what each names is held to
+/// a length, but the product is still the index's to decide: every build a
+/// blocker matches is a conflict that names the blocker again, and an atom may
+/// run to the length of the class it is written in. A refusal is reported in
+/// one sentence, and to an observer one event apiece, so this is what bounds
+/// both. A refusal commonly names a few hundred bytes, and this is room for
+/// more than ten thousand of those.
+const MAX_REFUSAL_TEXT: usize = 4 * 1024 * 1024;
 
 /// Resolves `wanted` against `index` and what `installed` already holds.
 ///
@@ -810,7 +889,7 @@ impl<'a> Resolution<'a> {
             Answer::Unmet => {
                 if self.refusals.has_room() {
                     let reason = self.wall(&[atom]);
-                    self.refusals.unsatisfied.push(Unsatisfied {
+                    self.refusals.record_unsatisfied(Unsatisfied {
                         atom: atom.to_string(),
                         wanted_by: Rc::clone(wanted_by),
                         reason,
@@ -936,7 +1015,7 @@ impl<'a> Resolution<'a> {
                         true => "in the root or in this resolution answers it".to_string(),
                         false => self.wall(&unmet),
                     };
-                    self.refusals.unsatisfied.push(Unsatisfied {
+                    self.refusals.record_unsatisfied(Unsatisfied {
                         atom: written,
                         wanted_by: Rc::clone(wanted_by),
                         reason,
@@ -1065,7 +1144,7 @@ impl<'a> Resolution<'a> {
         wanted_by: &Rc<str>,
     ) {
         if self.refusals.has_room() {
-            self.refusals.occupied.push(Occupied {
+            self.refusals.record_occupied(Occupied {
                 name: record.name().to_string(),
                 slot: slot_of(record.slot()).to_string(),
                 held,
@@ -1341,8 +1420,11 @@ fn conflicts<C: Candidate>(
     refusals: &mut Refusals,
 ) {
     for (blocker, stated_by) in blockers {
-        let conflict = |blocks: String, installed: bool| Conflict {
-            atom: blocker.to_string(),
+        // Written once the blocker is found to block something, and shared by
+        // every conflict it makes.
+        let mut written: Option<Rc<str>> = None;
+        let mut conflict = |blocks: String, installed: bool| Conflict {
+            atom: Rc::clone(written.get_or_insert_with(|| Rc::from(blocker.to_string()))),
             stated_by: Rc::clone(stated_by),
             stated_in_root: false,
             blocks,
@@ -1356,7 +1438,7 @@ fn conflicts<C: Candidate>(
                 if !refusals.has_room() {
                     return;
                 }
-                refusals.conflicts.push(conflict(package.cpv(), true));
+                refusals.record_conflict(conflict(package.cpv(), true));
             }
         }
         for (_, build) in chosen.under(blocker.name()) {
@@ -1367,7 +1449,7 @@ fn conflicts<C: Candidate>(
                 if !refusals.has_room() {
                     return;
                 }
-                refusals.conflicts.push(conflict(build.cpv(), false));
+                refusals.record_conflict(conflict(build.cpv(), false));
             }
         }
     }
@@ -1384,8 +1466,8 @@ fn conflicts<C: Candidate>(
             if !refusals.has_room() {
                 return;
             }
-            refusals.conflicts.push(Conflict {
-                atom: written(alternatives),
+            refusals.record_conflict(Conflict {
+                atom: Rc::from(written(alternatives)),
                 stated_by: Rc::clone(stated_by),
                 stated_in_root: false,
                 blocks,
@@ -1400,6 +1482,7 @@ fn conflicts<C: Candidate>(
         let mut stated_by: Option<Rc<str>> = None;
         let cpv = package.cpv();
         for blocker in package.blockers() {
+            let mut written: Option<Rc<str>> = None;
             for (_, build) in chosen.under(blocker.name()) {
                 if !compared.charge(blocker.reads(build)) {
                     return;
@@ -1408,8 +1491,10 @@ fn conflicts<C: Candidate>(
                     if !refusals.has_room() {
                         return;
                     }
-                    refusals.conflicts.push(Conflict {
-                        atom: blocker.to_string(),
+                    refusals.record_conflict(Conflict {
+                        atom: Rc::clone(
+                            written.get_or_insert_with(|| Rc::from(blocker.to_string())),
+                        ),
                         stated_by: Rc::clone(stated_by.get_or_insert_with(|| Rc::from(&*cpv))),
                         stated_in_root: true,
                         blocks: build.cpv(),
@@ -1438,8 +1523,8 @@ fn conflicts<C: Candidate>(
                 if !refusals.has_room() {
                     return;
                 }
-                refusals.conflicts.push(Conflict {
-                    atom: written(group),
+                refusals.record_conflict(Conflict {
+                    atom: Rc::from(written(group)),
                     stated_by: Rc::clone(stated_by.get_or_insert_with(|| Rc::from(&*cpv))),
                     stated_in_root: true,
                     blocks,
@@ -1565,7 +1650,7 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
         }
         if let Some((held, in_root)) = occupied {
             if refusals.has_room() {
-                refusals.occupied.push(Occupied {
+                refusals.record_occupied(Occupied {
                     name: build.name().to_string(),
                     slot: slot_of(build.slot()).to_string(),
                     held,
@@ -1657,7 +1742,7 @@ fn requirements(
             if !refusals.has_room() {
                 return;
             }
-            refusals.unsatisfied.push(Unsatisfied {
+            refusals.record_unsatisfied(Unsatisfied {
                 atom,
                 wanted_by: Rc::clone(&wanted_by),
                 reason: "in the root or in the plan answers it".to_string(),
@@ -2369,7 +2454,7 @@ USE: amd64
         let (_, refusals) = run(&installed, &["app-editors/vim"], &[]);
         assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
         let conflict = &refusals.conflicts[0];
-        assert_eq!(conflict.atom, "!app-editors/vim");
+        assert_eq!(&*conflict.atom, "!app-editors/vim");
         assert_eq!(&*conflict.stated_by, "sys-apps/openrc-0.62");
         assert!(conflict.stated_in_root, "the root states it");
         assert_eq!(conflict.blocks, "app-editors/vim-9.1");
@@ -2446,7 +2531,7 @@ USE: amd64
         let (_, refusals) = run(&root(&[]), &["app-test/consumer", "app-test/chooser"], &[]);
         assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
         let conflict = &refusals.conflicts[0];
-        assert_eq!(conflict.atom, "!app-test/blocked or app-test/fallback");
+        assert_eq!(&*conflict.atom, "!app-test/blocked or app-test/fallback");
         assert_eq!(&*conflict.stated_by, "app-test/consumer-1");
         assert_eq!(conflict.blocks, "app-test/blocked-1");
         assert!(!conflict.installed && !conflict.stated_in_root);
@@ -2490,7 +2575,7 @@ USE: amd64
         let (_, refusals) = run(&installed, &["app-test/blocked"], &[]);
         assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
         let conflict = &refusals.conflicts[0];
-        assert_eq!(conflict.atom, "!app-test/blocked or app-test/fallback");
+        assert_eq!(&*conflict.atom, "!app-test/blocked or app-test/fallback");
         assert_eq!(&*conflict.stated_by, "sys-apps/openrc-0.62");
         assert!(conflict.stated_in_root);
         assert_eq!(conflict.blocks, "app-test/blocked-1");
@@ -3327,6 +3412,40 @@ USE: amd64 compat
             build_id,
             requires,
         }
+    }
+
+    #[test]
+    fn the_refusals_one_resolution_records_name_a_bounded_amount_of_text() {
+        // An index can make one blocker of the longest atom a class holds
+        // match thousands of builds, each a conflict naming the atom again.
+        let atom: Rc<str> = Rc::from("!app-test/foo[".to_string() + &"f".repeat(60_000) + "]");
+        let stated_by: Rc<str> = Rc::from("app-test/hub-1");
+        let mut refusals = Refusals::default();
+        let mut recorded = 0;
+        while refusals.has_room() {
+            refusals.record_conflict(Conflict {
+                atom: Rc::clone(&atom),
+                stated_by: Rc::clone(&stated_by),
+                stated_in_root: false,
+                blocks: format!("app-test/foo-{recorded}"),
+                installed: false,
+            });
+            recorded += 1;
+            assert!(recorded <= MAX_REFUSALS, "the text bound never stopped it");
+        }
+        assert_eq!(refusals.exceeded, Some(Bound::RefusalText));
+        assert!(
+            refusals.conflicts.len() < 100,
+            "{}",
+            refusals.conflicts.len()
+        );
+        let described = refusals.describe();
+        assert!(
+            described.len() <= MAX_REFUSAL_TEXT + 1024,
+            "{}",
+            described.len()
+        );
+        assert!(described.starts_with("the resolution stopped once the refusals"));
     }
 
     #[test]
