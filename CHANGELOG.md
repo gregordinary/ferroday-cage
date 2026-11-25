@@ -132,6 +132,9 @@ consumer upgrading can skip it.
   true`, and `fcage --seccomp-relax` joins the curated policy the flags or a
   profile set. A relaxation of rules that do not start from the roster, or of
   a syscall it holds no entry for, is refused at build.
+- The `agent-tools` example prints each call the curated roster refuses its
+  command, naming the `--relax SYSCALL` that reruns the command with that
+  call allowed, and its profile turns the reports on for `fcage`.
 - `ResourceUsage::cgroup_refused_processes` counts the times the sandbox's
   cgroup refused the tree a process or thread at its `pids-max`, from
   `pids.events`. The `agent-tools` example prints it.

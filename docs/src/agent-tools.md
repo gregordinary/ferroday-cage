@@ -42,6 +42,7 @@ let cage = Cage::builder()
     .env("HOME", "/tmp")
     .network(Network::Isolated)
     .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+    .seccomp_reports(true)
     .landlock_resolve_unix(true)
     .rlimit(Resource::CoreDump, 0, 0)
     .stdin(Stdio::Null)
@@ -188,7 +189,7 @@ its configuration there finds none, and the caller passes what it needs with
 [`SeccompRules::curated`] denies the syscalls a tool command has no use for:
 mounting, creating or entering a namespace, loading a kernel module, and tracing
 among them. A tool that builds a sandbox of its own, such as a browser under
-test, needs a policy of its own. The [seccomp
+test, needs some of them. The [seccomp
 section](hardening.md#seccomp-syscall-filters) lists the roster.
 
 A read-only mount refuses a write, and does not refuse a connection to a socket.
@@ -203,6 +204,34 @@ where [`host::landlock_enforces_fs`] reports that the kernel enforces
 The sandbox's own PID and network namespaces keep its signals and its abstract
 sockets from the host's processes. No [Landlock
 scope](hardening.md#landlock-scopes) is needed for either.
+
+### A refusal, and a rerun past it
+
+A command the roster stops sees an errno, and its output may not say why. With
+[`seccomp_reports`], the filter's refusals reach the runtime instead: each names
+the syscall, the program that made it, and the errno it got. The example prints
+each one with the relaxation that would admit it:
+
+```text
+unshare: unshare failed: Operation not permitted
+agent-tools: the seccomp filter denied unshare to thread 3159327 (unshare): EPERM (--relax unshare allows it)
+```
+
+That is what a runtime offers its user when a command fails: rerun it in a
+wider sandbox, past exactly what stopped it. `--relax SYSCALL` takes that
+syscall's entries out of the roster with [`SeccompRules::relax`], and leaves the
+rest in force:
+
+```sh
+agent-tools --worktree ~/project --relax unshare -- sh -c 'unshare --user true'
+```
+
+A call the roster answers `ENOSYS`, as it answers `clone3` so that the C library
+falls back to `clone`, is not a refusal and is not reported. Landlock's
+refusals are not reported either: the kernel records them only where an
+unprivileged process cannot read them, and the command sees `EACCES`. [Reporting
+the filter's refusals](hardening.md#reporting-the-filters-refusals) sets out
+what reports cost and what they require.
 
 ## The service
 
@@ -523,6 +552,10 @@ fcage --profile crates/ferroday-cage/examples/agent-tools.toml --netstack \
 
 `--netstack-allow RULE` admits more, as `--allow` does.
 
+The profile turns the seccomp filter's reports on, so `fcage` writes each call
+the roster refuses on standard error, and `--seccomp-relax SYSCALL` relaxes the
+roster as `--relax` does.
+
 The profile carries both sets of limits, the cgroup's with `required = false`.
 With a delegated parent, `--cgroup-parent DIR` applies the limits on the whole
 tree; [Limits on the whole tree](hardening.md#limits-on-the-whole-tree) shows a
@@ -599,6 +632,8 @@ remain the caller's to decide:
 [`read_only`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.read_only
 [`present_as`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.present_as
 [`SeccompRules::curated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.curated
+[`seccomp_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.seccomp_reports
+[`SeccompRules::relax`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.relax
 [`landlock_resolve_unix`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.landlock_resolve_unix
 [`host::landlock_enforces_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.landlock_enforces_fs.html
 [`host::own_cgroup`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/host/fn.own_cgroup.html

@@ -29,7 +29,9 @@
 //!   prints each connection and lookup the stack refuses.
 //! - **The restrictions** are the curated seccomp roster, and Landlock's refusal
 //!   of the pathname sockets the mounts leave in view, where the kernel enforces
-//!   it.
+//!   it. The example prints each call the roster refuses, naming the `--relax`
+//!   that reruns the command with that call allowed, as a runtime offers a
+//!   wider sandbox to a command a refusal stopped.
 //! - **The limits** are on each process, and on the whole process tree in a
 //!   cgroup of the command's own where the example runs in a delegated cgroup.
 //!
@@ -39,8 +41,9 @@
 //! It exists to exercise the library from the vantage of an agent runtime: the
 //! host root with `hide` and `read_only`, a presented identity, a listener on
 //! the sandbox's loopback, the network stack's destination rules and reports,
-//! the unix-socket restriction, cgroup limits, and a wait driven through the
-//! handle's readiness descriptor. Everything it does is public API, and
+//! the unix-socket restriction, the seccomp filter's reports and the roster's
+//! relaxation, cgroup limits, and a wait driven through the handle's readiness
+//! descriptor. Everything it does is public API, and
 //! `crates/ferroday-cage/examples/agent-tools.toml` gives `fcage` the same
 //! sandbox.
 //!
@@ -67,7 +70,7 @@ use ferroday_cage::relay::Escalation;
 use ferroday_cage::{
     Cage, CageBuilder, CgroupLimit, DestinationRule, Error, ErrorChain, ExitStatus, FsAccess,
     NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Pending, PresentedIdentity,
-    Resource, ResourceUsage, Running, SeccompPolicy, SeccompRules, Stdio, host,
+    Resource, ResourceUsage, Running, SeccompPolicy, SeccompReport, SeccompRules, Stdio, host,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -203,6 +206,10 @@ The network:
                         destination rule such as github.com:443 or
                         192.0.2.0/24
 
+The restrictions:
+  --relax SYSCALL       Leave the curated seccomp roster's entries for SYSCALL
+                        out, so the command may make it (repeatable)
+
 The command:
   --timeout SECONDS     Ask the command to stop after SECONDS, and kill it 5
                         seconds later
@@ -243,6 +250,8 @@ struct Config {
     registries: bool,
     /// Destination rules admitted beside the registries.
     allow: Vec<DestinationRule>,
+    /// The syscalls whose curated entries are left out.
+    relax: Vec<i64>,
     /// When the command is asked to stop.
     timeout: Option<Duration>,
     /// Environment variables for the command.
@@ -355,6 +364,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         port: DEFAULT_PORT,
         registries: false,
         allow: Vec::new(),
+        relax: Vec::new(),
         timeout: None,
         env: Vec::new(),
         git: git::Mode::Private,
@@ -419,6 +429,12 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
                 .push(rule(string_value("--allow", &mut args)?)?);
         } else if let Some(value) = flag_value(&arg, b"--allow=") {
             config.allow.push(rule(into_string("--allow", value)?)?);
+        } else if arg == "--relax" {
+            config
+                .relax
+                .push(syscall(string_value("--relax", &mut args)?)?);
+        } else if let Some(value) = flag_value(&arg, b"--relax=") {
+            config.relax.push(syscall(into_string("--relax", value)?)?);
         } else if arg == "--timeout" {
             config.timeout = Some(seconds(string_value("--timeout", &mut args)?)?);
         } else if let Some(value) = flag_value(&arg, b"--timeout=") {
@@ -462,6 +478,11 @@ fn rule(value: String) -> Result<DestinationRule, String> {
     value
         .parse()
         .map_err(|err| format!("--allow {value:?}: {err}"))
+}
+
+/// Reads `--relax`'s value: a syscall by name.
+fn syscall(value: String) -> Result<i64, String> {
+    SeccompRules::syscall(&value).ok_or_else(|| format!("--relax: no syscall named {value:?}"))
 }
 
 /// Reads `--port`'s value: a port other than 0.
@@ -606,6 +627,7 @@ fn launch(
         .set_nonblocking(true)
         .map_err(|err| Failure::Own(format!("cannot make the listener non-blocking: {err}")))?;
     let mut running = pending.proceed()?;
+    let refusals = Refusals::start(&mut running)?;
     let mut escalation = Escalation::new(config.timeout, KILL_AFTER);
     let status = serve_until_exit(&mut running, &listener, &mut escalation).map_err(Launch::Ran)?;
     // The listener and the stack hold the sandbox's network namespace, which
@@ -614,8 +636,13 @@ fn launch(
     if let Some(attached) = attached {
         attached.stop();
     }
+    // The init's exit ended the sandbox's processes, and with them the
+    // filter's reports.
+    let usage = running.usage();
+    drop(running);
+    refusals.finish();
 
-    report(status, running.usage());
+    report(status, usage);
     Ok(match escalation.outcome(status) {
         Some(status) => ExitCode::from(status.shell_code()),
         None => {
@@ -662,7 +689,15 @@ fn posture(
     builder = builder
         .present_as(PresentedIdentity::Own)
         .network(Network::Isolated)
-        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+        .seccomp(SeccompPolicy::Rules(
+            config
+                .relax
+                .iter()
+                .fold(SeccompRules::curated(), |rules, &syscall| {
+                    rules.relax(syscall)
+                }),
+        ))
+        .seccomp_reports(true)
         .landlock_resolve_unix(resolve_unix)
         // A core dump would land in the working tree.
         .rlimit(Resource::CoreDump, 0, 0)
@@ -717,6 +752,56 @@ struct Attached {
     /// Prints each refusal the stack reports until the stack has stopped, and
     /// answers how many reports the stack had no room for.
     printer: JoinHandle<u64>,
+}
+
+/// The thread that prints the seccomp filter's refusals.
+struct Refusals {
+    /// The printer, which answers how many reports the filter dropped.
+    printer: std::thread::JoinHandle<u64>,
+}
+
+impl Refusals {
+    /// Takes the filter's reports from `running` and starts printing each
+    /// refusal, with the `--relax` that reruns the command past it.
+    ///
+    /// Every refusal the posture's filter makes is the curated roster's, so
+    /// each names a syscall `--relax` can take out of it. A call answered
+    /// `ENOSYS`, as the roster answers `clone3`, is not a refusal and is not
+    /// reported.
+    fn start(running: &mut Running<'_>) -> Result<Refusals, Failure> {
+        let reports = running
+            .take_seccomp_reports()
+            .expect("the posture reports its filter's refusals");
+        let printer = std::thread::Builder::new()
+            .name("agent-tools-refusals".to_string())
+            .spawn(move || {
+                // The reports end once no process of the sandbox is left and
+                // each one queued has been read.
+                while let Ok(report) = reports.recv() {
+                    match &report {
+                        SeccompReport::Denied {
+                            name: Some(name), ..
+                        } => eprintln!(
+                            "agent-tools: the seccomp filter {report} (--relax {name} allows it)"
+                        ),
+                        _ => eprintln!("agent-tools: the seccomp filter {report}"),
+                    }
+                }
+                reports.dropped()
+            })
+            .map_err(|err| Failure::Own(format!("cannot start the refusals' thread: {err}")))?;
+        Ok(Refusals { printer })
+    }
+
+    /// Waits for the last refusal to be printed, once the sandbox has gone.
+    fn finish(self) {
+        match self.printer.join() {
+            Ok(0) | Err(_) => {}
+            Ok(dropped) => eprintln!(
+                "agent-tools: the seccomp filter dropped {dropped} reports its queue had no room for"
+            ),
+        }
+    }
 }
 
 impl Attached {
@@ -1122,6 +1207,9 @@ mod tests {
             ]
         );
 
+        let config = parse_run(&["--relax", "unshare", "--relax=clone", "bwrap"]);
+        assert_eq!(config.relax, [libc::SYS_unshare, libc::SYS_clone]);
+
         let config = parse_run(&[
             "--empty-root",
             "--port=4100",
@@ -1170,6 +1258,8 @@ mod tests {
             &["--registries", "--allow", "github.com:0", "true"],
             // The empty root's /etc keeps the stack's nameserver unnamed.
             &["--registries", "--empty-root", "true"],
+            // A relaxation names a syscall.
+            &["--relax", "nosuchcall", "true"],
         ] {
             assert!(
                 parse(line.iter().map(OsString::from)).is_err(),

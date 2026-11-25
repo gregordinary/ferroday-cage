@@ -61,6 +61,8 @@ allow = [
 HOME = "/tmp"
 
 [hardening]
+# fcage writes each call the roster refuses on standard error.
+seccomp-reports = true
 seccomp = "curated"
 
 # Limits on each process, which hold wherever the command runs.
