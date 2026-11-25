@@ -266,9 +266,11 @@ consumer upgrading can skip it.
   sandbox up and returns its handle, its init holding it for further commands
   rather than running one, and `Cage::start_pending` holds it at the gate for
   a network stack to attach first. The init takes none of the caller's
-  streams. `terminate` sends `SIGTERM` to every process of such a sandbox,
-  which ends once none is left, reporting an exit code of 0. A cage that
-  shares the caller's PID namespace is refused with
+  streams. Unless `stop_with_caller` states otherwise, the sandbox is tied to
+  its handles: dropping the last of them, or the caller's exit, ends it.
+  `terminate` sends `SIGTERM` to every process of such a sandbox, which ends
+  once none is left, reporting an exit code of 0. A cage that shares the
+  caller's PID namespace is refused with
   `ConfigError::StartWithoutPidNamespace`.
 - A sandbox or a restriction can report each call its seccomp filter refuses
   the command: `seccomp_reports(true)` on `CageBuilder` and

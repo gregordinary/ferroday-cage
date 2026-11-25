@@ -52,7 +52,8 @@ managed-mounts = true       # default true; false establishes none of the four
                             # above, nor any managed mount a later release adds
 base-env = true             # default true; false gives the command exactly the
                             # [env] table, with no PATH or HOME underneath
-stop-with-caller = false    # default false
+stop-with-caller = false    # default false; true for a sandbox started with
+                            # no command
 path-lookup = false         # default false; true resolves a command with no
                             # slash against the sandbox's PATH
 

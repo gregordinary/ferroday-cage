@@ -210,9 +210,11 @@ streams, and needs a PID namespace.
 [`terminate`] sends `SIGTERM` to every process of such a sandbox, which ends
 once none is left. Its wait then reports an exit code of 0. A process that
 ignores the request keeps it up until a [`kill`]. A [`signal`] reaches every
-process of it too, and the sandbox holds once they are gone. [`Cage::start_pending`] holds
-the sandbox at the gate, so a network stack attaches before the handle is given
-out, as it does for a pending launch.
+process of it too, and the sandbox holds once they are gone. Nothing else ends
+such a sandbox, so it is tied to its handles unless `stop_with_caller(false)`
+says otherwise: dropping the last of them ends it, as the caller's exit does.
+[`Cage::start_pending`] holds the sandbox at the gate, so a network stack
+attaches before the handle is given out, as it does for a pending launch.
 
 The `session-sandbox` example keeps one sandbox for a session and runs each
 line it reads as a further command in it.
@@ -276,8 +278,10 @@ responds to its own signals is application policy. The defined behavior:
   the last handle to the launch is dropped, the supervisor stops the
   sandbox. The tie is a descriptor held by the handle, not a signal
   arrangement, so it works from any thread and holds even for `SIGKILL`.
-  It is off by default: an abandoned sandbox otherwise runs to completion,
-  supervised, and is torn down when the command exits. A process the caller
+  It is off by default for a launch that runs a command: an abandoned sandbox
+  otherwise runs to completion, supervised, and is torn down when the command
+  exits. A sandbox started with no command has none to end it, and is tied
+  unless `stop_with_caller(false)` says otherwise. A process the caller
   forks holds a copy of the descriptor until it exits or executes, and the tie
   waits for that copy too.
 

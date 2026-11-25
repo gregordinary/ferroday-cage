@@ -569,6 +569,25 @@ fn dropping_a_tied_started_sandboxs_handle_ends_it() {
 }
 
 #[test]
+fn dropping_a_started_sandboxs_handle_ends_it_where_no_tie_is_stated() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let sandbox = Cage::builder()
+        .rootfs(rootfs)
+        .build()
+        .expect("a cage without a command builds")
+        .start()
+        .expect("the sandbox starts");
+    let mut further = sandbox
+        .exec(&Exec::new("/bin/sleep").arg("86399").stop_with_caller(true))
+        .expect("the further command launches");
+    drop(sandbox);
+    let status = common::outcome_within(&mut further, PATIENCE);
+    assert_eq!(status.signal(), Some(9), "{status:?}");
+}
+
+#[test]
 fn a_started_sandbox_held_at_the_gate_proceeds_to_its_handle() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;

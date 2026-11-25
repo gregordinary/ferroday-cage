@@ -615,6 +615,12 @@ pub struct Cage {
     /// its launches return, which a further command joining the sandbox is
     /// planned from.
     plan: Arc<LaunchPlan>,
+    /// The tie to the caller as the builder stated it, `None` where nothing
+    /// did. The plan holds what a launch that runs the command makes of it, no
+    /// tie where nothing stated one; [`start`](Self::start) ties the sandbox
+    /// there instead, since a sandbox with no command has nothing else to end
+    /// it.
+    stated_tie: Option<bool>,
 }
 
 impl Cage {
@@ -836,12 +842,16 @@ impl Cage {
     /// none of the caller's streams.
     ///
     /// The handle ends the sandbox as it ends any: [`kill`](Running::kill)
-    /// ends every process of it, and dropping the last handle does where
-    /// [`stop_with_caller`](CageBuilder::stop_with_caller) ties it to them,
-    /// which a session usually wants. [`terminate`](Running::terminate) sends
-    /// `SIGTERM` to every process of the sandbox, and the sandbox ends once none
-    /// is left, its wait reporting an exit code of 0. A further command still
-    /// running then ends with it.
+    /// ends every process of it, and [`terminate`](Running::terminate) sends
+    /// `SIGTERM` to every process of the sandbox, which ends once none is left,
+    /// its wait reporting an exit code of 0. A further command still running
+    /// then ends with it.
+    ///
+    /// With no command to end it, the sandbox is tied to its handles unless
+    /// [`stop_with_caller`](CageBuilder::stop_with_caller) stated otherwise:
+    /// dropping the last of them ends it, and so does the caller's exit. A
+    /// sandbox started with `stop_with_caller(false)` outlives both, and only
+    /// a signal sent its init from outside its PID namespace ends it then.
     ///
     /// Blocks until the sandbox is set up, so a failure of its setup is
     /// reported here. [`start_pending`](Self::start_pending) holds it there for
@@ -898,6 +908,7 @@ impl Cage {
             stdout: StdioPlan::Null,
             stderr: StdioPlan::Null,
             own_session: true,
+            stop_with_caller: self.stated_tie.unwrap_or(true),
             ..(*self.plan).clone()
         }))
     }
@@ -2272,7 +2283,8 @@ impl CageBuilder {
         self
     }
 
-    /// Ties the sandbox's lifetime to the caller's (default `false`).
+    /// Ties the sandbox's lifetime to the caller's (default `false`, and
+    /// `true` for a sandbox [`Cage::start`] starts with no command).
     ///
     /// When enabled, the sandbox is stopped as soon as the calling process
     /// exits — however it exits — or the last handle to the launch (the
@@ -3110,7 +3122,7 @@ impl CageBuilder {
     /// The tie to the caller's lifetime as stated: `Some` where
     /// [`stop_with_caller`](Self::stop_with_caller) or a profile's
     /// `stop-with-caller` set it, and `None` where nothing did, which a launch
-    /// reads as no tie.
+    /// that runs the command reads as no tie, and [`Cage::start`] as a tie.
     ///
     /// A consumer whose own default differs, as `fcage`'s does, applies it
     /// where this is `None`.
@@ -3633,6 +3645,7 @@ impl CageBuilder {
                 #[cfg(feature = "hardening")]
                 hardening,
             }),
+            stated_tie: self.stop_with_caller,
         })
     }
 }
@@ -7304,6 +7317,17 @@ mod tests {
             .unwrap();
         assert!(matches!(cage.plan.stdin, StdioPlan::Null));
         assert!(cage.plan.stop_with_caller);
+    }
+
+    #[test]
+    fn a_started_sandbox_is_tied_to_its_handles_unless_stated_otherwise() {
+        let unstated = sh_in("/tmp").build().unwrap();
+        assert!(!unstated.plan.stop_with_caller, "a command runs untied");
+        assert!(unstated.started().unwrap().stop_with_caller);
+        for tie in [false, true] {
+            let stated = sh_in("/tmp").stop_with_caller(tie).build().unwrap();
+            assert_eq!(stated.started().unwrap().stop_with_caller, tie);
+        }
     }
 
     #[test]
