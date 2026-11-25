@@ -74,12 +74,16 @@ impl Namespaces {
                 Mode::empty(),
             )
         };
-        let net =
+        let mut net =
             open("net").map_err(|errno| ("opening the sandbox's network namespace", errno))?;
-        let user = open("user").map_err(|errno| ("opening the sandbox's user namespace", errno))?;
+        let mut user =
+            open("user").map_err(|errno| ("opening the sandbox's user namespace", errno))?;
         if super::has_exited(pidfd) {
             return Err(("opening the sandbox's namespaces", Errno::SRCH));
         }
+        // Held by the caller once the launch is under way; see `above_stdio`.
+        let _ = super::above_stdio(&mut net);
+        let _ = super::above_stdio(&mut user);
         Ok(Namespaces { user, net })
     }
 }
@@ -136,13 +140,16 @@ pub(crate) unsafe fn in_network_namespace(
     steps: &JoinSteps,
     work: impl FnOnce() -> Result<OwnedFd, (u32, Errno)>,
 ) -> Result<OwnedFd, HelperFailure> {
-    let (caller, helper_end) = rustix::net::socketpair(
+    let (mut caller, mut helper_end) = rustix::net::socketpair(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
         SocketFlags::CLOEXEC,
         None,
     )
     .map_err(HelperFailure::Spawn)?;
+    // Created by the caller once the launch is under way; see `above_stdio`.
+    let _ = super::above_stdio(&mut caller);
+    let _ = super::above_stdio(&mut helper_end);
 
     // SAFETY: the child branch runs `helper`, which makes raw syscalls over the
     // descriptors and step values marshaled above and calls `work`, whose
@@ -234,7 +241,13 @@ fn receive(socket: BorrowedFd<'_>) -> Result<OwnedFd, HelperFailure> {
         return Err(HelperFailure::Lost);
     }
     match frame::decode_record(record) {
-        (RECORD_DONE, _) => descriptor.ok_or(HelperFailure::Lost),
+        (RECORD_DONE, _) => {
+            let mut received = descriptor.ok_or(HelperFailure::Lost)?;
+            // Placed at the lowest number free, as any descriptor is; see
+            // `above_stdio`.
+            let _ = super::above_stdio(&mut received);
+            Ok(received)
+        }
         (wire, errno) => Err(HelperFailure::Step {
             wire,
             errno: Errno::from_raw_os_error(errno),

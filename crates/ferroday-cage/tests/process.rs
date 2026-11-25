@@ -935,6 +935,17 @@ impl Launchers {
             match pending {
                 Ok(pending) => {
                     still_closed("while a launch is held", &mut findings);
+                    // What a held launch opens in the sandbox's network
+                    // namespace is the caller's to hold, and is held above
+                    // the standard numbers as well.
+                    let listener = pending.listen(std::net::SocketAddr::from((
+                        std::net::Ipv4Addr::LOCALHOST,
+                        0,
+                    )));
+                    if let Err(err) = &listener {
+                        findings.push(format!("a held launch's listener failed: {err:?}"));
+                    }
+                    still_closed("while a held launch's listener is open", &mut findings);
                     match pending.proceed() {
                         Ok(mut running) => {
                             if let Some(status) =

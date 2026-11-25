@@ -1707,11 +1707,12 @@ pub(super) fn abandon_gated_child(child: &Forked) {
 /// there. The launch keeps every one of its own above them instead, on both
 /// sides of the fork:
 ///
-/// - The sandbox's processes inherit the caller's descriptor table, and the
-///   command stage `dup2`s the wired streams onto 0, 1 and 2. A channel on one
-///   of them would be replaced in the command process, and one on a stream the
-///   plan leaves inherited would reach the command. A report pipe replaced
-///   that way ends early, and its end of input reads as a successful exec.
+/// - The sandbox's processes inherit the caller's descriptor table at the
+///   fork, and the command stage `dup2`s the wired streams onto 0, 1 and 2. A
+///   channel on one of them would be replaced in the command process, and one
+///   on a stream the plan leaves inherited would reach the command. A report
+///   pipe replaced that way ends early, and its end of input reads as a
+///   successful exec.
 /// - The caller's own table keeps a closed standard number closed. It is the
 ///   caller's to reuse, and a later launch that inherits the stream hands the
 ///   command nothing.
@@ -1720,11 +1721,13 @@ pub(super) fn abandon_gated_child(child: &Forked) {
 /// [`fork_launch`] creates, the handle's readiness set, and the cgroup's
 /// descriptors. One created before the fork that cannot be moved fails the
 /// launch, as its creation failing would. One the caller comes to hold once the
-/// fork is behind it, the launch stage's pidfd, the supervisor's, and a
-/// terminal's primary, is moved where a number above the standard streams is
-/// free and kept where the kernel put it where none is: the sandbox's processes
-/// never hold it, and failing a launch already under way would cost more than
-/// the number. A copy the standard library takes with `try_clone` or
+/// fork is behind it, the launch stage's pidfd, the supervisor's, a terminal's
+/// primary, and what a pending launch opens into the sandbox's network
+/// namespace, is moved where a number above the standard streams is free and
+/// kept where the kernel put it where none is. The sandbox's processes never
+/// hold such a descriptor, which is close-on-exec, so the second reason above
+/// is the whole of its cost, and failing a launch already under way would
+/// cost more than the number. A copy the standard library takes with `try_clone` or
 /// `try_clone_to_owned`, as of the caller's terminal or of the supervisor's
 /// pidfd, needs nothing more, since its search starts at 3.
 ///

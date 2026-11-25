@@ -552,6 +552,10 @@ consumer upgrading can skip it.
 - `fcage` prints a line for each Gentoo package a resolution refuses because
   its slot is already taken, as it does for an unsatisfiable atom and a
   blocker. The refusal went unprinted until the run failed.
+- A listener or connection a pending launch opens in the sandbox's network
+  namespace, and the namespace descriptors it opens to do so, are held above
+  the standard streams' numbers. With one of them closed in the caller, the
+  listener took it, as every other descriptor a launch holds does not.
 
 ### Internal
 
