@@ -52,10 +52,11 @@ jobs:
         # 3.11 or newer -- the runner image is well past that.
         run: python3 tools/check-idioms.py
       - name: Provisioning seam
-        # The three userlands sit on the `provision` seam, and whether they ever
-        # become crates of their own is a decision for later. What keeps that
-        # decision cheap is that a layer reaches only through the seam;
-        # tools/seam.toml records every name that does not, with what it would
+        # The userlands and the archive machinery only they use could one day
+        # be a crate of their own. What keeps that decision cheap is that they
+        # reach the rest of the crate through its public API; tools/seam.toml
+        # records every item that is not, the code elsewhere that names them,
+        # and every userland feature gate elsewhere, with what each would
         # cost, and this fails on any difference.
         run: python3 tools/check-seam.py
       - name: Command-line parity

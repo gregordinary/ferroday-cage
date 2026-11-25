@@ -1,138 +1,669 @@
-# What each userland reaches for outside the provisioning seam.
+# The boundary between the userland side of `provision` and the rest of the crate.
 #
-# `provision` is the seam three archive layers sit on: the `Provisioner` trait,
-# `Fetch`, `ProvisionError`, `BuildLayer`, and the shared tar, compress,
-# extract, digest, document and OpenPGP machinery. A layer reaching only
-# through it is a layer that could be its own crate; every other name it uses
-# is a thing that would have to move, be re-exported, or become public first.
+# The userland side is the three archive layers and the archive machinery only
+# they use. A crate of its own could reach the rest of this crate through its
+# public API and nothing else, so every item it reaches that is not public API is
+# recorded here, with what that would cost. `tools/check-seam.py` compares this
+# file against the tree and fails on any difference, which makes each reach a
+# decision in a diff rather than one nobody made, and records the one that goes
+# away in the change that removed it.
 #
-# This file is that list. `tools/check-seam.py` compares it against the tree and
-# fails on any difference, which makes each reach past the seam a decision in a
-# diff rather than one nobody made. It is not a ban: several of these are the
-# library's own public API, which a separate crate would depend on anyway.
+# `code` counts the paths the userland side's code spells to the item; `tests`
+# counts those its tests spell. A method called on a value and a field are not
+# paths, so an entry names the type they belong to.
 #
-# `kind` says what a reach costs if the layers ever move out:
+# `cost` is one of:
 #
-#   public    Already public API. A separate crate would depend on this crate
-#             and use exactly this name.
-#   internal  Not public. Moving the layer means making it public, moving it,
-#             or writing the layer a copy.
+#   share    Part of machinery the rest of the crate uses too. It would be
+#            public API, or live where both sides could reach it.
+#   move     Only the userland side uses it. It would go with the userland side.
+#   copy     A small, pure unit both sides use. Each side would keep its own
+#            copy, held identical.
+#   reroute  Public API already reaches the same thing by another path.
+#   test     A test's helper. It would go to `ferroday-cage-testkit`.
 
-[[layer]]
-name = "debian"
+# The modules of `provision` on the userland side.
+userland = [
+    "alpine",
+    "available",
+    "binfmt",
+    "cache",
+    "coordinate",
+    "debian",
+    "digest",
+    "document",
+    "fetch",
+    "gentoo",
+    "http",
+    "layer",
+    "layer_error",
+    "observe",
+    "openpgp",
+    "settings",
+]
 
-[[layer.reach]]
-name = "Error"
-count = 3
-kind = "public"
-why = "A launch failure, wrapped as `DebianError::Launch`."
+# The three formats, which never name each other in code.
+layers = ["alpine", "debian", "gentoo"]
 
-[[layer.reach]]
-name = "IdentityMap"
-count = 2
-kind = "public"
-why = """\
-The map the builder takes and the bootstrap's own cages run under, imported \
-once by the layer and once by its bootstrap."""
+[[reach]]
+item = "failure::hostile::TEXT"
+tests = 30
+cost = "test"
+why = "The hostile string the escaping tests feed to every rendered field."
 
-[[layer.reach]]
-name = "IdMapper"
-count = 2
-kind = "public"
-why = """\
-The delegate the builder takes for that map and hands each of the bootstrap's \
-cages, imported once by the layer and once by its bootstrap."""
+[[reach]]
+item = "failure::hostile::assert_escaped"
+tests = 27
+cost = "test"
+why = "The assertion that a rendering escaped that string."
 
-[[layer.reach]]
-name = "status"
-count = 1
-kind = "public"
-why = "`ExitStatus`, the outcome a dpkg wave reports."
+[[reach]]
+item = "failure::path_io_error"
+code = 1
+cost = "copy"
+why = "`layer_error!` declares each layer error's `io` and `at` through it, as every error type in the crate does."
 
-[[layer.reach]]
-name = "ErrorChain"
-count = 1
-kind = "public"
-why = """\
-The renderer that flattens one of the crate's own errors into a reason with \
-its causes: an index that does not decompress, and a `.deb` the pool cannot \
-read."""
+[[reach]]
+item = "idmap::establishable"
+code = 1
+cost = "share"
+why = "A layered build's preflight: whether this request's identity map can be established, through the caller's own mapper."
 
-[[layer.reach]]
-name = "roster"
-count = 1
-kind = "internal"
-why = "`roster::roster_enum!`, which declares `Priority` and its roster."
+[[reach]]
+item = "mechanism::sys::Disposition"
+tests = 1
+cost = "test"
+why = "A cache test that needs `SIGXFSZ` ignored."
 
-[[layer]]
-name = "alpine"
+[[reach]]
+item = "mechanism::sys::set_disposition"
+tests = 1
+cost = "test"
+why = "As above."
 
-[[layer.reach]]
-name = "Error"
-count = 1
-kind = "public"
-why = "A launch failure, wrapped as `AlpineError::Launch`."
+[[reach]]
+item = "path::LeadingSlash"
+code = 1
+cost = "copy"
+why = "Whether a cache entry's path may start at the root, for `tree_components`."
 
-[[layer.reach]]
-name = "ExitStatus"
-count = 1
-kind = "public"
-why = "The outcome an install script reports."
+[[reach]]
+item = "path::is_ordinary_component"
+code = 6
+cost = "copy"
+why = "The one rule for a name that becomes a single path component: a signing key, a container member, a package database leaf, a download's file name."
 
-[[layer.reach]]
-name = "IdentityMap"
-count = 2
-kind = "public"
-why = "As in the Debian layer: once by the layer, once by its bootstrap."
+[[reach]]
+item = "path::parent_of"
+code = 3
+cost = "copy"
+why = "The directory a cache entry and a layer's upper are named in."
 
-[[layer.reach]]
-name = "IdMapper"
-count = 2
-kind = "public"
-why = "As in the Debian layer: once by the layer, once by its bootstrap."
+[[reach]]
+item = "path::tree_components"
+code = 1
+cost = "copy"
+why = "A cache entry's path, split as every path inside a tree is."
 
-[[layer.reach]]
-name = "ErrorChain"
-count = 2
-kind = "public"
-why = "As in the Debian layer, for a container's and a base layer's reasons."
+[[reach]]
+item = "provision::Delegate"
+code = 5
+cost = "copy"
+why = "How a `Debug` rendering names a caller's delegate it cannot render: the layers' builders and observers."
 
-[[layer.reach]]
-name = "roster"
-count = 1
-kind = "internal"
-why = "`roster::roster_enum!`, which declares `ScriptKind` and its roster."
+[[reach]]
+item = "provision::LimitedWriter"
+code = 2
+cost = "move"
+why = "The ceiling on what a download writes, in the cache and an apk's segments."
 
-[[layer.reach]]
-name = "path"
-count = 1
-kind = "internal"
-why = """\
-`path::is_ordinary_component`, the one rule for a name that becomes a single \
-path component: a signing key's name, which a bootstrap writes the key to \
-`/etc/apk/keys` under."""
+[[reach]]
+item = "provision::LimitedWriter::new"
+code = 8
+tests = 3
+cost = "move"
+why = "As above, and in the transports."
 
-[[layer]]
-name = "gentoo"
+[[reach]]
+item = "provision::Staged"
+code = 3
+cost = "share"
+why = "Publication beside a destination, which `ensure` and the export use too: the package cache and the Debian pool."
 
-[[layer.reach]]
-name = "IdentityMap"
-count = 1
-kind = "public"
-why = "The map a staged layer records."
+[[reach]]
+item = "provision::Staged::beside"
+code = 4
+tests = 1
+cost = "share"
+why = "As above."
 
-[[layer.reach]]
-name = "ErrorChain"
-count = 1
-kind = "public"
-why = "As in the other two layers, for a container's reasons."
+[[reach]]
+item = "provision::Staged::sweep"
+code = 3
+cost = "share"
+why = "As above: the staging a crashed run left behind."
 
-[[layer.reach]]
-name = "path"
-count = 2
-kind = "internal"
-why = """\
-`path::is_ordinary_component`, the one rule for a name that becomes a single \
-path component: a container member's directory and name, a metadata file's \
-name as the container lists it, and the same name again where it becomes a \
-leaf of a package database entry."""
+[[reach]]
+item = "provision::accounts::ACCOUNTS"
+code = 1
+cost = "share"
+why = "The account files a root names users and groups in, which extraction reads too."
+
+[[reach]]
+item = "provision::accounts::Dates"
+code = 3
+tests = 2
+cost = "move"
+why = "The password-change dates a bootstrap pins for a reproducible root."
+
+[[reach]]
+item = "provision::accounts::Dates::new"
+tests = 2
+cost = "move"
+why = "As above."
+
+[[reach]]
+item = "provision::accounts::Failure"
+code = 2
+cost = "move"
+why = "An account file that does not read, which `layer_error!` turns into each layer's error."
+
+[[reach]]
+item = "provision::accounts::SECONDS_PER_DAY"
+code = 1
+cost = "move"
+why = "The unit a shadow file counts its dates in."
+
+[[reach]]
+item = "provision::accounts::SHADOW"
+tests = 2
+cost = "move"
+why = "The shadow file the Debian bootstrap's tests write."
+
+[[reach]]
+item = "provision::accounts::account_dates"
+code = 2
+cost = "move"
+why = "Reads a root's password-change dates."
+
+[[reach]]
+item = "provision::accounts::ids"
+code = 2
+cost = "share"
+why = "A root's own users and groups by name, which extraction reads too."
+
+[[reach]]
+item = "provision::accounts::last_change_day"
+code = 2
+cost = "move"
+why = "The day a bootstrap records as every account's last password change."
+
+[[reach]]
+item = "provision::accounts::redate"
+code = 2
+cost = "move"
+why = "Rewrites a root's password-change dates."
+
+[[reach]]
+item = "provision::compress::Codec"
+code = 4
+cost = "share"
+why = "The compression a stage3 names, detected from its content as `Tarball` detects it."
+
+[[reach]]
+item = "provision::compress::Codec::of"
+code = 1
+cost = "share"
+why = "As above."
+
+[[reach]]
+item = "provision::compress::Inflate"
+code = 6
+cost = "move"
+why = "A compressed document read whole: an index, a package list, a digest file."
+
+[[reach]]
+item = "provision::compress::decoder"
+code = 4
+cost = "share"
+why = "The bounded decoder `Tarball` reads through, for a `.deb`'s and a binary package's members."
+
+[[reach]]
+item = "provision::compress::guard"
+code = 1
+cost = "share"
+why = "The same bound on an apk's gzip segments."
+
+[[reach]]
+item = "provision::compress::inflate"
+code = 3
+cost = "move"
+why = "As for `Inflate`."
+
+[[reach]]
+item = "provision::compress::lzma"
+code = 1
+cost = "move"
+why = "The raw LZMA a `.deb` member may be compressed with."
+
+[[reach]]
+item = "provision::containment::OPAQUE"
+tests = 3
+cost = "test"
+why = "The overlay attribute a test marks a lower directory opaque with."
+
+[[reach]]
+item = "provision::containment::create_dirs"
+code = 1
+cost = "share"
+why = "The package cache's directories, created inside its tree as extraction creates a root's."
+
+[[reach]]
+item = "provision::copyin::Owed"
+code = 1
+cost = "share"
+why = "The owner an Alpine bootstrap's entries are owed, which copy-in pays too."
+
+[[reach]]
+item = "provision::copyin::Owner"
+code = 2
+cost = "share"
+why = "As above."
+
+[[reach]]
+item = "provision::copyin::reown"
+code = 1
+cost = "share"
+why = "As above: the re-owning pass itself."
+
+[[reach]]
+item = "provision::extract::Extraction"
+code = 4
+cost = "share"
+why = "The confined tree writer `Tarball` uses: each layer's package members, and a binary package's database entry."
+
+[[reach]]
+item = "provision::extract::Extraction::new"
+code = 3
+tests = 3
+cost = "share"
+why = "As above."
+
+[[reach]]
+item = "provision::extract::OnEntry"
+code = 1
+cost = "share"
+why = "The per-entry callback a `.deb`'s extraction decides with."
+
+[[reach]]
+item = "provision::extract::Placement"
+code = 9
+tests = 2
+cost = "share"
+why = "What that callback answers."
+
+[[reach]]
+item = "provision::extract::overlay_tree"
+code = 4
+cost = "share"
+why = "A configure wave's tree laid over a root, by the same rules as an extraction."
+
+[[reach]]
+item = "provision::identity::Ownership"
+code = 4
+cost = "reroute"
+why = "The identity map and its delegate as one value, which the public `IdentityMap` and `IdMapper` express."
+
+[[reach]]
+item = "provision::identity::Ownership::default"
+tests = 3
+cost = "reroute"
+why = "As above."
+
+[[reach]]
+item = "provision::identity::Ownership::new"
+code = 4
+tests = 1
+cost = "reroute"
+why = "As above."
+
+[[reach]]
+item = "provision::lock_exclusive"
+code = 1
+cost = "share"
+why = "The publication lock `ensure` takes, which the Debian pool takes too."
+
+[[reach]]
+item = "provision::now_epoch"
+code = 4
+tests = 10
+cost = "move"
+why = "The clock a signature's or a release's freshness is judged against."
+
+[[reach]]
+item = "provision::number::compare_digit_runs"
+code = 4
+cost = "move"
+why = "Portage's digit-run order, for Gentoo versions."
+
+[[reach]]
+item = "provision::number::digits"
+code = 17
+cost = "copy"
+why = "The decimal reader every format goes through."
+
+[[reach]]
+item = "provision::number::digits_in"
+code = 2
+cost = "move"
+why = "A run of digits inside an HTTP header."
+
+[[reach]]
+item = "provision::number::is_digits"
+code = 12
+cost = "copy"
+why = "As for `digits`."
+
+[[reach]]
+item = "provision::remove_tree"
+code = 1
+cost = "reroute"
+why = "The package cache's stale entries, which `Remove` reaches publicly."
+
+[[reach]]
+item = "provision::rooted::AncestorLink"
+code = 3
+cost = "share"
+why = "What a symbolic link above a path does in an overlay's merged view, for a Gentoo root's installed packages."
+
+[[reach]]
+item = "provision::rooted::Merged"
+code = 2
+cost = "share"
+why = "As above: what the merged view shows."
+
+[[reach]]
+item = "provision::rooted::Rooted"
+code = 10
+cost = "share"
+why = "Confined reads and writes inside a root, which the launch checks use too. Its methods are called on values, so they are this entry."
+
+[[reach]]
+item = "provision::rooted::Rooted::is_file_with_content"
+code = 2
+cost = "share"
+why = "As above: whether a bootstrap may clear a file."
+
+[[reach]]
+item = "provision::rooted::Rooted::is_whiteout"
+code = 1
+cost = "share"
+why = "As above: whether a name is an overlay whiteout."
+
+[[reach]]
+item = "provision::rooted::Rooted::open"
+code = 15
+tests = 4
+cost = "share"
+why = "As above."
+
+[[reach]]
+item = "provision::rooted::Rooted::read_merged"
+code = 1
+cost = "share"
+why = "As above: a file as the merged view shows it."
+
+[[reach]]
+item = "provision::rooted::merged_lookup"
+code = 1
+cost = "share"
+why = "As for `Merged`."
+
+[[reach]]
+item = "provision::rooted::scratch_tree"
+tests = 2
+cost = "test"
+why = "A scratch directory opened as a root, for the bootstraps' tests."
+
+[[reach]]
+item = "provision::tar::BLOCK"
+code = 1
+cost = "share"
+why = "The tar block size, for the Alpine database's `scripts.tar`."
+
+[[reach]]
+item = "provision::tar::Entry"
+code = 3
+cost = "share"
+why = "A tar member, as the reader `Tarball` uses reads it."
+
+[[reach]]
+item = "provision::tar::MAX_USTAR_NAME"
+code = 2
+cost = "share"
+why = "The longest name a ustar header holds, for `scripts.tar`."
+
+[[reach]]
+item = "provision::tar::TarReader"
+code = 4
+cost = "share"
+why = "The tar reader `Tarball` uses: a `.deb`'s members, an apk's segments, a binary package's tar within tar."
+
+[[reach]]
+item = "provision::tar::TarReader::in_memory"
+code = 1
+tests = 3
+cost = "share"
+why = "As above, over bytes already read."
+
+[[reach]]
+item = "provision::tar::TarReader::new"
+code = 7
+cost = "share"
+why = "As above."
+
+[[reach]]
+item = "provision::tar::into_io"
+code = 1
+tests = 1
+cost = "share"
+why = "A reader failure carried through a `Read`, for tar within tar."
+
+[[reach]]
+item = "provision::tar::pad"
+code = 1
+cost = "share"
+why = "The padding after a member's data, for `scripts.tar`."
+
+[[reach]]
+item = "provision::tar::read_failure"
+code = 5
+tests = 1
+cost = "share"
+why = "A failed read beneath an archive, reported as the export and `Tarball` report one."
+
+[[reach]]
+item = "provision::tar::ustar_block"
+code = 1
+cost = "share"
+why = "One ustar header, for `scripts.tar`."
+
+[[reach]]
+item = "provision::tarball::Tarball::from_file"
+code = 1
+cost = "share"
+why = "A `Tarball` over a stage3 the Gentoo layer has already opened and verified."
+
+[[reach]]
+item = "provision::write_atomically"
+code = 2
+cost = "move"
+why = "A small file published by rename: the Debian pool's index and a Gentoo document."
+
+[[reach]]
+item = "roster::roster_enum"
+code = 2
+cost = "copy"
+why = "Declares an enum with its roster: Debian's `Priority` and Alpine's `ScriptKind`."
+
+[[reach]]
+item = "scratch::Scratch"
+tests = 16
+cost = "test"
+why = "A scratch directory that removes itself."
+
+[[reach]]
+item = "scratch::Scratch::for_test"
+tests = 76
+cost = "test"
+why = "As above."
+
+[[reach]]
+item = "scratch::Scratch::new"
+tests = 70
+cost = "test"
+why = "As above."
+
+[[reach]]
+item = "spec::overlay_work_dir"
+tests = 1
+cost = "test"
+why = "Where a layered build's overlay keeps its work directory, for a test that removes one."
+
+# Code outside the userland side that names an item inside it.
+
+[[reverse]]
+item = "provision::alpine::AlpineEvent"
+code = 1
+why = "`ProvisionEvent::Alpine`, the shared vocabulary's variant carrying the layer's own event."
+
+[[reverse]]
+item = "provision::alpine::AlpineError"
+tests = 3
+why = "The error-convention tests in `failure.rs`, which hold each layer's error to the crate's rules."
+
+[[reverse]]
+item = "provision::alpine::AlpineError::io"
+tests = 1
+why = "As above."
+
+[[reverse]]
+item = "provision::alpine::AlpineError::unreadable"
+tests = 1
+why = "As above."
+
+[[reverse]]
+item = "provision::debian::DebianError"
+tests = 6
+why = "As above."
+
+[[reverse]]
+item = "provision::debian::DebianError::io"
+tests = 1
+why = "As above."
+
+[[reverse]]
+item = "provision::debian::DebianEvent"
+code = 1
+why = "`ProvisionEvent::Debian`, as for Alpine."
+
+[[reverse]]
+item = "provision::digest::unhex"
+code = 1
+why = "The tar reader decodes apk's `APK-TOOLS.checksum.SHA1` record."
+
+[[reverse]]
+item = "provision::fetch::FetchError"
+tests = 1
+why = "The error-convention tests, as for the layers."
+
+[[reverse]]
+item = "provision::fetch::FetchError::io"
+tests = 1
+why = "As above."
+
+[[reverse]]
+item = "provision::gentoo::GentooError"
+tests = 3
+why = "As above."
+
+[[reverse]]
+item = "provision::gentoo::GentooError::io"
+tests = 1
+why = "As above."
+
+[[reverse]]
+item = "provision::gentoo::GentooEvent"
+code = 1
+why = "`ProvisionEvent::Gentoo`, as for Alpine."
+
+# Userland feature gates outside the userland side: `cfg` predicates naming
+# `debian`, `alpine` or `gentoo`, one per predicate.
+
+[[gate]]
+path = "crates/ferroday-cage/src/failure.rs"
+tests = 4
+
+[[gate]]
+path = "crates/ferroday-cage/src/idmap.rs"
+code = 1
+tests = 1
+
+[[gate]]
+path = "crates/ferroday-cage/src/lib.rs"
+code = 3
+tests = 1
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/accounts.rs"
+code = 8
+tests = 3
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/compress.rs"
+code = 3
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/copyin.rs"
+code = 1
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/extract.rs"
+code = 14
+tests = 8
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/identity.rs"
+code = 1
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/mod.rs"
+code = 37
+tests = 4
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/number.rs"
+code = 2
+tests = 2
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/rooted.rs"
+code = 6
+tests = 1
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/tar.rs"
+code = 9
+tests = 1
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/tarball.rs"
+code = 2
+
+[[gate]]
+path = "crates/ferroday-cage/src/provision/xattr.rs"
+code = 1
+
+[[gate]]
+path = "crates/ferroday-cage/src/spec.rs"
+code = 1

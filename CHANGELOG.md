@@ -57,6 +57,17 @@ consumer upgrading can skip it.
   them, or falls between an entry and its metadata. The reader ignored a global
   header's records.
 
+### Internal
+
+- `tools/check-seam.py` measures the userland side of `provision`: the three
+  layers and the archive machinery only they use. It records each item that
+  side reaches in the rest of the crate that is not public API (79, read from
+  the API snapshot), the code elsewhere that names the userland side (13), and
+  every `cfg` predicate elsewhere that names a userland feature (114), with
+  counts for code and tests apart. Paths are resolved through `use` bindings,
+  re-exports, glob imports and test modules. It recorded crate-level names
+  outside `provision` before, and read no test code.
+
 ## [0.6.0] - 2026-11-13
 
 `fcage` 0.7.0. Entries below marked **Breaking.** change the library's API and

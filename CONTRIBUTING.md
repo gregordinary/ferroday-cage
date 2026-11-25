@@ -264,14 +264,18 @@ Two further gates matter when the public API moves:
   comparison they make. `tools/parity.toml` is the other side. It reads the
   API snapshot above, so regenerate that first when the public surface moves.
 
-- **The provisioning seam.** `tools/check-seam.py` records what each userland
-  reaches for outside `provision`, and fails on any difference. The three
-  layers sit on a seam they could one day be crates of their own on, and this
-  keeps that decision cheap. A new reach past the seam is recorded in
-  `tools/seam.toml` with what it would cost. It also refuses a userland naming
-  another outright, since the three formats are deliberately not shared, and a
-  userland importing `provision` or the crate root with a glob, through which
-  either kind of reach would go unseen. The
+- **The provisioning seam.** The three layers and the archive machinery only
+  they use are the userland side of `provision`. It could one day be a crate of
+  its own, and `tools/check-seam.py` keeps that decision cheap. It records each
+  item that side reaches that is not public API, and the code elsewhere that
+  names it. It records each `cfg` predicate elsewhere that names a userland
+  feature too. Any difference fails, in code or in tests.
+
+  A new entry goes in `tools/seam.toml` with what it would cost, and one that
+  goes away leaves in the same change. The check refuses a layer naming another
+  in code, since the three formats are deliberately not shared. It refuses a
+  glob import from outside the userland side too, since a reach through one
+  would go unseen. The
   [stability
   chapter](https://gregordinary.github.io/ferroday-cage/stability.html) records
   how the userlands version with the library.

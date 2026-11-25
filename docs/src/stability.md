@@ -23,12 +23,15 @@ three external archives' formats rather than by this library's design. They
 version with the library: a Debian layer that has to break to follow a change in
 the archive breaks the whole library's minor version with it.
 
-The layers sit on a seam: `Provisioner`, `Fetch`, `ProvisionError`,
-`BuildLayer`, and the shared tar, compress, extract, digest, document and
-OpenPGP machinery. `tools/seam.toml` records every place a layer reaches around
-it, with what each would cost a layer that was a crate of its own, and whether
-it is public API already or internal. `tools/check-seam.py` fails on any
-difference from that record, and refuses a layer naming another layer outright.
+The layers, and the archive machinery only they use, are the userland side of
+`provision`. That machinery is the transport, digests, the plan-document syntax,
+OpenPGP, the package cache, mirror coordination and layered builds.
+`tools/seam.toml` records every item the userland side reaches that is not
+public API. Each comes with what it would cost a userland side that was a crate
+of its own. The record also holds the code elsewhere that names the userland
+side, and every `cfg` predicate elsewhere that names a userland feature.
+`tools/check-seam.py` fails on any difference from that record, and refuses a
+layer naming another layer outright.
 
 ## What the Rust API promises
 
@@ -283,4 +286,4 @@ Policy that only lives in a document decays. These are enforced:
 | The profile and record key sets are deliberate | `rename_all` on every container, a census of the field-level renames in `tools/idioms.toml`, and tests pinning the key sets of the profile format, of the resolved provenance record, and of `NetStackBuilder` |
 | Every public enum and every struct variant is `#[non_exhaustive]` | `tests/stability.rs`, reading the committed API snapshot |
 | The untrusted-profile surface cannot widen silently | `check_restricted` destructures `CageBuilder` and its hardening request exhaustively, and matches every `Mount` and `Network` variant. A new field or variant fails to compile until it is classified. A test drives each refusal `RestrictedProfile` lists, and holds every key of the profile format to a profile the policy refuses or one it admits |
-| A userland reaching past the provisioning seam is a decision | `tools/check-seam.py` against the record in `tools/seam.toml` |
+| A userland reaching past the public API, or the rest of the crate naming a userland, is a decision | `tools/check-seam.py` against the record in `tools/seam.toml` |

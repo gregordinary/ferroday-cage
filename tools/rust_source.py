@@ -5,6 +5,8 @@ crates' code, and both mean the same thing by "code": what the crate builds
 outside its tests, with no comment in it. A comment naming a shape is prose
 about it rather than a use of it, and a test constructs the shape it tests.
 This is that one reading, so the two tools cannot come to disagree about it.
+`tools/check-seam.py` counts what the tests spell as well, as the difference
+between this reading and the file with only its comments removed.
 
 Two things are removed:
 
