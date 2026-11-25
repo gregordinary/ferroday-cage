@@ -660,7 +660,7 @@ fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
     let mut nul_target = archive();
     nul_target
         .header(b"pax-header", b'x', 0o644, record.len() as u64, 0, b"")
-        .body(record.as_bytes())
+        .body(&record)
         .symlink("link", "placeholder");
     let err = provision_err("malformed-nul-symlink", &nul_target.finish());
     assert!(matches!(err, ProvisionError::Archive { .. }), "{err}");
@@ -943,9 +943,9 @@ fn pax_sparse_members_are_unsupported_in_every_format() {
         data,
     } in formats
     {
-        let records: String = records
+        let records: Vec<u8> = records
             .iter()
-            .map(|(key, value)| ferroday_cage_testkit::tar::pax_record(key, value))
+            .flat_map(|(key, value)| ferroday_cage_testkit::tar::pax_record(key, value))
             .collect();
         let mut tar = archive();
         tar.header(
@@ -956,7 +956,7 @@ fn pax_sparse_members_are_unsupported_in_every_format() {
             0,
             b"",
         )
-        .body(records.as_bytes())
+        .body(&records)
         .header(stored_name, b'0', 0o644, data.len() as u64, MTIME, b"")
         .body(data);
         let err = provision_err(&format!("extract-pax-sparse-{format}"), &tar.finish());
@@ -972,10 +972,10 @@ fn pax_overflowing_sizes_are_rejected() {
     // A pax size in the top block-sized band of the u64 range has no
     // representable block-padded length; the parser must reject it as a
     // malformed archive rather than overflow.
-    let record = ferroday_cage_testkit::tar::pax_record("size", &u64::MAX.to_string());
+    let record = ferroday_cage_testkit::tar::pax_record("size", u64::MAX.to_string());
     let mut tar = archive();
     tar.header(b"pax-header", b'x', 0o644, record.len() as u64, 0, b"");
-    tar.body(record.as_bytes());
+    tar.body(&record);
     tar.header(b"victim", b'0', 0o644, 0, 0, b"");
     let err = provision_err("attack-pax-size", &tar.finish());
     assert!(matches!(err, ProvisionError::Archive { .. }), "{err}");

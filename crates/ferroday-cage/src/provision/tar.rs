@@ -1512,7 +1512,7 @@ mod tests {
             "gname",
             "a-group-name-longer-than-the-header-field",
         );
-        archive.entry("PaxHeaders/next", b'x', 0o644, 0, 0, "", record.as_bytes());
+        archive.entry("PaxHeaders/next", b'x', 0o644, 0, 0, "", &record);
         archive.entry("next", b'0', 0o644, 0, 0, "", b"y");
         let tar = archive.finish();
         let mut reader = TarReader::in_memory(&tar[..]);

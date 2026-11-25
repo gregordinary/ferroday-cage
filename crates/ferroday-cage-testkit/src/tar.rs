@@ -130,7 +130,7 @@ impl Tar {
     pub fn pax_file(&mut self, path: &str, content: &[u8]) -> &mut Tar {
         let record = pax_record("path", path);
         self.header(b"pax-header", b'x', 0o644, record.len() as u64, 0, b"");
-        self.body(record.as_bytes());
+        self.body(&record);
         self.header(
             b"pax-placeholder",
             b'0',
@@ -266,8 +266,15 @@ impl Tar {
 /// A pax record: `"<length> <key>=<value>\n"`, where the decimal length counts
 /// the whole record, its own digits included. That is a fixed point, reached by
 /// iteration.
-pub fn pax_record(key: &str, value: &str) -> String {
-    let content = format!(" {key}={value}\n");
+///
+/// The key and the value are bytes, so a record can hold what a text form
+/// cannot: an attribute's binary value, a NUL.
+pub fn pax_record(key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Vec<u8> {
+    let mut content = vec![b' '];
+    content.extend_from_slice(key.as_ref());
+    content.push(b'=');
+    content.extend_from_slice(value.as_ref());
+    content.push(b'\n');
     let mut length = content.len();
     loop {
         let total = length.to_string().len() + content.len();
@@ -276,7 +283,9 @@ pub fn pax_record(key: &str, value: &str) -> String {
         }
         length = total;
     }
-    format!("{length}{content}")
+    let mut record = length.to_string().into_bytes();
+    record.extend_from_slice(&content);
+    record
 }
 
 /// Writes a zero-padded, NUL-terminated octal tar field.
