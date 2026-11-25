@@ -348,7 +348,8 @@ fn build_tap(context: &HelperContext<'_>) -> Result<OwnedFd, (Step, Errno)> {
     // SAFETY: TUNSETIFF reads a `struct ifreq` carrying the requested name
     // and tun flags, and writes the accepted name back; `IfreqFlags` lays
     // out the 16-byte name and the flags at the start of the union, padded
-    // to the kernel's 40-byte size.
+    // to 40 bytes, no less than the kernel's size, as the note on the
+    // request views states.
     unsafe {
         ioctl::ioctl(
             &tap,
@@ -537,7 +538,7 @@ fn bring_up(inet: &OwnedFd, name: [u8; 16]) -> Result<(), (Step, Errno)> {
     };
     // SAFETY: SIOCGIFFLAGS reads and writes a `struct ifreq` with the flags
     // at the start of the union; `IfreqFlags` lays that out at the kernel's
-    // offsets and size.
+    // offsets, in 40 bytes, no less than the kernel's size.
     unsafe {
         ioctl::ioctl(
             inet,

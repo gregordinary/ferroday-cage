@@ -4316,8 +4316,9 @@ fn map_file_path(pid: u32, file: &[u8]) -> StackPath {
 }
 
 /// The flags half of `struct ifreq`, as the kernel's interface ioctls
-/// expect it: the interface name and a union whose largest member pads the
-/// struct to 40 bytes.
+/// expect it: the interface name and the flags opening the request union,
+/// padded to 40 bytes. That is the kernel's size on 64-bit targets; on 32-bit
+/// ones `struct ifreq` is 32 bytes, and the padding past it goes unread.
 #[repr(C)]
 struct IfreqFlags {
     name: [u8; 16],
@@ -4325,8 +4326,9 @@ struct IfreqFlags {
     _pad: [u8; 22],
 }
 
-/// The ioctls copy `size_of::<IfreqFlags>()` bytes; a layout that drifts
-/// from `struct ifreq` must fail the build, not misissue the ioctl.
+/// The ioctls copy the kernel's own `struct ifreq`, which the view must be no
+/// smaller than; a layout that drifts from it must fail the build, not
+/// misissue the ioctl.
 const _: () = assert!(size_of::<IfreqFlags>() == 40);
 
 /// `IFF_UP` from the kernel's interface flags.
@@ -4353,7 +4355,7 @@ fn bring_up_loopback() -> Result<(), Errno> {
     };
     // SAFETY: SIOCGIFFLAGS reads and writes a `struct ifreq`, which
     // `IfreqFlags` lays out: the 16-byte name, then the flags at the start
-    // of the union, padded to the kernel's 40-byte size.
+    // of the union, padded to 40 bytes, no less than the kernel's size.
     unsafe {
         ioctl::ioctl(
             &socket,
