@@ -204,6 +204,10 @@ pub(super) const DB_DIR: &str = "var/db/pkg";
 /// reissue an ordinal an entry already carries.
 pub(super) const COUNTER_FILE: &str = "COUNTER";
 
+/// The metadata file in which a package states the phase functions its ebuild
+/// defines, space-separated without their `pkg_` or `src_` prefix.
+const DEFINED_PHASES_FILE: &str = "DEFINED_PHASES";
+
 /// The ceiling on a stage3 tarball where nothing declares its size.
 ///
 /// A fetch is normally bounded by the exact size the signed enumeration
@@ -1940,6 +1944,18 @@ impl Gentoo {
                 version: &planned.version,
             });
             vdb::merge(root, over, &rooted, cached, &package, planned, ordinal)?;
+            let defined = package
+                .metadata_files()
+                .find(|(name, _)| *name == DEFINED_PHASES_FILE)
+                .map_or(&[][..], |(_, bytes)| bytes);
+            let phases = merge_phases_defined(defined);
+            if !phases.is_empty() {
+                to.progress(GentooEvent::PhasesNotRun {
+                    package: &planned.name,
+                    version: &planned.version,
+                    phases: &phases,
+                });
+            }
             if targets.is_empty() {
                 targets.insert(package.chost().to_string());
             }
@@ -2253,6 +2269,45 @@ pub enum GentooEvent<'a> {
         /// [`Installed::skipped`]. A root portage built reports zero.
         skipped: usize,
     },
+    /// A package was merged whose phase functions a binary install runs, and
+    /// which this layer does not run.
+    ///
+    /// Portage runs a binary package's `pkg_setup`, `pkg_preinst` and
+    /// `pkg_postinst` as it merges one. Those are bash functions of the
+    /// package's ebuild environment, which need the guest's package manager, so
+    /// a merge here lays the image down and registers the entry without them.
+    /// This names the ones the package defines, from the `DEFINED_PHASES` its
+    /// own metadata states, so a caller can tell which merged packages still
+    /// want them run, such as an `acct-user` package whose account does not
+    /// exist yet. Running them takes portage inside the sandbox, as the
+    /// guide's Gentoo chapter sets out.
+    #[non_exhaustive]
+    PhasesNotRun {
+        /// The package, as `category/name`.
+        package: &'a str,
+        /// The version merged.
+        version: &'a str,
+        /// The phases it defines that a binary install runs, without their
+        /// `pkg_` prefix, in the order portage runs them.
+        phases: &'a [&'a str],
+    },
+}
+
+/// The phase functions portage runs as it merges a binary package, without
+/// their `pkg_` prefix, in the order it runs them, which a merge here does not.
+const MERGE_PHASES: [&str; 3] = ["setup", "preinst", "postinst"];
+
+/// The phases among [`MERGE_PHASES`] that a package's `DEFINED_PHASES`
+/// metadata file names.
+fn merge_phases_defined(defined: &[u8]) -> Vec<&'static str> {
+    let named: Vec<&[u8]> = defined
+        .split(u8::is_ascii_whitespace)
+        .filter(|word| !word.is_empty())
+        .collect();
+    MERGE_PHASES
+        .into_iter()
+        .filter(|phase| named.contains(&phase.as_bytes()))
+        .collect()
 }
 
 /// What a plan's packages weigh on the wire in total.
@@ -4649,6 +4704,61 @@ mod tests {
             .resolve_packages(&root)
             .expect("the preview reads the root");
         assert!(preview.packages.is_empty(), "{:?}", preview.packages);
+    }
+
+    #[test]
+    fn the_phases_a_merge_leaves_unrun_are_read_from_the_package() {
+        assert_eq!(
+            merge_phases_defined(b"compile configure install postinst preinst setup\n"),
+            ["setup", "preinst", "postinst"],
+        );
+        assert_eq!(merge_phases_defined(b"postinst"), ["postinst"]);
+        // Phases a binary install does not run, and words that only contain
+        // one, name nothing.
+        assert!(merge_phases_defined(b"compile install prepare postinstall").is_empty());
+        assert!(merge_phases_defined(b"").is_empty());
+    }
+
+    #[test]
+    fn a_merged_package_reports_the_phases_it_defines_and_did_not_run() {
+        struct Phases(Vec<(String, Vec<String>)>);
+        impl GentooObserver for Phases {
+            fn progress(&mut self, event: GentooEvent<'_>) {
+                if let GentooEvent::PhasesNotRun {
+                    package, phases, ..
+                } = event
+                {
+                    let phases = phases.iter().map(ToString::to_string).collect();
+                    self.0.push((package.to_string(), phases));
+                }
+            }
+        }
+        let scratch = Scratch::for_test("gentoo", "phases-not-run");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let root = supplied_root(&scratch, "root");
+        let built = gpkg::fixture::Built {
+            metadata: gpkg::fixture::metadata_with(&[(
+                "DEFINED_PHASES",
+                Some("compile install postinst setup\n"),
+            )]),
+            ..gpkg::fixture::Built::ordinary()
+        };
+        let mut phases = Phases(Vec::new());
+        installing(
+            &key,
+            BINHOST,
+            container(&key, built),
+            &scratch.join("cache"),
+        )
+        .install_wave(&root, None, &mut phases)
+        .expect("the package installs");
+        assert_eq!(
+            phases.0,
+            [(
+                "sys-libs/zlib".to_string(),
+                vec!["setup".to_string(), "postinst".to_string()]
+            )]
+        );
     }
 
     #[test]

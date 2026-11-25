@@ -6911,6 +6911,15 @@ impl<W: std::io::Write> Progress<W> {
             GentooEvent::Merging {
                 package, version, ..
             } => self.line(format_args!("fcage: merging {package}-{version}")),
+            GentooEvent::PhasesNotRun {
+                package,
+                version,
+                phases,
+                ..
+            } => self.line(format_args!(
+                "fcage: {package}-{version} defines pkg_{} which this install does not run",
+                phases.join(", pkg_"),
+            )),
             GentooEvent::DependencyCycle { packages, .. } => self.line(format_args!(
                 "fcage: a runtime dependency cycle among {} was broken to order the merge",
                 packages.join(", "),

@@ -898,6 +898,10 @@ pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::package: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::second: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::slot: &'a str
 pub ferroday_cage::provision::gentoo::GentooEvent::Occupied::wanted_by: &'a str
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::PhasesNotRun
+pub ferroday_cage::provision::gentoo::GentooEvent::PhasesNotRun::package: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::PhasesNotRun::phases: &'a [&'a str]
+pub ferroday_cage::provision::gentoo::GentooEvent::PhasesNotRun::version: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Planned
 pub ferroday_cage::provision::gentoo::GentooEvent::Planned::bytes: u64
 pub ferroday_cage::provision::gentoo::GentooEvent::Planned::packages: usize

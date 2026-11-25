@@ -502,6 +502,18 @@ package manager. What this layer gives you instead is a root portage can act on,
 which is the strongest argument for registering the entry properly. Run the
 phases with `emerge` inside the sandbox if you need them.
 
+Each merged package that defines `pkg_setup`, `pkg_preinst` or `pkg_postinst`
+is reported with `GentooEvent::PhasesNotRun`, which names the ones it defines.
+The names come from the package's own `DEFINED_PHASES`, and `fcage` prints a
+line for each. The common consequences each have a command of their own, run in
+a sandbox over the finished root:
+
+| What the phases would have done | What does it instead |
+| --- | --- |
+| Create an `acct-user` or `acct-group` package's account | `systemd-sysusers`, where the root has it, from the fragment under `/usr/lib/sysusers.d` |
+| Regenerate the CA bundle | `update-ca-certificates` |
+| Rebuild the font cache | `fc-cache` |
+
 **`CONFIG_PROTECT` is not honored.** An existing file under `/etc` is
 overwritten rather than given portage's `._cfg0000_` treatment. The layer builds
 roots rather than upgrading live systems, and a root whose configuration depends

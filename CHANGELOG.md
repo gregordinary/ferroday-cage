@@ -46,6 +46,10 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `GentooEvent::PhasesNotRun` names each package a Gentoo install merges that
+  defines `pkg_setup`, `pkg_preinst` or `pkg_postinst`, which the layer does
+  not run, from the package's own `DEFINED_PHASES`. `fcage` prints a line for
+  each.
 - `Capped`, an observer that keeps the beginning and the end of each stream a
   command writes, up to the bounds `Capped::new` is given, and counts what it
   leaves out between them, as an `Excerpt` per stream with `head`, `tail`,
