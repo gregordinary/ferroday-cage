@@ -328,10 +328,12 @@ impl RepositoryBuilder {
     /// A mirror whose URL ends in the moment it was taken, as a
     /// `snapshot.debian.org` URL does in `20260101T000000Z`, has its release
     /// held to that moment: dated no later than it, and where the release
-    /// states a `Valid-Until`, valid at it. So whatever answers for the URL can
-    /// serve only the release current when the snapshot was taken, not any
-    /// older one the key signed. A URL ending in anything else holds the
-    /// release to no moment.
+    /// states a `Valid-Until`, valid at it. So whatever answers for the URL
+    /// cannot serve a release signed after the snapshot was taken, nor, for a
+    /// suite that states a `Valid-Until`, one that had expired by then. A suite
+    /// that states none, as Debian's stable suite does, is bounded from above
+    /// alone: any earlier release the key signed passes, as it does from a live
+    /// mirror. A URL ending in anything else holds the release to no moment.
     pub fn snapshot_fallback(mut self, url: impl Into<String>) -> Self {
         let url = url.into();
         self.snapshots.push(url.clone());

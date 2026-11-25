@@ -387,9 +387,12 @@ a snapshot serves. The URL does, where it ends in the moment the snapshot was
 taken, as a `snapshot.debian.org` or `snapshot.ubuntu.com` URL does. A release
 from such a mirror must be dated no later than that moment, and where it states
 a `Valid-Until`, still be valid at it. Whatever answers for the URL on a plain
-transport can therefore serve only the release current when the snapshot was
-taken, not an older one the same key signed. A mirror whose URL ends in
-anything else holds its release to no moment.
+transport therefore cannot serve a release signed after the snapshot was taken.
+For a suite that states a `Valid-Until`, it cannot serve one that had expired by
+then either. A suite that states none, as Debian's stable suite does, is bounded
+from above alone. Any earlier release the same key signed passes, as it does
+from a live mirror. A mirror whose URL ends in anything else holds its release
+to no moment.
 
 Every authenticity check runs once per repository: the signature against that
 repository's keyring, the release bound to its suite, and the transport

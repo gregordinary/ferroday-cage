@@ -354,10 +354,14 @@ impl Release {
     ///
     /// A snapshot's release is accepted past its `Valid-Until`, so nothing
     /// else bounds which past release it is. Over a plain transport, whatever
-    /// answers for the snapshot URL could otherwise serve any older release of
-    /// the suite the key signed, and every one of them verifies. The release
+    /// answers for the snapshot URL could otherwise serve any release of the
+    /// suite the key signed, and every one of them verifies. The release
     /// current at the moment the URL names is dated before it and valid at it,
     /// and one older than its own `Valid-Until` allows is not.
+    ///
+    /// A release that states no `Valid-Until`, as Debian's stable suite does,
+    /// is bounded from above alone: one signed before an earlier point release
+    /// passes as the current one does.
     ///
     /// apt 2.8.4 holds a snapshot's release to neither bound: it compares the
     /// `Date` with the clock alone, refusing one in the future, and judges

@@ -357,6 +357,12 @@ consumer upgrading can skip it.
 - The Debian resolver no longer panics where a package resolved while the
   selection settles unselects one that comes after it in the selection, which
   a conflict on a chosen alternative does.
+- The Debian layer's documentation of `snapshot_fallback`, and of a snapshot
+  mirror as a repository's primary, no longer says such a mirror can serve only
+  the release current when the snapshot was taken. The moment in its URL bounds
+  the release from below only where the release states a `Valid-Until`, which
+  Debian's stable suite does not, so any earlier release the key signed passes,
+  as it does from a live mirror.
 
 ### Internal
 
