@@ -434,7 +434,8 @@ the server a TCP flow's first bytes ask for before it forwards anything the
 guest sent:
 
 - **TLS**: the server name of the ClientHello, read across as many records as it
-  spans.
+  spans. First bytes are TLS where they begin a handshake record of a version a
+  server reads as TLS's, as Go's reads any below `0x1000`.
 - **HTTP/1**: the `Host` header, and the host of an absolute or a `CONNECT`
   target.
 - **Anything else** is carried as it stands. Its address was admitted when the
@@ -478,7 +479,8 @@ their TLS library's words:
 The stack refuses first bytes a server could read another server from than the
 stack would:
 
-- A ClientHello naming two servers.
+- A ClientHello naming two servers, or one whose first record carries a
+  version other than TLS's, which no client writes and Go's server still reads.
 - A request line opened by whitespace, spaced by anything but spaces and tabs,
   or holding a control byte.
 - A header folded onto a further line, or a carriage return that ends no line.

@@ -81,6 +81,12 @@ consumer upgrading can skip it.
   link met at launch now fails it at the grant, and a grant on a path that
   does not resolve is refused at build with the new
   `ConfigError::LandlockGrantUnresolved`.
+- The network stack refuses, as a server name it cannot read, a TLS
+  handshake whose first record carries a major version other than 3 below
+  `0x10`. It carried such bytes unread, while Go's `crypto/tls` reads a first
+  record of any version below `0x1000` as TLS and serves the name its
+  ClientHello carries, so a guest could reach a site the name rules refuse
+  through a Go front end at an admitted address.
 
 ### Added
 

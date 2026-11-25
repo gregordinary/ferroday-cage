@@ -7,9 +7,10 @@
 //! the name the guest resolved is. [`read`] reads the bytes the guest has sent
 //! so far, the stream from its start, as one of three things:
 //!
-//! - **TLS**: a handshake record, `0x16` and then major version 3. Handshake
-//!   records are read until the ClientHello they carry is whole, and its server
-//!   name extension is taken.
+//! - **TLS**: a handshake record, `0x16` and then a major version below
+//!   `0x10`, as a lenient server reads one. Handshake records of major version
+//!   3 are read until the ClientHello they carry is whole, and its server name
+//!   extension is taken.
 //! - **HTTP/1**: a request line whose last word is an HTTP version, or a line
 //!   of two words whose target is absolute, as HTTP/0.9 writes one. The head is
 //!   read to the empty line that ends it, and the host of the target, where it
@@ -22,7 +23,7 @@
 //! the stream's first [`MAX_HEAD`] bytes. Where a lenient reader could take a
 //! different server from the bytes than the server does, this one refuses them
 //! instead: a ClientHello naming more than one server, a record of another kind
-//! inside one, a request line opened by whitespace, spaced by anything but
+//! inside one or of a version no client writes, a request line opened by whitespace, spaced by anything but
 //! spaces and tabs, or holding a control byte, a carriage return that ends no
 //! line, a header folded onto a further line, two `Host` headers, a target with
 //! user information in it, and a host written as anything but a host name or
@@ -79,6 +80,18 @@ const ALERT_UNRECOGNIZED_NAME: u8 = 112;
 /// The longest word the reader takes for an HTTP method. Past it, the bytes
 /// are not read as a request. The longest method IANA registers is 17 bytes.
 const MAX_METHOD: usize = 32;
+
+/// The lowest major version of a first record that a server does not read as
+/// TLS.
+///
+/// The record's version is not part of the handshake's transcript, so a
+/// client may write any. Go's `crypto/tls` takes a first record as a TLS
+/// handshake whatever its version below `0x1000`, and refuses one only at or
+/// above it, as no TLS version will reach it.
+const FIRST_MAJOR_NOT_TLS: u8 = 0x10;
+
+/// The major version every TLS record a client writes carries.
+const MAJOR_TLS: u8 = 3;
 
 /// The protocol a stream's first bytes begin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,9 +237,14 @@ impl<'a> Cursor<'a> {
 /// The records' fragments are joined until they hold the whole ClientHello,
 /// which may span several records and need not start or end at a record's
 /// boundary. Each record up to its end must be a handshake record of major
-/// version 3, non-empty and no longer than TLS allows, since a server refuses
-/// any other there. Records after the one that finishes the ClientHello are not
-/// read.
+/// version 3, non-empty and no longer than TLS allows, since a strict server
+/// refuses any other there. Records after the one that finishes the
+/// ClientHello are not read.
+///
+/// A first record of a major version from 3 up to [`FIRST_MAJOR_NOT_TLS`] is
+/// still TLS to a lenient server, which reads the server name from it, so it
+/// is refused rather than carried unread. Only one at or above that bound is
+/// not TLS.
 fn read_tls(bytes: &[u8]) -> Reading {
     let unreadable = |reason| Reading::Unreadable {
         protocol: Protocol::Tls,
@@ -263,8 +281,11 @@ fn read_tls(bytes: &[u8]) -> Reading {
                 return unreadable("a record of another kind interrupts its ClientHello");
             }
             // A first byte of 0x16 alone does not make a stream TLS.
-            [_, major, ..] if *major != 3 && at == 0 => return Reading::Other,
-            [_, major, ..] if *major != 3 => {
+            [_, major, ..] if *major >= FIRST_MAJOR_NOT_TLS && at == 0 => return Reading::Other,
+            [_, major, ..] if *major != MAJOR_TLS && at == 0 => {
+                return unreadable("its first record is of a version no client writes");
+            }
+            [_, major, ..] if *major != MAJOR_TLS => {
                 return unreadable("a record of another version interrupts its ClientHello");
             }
             _ if header.len() < RECORD_HEADER => return Reading::Incomplete,
@@ -664,11 +685,21 @@ fn is_port(port: &[u8]) -> bool {
 }
 
 /// Runs the reader over `bytes`, for a fuzz target: it may not panic, a name
-/// it gives is a host name's text, a reading of a shorter prefix is unfinished
-/// or the same, and each answer has the shape its protocol gives one.
+/// it gives is a host name's text, bytes a lenient server may read as a TLS
+/// handshake are never carried unread, a reading of a shorter prefix is
+/// unfinished or the same, and each answer has the shape its protocol gives
+/// one.
 #[cfg(fuzzing)]
 pub(super) fn exercise(bytes: &[u8]) {
     let whole = read(bytes);
+    if whole == Reading::Other {
+        let read_bytes = &bytes[..bytes.len().min(MAX_HEAD)];
+        assert!(
+            !a_server_may_read_a_client_hello(read_bytes),
+            "{} is carried unread",
+            read_bytes.escape_ascii()
+        );
+    }
     if let Reading::Asks { hosts, .. } = &whole {
         for host in hosts {
             if let Host::Name(name) = host {
@@ -783,6 +814,16 @@ fn a_server_may_read_a_request(bytes: &[u8]) -> bool {
         .any(|part| is_request_line(&lenient_words(part)))
 }
 
+/// Whether some server may read `bytes` as the start of a TLS handshake, stated
+/// apart from [`read_tls`]'s walk so a fuzz target can hold one to the other:
+/// Go's `crypto/tls` reads a first record as one where its type is a
+/// handshake's and its version is below `0x1000`, and the stack reads nothing
+/// as an alert first.
+#[cfg(any(test, fuzzing))]
+fn a_server_may_read_a_client_hello(bytes: &[u8]) -> bool {
+    matches!(bytes, [RECORD_HANDSHAKE, major, ..] if *major < FIRST_MAJOR_NOT_TLS)
+}
+
 /// `message` in handshake records of at most `size` bytes each.
 #[cfg(any(test, fuzzing))]
 fn records(message: &[u8], size: usize) -> Vec<u8> {
@@ -881,6 +922,23 @@ mod tests {
             more.extend_from_slice(&[0x17, 3, 3, 0, 1, 0]);
             assert_eq!(read(&more), read(hello), "{client}");
         }
+    }
+
+    #[test]
+    fn a_hello_in_a_record_of_a_version_go_still_reads_is_refused() {
+        // Go's server reads the server name from curl's ClientHello with its
+        // record's version rewritten to 0x0200, since the version is outside
+        // the handshake's transcript, so the stack does not carry it unread.
+        let mut rewritten = FIXTURES[1].1.to_vec();
+        rewritten[1..3].copy_from_slice(&[2, 0]);
+        assert_eq!(
+            read(&rewritten),
+            unreadable(
+                Protocol::Tls,
+                "its first record is of a version no client writes"
+            )
+        );
+        settles_once(&rewritten);
     }
 
     #[test]
@@ -1062,9 +1120,24 @@ mod tests {
         ] {
             assert_eq!(read(&bytes), unreadable(Protocol::Tls, reason));
         }
-        // A first byte of 0x16 alone does not make the stream TLS.
+        // A first byte of 0x16 alone does not make the stream TLS, and a major
+        // version a server takes for TLS's does.
         assert_eq!(read(&[RECORD_HANDSHAKE]), Reading::Incomplete);
-        assert_eq!(read(&[RECORD_HANDSHAKE, 2, 0]), Reading::Other);
+        for major in 0..=u8::MAX {
+            let reading = read(&[RECORD_HANDSHAKE, major, 0]);
+            match major {
+                MAJOR_TLS => assert_eq!(reading, Reading::Incomplete),
+                _ if a_server_may_read_a_client_hello(&[RECORD_HANDSHAKE, major]) => assert_eq!(
+                    reading,
+                    unreadable(
+                        Protocol::Tls,
+                        "its first record is of a version no client writes"
+                    ),
+                    "major {major}"
+                ),
+                _ => assert_eq!(reading, Reading::Other, "major {major}"),
+            }
+        }
         settles_once(&interrupted);
     }
 
