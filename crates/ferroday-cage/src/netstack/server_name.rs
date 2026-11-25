@@ -13,17 +13,21 @@
 //! - **HTTP/1**: a request line whose last word is an HTTP version, or a line
 //!   of two words whose target is absolute, as HTTP/0.9 writes one. The head is
 //!   read to the empty line that ends it, and the host of the target, where it
-//!   names one, and the `Host` header are taken.
+//!   names one, and the `Host` header are taken. Whether bytes are a request is
+//!   judged as the most lenient server judges it, so bytes some server reads as
+//!   one are never carried unread.
 //! - **Anything else**, which the stack carries as it stands.
 //!
 //! The bytes come from the guest and are read in the caller's process, within
 //! the stream's first [`MAX_HEAD`] bytes. Where a lenient reader could take a
 //! different server from the bytes than the server does, this one refuses them
 //! instead: a ClientHello naming more than one server, a record of another kind
-//! inside one, a carriage return that ends no line, a header folded onto a
-//! further line, two `Host` headers, a target with user information in it, and
-//! a host written as anything but a host name or an address. The stack answers
-//! those as it answers a server the rules refuse.
+//! inside one, a request line opened by whitespace, spaced by anything but
+//! spaces and tabs, or holding a control byte, a carriage return that ends no
+//! line, a header folded onto a further line, two `Host` headers, a target with
+//! user information in it, and a host written as anything but a host name or
+//! an address. The stack answers those as it answers a server the rules
+//! refuse.
 //!
 //! A reading, once it is more than [`Reading::Incomplete`], does not change as
 //! more of the stream arrives, so the stack decides a flow once.
@@ -348,10 +352,45 @@ fn is_control(byte: u8) -> bool {
     (byte < 0x20 && byte != b'\t') || byte == 0x7f
 }
 
-/// Whether `byte` separates the words of a request line. HTTP separates them
-/// with one space, and servers commonly take a run of spaces and tabs.
+/// Whether `byte` separates the words of a request line the reader reads.
+/// HTTP separates them with one space, and servers commonly take a run of
+/// spaces and tabs.
 fn is_separator(byte: u8) -> bool {
     byte == b' ' || byte == b'\t'
+}
+
+/// Whether some server may read `byte` as whitespace in a request line, before
+/// its first word or between two.
+///
+/// RFC 9112 (section 3) lets a recipient take a vertical tab, a form feed and
+/// a carriage return that ends no line as a space, beside the space and the
+/// tab. A reader that splits the line on Unicode whitespace after decoding it
+/// as Latin-1, as Python's `http.server` does, also takes the four information
+/// separators, `0x1c` to `0x1f`, a next-line `0x85` and a no-break space
+/// `0xa0`.
+fn is_lenient_space(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t' | 0x0b | 0x0c | b'\r' | 0x1c..=0x1f | 0x85 | 0xa0
+    )
+}
+
+/// The words of a request line as a server splitting it on every byte of
+/// [`is_lenient_space`] reads them.
+fn lenient_words(line: &[u8]) -> Vec<&[u8]> {
+    line.split(|&byte| is_lenient_space(byte))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Whether `words` are a request line's: a last word naming an HTTP version,
+/// or a method and an absolute target, as HTTP/0.9 writes one.
+fn is_request_line(words: &[&[u8]]) -> bool {
+    let last = words.last().copied().unwrap_or_default();
+    let versioned = last
+        .get(..5)
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"HTTP/"));
+    versioned || (words.len() == 2 && absolute_authority(words[1]).is_some())
 }
 
 /// The line of `bytes` that starts at `at`, without its line feed or a
@@ -365,24 +404,43 @@ fn line_at(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
 
 /// Reads `bytes`, which do not begin a handshake record, as an HTTP/1 request.
 ///
-/// Empty lines before the request line are passed over, as a server passes
-/// them over. The bytes are no request where they do not begin with a token and
-/// a separator, or where the request line holds a control byte, ends in no HTTP
-/// version, and is not a method and an absolute target. A request line ending
-/// in an HTTP version must be three words of version 1; an HTTP/2 connection
-/// without TLS sends one of version 2, whose host is in compressed headers the
-/// stack does not read.
+/// Whether the bytes are a request at all is judged as the most lenient server
+/// judges it, since that is the server the bytes may reach. Empty lines and
+/// [lenient whitespace](is_lenient_space) before the request line are passed
+/// over. The bytes are no request where they do not begin with a token and
+/// lenient whitespace, or where the request line is not one in any server's
+/// reading: its words, split on lenient whitespace, neither end in an HTTP
+/// version nor are a method and an absolute target, and the same holds of the
+/// line cut at a carriage return that ends no line, where a server ending
+/// lines there would cut it.
+///
+/// A request in some server's reading is then read as a strict server reads
+/// it, and refused where the two readings could part: whitespace before it,
+/// words spaced by anything but spaces and tabs, a control byte, or a carriage
+/// return that ends no line. A request line ending in an HTTP version must be
+/// three words of version 1; an HTTP/2 connection without TLS sends one of
+/// version 2, whose host is in compressed headers the stack does not read.
+///
+/// A first line holding a NUL is no request, finished or not: binary protocols
+/// write one early, and HTTP admits none in a request line. Reading it so
+/// even before the line ends carries such a protocol on, rather than holding
+/// one that sends no line feed to the deadline.
 fn read_http(bytes: &[u8]) -> Reading {
     let unreadable = |reason| Reading::Unreadable {
         protocol: Protocol::Http,
         reason,
     };
     let mut at = 0;
+    let mut spaced = false;
     loop {
         match &bytes[at..] {
             [b'\n', ..] => at += 1,
             [b'\r', b'\n', ..] => at += 2,
             [] | [b'\r'] => return Reading::Incomplete,
+            [byte, ..] if is_lenient_space(*byte) => {
+                spaced = true;
+                at += 1;
+            }
             _ => break,
         }
     }
@@ -395,32 +453,49 @@ fn read_http(bytes: &[u8]) -> Reading {
     }
     match bytes.get(at + method) {
         None => return Reading::Incomplete,
-        Some(&byte) if !is_separator(byte) => return Reading::Other,
+        Some(&byte) if !is_lenient_space(byte) => return Reading::Other,
         Some(_) => {}
     }
     let Some((line, head)) = line_at(bytes, at) else {
-        // A control byte other than the carriage return that may yet end the
-        // line is no request's, whatever follows it.
-        let partial = &bytes[at..];
-        let partial = partial.strip_suffix(b"\r").unwrap_or(partial);
-        return match partial.iter().any(|&byte| is_control(byte)) {
+        return match bytes[at..].contains(&0) {
             true => Reading::Other,
             false => Reading::Incomplete,
         };
     };
-    if line.iter().any(|&byte| is_control(byte)) {
+    if line.contains(&0) {
         return Reading::Other;
     }
-    let words: Vec<&[u8]> = line
-        .split(|&byte| is_separator(byte))
-        .filter(|word| !word.is_empty())
-        .collect();
+    let words = lenient_words(line);
+    let cut_at_return = line
+        .iter()
+        .position(|&byte| byte == b'\r')
+        .is_some_and(|cut| is_request_line(&lenient_words(&line[..cut])));
+    if !is_request_line(&words) && !cut_at_return {
+        return Reading::Other;
+    }
+    if line.contains(&b'\r') {
+        return unreadable("a carriage return in its request line ends no line");
+    }
+    if spaced {
+        return unreadable("whitespace comes before its request line");
+    }
+    if line
+        .iter()
+        .any(|&byte| is_lenient_space(byte) && !is_separator(byte))
+    {
+        return unreadable("its request line spaces its words with more than spaces and tabs");
+    }
+    if line.iter().any(|&byte| is_control(byte)) {
+        return unreadable("its request line holds a control byte");
+    }
+    // The line is now words between spaces and tabs, which every server splits
+    // as the lenient reading did.
     let last = words.last().copied().unwrap_or_default();
     let version = match last.get(..5) {
         Some(name) if name.eq_ignore_ascii_case(b"HTTP/") => &last[5..],
-        // HTTP/0.9: a method and a target, and no head. Only an absolute
-        // target names a server there.
-        _ if words.len() == 2 && absolute_authority(words[1]).is_some() => {
+        // HTTP/0.9: a method and an absolute target, and no head, which the
+        // lenient reading established.
+        _ => {
             return match target_host(words[0], words[1]) {
                 Ok(host) => Reading::Asks {
                     protocol: Protocol::Http,
@@ -429,7 +504,6 @@ fn read_http(bytes: &[u8]) -> Reading {
                 Err(reason) => unreadable(reason),
             };
         }
-        _ => return Reading::Other,
     };
     if words.len() != 3 {
         return unreadable("its request line is not a method, a target and a version");
@@ -649,11 +723,20 @@ pub(super) fn exercise_client_hello(input: &[u8]) {
 }
 
 /// Runs the reader over `bytes` as a request head, for a fuzz target: they
-/// read as [`exercise`] requires, and where they hold no carriage return, as
+/// read as [`exercise`] requires, bytes some server may read as a request are
+/// never carried unread, and where they hold no carriage return, they read as
 /// the same bytes with each line feed after one.
 #[cfg(fuzzing)]
 pub(super) fn exercise_http_head(bytes: &[u8]) {
     exercise(bytes);
+    let read_bytes = &bytes[..bytes.len().min(MAX_HEAD)];
+    if read(read_bytes) == Reading::Other {
+        assert!(
+            !a_server_may_read_a_request(read_bytes),
+            "{} is carried unread",
+            read_bytes.escape_ascii()
+        );
+    }
     if bytes.first() != Some(&RECORD_HANDSHAKE)
         && !bytes.contains(&b'\r')
         && bytes.len() < MAX_HEAD / 2
@@ -667,6 +750,37 @@ pub(super) fn exercise_http_head(bytes: &[u8]) {
         }
         assert_eq!(read(bytes), read(&crlf));
     }
+}
+
+/// Whether some server may read `bytes` as an HTTP request, stated apart from
+/// [`read_http`]'s walk so a fuzz target can hold one to the other: after any
+/// line feeds and lenient whitespace, a method token and lenient whitespace,
+/// on a first line holding no NUL whose words are a request line's, whole or
+/// cut at a carriage return. The first line must have ended, since a server
+/// reads no request before it does.
+#[cfg(any(test, fuzzing))]
+fn a_server_may_read_a_request(bytes: &[u8]) -> bool {
+    let Some(start) = bytes
+        .iter()
+        .position(|&byte| byte != b'\n' && !is_lenient_space(byte))
+    else {
+        return false;
+    };
+    let rest = &bytes[start..];
+    let Some(end) = rest.iter().position(|&byte| byte == b'\n') else {
+        return false;
+    };
+    let line = &rest[..end];
+    let method = line.iter().take_while(|&&byte| is_token_byte(byte)).count();
+    let spaced = line.get(method).is_some_and(|&byte| is_lenient_space(byte));
+    if !(1..=MAX_METHOD).contains(&method) || !spaced || line.contains(&0) {
+        return false;
+    }
+    line.split(|&byte| byte == b'\r')
+        .next()
+        .into_iter()
+        .chain([line])
+        .any(|part| is_request_line(&lenient_words(part)))
 }
 
 /// `message` in handshake records of at most `size` bytes each.
@@ -1077,6 +1191,85 @@ mod tests {
     }
 
     #[test]
+    fn a_request_line_a_lenient_server_reads_is_refused() {
+        for (request, reason) in [
+            // Whitespace before the request line, which a server may pass over
+            // as it passes over an empty line.
+            (
+                &b" GET / HTTP/1.1\r\nHost: b.example\r\n\r\n"[..],
+                "whitespace comes before its request line",
+            ),
+            (
+                b"\r\n\tGET / HTTP/1.1\r\n\r\n",
+                "whitespace comes before its request line",
+            ),
+            (
+                b"\x0cGET http://b.example/\r\n",
+                "whitespace comes before its request line",
+            ),
+            // Words a server may split on whitespace other than spaces and
+            // tabs: RFC 9112's, and a Latin-1 reader's Unicode whitespace.
+            (
+                b"GET\x0b/ HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                "its request line spaces its words with more than spaces and tabs",
+            ),
+            (
+                b"GET\x0c/ HTTP/1.1\r\n\r\n",
+                "its request line spaces its words with more than spaces and tabs",
+            ),
+            (
+                b"GET\x1f/ HTTP/1.1\r\n\r\n",
+                "its request line spaces its words with more than spaces and tabs",
+            ),
+            (
+                b"GET /\x85HTTP/1.1\r\n\r\n",
+                "its request line spaces its words with more than spaces and tabs",
+            ),
+            (
+                b"GET\xa0/\xa0HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                "its request line spaces its words with more than spaces and tabs",
+            ),
+            // A server ending lines at a bare carriage return reads a request
+            // line, and here a Host header, that the line feed's reading does
+            // not.
+            (
+                b"GET / HTTP/1.1\rHost: b.example\r\n\r\n",
+                "a carriage return in its request line ends no line",
+            ),
+            (
+                b"GET\rhttp://b.example/\r\n",
+                "a carriage return in its request line ends no line",
+            ),
+            (
+                b"GET / HTTP/1.1\r\r\n\r\n",
+                "a carriage return in its request line ends no line",
+            ),
+            // A control byte a server may take as part of a word.
+            (
+                b"GET /\x01 HTTP/1.1\r\nHost: b.example\r\n\r\n",
+                "its request line holds a control byte",
+            ),
+            (
+                b"GET http://b.example/\x7f\r\n",
+                "its request line holds a control byte",
+            ),
+        ] {
+            assert_eq!(
+                read(request),
+                unreadable(Protocol::Http, reason),
+                "{}",
+                request.escape_ascii()
+            );
+            assert!(
+                a_server_may_read_a_request(request),
+                "{}",
+                request.escape_ascii()
+            );
+            settles_once(request);
+        }
+    }
+
+    #[test]
     fn bytes_that_begin_no_request_are_other() {
         for bytes in [
             &b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5\r\n"[..],
@@ -1086,11 +1279,22 @@ mod tests {
             b"GET /\r\n",
             b"\0\0\0\x08\x04\xd2\x16\x2f",
             b"\x80\x2e\x01\x03\x01",
-            b"GET /\x01 HTTP/1.1\r\n\r\n",
-            b"GET /\x01",
             b"\r\x00",
+            // Whitespace before a line that is no request line either way.
+            b" hello world\r\n",
+            // Cut at its carriage return, the line is no request line either.
+            b"FOO bar\rbaz\r\n",
+            // git's protocol: a NUL before any line feed, which HTTP admits
+            // nowhere in a request line, finished or not.
+            b"0032git-upload-pack /project.git\0host=example.com\0",
+            b"GET /\0 HTTP/1.1\r\nHost: b.example\r\n\r\n",
         ] {
             assert_eq!(read(bytes), Reading::Other, "{}", bytes.escape_ascii());
+            assert!(
+                !a_server_may_read_a_request(bytes),
+                "{}",
+                bytes.escape_ascii()
+            );
             settles_once(bytes);
         }
         let method = vec![b'A'; MAX_METHOD + 1];
@@ -1100,10 +1304,15 @@ mod tests {
             &b""[..],
             b"\r",
             b"\r\n",
+            b" ",
+            b" GET",
             b"GE",
             b"GET",
             b"GET /",
+            b"GET\x0b",
+            b"GET /\x01",
             b"GET / HTTP/1.1\r",
+            b"GET / HTTP/1.1\rHost: b.example",
         ] {
             assert_eq!(read(bytes), Reading::Incomplete, "{}", bytes.escape_ascii());
         }

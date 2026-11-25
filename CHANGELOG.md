@@ -99,8 +99,11 @@ consumer upgrading can skip it.
   `FlowRefusal::ServerNameDenied`, `FlowRefusal::ServerNameUnfinished` or
   `FlowRefusal::ServerNameUnreadable`. First bytes not whole within ten seconds
   of their first byte, or within 16 KiB, are refused, and so are bytes a server
-  could read another server from, two `Host` headers among them. Other first
-  bytes are carried as they stand.
+  could read another server from, two `Host` headers among them. Whether first
+  bytes are an HTTP request is judged as the most lenient server judges it,
+  and a request line opened by whitespace, spaced by anything but spaces and
+  tabs, holding a control byte, or holding a carriage return that ends no line
+  is refused. Other first bytes are carried as they stand.
 - The native network stack reports each flow of the guest's it carries or
   refuses, and each question its nameserver relays, refuses, or answers with no
   records. `NetStackHandle::take_reports` hands over the new `NetStackReports`,

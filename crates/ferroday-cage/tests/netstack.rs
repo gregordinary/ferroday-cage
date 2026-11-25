@@ -2066,6 +2066,10 @@ fn a_server_name_the_rules_refuse_is_answered_in_its_protocol() {
         b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
         b"GET http://example.com/ HTTP/1.1\r\nHost: admitted.example\r\n\r\n".to_vec(),
         b"GET / HTTP/1.1\r\nHost: admitted.example\r\nHost: example.com\r\n\r\n".to_vec(),
+        // A request a lenient server reads, opened by a space or spaced by a
+        // vertical tab, is read and refused rather than carried unread.
+        b" GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+        b"GET\x0b/ HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
         b"GET / HTTP/1.1\r\nHost: admitted.example\r\n\r\n".to_vec(),
     ];
     let script = std::iter::once("getent hosts admitted.example > /dev/null".to_string())
@@ -2091,7 +2095,17 @@ fn a_server_name_the_rules_refuse_is_answered_in_its_protocol() {
         "400 Bad Request",
         "it carries more than one Host header",
     );
-    assert_eq!(lines[4], "");
+    assert_answered(
+        lines[4],
+        "400 Bad Request",
+        "whitespace comes before its request line",
+    );
+    assert_answered(
+        lines[5],
+        "400 Bad Request",
+        "its request line spaces its words with more than spaces and tabs",
+    );
+    assert_eq!(lines[6], "");
 
     let flow = |decision: &str| {
         (
@@ -2103,9 +2117,11 @@ fn a_server_name_the_rules_refuse_is_answered_in_its_protocol() {
     };
     let carried = flow("allowed by admitted.example");
     let refused = flow("server example.com not allowed");
-    let unread = flow(
-        "refused as ServerNameUnreadable { reason: \"it carries more than one Host header\" }",
-    );
+    let unread = |reason: &str| {
+        flow(&format!(
+            "refused as ServerNameUnreadable {{ reason: {reason:?} }}"
+        ))
+    };
     assert_eq!(
         flows(&reports),
         [
@@ -2116,7 +2132,11 @@ fn a_server_name_the_rules_refuse_is_answered_in_its_protocol() {
             carried.clone(),
             refused,
             carried.clone(),
-            unread,
+            unread("it carries more than one Host header"),
+            carried.clone(),
+            unread("whitespace comes before its request line"),
+            carried.clone(),
+            unread("its request line spaces its words with more than spaces and tabs"),
             carried,
         ]
     );

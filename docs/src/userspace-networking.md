@@ -438,7 +438,9 @@ guest sent:
 - **HTTP/1**: the `Host` header, and the host of an absolute or a `CONNECT`
   target.
 - **Anything else** is carried as it stands. Its address was admitted when the
-  guest connected. SSH to a Git host is the common case.
+  guest connected. SSH to a Git host is the common case. Whether bytes are an
+  HTTP request is judged as the most lenient server judges it, so bytes some
+  server reads as one are never carried unread.
 
 The server is held to the rules on the flow's port:
 
@@ -477,6 +479,8 @@ The stack refuses first bytes a server could read another server from than the
 stack would:
 
 - A ClientHello naming two servers.
+- A request line opened by whitespace, spaced by anything but spaces and tabs,
+  or holding a control byte.
 - A header folded onto a further line, or a carriage return that ends no line.
 - Two `Host` headers, or user information in a target.
 - HTTP/2 without TLS, whose host is in compressed headers.
