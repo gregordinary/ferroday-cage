@@ -58,6 +58,25 @@ impl Record {
 /// that sit in the answer section of a reply to it, each with its owner.
 pub type Zone = Vec<(&'static str, Vec<(&'static str, Record)>)>;
 
+/// A loopback UDP socket and a TCP listener on the same port.
+///
+/// The kernel picks a free UDP port, and TCP's ports are a table of their own:
+/// a TCP socket elsewhere, a connection's own end among them, can hold the same
+/// number. A port taken that way is passed over for another.
+fn one_port() -> (UdpSocket, TcpListener) {
+    const TRIES: usize = 64;
+    for _ in 0..TRIES {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback UDP socket binds");
+        let address = udp.local_addr().expect("the socket has an address");
+        match TcpListener::bind(address) {
+            Ok(listener) => return (udp, listener),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(err) => panic!("a TCP listener binds the UDP socket's port: {err}"),
+        }
+    }
+    panic!("no loopback port was free over both UDP and TCP in {TRIES} tries");
+}
+
 /// A stand-in for the host's resolver, on one loopback port over UDP and TCP.
 ///
 /// It answers a question for a name its zone holds with that name's records of
@@ -95,10 +114,8 @@ impl Resolver {
     /// A resolver answering for `zone`, each record with a time to live of
     /// `ttl` seconds.
     pub fn serving(zone: Zone, ttl: u32) -> Resolver {
-        let udp_socket =
-            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback UDP socket binds");
+        let (udp_socket, listener) = one_port();
         let address = udp_socket.local_addr().expect("the socket has an address");
-        let listener = TcpListener::bind(address).expect("a TCP listener binds the same port");
         let (udp, tcp) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let names = Arc::new(Mutex::new(HashMap::new()));
         let zone = Arc::new(zone);
