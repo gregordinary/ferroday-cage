@@ -3,16 +3,18 @@
 A coding agent works by running commands its model chooses: a test suite, a
 search, a build. An agent runtime runs each one in a sandbox. The command sees
 the host's programs and the project it works on, and writes only to the project.
-It reaches none of the user's credentials, and talks to one service the runtime
-chooses. The library ships such a sandbox as a worked example, `agent-tools`,
-and `fcage` loads the same sandbox from a profile.
+It reaches none of the user's credentials. Its network reaches one service the
+runtime chooses, and, where a build needs them, the package registries alone.
+The library ships such a sandbox as a worked example, `agent-tools`, and `fcage`
+loads the same sandbox from a profile.
 
 ```sh
 agent-tools --worktree ~/project -- git status
 ```
 
 Each part of the sandbox is an ordinary builder call. This chapter takes them in
-turn, then the service, the limits, and the report the example prints at the end.
+turn, then the service, the registries, the limits, and the report the example
+prints at the end.
 
 ## The sandbox
 
@@ -213,6 +215,109 @@ An event loop registers the same two descriptors. A listener keeps the
 sandbox's network namespace in being, so the example drops it once the wait
 returns.
 
+## The registries
+
+A build fetches its dependencies, which the service alone does not reach.
+`--registries` gives the command a second way out: the library's [network
+stack](userspace-networking.md#the-native-stack), bounded to the package
+registries a build fetches from. The listener stays, so the command reaches the
+service as well.
+
+The stack takes one allow rule for each name a registry serves from, on port 443
+alone. They are the names `cargo`, `pip`, `npm` and `go` reach to fetch a
+package, as the stack's reports name them:
+
+| Ecosystem | Names |
+|---|---|
+| crates.io | `index.crates.io`, `static.crates.io` |
+| PyPI | `pypi.org`, `files.pythonhosted.org` |
+| npm | `registry.npmjs.org` |
+| Go | `proxy.golang.org`, `sum.golang.org` |
+
+The stack is built before the sandbox, whose `resolv.conf` names the stack's
+nameserver. It is attached before the command starts, as the listener is made,
+and stopped once the command has exited:
+
+```rust,no_run
+use ferroday_cage::{Cage, NetStack};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut builder = NetStack::builder();
+for registry in [
+    "index.crates.io:443",
+    "static.crates.io:443",
+    "pypi.org:443",
+    "files.pythonhosted.org:443",
+    "registry.npmjs.org:443",
+    "proxy.golang.org:443",
+    "sum.golang.org:443",
+] {
+    builder = builder.allow(registry.parse()?);
+}
+let stack = builder.build()?;
+
+let tree = "/home/user/project";
+let cage = Cage::builder()
+    .host_rootfs()
+    .bind(tree, tree)
+    .current_dir(tree)
+    .nameservers(stack.nameservers())
+    .path_lookup(true)
+    .command("cargo")
+    .arg("fetch")
+    .build()?;
+let pending = cage.spawn_pending()?;
+let mut handle = stack.attach(&pending)?;
+let reports = handle.take_reports().expect("the reports are not yet taken");
+let printer = std::thread::spawn(move || {
+    while let Ok(report) = reports.recv() {
+        if report.is_refusal() {
+            eprintln!("agent-tools: the network stack {report}");
+        }
+    }
+});
+let mut running = pending.proceed()?;
+let status = running.wait()?;
+handle.stop()?;
+printer.join().expect("the printer finishes once the stack stops");
+# let _ = status;
+# Ok(())
+# }
+```
+
+### What the rules admit
+
+The stack's [nameserver](userspace-networking.md#dns) answers these names and
+no other, and pins each address it resolves for one to that name. A TCP flow to
+port 443 reaches a pinned address alone. Its TLS server name must be one of the
+names too, since a content network serves many sites at one address. A UDP flow
+is refused, so a QUIC client falls back to TCP. [Names](userspace-networking.md#names)
+and [Server names](userspace-networking.md#server-names) set out each rule.
+
+Everything else is refused. The stack reports each refusal, and the example
+prints it on standard error:
+
+```text
+agent-tools: the network stack refused the A question for example.com from 10.0.2.15:59100: no allow rule admits it
+agent-tools: the network stack refused tcp from 10.0.2.15:46748 to 198.51.100.7:443: no allow rule admits the address, and the stack resolved no name an allow rule admits to it
+```
+
+The stack never waits on a reader, so a thread of the example's reads the
+reports beside the wait. A report the queue has no room for is dropped and
+counted, and the example says how many once the stack has stopped.
+
+`--allow RULE` admits more, in the [rule
+grammar](userspace-networking.md#destination-rules). `github.com:443` admits a
+dependency fetched from Git. A mirror on the local network needs an address
+rule, since a name rule never admits a private address. `fcage --netstack
+--netstack-log` with no rules writes every name a build reaches, which is how to
+learn what a list needs.
+
+`--registries` needs the host's own root. The empty root binds the host's
+`/etc`, and a host directory bound there claims its `resolv.conf`. The library
+then places no file naming the stack's nameserver, and the command resolves no
+name.
+
 ## The limits
 
 A command can fork without end and allocate without end, so the example bounds
@@ -303,9 +408,9 @@ the signal that ended it. A command that outlives `--timeout` gives 124, as
 ## From the command line
 
 `crates/ferroday-cage/examples/agent-tools.toml` gives `fcage` the same sandbox.
-The profile holds what every command shares. The command line adds the working
-tree, its protected paths, and a forward of the loopback port to the runtime's
-service on the host:
+The profile holds what every command shares, the registries included. The
+command line adds the working tree, its protected paths, and a forward of the
+loopback port to the runtime's service on the host:
 
 ```sh
 fcage --profile crates/ferroday-cage/examples/agent-tools.toml \
@@ -323,6 +428,21 @@ open does not outlast the run. [A listener on the sandbox's
 loopback](userspace-networking.md#a-listener-on-the-sandboxs-loopback) sets out
 its bounds.
 
+The profile's `[netstack]` table holds the registries' rules. `--netstack`
+attaches the stack it configures, as `--registries` does, and `fcage` writes
+each refusal the stack reports on standard error. Without `--netstack` the
+table is unused, and `fcage` says so:
+
+```sh
+fcage --profile crates/ferroday-cage/examples/agent-tools.toml --netstack \
+    --bind "$PWD" "$PWD" --chdir "$PWD" --hide "$PWD/.env" \
+    --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
+    --forward-loopback 8080 127.0.0.1:8080 \
+    --timeout 600 -- cargo fetch
+```
+
+`--netstack-allow RULE` admits more, as `--allow` does.
+
 The profile carries both sets of limits, the cgroup's with `required = false`.
 With a delegated parent, `--cgroup-parent DIR` applies the limits on the whole
 tree; [Limits on the whole tree](hardening.md#limits-on-the-whole-tree) shows a
@@ -331,21 +451,36 @@ the per-process limits and says so on standard error.
 
 The profile leaves the unix-socket restriction to the host root's default,
 which applies where the kernel enforces it. `--landlock-resolve-unix` asks for
-it outright, and a kernel below Landlock ABI 9 then refuses the launch. The example's tests hold the profile, composed
-with the flags above, to the sandbox the example builds.
+it outright, and a kernel below Landlock ABI 9 then refuses the launch. The
+example's tests hold the profile, composed with the flags above, to the sandbox
+the example builds. They hold its `[netstack]` table to the stack
+`--registries` attaches.
 
 ## Running the example
 
 The example lives at `crates/ferroday-cage/examples/agent-tools.rs` and needs
-the `hardening` feature. `--worktree` names the working tree, and the current
-directory is the working tree without it. A command without a slash is found on
-the sandbox's `PATH`:
+the `hardening` and `netstack` features. `--worktree` names the working tree,
+and the current directory is the working tree without it. A command without a
+slash is found on the sandbox's `PATH`:
 
 ```sh
-cargo run --example agent-tools --features hardening -- \
+cargo run --example agent-tools --features hardening,netstack -- \
     --worktree ~/project -- git status
-cargo run --example agent-tools --features hardening -- \
+cargo run --example agent-tools --features hardening,netstack -- \
     --worktree ~/project -- curl -s http://127.0.0.1:8080/status
+cargo run --example agent-tools --features hardening,netstack -- \
+    --registries --worktree ~/project -- npm ci
+```
+
+A toolchain installed under the home directory is hidden with it. `--expose`
+binds it back, and `--env` names it, as for a rustup installation:
+
+```sh
+cargo run --example agent-tools --features hardening,netstack -- \
+    --registries --worktree ~/project \
+    --expose ~/.rustup --expose ~/.cargo/bin \
+    --env RUSTUP_HOME ~/.rustup --env PATH ~/.cargo/bin:/usr/bin:/bin \
+    -- cargo fetch
 ```
 
 To bound the whole tree, run the example in a scope of its own. `cargo run`
@@ -353,13 +488,13 @@ replaces itself with the example, which then runs in the scope alone:
 
 ```sh
 systemd-run --user --scope -p Delegate=yes \
-    cargo run --example agent-tools --features hardening -- \
+    cargo run --example agent-tools --features hardening,netstack -- \
     --worktree ~/project -- git status
 ```
 
 ## What stays in view
 
-The sandbox confines what the command writes and whom it talks to. Three things
+The sandbox confines what the command writes and whom it talks to. Four things
 remain the caller's to decide:
 
 - The rest of the host's tree stays readable, `/etc`, `/opt` and `/sys` among
@@ -367,6 +502,11 @@ remain the caller's to decide:
   `--empty-root`.
 - The service is as narrow as its policy. A proxy that admits every
   destination gives the command the network.
+- The registries are as narrow as a name rule. Each sits behind a content
+  network, where a client can name an admitted server and ask it for another
+  site. A registry that takes uploads where it serves downloads, as npm's does,
+  carries what a command publishes there with a token of its own. [Server
+  names](userspace-networking.md#server-names) sets out the rest.
 - The curated seccomp roster is a convenience posture rather than a boundary
   claim, and neither limit covers I/O or disk use. [What this boundary does not
   cover](hardening.md#what-this-boundary-does-not-cover) sets out the rest.

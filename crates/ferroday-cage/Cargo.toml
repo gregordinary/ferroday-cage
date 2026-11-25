@@ -304,13 +304,14 @@ required-features = ["alpine"]
 
 # A worked consumer: a sandbox for a coding agent's tool commands, over the
 # host's own root with a presented identity, a listener on the sandbox's
-# loopback, the hardening layer's seccomp roster and unix-socket restriction,
-# and cgroup or per-process limits. It needs the `hardening` feature. Its tests
-# hold the command lines it documents, and the fcage profile beside it, to the
-# sandbox it builds, and `test` runs them.
+# loopback, the network stack bounded to the package registries, the hardening
+# layer's seccomp roster and unix-socket restriction, and cgroup or per-process
+# limits. It needs the `hardening` and `netstack` features. Its tests hold the
+# command lines it documents, and the fcage profile beside it, to the sandbox it
+# builds, and `test` runs them.
 [[example]]
 name = "agent-tools"
-required-features = ["hardening"]
+required-features = ["hardening", "netstack"]
 test = true
 
 [dev-dependencies]

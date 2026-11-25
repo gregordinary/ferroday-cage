@@ -144,6 +144,12 @@ consumer upgrading can skip it.
   such a host now resolves. `--no-resolv-conf`, `--no-managed-mounts`,
   `--nameserver` and a mount of the run's own at the file still decline it.
 - The `fetch-sandbox` example names the stack's nameserver in the same way.
+- The `agent-tools` example takes `--registries`, which attaches the native
+  network stack beside its loopback listener, admitting the package registries
+  of crates.io, PyPI, npm and Go by name on port 443 and nothing else, and
+  prints each refusal the stack reports. `--allow RULE` admits more. The
+  example needs the `netstack` feature as well as `hardening`, and
+  `examples/agent-tools.toml` carries the registries as a `[netstack]` table.
 - `CageBuilder::get_resolv_conf` answers whether the managed `resolv.conf` is
   wanted under the host's own root as under any other, since `nameservers`
   places one there. The host's own file is still not bound there.

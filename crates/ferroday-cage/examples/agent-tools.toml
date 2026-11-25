@@ -7,6 +7,13 @@
 #       --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
 #       --forward-loopback 8080 127.0.0.1:8080 -- git status
 #
+# --netstack adds the package registries, as the example's --registries does:
+#
+#   fcage --profile agent-tools.toml --netstack \
+#       --bind "$PWD" "$PWD" --chdir "$PWD" --hide "$PWD/.env" \
+#       --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
+#       --forward-loopback 8080 127.0.0.1:8080 -- cargo fetch
+#
 # The host's own tree is the root, read-only. /home, /root, /run, /var/run and
 # /var/tmp are hidden, and Landlock refuses the command the pathname sockets
 # left in view where the kernel enforces it (Landlock ABI 9).
@@ -15,13 +22,35 @@ host-rootfs = true
 # The command runs as the caller's own uid and gid, with no capabilities.
 present-as = "own"
 
-# A network namespace of the sandbox's own. Its loopback is the one way out,
-# through a port the caller serves with --forward-loopback.
+# A network namespace of the sandbox's own. Its loopback is a way out, through
+# a port the caller serves with --forward-loopback, and with --netstack the
+# network stack below is the other.
 network = "isolated"
 
 stdin = "null"
 stop-with-caller = true
 path-lookup = true
+
+# The network stack --netstack attaches, which carries connections to these
+# registries alone, each by its name on port 443. The stack's nameserver
+# answers no other name, a connection reaches only an address it resolved for
+# one of them, and a TLS server name must be one of them too. fcage prints
+# each connection and lookup the stack refuses. Without --netstack the table
+# is unused.
+[netstack]
+allow = [
+  # crates.io: the sparse index, and the crate files.
+  "index.crates.io:443",
+  "static.crates.io:443",
+  # PyPI: the index, and the distribution files.
+  "pypi.org:443",
+  "files.pythonhosted.org:443",
+  # npm: the registry, which serves both.
+  "registry.npmjs.org:443",
+  # Go: the module proxy, and the checksum database go verifies against.
+  "proxy.golang.org:443",
+  "sum.golang.org:443",
+]
 
 [env]
 # The home directory is hidden, so the command's home is its own /tmp, empty at

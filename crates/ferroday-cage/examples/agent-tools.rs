@@ -20,7 +20,10 @@
 //!   hidden.
 //! - **The network** is a namespace of the sandbox's own, whose one way out is
 //!   a loopback port the example serves itself, with a stand-in for the service
-//!   a runtime offers its tool commands.
+//!   a runtime offers its tool commands. With `--registries`, the library's
+//!   network stack also carries the command's connections to the package
+//!   registries a build fetches from, and to nothing else, and the example
+//!   prints each connection and lookup the stack refuses.
 //! - **The restrictions** are the curated seccomp roster, and Landlock's refusal
 //!   of the pathname sockets the mounts leave in view, where the kernel enforces
 //!   it.
@@ -32,10 +35,11 @@
 //!
 //! It exists to exercise the library from the vantage of an agent runtime: the
 //! host root with `hide` and `read_only`, a presented identity, a listener on
-//! the sandbox's loopback, the unix-socket restriction, cgroup limits, and a
-//! wait driven through the handle's readiness descriptor. Everything it does is
-//! public API, and `crates/ferroday-cage/examples/agent-tools.toml` gives
-//! `fcage` the same sandbox.
+//! the sandbox's loopback, the network stack's destination rules and reports,
+//! the unix-socket restriction, cgroup limits, and a wait driven through the
+//! handle's readiness descriptor. Everything it does is public API, and
+//! `crates/ferroday-cage/examples/agent-tools.toml` gives `fcage` the same
+//! sandbox.
 //!
 //! # Usage
 //!
@@ -51,12 +55,14 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ferroday_cage::relay::Escalation;
 use ferroday_cage::{
-    Cage, CageBuilder, CgroupLimit, Error, ErrorChain, ExitStatus, FsAccess, Network,
-    PresentedIdentity, Resource, ResourceUsage, Running, SeccompPolicy, SeccompRules, Stdio, host,
+    Cage, CageBuilder, CgroupLimit, DestinationRule, Error, ErrorChain, ExitStatus, FsAccess,
+    NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Pending, PresentedIdentity,
+    Resource, ResourceUsage, Running, SeccompPolicy, SeccompRules, Stdio, host,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -86,6 +92,27 @@ const HOME: &str = "/tmp";
 /// otherwise. The port is the sandbox's own, so it collides with nothing on
 /// the host.
 const DEFAULT_PORT: u16 = 8080;
+
+/// The package registries a build fetches from, as the destination rules
+/// `--registries` admits: each a name, on HTTPS's port alone.
+///
+/// - crates.io: the sparse index, and the crate files.
+/// - PyPI: the index, and the distribution files.
+/// - npm: the registry, which serves both.
+/// - Go: the module proxy, and the checksum database `go` verifies against.
+///
+/// A name rule admits a TCP flow only to an address the stack's own nameserver
+/// resolved for one of these names, and only where the TLS server name the
+/// flow sends is one of them too.
+const REGISTRIES: &[&str] = &[
+    "index.crates.io:443",
+    "static.crates.io:443",
+    "pypi.org:443",
+    "files.pythonhosted.org:443",
+    "registry.npmjs.org:443",
+    "proxy.golang.org:443",
+    "sum.golang.org:443",
+];
 
 /// The grace a command that outlived its timeout has between the request to
 /// stop and the kill.
@@ -140,9 +167,18 @@ The root:
   --empty-root          Compose the root from the host's /usr and /etc alone,
                         rather than the host's whole tree, read-only
 
-The command:
+The network:
   --port PORT           The loopback port the stand-in service answers on
                         (default: 8080)
+  --registries          Carry connections to the package registries of
+                        crates.io, PyPI, npm and Go as well, through the
+                        library's network stack, and print each connection
+                        and lookup it refuses. Needs the host's own root
+  --allow RULE          Admit RULE beside the registries (repeatable), a
+                        destination rule such as github.com:443 or
+                        192.0.2.0/24
+
+The command:
   --timeout SECONDS     Ask the command to stop after SECONDS, and kill it 5
                         seconds later
   --env NAME VALUE      Set an environment variable for the command (repeatable)
@@ -178,6 +214,10 @@ struct Config {
     empty_root: bool,
     /// The loopback port the stand-in service answers on.
     port: u16,
+    /// Whether the network stack carries connections to the registries.
+    registries: bool,
+    /// Destination rules admitted beside the registries.
+    allow: Vec<DestinationRule>,
     /// When the command is asked to stop.
     timeout: Option<Duration>,
     /// Environment variables for the command.
@@ -197,6 +237,9 @@ enum Entry {
 enum Failure {
     /// The library's error, which carries the code a launcher reports.
     Sandbox(Error),
+    /// The network stack could not be built or attached. The command never
+    /// ran, so the example reports it as a failure of its own.
+    Stack(NetStackError),
     /// A failure of the example's own.
     Own(String),
 }
@@ -204,6 +247,12 @@ enum Failure {
 impl From<Error> for Failure {
     fn from(error: Error) -> Failure {
         Failure::Sandbox(error)
+    }
+}
+
+impl From<NetStackError> for Failure {
+    fn from(error: NetStackError) -> Failure {
+        Failure::Stack(error)
     }
 }
 
@@ -223,6 +272,10 @@ fn main() -> ExitCode {
                 eprintln!("agent-tools: {}", ErrorChain::new(&error));
                 ExitCode::from(error.shell_code())
             }
+            Err(Failure::Stack(error)) => failure(
+                "agent-tools",
+                &format!("the network stack: {}", ErrorChain::new(&error)),
+            ),
             Err(Failure::Own(message)) => failure("agent-tools", &message),
         },
         Err(message) => usage_error("agent-tools", &message),
@@ -238,6 +291,8 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         expose: Vec::new(),
         empty_root: false,
         port: DEFAULT_PORT,
+        registries: false,
+        allow: Vec::new(),
         timeout: None,
         env: Vec::new(),
         command: Vec::new(),
@@ -278,6 +333,14 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
             config.port = port(string_value("--port", &mut args)?)?;
         } else if let Some(value) = flag_value(&arg, b"--port=") {
             config.port = port(into_string("--port", value)?)?;
+        } else if arg == "--registries" {
+            config.registries = true;
+        } else if arg == "--allow" {
+            config
+                .allow
+                .push(rule(string_value("--allow", &mut args)?)?);
+        } else if let Some(value) = flag_value(&arg, b"--allow=") {
+            config.allow.push(rule(into_string("--allow", value)?)?);
         } else if arg == "--timeout" {
             config.timeout = Some(seconds(string_value("--timeout", &mut args)?)?);
         } else if let Some(value) = flag_value(&arg, b"--timeout=") {
@@ -300,7 +363,27 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
     if config.command.is_empty() {
         return Err("a command to run is required".to_string());
     }
+    if !config.allow.is_empty() && !config.registries {
+        return Err("--allow requires --registries".to_string());
+    }
+    // The empty root binds the host's /etc, which claims its resolv.conf, so
+    // the library places no file naming the stack's nameserver there, and
+    // nothing in the sandbox would resolve a registry's name.
+    if config.registries && config.empty_root {
+        return Err(
+            "--registries needs the host's own root: the empty root binds the host's /etc, \
+             whose resolv.conf cannot name the network stack's nameserver"
+                .to_string(),
+        );
+    }
     Ok(Invocation::Run(Box::new(config)))
+}
+
+/// Reads `--allow`'s value: a destination rule.
+fn rule(value: String) -> Result<DestinationRule, String> {
+    value
+        .parse()
+        .map_err(|err| format!("--allow {value:?}: {err}"))
 }
 
 /// Reads `--port`'s value: a port other than 0.
@@ -368,13 +451,30 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
         );
     }
 
-    let cage = posture(&config, &worktree, cgroup.as_deref(), resolve_unix)
-        .command(&config.command[0])
-        .args(&config.command[1..])
-        .build()?;
+    // Built before the sandbox, whose resolv.conf names the stack's nameserver.
+    let stack = if config.registries {
+        Some(registries(&config.allow).build()?)
+    } else {
+        None
+    };
+    let cage = posture(
+        &config,
+        &worktree,
+        cgroup.as_deref(),
+        resolve_unix,
+        stack.as_ref(),
+    )
+    .command(&config.command[0])
+    .args(&config.command[1..])
+    .build()?;
 
     let pending = cage.spawn_pending()?;
-    // Made before the command starts, so its first connection finds it.
+    // Attached and listening before the command starts, so its first lookup
+    // and its first connection find them.
+    let attached = match &stack {
+        Some(stack) => Some(Attached::start(stack, &pending)?),
+        None => None,
+    };
     let listener = pending.listen(SocketAddr::from((Ipv4Addr::LOCALHOST, config.port)))?;
     listener
         .set_nonblocking(true)
@@ -382,9 +482,12 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
     let mut running = pending.proceed()?;
     let mut escalation = Escalation::new(config.timeout, KILL_AFTER);
     let status = serve_until_exit(&mut running, &listener, &mut escalation)?;
-    // The listener holds the sandbox's network namespace, which nothing needs
-    // once the command has exited.
+    // The listener and the stack hold the sandbox's network namespace, which
+    // nothing needs once the command has exited.
     drop(listener);
+    if let Some(attached) = attached {
+        attached.stop();
+    }
 
     report(status, running.usage());
     Ok(match escalation.outcome(status) {
@@ -397,12 +500,14 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
 }
 
 /// The sandbox a tool command runs in, short of the command itself, with its
-/// limits on the whole tree in a cgroup beneath `cgroup` where one is given.
+/// limits on the whole tree in a cgroup beneath `cgroup` where one is given,
+/// and its `resolv.conf` naming the nameserver of `stack` where one is attached.
 fn posture(
     config: &Config,
     worktree: &Path,
     cgroup: Option<&Path>,
     resolve_unix: bool,
+    stack: Option<&NetStack>,
 ) -> CageBuilder {
     let mut builder = if config.empty_root {
         host_userland()
@@ -442,12 +547,92 @@ fn posture(
         .env("HOME", HOME)
         .envs(config.env.iter().map(|(name, value)| (name, value)));
 
+    if let Some(stack) = stack {
+        // The name rules admit the addresses the stack's nameserver resolved,
+        // so the command asks that nameserver.
+        builder = builder.nameservers(stack.nameservers());
+    }
+
     builder = CGROUP_LIMITS
         .into_iter()
         .fold(builder, CageBuilder::cgroup_limit);
     match cgroup {
         Some(parent) => builder.cgroup_parent(parent),
         None => builder,
+    }
+}
+
+/// The network stack `--registries` attaches: the [`REGISTRIES`] admitted, with
+/// `allow`'s rules beside them. Any allow rule refuses whatever no allow rule
+/// admits, so the command reaches the registries, the caller's additions, and
+/// nothing else through the stack.
+fn registries(allow: &[DestinationRule]) -> NetStackBuilder {
+    REGISTRIES
+        .iter()
+        .map(|rule| {
+            rule.parse::<DestinationRule>()
+                .expect("each registry is a destination rule")
+        })
+        .chain(allow.iter().cloned())
+        .fold(NetStack::builder(), NetStackBuilder::allow)
+}
+
+/// The network stack attached to a run's sandbox, and the thread printing what
+/// it refuses.
+struct Attached {
+    handle: NetStackHandle,
+    /// Prints each refusal the stack reports until the stack has stopped, and
+    /// answers how many reports the stack had no room for.
+    printer: JoinHandle<u64>,
+}
+
+impl Attached {
+    /// Attaches `stack` to the sandbox `pending` holds, and starts printing
+    /// the refusals it reports.
+    ///
+    /// The stack never waits on a reader: a report it has no room for is
+    /// dropped and counted. So the refusals are read on a thread of their own,
+    /// and the wait for the command goes on beside it.
+    fn start(stack: &NetStack, pending: &Pending<'_>) -> Result<Attached, Failure> {
+        let mut handle = stack.attach(pending)?;
+        let reports = handle
+            .take_reports()
+            .expect("a new attachment's reports are not yet taken");
+        let printer = std::thread::Builder::new()
+            .name("agent-tools-reports".to_string())
+            .spawn(move || {
+                // The reports end once the stack has stopped and each one
+                // queued has been read.
+                while let Ok(report) = reports.recv() {
+                    if report.is_refusal() {
+                        eprintln!("agent-tools: the network stack {report}");
+                    }
+                }
+                reports.dropped()
+            })
+            .map_err(|err| Failure::Own(format!("cannot start the reports' thread: {err}")))?;
+        Ok(Attached { handle, printer })
+    }
+
+    /// Stops the stack once the command has exited, and waits for the last of
+    /// its refusals to be printed.
+    fn stop(self) {
+        if let Err(error) = self.handle.stop() {
+            eprintln!(
+                "agent-tools: the network stack did not stop cleanly: {}",
+                ErrorChain::new(&error)
+            );
+        }
+        match self.printer.join() {
+            Ok(0) | Err(_) => {}
+            Ok(dropped) => {
+                let plural = if dropped == 1 { "" } else { "s" };
+                eprintln!(
+                    "agent-tools: the network stack dropped {dropped} report{plural} its queue \
+                     had no room for"
+                );
+            }
+        }
     }
 }
 
@@ -631,9 +816,9 @@ fn serve_until_exit(
 /// Answers one connection of the command's with a line naming its request.
 ///
 /// This stands in for the service a runtime offers its tool commands, such as
-/// a proxy that admits the registries a build needs. What the service carries,
-/// and where, is the runtime's policy, and the sandbox's network reaches
-/// nothing else.
+/// a proxy that adds the runtime's credentials to the requests it carries,
+/// which the network stack does not. What the service carries, and where, is
+/// the runtime's policy.
 fn answer(mut connection: TcpStream) {
     let _ = connection.set_read_timeout(Some(REQUEST_TIMEOUT));
     let mut head = Vec::new();
@@ -735,6 +920,25 @@ mod tests {
         assert_eq!(config.worktree.as_deref(), Some(Path::new("/w")));
         assert_eq!(config.command, ["git", "status"]);
         assert_eq!(config.port, DEFAULT_PORT);
+        assert!(!config.registries);
+
+        let config = parse_run(&[
+            "--registries",
+            "--allow",
+            "github.com:443",
+            "--allow=192.0.2.0/24",
+            "--",
+            "cargo",
+            "fetch",
+        ]);
+        assert!(config.registries);
+        assert_eq!(
+            config.allow,
+            [
+                "github.com:443".parse::<DestinationRule>().unwrap(),
+                "192.0.2.0/24".parse().unwrap(),
+            ]
+        );
 
         let config = parse_run(&[
             "--empty-root",
@@ -779,6 +983,11 @@ mod tests {
             &["--port", "0", "true"],
             &["--timeout", "soon", "true"],
             &["--no-such-flag", "true"],
+            // A rule needs the stack that holds it, and a rule must parse.
+            &["--allow", "github.com:443", "true"],
+            &["--registries", "--allow", "github.com:0", "true"],
+            // The empty root's /etc keeps the stack's nameserver unnamed.
+            &["--registries", "--empty-root", "true"],
         ] {
             assert!(
                 parse(line.iter().map(OsString::from)).is_err(),
@@ -813,6 +1022,7 @@ mod tests {
                     &tree,
                     cgroup,
                     host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
+                    None,
                 )
                 .command("git")
                 .arg("status")
@@ -824,6 +1034,29 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_registries_build_a_stack_the_sandbox_resolves_through() {
+        let extra: DestinationRule = "github.com:443".parse().unwrap();
+        let builder = registries(std::slice::from_ref(&extra));
+        assert_eq!(builder.get_allow().len(), REGISTRIES.len() + 1);
+        assert_eq!(builder.get_allow().last(), Some(&extra));
+        let stack = builder.build().expect("the registries build a stack");
+
+        let tree = worktree("registries");
+        let config = parse_run(&["--registries", "cargo", "fetch"]);
+        let built = posture(
+            &config,
+            &tree,
+            None,
+            host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
+            Some(&stack),
+        );
+        assert_eq!(built.get_nameservers(), stack.nameservers());
+        if let Err(error) = built.command("cargo").arg("fetch").build() {
+            panic!("{}", ErrorChain::new(&error));
         }
     }
 
@@ -847,17 +1080,35 @@ mod tests {
     /// `fcage` reads the profile beside this file, and the guide's command line
     /// adds the working tree. Composed the way `fcage` composes them, the two
     /// give the sandbox the example builds, with a cgroup parent and without
-    /// one.
+    /// one, and with `--netstack` the stack `--registries` attaches.
     #[cfg(feature = "serde")]
     #[test]
     fn the_profile_describes_the_example_s_sandbox() {
         const PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-tools.toml");
         let text = std::fs::read_to_string(PROFILE).expect("the profile is readable");
-        let profile: CageBuilder = toml::from_str(&text).expect("the profile parses");
+        // `fcage` takes the [netstack] table apart, as the stack's own format,
+        // and reads the rest as the sandbox's.
+        let mut table: toml::Table = text.parse().expect("the profile parses");
+        let stack: NetStackBuilder = table
+            .remove("netstack")
+            .expect("the profile configures a stack")
+            .try_into()
+            .expect("the stack's table parses");
+        let profile: CageBuilder = table.try_into().expect("the sandbox's keys parse");
+
+        // The table is the stack `--registries` attaches, setting for setting.
+        let serialized = |builder: &NetStackBuilder| {
+            toml::to_string(builder).expect("a stack's settings serialize")
+        };
+        assert_eq!(serialized(&stack), serialized(&registries(&[])));
+        let stack = stack.build().expect("the profile's stack builds");
 
         let tree = worktree("profile");
         let parent = Path::new("/sys/fs/cgroup/agent");
-        for cgroup in [None, Some(parent)] {
+        for (cgroup, attached) in [None, Some(parent)]
+            .into_iter()
+            .flat_map(|cgroup| [(cgroup, None), (cgroup, Some(&stack))])
+        {
             // The flags the guide gives: --bind, --chdir, --hide and
             // --read-only, each extending the profile's lists or replacing its
             // value, and --cgroup-parent where a delegated cgroup is available.
@@ -873,11 +1124,18 @@ mod tests {
                 Some(parent) => from_profile.cgroup_parent(parent),
                 None => from_profile,
             };
+            // `fcage --netstack` names the stack's nameserver, as
+            // `--registries` does.
+            let from_profile = match attached {
+                Some(stack) => from_profile.nameservers(stack.nameservers()),
+                None => from_profile,
+            };
             let example = posture(
                 &parse_run(&["git"]),
                 &tree,
                 cgroup,
                 host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
+                attached,
             )
             .command("git");
             // Two settings the resolved inputs do not record.
@@ -897,7 +1155,8 @@ mod tests {
             assert_eq!(
                 from_profile.resolved_inputs(),
                 example.resolved_inputs(),
-                "cgroup {cgroup:?}"
+                "cgroup {cgroup:?}, stack attached {}",
+                attached.is_some()
             );
         }
     }

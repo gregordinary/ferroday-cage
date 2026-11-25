@@ -499,6 +499,30 @@ reaches:
   questions reach that zone's own servers. Questions for every name the rules
   refuse stay in the stack.
 
+#### What the rules leave to the caller
+
+The rules bound the flows the guest sends through the stack. A sandbox can have
+other ways out, which the stack never sees:
+
+- A socket in a directory bound into the sandbox, such as a service's unix
+  socket. [`landlock_resolve_unix`](hardening.md#landlock-and-unix-sockets)
+  refuses connections to the pathname sockets in view.
+- The host's `/run`, which holds the sockets of its resolver and its message
+  buses. [The host's own root](how-the-sandbox-is-built.md#the-hosts-own-root)
+  hides it, and a `reveal` of it brings them back.
+- A [listener on the sandbox's loopback](#a-listener-on-the-sandboxs-loopback),
+  the gateway's loopback mapping, and a published port. Each is a grant of the
+  caller's own.
+
+The stack decides by address, by name, and by the server a flow's first bytes
+ask for. It does not open TLS, so it holds no rule on a path, a method or a
+header, and adds no credentials to a request. Those need the caller's keys and
+certificate trust. A caller that needs them runs a proxy of its own. It gives
+the sandbox that proxy through a listener on its loopback, or admits it with an
+address rule.
+[Confining an agent's tool commands](agent-tools.md) shows a listener beside a
+stack bounded to package registries.
+
 ### Reports
 
 The stack reports each decision it takes about a flow of the guest's. A flow is
@@ -574,6 +598,10 @@ every queued report has been read, so a thread reading them ends after `stop`.
 The stack's own grants are not reported: the connections a published port
 accepts, and a connection or datagram to the nameserver. Its questions have
 reports of their own.
+
+A stack with no rules reports every flow it carries, with the name its
+nameserver resolved for the destination. Its reports are therefore the list an
+allowlist starts from.
 
 ### What answers, and what checks reachability
 

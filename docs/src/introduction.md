@@ -53,9 +53,10 @@ The isolated network is loopback-only by default. A caller gives it network
 access by attaching a userspace network stack at a seam, while the sandbox keeps
 its private namespace and the host network policy stays outside it. The library
 ships its own native stack, self-contained and unprivileged. It carries outbound
-IPv4 and IPv6, and inbound connections to the ports a caller publishes. The seam
-also accepts an external stack such as `pasta` or `slirp4netns`. See
-[Userspace networking](userspace-networking.md).
+IPv4 and IPv6, within destination rules by address or by name, and inbound
+connections to the ports a caller publishes. The seam also accepts an external
+stack such as `pasta` or `slirp4netns`. See [Userspace
+networking](userspace-networking.md).
 
 The root filesystem is the caller's to supply, and the library can also produce
 one — provisioning from a tarball, or bootstrapping [a Debian](debian.md), [an
