@@ -446,7 +446,8 @@ guest sent:
 
 - **TLS**: the server name of the ClientHello, read across as many records as it
   spans. First bytes are TLS where they begin a handshake record of a version a
-  server reads as TLS's, as Go's reads any below `0x1000`.
+  server reads as TLS's, as Go's reads any below `0x1000`. Only the flow's
+  first ClientHello is read.
 - **HTTP/1**: the `Host` header, and the host of an absolute or a `CONNECT`
   target.
 - **Anything else** is carried as it stands. Its address was admitted when the
@@ -492,6 +493,11 @@ stack would:
 
 - A ClientHello naming two servers, or one whose first record carries a
   version other than TLS's, which no client writes and Go's server still reads.
+- A ClientHello carrying Encrypted Client Hello, or Encrypted SNI before it. A
+  server holding the key serves the name encrypted inside, which the stack
+  cannot read. A browser without a key commonly sends a GREASE extension in its
+  place, made to look like a real one, and that is refused the same way, so a
+  browser's TLS is refused on a flow the stack reads.
 - A request line opened by whitespace, spaced by anything but spaces and tabs,
   or holding a control byte.
 - A header folded onto a further line, or a carriage return that ends no line.
@@ -508,8 +514,10 @@ reaches:
   or cloud host is weaker than it reads.
 - Only the first request of a plain HTTP connection is read. A later one on the
   same connection can name another host.
-- A client using Encrypted Client Hello with keys it learned elsewhere names its
-  provider's public server, which is refused unless a rule admits it.
+- Only the first ClientHello of a TLS connection is read. A server that answers
+  it with a HelloRetryRequest receives a second, which is carried unread. TLS
+  1.3 has the client repeat its server name there, and a hostile client need
+  not.
 - The name a flow is held to is the one the guest asked for. The aliases its
   answer passes through are not held to the rules.
 - A guest can spell data into names below an admitted wildcard, and those

@@ -10,7 +10,9 @@
 //! - **TLS**: a handshake record, `0x16` and then a major version below
 //!   `0x10`, as a lenient server reads one. Handshake records of major version
 //!   3 are read until the ClientHello they carry is whole, and its server name
-//!   extension is taken.
+//!   extension is taken. Only the stream's first ClientHello is read: the
+//!   second a client sends after a server's HelloRetryRequest is carried
+//!   unread.
 //! - **HTTP/1**: a request line whose last word is an HTTP version, or a line
 //!   of two words whose target is absolute, as HTTP/0.9 writes one. The head is
 //!   read to the empty line that ends it, and the host of the target, where it
@@ -22,10 +24,11 @@
 //! The bytes come from the guest and are read in the caller's process, within
 //! the stream's first [`MAX_HEAD`] bytes. Where a lenient reader could take a
 //! different server from the bytes than the server does, this one refuses them
-//! instead: a ClientHello naming more than one server, a record of another kind
-//! inside one or of a version no client writes, a request line opened by whitespace, spaced by anything but
-//! spaces and tabs, or holding a control byte, a carriage return that ends no
-//! line, a header folded onto a further line, two `Host` headers, a target with
+//! instead: a ClientHello naming more than one server or carrying Encrypted
+//! Client Hello, a record of another kind inside one or of a version no client
+//! writes, a request line opened by whitespace, spaced by anything but spaces
+//! and tabs, or holding a control byte, a carriage return that ends no line, a
+//! header folded onto a further line, two `Host` headers, a target with
 //! user information in it, and a host written as anything but a host name or
 //! an address. The stack answers those as it answers a server the rules
 //! refuse.
@@ -70,6 +73,20 @@ const HANDSHAKE_HEADER: usize = 4;
 /// section 3).
 const EXTENSION_SERVER_NAME: u16 = 0;
 const HOST_NAME: u8 = 0;
+
+/// Whether an extension of type `kind` carries the ClientHello a server is to
+/// read in encrypted form: Encrypted Client Hello's `0xfe0d` (RFC 9849), the
+/// codepoints its drafts used, `0xfe08` to `0xfe0c` and `0xff02`, and
+/// `0xffce`, which Encrypted SNI, its predecessor, used.
+///
+/// A server that holds the key serves the name inside, which the stack cannot
+/// read, so the server name extension beside it says nothing of the site a
+/// flow reaches. A client without a key commonly sends a GREASE extension of
+/// the same type, random bytes of a real one's shape, which cannot be told
+/// from a real one either.
+fn encrypts_client_hello(kind: u16) -> bool {
+    matches!(kind, 0xfe08..=0xfe0d | 0xff02 | 0xffce)
+}
 
 /// The alerts the stack answers refused first bytes with (RFC 8446, section
 /// 6): fatal, and why.
@@ -310,7 +327,9 @@ fn read_tls(bytes: &[u8]) -> Reading {
 /// The body must read to its end. Its server name extension must hold exactly
 /// one name, a host name, as RFC 6066 has a client send. A list of several, or
 /// of a kind other than a host name, is refused: servers differ on which of
-/// several they take, and on whether they pass over a kind they do not know.
+/// several they take, and on whether they pass over a kind they do not know. A
+/// ClientHello that [encrypts](encrypts_client_hello) the one its server reads
+/// is refused, real or GREASE.
 fn server_name(body: &[u8]) -> Result<Option<Host>, &'static str> {
     const MALFORMED: &str = "its ClientHello does not read to its end";
     const NOT_ONE: &str = "its server name extension does not hold exactly one host name";
@@ -336,6 +355,9 @@ fn server_name(body: &[u8]) -> Result<Option<Host>, &'static str> {
     while !extensions.is_empty() {
         let kind = extensions.u16().ok_or(MALFORMED)?;
         let data = extensions.vector16().ok_or(MALFORMED)?;
+        if encrypts_client_hello(kind) {
+            return Err("its ClientHello carries an Encrypted Client Hello extension");
+        }
         if kind != EXTENSION_SERVER_NAME {
             continue;
         }
@@ -1067,6 +1089,42 @@ mod tests {
             assert_eq!(
                 read(&hello(&body)),
                 unreadable(Protocol::Tls, "its ClientHello does not read to its end")
+            );
+        }
+    }
+
+    #[test]
+    fn a_hello_carrying_encrypted_client_hello_is_refused() {
+        // An outer ClientHello naming an admitted server, beside an Encrypted
+        // Client Hello extension: its type, a cipher suite, a config id, an
+        // encapsulated key and a payload, which is all a GREASE one holds too.
+        let named = (0, server_names(&[(HOST_NAME, b"example.com")]));
+        let mut ech = vec![0, 0, 1, 0, 1, 0x2a, 0, 32];
+        ech.extend_from_slice(&[0x11; 32]);
+        ech.extend_from_slice(&[0, 64]);
+        ech.extend_from_slice(&[0x22; 64]);
+        let refused = unreadable(
+            Protocol::Tls,
+            "its ClientHello carries an Encrypted Client Hello extension",
+        );
+        for kind in [0xfe0d, 0xfe08, 0xfe0b, 0xff02, 0xffce] {
+            for extensions in [
+                vec![named.clone(), (kind, ech.clone())],
+                vec![(kind, ech.clone()), named.clone()],
+                vec![(kind, Vec::new())],
+            ] {
+                let bytes = hello(&hello_body(Some(&extensions)));
+                assert_eq!(read(&bytes), refused, "{kind:#06x}");
+                settles_once(&bytes);
+            }
+        }
+        // The types around them are read past as any other extension is.
+        for kind in [0xfe07, 0xfe0e, 0xff01, 0xffcd] {
+            let extensions = [named.clone(), (kind, ech.clone())];
+            assert_eq!(
+                read(&hello(&hello_body(Some(&extensions)))),
+                asks(Protocol::Tls, &["example.com"]),
+                "{kind:#06x}"
             );
         }
     }

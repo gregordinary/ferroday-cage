@@ -492,7 +492,8 @@ pub enum FlowRefusal {
     /// A TCP flow's first bytes began a TLS ClientHello or an HTTP request the
     /// stack does not read a server from: one that names several, one not
     /// whole within the stream's first 16 KiB, or one a server could read
-    /// another server from than the stack would.
+    /// another server from than the stack would, a ClientHello carrying
+    /// Encrypted Client Hello among them.
     #[non_exhaustive]
     ServerNameUnreadable {
         /// What the stack does not read, as a clause.

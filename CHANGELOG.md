@@ -87,6 +87,13 @@ consumer upgrading can skip it.
   record of any version below `0x1000` as TLS and serves the name its
   ClientHello carries, so a guest could reach a site the name rules refuse
   through a Go front end at an admitted address.
+- The network stack refuses, as a server name it cannot read, a ClientHello
+  carrying Encrypted Client Hello, under any of the codepoints its drafts and
+  Encrypted SNI used. It read the outer ClientHello's server name, which a
+  client sets as it likes, while a server holding the key serves the name
+  encrypted inside, so a guest could reach a site the name rules refuse at an
+  admitted address. A browser's GREASE extension cannot be told from a real
+  one, and is refused the same way.
 - A provisioning run that names no cache directory makes the directory it
   downloads into afresh, readable by the calling user alone, in place of
   whatever held its name. It created it with `create_dir_all`, which took a

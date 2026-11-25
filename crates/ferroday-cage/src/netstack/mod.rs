@@ -979,10 +979,13 @@ impl NetStackBuilder {
     /// this way, since the address is the grant. A refusal there is answered in
     /// the flow's own protocol, a TLS alert or an HTTP `403`, before the flow
     /// is closed. First bytes that are neither TLS nor HTTP are carried as they
-    /// stand, and so is a ClientHello or a request naming no server. Inside TLS
-    /// the stack sees nothing after the ClientHello, the HTTP host included, so
-    /// a client that names an admitted server and asks it for another site
-    /// reaches that site wherever the content network routes such a request.
+    /// stand, and so is a ClientHello or a request naming no server. A
+    /// ClientHello carrying Encrypted Client Hello is refused, a browser's
+    /// GREASE one included, since its server reads a name the stack cannot.
+    /// Inside TLS the stack sees nothing after the first ClientHello, a second
+    /// after a HelloRetryRequest and the HTTP host included, so a client that
+    /// names an admitted server and asks it for another site reaches that site
+    /// wherever the content network routes such a request.
     ///
     /// The rules decide the destinations the stack would otherwise carry.
     /// Those it refuses under any configuration, loopback and link-local among
