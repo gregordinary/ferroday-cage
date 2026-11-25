@@ -380,12 +380,16 @@ the environment, so four decisions belong to the program driving the session:
   thread the run may start, because a thread inherits the mask of the thread
   that created it.
 
-  The library starts threads in two places. Attaching the [native network
+  The library starts threads in four places. Attaching the [native network
   stack](userspace-networking.md) starts its pump, which runs for as long as
   the stack is attached. A program composing a relay with a stack therefore
-  installs the signals before it attaches one. `HttpFetch::fetch_all` runs a
-  provisioner's batch downloads on scoped workers and joins each before it
-  returns. Those matter only to a program that provisions while it relays a
+  installs the signals before it attaches one. A launch whose seccomp
+  refusals are reported starts a thread that answers them for as long as its
+  command runs, so it too comes after the signals are installed. A held
+  `Interrupt` reads `SIGINT` on a thread of its own, and is held before the
+  signals are installed or after the relay is done. `HttpFetch::fetch_all`
+  runs a provisioner's batch downloads on scoped workers and joins each before
+  it returns. Those matter only to a program that provisions while it relays a
   session.
 
   The relay restores no mask, deliberately: a relay that unblocked on the way

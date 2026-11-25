@@ -1,10 +1,12 @@
 # Embedding in a runtime
 
 The library is synchronous: a launch blocks the thread that made it, and
-captured output is pumped inside that blocking call, on that thread. Launching
-and waiting start no thread. The library starts threads in two places, both
-outside that path. An attached [native network stack](userspace-networking.md)
-runs its pump on a thread of its own for as long as it is attached.
+captured output is pumped inside that blocking call, on that thread. Waiting
+starts no thread. The library starts threads in four places, each outside that
+path. An attached [native network stack](userspace-networking.md) runs its
+pump on a thread of its own for as long as it is attached. A launch whose
+seccomp refusals are reported starts a thread that answers them for as long as
+its command runs. A held `Interrupt` reads `SIGINT` on a thread of its own.
 `HttpFetch::fetch_all`, which a provisioner's downloads reach, runs a batch on
 scoped workers and joins every one before it returns. A service that wants to
 launch sandboxes from a thread pool or an async runtime therefore launches from

@@ -162,9 +162,9 @@ the trait.
 Delivery is synchronous and starts no thread. Captured output is pumped inside
 the calls that serve the handle — `run_with` itself, or the handle's `wait`,
 `wait_deadline`, and `wait_timeout`, and the non-blocking `try_wait` — with a
-single `poll` over the capture pipes, on the calling thread. The library starts threads only for a network
-stack's pump and a batch download's workers, which [Embedding in a
-runtime](embedding.md) describes. Delivery has three practical consequences:
+single `poll` over the capture pipes, on the calling thread. The threads the
+library does start are outside delivery, and [Embedding in a
+runtime](embedding.md) lists them. Delivery has three practical consequences:
 
 - The observer runs on the caller's thread, so it can borrow freely from
   the caller's state; no synchronization is imposed.

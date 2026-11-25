@@ -71,16 +71,21 @@ pub(super) const RELAYED: [Signal; 8] = [
 /// blocking first is what keeps a process-directed `SIGINT` from being delivered
 /// to some other thread and killing the process behind the relay's back.
 ///
-/// The library starts threads in three places, and each inherits the mask of the
+/// The library starts threads in four places, and each inherits the mask of the
 /// thread that calls into it. A held [`Interrupt`] watches for `SIGINT` from a
 /// thread of its own until it drops, which a program holds before it installs
 /// this or after its relay is done. `NetStack::attach`, with the `netstack` feature,
 /// starts the native network stack's pump, which runs for as long as the stack
 /// is attached; a program composing a relay with a stack installs this before
-/// it attaches one. `HttpFetch::fetch_all`, which a provisioner's downloads
-/// reach, runs a batch on scoped workers and joins every one before it returns.
-/// Those cannot outlive the call, so the order matters for them only where a
-/// provisioner runs while a session is being relayed.
+/// it attaches one. A launch whose seccomp refusals are reported
+/// (`seccomp_reports`, with the `hardening` feature) starts the thread that
+/// answers them before it forks. That thread runs for as long as the command
+/// does, and below Linux 5.8 for the rest of the process's life; a program
+/// composing a relay with reported refusals installs this before it launches.
+/// `HttpFetch::fetch_all`, which a provisioner's downloads reach, runs a batch
+/// on scoped workers and joins every one before it returns. Those cannot
+/// outlive the call, so the order matters for them only where a provisioner
+/// runs while a session is being relayed.
 ///
 /// The blocked set stays blocked for the process's life. That is deliberate: a
 /// relay that restored the mask on the way out would leave a window in which the

@@ -762,6 +762,10 @@ consumer upgrading can skip it.
   namespace, and the namespace descriptors it opens to do so, are held above
   the standard streams' numbers. With one of them closed in the caller, the
   listener took it, as every other descriptor a launch holds does not.
+- `relay::Signals`, and the embedding, terminal and streaming chapters, name
+  every thread the library starts: the thread that answers a launch's reported
+  seccomp refusals and an `Interrupt`'s were missing, and the embedding chapter
+  said a launch starts none.
 
 ### Internal
 
