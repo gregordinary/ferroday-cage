@@ -44,7 +44,7 @@
 //! the documented set and nothing else.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io;
 
 use ferrata::dependency::Dependency;
 
@@ -52,7 +52,7 @@ use super::DIALECT;
 use super::apk::ScriptKind;
 use super::pkginfo::PkgInfo;
 use super::sign;
-use crate::provision::tar;
+use ferrotape::{Header, Timestamp, Writer};
 
 /// The uid, gid and mode a directory has when its record states none.
 const DEFAULT_DIR_ACL: OwnerMode = OwnerMode {
@@ -803,41 +803,26 @@ impl Database {
         let mut order: Vec<&Record> = self.records.iter().collect();
         order.sort_by(|a, b| a.name.cmp(&b.name));
         let mut out = Vec::new();
+        let mut archive = Writer::new(&mut out);
         for record in order {
             for (kind, body) in &record.scripts {
                 let name = script_name(record, *kind);
-                let mtime = record.build_time.unwrap_or(0) as i64;
-                if name.len() > tar::MAX_USTAR_NAME {
-                    let records = tar::pax_record(b"path", name.as_bytes());
-                    out.write_all(&tar::pax_header_block(
-                        name.as_bytes(),
-                        mtime,
-                        records.len(),
-                    )?)?;
-                    out.write_all(&records)?;
-                    tar::pad(&mut out, records.len() as u64)?;
-                }
-                out.write_all(&tar::ustar_block(
-                    name.as_bytes(),
-                    &[],
-                    0o755,
-                    0,
-                    0,
-                    body.len() as u64,
-                    mtime,
-                    b'0',
-                    &[],
-                )?)?;
-                out.write_all(body)?;
-                tar::pad(&mut out, body.len() as u64)?;
+                let mut header = Header::file(name, body.len() as u64);
+                header
+                    .set_mode(0o755)
+                    .set_mtime(Timestamp::from_secs(record.build_time.unwrap_or(0) as i64));
+                archive
+                    .append(&header, body.as_slice())
+                    .map_err(io::Error::from)?;
             }
         }
         if self.carried.scripts.is_empty() {
-            // The terminator, which `apk`'s reader stops at. A carried archive
+            // The end marker, which `apk`'s reader stops at. A carried archive
             // brings its own.
-            out.write_all(&[0u8; 2 * tar::BLOCK as usize])?;
+            archive.finish().map_err(io::Error::from)?;
         } else {
-            out.write_all(&self.carried.scripts)?;
+            drop(archive);
+            out.extend_from_slice(&self.carried.scripts);
         }
         Ok(out)
     }
@@ -1209,7 +1194,8 @@ mod tests {
             .expect("the archive parses")
             .expect("the script is there");
         let name = format!("{long}-1.0.0-r0.X1{}.post-install", "0".repeat(40));
-        assert!(name.len() > crate::provision::tar::MAX_USTAR_NAME);
+        // Past the 100 bytes a ustar header's name field holds.
+        assert!(name.len() > 100);
         assert_eq!(entry.path, name.as_bytes());
         let mut body = vec![0; 16];
         let read = reader.read_data(&mut body).expect("the body reads");

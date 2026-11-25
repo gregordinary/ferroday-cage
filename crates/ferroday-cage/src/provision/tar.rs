@@ -8,13 +8,6 @@
 //! ever sees concrete file entries with their effective path, link target,
 //! size, and times. Header checksums are verified.
 //!
-//! The writing side is here too: [`ustar_block`], one header block and its
-//! checksum; [`pad`], the padding that follows an entry's data; and
-//! [`pax_record`], one record of a pax extended header. They are the whole of
-//! what a writer shares with a reader, and keeping the two in one module is
-//! what stops the field offsets and the record framing being written down
-//! twice.
-//!
 //! v7 is a subset rather than a separate format: the first 257 bytes of a
 //! header are laid out identically, and what v7 lacks is everything after them
 //! — the magic, the version, `uname`/`gname`, the device numbers, and the
@@ -25,7 +18,7 @@
 //! software, on whatever machine, in whatever year.
 
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -1151,11 +1144,6 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
     Ok(records)
 }
 
-// The writing side of the same format, which the Alpine database's scripts
-// archive is written with. The reader above and these share the block size,
-// the field offsets, and the octal encoding, so they are one module: two files
-// describing one header layout drift.
-
 /// The prefix of the pax keyword that records an extended attribute, the name
 /// following it.
 pub(crate) const XATTR_KEYWORD: &[u8] = b"SCHILY.xattr.";
@@ -1187,153 +1175,6 @@ fn xattr_name(spelled: &[u8]) -> Vec<u8> {
     name
 }
 
-/// The length of the ustar `name` field. A longer path is split into `prefix`
-/// and `name` at a separator, or carried in a pax `path` record when it does not
-/// split; a name with no separator in it fits or it does not.
-pub(crate) const MAX_USTAR_NAME: usize = 100;
-/// The length of the ustar `prefix` field, the other half of that split.
-pub(crate) const MAX_USTAR_PREFIX: usize = 155;
-/// The modification-time range the ustar octal `mtime` field holds: zero
-/// through `8^11 - 1` seconds since the epoch, about the year 2242. A time
-/// outside it — a pre-1970 negative time, or one further out than 2242 — is
-/// carried in a pax `mtime` record instead, the ustar field holding a clamped
-/// placeholder the reader ignores, the way an oversized path or file does.
-pub(crate) const MAX_USTAR_MTIME: i64 = (1 << 33) - 1;
-
-/// A pax extended-header record, `<length> <key>=<value>` and a newline, whose
-/// length counts the whole record, its own digits included.
-///
-/// The framing [`parse_pax`] reads, written once for every writer: an export's
-/// records, and every test that builds a record by hand.
-pub(crate) fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
-    // Everything but the leading length digits: a space, the key, `=`, the
-    // value, and a newline.
-    let content = 1 + key.len() + 1 + value.len() + 1;
-    let mut length = content + 1;
-    loop {
-        let total = length.to_string().len() + content;
-        if total == length {
-            break;
-        }
-        length = total;
-    }
-    let mut out = Vec::with_capacity(length);
-    out.extend_from_slice(length.to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(key);
-    out.push(b'=');
-    out.extend_from_slice(value);
-    out.push(b'\n');
-    out
-}
-
-/// The header of a pax extended-header entry (typeflag `x`) carrying `size`
-/// bytes of [records](pax_record) for the entry at `path`, which follows it.
-///
-/// The header's own name is cosmetic, since a reader keys on the typeflag, and
-/// a path-derived one keeps `tar tvf` legible.
-pub(crate) fn pax_header_block(
-    path: &[u8],
-    mtime: i64,
-    size: usize,
-) -> io::Result<[u8; BLOCK as usize]> {
-    let mut name = b"PaxHeaders/".to_vec();
-    name.extend_from_slice(path);
-    let name = &name[..name.len().min(MAX_USTAR_NAME)];
-    ustar_block(name, &[], 0o644, 0, 0, size as u64, mtime, b'x', &[])
-}
-
-/// Writes the zero padding after `size` bytes of data, up to the next block.
-pub(crate) fn pad(out: &mut impl Write, size: u64) -> io::Result<()> {
-    let rem = (size % BLOCK) as usize;
-    if rem != 0 {
-        out.write_all(&[0u8; BLOCK as usize][..BLOCK as usize - rem])?;
-    }
-    Ok(())
-}
-
-/// Assembles a 512-byte ustar header block with its checksum.
-///
-/// The parameters are the header's own fields, in the header's own order, so
-/// they are a record rather than a bundle threaded down through call levels:
-/// gathering them into a struct would put a copy of the ustar header beside the
-/// ustar header. The suppression stays for that reason.
-#[expect(clippy::too_many_arguments)]
-pub(crate) fn ustar_block(
-    name: &[u8],
-    prefix: &[u8],
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    mtime: i64,
-    typeflag: u8,
-    linkname: &[u8],
-) -> io::Result<[u8; BLOCK as usize]> {
-    let mut block = [0u8; BLOCK as usize];
-    let name = &name[..name.len().min(MAX_USTAR_NAME)];
-    block[0..name.len()].copy_from_slice(name);
-    octal(&mut block[100..108], u64::from(mode & 0o7777))?;
-    octal(&mut block[108..116], u64::from(uid))?;
-    octal(&mut block[116..124], u64::from(gid))?;
-    octal(&mut block[124..136], size)?;
-    // Clamp into the field's range: a time outside it is carried in a pax
-    // `mtime` record, so this placeholder is what the reader ignores. Clamping
-    // (rather than failing) keeps one out-of-range stamp from aborting the
-    // export.
-    octal(&mut block[136..148], mtime.clamp(0, MAX_USTAR_MTIME) as u64)?;
-    block[156] = typeflag;
-    let linkname = &linkname[..linkname.len().min(MAX_USTAR_NAME)];
-    block[157..157 + linkname.len()].copy_from_slice(linkname);
-    block[257..263].copy_from_slice(b"ustar\0");
-    block[263..265].copy_from_slice(b"00");
-    octal(&mut block[329..337], 0)?;
-    octal(&mut block[337..345], 0)?;
-    let prefix = &prefix[..prefix.len().min(MAX_USTAR_PREFIX)];
-    block[345..345 + prefix.len()].copy_from_slice(prefix);
-
-    // The checksum: the sum of every byte with the field read as spaces,
-    // written as six octal digits, a NUL, and a space. The field is six full
-    // octal digits (not the NUL-terminated form `octal` produces), so it is
-    // formatted directly.
-    for byte in &mut block[148..156] {
-        *byte = b' ';
-    }
-    let sum: u32 = block.iter().map(|b| u32::from(*b)).sum();
-    let mut v = sum;
-    for slot in block[148..154].iter_mut().rev() {
-        *slot = b'0' + (v & 0o7) as u8;
-        v >>= 3;
-    }
-    block[154] = 0;
-    block[155] = b' ';
-    Ok(block)
-}
-
-/// Formats `value` right-justified as NUL-terminated octal ASCII into `field`,
-/// erroring when it does not fit.
-fn octal(field: &mut [u8], value: u64) -> io::Result<()> {
-    let digits = field.len() - 1;
-    let max = if digits >= 22 {
-        u64::MAX
-    } else {
-        (1u64 << (3 * digits)) - 1
-    };
-    if value > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a tar header field does not fit an octal value",
-        ));
-    }
-    let mut v = value;
-    for slot in field[..digits].iter_mut().rev() {
-        *slot = b'0' + (v & 0o7) as u8;
-        v >>= 3;
-    }
-    field[digits] = 0;
-    Ok(())
-}
-
 /// Reads `archive` as an extraction reads one, each entry's data whole within
 /// a bound, for a fuzz target: it may not panic, and it ends, since each entry
 /// consumes at least a header's block of the input.
@@ -1350,13 +1191,12 @@ pub(super) fn exercise(archive: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferroday_cage_testkit::tar::pax_record;
 
-    #[test]
-    fn octal_rejects_an_overlong_value() {
-        let mut field = [0u8; 8];
-        // The most seven octal digits hold, and one past it.
-        assert!(octal(&mut field, 0o7777777).is_ok());
-        assert!(octal(&mut field, 0o7777777 + 1).is_err());
+    /// Pads `out` with zeros to the block boundary after `size` bytes of data.
+    fn pad(out: &mut Vec<u8>, size: u64) {
+        let padded = size.next_multiple_of(BLOCK);
+        out.resize(out.len() + (padded - size) as usize, 0);
     }
 
     #[test]
@@ -1439,24 +1279,6 @@ mod tests {
                 text: Some(b"user::rwx".to_vec()),
             }
         );
-    }
-
-    #[test]
-    fn pax_record_length_is_self_counting() {
-        // "SCHILY.xattr.security.capability" = 32-byte value, per the spec's
-        // self-referential length.
-        let record = pax_record(b"path", b"x");
-        // "9 path=x\n" — the 9 counts the whole record, itself included.
-        assert_eq!(record, b"9 path=x\n");
-        // A record whose length crosses a digit boundary still self-counts.
-        let value = "y".repeat(90);
-        let record = pax_record(b"path", value.as_bytes());
-        let space = record.iter().position(|b| *b == b' ').unwrap();
-        let declared: usize = std::str::from_utf8(&record[..space])
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(declared, record.len());
     }
 
     #[test]
@@ -1716,7 +1538,7 @@ mod tests {
     /// A ustar header block for a file of `size` bytes with `typeflag`, with
     /// `name` in the 100-byte name field.
     fn sized_header(name: &[u8], size: u64, typeflag: u8) -> [u8; BLOCK as usize] {
-        let mut block = ustar_header(&name[..name.len().min(MAX_USTAR_NAME)], b"");
+        let mut block = ustar_header(&name[..name.len().min(100)], b"");
         block[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
         block[156] = typeflag;
         checksum(&mut block);
@@ -1736,7 +1558,7 @@ mod tests {
         // A hundred bytes of directory, then the file: the name field holds
         // exactly the directory part, trailing separator and all.
         let long_name = format!("./{}/deep.hpp", "d".repeat(97));
-        assert_eq!(long_name.as_bytes()[MAX_USTAR_NAME - 1], b'/');
+        assert_eq!(long_name.as_bytes()[100 - 1], b'/');
         let body = b"the contents of a file that is not a directory\n";
 
         let mut archive = Vec::new();
@@ -1748,11 +1570,11 @@ mod tests {
         ));
         archive.extend_from_slice(long_name.as_bytes());
         archive.push(0);
-        pad(&mut archive, long_name.len() as u64 + 1).unwrap();
+        pad(&mut archive, long_name.len() as u64 + 1);
         // The file itself, its own name field truncated to the directory part.
         archive.extend_from_slice(&sized_header(long_name.as_bytes(), body.len() as u64, b'0'));
         archive.extend_from_slice(body);
-        pad(&mut archive, body.len() as u64).unwrap();
+        pad(&mut archive, body.len() as u64);
         // A second entry, which is only reachable if the first was skipped by
         // the right number of bytes.
         archive.extend_from_slice(&sized_header(b"after.txt", 0, b'0'));
@@ -1781,7 +1603,7 @@ mod tests {
     fn long_link_entry(typeflag: u8, value: &[u8]) -> Vec<u8> {
         let mut out = sized_header(b"././@LongLink", value.len() as u64, typeflag).to_vec();
         out.extend_from_slice(value);
-        pad(&mut out, value.len() as u64).unwrap();
+        pad(&mut out, value.len() as u64);
         out
     }
 

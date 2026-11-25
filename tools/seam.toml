@@ -462,23 +462,10 @@ cost = "test"
 why = "A scratch directory opened as a root, for the bootstraps' tests."
 
 [[reach]]
-item = "provision::tar::BLOCK"
-code = 1
-cost = "share"
-why = "The tar block size, for the Alpine database's `scripts.tar`."
-
-[[reach]]
 item = "provision::tar::Entry"
 code = 3
 cost = "share"
 why = "A tar member, as the reader `Tarball` uses reads it."
-
-[[reach]]
-item = "provision::tar::MAX_USTAR_NAME"
-code = 1
-tests = 1
-cost = "share"
-why = "The longest name a ustar header holds, past which `scripts.tar` carries a pax `path` record."
 
 [[reach]]
 item = "provision::tar::TarReader"
@@ -507,35 +494,11 @@ cost = "share"
 why = "A reader failure carried through a `Read`, for tar within tar."
 
 [[reach]]
-item = "provision::tar::pad"
-code = 2
-cost = "share"
-why = "The padding after a member's data, and after a pax header's records, for `scripts.tar`."
-
-[[reach]]
-item = "provision::tar::pax_header_block"
-code = 1
-cost = "share"
-why = "The header of a pax record block, for a long `scripts.tar` name."
-
-[[reach]]
-item = "provision::tar::pax_record"
-code = 1
-cost = "share"
-why = "The pax `path` record a long `scripts.tar` name is carried in."
-
-[[reach]]
 item = "provision::tar::read_failure"
 code = 5
 tests = 1
 cost = "share"
 why = "A failed read beneath an archive, reported as the export and `Tarball` report one."
-
-[[reach]]
-item = "provision::tar::ustar_block"
-code = 1
-cost = "share"
-why = "One ustar header, for `scripts.tar`."
 
 [[reach]]
 item = "provision::tarball::Tarball::from_file"

@@ -1089,6 +1089,10 @@ consumer upgrading can skip it.
   `provision::xattr` keeps reading an entry's attributes, the narrowing given
   as a mode, and a capability's restatement. The `acl` fuzz target is retired:
   the readers it drove are the crate's, which fuzzes them.
+- The Alpine database's `scripts.tar` is written through ferrotape's `Writer`,
+  as an export is, so no tar header is encoded by hand in the library.
+  `provision::tar`'s `ustar_block`, `pax_record` and `pax_header_block` are
+  gone.
 
 ## [0.6.0] - 2026-11-13
 

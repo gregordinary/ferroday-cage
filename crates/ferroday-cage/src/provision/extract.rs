@@ -2593,9 +2593,9 @@ mod naming_tests {
 #[cfg(test)]
 mod list_tests {
     use super::{Placement, ProvisionError, TarReader, extract_archive};
-    use crate::provision::tar::pax_record;
     use crate::scratch::Scratch;
     use ferroday_cage_testkit::tar::Tar;
+    use ferroday_cage_testkit::tar::pax_record;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -2667,12 +2667,12 @@ mod list_tests {
         let mut tar = Tar::new();
         pax(
             &mut tar,
-            &pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
+            &pax_record(b"SCHILY.xattr.system.posix_acl_access", masked(0)),
         );
         tar.file("shared", 0o660, b"for root\n");
         pax(
             &mut tar,
-            &pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(4242)),
+            &pax_record(b"SCHILY.xattr.system.posix_acl_access", masked(4242)),
         );
         tar.file("unmapped", 0o4660, b"for someone else\n");
         // A directory's default list waits for the deferred pass, so the file
@@ -2680,8 +2680,8 @@ mod list_tests {
         pax(
             &mut tar,
             &[
-                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked_dir(0)),
-                pax_record(b"SCHILY.xattr.system.posix_acl_default", &masked_dir(0)),
+                pax_record(b"SCHILY.xattr.system.posix_acl_access", masked_dir(0)),
+                pax_record(b"SCHILY.xattr.system.posix_acl_default", masked_dir(0)),
             ]
             .concat(),
         );
@@ -2786,13 +2786,13 @@ mod list_tests {
         tar.dir("etc", 0o755)
             .file("etc/passwd", 0o644, b"admin:x:0:0::/root:/bin/sh\n")
             .file("etc/group", 0o644, b"admin:x:0:\ndomain users:x:0:\n");
-        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("0")));
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", text("0")));
         tar.file("by-id", 0o660, b"x");
-        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("admin")));
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", text("admin")));
         tar.file("by-name", 0o660, b"x");
         pax(
             &mut tar,
-            &pax_record(b"SCHILY.acl.access", &text("stranger")),
+            &pax_record(b"SCHILY.acl.access", text("stranger")),
         );
         tar.file("unanswered", 0o4660, b"x");
         // A name GNU tar writes escaped, as libacl writes it.
@@ -2856,14 +2856,14 @@ mod list_tests {
         tar.dir("etc", 0o755)
             .file("etc/passwd", 0o644, b"admin:x:0:0::/root:/bin/sh\n")
             .file("etc/group", 0o644, b"admin:x:0:\n");
-        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("late")));
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", text("late")));
         tar.file("before", 0o660, b"x");
         tar.file(
             "etc/passwd",
             0o644,
             b"admin:x:0:0::/root:/bin/sh\nlate:x:0:0::/:/bin/sh\n",
         );
-        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("late")));
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", text("late")));
         tar.file("after", 0o660, b"x");
         extract_archive(
             &mut TarReader::in_memory(&tar.finish()[..]),
@@ -2911,7 +2911,7 @@ mod list_tests {
             &[
                 pax_record(b"SCHILY.acl.access", text),
                 pax_record(b"SCHILY.acl.default", b""),
-                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked_dir(0)),
+                pax_record(b"SCHILY.xattr.system.posix_acl_access", masked_dir(0)),
             ]
             .concat(),
         );
@@ -2977,7 +2977,7 @@ mod list_tests {
             pax(
                 &mut tar,
                 &[
-                    pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
+                    pax_record(b"SCHILY.xattr.system.posix_acl_access", masked(0)),
                     pax_record(b"SCHILY.acl.access", text.as_bytes()),
                 ]
                 .concat(),
@@ -3002,7 +3002,7 @@ mod list_tests {
 
     #[test]
     fn a_lists_two_forms_that_do_not_state_one_list_refuse_their_entry() {
-        let value = pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0));
+        let value = pax_record(b"SCHILY.xattr.system.posix_acl_access", masked(0));
         let both = |text: &[u8]| [value.clone(), pax_record(b"SCHILY.acl.access", text)].concat();
         // GNU tar and bsdtar would give user 4242 the access the value gives
         // root.
