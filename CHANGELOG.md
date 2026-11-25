@@ -505,6 +505,10 @@ consumer upgrading can skip it.
   whose access control lists name accounts, and again only when the archive
   changes either file. It read and parsed both files for each such entry, so an
   archive of many of them over sixteen-mebibyte account files took minutes.
+- Creating a chain of missing directories, for an archive entry whose parents
+  the archive does not name, costs a step per directory. Each directory was
+  made after resolving every prefix of the chain from the root again, so a
+  chain as deep as a path allows cost the square of its depth.
 
 ### Internal
 

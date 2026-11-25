@@ -1289,6 +1289,49 @@ mod tests {
         assert_eq!(mode("etc/shadow"), 0o640);
     }
 
+    #[test]
+    fn a_chain_is_made_below_what_resolves_however_deep_a_path_reaches() {
+        let (scratch, tree) = tree("chain");
+        let root = scratch.join("tree");
+        std::fs::create_dir_all(root.join("usr/lib")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        std::fs::write(root.join("usr/file"), b"").unwrap();
+
+        // Below an in-tree link, as the tree resolves it.
+        tree.create_dir_all("lib/a/b/c").unwrap();
+        assert!(root.join("usr/lib/a/b/c").is_dir());
+
+        // As deep as a path can name, each directory at its mode.
+        let deep = vec!["d"; 2000].join("/");
+        tree.create_dir_all(format!("usr/lib/a/{deep}")).unwrap();
+        let reached = root.join("usr/lib/a").join(&deep);
+        assert!(reached.is_dir());
+        assert_eq!(
+            std::fs::symlink_metadata(&reached)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            DIR_MODE
+        );
+
+        // Past what a path can name, nothing is made.
+        let past = vec!["e"; 2100].join("/");
+        let err = tree.create_dir_all(format!("usr/{past}")).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+        );
+        assert!(!root.join("usr/e").exists());
+
+        // A file in the chain is no directory to make one in.
+        let err = tree.create_dir_all("usr/file/x/y").unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+    }
+
     #[cfg(feature = "tarball")]
     #[test]
     fn a_base_directory_its_owner_cannot_write_is_carried_up_and_written_beneath() {

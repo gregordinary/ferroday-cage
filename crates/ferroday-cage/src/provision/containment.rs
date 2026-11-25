@@ -181,10 +181,15 @@ pub(super) struct Made<'a> {
 /// Opens `components` beneath `anchor` as a directory, creating the missing
 /// links of the chain.
 ///
-/// Each prefix is resolved from the anchor rather than descended into, so an
-/// in-tree symbolic link mid-path — a merged-usr alias — keeps working under
-/// either containment flag, and each `mkdirat` is anchored to the descriptor
-/// the resolve before it returned.
+/// The chain that exists is resolved from the anchor rather than descended
+/// into, so an in-tree symbolic link mid-path — a merged-usr alias — keeps
+/// working under either containment flag. Its deepest directory is found by
+/// halving: a prefix resolves only where every shorter one does, so the walk
+/// asks a logarithm's worth of prefixes rather than one per component. Below
+/// it, every directory is one this call makes, and each is made in the one
+/// above through the descriptor that one's creation returned, so a chain the
+/// tree does not hold costs a step per component rather than a resolution per
+/// component of every prefix.
 ///
 /// Every directory this creates is made at [`CREATION_MODE`] and handed to
 /// `made`, which is where the caller states the mode it keeps. Every caller
@@ -199,47 +204,77 @@ pub(super) struct Made<'a> {
 /// said about the link: the `mkdirat` that found the name taken is what shows
 /// it, and the caller reports a path it cannot create a directory at rather
 /// than the detail of why. A link the containment flag refuses fails as the
-/// kernel refused it, `EXDEV` or `ELOOP`, before anything is created.
+/// kernel refused it, `EXDEV` or `ELOOP`, before anything is created. Below
+/// the first directory this makes, a name something else took meanwhile is
+/// taken only where it is a directory, and never through a link.
 pub(super) fn create_dirs<C: AsRef<[u8]>>(
     anchor: BorrowedFd<'_>,
     components: &[C],
     containment: ResolveFlags,
     made: &mut dyn FnMut(Made<'_>) -> Result<(), Errno>,
 ) -> Result<OwnedFd, Errno> {
-    match open_dir(anchor, components, OFlags::PATH, containment) {
+    let full = joined(components)?;
+    match open_dir_path(anchor, &full, OFlags::PATH, containment) {
         Ok(fd) => return Ok(fd),
         Err(Errno::NOENT) => {}
         Err(errno) => return Err(errno),
     }
-    for depth in 1..=components.len() {
-        match open_dir(anchor, &components[..depth], OFlags::PATH, containment) {
-            Ok(_) => continue,
-            Err(Errno::NOENT) => {}
-            Err(errno) => return Err(errno),
+
+    // `resolved` is the deepest prefix known to resolve, the anchor itself at
+    // first, and `missing` the shallowest known not to, with how it failed.
+    let (mut resolved, mut missing, mut failed) = (0, components.len(), Errno::NOENT);
+    let mut above = None;
+    while missing - resolved > 1 {
+        let mid = resolved + (missing - resolved) / 2;
+        match open_dir(anchor, &components[..mid], OFlags::PATH, containment) {
+            Ok(fd) => (resolved, above) = (mid, Some(fd)),
+            Err(errno) => (missing, failed) = (mid, errno),
         }
-        let above = open_dir(anchor, &components[..depth - 1], OFlags::PATH, containment)?;
-        let leaf = joined(&components[depth - 1..depth])?;
-        match make_dir(above.as_fd(), &leaf) {
+    }
+    if failed != Errno::NOENT {
+        return Err(failed);
+    }
+    let above = match above {
+        Some(fd) => fd,
+        None => open_dir(anchor, &components[..resolved], OFlags::PATH, containment)?,
+    };
+
+    let mut path = joined(&components[..resolved])?.into_bytes();
+    if resolved == 0 {
+        path.clear();
+    }
+    let mut parent = above;
+    for (depth, component) in components.iter().enumerate().skip(resolved) {
+        let leaf = joined(std::slice::from_ref(component))?;
+        if depth > 0 {
+            path.push(b'/');
+        }
+        path.extend_from_slice(component.as_ref());
+        parent = match make_dir(parent.as_fd(), &leaf) {
             Ok(dir) => {
-                let path = joined(&components[..depth])?;
                 made(Made {
-                    path: path.as_bytes(),
+                    path: &path,
                     dir: dir.as_fd(),
                     copied: None,
                 })?;
+                dir
             }
-            // Something already holds the name. A directory that arrived since
-            // the resolve above is taken as it stands; anything else did not
-            // resolve to a directory there and still does not.
+            // Something already holds the name. At the first directory this
+            // makes, a directory that arrived since the resolve above is taken
+            // as it stands, and anything else did not resolve to a directory
+            // there and still does not. Below it, the name is in a directory
+            // this call made, and is taken only as a directory itself.
+            Err(Errno::EXIST) if depth == resolved => {
+                open_dir(anchor, &components[..=depth], OFlags::PATH, containment)
+                    .map_err(|_| Errno::NOTDIR)?
+            }
             Err(Errno::EXIST) => {
-                if open_dir(anchor, &components[..depth], OFlags::PATH, containment).is_err() {
-                    return Err(Errno::NOTDIR);
-                }
+                open_child_dir(parent.as_fd(), &leaf, OFlags::PATH).map_err(|_| Errno::NOTDIR)?
             }
             Err(errno) => return Err(errno),
-        }
+        };
     }
-    open_dir(anchor, components, OFlags::PATH, containment)
+    open_dir_path(anchor, &full, OFlags::PATH, containment)
 }
 
 /// Creates the directory `leaf` in `parent` at [`CREATION_MODE`] and opens the
