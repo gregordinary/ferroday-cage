@@ -266,6 +266,10 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- `DestinationRule`'s `FromStr` refuses text whose third or fourth byte falls
+  inside a character that is not ASCII, such as `tcé`, where it panicked. That
+  reached `fcage --netstack-allow` and `--netstack-deny`, and a trusted
+  profile's `[netstack]` table.
 - An `Export` refuses an entry whose POSIX access control list names a user or
   group the identity map does not hold, with `ProvisionError::EntryRefused`. The
   kernel reports such an entry with the id that stands for no one, not the

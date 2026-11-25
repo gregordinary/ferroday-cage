@@ -220,13 +220,19 @@ impl FromStr for DestinationRule {
 }
 
 /// Splits a leading `tcp:` or `udp:`, in any case, from the rest of a rule.
+///
+/// Compared as bytes: a rule is text a caller supplies, and a character that
+/// is not ASCII can straddle where a spelling would end.
 fn split_transport(text: &str) -> (Option<Transport>, &str) {
+    let bytes = text.as_bytes();
     for transport in [Transport::Tcp, Transport::Udp] {
-        let spelling = transport.spelling();
-        if let Some(prefix) = text.get(..spelling.len() + 1)
-            && prefix[..spelling.len()].eq_ignore_ascii_case(spelling)
-            && prefix.ends_with(':')
+        let spelling = transport.spelling().as_bytes();
+        if let Some(prefix) = bytes.get(..spelling.len())
+            && prefix.eq_ignore_ascii_case(spelling)
+            && bytes.get(spelling.len()) == Some(&b':')
         {
+            // The byte before the cut is an ASCII colon, so the cut falls
+            // between two characters.
             return (Some(transport), &text[spelling.len() + 1..]);
         }
     }
@@ -816,6 +822,22 @@ mod tests {
             assert_eq!(parsed.to_string(), written, "{given}");
             assert_eq!(rule(written), parsed, "{given} reads back as itself");
         }
+    }
+
+    #[test]
+    fn a_character_straddling_a_transport_s_spelling_is_read_not_sliced() {
+        // `é` takes two bytes, so a slice at a spelling's length would cut it.
+        for text in [
+            "tcé",
+            "udé",
+            "tcé:example.com",
+            "tcpé",
+            "TCé:443",
+            "tcp:é.example",
+        ] {
+            assert!(text.parse::<DestinationRule>().is_err(), "{text}");
+        }
+        assert_eq!(rule("tCp:example.com").to_string(), "tcp:example.com");
     }
 
     #[test]
