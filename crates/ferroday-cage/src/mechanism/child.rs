@@ -151,6 +151,11 @@ pub(super) struct Context<'a> {
     /// The sandbox end of the terminal channel, when this is a terminal launch:
     /// the primary of the pseudoterminal goes back to the caller over it.
     pub(super) terminal_channel_fd: Option<BorrowedFd<'a>>,
+    /// The sandbox end of the listener channel, where a seccomp filter's
+    /// refusals are reported: the command stage sends the filter's listener
+    /// back over it. Every other process of the launch closes its copy, so the
+    /// caller reads end-of-file where the command stage fails first.
+    pub(super) listener_channel_fd: Option<BorrowedFd<'a>>,
     /// Whether the init makes its process group the foreground of the caller's
     /// terminal, standard input: the caller decided at the launch that it
     /// lends the terminal, as [`Foreground`](super::Foreground) describes.
@@ -327,9 +332,12 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
         }
         sys::Fork::ParentOf(child) => {
             // The terminal channel is for the stage just forked, which allocates
-            // the terminal and sends the primary; this process has nothing to
-            // send over it.
-            if let Some(channel) = context.terminal_channel_fd {
+            // the terminal and sends the primary, and the listener channel for
+            // the command stage below it; this process sends over neither.
+            for channel in [context.terminal_channel_fd, context.listener_channel_fd]
+                .into_iter()
+                .flatten()
+            {
                 // SAFETY: the raw descriptor is this process's own copy of the
                 // channel's sandbox end, closed exactly once here and never used
                 // again in this process.
@@ -640,6 +648,14 @@ fn stage_init(context: &Context<'_>, launch_stage: Option<OwnedFd>) -> ! {
             // process drops its copy before it settles in to supervise, which
             // never returns and so never drops anything.
             drop(replica);
+            // The listener channel is the command's to send over, and the
+            // caller reads end-of-file on it only once this copy is gone too.
+            if let Some(channel) = context.listener_channel_fd {
+                // SAFETY: the raw descriptor is this process's own copy of the
+                // channel's sandbox end, closed exactly once here and never
+                // used again in this process.
+                unsafe { rustix::io::close(channel.as_raw_fd()) };
+            }
             // The descriptors the supervisor sleeps on, the command's pidfd
             // and its children's signals; opened before anything else so a
             // failure is still reportable.
@@ -856,7 +872,9 @@ fn exec_command(
     }
 
     #[cfg(feature = "hardening")]
-    if let Err((step, errno, detail)) = super::harden::apply_post_switch(&context.plan.hardening) {
+    if let Err((step, errno, detail)) =
+        super::harden::apply_post_switch(&context.plan.hardening, context.listener_channel_fd)
+    {
         report(context.report_fd, step, errno, detail);
         sys::exit_group(127)
     }
@@ -2321,6 +2339,7 @@ fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
         context.stdout_fd,
         context.stderr_fd,
         context.terminal_channel_fd,
+        context.listener_channel_fd,
     ]
     .map(|channel| channel.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
     sweep_fds_keeping(&keep)

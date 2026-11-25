@@ -437,11 +437,18 @@ macro_rules! retry_on_intr {
 
 pub(crate) use retry_on_intr;
 
+/// The flags [`send_with_fd`] sends with: `MSG_NOSIGNAL`.
+///
+/// Named so the command stage's check that a seccomp filter lets it hand a
+/// listener over (`seccomp::hands_over`) judges the very call this makes.
+pub(crate) const SEND_WITH_FD_FLAGS: SendFlags = SendFlags::NOSIGNAL;
+
 /// Sends `payload` as one message on a socket, with `fd` attached as
 /// `SCM_RIGHTS`, retrying `EINTR`.
 ///
 /// How a child hands the caller a descriptor it opened: the supervisor's pidfd,
-/// the network stack's tap, the sandbox's pseudoterminal. Each rides on a
+/// the network stack's tap, the sandbox's pseudoterminal, a seccomp filter's
+/// listener. Each rides on a
 /// payload of its own protocol, which is the caller's to decide, and the
 /// message is sent whole or not at all. A seqpacket socket keeps the payload
 /// and its descriptor one unit on the receiving side, which is what every
@@ -464,7 +471,7 @@ pub(crate) fn send_with_fd(
         socket,
         &[std::io::IoSlice::new(payload)],
         &mut ancillary,
-        SendFlags::NOSIGNAL,
+        SEND_WITH_FD_FLAGS,
     ))
     .map(|_| ())
 }

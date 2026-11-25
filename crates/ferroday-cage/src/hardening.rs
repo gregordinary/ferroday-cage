@@ -33,10 +33,14 @@ use rustix::thread::CapabilitySet;
 
 use crate::error::ConfigError;
 use crate::mechanism::seccomp::{
-    AUDIT_ARCH_AARCH64, AUDIT_ARCH_RISCV64, AUDIT_ARCH_X86_64, ENOSYS, X32_SYSCALL_BIT, bpf,
+    self, AUDIT_ARCH_AARCH64, AUDIT_ARCH_RISCV64, AUDIT_ARCH_X86_64, ENOSYS, X32_SYSCALL_BIT, bpf,
 };
-use crate::mechanism::{HardeningPlan, LandlockNetRule, LandlockRule, SockFilter};
+use crate::mechanism::{HardeningPlan, LandlockNetRule, LandlockRule, ReportedFilter, SockFilter};
 use crate::roster::roster_enum;
+
+mod report;
+
+pub use report::SeccompReport;
 
 /// Declares the text side of a letter-set access type: its
 /// [`Display`](fmt::Display), its [`FromStr`], the parse error it produces, and
@@ -1907,6 +1911,8 @@ pub(crate) struct Request {
     /// the root's default.
     resolve_unix: Option<bool>,
     seccomp: Option<SeccompPolicy>,
+    /// Whether the seccomp policy's refusals are reported to the caller.
+    seccomp_reports: bool,
     capabilities: CapabilityPosture,
 }
 
@@ -1945,6 +1951,11 @@ impl Request {
         self.seccomp = Some(policy);
     }
 
+    /// Sets whether the seccomp policy's refusals are reported.
+    pub(crate) fn set_seccomp_reports(&mut self, report: bool) {
+        self.seccomp_reports = report;
+    }
+
     /// Whether the request restricts nothing: no Landlock grant — filesystem
     /// or network — and no seccomp policy that denies a syscall. A seccomp
     /// policy that denies nothing (an empty `denying([])`) does not count, so a
@@ -1981,6 +1992,7 @@ impl Request {
             && self.scope == 0
             && self.resolve_unix.is_none()
             && self.seccomp.is_none()
+            && !self.seccomp_reports
             && matches!(self.capabilities, CapabilityPosture::Keep)
     }
 
@@ -2056,6 +2068,10 @@ impl Request {
             scope: _,
             resolve_unix,
             seccomp: _,
+            // Reports refuse nothing more and open nothing: a call the policy
+            // refuses is refused with the same errno. A consumer's own call
+            // replaces the setting.
+            seccomp_reports: _,
             capabilities,
         } = self;
         // Grants are an allow-list the builder appends to and offers no call
@@ -2160,9 +2176,17 @@ impl Request {
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
 
-        let seccomp = match &self.seccomp {
+        let compiled = match &self.seccomp {
             Some(policy) => Some(compile_seccomp(policy)?),
             None => None,
+        };
+        let (seccomp, reported) = match (compiled, self.seccomp_reports) {
+            (compiled, false) => (compiled, None),
+            (None, true) => return Err(ConfigError::SeccompReportsUnfiltered),
+            (Some(answers), true) => {
+                let (notifying, reported) = reporting(answers)?;
+                (Some(notifying), Some(reported))
+            }
         };
 
         let keep_caps = match &self.capabilities {
@@ -2190,6 +2214,7 @@ impl Request {
             // A sandbox's grants refuse a link on their way, and the
             // restriction's build, whose paths are the host's, lets them follow.
             seccomp,
+            reported,
             keep_caps,
             // Whether the identity switch needs securebits is decided by
             // the builder, which alone knows the run-as identity.
@@ -2234,6 +2259,43 @@ fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigErro
         });
     }
     Ok(program)
+}
+
+/// The filter a policy whose refusals are reported installs, the program
+/// compiled from it with each refusal turned into a notification, and what its
+/// listener answers each one by: the program as compiled, `answers`.
+///
+/// Refuses a program whose refusals no rewrite reaches (one returning a
+/// computed value), and a policy that refuses the `sendmsg` the command stage
+/// hands the listener over with whatever its arguments, which would hold the
+/// stage in a notification nobody could answer. A rule refusing it for some
+/// arguments only passes here, and the command stage makes the same check
+/// against its own call before it installs the filter.
+fn reporting(answers: Vec<SockFilter>) -> Result<(Vec<SockFilter>, ReportedFilter), ConfigError> {
+    let arch = audit_arch(host_target_arch()?);
+    let notifying = seccomp::notifying(&answers).ok_or(ConfigError::SeccompReportsUnrewritable)?;
+    if !hands_over_ever(&notifying, arch) {
+        return Err(ConfigError::SeccompReportsUndelivered);
+    }
+    Ok((
+        notifying,
+        ReportedFilter {
+            answers: answers.into(),
+            arch,
+        },
+    ))
+}
+
+/// Whether `program` lets the command stage hand a listener over on some
+/// channel: whether a `sendmsg` on one of the descriptors the stage could hold
+/// runs under it.
+///
+/// The channel's number is chosen at launch, above the standard streams, so
+/// the build asks of a range of numbers rather than of one; a policy that lets
+/// none of them through is refused here, and one that lets some through is
+/// checked again by the stage for the number it holds.
+fn hands_over_ever(program: &[SockFilter], arch: u32) -> bool {
+    (3..1024).any(|channel| seccomp::hands_over(program, arch, channel))
 }
 
 /// The audit architecture a filter for `arch` gates on.
@@ -2576,6 +2638,7 @@ fn host_target_arch() -> Result<seccompiler::TargetArch, ConfigError> {
 /// [hardening]
 /// drop-caps = true                 # or: keep-caps = ["net-bind-service"]
 /// landlock-scope = ["signal"]      # or: ["signal", "abstract-unix-socket"]
+/// seccomp-reports = true           # report each call the policy refuses
 /// seccomp = "curated"              # or a [hardening.seccomp] deny/allow table
 ///
 /// [[hardening.landlock-fs]]
@@ -2652,6 +2715,9 @@ pub(crate) mod serde_request {
         /// The unix-socket restriction, where the profile sets it.
         #[serde(skip_serializing_if = "Option::is_none")]
         resolve_unix: Option<bool>,
+        /// Whether the seccomp policy's refusals are reported.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        seccomp_reports: bool,
         /// The seccomp policy, when one is configured.
         #[serde(skip_serializing_if = "Option::is_none")]
         seccomp: Option<SeccompProfile>,
@@ -2892,6 +2958,7 @@ pub(crate) mod serde_request {
                 scope,
                 resolve_unix: self.resolve_unix,
                 seccomp,
+                seccomp_reports: self.seccomp_reports,
                 capabilities,
             })
         }
@@ -2939,6 +3006,7 @@ pub(crate) mod serde_request {
                 keep_caps,
                 landlock_scope,
                 resolve_unix: request.resolve_unix,
+                seccomp_reports: request.seccomp_reports,
                 seccomp,
                 landlock_fs,
                 landlock_net,
@@ -3752,6 +3820,134 @@ mod tests {
             compile_seccomp(&SeccompPolicy::Rules(rules)),
             Err(ConfigError::SeccompInvalid { .. })
         ));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_curated_rosters_reporting_filter_notifies_exactly_its_refusals() {
+        use crate::mechanism::seccomp::{RET_USER_NOTIF, X32_SYSCALL_BIT, is_reported};
+
+        let program = compile_seccomp(&SeccompPolicy::Rules(SeccompRules::curated())).unwrap();
+        let notifying = seccomp::notifying(&program).expect("every return is a constant");
+        let tiocsti = 0x5412;
+        let new_user = libc::CLONE_NEWUSER as u64;
+        let mut notified = 0;
+        for nr in (0..600).chain((0..600).map(|nr| nr | i64::from(X32_SYSCALL_BIT))) {
+            for args in [&[][..], &[0, tiocsti], &[new_user], &[libc::AF_INET as u64]] {
+                let call = host_call(nr, args);
+                let (original, rewritten) =
+                    (eval::run(&program, &call), eval::run(&notifying, &call));
+                if is_reported(original) {
+                    assert_eq!(rewritten, RET_USER_NOTIF, "{nr} {args:?}");
+                    notified += 1;
+                } else {
+                    assert_eq!(rewritten, original, "{nr} {args:?}");
+                }
+            }
+        }
+        assert!(notified > 0);
+        // A refusal is held for the listener, an answer of absence is not.
+        let held = |nr, args: &[u64]| eval::run(&notifying, &host_call(nr, args)) == RET_USER_NOTIF;
+        assert!(held(libc::SYS_mount, &[]));
+        assert!(held(libc::SYS_ioctl, &[0, tiocsti]));
+        assert!(!held(libc::SYS_ioctl, &[0, 0x5413]));
+        assert!(!held(libc::SYS_clone3, &[]));
+        assert!(!held(libc::SYS_getpid, &[]));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn reports_install_the_notifying_program_and_answer_by_the_compiled_one() {
+        let mut request = Request::default();
+        request.set_seccomp(SeccompPolicy::Rules(SeccompRules::curated()));
+        let compiled = request.lower(false).unwrap().seccomp.unwrap();
+        request.set_seccomp_reports(true);
+        let plan = request.lower(false).unwrap();
+        let reported = plan.reported.expect("the refusals are reported");
+        assert_eq!(&*reported.answers, &compiled[..]);
+        assert_eq!(plan.seccomp, seccomp::notifying(&compiled));
+        assert_eq!(reported.arch, audit_arch(host_target_arch().unwrap()));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn reports_are_refused_where_the_listener_could_not_be_handed_over() {
+        let lowered = |policy: Option<SeccompPolicy>| {
+            let mut request = Request::default();
+            if let Some(policy) = policy {
+                request.set_seccomp(policy);
+            }
+            request.set_seccomp_reports(true);
+            request.lower(false).map(|_| ())
+        };
+        let core = [
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_execve,
+            libc::SYS_exit_group,
+        ];
+        assert!(matches!(
+            lowered(None),
+            Err(ConfigError::SeccompReportsUnfiltered)
+        ));
+        // An allowlist without sendmsg, and one allowing it only on a standard
+        // stream, which no channel of the launch's is.
+        assert!(matches!(
+            lowered(Some(SeccompPolicy::Rules(SeccompRules::allowing(core)))),
+            Err(ConfigError::SeccompReportsUndelivered)
+        ));
+        let on_stdout =
+            SeccompRules::allowing(core).rule(libc::SYS_sendmsg, [SeccompArg::eq_qword(0, 1)]);
+        assert!(matches!(
+            lowered(Some(SeccompPolicy::Rules(on_stdout))),
+            Err(ConfigError::SeccompReportsUndelivered)
+        ));
+        // A denylist naming it, and a deny-everything program.
+        assert!(matches!(
+            lowered(Some(SeccompPolicy::Rules(SeccompRules::denying([
+                libc::SYS_sendmsg
+            ])))),
+            Err(ConfigError::SeccompReportsUndelivered)
+        ));
+        let refuse_all = vec![SockFilter {
+            code: bpf::RET_K,
+            jt: 0,
+            jf: 0,
+            k: ret_value(SeccompAction::Errno(EPERM)),
+        }];
+        assert!(matches!(
+            lowered(Some(SeccompPolicy::Program(refuse_all))),
+            Err(ConfigError::SeccompReportsUndelivered)
+        ));
+        // A program whose answer is computed.
+        let computed = vec![
+            SockFilter {
+                code: 0x00,
+                jt: 0,
+                jf: 0,
+                k: ret_value(SeccompAction::Allow),
+            },
+            SockFilter {
+                code: 0x16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+        ];
+        assert!(matches!(
+            lowered(Some(SeccompPolicy::Program(computed))),
+            Err(ConfigError::SeccompReportsUnrewritable)
+        ));
+        // Allowing sendmsg admits them.
+        let mut with_sendmsg = core.to_vec();
+        with_sendmsg.push(libc::SYS_sendmsg);
+        assert!(
+            lowered(Some(SeccompPolicy::Rules(SeccompRules::allowing(
+                with_sendmsg
+            ))))
+            .is_ok()
+        );
+        assert!(lowered(Some(SeccompPolicy::Rules(SeccompRules::curated()))).is_ok());
     }
 
     #[test]

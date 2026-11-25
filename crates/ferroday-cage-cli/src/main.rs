@@ -46,6 +46,7 @@
 mod forward;
 mod netstack;
 mod output;
+mod seccomp;
 mod streams;
 mod terminal;
 
@@ -2326,6 +2327,21 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--seccomp-reports",
+        section: Section::Hardening,
+        help: &[
+            "Write each call the seccomp filter refuses the",
+            "command on standard error, answering it with the",
+            "policy's errno. The policy must allow sendmsg, which",
+            "hands the reports over",
+        ],
+        restriction: true,
+        take: Take::Bare(|options| {
+            options.seccomp_reports = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--drop-caps",
         section: Section::Hardening,
         help: &["Drop every capability from the command"],
@@ -2382,6 +2398,16 @@ const FLAGS: &[Flag] = &[
         restriction: true,
         take: Take::Bare(|options| {
             options.landlock_resolve_unix = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-seccomp-reports",
+        section: Section::Off,
+        help: &["Do not report the seccomp filter's refusals"],
+        restriction: true,
+        take: Take::Bare(|options| {
+            options.seccomp_reports = Some(false);
         }),
         ..Flag::DEFAULTS
     },
@@ -2651,8 +2677,9 @@ A profile's [hardening] table composes with the hardening flags:
 --landlock-ro, --landlock-rw, --landlock-unix, --landlock-bind, and
 --landlock-connect add grants to it, while --landlock-scope,
 --landlock-resolve-unix and --no-landlock-resolve-unix, --drop-caps,
---keep-caps, and the seccomp flags that set a posture replace its scopes,
-unix-socket restriction, capability posture, or seccomp policy. Those
+--keep-caps, --seccomp-reports and --no-seccomp-reports, and the seccomp
+flags that set a posture replace its scopes, unix-socket restriction,
+capability posture, reports, or seccomp policy. Those
 seccomp flags are mutually constrained: an allow side (--seccomp-allow,
 --seccomp-allow-rule) cannot be mixed with a deny side (--seccomp-deny,
 --seccomp-deny-rule), and --seccomp curated is a deny side the deny flags
@@ -2853,6 +2880,8 @@ struct Options {
     landlock_scope: Option<Vec<LandlockScope>>,
     landlock_resolve_unix: Option<bool>,
     seccomp: Option<SeccompPolicy>,
+    /// `--seccomp-reports` or `--no-seccomp-reports`, where given.
+    seccomp_reports: Option<bool>,
     /// The seccomp flags as they were given, reconciled into
     /// [`seccomp`](Self::seccomp) once the whole command line has been read.
     ///
@@ -3407,6 +3436,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         landlock_scope: None,
         landlock_resolve_unix: None,
         seccomp: None,
+        seccomp_reports: None,
         seccomp_curated: false,
         seccomp_allow: Vec::new(),
         seccomp_deny: Vec::new(),
@@ -5803,6 +5833,9 @@ impl Launch {
         if let Some(policy) = seccomp {
             builder = builder.seccomp(policy);
         }
+        if let Some(reports) = options.seccomp_reports {
+            builder = builder.seccomp_reports(reports);
+        }
         match options.caps {
             Some(CapsChoice::DropAll) => builder = builder.drop_all_capabilities(),
             Some(CapsChoice::Keep(caps)) => builder = builder.keep_capabilities(caps),
@@ -5875,8 +5908,11 @@ impl Launch {
                 relay,
             );
         }
-        let outcome = start(builder, Cage::spawn)
-            .and_then(|running| Ok(wait_with_deadline(running, timeout, kill_after)?));
+        let outcome = start(builder, Cage::spawn).and_then(|running| {
+            Ok(seccomp::writing_refusals(running, |running| {
+                wait_with_deadline(running, timeout, kill_after)
+            })?)
+        });
         finish(relay, outcome)
     }
 }
@@ -6259,7 +6295,12 @@ fn run_on_a_terminal(
         Ok(launched) => launched,
         Err(failure) => return conclude(Err(failure)),
     };
-    conclude(terminal::relay(running, pty, signals, timeout, kill_after).map_err(Failure::from))
+    conclude(
+        seccomp::writing_refusals(running, |running| {
+            terminal::relay(running, pty, signals, timeout, kill_after)
+        })
+        .map_err(Failure::from),
+    )
 }
 
 /// Composes the native network stack a `--netstack` run attaches: the
@@ -6413,12 +6454,12 @@ fn run_pending(
 
     // The relay when a terminal was allocated, the plain wait otherwise. Both
     // return the same outcome; only the driving differs.
-    let outcome = match (pty, signals) {
+    let outcome = seccomp::writing_refusals(running, |running| match (pty, signals) {
         (Some(pty), Some(signals)) => {
             terminal::relay(running, pty, signals, timeout, kill_after).map_err(Failure::from)
         }
         _ => wait_with_deadline(running, timeout, kill_after).map_err(Failure::from),
-    };
+    });
     let stopped = beside.stop();
     let delivered = settle(relay);
     // Printed after the stream relays have delivered the command's output, so
@@ -6590,8 +6631,10 @@ fn run_restricted(mut options: Options) -> ExitCode {
             Err(failure) => return conclude(Err(failure)),
         };
         return conclude(
-            terminal::relay(running, pty, signals, options.timeout, options.kill_after)
-                .map_err(Failure::from),
+            seccomp::writing_refusals(running, |running| {
+                terminal::relay(running, pty, signals, options.timeout, options.kill_after)
+            })
+            .map_err(Failure::from),
         );
     }
 
@@ -6604,11 +6647,9 @@ fn run_restricted(mut options: Options) -> ExitCode {
         Err(code) => return code,
     };
     let outcome = start(builder, Restriction::spawn).and_then(|running| {
-        Ok(wait_with_deadline(
-            running,
-            options.timeout,
-            options.kill_after,
-        )?)
+        Ok(seccomp::writing_refusals(running, |running| {
+            wait_with_deadline(running, options.timeout, options.kill_after)
+        })?)
     });
     finish(relay, outcome)
 }
@@ -6676,6 +6717,9 @@ fn restriction_builder(options: &mut Options) -> Result<RestrictionBuilder, Stri
     }
     if let Some(policy) = seccomp {
         builder = builder.seccomp(policy);
+    }
+    if let Some(reports) = options.seccomp_reports {
+        builder = builder.seccomp_reports(reports);
     }
     Ok(builder)
 }
@@ -11286,8 +11330,9 @@ mod tests {
         // flag, given with a value it accepts, changes the restriction the
         // launch builds from the one it builds without it. A flag that states
         // the default changes nothing alone, so it is held to overriding its
-        // `--no-` form instead. The four the launch applies around the
-        // restriction stay in the options for it.
+        // counterpart instead: its `--no-` form, or for a `--no-` flag the
+        // form without it. The four the launch applies around the restriction
+        // stay in the options for it.
         let built = |flags: &[&str]| {
             let mut args = vec!["--restrict", "--landlock-ro", "/usr"];
             args.extend(flags);
@@ -11310,11 +11355,14 @@ mod tests {
                 "--kill-after" => options.kill_after == Duration::from_secs(1),
                 _ if with != without => true,
                 long => {
-                    let negated = format!("--no-{}", &long[2..]);
-                    FLAGS.iter().any(|flag| flag.long == negated) && {
-                        let (negated_alone, _) = built(&[&negated]);
-                        let (overridden, _) = built(&[&negated, long]);
-                        negated_alone != without && overridden == without
+                    let counterpart = match long.strip_prefix("--no-") {
+                        Some(stated) => format!("--{stated}"),
+                        None => format!("--no-{}", &long[2..]),
+                    };
+                    FLAGS.iter().any(|flag| flag.long == counterpart) && {
+                        let (counterpart_alone, _) = built(&[&counterpart]);
+                        let (overridden, _) = built(&[&counterpart, long]);
+                        counterpart_alone != without && overridden == without
                     }
                 }
             };

@@ -163,6 +163,10 @@ pub struct Running<'obs> {
     /// Whether [`resolve`](Self::resolve) has read the cgroup's account of the
     /// tree and tried to remove it, which it does once.
     cgroup_read: bool,
+    /// The receiving end of the seccomp filter's reports, where the launch
+    /// reports its refusals, until the caller takes it.
+    #[cfg(feature = "hardening")]
+    seccomp_reports: Option<mechanism::SeccompReports>,
 }
 
 /// Which channel one of the pump's poll slots watches, and where its readiness
@@ -407,6 +411,8 @@ impl<'obs> Running<'obs> {
             ready,
             cgroup: cgroup.map(Arc::new),
             cgroup_read: false,
+            #[cfg(feature = "hardening")]
+            seccomp_reports: launched.seccomp_reports,
         }
     }
 
@@ -419,6 +425,54 @@ impl<'obs> Running<'obs> {
     /// [`terminate`](Self::terminate), which cannot hit a recycled pid.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Takes the receiving end of the seccomp filter's reports: each call the
+    /// command's filter refused, where the launch reports its refusals
+    /// ([`seccomp_reports`](crate::CageBuilder::seccomp_reports)). `None`
+    /// where it does not, and once the reports have been taken.
+    ///
+    /// The filter holds each refused call until the caller answers it, and a
+    /// thread of the caller's answers it whether or not the reports are taken.
+    /// It never waits on their reader: the queue holds 1024 reports, and a
+    /// report it has no room for is dropped and counted. A handle whose reports
+    /// are never taken holds 1024 at most. Dropping the receiving end stops the
+    /// reports, not the answers.
+    ///
+    /// The reports end once no process the filter governs remains and every
+    /// queued report has been read: under a PID namespace, soon after
+    /// [`wait`](Self::wait) returns, so a thread reading them ends then. Without
+    /// one, a process the command leaves behind keeps them going. On a kernel
+    /// before Linux 5.8 they end only with the caller's process.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use ferroday_cage::{Cage, SeccompPolicy, SeccompRules};
+    ///
+    /// let cage = Cage::builder()
+    ///     .rootfs("/var/cache/myapp/rootfs")
+    ///     .command("/usr/bin/job")
+    ///     .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+    ///     .seccomp_reports(true)
+    ///     .build()?;
+    /// let mut running = cage.spawn()?;
+    /// let reports = running.take_seccomp_reports().expect("the reports are made");
+    /// let reader = std::thread::spawn(move || {
+    ///     while let Ok(report) = reports.recv() {
+    ///         eprintln!("{report}");
+    ///     }
+    /// });
+    /// let status = running.wait()?;
+    /// reader.join().expect("the reader finishes");
+    /// # let _ = status;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "hardening")]
+    pub fn take_seccomp_reports(
+        &mut self,
+    ) -> Option<crate::reports::Reports<crate::hardening::SeccompReport>> {
+        self.seccomp_reports.take()
     }
 
     /// Waits for the command to terminate, pumping captured output to the
@@ -1877,6 +1931,8 @@ mod tests {
                 stderr: None,
                 reap: None,
                 foreground: None,
+                #[cfg(feature = "hardening")]
+                seccomp_reports: None,
             },
             Some(&mut observer),
             PlaceholderGuard::default(),
@@ -1933,6 +1989,8 @@ mod tests {
                 stderr: None,
                 reap: None,
                 foreground: None,
+                #[cfg(feature = "hardening")]
+                seccomp_reports: None,
             },
             None,
             PlaceholderGuard::default(),
@@ -1987,6 +2045,8 @@ mod tests {
                 stderr: None,
                 reap: None,
                 foreground: None,
+                #[cfg(feature = "hardening")]
+                seccomp_reports: None,
             },
             Some(&mut collect),
             PlaceholderGuard::default(),

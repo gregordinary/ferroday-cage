@@ -264,6 +264,8 @@ mod hardening {
     const _: () = assert_send_sync::<hardening::SeccompCompare>();
     const _: () = assert_send_sync::<hardening::SeccompPolicy>();
     const _: () = assert_send_sync::<hardening::SeccompRules>();
+    const _: () = assert_send_sync::<hardening::SeccompReport>();
+    const _: () = assert_send_sync::<hardening::Reports<hardening::SeccompReport>>();
     const _: () = assert_send_sync::<hardening::SockFilter>();
     const _: () = assert_send_sync::<hardening::ParseCapabilityError>();
     const _: () = assert_send_sync::<hardening::ParseFsAccessError>();

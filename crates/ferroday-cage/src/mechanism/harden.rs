@@ -37,7 +37,7 @@
 //!
 //! [`CageBuilder::build`]: crate::CageBuilder::build
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
@@ -108,7 +108,13 @@ pub(super) fn apply_pre_switch(plan: &HardeningPlan) -> Result<(), Failure> {
 
 /// Applies the hardening that follows the identity switch: the capability
 /// drop and the seccomp filter.
-pub(super) fn apply_post_switch(plan: &HardeningPlan) -> Result<(), Failure> {
+///
+/// `listener_channel` is the sandbox end of the listener channel, present
+/// where the filter's refusals are reported.
+pub(super) fn apply_post_switch(
+    plan: &HardeningPlan,
+    listener_channel: Option<BorrowedFd<'_>>,
+) -> Result<(), Failure> {
     if plan.is_empty() {
         return Ok(());
     }
@@ -127,9 +133,50 @@ pub(super) fn apply_post_switch(plan: &HardeningPlan) -> Result<(), Failure> {
     // governance. No-new-privileges, set before the switch, is what admits the
     // install once the switch has left the command without CAP_SYS_ADMIN.
     if let Some(program) = &plan.seccomp {
-        seccomp::install(program).map_err(|errno| (SetupStep::InstallSeccomp, errno, 0))?;
+        match &plan.reported {
+            Some(reported) => install_reporting(program, reported.arch, listener_channel)?,
+            None => {
+                seccomp::install(program).map_err(|errno| (SetupStep::InstallSeccomp, errno, 0))?;
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Installs `program`, a filter whose refusals are reported, and hands its
+/// listener to the caller over `channel`.
+///
+/// The filter governs the hand-over, since the install is what makes the
+/// listener, so the stage checks first that the filter lets its own `sendmsg`
+/// through (`seccomp::hands_over`). One it refused would hold the stage on a
+/// notification only the listener it holds could answer; it is reported as
+/// `EDEADLK` instead. The build refused every policy that lets no such
+/// `sendmsg` through, so this catches only a rule on its arguments.
+///
+/// Every call after the hand-over that the filter refuses is the caller's to
+/// answer: a refused `execve` fails the launch at its own step, with the
+/// policy's errno, as without reports. A hand-over that fails leaves the
+/// listener with the stage. Its peer is the caller's thread, which holds the
+/// channel until the listener arrives, so the caller is gone, and a refused
+/// call after that waits until the sandbox is ended.
+fn install_reporting(
+    program: &[super::SockFilter],
+    arch: u32,
+    channel: Option<BorrowedFd<'_>>,
+) -> Result<(), Failure> {
+    let channel = channel.ok_or((SetupStep::HandOverSeccompListener, Errno::BADF, 0))?;
+    if !seccomp::hands_over(program, arch, channel.as_raw_fd()) {
+        return Err((SetupStep::HandOverSeccompListener, Errno::DEADLK, 0));
+    }
+    let listener = seccomp::install_listening(program)
+        .map_err(|errno| (SetupStep::InstallSeccompListener, errno, 0))?;
+    super::frame::send_with_fd(channel, &[super::LISTENER_BYTE], listener.as_fd())
+        .map_err(|errno| (SetupStep::HandOverSeccompListener, errno, 0))?;
+    // Left open: it is close-on-exec, so the exec closes it, and an exit closes
+    // it on any failure after. A `close` here would be one more call for the
+    // filter to judge, and one more report where it refused it.
+    let _ = listener.into_raw_fd();
     Ok(())
 }
 

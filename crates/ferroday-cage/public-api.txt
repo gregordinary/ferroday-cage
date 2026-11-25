@@ -1845,6 +1845,9 @@ pub ferroday_cage::ConfigError::SeccompInvalid::reason: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::SeccompProgramTooLong
 pub ferroday_cage::ConfigError::SeccompProgramTooLong::len: usize
 pub ferroday_cage::ConfigError::SeccompProgramTooLong::max: usize
+pub ferroday_cage::ConfigError::SeccompReportsUndelivered
+pub ferroday_cage::ConfigError::SeccompReportsUnfiltered
+pub ferroday_cage::ConfigError::SeccompReportsUnrewritable
 #[non_exhaustive] pub ferroday_cage::ConfigError::SeccompUnsupportedArch
 pub ferroday_cage::ConfigError::SeccompUnsupportedArch::arch: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::SetidCapWithNonRootIdentity
@@ -1908,6 +1911,8 @@ pub ferroday_cage::Error::NamespaceLimitReached::step: ferroday_cage::SetupStep
 #[non_exhaustive] pub ferroday_cage::Error::ProcfsRefused
 pub ferroday_cage::Error::ProcfsRefused::blocker: ferroday_cage::host::ProcfsBlocker
 pub ferroday_cage::Error::ProcfsRefused::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::Error::SeccompListenerHeld
+pub ferroday_cage::Error::SeccompListenerHeld::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::Setup
 pub ferroday_cage::Error::Setup::detail: core::option::Option<alloc::string::String>
 pub ferroday_cage::Error::Setup::source: core::io::error::Error
@@ -2264,6 +2269,7 @@ pub ferroday_cage::ResolvedHardening::Applied::landlock_net: alloc::vec::Vec<fer
 pub ferroday_cage::ResolvedHardening::Applied::landlock_resolve_unix: bool
 pub ferroday_cage::ResolvedHardening::Applied::landlock_scope: u64
 pub ferroday_cage::ResolvedHardening::Applied::seccomp_instructions: core::option::Option<usize>
+pub ferroday_cage::ResolvedHardening::Applied::seccomp_reports: bool
 pub ferroday_cage::ResolvedHardening::Unavailable
 impl core::marker::Freeze for ferroday_cage::ResolvedHardening
 impl core::marker::Send for ferroday_cage::ResolvedHardening
@@ -2425,6 +2431,24 @@ impl core::marker::Unpin for ferroday_cage::SeccompPolicy
 impl core::marker::UnsafeUnpin for ferroday_cage::SeccompPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::SeccompPolicy
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SeccompPolicy
+#[non_exhaustive] pub enum ferroday_cage::SeccompReport
+#[non_exhaustive] pub ferroday_cage::SeccompReport::Denied
+pub ferroday_cage::SeccompReport::Denied::arch: u32
+pub ferroday_cage::SeccompReport::Denied::arguments: [u64; 6]
+pub ferroday_cage::SeccompReport::Denied::command: core::option::Option<alloc::string::String>
+pub ferroday_cage::SeccompReport::Denied::errno: u16
+pub ferroday_cage::SeccompReport::Denied::name: core::option::Option<&'static str>
+pub ferroday_cage::SeccompReport::Denied::syscall: i64
+pub ferroday_cage::SeccompReport::Denied::thread: u32
+impl core::fmt::Display for ferroday_cage::SeccompReport
+pub fn ferroday_cage::SeccompReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::SeccompReport
+impl core::marker::Send for ferroday_cage::SeccompReport
+impl core::marker::Sync for ferroday_cage::SeccompReport
+impl core::marker::Unpin for ferroday_cage::SeccompReport
+impl core::marker::UnsafeUnpin for ferroday_cage::SeccompReport
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::SeccompReport
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::SeccompReport
 #[non_exhaustive] #[repr(u32)] pub enum ferroday_cage::SetupStep
 pub ferroday_cage::SetupStep::AllocateTerminal = 56
 pub ferroday_cage::SetupStep::AwaitIdentityMap = 38
@@ -2445,10 +2469,12 @@ pub ferroday_cage::SetupStep::EnterRootfs = 9
 pub ferroday_cage::SetupStep::Exec = 21
 pub ferroday_cage::SetupStep::ForkCommand = 28
 pub ferroday_cage::SetupStep::ForkInit = 23
+pub ferroday_cage::SetupStep::HandOverSeccompListener = 71
 pub ferroday_cage::SetupStep::HidePath = 65
 pub ferroday_cage::SetupStep::HoldReadOnlyName = 69
 pub ferroday_cage::SetupStep::InstallNetworkFilter = 58
 pub ferroday_cage::SetupStep::InstallSeccomp = 36
+pub ferroday_cage::SetupStep::InstallSeccompListener = 70
 pub ferroday_cage::SetupStep::JoinCgroup = 67
 pub ferroday_cage::SetupStep::LandlockAddRule = 34
 pub ferroday_cage::SetupStep::LandlockCreateRuleset = 33
@@ -2662,6 +2688,7 @@ pub fn ferroday_cage::CageBuilder::landlock_net(self, ferroday_cage::NetAccess, 
 pub fn ferroday_cage::CageBuilder::landlock_resolve_unix(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::landlock_scope<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>
 pub fn ferroday_cage::CageBuilder::seccomp(self, ferroday_cage::SeccompPolicy) -> Self
+pub fn ferroday_cage::CageBuilder::seccomp_reports(self, bool) -> Self
 impl core::convert::TryFrom<ferroday_cage::CageBuilder> for ferroday_cage::RestrictedProfile
 pub type ferroday_cage::RestrictedProfile::Error = ferroday_cage::ConfigError
 pub fn ferroday_cage::RestrictedProfile::try_from(ferroday_cage::CageBuilder) -> core::result::Result<ferroday_cage::RestrictedProfile, ferroday_cage::ConfigError>
@@ -3364,6 +3391,7 @@ pub fn ferroday_cage::RestrictionBuilder::landlock_resolve_unix(self, bool) -> S
 pub fn ferroday_cage::RestrictionBuilder::landlock_scope<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::LandlockScope>>(self, I) -> Self
 pub fn ferroday_cage::RestrictionBuilder::rlimit(self, ferroday_cage::limits::Resource, impl core::convert::Into<ferroday_cage::limits::Limit>, impl core::convert::Into<ferroday_cage::limits::Limit>) -> Self
 pub fn ferroday_cage::RestrictionBuilder::seccomp(self, ferroday_cage::SeccompPolicy) -> Self
+pub fn ferroday_cage::RestrictionBuilder::seccomp_reports(self, bool) -> Self
 pub fn ferroday_cage::RestrictionBuilder::stderr(self, ferroday_cage::Stdio) -> Self
 pub fn ferroday_cage::RestrictionBuilder::stdin(self, ferroday_cage::Stdio) -> Self
 pub fn ferroday_cage::RestrictionBuilder::stdout(self, ferroday_cage::Stdio) -> Self
@@ -3382,6 +3410,7 @@ impl<'obs> ferroday_cage::Running<'obs>
 pub fn ferroday_cage::Running<'obs>::kill(&mut self) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::kill_handle(&self) -> core::result::Result<ferroday_cage::KillHandle, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::pid(&self) -> u32
+pub fn ferroday_cage::Running<'obs>::take_seccomp_reports(&mut self) -> core::option::Option<ferroday_cage::Reports<ferroday_cage::SeccompReport>>
 pub fn ferroday_cage::Running<'obs>::terminate(&mut self) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::try_wait(&mut self) -> core::result::Result<core::option::Option<ferroday_cage::ExitStatus>, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::usage(&self) -> core::option::Option<ferroday_cage::ResourceUsage>
@@ -3392,7 +3421,7 @@ impl core::fmt::Debug for ferroday_cage::Running<'_>
 pub fn ferroday_cage::Running<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl std::os::fd::owned::AsFd for ferroday_cage::Running<'_>
 pub fn ferroday_cage::Running<'_>::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
-impl<'obs> core::marker::Freeze for ferroday_cage::Running<'obs>
+impl<'obs> !core::marker::Freeze for ferroday_cage::Running<'obs>
 impl<'obs> !core::marker::Send for ferroday_cage::Running<'obs>
 impl<'obs> !core::marker::Sync for ferroday_cage::Running<'obs>
 impl<'obs> core::marker::Unpin for ferroday_cage::Running<'obs>

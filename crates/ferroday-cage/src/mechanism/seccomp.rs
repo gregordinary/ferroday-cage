@@ -11,6 +11,9 @@
 //! are named here rather than taken from a binding, so the crate's raw BPF is
 //! self-contained and reviewable.
 
+#[cfg(feature = "hardening")]
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+
 use rustix::io::Errno;
 use rustix::thread::UnshareFlags;
 use syscalls::Sysno;
@@ -30,7 +33,7 @@ pub(crate) mod bpf {
     pub(crate) const JMP_JEQ_K: u16 = 0x15;
     /// `BPF_JMP | BPF_JSET | BPF_K`: branch on the accumulator sharing any bit
     /// with `k`. Only the hardening layer's fragments use it.
-    #[cfg(any(feature = "hardening", test))]
+    #[cfg(feature = "hardening")]
     pub(crate) const JMP_JSET_K: u16 = 0x45;
     /// `BPF_JMP | BPF_JA`: jump forward `k` instructions unconditionally. Only
     /// the hardening layer's fragments use it.
@@ -38,6 +41,76 @@ pub(crate) mod bpf {
     pub(crate) const JMP_JA: u16 = 0x05;
     /// `BPF_RET | BPF_K`: return `k` as the seccomp action.
     pub(crate) const RET_K: u16 = 0x06;
+    /// `BPF_RET | BPF_A`: return the accumulator as the seccomp action.
+    #[cfg(any(feature = "hardening", test))]
+    pub(crate) const RET_A: u16 = 0x16;
+
+    /// The rest of the instructions the kernel's seccomp verifier accepts,
+    /// which no program of the crate's own emits and a caller's precompiled
+    /// one may: the evaluator interprets them. `K` takes the operand from the
+    /// instruction, `X` from the index register.
+    #[cfg(any(feature = "hardening", test))]
+    pub(crate) mod more {
+        /// `BPF_LD | BPF_W | BPF_LEN`: the accumulator takes the length of
+        /// `seccomp_data`, 64.
+        pub(crate) const LD_W_LEN: u16 = 0x80;
+        /// `BPF_LDX | BPF_W | BPF_LEN`: the index register takes it.
+        pub(crate) const LDX_W_LEN: u16 = 0x81;
+        /// `BPF_LD | BPF_IMM`: the accumulator takes `k`.
+        pub(crate) const LD_IMM: u16 = 0x00;
+        /// `BPF_LDX | BPF_IMM`: the index register takes `k`.
+        pub(crate) const LDX_IMM: u16 = 0x01;
+        /// `BPF_LD | BPF_MEM`: the accumulator takes scratch word `k`.
+        pub(crate) const LD_MEM: u16 = 0x60;
+        /// `BPF_LDX | BPF_MEM`: the index register takes scratch word `k`.
+        pub(crate) const LDX_MEM: u16 = 0x61;
+        /// `BPF_ST`: scratch word `k` takes the accumulator.
+        pub(crate) const ST: u16 = 0x02;
+        /// `BPF_STX`: scratch word `k` takes the index register.
+        pub(crate) const STX: u16 = 0x03;
+        /// `BPF_MISC | BPF_TAX`: the index register takes the accumulator.
+        pub(crate) const TAX: u16 = 0x07;
+        /// `BPF_MISC | BPF_TXA`: the accumulator takes the index register.
+        pub(crate) const TXA: u16 = 0x87;
+        /// `BPF_ALU | BPF_NEG`: the accumulator is negated.
+        pub(crate) const ALU_NEG: u16 = 0x84;
+        /// `BPF_ALU`, the class of the arithmetic instructions, each of which
+        /// is `ALU | op | source`.
+        pub(crate) const ALU: u16 = 0x04;
+        /// `BPF_JMP`, the class of the jumps, each `JMP | test | source`.
+        pub(crate) const JMP: u16 = 0x05;
+        /// `BPF_X`: the operand is the index register rather than `k`.
+        pub(crate) const X: u16 = 0x08;
+        /// The arithmetic operations the verifier accepts, by their `op`
+        /// field: add, subtract, multiply, divide, or, and, shift left, shift
+        /// right, exclusive or. `BPF_MOD` is not among them.
+        pub(crate) const ADD: u16 = 0x00;
+        /// `BPF_SUB`.
+        pub(crate) const SUB: u16 = 0x10;
+        /// `BPF_MUL`.
+        pub(crate) const MUL: u16 = 0x20;
+        /// `BPF_DIV`.
+        pub(crate) const DIV: u16 = 0x30;
+        /// `BPF_OR`.
+        pub(crate) const OR: u16 = 0x40;
+        /// `BPF_AND`.
+        pub(crate) const AND: u16 = 0x50;
+        /// `BPF_LSH`.
+        pub(crate) const LSH: u16 = 0x60;
+        /// `BPF_RSH`.
+        pub(crate) const RSH: u16 = 0x70;
+        /// `BPF_XOR`.
+        pub(crate) const XOR: u16 = 0xa0;
+        /// The jump tests, by their `op` field: equal, greater, greater or
+        /// equal, any bit in common.
+        pub(crate) const JEQ: u16 = 0x10;
+        /// `BPF_JGT`.
+        pub(crate) const JGT: u16 = 0x20;
+        /// `BPF_JGE`.
+        pub(crate) const JGE: u16 = 0x30;
+        /// `BPF_JSET`.
+        pub(crate) const JSET: u16 = 0x40;
+    }
 
     /// Byte offset of `seccomp_data.nr`, the syscall number.
     pub(crate) const OFF_NR: u32 = 0;
@@ -87,6 +160,22 @@ pub(crate) const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 pub(crate) const RET_ALLOW: u32 = 0x7FFF_0000;
 /// `SECCOMP_RET_KILL_PROCESS`: kill the whole process, as by `SIGSYS`.
 pub(crate) const RET_KILL_PROCESS: u32 = 0x8000_0000;
+/// `SECCOMP_RET_USER_NOTIF`: hold the syscall and notify the filter's
+/// listener, whose answer the syscall returns.
+#[cfg(feature = "hardening")]
+pub(crate) const RET_USER_NOTIF: u32 = 0x7FC0_0000;
+/// `SECCOMP_RET_LOG`: let the syscall run, and log it.
+#[cfg(feature = "hardening")]
+pub(crate) const RET_LOG: u32 = 0x7FFC_0000;
+/// `SECCOMP_RET_ERRNO`, the action an errno answer carries in its high half.
+pub(crate) const RET_ERRNO: u32 = 0x0005_0000;
+/// `SECCOMP_RET_ACTION_FULL`: the bits of a return value that name its action.
+#[cfg(feature = "hardening")]
+pub(crate) const RET_ACTION_FULL: u32 = 0xFFFF_0000;
+/// `SECCOMP_RET_DATA`: the bits of a return value that carry its data, an
+/// errno answer's errno.
+#[cfg(feature = "hardening")]
+pub(crate) const RET_DATA: u32 = 0x0000_FFFF;
 
 /// `SECCOMP_RET_ERRNO` with `errno` as its data: fail the syscall with that
 /// errno without running it.
@@ -96,7 +185,7 @@ pub(crate) const RET_KILL_PROCESS: u32 = 0x8000_0000;
 /// encoding is the network and keyring filters', which cannot depend on
 /// seccompiler: that ships only with the `hardening` feature.
 pub(crate) const fn ret_errno(errno: u16) -> u32 {
-    0x0005_0000 | errno as u32
+    RET_ERRNO | errno as u32
 }
 
 /// `ENOSYS`, the error a kernel answers a syscall it does not implement with.
@@ -649,6 +738,13 @@ const _: () = {
 /// keyring filters' are fixed, and the hardening layer refuses anything longer
 /// than `BPF_MAXINSNS` (4096) at build time, so the narrowing cannot wrap.
 pub(crate) fn install(program: &[SockFilter]) -> Result<(), Errno> {
+    install_with(program, 0).map(|_| ())
+}
+
+/// Installs `program` with the `SECCOMP_FILTER_FLAG_*` bits of `flags`,
+/// returning what the kernel answers: the listener's descriptor number where
+/// the flags ask for one, and zero otherwise.
+fn install_with(program: &[SockFilter], flags: usize) -> Result<usize, Errno> {
     let fprog = SockFprog {
         len: program.len() as u16,
         filter: program.as_ptr(),
@@ -660,12 +756,105 @@ pub(crate) fn install(program: &[SockFilter]) -> Result<(), Errno> {
         syscalls::syscall!(
             Sysno::seccomp,
             SECCOMP_SET_MODE_FILTER,
-            0usize,
+            flags,
             &fprog as *const SockFprog
         )
     }
-    .map(|_| ())
     .map_err(errno)
+}
+
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER`: install the filter with a listener, a
+/// descriptor its notifications are read from and answered through.
+#[cfg(feature = "hardening")]
+const FILTER_FLAG_NEW_LISTENER: usize = 1 << 3;
+
+/// `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19): a call whose
+/// notification the listener has received waits for the answer through every
+/// signal but a fatal one.
+#[cfg(feature = "hardening")]
+const FILTER_FLAG_WAIT_KILLABLE_RECV: usize = 1 << 5;
+
+/// Installs `program` as [`install`] does, with a listener, and returns the
+/// listener: the descriptor the filter's notifications are read from and
+/// answered through, close-on-exec as the kernel opens it.
+///
+/// Asks for `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`, and installs without it
+/// where the kernel does not know it (before Linux 5.19) and answers `EINVAL`.
+/// Without it, a call that a signal interrupts while its notification waits is
+/// notified again when it restarts.
+///
+/// A task can be under one filter with a listener at most: where one it
+/// already runs under has one, the kernel answers `EBUSY`.
+#[cfg(feature = "hardening")]
+pub(crate) fn install_listening(program: &[SockFilter]) -> Result<OwnedFd, Errno> {
+    let listener = match install_with(
+        program,
+        FILTER_FLAG_NEW_LISTENER | FILTER_FLAG_WAIT_KILLABLE_RECV,
+    ) {
+        Err(Errno::INVAL) => install_with(program, FILTER_FLAG_NEW_LISTENER)?,
+        installed => installed?,
+    };
+    // SAFETY: the kernel opened the listener for this process as the install's
+    // answer, and nothing else holds or closes that number.
+    Ok(unsafe { OwnedFd::from_raw_fd(listener as RawFd) })
+}
+
+/// The program `program` is with its refusals turned into notifications, for a
+/// filter whose refusals are reported.
+///
+/// Every `RET` of an errno answer returns `SECCOMP_RET_USER_NOTIF` instead,
+/// except an answer of `ENOSYS`, which tells the command the call does not
+/// exist so that it falls back, and is no refusal to report. Every other
+/// return is kept. The listener answers each notification with what `program`
+/// answers the call ([`eval`]), so the command sees what it would have without
+/// the reports.
+///
+/// `None` where the program returns a computed value (`RET A`), which no
+/// rewrite of its instructions can reach.
+#[cfg(feature = "hardening")]
+pub(crate) fn notifying(program: &[SockFilter]) -> Option<Vec<SockFilter>> {
+    program
+        .iter()
+        .map(|insn| match insn.code {
+            bpf::RET_A => None,
+            bpf::RET_K if is_reported(insn.k) => Some(SockFilter {
+                k: RET_USER_NOTIF,
+                ..*insn
+            }),
+            _ => Some(*insn),
+        })
+        .collect()
+}
+
+/// Whether `ret`, a `SECCOMP_RET_*` value, is an answer a reporting filter
+/// notifies its listener of: an errno other than `ENOSYS`.
+#[cfg(feature = "hardening")]
+pub(crate) fn is_reported(ret: u32) -> bool {
+    ret & RET_ACTION_FULL == RET_ERRNO && ret & RET_DATA != u32::from(ENOSYS)
+}
+
+/// Whether the command stage's hand-over of a listener on `channel` runs under
+/// `program`, a filter for calls under the audit architecture `arch`.
+///
+/// The hand-over is one `sendmsg` on the channel ([`frame::send_with_fd`]),
+/// made after the filter is installed, since the install is what makes the
+/// listener. A filter that refused it would hold the stage in a notification
+/// no one could answer: the only listener is the one the stage was sending.
+/// Only an answer that runs the call passes, allow or log. The message's
+/// address is on the stage's stack, which no rule names, so it is taken as
+/// zero.
+///
+/// [`frame::send_with_fd`]: super::frame::send_with_fd
+#[cfg(feature = "hardening")]
+pub(crate) fn hands_over(program: &[SockFilter], arch: u32, channel: RawFd) -> bool {
+    let flags = u64::from(super::frame::SEND_WITH_FD_FLAGS.bits());
+    let call = eval::Call::new(
+        arch,
+        Sysno::sendmsg.id() as u32,
+        &[channel as u64, 0, flags],
+    );
+    eval::answer(program, &call)
+        .is_some_and(|ret| matches!(ret & RET_ACTION_FULL, RET_ALLOW | RET_LOG))
 }
 
 /// Whether this process can install a seccomp filter, found by installing
@@ -708,81 +897,169 @@ fn install_in_probe() -> i32 {
     if installed { 0 } else { 1 }
 }
 
-/// A classic-BPF seccomp program, run the way the kernel runs it, for the unit
-/// tests of every program the crate writes or compiles.
-#[cfg(test)]
+/// A classic-BPF seccomp program, run the way the kernel runs it.
+///
+/// Three users: the listener of a filter whose refusals are reported, which
+/// answers each notification with what the policy as compiled answers the
+/// call; the command stage, which checks before installing such a filter that
+/// it lets the stage hand the listener over (`hands_over`); and the unit tests
+/// of every program the crate writes or compiles.
+///
+/// Every instruction the kernel's seccomp verifier accepts is interpreted, so a
+/// caller's precompiled program is run as faithfully as the crate's own. A
+/// program the verifier would refuse answers `None`: an instruction outside its
+/// set, a load beyond `seccomp_data` or off a word boundary, a scratch word
+/// out of range, a jump past the end. Post-fork safe: nothing here allocates,
+/// locks, or panics.
+#[cfg(any(feature = "hardening", test))]
 pub(crate) mod eval {
-    use super::{SockFilter, bpf};
+    use super::SockFilter;
+    use super::bpf::{self, more};
+
+    /// The size of `seccomp_data`, which `BPF_LEN` loads.
+    const DATA_LEN: u32 = 64;
 
     /// The `seccomp_data` a filter is run over: the syscall number, the audit
-    /// architecture, and the six arguments.
+    /// architecture, the address the call was made from, and the six
+    /// arguments.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct Call {
-        arch: u32,
-        nr: u32,
-        args: [u64; 6],
+        /// The audit architecture the call was made under.
+        pub(crate) arch: u32,
+        /// The syscall number, in that architecture's table.
+        pub(crate) nr: u32,
+        /// The address of the instruction that made the call.
+        pub(crate) instruction_pointer: u64,
+        /// The six arguments, as the registers held them.
+        pub(crate) args: [u64; 6],
     }
 
     impl Call {
         /// A call of syscall `nr` under the audit architecture `arch`, with
-        /// `args` and then zeroes.
+        /// `args` and then zeroes, made from address zero. Arguments past the
+        /// sixth are ignored.
         pub(crate) fn new(arch: u32, nr: u32, args: &[u64]) -> Call {
             let mut all = [0; 6];
-            all[..args.len()].copy_from_slice(args);
+            for (slot, &arg) in all.iter_mut().zip(args) {
+                *slot = arg;
+            }
             Call {
                 arch,
                 nr,
+                instruction_pointer: 0,
                 args: all,
             }
+        }
+
+        /// The call as the kernel lays `seccomp_data` out, in the build's byte
+        /// order.
+        fn data(&self) -> [u8; DATA_LEN as usize] {
+            let mut data = [0u8; DATA_LEN as usize];
+            data[0..4].copy_from_slice(&self.nr.to_ne_bytes());
+            data[4..8].copy_from_slice(&self.arch.to_ne_bytes());
+            data[8..16].copy_from_slice(&self.instruction_pointer.to_ne_bytes());
+            for (index, arg) in self.args.iter().enumerate() {
+                let at = 16 + 8 * index;
+                data[at..at + 8].copy_from_slice(&arg.to_ne_bytes());
+            }
+            data
         }
     }
 
     /// Runs `program` over `call` as the kernel does, returning the
-    /// `SECCOMP_RET_*` value it answers.
+    /// `SECCOMP_RET_*` value it answers, or `None` for a program the kernel's
+    /// verifier would refuse.
     ///
-    /// Only the instructions this crate's programs and seccompiler's backend
-    /// emit are interpreted. Any other fails the test, so a program that
-    /// starts using one is not misread, and so does a jump past the program's
-    /// end, which the kernel's verifier would refuse.
-    pub(crate) fn run(program: &[SockFilter], call: &Call) -> u32 {
-        let mut data = [0u8; 64];
-        data[0..4].copy_from_slice(&call.nr.to_ne_bytes());
-        data[4..8].copy_from_slice(&call.arch.to_ne_bytes());
-        for (index, arg) in call.args.iter().enumerate() {
-            let at = 16 + 8 * index;
-            data[at..at + 8].copy_from_slice(&arg.to_ne_bytes());
-        }
+    /// Division by a zero index register ends the program with 0, as the
+    /// kernel's does, and a shift by the index register takes its low five
+    /// bits. Every jump goes forward, so the run ends within the program's
+    /// length.
+    pub(crate) fn answer(program: &[SockFilter], call: &Call) -> Option<u32> {
+        let data = call.data();
         let mut accumulator = 0u32;
+        let mut index = 0u32;
+        let mut scratch = [0u32; 16];
         let mut next = 0usize;
         loop {
-            let insn = *program
-                .get(next)
-                .unwrap_or_else(|| panic!("the program runs past its end, to {next}"));
+            let insn = *program.get(next)?;
             next += 1;
             let k = insn.k;
+            let operand = if insn.code & more::X != 0 { index } else { k };
             let branch = |taken: bool| usize::from(if taken { insn.jt } else { insn.jf });
             match insn.code {
                 bpf::LD_W_ABS => {
+                    if k % 4 != 0 || k >= DATA_LEN {
+                        return None;
+                    }
                     let at = k as usize;
-                    accumulator = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+                    let word = data.get(at..at + 4)?;
+                    accumulator = u32::from_ne_bytes([word[0], word[1], word[2], word[3]]);
                 }
-                bpf::ALU_AND_K => accumulator &= k,
-                bpf::JMP_JA => next += k as usize,
-                bpf::JMP_JEQ_K => next += branch(accumulator == k),
-                // BPF_JMP | BPF_JGT | BPF_K
-                0x25 => next += branch(accumulator > k),
-                // BPF_JMP | BPF_JGE | BPF_K
-                0x35 => next += branch(accumulator >= k),
-                bpf::JMP_JSET_K => next += branch(accumulator & k != 0),
-                bpf::RET_K => return k,
-                code => panic!("instruction {code:#06x} at {} is not interpreted", next - 1),
+                more::LD_W_LEN => accumulator = DATA_LEN,
+                more::LDX_W_LEN => index = DATA_LEN,
+                more::LD_IMM => accumulator = k,
+                more::LDX_IMM => index = k,
+                more::LD_MEM => accumulator = *scratch.get(k as usize)?,
+                more::LDX_MEM => index = *scratch.get(k as usize)?,
+                more::ST => *scratch.get_mut(k as usize)? = accumulator,
+                more::STX => *scratch.get_mut(k as usize)? = index,
+                more::TAX => index = accumulator,
+                more::TXA => accumulator = index,
+                more::ALU_NEG => accumulator = accumulator.wrapping_neg(),
+                // `ALU | op | source`, an opcode of one byte.
+                code if code < 0x100 && code & 0x07 == more::ALU => {
+                    accumulator = match code & 0xf0 {
+                        more::ADD => accumulator.wrapping_add(operand),
+                        more::SUB => accumulator.wrapping_sub(operand),
+                        more::MUL => accumulator.wrapping_mul(operand),
+                        more::DIV => match accumulator.checked_div(operand) {
+                            Some(quotient) => quotient,
+                            None if code & more::X != 0 => return Some(0),
+                            None => return None,
+                        },
+                        more::OR => accumulator | operand,
+                        more::AND => accumulator & operand,
+                        more::LSH if code & more::X != 0 || operand < 32 => {
+                            accumulator.wrapping_shl(operand)
+                        }
+                        more::RSH if code & more::X != 0 || operand < 32 => {
+                            accumulator.wrapping_shr(operand)
+                        }
+                        more::XOR => accumulator ^ operand,
+                        _ => return None,
+                    };
+                }
+                bpf::JMP_JA => next = next.checked_add(k as usize)?,
+                // `JMP | test | source`.
+                code if code < 0x100 && code & 0x07 == more::JMP => {
+                    let taken = match code & 0xf0 {
+                        more::JEQ => accumulator == operand,
+                        more::JGT => accumulator > operand,
+                        more::JGE => accumulator >= operand,
+                        more::JSET => accumulator & operand != 0,
+                        _ => return None,
+                    };
+                    next += branch(taken);
+                }
+                bpf::RET_K => return Some(k),
+                bpf::RET_A => return Some(accumulator),
+                _ => return None,
             }
         }
+    }
+
+    /// [`answer`], for a test that holds a program the kernel accepts: a
+    /// program it would refuse fails the test.
+    #[cfg(test)]
+    pub(crate) fn run(program: &[SockFilter], call: &Call) -> u32 {
+        answer(program, call)
+            .unwrap_or_else(|| panic!("the kernel's verifier would refuse the program"))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::eval::{Call, run};
+    use super::eval::{self, Call, run};
     use super::*;
 
     /// A syscall table of the `syscalls` crate: one per architecture a
@@ -1121,5 +1398,228 @@ mod tests {
     fn the_errnos_are_the_kernels() {
         assert_eq!(i32::from(ENOSYS), Errno::NOSYS.raw_os_error());
         assert_eq!(i32::from(EAFNOSUPPORT), Errno::AFNOSUPPORT.raw_os_error());
+    }
+
+    // -- The evaluator: every instruction the kernel's verifier accepts -------
+
+    /// A call of syscall 5 under audit architecture 7, made from an address
+    /// whose halves differ, with arguments that tell each other apart.
+    const CALL: Call = Call {
+        arch: 7,
+        nr: 5,
+        instruction_pointer: 0x1122_3344_5566_7788,
+        args: [10, 20, 30, 40, 50, 60],
+    };
+
+    /// What `program` answers [`CALL`].
+    fn answered(program: &[SockFilter]) -> Option<u32> {
+        eval::answer(program, &CALL)
+    }
+
+    /// The accumulator after `a` meets `k` under `op`, or the program's
+    /// refusal, for an operation with an immediate operand and then the same
+    /// with the index register as the operand.
+    fn arithmetic(op: u16, a: u32, k: u32) -> [Option<u32>; 2] {
+        use bpf::more::{ALU, LD_IMM, LDX_IMM, X};
+        [
+            answered(&[stmt(LD_IMM, a), stmt(ALU | op, k), stmt(bpf::RET_A, 0)]),
+            answered(&[
+                stmt(LDX_IMM, k),
+                stmt(LD_IMM, a),
+                stmt(ALU | op | X, 0),
+                stmt(bpf::RET_A, 0),
+            ]),
+        ]
+    }
+
+    #[test]
+    fn the_evaluator_reads_every_load() {
+        use bpf::more::{LD_IMM, LD_MEM, LD_W_LEN, LDX_IMM, LDX_MEM, LDX_W_LEN, ST, STX, TAX, TXA};
+        let low_half = |offset: u32| {
+            if cfg!(target_endian = "little") {
+                offset
+            } else {
+                offset + 4
+            }
+        };
+        let ret_a = stmt(bpf::RET_A, 0);
+        assert_eq!(answered(&[stmt(bpf::LD_W_ABS, 0), ret_a]), Some(5));
+        assert_eq!(answered(&[stmt(bpf::LD_W_ABS, 4), ret_a]), Some(7));
+        assert_eq!(
+            answered(&[stmt(bpf::LD_W_ABS, low_half(8)), ret_a]),
+            Some(0x5566_7788)
+        );
+        assert_eq!(
+            answered(&[stmt(bpf::LD_W_ABS, low_half(56)), ret_a]),
+            Some(60)
+        );
+        assert_eq!(answered(&[stmt(LD_W_LEN, 0), ret_a]), Some(64));
+        assert_eq!(
+            answered(&[stmt(LDX_W_LEN, 0), stmt(TXA, 0), ret_a]),
+            Some(64)
+        );
+        assert_eq!(
+            answered(&[
+                stmt(LD_IMM, 9),
+                stmt(TAX, 0),
+                stmt(LD_IMM, 1),
+                stmt(TXA, 0),
+                ret_a
+            ]),
+            Some(9)
+        );
+        // Scratch words, stored from either register and loaded into either.
+        let program = [
+            stmt(LD_IMM, 42),
+            stmt(ST, 15),
+            stmt(LDX_IMM, 7),
+            stmt(STX, 0),
+            stmt(LD_MEM, 15),
+            stmt(LDX_MEM, 0),
+            stmt(bpf::more::ALU | bpf::more::SUB | bpf::more::X, 0),
+            ret_a,
+        ];
+        assert_eq!(answered(&program), Some(35));
+        assert_eq!(answered(&[stmt(bpf::RET_K, 0x1234)]), Some(0x1234));
+    }
+
+    #[test]
+    fn the_evaluator_does_the_verifiers_arithmetic() {
+        use bpf::more::{ADD, AND, DIV, LSH, MUL, OR, RSH, SUB, XOR};
+        assert_eq!(arithmetic(ADD, u32::MAX, 2), [Some(1); 2]);
+        assert_eq!(arithmetic(SUB, 1, 2), [Some(u32::MAX); 2]);
+        assert_eq!(arithmetic(MUL, 0x8000_0000, 3), [Some(0x8000_0000); 2]);
+        assert_eq!(arithmetic(DIV, 7, 2), [Some(3); 2]);
+        assert_eq!(arithmetic(OR, 0b1100, 0b1010), [Some(0b1110); 2]);
+        assert_eq!(arithmetic(AND, 0b1100, 0b1010), [Some(0b1000); 2]);
+        assert_eq!(arithmetic(XOR, 0b1100, 0b1010), [Some(0b0110); 2]);
+        assert_eq!(arithmetic(LSH, 1, 31), [Some(0x8000_0000); 2]);
+        assert_eq!(arithmetic(RSH, 0x8000_0000, 31), [Some(1); 2]);
+        // A zero divisor the verifier sees is refused; one in the index
+        // register ends the program with 0, as the kernel's does.
+        assert_eq!(arithmetic(DIV, 7, 0), [None, Some(0)]);
+        // A shift past the width is refused as a constant, and takes the low
+        // five bits from the register.
+        assert_eq!(arithmetic(LSH, 1, 33), [None, Some(2)]);
+        assert_eq!(
+            answered(&[
+                stmt(bpf::more::LD_IMM, 1),
+                stmt(bpf::more::ALU_NEG, 0),
+                stmt(bpf::RET_A, 0)
+            ]),
+            Some(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn the_evaluator_takes_every_jump() {
+        use bpf::more::{JEQ, JGE, JGT, JMP, JSET, LD_IMM, LDX_IMM, X};
+        // A program that answers 1 where the test holds and 2 where it does
+        // not, comparing 6 with the operand, given as `k` or in the register.
+        let tested = |test: u16, operand: u32| {
+            let with_k = [
+                stmt(LD_IMM, 6),
+                jump(JMP | test, operand, 0, 1),
+                stmt(bpf::RET_K, 1),
+                stmt(bpf::RET_K, 2),
+            ];
+            let with_x = [
+                stmt(LDX_IMM, operand),
+                stmt(LD_IMM, 6),
+                jump(JMP | test | X, 0, 0, 1),
+                stmt(bpf::RET_K, 1),
+                stmt(bpf::RET_K, 2),
+            ];
+            let (k, x) = (answered(&with_k), answered(&with_x));
+            assert_eq!(k, x, "test {test:#x} against {operand}");
+            k
+        };
+        assert_eq!(tested(JEQ, 6), Some(1));
+        assert_eq!(tested(JEQ, 5), Some(2));
+        assert_eq!(tested(JGT, 5), Some(1));
+        assert_eq!(tested(JGT, 6), Some(2));
+        assert_eq!(tested(JGE, 6), Some(1));
+        assert_eq!(tested(JGE, 7), Some(2));
+        assert_eq!(tested(JSET, 2), Some(1));
+        assert_eq!(tested(JSET, 1), Some(2));
+        let skipped = [
+            stmt(bpf::JMP_JA, 1),
+            stmt(bpf::RET_K, 1),
+            stmt(bpf::RET_K, 2),
+        ];
+        assert_eq!(answered(&skipped), Some(2));
+    }
+
+    #[test]
+    fn the_evaluator_refuses_what_the_verifier_refuses() {
+        let ret_a = stmt(bpf::RET_A, 0);
+        for refused in [
+            // Off a word boundary, and beyond `seccomp_data`.
+            vec![stmt(bpf::LD_W_ABS, 2), ret_a],
+            vec![stmt(bpf::LD_W_ABS, 64), ret_a],
+            // A half-word load, which classic BPF has and seccomp refuses.
+            vec![stmt(0x28, 0), ret_a],
+            // A scratch word past the sixteenth.
+            vec![stmt(bpf::more::ST, 16), ret_a],
+            // The remainder, which the verifier leaves out.
+            vec![stmt(bpf::more::ALU | 0x90, 2), ret_a],
+            // A jump past the end, and a program with no return.
+            vec![stmt(bpf::JMP_JA, 5), ret_a],
+            vec![stmt(bpf::more::LD_IMM, 1)],
+            vec![],
+        ] {
+            assert_eq!(answered(&refused), None, "{refused:?}");
+        }
+    }
+
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_rewritten_program_notifies_where_the_original_refuses_with_an_errno() {
+        let refuse = |errno| stmt(bpf::RET_K, ret_errno(errno));
+        // Call 5 refused with EPERM, call 6 answered ENOSYS, call 7 killed, the
+        // rest allowed.
+        let program = [
+            stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+            jump(bpf::JMP_JEQ_K, 5, 0, 1),
+            refuse(1),
+            jump(bpf::JMP_JEQ_K, 6, 0, 1),
+            refuse(ENOSYS),
+            jump(bpf::JMP_JEQ_K, 7, 0, 1),
+            stmt(bpf::RET_K, RET_KILL_PROCESS),
+            stmt(bpf::RET_K, RET_ALLOW),
+        ];
+        let rewritten = notifying(&program).expect("every return is a constant");
+        let call = |nr| Call::new(AUDIT_ARCH_X86_64, nr, &[]);
+        assert_eq!(run(&rewritten, &call(5)), RET_USER_NOTIF);
+        assert_eq!(run(&rewritten, &call(6)), ret_errno(ENOSYS));
+        assert_eq!(run(&rewritten, &call(7)), RET_KILL_PROCESS);
+        assert_eq!(run(&rewritten, &call(8)), RET_ALLOW);
+        // A computed return cannot be rewritten.
+        assert_eq!(
+            notifying(&[stmt(bpf::more::LD_IMM, RET_ALLOW), stmt(bpf::RET_A, 0)]),
+            None
+        );
+    }
+
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn the_hand_over_passes_only_a_filter_that_runs_its_sendmsg() {
+        let sendmsg = Sysno::sendmsg.id() as u32;
+        let arch = AUDIT_ARCH_X86_64;
+        // A filter refusing sendmsg on one descriptor number, and logging it on
+        // another.
+        let program = [
+            stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+            jump(bpf::JMP_JEQ_K, sendmsg, 0, 5),
+            stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+            jump(bpf::JMP_JEQ_K, 9, 0, 1),
+            stmt(bpf::RET_K, RET_USER_NOTIF),
+            jump(bpf::JMP_JEQ_K, 10, 0, 1),
+            stmt(bpf::RET_K, RET_LOG),
+            stmt(bpf::RET_K, RET_ALLOW),
+        ];
+        assert!(!hands_over(&program, arch, 9));
+        assert!(hands_over(&program, arch, 10));
+        assert!(hands_over(&program, arch, 11));
     }
 }

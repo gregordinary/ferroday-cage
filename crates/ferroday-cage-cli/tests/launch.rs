@@ -134,3 +134,80 @@ fn the_resolved_inputs_name_what_fcage_adds_around_the_sandbox() {
     // relayed.
     assert_eq!(fcage["relayed"].as_array().map(Vec::len), Some(0));
 }
+
+/// What `fcage` writes of each call the seccomp filter refuses, before the
+/// call's name.
+const DENIED: &str = "fcage: the seccomp filter denied";
+
+/// Runs `fcage` with `flags`, the curated roster with its refusals reported,
+/// and then `command`, and checks the run wrote a refusal of `syscall`.
+fn assert_refusal_written(case: &str, flags: &[&str], command: &[&str], syscall: &str) {
+    let mut invocation = Command::new(FCAGE);
+    invocation
+        .args(flags)
+        .args(["--seccomp", "curated", "--seccomp-reports", "--"])
+        .args(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = common::run_bounded(&mut invocation, PATIENCE);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let written = format!("{DENIED} {syscall} to thread ");
+    assert!(
+        stderr.contains(&written) && stderr.contains("EPERM"),
+        "{case}: {}: {stderr:?}",
+        output.status
+    );
+}
+
+#[test]
+fn a_sandbox_writes_its_seccomp_refusals_however_it_starts() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    let rootfs = rootfs.to_str().expect("a UTF-8 fixture path");
+    let mount = [
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "mkdir -p /mnt; mount -t tmpfs none /mnt",
+    ];
+    assert_refusal_written("plain", &["--rootfs", rootfs], &mount, "mount");
+    assert_refusal_written(
+        "terminal",
+        &["--rootfs", rootfs, "--terminal"],
+        &mount,
+        "mount",
+    );
+    if common::require::tun() {
+        assert_refusal_written(
+            "pending",
+            &["--rootfs", rootfs, "--netstack", "--no-resolv-conf"],
+            &mount,
+            "mount",
+        );
+    }
+}
+
+#[test]
+fn a_restriction_writes_its_seccomp_refusals_however_it_starts() {
+    if !common::require::seccomp() {
+        return;
+    }
+    let unshare = "/usr/bin/unshare";
+    if !std::path::Path::new(unshare).exists() {
+        eprintln!("skipping: no {unshare} on this host");
+        return;
+    }
+    let command = [unshare, "--user", "true"];
+    assert_refusal_written("plain", &["--restrict"], &command, "unshare");
+    assert_refusal_written(
+        "terminal",
+        &["--restrict", "--terminal"],
+        &command,
+        "unshare",
+    );
+}

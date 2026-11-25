@@ -217,6 +217,10 @@ flags = [
 ]
 
 [[builder.setting]]
+name = "seccomp_reports"
+flags = ["--seccomp-reports", "--no-seccomp-reports"]
+
+[[builder.setting]]
 name = "landlock_fs"
 flags = ["--landlock-ro", "--landlock-rw", "--landlock-unix"]
 
@@ -324,6 +328,10 @@ flags = [
     "--seccomp-deny-rule",
     "--seccomp-errno",
 ]
+
+[[builder.setting]]
+name = "seccomp_reports"
+flags = ["--seccomp-reports", "--no-seccomp-reports"]
 
 [[builder.setting]]
 name = "landlock_fs"

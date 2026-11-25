@@ -99,6 +99,8 @@ mod export;
 pub(crate) mod frame;
 #[cfg(feature = "hardening")]
 mod harden;
+#[cfg(feature = "hardening")]
+mod listener;
 pub(crate) mod netns;
 mod overlay;
 mod procfs;
@@ -932,8 +934,15 @@ pub(crate) struct HardeningPlan {
     /// [`landlock_net`](Self::landlock_net)'s, in the order the command stage
     /// adds them. Never touched by the sandbox stages.
     pub(crate) landlock_labels: Vec<String>,
-    /// The compiled seccomp program, installed verbatim when present.
+    /// The compiled seccomp program, installed verbatim when present. Where
+    /// the refusals are reported, this is the notifying program, which holds
+    /// each refused call for the listener.
     pub(crate) seccomp: Option<Vec<SockFilter>>,
+    /// Where the seccomp program's refusals are reported: what the listener
+    /// answers each held call by. The command stage installs the filter with a
+    /// listener and hands it over on the listener channel, and the caller
+    /// serves it.
+    pub(crate) reported: Option<ReportedFilter>,
     /// The capability bits to retain across the drop; `None` leaves the
     /// namespaced capability set untouched.
     pub(crate) keep_caps: Option<u64>,
@@ -941,6 +950,22 @@ pub(crate) struct HardeningPlan {
     /// so a kept capability set survives it. Set only when a non-root
     /// run-as identity is combined with a capability keep set.
     pub(crate) set_securebits: bool,
+}
+
+/// The receiving end of a seccomp filter's reports.
+#[cfg(feature = "hardening")]
+pub(crate) type SeccompReports = crate::reports::Reports<crate::hardening::SeccompReport>;
+
+/// What the listener of a filter whose refusals are reported answers by: the
+/// policy as compiled, before its refusals became notifications, and the audit
+/// architecture its calls are made under.
+#[cfg(feature = "hardening")]
+#[derive(Debug, Clone)]
+pub(crate) struct ReportedFilter {
+    /// The policy as compiled, each refusal answered with its errno.
+    pub(crate) answers: std::sync::Arc<[SockFilter]>,
+    /// The audit architecture the filter is compiled for, the build's own.
+    pub(crate) arch: u32,
 }
 
 #[cfg(feature = "hardening")]
@@ -1436,6 +1461,9 @@ pub(crate) struct Launched {
     /// The caller's terminal, where the launch lent the sandbox its
     /// foreground, for the handle to hand back.
     pub(crate) foreground: Option<Foreground>,
+    /// The receiving end of the seccomp filter's reports, where they are made.
+    #[cfg(feature = "hardening")]
+    pub(crate) seccomp_reports: Option<SeccompReports>,
 }
 
 /// A process this caller forked, named by the pidfd its fork opened.
@@ -1527,6 +1555,11 @@ struct ParentSide {
     /// the sandbox sends the primary of the pseudoterminal it allocated over
     /// it, and [`receive_primary`] takes it.
     terminal: Option<OwnedFd>,
+    /// Caller end of the listener channel, present only where a seccomp
+    /// filter's refusals are reported: the command stage sends the filter's
+    /// listener over it before it executes the command.
+    #[cfg(feature = "hardening")]
+    listener: Option<OwnedFd>,
     /// The caller's terminal, where the launch lends the sandbox its
     /// foreground. Dropped with the rest of this on a launch that fails, which
     /// hands the foreground back.
@@ -1537,6 +1570,11 @@ struct ParentSide {
 /// is immaterial; a message of one byte with a descriptor is the primary, and
 /// anything else is a broken protocol.
 pub(super) const TERMINAL_BYTE: u8 = b'P';
+
+/// The payload byte a seccomp filter's listener rides on over the listener
+/// channel, on the terms [`TERMINAL_BYTE`] states for its own.
+#[cfg(feature = "hardening")]
+pub(super) const LISTENER_BYTE: u8 = b'L';
 
 /// The go byte written to the proceed pipe to release a gated command. Its
 /// value is immaterial; the child treats any byte as the signal to proceed.
@@ -1854,6 +1892,17 @@ fn fork_launch(
     } else {
         None
     };
+    // The listener channel exists only where a seccomp filter's refusals are
+    // reported. The command stage makes the listener as it installs the
+    // filter, and the listener crosses back before the command runs.
+    #[cfg(feature = "hardening")]
+    let listener_channel = if plan.hardening.reported.is_some() {
+        Some(seqpacket().map_err(spawn_error)?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "hardening"))]
+    let listener_channel: Option<(OwnedFd, OwnedFd)> = None;
 
     // The slots the setup keeps each hidden directory's tmpfs in until the
     // profile is in place, allocated here because the child cannot allocate.
@@ -1890,6 +1939,9 @@ fn fork_launch(
                 stderr_fd: plan.stderr.caller_fd(),
                 terminal,
                 terminal_channel_fd: terminal_channel
+                    .as_ref()
+                    .map(|(_, sandbox)| sandbox.as_fd()),
+                listener_channel_fd: listener_channel
                     .as_ref()
                     .map(|(_, sandbox)| sandbox.as_fd()),
                 take_foreground: foreground.is_some(),
@@ -1929,6 +1981,11 @@ fn fork_launch(
                 drop(sandbox);
                 caller
             });
+            #[cfg(feature = "hardening")]
+            let listener = listener_channel.map(|(caller, sandbox)| {
+                drop(sandbox);
+                caller
+            });
             Ok(ParentSide {
                 stage: stage_a,
                 host_sock,
@@ -1939,6 +1996,8 @@ fn fork_launch(
                 proceed_write,
                 map_gate,
                 terminal,
+                #[cfg(feature = "hardening")]
+                listener,
                 foreground,
             })
         }
@@ -1951,18 +2010,54 @@ fn fork_launch(
 /// `None` when the channel hung up without one: every process that could have
 /// sent it is gone, having failed first, and the report pipe says which step.
 fn receive_primary(channel: &OwnedFd) -> Result<Option<OwnedFd>, Error> {
+    receive_tagged(channel, TERMINAL_BYTE)
+}
+
+/// Receives the descriptor a channel of the launch's own carries on one
+/// message of the payload byte `tag`.
+///
+/// `None` when the channel hung up without one: every process that could have
+/// sent it is gone, having failed first, and the report pipe says which step.
+/// Anything but that one message is a broken protocol.
+pub(super) fn receive_tagged(channel: &OwnedFd, tag: u8) -> Result<Option<OwnedFd>, Error> {
     let mut payload = [0u8; 1];
-    let (bytes, primary) =
+    let (bytes, received) =
         frame::recv_with_fd(channel.as_fd(), &mut payload).map_err(wait_syscall_error)?;
-    match (bytes, primary) {
+    match (bytes, received) {
         (0, _) => Ok(None),
-        (1, Some(mut primary)) if payload[0] == TERMINAL_BYTE => {
+        (1, Some(mut received)) if payload[0] == tag => {
             // Kept off a standard number where a number above them is free;
             // see `above_stdio`.
-            let _ = above_stdio(&mut primary);
-            Ok(Some(primary))
+            let _ = above_stdio(&mut received);
+            Ok(Some(received))
         }
         _ => Err(wait_syscall_error(Errno::PROTO)),
+    }
+}
+
+/// Starts the thread that serves a reporting filter's listener, where `plan`'s
+/// refusals are reported, before the launch forks; see
+/// [`listener::prepare`].
+#[cfg(feature = "hardening")]
+fn prepare_listener(
+    plan: &LaunchPlan,
+) -> Result<(Option<listener::Awaiting>, Option<SeccompReports>), Error> {
+    match &plan.hardening.reported {
+        Some(reported) => {
+            let (awaiting, reports) =
+                listener::prepare(reported).map_err(|source| Error::Spawn { source })?;
+            Ok((Some(awaiting), Some(reports)))
+        }
+        None => Ok((None, None)),
+    }
+}
+
+/// Hands a waiting listener thread the caller's end of the listener channel the
+/// launch just made.
+#[cfg(feature = "hardening")]
+fn hand_listener(listening: Option<listener::Awaiting>, parent: &mut ParentSide) {
+    if let (Some(listening), Some(channel)) = (listening, parent.listener.take()) {
+        listening.hand(channel);
     }
 }
 
@@ -2112,7 +2207,11 @@ pub(crate) fn spawn(
     created: &mut Vec<CreatedTarget>,
 ) -> Result<(Launched, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
+    #[cfg(feature = "hardening")]
+    let (listening, seccomp_reports) = prepare_listener(plan)?;
     let mut parent = fork_launch(plan, observe, false, terminal, cgroup_procs)?;
+    #[cfg(feature = "hardening")]
+    hand_listener(listening, &mut parent);
     // A range map is established before the supervisor is published, so a
     // published sandbox always has a fully mapped user namespace.
     establish_identity_map(plan, &parent)?;
@@ -2159,6 +2258,8 @@ pub(crate) fn spawn(
                     stderr: parent.stderr,
                     reap: reap_after(plan.pid_namespace, parent.stage),
                     foreground: parent.foreground,
+                    #[cfg(feature = "hardening")]
+                    seccomp_reports,
                 },
                 primary,
             ))
@@ -2337,6 +2438,11 @@ pub(crate) struct PendingLaunch {
     /// kernel.
     #[cfg(all(feature = "hardening", feature = "netstack"))]
     landlock_net_handled: u64,
+    /// The receiving end of the seccomp filter's reports, where they are made:
+    /// the listener thread waits for the listener the command stage sends once
+    /// it is released.
+    #[cfg(feature = "hardening")]
+    seccomp_reports: Option<SeccompReports>,
 }
 
 /// Launches the sandbox but holds the command at the gate before `execve`,
@@ -2365,7 +2471,11 @@ pub(crate) fn spawn_pending(
     created: &mut Vec<CreatedTarget>,
 ) -> Result<(PendingLaunch, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
+    #[cfg(feature = "hardening")]
+    let (listening, seccomp_reports) = prepare_listener(plan)?;
     let mut parent = fork_launch(plan, observe, true, terminal, cgroup_procs)?;
+    #[cfg(feature = "hardening")]
+    hand_listener(listening, &mut parent);
     // The map precedes the supervisor's publication, so by the time the
     // caller holds a Pending, /proc/<pid>/ns/user is fully mapped — the
     // ordering the network stack's helper relies on when it enters the
@@ -2483,6 +2593,8 @@ pub(crate) fn spawn_pending(
             landlock_labels: plan.hardening.landlock_labels.clone(),
             #[cfg(all(feature = "hardening", feature = "netstack"))]
             landlock_net_handled: plan.hardening.landlock_net_handled,
+            #[cfg(feature = "hardening")]
+            seccomp_reports,
         },
         primary,
     ))
@@ -2537,6 +2649,8 @@ impl PendingLaunch {
                     stderr: self.stderr,
                     reap: reap_after(self.pid_namespace, self.stage),
                     foreground: self.foreground,
+                    #[cfg(feature = "hardening")]
+                    seccomp_reports: self.seccomp_reports,
                 })
             }
             Ok(Report::SetupFailed {
@@ -2688,6 +2802,14 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
         return Error::CgroupRefused {
             parent: parent.to_path_buf(),
             reason,
+        };
+    }
+    // A task may be under one filter with a listener, and the install answers
+    // `EBUSY` for that and nothing else: a filter this process runs under
+    // already holds one.
+    if step == SetupStep::InstallSeccompListener && errno == Errno::BUSY.raw_os_error() {
+        return Error::SeccompListenerHeld {
+            source: std::io::Error::from_raw_os_error(errno),
         };
     }
     // A `devpts` instance answers an open of its multiplexer with `ENOSPC` when

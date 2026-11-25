@@ -4361,6 +4361,52 @@ impl CageBuilder {
         self
     }
 
+    /// Reports each call the [seccomp](Self::seccomp) filter refuses the
+    /// command. Off by default.
+    ///
+    /// The filter holds each call its policy answers with an errno, and a
+    /// thread of the caller's answers it with that errno and reports it, so
+    /// the command sees what it would without the reports.
+    /// [`Running::take_seccomp_reports`](crate::Running::take_seccomp_reports)
+    /// hands the reports over, each a
+    /// [`SeccompReport`](crate::SeccompReport). A call answered `ENOSYS` is
+    /// answered at once and not reported: the answer tells the command the
+    /// call does not exist, so that it falls back.
+    ///
+    /// What the reports cost and change:
+    ///
+    /// - **Time.** A refused call takes about 4 µs rather than 1. The thread
+    ///   answers a burst of a thousand at once and then a thousand a second,
+    ///   so a command spinning on a refused call slows itself rather than
+    ///   costing the caller a processor.
+    /// - **The policy must allow `sendmsg`.** The command's stage hands the
+    ///   filter's listener to the caller with one, under the filter it has
+    ///   just installed. A policy that refuses it is refused at build with
+    ///   [`ConfigError::SeccompReportsUndelivered`](crate::ConfigError::SeccompReportsUndelivered).
+    ///   The curated roster allows it, and an allowlist names it.
+    /// - **A caller that exits.** Its thread ends with it, and every call the
+    ///   filter refuses after that fails with `ENOSYS` instead of the
+    ///   policy's errno: still refused.
+    /// - **The launch's own filters.** A call the sandbox's network filter
+    ///   also refuses gets that filter's errno and no report, since the kernel
+    ///   ranks an errno above a held call: under the curated roster,
+    ///   `io_uring_setup` fails with `ENOSYS` rather than `EPERM`.
+    /// - **One listener a process.** A launch whose caller already runs under
+    ///   a filter with a listener, as a runtime that intercepts syscalls
+    ///   installs, fails with
+    ///   [`Error::SeccompListenerHeld`](crate::Error::SeccompListenerHeld).
+    ///
+    /// A pre-compiled [`Program`](crate::SeccompPolicy::Program) is reported
+    /// as rules are, except one that returns a computed value, which is
+    /// refused with
+    /// [`ConfigError::SeccompReportsUnrewritable`](crate::ConfigError::SeccompReportsUnrewritable).
+    /// Reports without a policy are refused with
+    /// [`ConfigError::SeccompReportsUnfiltered`](crate::ConfigError::SeccompReportsUnfiltered).
+    pub fn seccomp_reports(mut self, report: bool) -> Self {
+        self.hardening.set_seccomp_reports(report);
+        self
+    }
+
     /// Drops every capability from the command.
     ///
     /// The command runs mapped to root inside the user namespace but holds no
@@ -9187,6 +9233,7 @@ seccomp = "curated"
 keep-caps = ["net-bind-service"]
 landlock-scope = ["signal"]
 resolve-unix = true
+seccomp-reports = true
 
 [[hardening.landlock-fs]]
 path = "/usr"
@@ -9278,7 +9325,7 @@ target = "/work/.git/hooks"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 107] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 108] = [
         "args",
         "base-env",
         "cgroup",
@@ -9307,6 +9354,7 @@ target = "/work/.git/hooks"
         "hardening.landlock-scope",
         "hardening.resolve-unix",
         "hardening.seccomp",
+        "hardening.seccomp-reports",
         "hardening.seccomp.allow",
         "hardening.seccomp.allow-rule",
         "hardening.seccomp.allow-rule[].arg",
@@ -9578,6 +9626,7 @@ target = "/work/.git/hooks"
 seccomp = "curated"
 landlock-scope = ["signal"]
 resolve-unix = true
+seccomp-reports = true
 "#,
         "empty-rootfs = true\nnameservers = [\"10.0.2.3\"]\n",
     ];

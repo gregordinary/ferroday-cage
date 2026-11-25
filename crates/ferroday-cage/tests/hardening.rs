@@ -736,3 +736,317 @@ fn keeping_a_capability_retains_only_it() {
     let bits = u64::from_str_radix(effective, 16).expect("a hex capability mask");
     assert_eq!(bits, 1 << 10, "only the kept capability remains");
 }
+
+// ---------------------------------------------------------------------------
+// Seccomp reports: each call the filter refuses, answered by the caller.
+// ---------------------------------------------------------------------------
+
+/// Collects the command's standard output.
+#[derive(Default)]
+struct Collected(Vec<u8>);
+
+impl ferroday_cage::Observer for Collected {
+    fn stdout(&mut self, chunk: &[u8]) {
+        self.0.extend_from_slice(chunk);
+    }
+}
+
+/// Every report a stream holds, read to its end, which comes once no process
+/// the filter governs is left; a stream that has not ended within ten seconds
+/// fails the test.
+fn drained(
+    reports: ferroday_cage::Reports<ferroday_cage::SeccompReport>,
+) -> Vec<ferroday_cage::SeccompReport> {
+    let mut read = Vec::new();
+    loop {
+        match reports.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(report) => read.push(report),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return read,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the reports did not end; read so far: {read:?}")
+            }
+        }
+    }
+}
+
+/// The syscall a report names, and the errno it answered.
+fn named(report: &ferroday_cage::SeccompReport) -> (Option<&'static str>, u16) {
+    match report {
+        ferroday_cage::SeccompReport::Denied { name, errno, .. } => (*name, *errno),
+        other => panic!("not a denial: {other:?}"),
+    }
+}
+
+/// How a test launches its sandbox: spawned, or held at the gate and released.
+#[derive(Debug, Clone, Copy)]
+enum Launch {
+    Spawned,
+    Released,
+}
+
+/// Runs `script` under the fixture's busybox with `policy`, its refusals
+/// reported where `reports` says so, and returns its standard output and the
+/// reports read to their end.
+fn reported_run(
+    rootfs: &Path,
+    script: &str,
+    policy: SeccompRules,
+    reports: bool,
+    pid_namespace: bool,
+    launch: Launch,
+) -> (String, Vec<ferroday_cage::SeccompReport>) {
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/busybox")
+        .args(["sh", "-c", script])
+        .pid_namespace(pid_namespace)
+        .seccomp(SeccompPolicy::Rules(policy))
+        .seccomp_reports(reports)
+        .build()
+        .expect("a valid sandbox configuration");
+    let mut collected = Collected::default();
+    let mut running = match launch {
+        Launch::Spawned => cage.spawn_with(&mut collected),
+        Launch::Released => cage
+            .spawn_pending_with(&mut collected)
+            .and_then(|pending| pending.proceed()),
+    }
+    .expect("the sandbox launches");
+    let stream = running.take_seccomp_reports();
+    assert_eq!(
+        stream.is_some(),
+        reports,
+        "reports are made exactly where asked for"
+    );
+    assert!(
+        running.take_seccomp_reports().is_none(),
+        "the reports are taken once"
+    );
+    running.wait().expect("the outcome is collected");
+    drop(running);
+    let read = stream.map(drained).unwrap_or_default();
+    (String::from_utf8_lossy(&collected.0).into_owned(), read)
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn a_refused_call_is_reported_and_answered_as_it_is_without_reports() {
+    let Some(rootfs) = rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    // Two refusals of the curated roster's, each run where the command is root
+    // in its own namespaces and would succeed unfiltered. The command sees the
+    // same failure with reports as without: the listener answers with the
+    // roster's errno.
+    let script = "mkdir -p /mnt; mount -t tmpfs none /mnt 2>&1; echo mount=$?; \
+                  unshare -U true 2>&1; echo unshare=$?";
+    for pid_namespace in [true, false] {
+        for launch in [Launch::Spawned, Launch::Released] {
+            let context = format!("pid namespace {pid_namespace}, {launch:?}");
+            let (plain, none) = reported_run(
+                rootfs,
+                script,
+                SeccompRules::curated(),
+                false,
+                pid_namespace,
+                launch,
+            );
+            assert!(none.is_empty());
+            assert!(
+                plain.contains("mount=1") && plain.contains("unshare=1"),
+                "{context}: {plain:?}"
+            );
+            let (reported_output, reports) = reported_run(
+                rootfs,
+                script,
+                SeccompRules::curated(),
+                true,
+                pid_namespace,
+                launch,
+            );
+            assert_eq!(reported_output, plain, "{context}");
+            let names: Vec<_> = reports.iter().map(named).collect();
+            assert!(
+                names.contains(&(Some("mount"), 1)),
+                "{context}: {reports:?}"
+            );
+            assert!(
+                names.contains(&(Some("unshare"), 1)),
+                "{context}: {reports:?}"
+            );
+            // Every report names a thread and what it ran.
+            for report in &reports {
+                let ferroday_cage::SeccompReport::Denied {
+                    thread, command, ..
+                } = report
+                else {
+                    unreachable!()
+                };
+                assert!(*thread > 0 && command.is_some(), "{context}: {report:?}");
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn a_report_carries_the_arguments_its_refusal_was_judged_on() {
+    let Some(rootfs) = rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    // The roster refuses `unshare` by its flags, and the report holds them.
+    let (_, reports) = reported_run(
+        rootfs,
+        "unshare -n true",
+        SeccompRules::curated(),
+        true,
+        true,
+        Launch::Spawned,
+    );
+    let flags = reports.iter().find_map(|report| match report {
+        ferroday_cage::SeccompReport::Denied {
+            name: Some("unshare"),
+            arguments,
+            ..
+        } => Some(arguments[0]),
+        _ => None,
+    });
+    let new_net = libc::CLONE_NEWNET as u64;
+    assert!(
+        flags.is_some_and(|flags| flags & new_net != 0),
+        "{reports:?}"
+    );
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn an_answer_of_absence_is_answered_and_not_reported() {
+    let Some(rootfs) = rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    // `sethostname` answered ENOSYS, as a kernel without it would, beside the
+    // roster's own refusals: the command sees the errno, and nothing reports
+    // it. The mount is the positive control that reports flow at all.
+    let rules = SeccompRules::curated().errno_for(libc::SYS_sethostname, libc::ENOSYS as u16);
+    let (output, reports) = reported_run(
+        rootfs,
+        "hostname elsewhere 2>&1; echo hostname=$?; mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null",
+        rules,
+        true,
+        true,
+        Launch::Spawned,
+    );
+    assert!(output.contains("hostname=1"), "{output:?}");
+    let names: Vec<_> = reports.iter().map(named).collect();
+    assert!(names.contains(&(Some("mount"), 1)), "{reports:?}");
+    assert!(
+        !names.iter().any(|(name, _)| *name == Some("sethostname")),
+        "{reports:?}"
+    );
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn a_restricted_commands_refusals_are_reported() {
+    if !common::require::seccomp() {
+        return;
+    }
+    let unshare = Path::new("/usr/bin/unshare");
+    if !unshare.exists() {
+        eprintln!("skipping: no {} on this host", unshare.display());
+        return;
+    }
+    let restriction = Restriction::builder()
+        .command(unshare)
+        .args(["--user", "true"])
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+        .seccomp_reports(true)
+        .build()
+        .expect("a valid restriction");
+    let mut running = restriction.spawn().expect("the command launches");
+    let stream = running
+        .take_seccomp_reports()
+        .expect("the reports are made");
+    let status = running.wait().expect("the outcome is collected");
+    assert!(!status.success(), "{status:?}");
+    drop(running);
+    let reports = drained(stream);
+    assert!(
+        reports
+            .iter()
+            .map(named)
+            .any(|named| named == (Some("unshare"), 1)),
+        "{reports:?}"
+    );
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+#[allow(unsafe_code)]
+fn a_caller_already_under_a_listener_cannot_have_reports() {
+    let Some(rootfs) = rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    let cage = move |reports: bool| {
+        Cage::builder()
+            .rootfs(rootfs)
+            .command("/bin/true")
+            .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+            .seccomp_reports(reports)
+            .build()
+            .expect("a valid sandbox configuration")
+    };
+    // A thread of its own takes a filter with a listener, as a runtime that
+    // intercepts syscalls installs one: a filter binds only the thread that
+    // installs it, and this one ends with the thread.
+    std::thread::spawn(move || {
+        let allow = libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        };
+        let program = libc::sock_fprog {
+            len: 1,
+            filter: (&raw const allow).cast_mut(),
+        };
+        // SAFETY: a flag on the calling thread, which ends with the test.
+        let no_new_privs = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        assert_eq!(no_new_privs, 0);
+        // SAFETY: the kernel copies the one-instruction program, which outlives
+        // the call, and answers with a listener this thread owns.
+        let listener = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                &raw const program,
+            )
+        };
+        assert!(listener >= 0, "{}", std::io::Error::last_os_error());
+        let held = cage(true).spawn();
+        assert!(
+            matches!(held, Err(Error::SeccompListenerHeld { .. })),
+            "{:?}",
+            held.map(|_| ())
+        );
+        // The same launch without reports installs its filter as usual.
+        assert!(cage(false).run().expect("the sandbox runs").success());
+        // SAFETY: the listener is this thread's, closed once.
+        unsafe { libc::close(listener as libc::c_int) };
+    })
+    .join()
+    .expect("the thread's assertions hold");
+}

@@ -759,6 +759,17 @@ impl RestrictionBuilder {
         self
     }
 
+    /// Reports each call the [seccomp](Self::seccomp) filter refuses the
+    /// command, as [`CageBuilder::seccomp_reports`](crate::CageBuilder::seccomp_reports)
+    /// describes for a sandbox. Off by default.
+    ///
+    /// The command runs in the host's PID namespace, so a process it leaves
+    /// behind keeps the reports going after it exits.
+    pub fn seccomp_reports(mut self, report: bool) -> Self {
+        self.hardening.set_seccomp_reports(report);
+        self
+    }
+
     /// The configured command path.
     pub fn get_command(&self) -> Option<&Path> {
         self.command.as_deref()

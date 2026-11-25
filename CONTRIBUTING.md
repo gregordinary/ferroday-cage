@@ -384,8 +384,9 @@ therefore replaces the crate page with that line's metadata.
   `Interrupt` blocks `SIGINT` there the same way. `fcage` has none. The only other
   `unsafe` is in test code that drives the kernel directly: `tests/keyring.rs`,
   `tests/relay.rs`, `tests/network_filter.rs`, `tests/process.rs`,
-  `tests/cgroup.rs`, and the testkit's pseudoterminal harness and its closing
-  of a probe's standard descriptors.
+  `tests/cgroup.rs`, the one test in `tests/hardening.rs` that runs under a
+  seccomp filter of its own, and the testkit's pseudoterminal harness and its
+  closing of a probe's standard descriptors.
 - **Every `unsafe` block states its invariant.** Every crate in the workspace
   denies `unsafe` by default. Each block that needs it carries a `SAFETY:`
   comment stating the invariant it relies on, which

@@ -107,6 +107,24 @@ consumer upgrading can skip it.
 
 ### Added
 
+- A sandbox or a restriction can report each call its seccomp filter refuses
+  the command: `seccomp_reports(true)` on `CageBuilder` and
+  `RestrictionBuilder`, `seccomp-reports` in a profile's `[hardening]` table.
+  The filter holds each call its policy answers with an errno, a thread of the
+  caller's answers it with that errno, and `Running::take_seccomp_reports`
+  hands over the reports, each a `SeccompReport` naming the syscall, its
+  arguments, the thread and its program, and the errno. A call answered
+  `ENOSYS` is not reported. A policy must allow `sendmsg` for its refusals to
+  be reported; one that does not is refused at build with
+  `ConfigError::SeccompReportsUndelivered`, reports without a policy with
+  `ConfigError::SeccompReportsUnfiltered`, and a precompiled program returning
+  a computed value with `ConfigError::SeccompReportsUnrewritable`. The command
+  stage installs the filter at the new `SetupStep::InstallSeccompListener` and
+  hands the listener over at `SetupStep::HandOverSeccompListener`. A caller
+  already under a filter with a listener fails to launch with
+  `Error::SeccompListenerHeld`. The resolved inputs record
+  `seccomp-reports`. `fcage --seccomp-reports` writes each refusal on standard
+  error, and `--no-seccomp-reports` overrides a profile.
 - `fcage --host-report` prints what the host offers a sandbox, as TOML: user
   namespaces, the Landlock ABI, seccomp, a procfs of the sandbox's own, range
   maps, this process's cgroup, and a security module's confinement, each a

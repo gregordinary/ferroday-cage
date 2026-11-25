@@ -223,6 +223,14 @@ wire_enum! {
         /// between it and the nearest mount above it onto itself; see
         /// [`ReadOnly`](crate::ReadOnly).
         HoldReadOnlyName = 69 => "holding the name of a read-only path",
+        /// Install the seccomp filter with the listener its reports are made
+        /// through; see
+        /// `CageBuilder::seccomp_reports`.
+        InstallSeccompListener = 70 => "installing the seccomp filter with its listener",
+        /// Hand the seccomp filter's listener to the caller, on a channel of
+        /// the launch's own. `EDEADLK` where the filter would refuse the hand-over
+        /// itself, which the stage checks before installing it.
+        HandOverSeccompListener = 71 => "handing the seccomp filter's listener to the caller",
     }
 }
 
@@ -989,6 +997,21 @@ rendered as text.
         /// The limit the kernel would not apply.
         resource: crate::Resource,
     },
+    /// A seccomp policy's refusals were to be reported, and no seccomp policy
+    /// is set; see
+    /// `CageBuilder::seccomp_reports`.
+    SeccompReportsUnfiltered,
+    /// A seccomp policy's refusals were to be reported, and the precompiled
+    /// program returns a computed value: its refusals cannot be told from its
+    /// other answers before it runs, so none can be turned into a report.
+    SeccompReportsUnrewritable,
+    /// A seccomp policy's refusals were to be reported, and the policy refuses
+    /// the `sendmsg` that hands the reports' listener to the caller.
+    ///
+    /// The command stage installs the filter, which makes the listener, and
+    /// then sends it; a filter refusing the send would hold the stage waiting
+    /// for an answer only the listener it holds could give.
+    SeccompReportsUndelivered,
 }
 
 impl fmt::Display for ConfigError {
@@ -1057,6 +1080,17 @@ impl fmt::Display for ConfigError {
                 "the command would run as the host's root user, whom the kernel exempts from \
                  {resource}, so the limit would hold nothing; a cgroup's pids-max bounds the \
                  process count instead",
+            ),
+            ConfigError::SeccompReportsUnfiltered => f.write_str(
+                "seccomp reports are on, and no seccomp policy is set to refuse anything",
+            ),
+            ConfigError::SeccompReportsUnrewritable => f.write_str(
+                "seccomp reports are on, and the precompiled program returns a computed value, \
+                 so its refusals cannot be reported",
+            ),
+            ConfigError::SeccompReportsUndelivered => f.write_str(
+                "seccomp reports are on, and the policy refuses sendmsg, which hands the \
+                 reports' listener to the caller; allow sendmsg, or turn the reports off",
             ),
             ConfigError::MountTargetInvalid { path } => write!(
                 f,
@@ -1693,6 +1727,19 @@ pub enum Error {
         /// The error the kernel returned, `EACCES`.
         source: io::Error,
     },
+    /// The seccomp filter's refusals could not be reported: a filter this
+    /// process already runs under holds a listener, and a process may be
+    /// under one such filter at most.
+    ///
+    /// A container runtime or a sandbox that intercepts syscalls with a
+    /// listener of its own leaves no room for this one. The same launch
+    /// without `seccomp_reports`
+    /// installs its filter as usual.
+    #[non_exhaustive]
+    SeccompListenerHeld {
+        /// The error the kernel returned for the install, `EBUSY`.
+        source: io::Error,
+    },
 }
 
 /// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
@@ -1873,6 +1920,10 @@ impl fmt::Display for Error {
                  naming the sandbox's supervisor (no descriptor number was free under \
                  RLIMIT_NOFILE, or a security module refused it)",
             ),
+            Error::SeccompListenerHeld { .. } => f.write_str(
+                "the seccomp filter's refusals cannot be reported: a filter this process \
+                 already runs under holds the one listener a process may have",
+            ),
             Error::MountRefused {
                 step,
                 confinement,
@@ -1921,7 +1972,8 @@ impl std::error::Error for Error {
             | Error::TerminalsExhausted { source }
             | Error::ProcfsRefused { source, .. }
             | Error::Cgroup { source, .. }
-            | Error::MountRefused { source, .. } => Some(source),
+            | Error::MountRefused { source, .. }
+            | Error::SeccompListenerHeld { source } => Some(source),
             Error::Listen { source, .. } => source
                 .as_ref()
                 .map(|source| source as &(dyn std::error::Error + 'static)),

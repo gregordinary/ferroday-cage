@@ -29,8 +29,20 @@ use std::time::Duration;
 /// those 1024 reports at most, and the empty queue costs a few kilobytes.
 pub(crate) const QUEUED_REPORTS: usize = 1024;
 
-/// The receiving end of a stream of reports: the network stack's, from
-/// [`NetStackHandle::take_reports`](crate::NetStackHandle::take_reports).
+/// The receiving end of a stream of reports.
+///
+// Each source is feature-gated, so the sentence naming it, and its intra-doc
+// link, is gated with it, per the crate-level convention.
+#[cfg_attr(
+    feature = "netstack",
+    doc = "The network stack's decisions arrive in one, from
+[`NetStackHandle::take_reports`](crate::NetStackHandle::take_reports)."
+)]
+#[cfg_attr(
+    feature = "hardening",
+    doc = "A seccomp filter's refusals arrive in one, from
+[`Running::take_seccomp_reports`](crate::Running::take_seccomp_reports)."
+)]
 ///
 /// Whatever makes the reports never waits on their reader. The queue holds
 /// 1024 reports, and a report it has no room for is dropped and counted, which

@@ -364,6 +364,83 @@ unchanged, as [A foreign-architecture test
 run](cross-architecture.md#where-the-architecture-is-decided-and-where-it-is-not)
 describes.
 
+### Reporting the filter's refusals
+
+[`seccomp_reports`] reports each call the filter refuses the command. The filter
+holds each call its policy answers with an errno, and a thread of the caller's
+answers it with that errno and reports it, so the command sees what it would
+without the reports. [`Running::take_seccomp_reports`] hands the reports over,
+each a [`SeccompReport`] naming the syscall, its six arguments as raw values,
+the thread that made it and the program the thread runs, and the errno. A
+harness that reads them can name what stopped a command and offer to rerun it
+with the policy widened.
+
+```rust,no_run
+# use ferroday_cage::{Cage, SeccompPolicy, SeccompRules};
+# fn main() -> ferroday_cage::Result<()> {
+let cage = Cage::builder()
+    .rootfs("/srv/rootfs")
+    .command("/usr/bin/job")
+    .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+    .seccomp_reports(true)
+    .build()?;
+let mut running = cage.spawn()?;
+let reports = running.take_seccomp_reports().expect("the reports are made");
+let reader = std::thread::spawn(move || {
+    while let Ok(report) = reports.recv() {
+        // denied mount to thread 48213 (mount): EPERM
+        eprintln!("{report}");
+    }
+});
+let status = running.wait()?;
+reader.join().expect("the reader finishes");
+# let _ = status;
+# Ok(())
+# }
+```
+
+What is reported, and what is not:
+
+- **An answer of absence is not a refusal.** A call the policy answers `ENOSYS`
+  is answered at once and not reported, since the answer tells the command the
+  call does not exist so that it falls back. The curated roster answers
+  `clone3` so.
+- **The launch's own filters answer first.** The kernel ranks an errno above a
+  held call, so a call the network filter also refuses gets that filter's errno
+  and no report. With reports on, `io_uring_setup` under the curated roster
+  fails with `ENOSYS` rather than `EPERM`.
+- **A pointer is not followed.** What an argument points at belongs to the
+  command, and a thread of its own could change it before anything read it.
+- **Landlock's refusals are not reported.** The kernel records a Landlock denial
+  only in its audit log, which a process without privilege cannot read, and by
+  default not at all for a program the domain's creator executed. The command
+  sees `EACCES`, or `EXDEV` for a rename across a granted boundary.
+
+What the reports cost and require:
+
+- **Time.** A refused call takes about 4 µs rather than 1. The caller's thread
+  answers a burst of a thousand at once and a thousand a second after, holding
+  each call until its turn, so a command that spins on a refused call slows
+  itself rather than costing the caller a processor outside every limit the
+  sandbox runs under.
+- **`sendmsg`.** The command's stage installs the filter, which makes the
+  listener, and hands the listener to the caller with one `sendmsg` under the
+  filter it has just installed. A policy that refuses it would hold the stage
+  forever, so the build refuses that policy. The curated roster allows it, and
+  an allowlist names it.
+- **One listener a process.** A process may be under one filter with a listener.
+  A caller already under one, as a runtime that intercepts syscalls installs,
+  fails to launch with [`Error::SeccompListenerHeld`].
+- **A caller that stays.** The caller's thread answers every refused call. Once
+  the caller exits, the kernel answers each `ENOSYS` instead: still refused,
+  under another errno.
+
+The reports end once no process under the filter is left and every queued
+report has been read. Under a PID namespace that is as the sandbox ends. Without
+one, a process the command leaves behind keeps them going. The queue holds 1024
+reports and never makes the caller's thread wait: a report it has no room for is
+dropped and counted, which [`Reports::dropped`] answers.
+
 ## Capability drops
 
 In a user namespace the command is mapped to root and holds every capability
@@ -769,7 +846,8 @@ filter syscalls by name.
 terms of a profile's `arg` entries, `len`, `op`, `value` and `mask`, except that
 the flag names the argument `arg=` where the profile's entry names it `index`:
 `--seccomp-allow-rule 'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno clone3=ENOSYS`
-answers one syscall with an errno of its own. `--drop-caps` and `--keep-caps`
+answers one syscall with an errno of its own, and `--seccomp-reports` writes
+each call the filter refuses on standard error. `--drop-caps` and `--keep-caps`
 control capabilities, and `--deny-net` selects the denied network.
 
 The Landlock and seccomp primitives also stand on their own: on hosts
@@ -784,6 +862,11 @@ with no sandbox around it.
 [`seccomp`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.seccomp
 [`SeccompPolicy`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.SeccompPolicy.html
 [`SeccompRules`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html
+[`seccomp_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.seccomp_reports
+[`Running::take_seccomp_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.take_seccomp_reports
+[`SeccompReport`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.SeccompReport.html
+[`Error::SeccompListenerHeld`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.Error.html#variant.SeccompListenerHeld
+[`Reports::dropped`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Reports.html#method.dropped
 [`SeccompRules::rule`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.rule
 [`SeccompRules::curated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.curated
 [`SeccompRules::syscall`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.syscall

@@ -540,6 +540,9 @@ pub enum ResolvedHardening {
         /// policy from another at a glance, and a consumer that needs to pin
         /// the exact program has the policy it supplied.
         seccomp_instructions: Option<usize>,
+        /// Whether the seccomp filter's refusals are reported to the caller;
+        /// see `CageBuilder::seccomp_reports`.
+        seccomp_reports: bool,
         /// The capability bits retained across the drop.
         ///
         /// `None` drops nothing, leaving the set the identity switch leaves:
@@ -933,6 +936,7 @@ fn project_hardening(plan: &LaunchPlan) -> ResolvedHardening {
                 != 0,
             landlock_scope: plan.hardening.landlock_scoped,
             seccomp_instructions: plan.hardening.seccomp.as_ref().map(Vec::len),
+            seccomp_reports: plan.hardening.reported.is_some(),
             keep_capabilities: plan.hardening.keep_caps,
             landlock_abi: requests_landlock(&plan.hardening)
                 .then(crate::mechanism::probe_landlock_abi)
@@ -1121,7 +1125,7 @@ mod serde_tests {
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 76] = [
+    const EXPECTED_RECORD_KEYS: [&str; 77] = [
         "cgroup",
         "cgroup.kind",
         "cgroup.limits",
@@ -1148,6 +1152,7 @@ mod serde_tests {
         "hardening.landlock-resolve-unix",
         "hardening.landlock-scope",
         "hardening.seccomp-instructions",
+        "hardening.seccomp-reports",
         "hostname",
         "identity",
         "identity.gid",
@@ -1312,6 +1317,7 @@ mod serde_tests {
                 landlock_resolve_unix: true,
                 landlock_scope: 3,
                 seccomp_instructions: Some(4),
+                seccomp_reports: true,
                 keep_capabilities: Some(5),
                 landlock_abi: Some(6),
             },
@@ -1490,7 +1496,7 @@ mod serde_tests {
         // than on the configuration, which is the whole point of the field
         // being present either way.
         #[cfg(feature = "hardening")]
-        let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\nlandlock-resolve-unix = false\nlandlock-scope = 0\n";
+        let hardening = "[hardening]\nkind = \"applied\"\nlandlock-fs = []\nlandlock-net = []\nlandlock-resolve-unix = false\nlandlock-scope = 0\nseccomp-reports = false\n";
         #[cfg(not(feature = "hardening"))]
         let hardening = "[hardening]\nkind = \"unavailable\"\n";
         // The isolated network's filter, which refuses `socketcall`'s socket

@@ -349,6 +349,7 @@ drop-caps = true                    # drop every capability...
 landlock-scope = ["signal"]         # no signals to processes outside the sandbox
 resolve-unix = true                 # no connections to unix sockets ungranted
 
+seccomp-reports = true              # report each call the policy refuses
 seccomp = "curated"                 # the curated deny-list of dangerous syscalls
 
 [[hardening.landlock-fs]]
@@ -388,6 +389,10 @@ it did not create, except beneath a path granted `u`, and needs Landlock ABI 9.
 The [hardening chapter](hardening.md#landlock-and-unix-sockets) describes it. A
 sandbox on the host's own root has it on unless `resolve-unix = false` turns it
 off.
+
+`seccomp-reports = true` reports each call the seccomp policy refuses the
+command, as the [hardening chapter](hardening.md#reporting-the-filters-refusals)
+describes, and `fcage` writes each on standard error.
 
 `seccomp` is either the string `"curated"` or a table naming syscalls to
 filter — a deny-list, or an allow-list that must name every syscall the command
@@ -525,9 +530,10 @@ it:
 - Hardening flags compose with a profile's `[hardening]` table. `--landlock-ro`,
   `--landlock-rw`, `--landlock-unix`, `--landlock-bind`, and `--landlock-connect`
   add grants to it. `--landlock-scope`, `--landlock-resolve-unix` and
-  `--no-landlock-resolve-unix`, `--drop-caps`, `--keep-caps`, and the seccomp
-  flags that set a posture replace its scopes, unix-socket restriction,
-  capability posture, or seccomp policy.
+  `--no-landlock-resolve-unix`, `--drop-caps`, `--keep-caps`,
+  `--seccomp-reports` and `--no-seccomp-reports`, and the seccomp flags that
+  set a posture replace its scopes, unix-socket restriction, capability
+  posture, reports, or seccomp policy.
   `--seccomp-errno` joins the policy that stands instead, the flags' or else the
   profile's. The seccomp flags mirror the profile's seccomp table.
   `--seccomp-allow` and `--seccomp-deny` take comma-separated syscall names.

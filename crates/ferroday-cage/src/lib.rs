@@ -306,7 +306,7 @@ mod path;
 mod poll;
 pub mod provision;
 pub mod relay;
-#[cfg(feature = "netstack")]
+#[cfg(any(feature = "netstack", feature = "hardening"))]
 mod reports;
 mod resolved;
 #[cfg(feature = "hardening")]
@@ -327,7 +327,7 @@ pub use failure::ErrorChain;
 pub use hardening::{
     Capability, FsAccess, LandlockScope, NetAccess, ParseCapabilityError, ParseFsAccessError,
     ParseLandlockScopeError, ParseNetAccessError, SeccompAction, SeccompArg, SeccompArgLen,
-    SeccompCompare, SeccompPolicy, SeccompRules,
+    SeccompCompare, SeccompPolicy, SeccompReport, SeccompRules,
 };
 #[cfg(feature = "subid")]
 pub use idmap::SubidMapper;
@@ -344,7 +344,7 @@ pub use netstack::{
     NetStackHandle, NetStackReport, ParseDestinationRuleError, Transport,
 };
 pub use observer::{Capped, Excerpt, Observer, Output, Progress};
-#[cfg(feature = "netstack")]
+#[cfg(any(feature = "netstack", feature = "hardening"))]
 pub use reports::Reports;
 pub use resolved::{
     ResolvedCgroup, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
