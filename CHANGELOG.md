@@ -119,6 +119,11 @@ consumer upgrading can skip it.
   `ProvisionError::EntryRefused`, an overlay naming no upper or no lower with
   `ProvisionError::OverlayLayerMissing`, and an entry the caller cannot read
   is listed as incomplete.
+- An upper can be copied to a new one, so two sessions continue from one
+  point: `ChangeSet::fork` copies the upper the changes were read from,
+  whiteouts, opaque markers and escaped attributes included, keeping holes,
+  shared inodes, modes and times, and returns the `Overlay` of the same
+  lowers over the copy.
 - A change set can be written into a tree: `ChangeSet::apply` returns an
   `Apply`, which takes a `filter`, the paths it refuses to change
   (`Protected`, a path from the target's top or a name at any depth, with

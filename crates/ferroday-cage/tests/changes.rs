@@ -253,3 +253,46 @@ fn a_run_applied_to_its_tree_leaves_the_tree_as_the_run_saw_it() {
     let left: Vec<&Path> = left.changes().iter().map(|change| change.path()).collect();
     assert_eq!(left, [Path::new("added-fifo")]);
 }
+
+/// A fork of a run's upper mounts with the view the run left, and what a
+/// sandbox over the fork writes stays out of the upper it was copied from.
+#[test]
+fn a_forked_upper_continues_from_where_the_run_left_it() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("changes-fork");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let tree = tree(&dir);
+    let overlay = Overlay::new().lower(&tree).upper(dir.join("upper"));
+    let run = |overlay: &Overlay, script: &str| {
+        Cage::builder()
+            .rootfs(rootfs)
+            .overlay_at("/work", overlay.clone())
+            .command("/bin/sh")
+            .args(["-c", script])
+            .build()
+            .expect("a valid overlay mount")
+            .run()
+            .expect("the sandbox launches")
+            .success()
+    };
+    assert!(run(&overlay, SCRIPT));
+    let forked = ChangeSet::read(&overlay)
+        .unwrap()
+        .fork(dir.join("fork"))
+        .expect("the upper forks");
+    assert!(
+        run(
+            &forked,
+            "set -e; cd /work; test \"$(cat modify)\" = changed; test ! -e delete; \
+             test ! -e replace-dir/inner; test -d replace-file; echo forked > only-in-fork"
+        ),
+        "the fork shows what the run left"
+    );
+    assert!(dir.join("fork/only-in-fork").is_file());
+    assert!(!dir.join("upper/only-in-fork").exists());
+    assert!(run(&overlay, "test ! -e /work/only-in-fork"));
+}

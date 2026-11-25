@@ -507,7 +507,7 @@ report name a package and its version bare.
 | Read a file in such a tree, bounded, with absence as an answer | `Rooted::read`, `Rooted::read_if_present`, and `Rooted::read_text`, `Rooted::read_text_if_present` for a file read as text |
 | Remove or empty a file in such a tree only where what holds the name is approved | `Rooted::remove_if`, `Rooted::truncate_if`, judged by `Rooted::is_file_with_content` or `Rooted::is_whiteout` |
 | Rewrite a file in place, keeping the owner and mode a script gave it | `Rooted::overwrite` |
-| Lay a host tree into a root | `provision::CopyIn`, or `extract::overlay_tree` between configure waves |
+| Lay a host tree into a root | `provision::CopyIn`, or `extract::overlay_tree` between configure waves. An overlay's upper into a new upper, its records kept, is `provision::ChangeSet::fork` |
 | Give entries a tree already holds the owner only its identity map can express | `provision::copyin::reown`, an `Owed` per entry, `Owner::Host` or `Owner::Tree` |
 | Which identity map, and which delegate, is a tree owned through? | `provision::identity::Ownership` |
 | Stage a layer into an overlay upper, removing the upper on failure only where this call created it | `provision::layer::Staging` |

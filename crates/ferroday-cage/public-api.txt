@@ -1457,6 +1457,8 @@ pub fn ferroday_cage::provision::ChangeSet::get_lowers(&self) -> &[std::path::Pa
 pub fn ferroday_cage::provision::ChangeSet::get_upper(&self) -> &std::path::Path
 pub fn ferroday_cage::provision::ChangeSet::is_empty(&self) -> bool
 pub fn ferroday_cage::provision::ChangeSet::read(&ferroday_cage::Overlay) -> core::result::Result<ferroday_cage::provision::ChangeSet, ferroday_cage::provision::ProvisionError>
+impl ferroday_cage::provision::ChangeSet
+pub fn ferroday_cage::provision::ChangeSet::fork(&self, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::Overlay, ferroday_cage::provision::ProvisionError>
 impl core::marker::Freeze for ferroday_cage::provision::ChangeSet
 impl core::marker::Send for ferroday_cage::provision::ChangeSet
 impl core::marker::Sync for ferroday_cage::provision::ChangeSet

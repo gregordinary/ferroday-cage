@@ -986,7 +986,7 @@ fn align_attributes(from: BorrowedFd<'_>, to: BorrowedFd<'_>) -> Result<(), Errn
 
 /// Whether an apply carries the attribute `name`: one in the `user.` namespace
 /// or an access control list, and not one the host assigns.
-fn carries(name: &[u8]) -> bool {
+pub(super) fn carries(name: &[u8]) -> bool {
     (name.starts_with(b"user.")
         || name == b"system.posix_acl_access"
         || name == b"system.posix_acl_default")
@@ -997,7 +997,7 @@ fn carries(name: &[u8]) -> bool {
 /// the holes of a sparse file as holes: only the ranges `from` holds data in
 /// are copied, and `to` is extended to `size` after. `ESTALE` where `from`
 /// holds fewer bytes than `size`.
-fn copy_data(from: BorrowedFd<'_>, to: BorrowedFd<'_>, size: u64) -> Result<(), Errno> {
+pub(super) fn copy_data(from: BorrowedFd<'_>, to: BorrowedFd<'_>, size: u64) -> Result<(), Errno> {
     let mut at = 0u64;
     while at < size {
         let data = match fs::seek(from, SeekFrom::Data(at)) {
@@ -1082,7 +1082,7 @@ fn copy_buffered(
 /// The directory `path`, relative to `top`, opened by descriptor one component
 /// at a time, never through a symbolic link: `ELOOP` or `ENOTDIR` where a
 /// component is a link or not a directory.
-fn resolve(top: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd, Errno> {
+pub(super) fn resolve(top: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd, Errno> {
     let mut dir = fs::openat(
         top,
         c".",
@@ -1100,7 +1100,7 @@ fn resolve(top: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd, Errno> {
 
 /// A change's path split into the directory it lies in and its own name.
 /// `EINVAL` for a path naming no entry, which no change the reader lists does.
-fn split(path: &Path) -> Result<(&Path, CString), Errno> {
+pub(super) fn split(path: &Path) -> Result<(&Path, CString), Errno> {
     let leaf = path.file_name().ok_or(Errno::INVAL)?;
     let leaf = CString::new(leaf.as_bytes()).map_err(|_| Errno::INVAL)?;
     Ok((path.parent().unwrap_or(Path::new("")), leaf))
