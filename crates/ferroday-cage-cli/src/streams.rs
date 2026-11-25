@@ -78,7 +78,6 @@ use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::thread::JoinHandle;
 
-use ferroday_cage::Stdio;
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{FileType, OFlags, Stat};
 use rustix::io::Errno;
@@ -185,13 +184,13 @@ impl std::error::Error for StartError {
     }
 }
 
-/// The relays one launch runs, and the dispositions that route the command's
-/// streams through them.
+/// The relays a launch or `fcage --exec` runs, and the descriptors that route
+/// the command's streams through them.
 pub struct StreamRelay {
-    /// The dispositions to give the builder in place of the inherited ones:
-    /// standard input, output, and error, in that order. `None` leaves a stream
-    /// as it was.
-    replacements: [Option<Stdio>; 3],
+    /// The descriptors to give the command in place of `fcage`'s own: standard
+    /// input, output, and error, in that order. `None` leaves a stream as it
+    /// was.
+    replacements: [Option<OwnedFd>; 3],
     /// The standard input relay, where standard input is a file.
     input: Option<Input>,
     /// The output relays, each with the streams it serves, joined by
@@ -286,13 +285,13 @@ impl Judged {
         };
         if shared {
             let writer = relay.pump(own[1], "standard output and error", &stop_read)?;
-            relay.replacements[2] = Some(Stdio::from_fd(writer.try_clone()?));
-            relay.replacements[1] = Some(Stdio::from_fd(writer));
+            relay.replacements[2] = Some(writer.try_clone()?);
+            relay.replacements[1] = Some(writer);
         } else {
             for index in [1, 2] {
                 if relayed(index).is_some() {
                     let writer = relay.pump(own[index], STREAMS[index], &stop_read)?;
-                    relay.replacements[index] = Some(Stdio::from_fd(writer));
+                    relay.replacements[index] = Some(writer);
                 }
             }
         }
@@ -303,14 +302,14 @@ impl Judged {
             let file = File::from(own[0].try_clone_to_owned()?);
             let (input, reader) = Input::start(file, stop_read.try_clone()?)?;
             relay.input = Some(input);
-            relay.replacements[0] = Some(Stdio::from_fd(reader));
+            relay.replacements[0] = Some(reader);
         }
         Ok(relay)
     }
 }
 
 /// `fcage`'s own standard input, output, and error, in that order.
-fn own_streams() -> [BorrowedFd<'static>; 3] {
+pub fn own_streams() -> [BorrowedFd<'static>; 3] {
     [
         rustix::stdio::stdin(),
         rustix::stdio::stdout(),
@@ -337,9 +336,11 @@ impl StreamRelay {
         Ok(writer.into())
     }
 
-    /// The dispositions to set on the builder, taken once: a stream this
-    /// returns `None` for is left as it was.
-    pub fn take_replacements(&mut self) -> [Option<Stdio>; 3] {
+    /// The descriptors to hand the command in place of `fcage`'s own streams,
+    /// taken once: a stream this returns `None` for is left as it was. A
+    /// launch sets each on its builder, and `fcage --exec` passes each to the
+    /// session.
+    pub fn take_replacements(&mut self) -> [Option<OwnedFd>; 3] {
         std::mem::take(&mut self.replacements)
     }
 

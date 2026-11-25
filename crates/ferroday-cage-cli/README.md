@@ -93,6 +93,14 @@ process outside `fcage`'s own user namespace, as every sandbox's is, is refused:
 fcage --serve "$XDG_RUNTIME_DIR/build.sock" --host-rootfs --bind ~/project ~/project &
 ```
 
+`--exec SOCKET` runs one command in that sandbox from a shell. The command gets the
+client's own standard streams, and the client exits as the command did. A `^C` reaches the
+command, and the client's end ends it:
+
+```sh
+fcage --exec "$XDG_RUNTIME_DIR/build.sock" --chdir ~/project -- cargo test
+```
+
 ## Confining the command
 
 The default profile is a rootless convenience for code you trust. Untrusted code calls for

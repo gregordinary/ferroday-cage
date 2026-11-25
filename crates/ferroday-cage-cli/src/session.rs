@@ -67,10 +67,10 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, IoSliceMut, Read as _, Write as _};
+use std::io::{self, IoSlice, IoSliceMut, Read as _, Write as _};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -86,11 +86,11 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::net::{
-    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendFlags,
-    SocketAddrUnix, SocketFlags, SocketType,
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
 };
 use rustix::process::Signal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::events::{self, Bytes, EndReason, Event, Fault};
@@ -162,33 +162,15 @@ impl Socket {
     /// process-wide umask set around the bind.
     pub fn bind(path: &Path) -> Result<Socket, Fault> {
         let refused = |message: String| Fault::plain("fcage", message);
-        let name = path
-            .file_name()
-            .filter(|_| !path.as_os_str().as_bytes().ends_with(b"/"))
-            .ok_or_else(|| {
-                refused(format!(
-                    "--serve {}: the path names no socket; give the directory and the \
-                     socket's name in it",
-                    path.display()
-                ))
-            })?
-            .to_os_string();
-        // The library's `path::parent_of` answers this for itself; `fcage` is
-        // a crate apart, and states the same fallback (`tools/idioms.toml`).
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let directory = rustix::fs::open(
-            parent,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| {
-            let mut fault = Fault::of("fcage", &io::Error::from(errno));
-            fault.message = format!("opening {}: {}", parent.display(), fault.message);
-            fault
+        let (parent, name) = place(path).ok_or_else(|| {
+            refused(format!(
+                "--serve {}: the path names no socket; give the directory and the socket's \
+                 name in it",
+                path.display()
+            ))
         })?;
+        let name = name.to_os_string();
+        let directory = open_directory(parent)?;
         let held = rustix::fs::fstat(&directory)
             .map_err(|errno| Fault::of("fcage", &io::Error::from(errno)))?;
         let user = rustix::process::geteuid().as_raw();
@@ -220,12 +202,8 @@ impl Socket {
         )
         .map_err(|errno| Fault::of("fcage", &io::Error::from(errno)))?;
         // Bound through the directory's descriptor, so the bind lands in the
-        // directory checked above whatever its path names by now, and a path
-        // too long for a socket address is bound all the same. A client
-        // reaches such a path through a descriptor of its directory too.
-        let mut through = PathBuf::from(format!("/proc/self/fd/{}", fd_number(&directory)));
-        through.push(&name);
-        let address = SocketAddrUnix::new(&through).map_err(|_| {
+        // directory checked above whatever its path names by now.
+        let address = address_in(&directory, &name).ok_or_else(|| {
             refused(format!(
                 "--serve {}: the socket's name is too long for a unix socket's address",
                 path.display()
@@ -293,10 +271,48 @@ impl Drop for Socket {
     }
 }
 
-/// The number of the descriptor `fd` is, for a path through `/proc/self/fd`.
-fn fd_number(fd: &OwnedFd) -> i32 {
+/// The directory a socket's `path` names it in, as a path `open` takes, and its
+/// name there; `None` where the path names no socket, as one that ends in a
+/// slash does.
+pub fn place(path: &Path) -> Option<(&Path, &OsStr)> {
+    let name = path
+        .file_name()
+        .filter(|_| !path.as_os_str().as_bytes().ends_with(b"/"))?;
+    // The library's `path::parent_of` answers this for itself; `fcage` is a
+    // crate apart, and states the same fallback (`tools/idioms.toml`).
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Some((parent, name))
+}
+
+/// Opens the directory a socket is named in, to reach the socket through.
+pub fn open_directory(parent: &Path) -> Result<OwnedFd, Fault> {
+    rustix::fs::open(
+        parent,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| {
+        let mut fault = Fault::of("fcage", &io::Error::from(errno));
+        fault.message = format!("opening {}: {}", parent.display(), fault.message);
+        fault
+    })
+}
+
+/// The address of the socket `name` in `directory`, through the directory's
+/// descriptor; `None` where even that is too long for a socket's address.
+///
+/// The server binds there and a client connects there, so each acts on the
+/// directory it opened whatever the directory's path names by then, and a path
+/// too long for a socket's address is reached all the same: the address holds
+/// the descriptor's number and the name alone.
+pub fn address_in(directory: &OwnedFd, name: &OsStr) -> Option<SocketAddrUnix> {
     use std::os::fd::AsRawFd as _;
-    fd.as_raw_fd()
+    let mut through = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    through.push(name);
+    SocketAddrUnix::new(&through).ok()
 }
 
 /// Opens the input `--serve-until-closed` names, whose end ends the session:
@@ -1008,10 +1024,11 @@ fn refuse_peer(stream: &UnixStream, answer: &io::Result<bool>) {
 // Reading a connection
 // ---------------------------------------------------------------------------
 
-/// A connection's reading of its client's messages: one JSON object a line,
-/// descriptors only with a message's first byte.
+/// A connection's reading of the messages its other end sends: one JSON object
+/// a line, descriptors only with a message's first byte. The server reads its
+/// clients' requests through it, and `fcage --exec` the session's answers.
 #[derive(Default)]
-struct Reader {
+pub struct Reader {
     /// The message read so far.
     partial: Vec<u8>,
     /// The descriptors that came with its first byte.
@@ -1021,22 +1038,22 @@ struct Reader {
 }
 
 /// What a connection's input holds next.
-enum Framed {
+pub enum Framed {
     /// A whole message, without its newline, and the descriptors its first
     /// byte carried.
     Message(Vec<u8>, Vec<OwnedFd>),
     /// Nothing whole yet.
     Pending,
-    /// The end of the client's input.
+    /// The end of what the other end sends.
     Closed,
     /// A message the protocol refuses, which closes the connection.
     Refused(&'static str),
 }
 
 impl Reader {
-    /// Reads what the client has sent without waiting, up to the end of the
+    /// Reads what the other end has sent without waiting, up to the end of the
     /// next whole message.
-    fn next(&mut self, stream: &UnixStream) -> io::Result<Framed> {
+    pub fn next(&mut self, stream: &UnixStream) -> io::Result<Framed> {
         self.ahead.resize(PEEK, 0);
         loop {
             let peeked = match rustix::net::recv(
@@ -1095,8 +1112,8 @@ impl Reader {
     }
 }
 
-/// Reads exactly `len` bytes the client has sent, which a peek has seen, onto
-/// `into`, with the descriptors they carry, and whether the client sent more
+/// Reads exactly `len` bytes the other end has sent, which a peek has seen,
+/// onto `into`, with the descriptors they carry, and whether it sent more
 /// descriptors than a message may carry.
 fn receive(
     stream: &UnixStream,
@@ -1138,6 +1155,35 @@ fn receive(
         filled += received.bytes;
     }
     Ok((fds, truncated))
+}
+
+/// Writes one message, `line`, with `fds` attached to its first byte, as the
+/// protocol has a message carry descriptors; see the module documentation.
+///
+/// The descriptors go with the first `sendmsg`, whose data begins the message,
+/// and whatever of a long message it leaves follows without any.
+pub fn send_message(stream: &UnixStream, line: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+    let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(fds)) {
+        return Err(io::Error::other(
+            "a message carries no more descriptors than an exec's three streams",
+        ));
+    }
+    let sent = loop {
+        match rustix::net::sendmsg(
+            stream,
+            &[IoSlice::new(line)],
+            &mut control,
+            SendFlags::NOSIGNAL,
+        ) {
+            Ok(sent) => break sent,
+            Err(Errno::INTR) => {}
+            Err(errno) => return Err(errno.into()),
+        }
+    };
+    let mut rest = stream;
+    rest.write_all(&line[sent..])
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,40 +1282,41 @@ impl Request {
     }
 }
 
-/// An `exec` request's parameters.
-#[derive(Deserialize)]
+/// An `exec` request's parameters: what the server reads, and what
+/// `fcage --exec` writes, so the two ends share one schema.
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct ExecParams {
+pub struct ExecParams {
     /// The command: an absolute path, or with path lookup a bare name.
-    command: Bytes,
+    pub command: Bytes,
     /// Its arguments, after the command.
-    #[serde(default)]
-    args: Vec<Bytes>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<Bytes>,
     /// Variables set over the launch's environment, in order, as pairs.
-    #[serde(default)]
-    env: Vec<(Bytes, Bytes)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(Bytes, Bytes)>,
     /// The working directory, where not the launch's.
-    #[serde(default)]
-    cwd: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<Bytes>,
     /// Whether a bare command name is looked up on `PATH`, where not as the
     /// launch says.
-    #[serde(default)]
-    path_lookup: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_lookup: Option<bool>,
     /// Standard input.
     #[serde(default)]
-    stdin: Disposition,
+    pub stdin: Disposition,
     /// Standard output.
     #[serde(default)]
-    stdout: Disposition,
+    pub stdout: Disposition,
     /// Standard error.
     #[serde(default)]
-    stderr: Disposition,
+    pub stderr: Disposition,
     /// Seconds until the command is asked to end, as `--timeout` counts them.
-    #[serde(default)]
-    timeout: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
     /// Seconds from that until it is killed, as `--kill-after` counts them.
-    #[serde(default)]
-    kill_after: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_after: Option<f64>,
 }
 
 /// A `signal` request's parameters.
@@ -1283,9 +1330,9 @@ struct SignalParams {
 }
 
 /// Where one of an exec's standard streams goes.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-enum Disposition {
+pub enum Disposition {
     /// Nowhere: `/dev/null`.
     #[default]
     Null,
@@ -1439,8 +1486,8 @@ fn exec_event(event: &Event, id: &Value) -> Vec<u8> {
     line(&value)
 }
 
-/// `value` as one line: its JSON and a newline.
-fn line(value: &Value) -> Vec<u8> {
+/// `value` as one line of a connection: its JSON and a newline.
+pub fn line(value: &Value) -> Vec<u8> {
     // A value built of maps with string keys always writes.
     let mut line = serde_json::to_vec(value).unwrap_or_default();
     line.push(b'\n');
@@ -1743,11 +1790,6 @@ fn hand_on(
 
 #[cfg(test)]
 mod tests {
-    use std::io::IoSlice;
-    use std::os::fd::BorrowedFd;
-
-    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
-
     use super::*;
 
     /// Sends `bytes` on `stream` in one message, with `fds` attached to its

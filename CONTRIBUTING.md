@@ -584,7 +584,8 @@ report name a package and its version bare.
 | Retry one call a signal interrupted | `mechanism::frame::retry_on_intr!` |
 | Encode, decode, or read a helper child's outcome record | `mechanism::frame::encode_record`, `decode_record`, `read_record` |
 | Encode or decode the supervisor's status record, the command's outcome and what it used | `mechanism::encode_status`, `mechanism::decode_status`, with the usage read by `mechanism::sys::children_usage` |
-| Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd`. A session's connection in `fcage`, a crate apart, reads a request's descriptors with the CLI's `session::Reader`, from the first byte of a line of JSON |
+| Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd`. A session's connection in `fcage`, a crate apart, carries descriptors on the first byte of a line of JSON: the CLI's `session::send_message` attaches them, and `session::Reader` reads them, for `fcage --serve` and `fcage --exec` alike |
+| Reach a session's socket by its path, however long | the CLI's `session::place`, the directory a path names the socket in, `session::open_directory`, and `session::address_in`, the address through that directory's descriptor, which `fcage --serve` binds and `fcage --exec` connects through |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Resolve a range identity map into the extents a delegate writes, validated | `idmap::resolve_delegate`, through the configured delegate or the bundled chain |
 | Can a provisioner establish its range map, asked before it downloads anything? | `idmap::establishable` |
@@ -651,13 +652,13 @@ report name a package and its version bare.
 | Name, in an error or a progress report, a string a mirror, an index, a package, or a sandbox supplied | `{:?}`, which escapes a control character, as the `failure` module states, unless an alphabet without control characters already admitted the value |
 | Render an error with every cause beneath it | `ErrorChain` |
 | What process exit code does a launcher report? | `ExitStatus::shell_code`, `Error::shell_code`, and `ExitStatus::signaled` for an outcome of the caller's own, such as a reader gone |
-| Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, and `print_json` for a listing `--json` prints, `say`, `report`, `say_event` and `report_event`, which write to the run's event stream where it has one, and `Reports` for a thread that must not wait on its reader, one per run, which the forwards and the network stack's reports share |
+| Write a line of `fcage`'s own, deciding what a reader gone means | the CLI's `output` module: `print_stdout`, and `print_json` for a listing `--json` prints, `say`, `report`, `say_event` and `report_event`, which write to the run's event stream where it has one, `say_received` for an event `fcage --exec` received from a session, and `Reports` for a thread that must not wait on its reader, one per run, which the forwards and the network stack's reports share |
 | Name what `fcage` says for a program to read: a report, an outcome, a failure, a setup step, an errno, a change and an apply's verdict | the CLI's `events` module: `Event`, `Fault`, `events::error_kind`, `events::step_name`, `events::errno_name`, `events::Bytes` for a byte string, and its `listing` module for what `--changes` and `--apply-changes` print, as text and as JSON: `ChangeListing`, `ApplyListing`, `listing::entry_kind`, `listing::differences` |
 | Make a scratch tree for a test that leaves nothing to accumulate | `scratch::Scratch`, removed when it drops, or from a test suite `common::scratch_dir`, emptied when the next run reuses it, and `common::ranged_scratch` for a tree of subordinate-owned entries |
 | What happens when a run's timeout runs out? | `relay::Escalation` |
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |
 | Read the signals that end a program as data, in a poll loop of its own | `relay::Signals`, which a relay and `fcage --serve` both read |
-| Is a descriptor `fcage` would hand a command one it hands over as it is, relays through a pipe, or refuses? | the CLI's `streams::handling`, which a launch's standard streams and a session's passed descriptors are both judged by |
+| Is a descriptor `fcage` would hand a command one it hands over as it is, relays through a pipe, or refuses? | the CLI's `streams::handling`, which a launch's standard streams, `fcage --exec`'s, and a session's passed descriptors are all judged by |
 | Parse an argument in an example | `examples/common` |
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
 | Hand a provisioner a transport standing in for a mirror, in a unit test | `provision::fetch::fixture`: `Canned`, `Uniform`, `Unreachable` |

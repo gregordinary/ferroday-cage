@@ -107,6 +107,16 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `fcage --exec SOCKET -- COMMAND` runs a command in the sandbox a
+  `fcage --serve` session holds on `SOCKET`, with the client's own standard
+  streams passed to it, a file relayed through a pipe as a launch relays one,
+  and exits as the command did: its exit status, 124 where `--timeout` expired,
+  and 125 for a failure of the client's own. It takes `--chdir`, `--setenv`,
+  `--path-lookup`, `--no-path-lookup`, `--stdin`, `--timeout`, `--kill-after`
+  and `--events`, as a launch takes them. `SIGINT`, `SIGTERM`, `SIGHUP` and
+  `SIGQUIT` are forwarded to the command, and the client's end ends it. With
+  `--events`, its stream carries the exec's events and `exited` or `failed`,
+  as a launch's does (`ferroday-cage-cli`).
 - `Running::signal` and `KillHandle::signal` deliver a signal to the command by
   its number, as `terminate` delivers `SIGTERM`: through the sandbox's
   supervisor, to the command's process alone, and for a sandbox started with no

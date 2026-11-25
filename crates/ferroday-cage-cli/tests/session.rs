@@ -822,6 +822,265 @@ fn a_peer_inside_a_sandbox_is_refused() {
     assert_eq!(hello["result"]["protocol"], 1, "{hello}");
 }
 
+// ---------------------------------------------------------------------------
+// The shell client, `fcage --exec`
+// ---------------------------------------------------------------------------
+
+/// `fcage --exec` on `server`'s socket with `args`, the command among them.
+fn client(server: &Server, args: &[&str]) -> Command {
+    let mut command = Command::new(FCAGE);
+    command.arg("--exec").arg(&server.socket).args(args);
+    command
+}
+
+/// The events an `--events` file holds, one JSON value a line.
+fn events_in(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .expect("the events file reads")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each event is JSON"))
+        .collect()
+}
+
+#[test]
+fn a_client_runs_a_command_on_its_own_streams_and_exits_as_it_did() {
+    // The directory's name makes the socket's path longer than a socket's
+    // address holds, wherever the scratch directory is, so the client reaches
+    // it through a descriptor of its directory, as the server binds it.
+    let Some(server) = Server::start(
+        "fcage-session-client-reaches-a-socket-past-the-length-a-unix-socket-address-holds",
+        &[],
+    ) else {
+        return;
+    };
+    assert!(server.socket.as_os_str().len() > 108, "{:?}", server.socket);
+
+    let mut command = client(
+        &server,
+        &["--", "/bin/sh", "-c", "wc -l; echo err >&2; exit 3"],
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = common::spawn_grouped(&mut command);
+    child
+        .stdin
+        .as_mut()
+        .expect("the input is piped")
+        .write_all(b"a\nb\n")
+        .expect("the input is written");
+    let output = common::finish_bounded(child, PATIENCE);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert_eq!(output.stdout, b"2\n");
+    assert_eq!(output.stderr, b"err\n", "nothing of fcage's own");
+
+    // A command a signal ends is reported as a shell reports one.
+    let output = common::run_bounded(
+        client(&server, &["/bin/sh", "-c", "kill -TERM $$"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert_eq!(output.status.code(), Some(128 + 15), "{output:?}");
+
+    // And one its timeout ends as `timeout` reports one.
+    let output = common::run_bounded(
+        client(&server, &["--timeout", "0.2", "/bin/sleep", "30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert_eq!(output.status.code(), Some(124), "{output:?}");
+}
+
+#[test]
+fn a_client_relays_a_file_and_leaves_what_the_command_did_not_read() {
+    let Some(server) = Server::start("fcage-session-client-files", &[]) else {
+        return;
+    };
+    let directory = server.socket.parent().expect("a directory").to_path_buf();
+    std::fs::write(directory.join("in"), "x\ny\nz\n").expect("the input is written");
+    let mut input = File::open(directory.join("in")).expect("the input opens");
+    let output_file = File::create(directory.join("out")).expect("the output opens");
+    let output = common::run_bounded(
+        client(&server, &["/bin/sh", "-c", "read line; echo \"got $line\""])
+            .stdin(input.try_clone().expect("the input clones"))
+            .stdout(output_file)
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("out")).expect("the output reads"),
+        "got x\n"
+    );
+    // The input's offset is shared, and stands where the command stopped.
+    let mut rest = String::new();
+    input.read_to_string(&mut rest).expect("the rest reads");
+    assert_eq!(rest, "y\nz\n");
+}
+
+#[test]
+fn a_client_forwards_an_interrupt_and_its_end_ends_the_command() {
+    let Some(server) = Server::start("fcage-session-client-signals", &[]) else {
+        return;
+    };
+    // An interrupt from the client's terminal reaches its whole process group,
+    // the client, which forwards it, among it.
+    let mut child = common::spawn_grouped(
+        client(
+            &server,
+            &[
+                "/bin/sh",
+                "-c",
+                "trap 'kill $!; exit 5' INT; echo ready; sleep 30 & wait $!",
+            ],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped()),
+    );
+    let mut ready = String::new();
+    BufReader::new(child.stdout.as_mut().expect("the output is piped"))
+        .read_line(&mut ready)
+        .expect("the command says it is ready");
+    assert_eq!(ready, "ready\n");
+    let group = rustix::process::Pid::from_raw(child.id() as i32).expect("a pid");
+    rustix::process::kill_process_group(group, rustix::process::Signal::INT)
+        .expect("the group is interrupted");
+    let output = common::finish_bounded(child, PATIENCE);
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+
+    // A client that dies takes its command with it: the session ends the
+    // exec whose connection closed.
+    let mut child = common::spawn_grouped(
+        client(
+            &server,
+            &["/bin/sh", "-c", "echo $$ > /tmp/held; exec sleep 86399"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null()),
+    );
+    let mut probe = server.connect();
+    let (_, held) = probe.call(&json!({"id": 1, "method": "exec", "params": {
+        "command": "/bin/sh",
+        "args": ["-c", "for i in $(seq 600); do [ -s /tmp/held ] && exit 0; sleep 0.05; done; exit 1"],
+    }}));
+    assert_eq!(
+        held["result"]["code"], 0,
+        "the command never started: {held}"
+    );
+    child.kill().expect("the client is killed");
+    child.wait().expect("the client is collected");
+    let (_, gone) = probe.call(&json!({"id": 2, "method": "exec", "params": {
+        "command": "/bin/sh",
+        "args": ["-c", "pid=$(cat /tmp/held); for i in $(seq 600); do [ -d /proc/$pid ] || exit 0; sleep 0.05; done; exit 1"],
+    }}));
+    assert_eq!(
+        gone["result"]["code"], 0,
+        "the command outlived its client: {gone}"
+    );
+}
+
+#[test]
+fn a_client_says_what_a_launch_says() {
+    let Some(server) = Server::start("fcage-session-client-events", &[]) else {
+        return;
+    };
+    let directory = server.socket.parent().expect("a directory").to_path_buf();
+
+    // With an event stream, everything the client says is an event there, and
+    // standard error is the command's alone.
+    let events = directory.join("ran.events");
+    let events_arg = events.to_str().expect("a UTF-8 scratch path");
+    let output = common::run_bounded(
+        client(
+            &server,
+            &[
+                "--events",
+                events_arg,
+                "/bin/sh",
+                "-c",
+                "echo err >&2; exit 4",
+            ],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert_eq!(output.stderr, b"err\n");
+    let said = events_in(&events);
+    assert_eq!(kinds(&said), ["hello", "started", "exited"], "{said:?}");
+    assert!(
+        said[1].get("exec").is_none(),
+        "the connection's member: {said:?}"
+    );
+    assert_eq!(said[2]["code"], 4);
+    assert_eq!(said[2]["shell-code"], 4);
+
+    // A command the session cannot run fails as a launch's does.
+    let events = directory.join("failed.events");
+    let events_arg = events.to_str().expect("a UTF-8 scratch path");
+    let output = common::run_bounded(
+        client(&server, &["--events", events_arg, "/no/such/command"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert_eq!(output.status.code(), Some(127), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let said = events_in(&events);
+    assert_eq!(kinds(&said), ["hello", "failed"], "{said:?}");
+    let failed = &said[1];
+    assert_eq!(failed["error"], "setup", "{failed}");
+    assert_eq!(failed["step"], "exec");
+    assert_eq!(failed["errno"], "ENOENT");
+    assert_eq!(failed["shell-code"], 127);
+    assert!(
+        failed["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("fcage: ")),
+        "{failed}"
+    );
+
+    // Without one, its line is on standard error.
+    let output = common::run_bounded(
+        client(&server, &["/no/such/command"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert_eq!(output.status.code(), Some(127), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("fcage: ") && stderr.contains("/no/such/command"),
+        "{stderr}"
+    );
+
+    // And a session it cannot reach is a failure of its own.
+    let output = common::run_bounded(
+        Command::new(FCAGE)
+            .args(["--exec"])
+            .arg(directory.join("absent.sock"))
+            .arg("/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert_eq!(output.status.code(), Some(125), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no session serves there"), "{stderr}");
+}
+
 /// A server a test is done with and did not finish: asked to end, as a signal
 /// asks it, and collected, so no session outlives its test.
 impl Drop for Server {

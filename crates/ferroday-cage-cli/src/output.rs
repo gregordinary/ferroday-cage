@@ -110,6 +110,46 @@ pub fn report_event(event: &Event) {
     let _ = say_event(event);
 }
 
+/// Says an event `fcage --exec` received from a session, as [`say_event`] says
+/// one of the run's own: on the run's event stream where it has one, and
+/// otherwise its `text` on standard error, where it has a `text`.
+///
+/// The event is the session's, in the vocabulary [`Event`] writes, and is
+/// written as it arrived: it may be of a kind this `fcage` writes no
+/// [`Event`] for, which a reader takes as it takes any kind it does not know.
+pub fn say_received(event: &serde_json::Map<String, serde_json::Value>) -> Result<(), ReaderGone> {
+    match EVENTS.get() {
+        Some(stream) => {
+            // A map of JSON values always writes.
+            let mut line = serde_json::to_vec(&KindFirst(event)).unwrap_or_default();
+            line.push(b'\n');
+            stream.write_line(&line)
+        }
+        None => match event.get("text").and_then(serde_json::Value::as_str) {
+            Some(text) => say_to(&mut io::stderr().lock(), format_args!("{text}")),
+            None => Ok(()),
+        },
+    }
+}
+
+/// A received event as [`say_received`] writes it: its `event` member first,
+/// as an [`Event`] of the run's own writes its kind, and then the others.
+struct KindFirst<'a>(&'a serde_json::Map<String, serde_json::Value>);
+
+impl serde::Serialize for KindFirst<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        if let Some(kind) = self.0.get("event") {
+            map.serialize_entry("event", kind)?;
+        }
+        for (name, value) in self.0.iter().filter(|(name, _)| *name != "event") {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
 /// A run's event stream: one JSON object per line, each written whole, by one
 /// writer at a time, whichever thread says it.
 pub struct EventStream {
@@ -129,11 +169,16 @@ impl EventStream {
     /// reader has gone and dropping any other failure, as a line on standard
     /// error does.
     pub fn write(&self, event: &Event) -> Result<(), ReaderGone> {
-        let line = event.line();
+        self.write_line(&event.line())
+    }
+
+    /// Writes `line`, an event's JSON and its newline, as [`write`](Self::write)
+    /// writes an event.
+    fn write_line(&self, line: &[u8]) -> Result<(), ReaderGone> {
         // A writer that panicked left at most a line unfinished, and a reader
         // skips a line it cannot read as it skips one it does not know.
         let mut out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
-        gone_or_dropped(out.write_all(&line).and_then(|()| out.flush()))
+        gone_or_dropped(out.write_all(line).and_then(|()| out.flush()))
     }
 }
 

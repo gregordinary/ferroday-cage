@@ -873,15 +873,17 @@ name = "raw"
 kind = "positional"
 why = "Raw mode follows whether `fcage`'s own standard input is a terminal, which the shell decides."
 
-# A further command run in a running sandbox.
+# A further command run in a running sandbox: `fcage --exec`, which sends a
+# `--serve` session the `exec` request a program may send it directly.
 [[builder]]
 name = "Exec"
 path = "ferroday_cage::Exec"
+mode = "Exec"
 
 [[builder.setting]]
 name = "arg"
 kind = "positional"
-why = "The `args` member of the `exec` request a `--serve` session takes, after its `command`."
+why = "The command line after the command, as a launch's; the `args` member of the `exec` request."
 
 [[builder.setting]]
 name = "args"
@@ -890,43 +892,43 @@ why = "As `arg`."
 
 [[builder.setting]]
 name = "current_dir"
-kind = "positional"
-why = "The `cwd` member of the `exec` request a `--serve` session takes."
+flags = ["--chdir"]
+why = "The `cwd` member of the `exec` request."
 
 [[builder.setting]]
 name = "env"
-kind = "positional"
-why = "The `env` member of the `exec` request a `--serve` session takes, a list of name and value pairs in order."
+flags = ["--setenv"]
+why = "The `env` member of the `exec` request, a list of name and value pairs in order."
 
 [[builder.setting]]
 name = "envs"
-kind = "positional"
+flags = ["--setenv"]
 why = "As `env`."
 
 [[builder.setting]]
 name = "path_lookup"
-kind = "positional"
-why = "The `path-lookup` member of the `exec` request a `--serve` session takes, which defaults to the session's own `--path-lookup`."
-
-[[builder.setting]]
-name = "stderr"
-kind = "positional"
-why = "As `stdin`."
+flags = ["--path-lookup", "--no-path-lookup"]
+why = "The `path-lookup` member of the `exec` request, which defaults to the session's own `--path-lookup`."
 
 [[builder.setting]]
 name = "stdin"
-kind = "positional"
-why = "The `stdin` member of the `exec` request a `--serve` session takes: `null`, or `passed` with the descriptor attached to the request."
+flags = ["--stdin"]
+why = "`null`, or the client's own standard input passed, a file relayed through a pipe: the `stdin` member of the `exec` request, `null` or `passed` with the descriptor attached to the request."
 
 [[builder.setting]]
 name = "stdout"
 kind = "positional"
-why = "As `stdin`."
+why = "The client's own standard output, passed, which a shell already spells; the `stdout` member of the `exec` request, as `stdin`."
+
+[[builder.setting]]
+name = "stderr"
+kind = "positional"
+why = "As `stdout`."
 
 [[builder.setting]]
 name = "stop_with_caller"
 kind = "library"
-why = "A `--serve` session ties every exec it starts to itself, so the server's end takes its execs with it. An exec that outlives the session, unanswered, is not something the tool offers."
+why = "A `--serve` session ties every exec it starts to itself, so the server's end takes its execs with it, and `fcage --exec`'s end takes its own. An exec that outlives the session, unanswered, is not something the tool offers."
 
 # The provisioners' own collaborators.
 [[builder]]

@@ -43,6 +43,7 @@
 //! publishes the enumerations they print. `tools/parity.toml` records the whole
 //! comparison, setting by setting, and a check holds it to the code.
 
+mod client;
 mod events;
 mod forward;
 mod listing;
@@ -198,6 +199,8 @@ enum Mode {
     Changes,
     /// `--apply-changes`.
     ApplyChanges,
+    /// `--exec`.
+    Exec,
     /// `--gentoo-variants`.
     GentooVariants,
     /// `--gentoo-packages`.
@@ -1776,15 +1779,7 @@ const FLAGS: &[Flag] = &[
         needs: "a name and a value",
         restriction: true,
         take: Take::Two(|options, flag, value, second| {
-            // Validated here so a bad name is the usage error it is (exit 2),
-            // rather than deferring to the library's build-time rejection
-            // (exit 125). The rule matches the library's.
-            if value.is_empty() || value.as_bytes().contains(&b'=') {
-                return Err(format!(
-                    "{flag}: {value:?} is not a valid environment variable name \
-                     (it is empty or contains '=')"
-                ));
-            }
+            check_env_name(flag, &value)?;
             options.setenv.push((value, second));
             Ok(())
         }),
@@ -1923,13 +1918,13 @@ const FLAGS: &[Flag] = &[
             "Start the sandbox with no command and serve further",
             "commands in it on a unix socket that fcage creates at",
             "SOCKET, in a directory only you can write, and removes",
-            "when done. A program that connects runs commands, one",
-            "at a time per connection, each confined as a launch's",
-            "command; a process outside fcage's own user namespace,",
-            "as a sandbox's is, is refused. Takes no command. Ends",
-            "on a stop request or SIGINT, SIGTERM, SIGHUP or",
-            "SIGQUIT, terminating the sandbox and killing it",
-            "--kill-after seconds later",
+            "when done. fcage --exec, or a program that connects,",
+            "runs commands in it, one at a time per connection,",
+            "each confined as a launch's command; a process outside",
+            "fcage's own user namespace, as a sandbox's is, is",
+            "refused. Takes no command. Ends on a stop request or",
+            "SIGINT, SIGTERM, SIGHUP or SIGQUIT, terminating the",
+            "sandbox and killing it --kill-after seconds later",
         ],
         take: Take::One(|options, _flag, value| {
             options.serve = Some(PathBuf::from(value));
@@ -1950,6 +1945,26 @@ const FLAGS: &[Flag] = &[
             options.serve_until_closed = Some(PathBuf::from(value));
             Ok(())
         }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--exec",
+        section: Section::Command,
+        placeholder: "SOCKET",
+        help: &[
+            "Run COMMAND in the sandbox an fcage --serve session",
+            "holds on SOCKET, with this process's standard streams,",
+            "a file relayed through a pipe, and exit as it does.",
+            "SIGINT, SIGTERM, SIGHUP and SIGQUIT are forwarded to",
+            "it, and this process's end ends it. Takes --chdir,",
+            "--setenv, --path-lookup, --no-path-lookup, --stdin,",
+            "--timeout, --kill-after and --events, each as a launch",
+            "takes it; --kill-after alone is the grace the session",
+            "gives the command if this process goes",
+        ],
+        mode: Mode::Exec,
+        selects: true,
+        take: Take::Refused(Arity::One),
         ..Flag::DEFAULTS
     },
     Flag {
@@ -2893,6 +2908,7 @@ Usage: fcage [--rootfs DIR | --empty-rootfs | --overlay-lower DIR | --profile FI
        fcage --export-rootfs DIR [--export-to FILE] [--identity-map M] [--clamp-mtime EPOCH]
        fcage --changes UPPER --overlay-lower DIR...
        fcage --apply-changes UPPER --overlay-lower DIR... --to DIR [--only PATH] [--protect PATH] [--protect-name NAME] [--no-protection] [--since EPOCH]
+       fcage --exec SOCKET [--chdir DIR] [--setenv NAME VALUE]... [--path-lookup | --no-path-lookup] [--stdin MODE] [--timeout SECS] [--kill-after SECS] [--events PATH] [--] COMMAND [ARGS...]
        fcage --gentoo-variants ARCH [--gentoo-mirror URL] [--gentoo-mirror-fallback URL] [--gentoo-max-pointer-age DAYS]
        fcage --gentoo-packages ARCH --gentoo-binhost SUBARCH [--gentoo-mirror URL] [--gentoo-mirror-fallback URL]
        fcage --gentoo-installed ROOT
@@ -3035,6 +3051,13 @@ enum Invocation {
         /// Whether what the apply wrote or refused is printed as JSON rather
         /// than as text.
         json: bool,
+    },
+    /// Run a command in the sandbox a session holds.
+    Exec {
+        call: Box<client::Call>,
+        /// `--events`: where the run says what it says, in place of standard
+        /// error.
+        events: Option<PathBuf>,
     },
     Help,
     Version,
@@ -3563,6 +3586,10 @@ fn main() -> ExitCode {
             )
         }),
         Ok(Invocation::Run(options)) => run(*options),
+        Ok(Invocation::Exec { call, events }) => match open_event_stream(events.as_deref()) {
+            Ok(()) => client::run(*call),
+            Err(code) => code,
+        },
         Ok(Invocation::Remove { dest, map, removal }) => remove_tree(&dest, map, removal),
         Ok(Invocation::GentooVariants {
             architecture,
@@ -3622,6 +3649,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         Some(Mode::Export) => return parse_export(args),
         Some(Mode::Changes) => return parse_changes(args),
         Some(Mode::ApplyChanges) => return parse_apply_changes(args),
+        Some(Mode::Exec) => return parse_exec(args),
         _ => {}
     }
     let mut args = args.into_iter();
@@ -4605,6 +4633,131 @@ fn parse_changes(args: Vec<OsString>) -> Result<Invocation, String> {
         );
     }
     Ok(Invocation::Changes { overlay, json })
+}
+
+/// Refuses an environment variable name `flag` gives that the library would
+/// refuse: an empty one, or one holding `=`.
+///
+/// Checked as the command line is read, so a bad name is the usage error it is
+/// (exit 2), rather than the library's refusal when the command is built (exit
+/// 125). The rule is the library's.
+fn check_env_name(flag: &str, name: &OsStr) -> Result<(), String> {
+    if name.is_empty() || name.as_bytes().contains(&b'=') {
+        return Err(format!(
+            "{flag}: {name:?} is not a valid environment variable name (it is empty or contains \
+             '=')"
+        ));
+    }
+    Ok(())
+}
+
+/// The flags `fcage --exec` takes: the settings of a further command, each
+/// spelled as a launch spells the setting it shares, and the stream it says
+/// what it says on.
+const EXEC_FLAGS: &[&str] = &[
+    "--exec",
+    "--chdir",
+    "--setenv",
+    "--path-lookup",
+    "--no-path-lookup",
+    "--stdin",
+    "--timeout",
+    "--kill-after",
+    "--events",
+];
+
+/// Parses an `--exec` command line, excluding the program name.
+///
+/// The client takes a further command's settings and the command after them.
+/// Every other flag configures a sandbox, which the session already holds, so
+/// naming one is a usage error rather than a setting with no effect. As in a
+/// launch, everything from the command on is the command's, `--help` among it.
+fn parse_exec(args: Vec<OsString>) -> Result<Invocation, String> {
+    let mut socket = None;
+    let mut events = None;
+    let mut params = session::ExecParams {
+        command: events::Bytes(Vec::new()),
+        args: Vec::new(),
+        env: Vec::new(),
+        cwd: None,
+        path_lookup: None,
+        stdin: session::Disposition::Passed,
+        stdout: session::Disposition::Passed,
+        stderr: session::Disposition::Passed,
+        timeout: None,
+        kill_after: None,
+    };
+    let mut command_line = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            return Ok(Invocation::Help);
+        }
+        if arg == "-V" || arg == "--version" {
+            return Ok(Invocation::Version);
+        }
+        if arg == "--" {
+            command_line.extend(args);
+            break;
+        }
+        if let Some(value) = mode_value("--exec", &arg, &mut args)? {
+            if value.is_empty() {
+                return Err(
+                    "--exec requires a socket, and was given an empty value, which is what an \
+                     unset variable expands to"
+                        .to_string(),
+                );
+            }
+            socket = Some(PathBuf::from(value));
+        } else if let Some(value) = mode_value("--chdir", &arg, &mut args)? {
+            params.cwd = Some(events::Bytes(value.into_vec()));
+        } else if arg == "--setenv" {
+            let needs = "a name and a value";
+            let name = value_for("--setenv", needs, Arity::Two, &mut args)?;
+            let value = value_for("--setenv", needs, Arity::Two, &mut args)?;
+            check_env_name("--setenv", &name)?;
+            params.env.push((
+                events::Bytes(name.into_vec()),
+                events::Bytes(value.into_vec()),
+            ));
+        } else if arg == "--path-lookup" {
+            params.path_lookup = Some(true);
+        } else if arg == "--no-path-lookup" {
+            params.path_lookup = Some(false);
+        } else if let Some(value) = mode_value("--stdin", &arg, &mut args)? {
+            params.stdin = match parse_stdin(&value)? {
+                Stdio::Null => session::Disposition::Null,
+                _ => session::Disposition::Passed,
+            };
+        } else if let Some(value) = mode_value("--timeout", &arg, &mut args)? {
+            params.timeout = Some(parse_seconds("--timeout", &value)?.as_secs_f64());
+        } else if let Some(value) = mode_value("--kill-after", &arg, &mut args)? {
+            params.kill_after = Some(parse_seconds("--kill-after", &value)?.as_secs_f64());
+        } else if let Some(value) = mode_value("--events", &arg, &mut args)? {
+            events = Some(PathBuf::from(value));
+        } else if arg.as_bytes().starts_with(b"-") && arg != "-" {
+            return Err(mode_conflict(&arg, "--exec", EXEC_FLAGS));
+        } else {
+            command_line.push(arg);
+            command_line.extend(args);
+            break;
+        }
+    }
+    // The caller established that the flag is present, so this is a guard
+    // rather than a live path.
+    let socket = socket.ok_or_else(|| "--exec requires a value".to_string())?;
+    let mut command_line = command_line.into_iter();
+    let command = command_line
+        .next()
+        .ok_or_else(|| "--exec requires a command to run in the session's sandbox".to_string())?;
+    params.command = events::Bytes(command.into_vec());
+    params.args = command_line
+        .map(|arg| events::Bytes(arg.into_vec()))
+        .collect();
+    Ok(Invocation::Exec {
+        call: Box::new(client::Call { socket, params }),
+        events,
+    })
 }
 
 /// Parses an `--apply-changes` invocation.
@@ -6247,23 +6400,9 @@ fn export_rootfs(
 /// configuration is checked when the sandbox is built, over the root the
 /// provisioner published.
 fn run(options: Options) -> ExitCode {
-    // First of all, so the run says everything of its own there. A stream
-    // that cannot be opened is said on standard error, as nothing else is.
-    if let Some(path) = &options.events
-        && let Err(error) = output::open_events(path)
-    {
-        let unread = match error.raw_os_error() {
-            Some(errno) if errno == rustix::io::Errno::NXIO.raw_os_error() => {
-                " (nothing reads it: a pipe needs its reader open, and a socket cannot be \
-                 opened by name)"
-            }
-            _ => "",
-        };
-        return fail(format_args!(
-            "opening {} for the run's events{unread}: {}",
-            path.display(),
-            ErrorChain::new(&error)
-        ));
+    // First of all, so the run says everything of its own there.
+    if let Err(code) = open_event_stream(options.events.as_deref()) {
+        return code;
     }
     if options.restrict {
         return run_restricted(options);
@@ -6339,6 +6478,30 @@ fn run(options: Options) -> ExitCode {
         Some(serving) => launch.serve(serving),
         None => launch.run(),
     }
+}
+
+/// Opens the run's event stream at `path`, where `--events` names one, so the
+/// run says everything of its own there. A stream that cannot be opened is
+/// said on standard error, as nothing else is, and ends the run with
+/// [`FAILED`].
+fn open_event_stream(path: Option<&Path>) -> Result<(), ExitCode> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    output::open_events(path).map_err(|error| {
+        let unread = match error.raw_os_error() {
+            Some(errno) if errno == rustix::io::Errno::NXIO.raw_os_error() => {
+                " (nothing reads it: a pipe needs its reader open, and a socket cannot be \
+                 opened by name)"
+            }
+            _ => "",
+        };
+        fail(format_args!(
+            "opening {} for the run's events{unread}: {}",
+            path.display(),
+            ErrorChain::new(&error)
+        ))
+    })
 }
 
 /// What `--serve` places before the sandbox starts: the socket, and the input
@@ -7183,8 +7346,8 @@ fn route_streams<B>(
     let mut relay = judged.start().map_err(fail)?;
     let mut builder = builder;
     for (replacement, set) in relay.take_replacements().into_iter().zip(streams.set) {
-        if let Some(stdio) = replacement {
-            builder = set(builder, stdio);
+        if let Some(fd) = replacement {
+            builder = set(builder, Stdio::from_fd(fd));
         }
     }
     Ok((builder, relay))
@@ -7218,15 +7381,25 @@ fn settled_code(
     undelivered: &[(&'static str, std::io::Error)],
 ) -> ExitCode {
     let code = conclude(outcome);
+    undelivered_code(undelivered).unwrap_or(code)
+}
+
+/// Says that each relay in `undelivered` failed, and answers [`FAILED`] where
+/// any did, the status a run whose relay failed exits with whatever its
+/// command's was.
+///
+/// Said after the outcome, so the last thing a run says is what decides its
+/// status. A launch and `fcage --exec` both settle their relays this way.
+fn undelivered_code(undelivered: &[(&'static str, std::io::Error)]) -> Option<ExitCode> {
     if undelivered.is_empty() {
-        return code;
+        return None;
     }
     for (streams, error) in undelivered {
         let mut fault = Fault::of("relay", error);
         fault.message = format!("relaying the command's {streams}: {}", fault.message);
         output::report_event(&Event::failed(fault, FAILED));
     }
-    ExitCode::from(FAILED)
+    Some(ExitCode::from(FAILED))
 }
 
 /// Runs a sandbox on a pseudoterminal of its own and relays the caller's
@@ -12864,6 +13037,127 @@ mod tests {
             "/s.sock",
         ]);
         assert!(options.serve.is_some() && options.provision_tar.is_some());
+    }
+
+    /// The call an `--exec` command line parses to, with its event stream.
+    fn exec_call(args: &[&str]) -> (client::Call, Option<PathBuf>) {
+        match parse_args(args).expect("the client's command line parses") {
+            Invocation::Exec { call, events } => (*call, events),
+            _ => panic!("{args:?} is not a client's command line"),
+        }
+    }
+
+    /// The `exec` request's parameters a call sends, as the session reads them.
+    fn exec_params(call: &client::Call) -> serde_json::Value {
+        serde_json::to_value(&call.params).expect("the parameters write")
+    }
+
+    #[test]
+    fn a_client_takes_a_further_commands_settings_and_its_command() {
+        let (call, events) = exec_call(&[
+            "--exec",
+            "/run/user/1000/s.sock",
+            "--chdir",
+            "/work",
+            "--setenv",
+            "A",
+            "b",
+            "--setenv",
+            "C",
+            "d",
+            "--no-path-lookup",
+            "--stdin=null",
+            "--timeout",
+            "1.5",
+            "--kill-after",
+            "2",
+            "--events",
+            "/dev/fd/3",
+            "--",
+            "cargo",
+            "test",
+            "--help",
+        ]);
+        assert_eq!(call.socket, Path::new("/run/user/1000/s.sock"));
+        assert_eq!(events.as_deref(), Some(Path::new("/dev/fd/3")));
+        assert_eq!(
+            exec_params(&call),
+            serde_json::json!({
+                "command": "cargo",
+                "args": ["test", "--help"],
+                "env": [["A", "b"], ["C", "d"]],
+                "cwd": "/work",
+                "path-lookup": false,
+                "stdin": "null",
+                "stdout": "passed",
+                "stderr": "passed",
+                "timeout": 1.5,
+                "kill-after": 2.0,
+            })
+        );
+
+        // Without `--` the first argument that is no flag begins the command,
+        // and what follows it is the command's, a flag of fcage's included.
+        // The grace alone is the session's for a client that goes.
+        let (call, events) = exec_call(&[
+            "--kill-after",
+            "1",
+            "--exec=/s.sock",
+            "/bin/sh",
+            "--help",
+            "--rootfs",
+        ]);
+        assert_eq!(events, None);
+        assert_eq!(
+            exec_params(&call),
+            serde_json::json!({
+                "command": "/bin/sh",
+                "args": ["--help", "--rootfs"],
+                "stdin": "passed",
+                "stdout": "passed",
+                "stderr": "passed",
+                "kill-after": 1.0,
+            })
+        );
+        assert!(matches!(
+            parse_args(&["--exec", "/s.sock", "--help", "/bin/sh"]),
+            Ok(Invocation::Help)
+        ));
+    }
+
+    #[test]
+    fn a_client_refuses_what_configures_a_sandbox_and_a_missing_command() {
+        for (args, expected) in [
+            (&["--exec", "/s.sock"][..], "--exec requires a command"),
+            (&["--exec", "", "/bin/true"], "an empty value"),
+            (
+                &["--exec", "/s.sock", "--rootfs", "/r", "/bin/true"],
+                "--rootfs cannot be used with --exec",
+            ),
+            (
+                &["--host-rootfs", "--exec", "/s.sock", "/bin/true"],
+                "--host-rootfs cannot be used with --exec",
+            ),
+            (
+                &["--exec", "/s.sock", "--serve", "/t.sock", "/bin/true"],
+                "--serve cannot be used with --exec",
+            ),
+            (
+                &["--exec", "/s.sock", "--setenv", "A=B", "c", "/bin/true"],
+                "not a valid environment variable name",
+            ),
+            (
+                &["--exec", "/s.sock", "--stdin", "closed", "/bin/true"],
+                "--stdin accepts",
+            ),
+            (
+                &["--exec", "/s.sock", "--chdri", "/w", "/bin/true"],
+                "Try 'fcage --chdir'",
+            ),
+        ] {
+            let error = parse_error(args);
+            assert!(error.contains(expected), "{args:?}: {error}");
+        }
     }
 
     #[test]
