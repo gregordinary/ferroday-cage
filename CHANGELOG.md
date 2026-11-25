@@ -472,6 +472,10 @@ consumer upgrading can skip it.
 - A mirror at the filesystem's root, `file:///`, is joined to a path as
   `file:///debian/...`. Every trailing slash was taken from a mirror, which
   left `file:` and the path read as an authority.
+- The field-and-stanza reader takes space and tab alone as whitespace, as apt
+  does. It took every Unicode space, so a continuation line holding a no-break
+  space ended the stanza, splitting it into two halves apt reads as one, and a
+  value lost a no-break space at its end.
 
 ### Internal
 

@@ -80,7 +80,7 @@ impl<'a> Iterator for Stanzas<'a> {
             // readers treat it so, and a continuation line is one that starts
             // with a space *and* carries content.
             while let Some((line, after)) = split_line(self.rest)
-                && line.trim().is_empty()
+                && line.trim_matches(SPACE).is_empty()
             {
                 self.rest = after;
             }
@@ -89,7 +89,7 @@ impl<'a> Iterator for Stanzas<'a> {
             }
             let start = self.rest;
             while let Some((line, after)) = split_line(self.rest)
-                && !line.trim().is_empty()
+                && !line.trim_matches(SPACE).is_empty()
             {
                 self.rest = after;
             }
@@ -208,7 +208,7 @@ impl<'a> Iterator for Spelled<'a> {
                 continue;
             }
             if let Some((name, value)) = line.split_once(':') {
-                break (name.trim(), value.trim());
+                break (name.trim_matches(SPACE), value.trim_matches(SPACE));
             }
         };
         let below = self.rest;
@@ -249,6 +249,14 @@ impl<'a> Spelling<'a> {
         joined.map_or(Cow::Borrowed(self.first), Cow::Owned)
     }
 }
+
+/// The whitespace of the format: what a reader strips around a field's name
+/// and value, and all a blank line may hold.
+///
+/// Space and tab alone, as apt reads a document. Rust's own `trim` takes every
+/// Unicode space, so a continuation line holding a no-break space would end the
+/// stanza and split it in two, where apt reads it as part of the value.
+const SPACE: [char; 2] = [' ', '\t'];
 
 /// Splits the first line off `text` as [`str::lines`] yields it, without its
 /// line ending, and returns it with what follows; `None` where nothing is left.
@@ -500,7 +508,7 @@ impl Draft {
             if let Name::Carried(carried) = name
                 && (carried.is_empty()
                     || carried.contains([':', '\n', '\r'])
-                    || carried.trim() != carried)
+                    || carried.trim_matches(SPACE) != carried)
             {
                 return Err(format!(
                     "the document carried a field named {carried:?}, which cannot be written \
@@ -533,7 +541,7 @@ impl Draft {
             // read back. A leading one is worse still: the continuation marker
             // is a leading space, so such a value would be folded into the
             // field above it.
-            if first.trim() != first {
+            if first.trim_matches(SPACE) != first {
                 return Err(format!(
                     "the {name} value begins or ends with whitespace, which a reader strips, so \
                      the document would not read back as what wrote it",
@@ -548,7 +556,10 @@ impl Draft {
             // own. Nothing this crate reads produces one — a blank line ends the
             // stanza there too — so this is about a value assembled rather than
             // read.
-            if continuations.iter().any(|line| line.trim().is_empty()) {
+            if continuations
+                .iter()
+                .any(|line| line.trim_matches(SPACE).is_empty())
+            {
                 return Err(format!(
                     "the {name} value folds onto a blank line, which ends a stanza rather than \
                      continuing a field",
@@ -598,6 +609,23 @@ mod tests {
         // the comparison is not loosened by case or by a suffix.
         assert!(refusal("Format: PLAN 1\n").contains("format"));
         assert!(refusal("Format: plan 10\n").contains("format"));
+    }
+
+    #[test]
+    fn a_line_of_another_space_continues_a_value_as_apt_reads_it() {
+        // A no-break space is no deb822 whitespace: a continuation line of
+        // one carries content, and the stanza goes on past it, as apt reads it.
+        let text = "Package: one\nDescription: short\n \u{a0}\n more\nVersion: 1\n";
+        let stanzas: Vec<Stanza<'_>> = parse(text).collect();
+        assert_eq!(stanzas.len(), 1);
+        assert_eq!(stanzas[0].get("Version").as_deref(), Some("1"));
+        assert_eq!(
+            stanzas[0].get("Description").as_deref(),
+            Some("short\n\u{a0}\nmore")
+        );
+        // And a value ending in one keeps it, as the writer writes it back.
+        let value = parse("Package: one\u{a0}\n").next().unwrap();
+        assert_eq!(value.get("Package").as_deref(), Some("one\u{a0}"));
     }
 
     #[test]
