@@ -10,15 +10,23 @@
 //! 3. Otherwise take the index's builds of the atom's package that the atom
 //!    admits, keep those at the highest version among them, and rank the rest.
 //! 4. Queue the chosen build's `RDEPEND` and `PDEPEND`.
-//! 5. An `|| ( ... )` group with a satisfied alternative is done; otherwise its
+//! 5. An `|| ( ... )` group with a matched alternative is done; otherwise its
 //!    first alternative is taken whose every atom is answered, or answered by a
 //!    build that takes no slot anything already holds. An alternative is what
 //!    the group lists together, so `|| ( a ( b c ) )` takes `b` and `c` both or
-//!    neither.
+//!    neither. A blocker in an alternative is matched where nothing the root
+//!    has or the resolution chose matches what it names (PMS 8.2.3), so
+//!    `|| ( !a b )` takes `b` where `a` is there. A group holding a blocker is
+//!    settled once everything else queued is, so its blockers are judged
+//!    against the set as nearly finished as the walk allows.
 //! 6. A blocker is checked against the finished set, and a match is a conflict.
 //!    That is a blocker a chosen build states against the root or the
 //!    resolution, and one a package the root already has states against the
-//!    resolution.
+//!    resolution. A weak blocker does not count against the package version
+//!    that states it (PMS 8.3.2), and a strong one does. Each group a blocker
+//!    helped settle is matched again against the finished set, and so is each
+//!    group holding a blocker that a package in the root states and the root
+//!    alone matches, and one this resolution leaves unmatched is a conflict.
 //! 7. An atom nothing answers is unsatisfiable, and the refusal says which of
 //!    the name, the version, the slot or a USE flag was the wall.
 //!
@@ -93,7 +101,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::rc::Rc;
 
-use super::atom::{self, Atom, Candidate, Dependency, Unmet};
+use super::atom::{self, Atom, Blocker, Candidate, Dependency, Unmet};
 use super::index::{Index, Record};
 use super::installed::{Installed, InstalledPackage, slot_of};
 use super::plan::PlannedPackage;
@@ -353,6 +361,9 @@ struct Pending {
     /// group, whose alternatives were resolved as a choice rather than as a
     /// requirement of the build that states them.
     orders: Option<usize>,
+    /// Whether it was held back until the rest of the queue was settled, which
+    /// an any-of group holding a blocker is, once.
+    held_back: bool,
 }
 
 /// The most builds one resolution chooses before it refuses the index it is
@@ -467,11 +478,14 @@ fn settle<'a>(
                 dependency: Dependency::One(atom.clone()),
                 wanted_by: Rc::clone(&caller),
                 orders: None,
+                held_back: false,
             })
             .collect(),
+        held_back: Vec::new(),
         chosen: Builds::default(),
         needs: Vec::new(),
         blockers: Vec::new(),
+        guarded: Vec::new(),
         offers: HashMap::new(),
         stated: 0,
         compared: Comparisons::bounded(),
@@ -482,9 +496,26 @@ fn settle<'a>(
     // from a set.
     run.queue.reverse();
 
-    while !run.stopped()
-        && let Some(pending) = run.queue.pop()
-    {
+    while !run.stopped() {
+        let Some(pending) = run.queue.pop() else {
+            if run.held_back.is_empty() {
+                break;
+            }
+            // Settled in the order they were met, as the queue pops from its
+            // end.
+            let held_back = std::mem::take(&mut run.held_back);
+            run.queue.extend(held_back.into_iter().rev());
+            continue;
+        };
+        let hold = !pending.held_back
+            && matches!(&pending.dependency, Dependency::AnyOf(alternatives) if guards(alternatives));
+        if hold {
+            run.held_back.push(Pending {
+                held_back: true,
+                ..pending
+            });
+            continue;
+        }
         match &pending.dependency {
             Dependency::One(atom) => run.require(atom, &pending.wanted_by, pending.orders),
             Dependency::AnyOf(alternatives) => run.any_of(alternatives, &pending.wanted_by),
@@ -494,6 +525,7 @@ fn settle<'a>(
     if !run.stopped() {
         conflicts(
             &run.blockers,
+            &run.guarded,
             installed,
             &run.chosen,
             &mut run.compared,
@@ -504,6 +536,19 @@ fn settle<'a>(
     run
 }
 
+/// Whether an any-of group's `alternatives` hold a blocker among several
+/// alternatives, which makes the group one installing more can unmatch.
+///
+/// A group of one alternative asks for exactly that alternative's atoms, so a
+/// blocker there binds as a plain one does.
+fn guards(alternatives: &[Vec<Atom>]) -> bool {
+    alternatives.len() > 1
+        && alternatives
+            .iter()
+            .flatten()
+            .any(|atom| atom.blocker().is_some())
+}
+
 /// One resolution part way through.
 struct Resolution<'a> {
     index: &'a Index,
@@ -511,6 +556,9 @@ struct Resolution<'a> {
     prefer: &'a [Preference],
     /// The dependencies still to settle, popped from the end.
     queue: Vec<Pending>,
+    /// The any-of groups holding a blocker, held back until the queue is
+    /// otherwise empty, in the order they were met.
+    held_back: Vec<Pending>,
     /// The builds chosen so far, in the order they were chosen.
     chosen: Builds<Record>,
     /// `needs[i]`: the chosen builds `chosen[i]` merges after, which are the
@@ -529,6 +577,14 @@ struct Resolution<'a> {
     /// met early would pass against a set the resolution had not finished
     /// choosing, and the package it refuses may be chosen later.
     blockers: Vec<(Atom, Rc<str>)>,
+    /// Every any-of group holding a blocker that the walk found matched or
+    /// settled by choosing an alternative, and who stated it.
+    ///
+    /// Matched again against the finished set, for the reason
+    /// [`blockers`](Self::blockers) are checked at the end: a choice made
+    /// after the group was settled can install what one of its blockers
+    /// names.
+    guarded: Vec<(Vec<Vec<Atom>>, Rc<str>)>,
     /// What the index offers for each atom asked of it, by the atom as written.
     ///
     /// An offer depends on nothing the resolution changes as it goes, only on
@@ -769,15 +825,21 @@ impl<'a> Resolution<'a> {
     ///
     /// A group of one alternative asks for exactly that alternative's atoms,
     /// blockers included, which is the plain-atom case. In a group of several,
-    /// a blocker is one alternative among several and binds nothing on its
-    /// own, so an alternative is satisfied when every atom in it that names
-    /// something to install is.
+    /// an alternative is matched where every atom in it that names something
+    /// to install is answered and every blocker in it matches nothing the root
+    /// has or the resolution chose (PMS 8.2.3).
     ///
-    /// A group with a satisfied alternative is done. Otherwise its first
+    /// A group with a matched alternative is done. Otherwise its first
     /// alternative is taken whose every atom is answered or answerable without
-    /// taking an occupied slot: an alternative that would collide is passed
+    /// taking an occupied slot, and whose every blocker matches nothing: an
+    /// alternative that would collide, or that blocks what is there, is passed
     /// over for the next, which is a choice the group offers rather than
-    /// backtracking.
+    /// backtracking. A group holding a blocker that is settled either way is
+    /// kept, to be matched again once the resolution is finished.
+    ///
+    /// `wanted_by` is the `CPV` of the build stating the group, since only a
+    /// chosen build's dependencies are any-of groups, and a weak blocker does
+    /// not count against it.
     ///
     /// A group can be as long as a dependency class, so the resolution's
     /// bounds are consulted atom by atom rather than only between groups.
@@ -793,27 +855,50 @@ impl<'a> Resolution<'a> {
         }
         let installs = |atom: &&Atom| atom.blocker().is_none();
         for together in alternatives {
-            let mut held = true;
-            for atom in together.iter().filter(installs) {
-                if self.stopped() {
+            let matched = alternative_matched(
+                together,
+                wanted_by,
+                self.installed,
+                &self.chosen,
+                &mut self.compared,
+            );
+            match matched {
+                None => {
+                    self.stopped();
                     return;
                 }
-                if self.held(atom).is_none() {
-                    held = false;
-                    break;
+                Some(true) => {
+                    self.keep_guarded(alternatives, wanted_by);
+                    return;
                 }
-            }
-            if held {
-                return;
+                Some(false) => {}
             }
         }
         let mut taken = None;
         let mut unmet = Vec::new();
         for together in alternatives {
             let mut answerable = true;
-            for atom in together.iter().filter(installs) {
+            for atom in together {
                 if self.stopped() {
                     return;
+                }
+                if atom.blocker().is_some() {
+                    let found = matching(
+                        atom,
+                        wanted_by,
+                        self.installed,
+                        &self.chosen,
+                        &mut self.compared,
+                    );
+                    match found {
+                        None => {
+                            self.stopped();
+                            return;
+                        }
+                        Some(Some(_)) => answerable = false,
+                        Some(None) => {}
+                    }
+                    continue;
                 }
                 match self.answer(atom) {
                     Answer::Held(_) | Answer::Free(_) => {}
@@ -832,12 +917,14 @@ impl<'a> Resolution<'a> {
                 for atom in together.iter().filter(installs) {
                     self.require(atom, wanted_by, None);
                 }
+                self.keep_guarded(alternatives, wanted_by);
                 return;
             }
         }
         // Nothing answers the group. A build that was there and collided is
         // the wall a caller can act on, so it is reported over the atoms
-        // nothing publishes.
+        // nothing publishes, and those over the blockers whose packages are
+        // there.
         let written = written(alternatives);
         match taken {
             Some((record, held, installed)) => {
@@ -845,7 +932,10 @@ impl<'a> Resolution<'a> {
             }
             None => {
                 if self.refusals.has_room() {
-                    let reason = self.wall(&unmet);
+                    let reason = match unmet.is_empty() {
+                        true => "in the root or in this resolution answers it".to_string(),
+                        false => self.wall(&unmet),
+                    };
                     self.refusals.unsatisfied.push(Unsatisfied {
                         atom: written,
                         wanted_by: Rc::clone(wanted_by),
@@ -853,6 +943,15 @@ impl<'a> Resolution<'a> {
                     });
                 }
             }
+        }
+    }
+
+    /// Keeps a settled any-of group to be matched again once the resolution is
+    /// finished, where it holds a blocker installing more can unmatch.
+    fn keep_guarded(&mut self, alternatives: &[Vec<Atom>], wanted_by: &Rc<str>) {
+        if guards(alternatives) {
+            self.guarded
+                .push((alternatives.to_vec(), Rc::clone(wanted_by)));
         }
     }
 
@@ -887,6 +986,7 @@ impl<'a> Resolution<'a> {
                 dependency,
                 wanted_by: Rc::clone(&wanted_by),
                 orders,
+                held_back: false,
             });
         }
         for dependency in post_merge {
@@ -894,6 +994,7 @@ impl<'a> Resolution<'a> {
                 dependency,
                 wanted_by: Rc::clone(&wanted_by),
                 orders: None,
+                held_back: false,
             });
         }
         Some(at)
@@ -1096,8 +1197,119 @@ fn occupant<C: Build>(
     None
 }
 
-/// Records every conflict `blockers`, and the root's own, make with the root
-/// and with `chosen`.
+/// Whether `blocker`, which the package `stated_by` states, leaves
+/// `candidate` out of what it counts against.
+///
+/// A weak block on the package version that states it does not count (PMS
+/// 8.3.2), which is what lets a package refuse every other version of itself.
+/// A strong block counts against anything it matches, its own version
+/// included. `stated_by` is a `CPV`, or for the caller's own atoms a name no
+/// candidate has.
+fn exempt(blocker: &Atom, stated_by: &str, candidate: &impl Candidate) -> bool {
+    blocker.blocker() == Some(Blocker::Soft) && candidate.cpv() == stated_by
+}
+
+/// The first package the root has, or build of `chosen`, that `atom` matches
+/// what it names in, as `(CPV, in the root)`, the root's first; `Some(None)`
+/// where none does.
+///
+/// For a blocker that is what it names, and a weak blocker passes over the
+/// package `stated_by` itself ([`exempt`]). Each candidate is charged to
+/// `compared`, and where that reaches a bound this answers `None`.
+fn matching<C: Candidate>(
+    atom: &Atom,
+    stated_by: &str,
+    installed: &Installed,
+    chosen: &Builds<C>,
+    compared: &mut Comparisons,
+) -> Option<Option<(String, bool)>> {
+    for package in installed.under(atom.name()) {
+        if !compared.charge(atom.reads(package)) {
+            return None;
+        }
+        if atom.matches(package) && !exempt(atom, stated_by, package) {
+            return Some(Some((package.cpv(), true)));
+        }
+    }
+    for (_, build) in chosen.under(atom.name()) {
+        if !compared.charge(atom.reads(build)) {
+            return None;
+        }
+        if atom.matches(build) && !exempt(atom, stated_by, build) {
+            return Some(Some((build.cpv(), false)));
+        }
+    }
+    Some(None)
+}
+
+/// Whether `together`, one alternative of an any-of group `stated_by` states,
+/// is matched by the root and `chosen`: every atom in it that names something
+/// to install matched, and every blocker in it matching nothing, since a
+/// blocker is matched where what it names is not (PMS 8.2.3).
+///
+/// `None` where the comparisons reach a bound.
+fn alternative_matched<C: Candidate>(
+    together: &[Atom],
+    stated_by: &str,
+    installed: &Installed,
+    chosen: &Builds<C>,
+    compared: &mut Comparisons,
+) -> Option<bool> {
+    for atom in together {
+        let found = matching(atom, stated_by, installed, chosen, compared)?.is_some();
+        if found == atom.blocker().is_some() {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Whether any alternative of the group `alternatives`, which `stated_by`
+/// states, is matched by the root and `chosen`, as [`alternative_matched`]
+/// judges one.
+fn group_matched<C: Candidate>(
+    alternatives: &[Vec<Atom>],
+    stated_by: &str,
+    installed: &Installed,
+    chosen: &Builds<C>,
+    compared: &mut Comparisons,
+) -> Option<bool> {
+    for together in alternatives {
+        if alternative_matched(together, stated_by, installed, chosen, compared)? {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// The first build of `chosen` that a blocker in `alternatives`, a group
+/// `stated_by` states, counts against, as its `CPV`: a build that took the
+/// group's last matched alternative away.
+fn chosen_blocked<C: Candidate>(
+    alternatives: &[Vec<Atom>],
+    stated_by: &str,
+    chosen: &Builds<C>,
+    compared: &mut Comparisons,
+) -> Option<Option<String>> {
+    let blockers = alternatives
+        .iter()
+        .flatten()
+        .filter(|atom| atom.blocker().is_some());
+    for blocker in blockers {
+        for (_, build) in chosen.under(blocker.name()) {
+            if !compared.charge(blocker.reads(build)) {
+                return None;
+            }
+            if blocker.matches(build) && !exempt(blocker, stated_by, build) {
+                return Some(Some(build.cpv()));
+            }
+        }
+    }
+    Some(None)
+}
+
+/// Records every conflict `blockers`, `groups`, and the root's own, make with
+/// the root and with `chosen`.
 ///
 /// `blockers` are the ones the builds being installed state, each with who
 /// stated it; they bind against the root and against each other. The root
@@ -1105,7 +1317,16 @@ fn occupant<C: Build>(
 /// its own: portage will not merge a package an installed one refuses to share
 /// the root with. Those are held to `chosen` only, since what the root's own
 /// packages say of each other is the state it arrived in rather than something
-/// this install did.
+/// this install did. A weak blocker passes over the package version stating it
+/// ([`exempt`]).
+///
+/// `groups` are the any-of groups holding a blocker that a resolution found
+/// matched or settled by an alternative, each with who stated it, and each is
+/// matched again against the finished set. The root's packages state such
+/// groups too, and one the root alone matches and the root and `chosen`
+/// together do not is refused as this install's doing. Either way the
+/// conflict names the group whole and the chosen build its blocker counts
+/// against.
 ///
 /// Every blocker is held against each candidate under its name, and how many
 /// candidates that is, and how many conflicts it finds, is the index's to
@@ -1113,6 +1334,7 @@ fn occupant<C: Build>(
 /// has no room left, and the caller reports whichever it was.
 fn conflicts<C: Candidate>(
     blockers: &[(Atom, Rc<str>)],
+    groups: &[(Vec<Vec<Atom>>, Rc<str>)],
     installed: &Installed,
     chosen: &Builds<C>,
     compared: &mut Comparisons,
@@ -1130,7 +1352,7 @@ fn conflicts<C: Candidate>(
             if !compared.charge(blocker.reads(package)) {
                 return;
             }
-            if blocker.matches(package) {
+            if blocker.matches(package) && !exempt(blocker, stated_by, package) {
                 if !refusals.has_room() {
                     return;
                 }
@@ -1141,7 +1363,7 @@ fn conflicts<C: Candidate>(
             if !compared.charge(blocker.reads(build)) {
                 return;
             }
-            if blocker.matches(build) {
+            if blocker.matches(build) && !exempt(blocker, stated_by, build) {
                 if !refusals.has_room() {
                     return;
                 }
@@ -1149,29 +1371,80 @@ fn conflicts<C: Candidate>(
             }
         }
     }
+    for (alternatives, stated_by) in groups {
+        match group_matched(alternatives, stated_by, installed, chosen, compared) {
+            None => return,
+            Some(true) => continue,
+            Some(false) => {}
+        }
+        let Some(blocked) = chosen_blocked(alternatives, stated_by, chosen, compared) else {
+            return;
+        };
+        if let Some(blocks) = blocked {
+            if !refusals.has_room() {
+                return;
+            }
+            refusals.conflicts.push(Conflict {
+                atom: written(alternatives),
+                stated_by: Rc::clone(stated_by),
+                stated_in_root: false,
+                blocks,
+                installed: false,
+            });
+        }
+    }
+    let nothing = Builds::<C>::default();
     for package in installed.packages() {
         // Made once the package is found to block something, and shared by
         // every conflict it makes.
         let mut stated_by: Option<Rc<str>> = None;
+        let cpv = package.cpv();
         for blocker in package.blockers() {
             for (_, build) in chosen.under(blocker.name()) {
                 if !compared.charge(blocker.reads(build)) {
                     return;
                 }
-                if blocker.matches(build) {
+                if blocker.matches(build) && !exempt(blocker, &cpv, build) {
                     if !refusals.has_room() {
                         return;
                     }
                     refusals.conflicts.push(Conflict {
                         atom: blocker.to_string(),
-                        stated_by: Rc::clone(
-                            stated_by.get_or_insert_with(|| Rc::from(package.cpv())),
-                        ),
+                        stated_by: Rc::clone(stated_by.get_or_insert_with(|| Rc::from(&*cpv))),
                         stated_in_root: true,
                         blocks: build.cpv(),
                         installed: false,
                     });
                 }
+            }
+        }
+        for group in package.guards() {
+            // A group the root alone leaves unmatched is the state it arrived
+            // in, and not this install's doing.
+            match group_matched(group, &cpv, installed, &nothing, compared) {
+                None => return,
+                Some(false) => continue,
+                Some(true) => {}
+            }
+            match group_matched(group, &cpv, installed, chosen, compared) {
+                None => return,
+                Some(true) => continue,
+                Some(false) => {}
+            }
+            let Some(blocked) = chosen_blocked(group, &cpv, chosen, compared) else {
+                return;
+            };
+            if let Some(blocks) = blocked {
+                if !refusals.has_room() {
+                    return;
+                }
+                refusals.conflicts.push(Conflict {
+                    atom: written(group),
+                    stated_by: Rc::clone(stated_by.get_or_insert_with(|| Rc::from(&*cpv))),
+                    stated_in_root: true,
+                    blocks,
+                    installed: false,
+                });
             }
         }
     }
@@ -1296,6 +1569,7 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
     if !compared.spent() {
         conflicts(
             &blockers,
+            &[],
             installed,
             &admitted,
             &mut compared,
@@ -1317,8 +1591,9 @@ pub(super) fn admit(installed: &Installed, arriving: Vec<Arriving>) -> Refusals 
 /// What answers is the root and the whole of what the plan installs, whatever
 /// order it merges in: a resolution's closure is a set, and its order breaks
 /// the cycles the archive's runtime graph has. An any-of group is answered by
-/// any one of its alternatives, every atom of it that names something to
-/// install answered, as [`Resolution::any_of`] reads one.
+/// any one of its alternatives that [`alternative_matched`] finds matched, as
+/// [`Resolution::any_of`] reads one: every atom of it that names something to
+/// install answered, and every blocker of it matching nothing.
 ///
 /// Each candidate an atom is held against is charged to `compared`, and where
 /// that reaches a bound the check stops there, recording nothing for the
@@ -1345,12 +1620,8 @@ fn requirements(
                 Dependency::One(atom) if atom.blocker().is_some() => continue,
                 Dependency::One(atom) => (answered(atom, compared), atom.to_string()),
                 Dependency::AnyOf(alternatives) => (
-                    alternatives.iter().any(|together| {
-                        together
-                            .iter()
-                            .filter(|atom| atom.blocker().is_none())
-                            .all(|atom| answered(atom, compared))
-                    }),
+                    group_matched(alternatives, &wanted_by, installed, admitted, compared)
+                        .unwrap_or(false),
                     written(alternatives),
                 ),
             };
@@ -1817,6 +2088,76 @@ PATH: dev-python/two-slot/two-slot-1.0-1.gpkg.tar
 RDEPEND: dev-lang/python:3.11 dev-lang/python:3.12
 SIZE: 10
 USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 110
+CPV: app-test/consumer-1
+MD5: 000000000000000000000000b10c0000
+PATH: app-test/consumer/consumer-1-1.gpkg.tar
+RDEPEND: || ( !app-test/blocked app-test/fallback )
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 111
+CPV: app-test/fallback-1
+MD5: 000000000000000000000000b10c0001
+PATH: app-test/fallback/fallback-1-1.gpkg.tar
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 112
+CPV: app-test/blocked-1
+MD5: 000000000000000000000000b10c0002
+PATH: app-test/blocked/blocked-1-1.gpkg.tar
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 113
+CPV: app-test/mixed-1
+MD5: 000000000000000000000000b10c0003
+PATH: app-test/mixed/mixed-1-1.gpkg.tar
+RDEPEND: || ( ( !app-test/blocked app-test/extra ) app-test/fallback )
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 114
+CPV: app-test/extra-1
+MD5: 000000000000000000000000b10c0004
+PATH: app-test/extra/extra-1-1.gpkg.tar
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 115
+CPV: app-test/chooser-1
+MD5: 000000000000000000000000b10c0005
+PATH: app-test/chooser/chooser-1-1.gpkg.tar
+RDEPEND: || ( ( !app-test/absent app-test/blocked ) app-test/other )
+SIZE: 10
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 116
+CPV: app-test/self-block-1
+MD5: 000000000000000000000000b10c0006
+PATH: app-test/self-block/self-block-1-1.gpkg.tar
+RDEPEND: !app-test/self-block
+SIZE: 10
+SLOT: 1
+USE: amd64
+
+BUILD_ID: 1
+BUILD_TIME: 117
+CPV: app-test/strong-self-1
+MD5: 000000000000000000000000b10c0007
+PATH: app-test/strong-self/strong-self-1-1.gpkg.tar
+RDEPEND: !!app-test/strong-self
+SIZE: 10
+USE: amd64
 ";
 
     /// The fixture index.
@@ -1860,6 +2201,14 @@ USE: amd64
     /// The `CPV`s a resolution chose, in install order.
     fn installing(resolved: &Resolved) -> Vec<String> {
         resolved.packages.iter().map(Record::cpv).collect()
+    }
+
+    /// The `CPV`s a resolution chose, in name order, for a test that asserts
+    /// what was chosen and not the order it merges in.
+    fn chosen(resolved: &Resolved) -> Vec<String> {
+        let mut chosen = installing(resolved);
+        chosen.sort();
+        chosen
     }
 
     #[test]
@@ -2020,6 +2369,119 @@ USE: amd64
                 .iter()
                 .any(|record| record.name() == "dev-vcs/git")
         );
+    }
+
+    #[test]
+    fn a_blocker_in_an_any_of_group_is_matched_where_what_it_names_is_not_there() {
+        // `|| ( !app-test/blocked app-test/fallback )`: with the blocked
+        // package in the root the first alternative is not matched, so the
+        // group needs the second.
+        let (resolved, refusals) = run(&root(&["app-test/blocked-1"]), &["app-test/consumer"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(
+            chosen(&resolved),
+            ["app-test/consumer-1", "app-test/fallback-1"]
+        );
+        // Without it, the blocker alone matches the group.
+        let (resolved, refusals) = run(&root(&[]), &["app-test/consumer"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(chosen(&resolved), ["app-test/consumer-1"]);
+
+        // An alternative mixing a blocker and a requirement takes both or
+        // neither: `( !app-test/blocked app-test/extra )`.
+        let (resolved, refusals) = run(&root(&[]), &["app-test/mixed"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(chosen(&resolved), ["app-test/extra-1", "app-test/mixed-1"]);
+        let (resolved, refusals) = run(&root(&["app-test/blocked-1"]), &["app-test/mixed"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(
+            chosen(&resolved),
+            ["app-test/fallback-1", "app-test/mixed-1"]
+        );
+    }
+
+    #[test]
+    fn a_group_a_blocker_settles_is_judged_against_the_finished_set() {
+        // The blocked package is chosen after the group is met, by the
+        // caller's own list. The group waits for the rest of the queue, so it
+        // sees the blocked package and takes its fallback.
+        let (resolved, refusals) = run(&root(&[]), &["app-test/consumer", "app-test/blocked"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        let installing = installing(&resolved);
+        for cpv in [
+            "app-test/consumer-1",
+            "app-test/blocked-1",
+            "app-test/fallback-1",
+        ] {
+            assert!(installing.contains(&cpv.to_string()), "{installing:?}");
+        }
+
+        // Another held-back group installs it after the first was matched by
+        // its blocker. Nothing is revisited, so the first group is unmatched
+        // in the finished set, and that is refused as a conflict naming the
+        // build that unmatched it.
+        let (_, refusals) = run(&root(&[]), &["app-test/consumer", "app-test/chooser"], &[]);
+        assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
+        let conflict = &refusals.conflicts[0];
+        assert_eq!(conflict.atom, "!app-test/blocked or app-test/fallback");
+        assert_eq!(&*conflict.stated_by, "app-test/consumer-1");
+        assert_eq!(conflict.blocks, "app-test/blocked-1");
+        assert!(!conflict.installed && !conflict.stated_in_root);
+        assert!(
+            refusals.describe().contains(
+                "app-test/consumer-1 blocks app-test/blocked-1 with !app-test/blocked or \
+                 app-test/fallback, and app-test/blocked-1 would be installed by this same \
+                 resolution"
+            ),
+            "{}",
+            refusals.describe(),
+        );
+    }
+
+    #[test]
+    fn a_weak_block_on_its_own_version_does_not_count_and_a_strong_one_does() {
+        let (resolved, refusals) = run(&root(&[]), &["app-test/self-block"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(installing(&resolved), ["app-test/self-block-1"]);
+
+        let (_, refusals) = run(&root(&[]), &["app-test/strong-self"], &[]);
+        assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
+        assert_eq!(refusals.conflicts[0].blocks, "app-test/strong-self-1");
+
+        // Another version of the package is still blocked, here one in the
+        // root in a slot the chosen build does not take.
+        let (_, refusals) = run(
+            &root(&["app-test/self-block-0"]),
+            &[">=app-test/self-block-1"],
+            &[],
+        );
+        assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
+        assert_eq!(refusals.conflicts[0].blocks, "app-test/self-block-0");
+        assert!(refusals.conflicts[0].installed);
+    }
+
+    #[test]
+    fn a_group_a_package_in_the_root_states_binds_what_the_resolution_installs() {
+        let group = "|| ( !app-test/blocked app-test/fallback )";
+        let installed = root(&["sys-apps/openrc-0.62"]).guarding("sys-apps/openrc", group);
+        let (_, refusals) = run(&installed, &["app-test/blocked"], &[]);
+        assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
+        let conflict = &refusals.conflicts[0];
+        assert_eq!(conflict.atom, "!app-test/blocked or app-test/fallback");
+        assert_eq!(&*conflict.stated_by, "sys-apps/openrc-0.62");
+        assert!(conflict.stated_in_root);
+        assert_eq!(conflict.blocks, "app-test/blocked-1");
+
+        // Another alternative the root matches keeps the group matched.
+        let installed = root(&["sys-apps/openrc-0.62", "app-test/fallback-1"])
+            .guarding("sys-apps/openrc", group);
+        assert!(run(&installed, &["app-test/blocked"], &[]).1.is_empty());
+
+        // A group the root arrived with unmatched is not this install's doing.
+        let installed = root(&["sys-apps/openrc-0.62", "app-test/blocked-0"])
+            .guarding("sys-apps/openrc", group);
+        let (_, refusals) = run(&installed, &["app-editors/vim"], &[]);
+        assert!(refusals.is_empty(), "{}", refusals.describe());
     }
 
     #[test]
@@ -3002,6 +3464,63 @@ USE: amd64 compat
         let refusals = admit(&root, without);
         assert_eq!(refusals.unsatisfied.len(), 1, "{}", refusals.describe());
         assert_eq!(refusals.unsatisfied[0].atom, "a/x or a/y");
+    }
+
+    #[test]
+    fn a_replayed_plan_holds_a_blocker_in_a_group_as_a_resolution_does() {
+        let consumer = || {
+            arriving(
+                "app-test/consumer-1",
+                1,
+                &[
+                    ("SLOT", "0\n"),
+                    ("RDEPEND", "|| ( !app-test/blocked app-test/fallback )\n"),
+                ],
+            )
+        };
+        // The blocked package in the root unmatches the blocker, and nothing
+        // answers the fallback.
+        let refusals = admit(&root(&["app-test/blocked-1"]), vec![consumer()]);
+        assert_eq!(refusals.unsatisfied.len(), 1, "{}", refusals.describe());
+        assert_eq!(
+            refusals.unsatisfied[0].atom,
+            "!app-test/blocked or app-test/fallback"
+        );
+        // The plan bringing the fallback, or a root without the blocked
+        // package, matches the group.
+        let refusals = admit(
+            &root(&["app-test/blocked-1"]),
+            vec![
+                consumer(),
+                arriving("app-test/fallback-1", 2, &[("SLOT", "0\n")]),
+            ],
+        );
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert!(admit(&root(&[]), vec![consumer()]).is_empty());
+
+        // A group a package in the root states binds the plan as it binds a
+        // resolution.
+        let installed = root(&["sys-apps/openrc-0.62"]).guarding(
+            "sys-apps/openrc",
+            "|| ( !app-test/blocked app-test/fallback )",
+        );
+        let refusals = admit(
+            &installed,
+            vec![arriving("app-test/blocked-1", 1, &[("SLOT", "0\n")])],
+        );
+        assert_eq!(refusals.conflicts.len(), 1, "{}", refusals.describe());
+        assert!(refusals.conflicts[0].stated_in_root);
+
+        // A weak block on the arriving build's own version does not count.
+        let refusals = admit(
+            &root(&[]),
+            vec![arriving(
+                "app-test/self-block-1",
+                1,
+                &[("SLOT", "1\n"), ("RDEPEND", "!app-test/self-block\n")],
+            )],
+        );
+        assert!(refusals.is_empty(), "{}", refusals.describe());
     }
 
     #[test]

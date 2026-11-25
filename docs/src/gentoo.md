@@ -312,7 +312,18 @@ had as a preference.
 A blocker atom that matches something the root has or the resolution chose is a
 conflict, and the run fails naming both sides. The root's own packages state
 blockers too, in their database entries. One that matches a chosen build is the
-same conflict from the other side.
+same conflict from the other side. A weak blocker, `!`, does not count against
+the package version that states it, as the package manager specification
+exempts it. A strong one, `!!`, does.
+
+A blocker can also be one alternative of an any-of group. `|| ( !a b )` is
+matched where `a` is not installed, or where `b` is. The resolution takes `b`
+where the root or the resolution has `a`, and nothing where neither has.
+
+Such a group is settled after the rest of the install list and its closure, so
+it sees the set the other choices made. A group a later choice still unmatches
+is a conflict naming the group and the build. So is a group a root package
+states that this install unmatches.
 
 There is no backtracking. The conflicts a resolution meets are ones portage
 refuses too. Almost all are a desktop stack asked for in a root built against

@@ -29,7 +29,8 @@
 //! The category and the version are the directory names; `SLOT` and `USE` are
 //! one-line files inside the entry. That is everything an atom is matched
 //! against. `RDEPEND` and `PDEPEND` beside them carry the blockers the package
-//! states, which bind what a resolution may install into the same root.
+//! states, plain or as an alternative of an any-of group, which bind what a
+//! resolution may install into the same root.
 //!
 //! # The tree is read as an untrusted one
 //!
@@ -139,10 +140,17 @@ pub struct InstalledPackage {
     ///
     /// Not exposed, for the reason [`iuse`](Self::iuse) is not: it is what a
     /// resolution holds its choices to, rather than what a caller asks of an
-    /// installed package. A blocker inside an any-of group is one alternative
-    /// among several and binds nothing on its own, so only the plain ones are
-    /// kept, which is the reading the resolver gives a chosen build's own.
+    /// installed package.
     blockers: Vec<Atom>,
+    /// The any-of groups of its runtime dependencies that hold a blocker, each
+    /// a list of alternatives.
+    ///
+    /// A blocker in a group is matched where what it names is not installed
+    /// (PMS 8.2.3), so installing that is refused unless another alternative
+    /// of the group is matched. A group of nothing but requirements cannot be
+    /// unmatched by installing more, and only these can, so only these are
+    /// kept. Not exposed, for the reason [`blockers`](Self::blockers) is not.
+    guards: Vec<Vec<Vec<Atom>>>,
     /// The ordinal its merge was stamped with, where the entry records one
     /// that parses.
     ///
@@ -188,6 +196,12 @@ impl InstalledPackage {
     /// The blockers the package's runtime dependencies state.
     pub(super) fn blockers(&self) -> &[Atom] {
         &self.blockers
+    }
+
+    /// The any-of groups the package's runtime dependencies state that hold a
+    /// blocker, each a list of alternatives.
+    pub(super) fn guards(&self) -> &[Vec<Vec<Atom>>] {
+        &self.guards
     }
 }
 
@@ -328,6 +342,7 @@ impl Installed {
                     iuse: use_flags.clone(),
                     use_flags,
                     blockers: Vec::new(),
+                    guards: Vec::new(),
                     counter: None,
                     chost: None,
                 })
@@ -348,6 +363,26 @@ impl Installed {
         package.blockers = blockers
             .iter()
             .map(|text| atom::parse(text).expect("a fixture blocker"))
+            .collect();
+        self
+    }
+
+    /// The same set, with the package published under `name` stating the
+    /// blocker-holding any-of groups of `class`, a runtime dependency class.
+    #[cfg(test)]
+    pub(super) fn guarding(mut self, name: &str, class: &str) -> Installed {
+        let package = self
+            .packages
+            .iter_mut()
+            .find(|package| package.name == name)
+            .expect("the fixture root holds the package");
+        package.guards = index::read_class(class)
+            .expect("a fixture class")
+            .into_iter()
+            .filter_map(|dependency| match dependency {
+                Dependency::AnyOf(alternatives) => Some(alternatives),
+                Dependency::One(_) => None,
+            })
             .collect();
         self
     }
@@ -614,7 +649,8 @@ fn read_entry(
             },
         )
     })?;
-    budget.charge(package.blockers.len() * size_of::<Atom>(), at)?;
+    let guarded: usize = package.guards.iter().flatten().map(Vec::len).sum();
+    budget.charge((package.blockers.len() + guarded) * size_of::<Atom>(), at)?;
     Ok(package)
 }
 
@@ -747,6 +783,7 @@ fn read_package<E>(
     // absence is no blockers. One that does not parse is a gap in what the
     // root forbids, and resolving past it could install what it blocks.
     let mut blockers = Vec::new();
+    let mut guards = Vec::new();
     let mut requires = Vec::new();
     for file in RUNTIME_DEPENDENCY_FILES {
         let class = field(file)?.unwrap_or_default();
@@ -755,6 +792,16 @@ fn read_package<E>(
         for dependency in parsed {
             match dependency {
                 Dependency::One(atom) if atom.blocker().is_some() => blockers.push(atom),
+                Dependency::AnyOf(alternatives) => {
+                    if alternatives
+                        .iter()
+                        .flatten()
+                        .any(|atom| atom.blocker().is_some())
+                    {
+                        guards.push(alternatives.clone());
+                    }
+                    requires.push(Dependency::AnyOf(alternatives));
+                }
                 requirement => requires.push(requirement),
             }
         }
@@ -779,6 +826,7 @@ fn read_package<E>(
         use_flags,
         iuse,
         blockers,
+        guards,
         counter: field(COUNTER_FILE)?.and_then(|text| text.parse().ok()),
         chost: field(CHOST_FILE)?.filter(|chost| !chost.is_empty()),
     };
@@ -1206,9 +1254,9 @@ mod tests {
 
     #[test]
     fn an_entry_carries_the_blockers_its_runtime_dependencies_state() {
-        // Plain blockers bind; one inside an any-of group is an alternative
-        // and binds nothing on its own; and an atom that requires rather than
-        // refuses is no blocker at all.
+        // Plain blockers bind; a group holding one binds as a whole, matched
+        // by any alternative; and an atom that requires rather than refuses is
+        // no blocker at all.
         let dir = Scratch::for_test("gentoo-installed", "blockers");
         entry(&dir, "sys-apps", "openrc-0.62", Some("0"), "amd64");
         let at = dir.join(DB_DIR).join("sys-apps/openrc-0.62");
@@ -1222,6 +1270,17 @@ mod tests {
         let openrc = read.packages().next().expect("openrc is installed");
         let blockers: Vec<String> = openrc.blockers().iter().map(Atom::to_string).collect();
         assert_eq!(blockers, ["!sys-apps/sysvinit", "!!<sys-fs/udev-250"]);
+        let guards: Vec<Vec<Vec<String>>> = openrc
+            .guards()
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|together| together.iter().map(Atom::to_string).collect())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(guards, [[["!app-misc/a"], ["app-misc/b"]]]);
 
         // A class that does not parse is a gap in what the root forbids, and
         // is refused rather than read as forbidding nothing.

@@ -215,6 +215,18 @@ consumer upgrading can skip it.
   permission field longer than three characters, a name beginning with
   whitespace or a `#`, and an escape of fewer than three digits, or spelling a
   NUL or a value past a byte.
+- The Gentoo layer matches a blocker in an any-of group where what it names is
+  not installed, as the package manager specification does. A resolution read
+  `|| ( !a b )` over a root holding `a` as matched and installed neither, and
+  replaying a plan admitted it; it now takes `b`, or refuses the group. A group
+  holding a blocker is settled after the rest of the install list and its
+  closure. Each such group a resolution settles, and each one a package in the
+  root states and the root alone matches, is matched again against the
+  finished set, and one the install leaves unmatched is a conflict.
+- The Gentoo layer does not count a weak blocker, `!`, against the package
+  version that states it, as the package manager specification exempts one. A
+  package blocking the other versions of itself was refused as blocking
+  itself. A strong blocker, `!!`, still counts against its own version.
 - The embedding chapter's tokio recipe for cancelling a sandbox kills it when
   the async side is dropped, before the kill handle reaches it or after. As
   written, a future dropped before the handle arrived left the sandbox running
