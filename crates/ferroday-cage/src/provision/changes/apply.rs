@@ -227,10 +227,10 @@ fn removes(kind: ChangeKind) -> bool {
 /// by a sandbox still running on it, is refused with
 /// [`ProvisionError::SourceChanged`] rather than written unread.
 ///
-/// Every path in the target is resolved by descriptor, never through a
-/// symbolic link, and the target's directories hold no entry the apply did not
-/// check. Apply to a tree no sandbox has mounted as a lower: the kernel does
-/// not define what a mounted overlay shows of a lower that changes beneath it.
+/// Every path in the target is resolved by descriptor, one component at a
+/// time, never through a symbolic link. Apply to a tree no sandbox has mounted
+/// as a lower: the kernel does not define what a mounted overlay shows of a
+/// lower that changes beneath it.
 pub struct Apply<'a> {
     changes: &'a ChangeSet,
     target: PathBuf,
