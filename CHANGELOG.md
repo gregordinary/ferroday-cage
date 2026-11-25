@@ -25,6 +25,14 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Fixed
+
+- Extraction refuses an entry whose access control list the kernel would not
+  store with `ProvisionError::EntryRefused`, naming what is wrong with it, rather
+  than failing to set it with an I/O error. A list naming one user or group twice,
+  which the kernel stores and libacl's checker refuses, is refused too; named
+  entries are written in ascending order.
+
 ## [0.6.0] - 2026-11-13
 
 `fcage` 0.7.0. Entries below marked **Breaking.** change the library's API and

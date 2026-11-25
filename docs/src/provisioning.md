@@ -769,7 +769,8 @@ An archive records an access control list as
 mode, and a directory's once its contents are written. Its named users and
 groups are the ids the tree means, as an export reads them inside the map. Each
 is read through the map to the host's id. The single-identity map holds only
-root inside, which is the calling user.
+root inside, which is the calling user. A list the kernel would not store
+refuses its entry with `ProvisionError::EntryRefused`.
 
 A list naming an id the map has no host id for is given as its narrowing. So is
 a list the destination's filesystem cannot hold. The owning group then keeps

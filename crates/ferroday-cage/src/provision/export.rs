@@ -766,7 +766,7 @@ impl<'f, W: Write> TarWriter<'f, W> {
             {
                 continue;
             }
-            let names_overflow = Acl::parse(value).is_some_and(|acl| {
+            let names_overflow = Acl::parse(value).ok().flatten().is_some_and(|acl| {
                 acl.mapped(
                     |id| (Some(id) != uid).then_some(id),
                     |id| (Some(id) != gid).then_some(id),
@@ -1889,8 +1889,8 @@ mod tests {
             use ferroday_cage_testkit::xattr::NO_ID;
             ferroday_cage_testkit::xattr::acl(&[
                 (0x01, 6, NO_ID),
-                (0x08, 4, named),
                 (0x04, 4, NO_ID),
+                (0x08, 4, named),
                 (0x10, 4, NO_ID),
                 (0x20, 0, NO_ID),
             ])

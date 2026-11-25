@@ -949,8 +949,11 @@ fn judge(
             Ok(value)
         } else if is(xattr::ACCESS_ACL) || is(xattr::DEFAULT_ACL) {
             match Acl::parse(&value) {
-                None => Err(AttributeSkip::Unsettable),
-                Some(acl) => match acl.mapped(|id| ids.maps_uid(id), |id| ids.maps_gid(id)) {
+                Err(_) => Err(AttributeSkip::Unsettable),
+                // No entries, which the kernel never reports and takes as no
+                // list: carried as it was read, it sets none.
+                Ok(None) => Ok(value),
+                Ok(Some(acl)) => match acl.mapped(|id| ids.maps_uid(id), |id| ids.maps_gid(id)) {
                     Some(mapped) => Ok(mapped.encode()),
                     None => {
                         let narrowed = acl.narrowed();

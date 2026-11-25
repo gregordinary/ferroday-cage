@@ -1208,8 +1208,9 @@ fn apply_meta_fd(
 /// than the archive recorded; a filesystem without lists holds no default at
 /// all.
 ///
-/// A list the archive records in a form the kernel does not store refuses the
-/// entry, since nothing about the entry's access could then be relied on.
+/// A list the kernel would not store ([`xattr::AclFlaw`]) refuses the entry
+/// before anything is set, since nothing about the entry's access could then be
+/// relied on. A value holding no entry is no list, as the kernel takes it.
 fn apply_lists(
     fd: BorrowedFd<'_>,
     mode: u32,
@@ -1221,13 +1222,17 @@ fn apply_lists(
     let setting =
         |errno: Errno| ProvisionError::io("setting the access control list of", path, errno.into());
     let parse = |value: &[u8]| {
-        Acl::parse(value).ok_or_else(|| ProvisionError::EntryRefused {
+        Acl::parse(value).map_err(|flaw| ProvisionError::EntryRefused {
             path: path.to_path_buf(),
-            reason: "the access control list it records is not one the kernel stores".to_string(),
+            reason: format!(
+                "the access control list it records is not one the kernel stores: {}",
+                flaw.reason()
+            ),
         })
     };
-    if let Some(value) = access {
-        let acl = parse(value)?;
+    if let Some(value) = access
+        && let Some(acl) = parse(value)?
+    {
         let given = match lists.on_host(&acl) {
             Some(on_host) => {
                 match rustix::fs::fsetxattr(
@@ -1248,8 +1253,9 @@ fn apply_lists(
             rustix::fs::fchmod(fd, Mode::from_raw_mode(narrowed)).map_err(setting)?;
         }
     }
-    if let Some(value) = default {
-        let acl = parse(value)?;
+    if let Some(value) = default
+        && let Some(acl) = parse(value)?
+    {
         let list = lists.on_host(&acl).unwrap_or_else(|| acl.narrowed());
         match rustix::fs::fsetxattr(fd, xattr::DEFAULT_ACL, &list.encode(), XattrFlags::empty()) {
             Ok(()) | Err(Errno::NOTSUP) => {}
@@ -2095,7 +2101,7 @@ mod naming_tests {
 // rather than leaving the mode to stand for them.
 #[cfg(test)]
 mod list_tests {
-    use super::{Placement, TarReader, extract_archive};
+    use super::{Placement, ProvisionError, TarReader, extract_archive};
     use crate::provision::tar::pax_record;
     use crate::scratch::Scratch;
     use ferroday_cage_testkit::tar::Tar;
@@ -2231,6 +2237,32 @@ mod list_tests {
         )
         .expect_err("a malformed list is refused");
         assert!(err.to_string().contains("access control list"), "{err}",);
+    }
+
+    #[test]
+    fn a_list_in_an_order_the_kernel_refuses_is_refused_before_it_is_set() {
+        // Everyone else's entry before the owning group's: the kernel answers
+        // `EINVAL`, which would be reported as a failure to set the list
+        // rather than as the archive's.
+        let root = Scratch::for_test("extract", "shuffled-list");
+        let mut tar = Tar::new();
+        let shuffled = acl(&[(0x01, 6, NONE), (0x20, 0, NONE), (0x04, 4, NONE)]);
+        pax(
+            &mut tar,
+            &pax_record(b"SCHILY.xattr.system.posix_acl_access", &shuffled),
+        );
+        tar.file("file", 0o640, b"x");
+        match extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        ) {
+            Err(ProvisionError::EntryRefused { path, reason }) => {
+                assert_eq!(path, Path::new("file"));
+                assert!(reason.contains("out of order"), "{reason}");
+            }
+            other => panic!("expected the entry refused, got {other:?}"),
+        }
     }
 }
 

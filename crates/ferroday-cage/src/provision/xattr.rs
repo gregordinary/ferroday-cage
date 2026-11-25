@@ -157,7 +157,10 @@ pub(super) fn narrowed_mode(fd: BorrowedFd<'_>, mode: u32) -> Result<u32, Errno>
         Err(Errno::NODATA) => return Ok(mode),
         Err(errno) => return Err(errno),
     };
-    Ok(Acl::parse(&value).map_or(mode, |acl| acl.narrowed().mode_of(mode)))
+    Ok(match Acl::parse(&value) {
+        Ok(Some(acl)) => acl.narrowed().mode_of(mode),
+        Ok(None) | Err(_) => mode,
+    })
 }
 
 /// Reads a listing or a value whose length `query` answers, through `read`,
@@ -202,36 +205,158 @@ struct AclEntry {
     id: u32,
 }
 
+/// Why an attribute value is not an access control list this crate carries.
+///
+/// A list is carried where the kernel stores it and libacl's checker passes
+/// it. The two disagree in one place: the kernel stores a list naming one user
+/// or group twice, where libacl calls it invalid. No tool writes one, and what
+/// the kernel makes of it is nothing a reader of an archive should need to
+/// know, so it is refused with the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AclFlaw {
+    /// A version other than 2, or a value too short to state one.
+    Version,
+    /// A length that is not a whole number of entries.
+    Length,
+    /// A tag no list holds.
+    Tag,
+    /// Permission bits beyond reading, writing and executing.
+    Permissions,
+    /// Entries out of the order the kernel takes them in, a required entry
+    /// missing or repeated, or named entries without a mask.
+    Shape,
+    /// One user or group named twice.
+    Duplicate,
+    /// A named entry holding the id that stands for no one. It is what the
+    /// kernel reports, to a reader in a user namespace, for an id the
+    /// namespace's map does not hold: it reports the entry, and in place of
+    /// its id the id it refuses to store.
+    UnmappedId,
+}
+
+#[cfg(feature = "tarball")]
+impl AclFlaw {
+    /// The flaw as the end of a sentence saying why a list was refused.
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            AclFlaw::Version => "it is not a version-2 list",
+            AclFlaw::Length => "its length is not a whole number of entries",
+            AclFlaw::Tag => "an entry has a tag no list holds",
+            AclFlaw::Permissions => "an entry grants more than reading, writing and executing",
+            AclFlaw::Shape => {
+                "its entries are out of order, a required entry is missing or repeated, or it \
+                 names a user or group without a mask"
+            }
+            AclFlaw::Duplicate => "it names one user or group twice",
+            AclFlaw::UnmappedId => "it names a user or group by the id that stands for no one",
+        }
+    }
+}
+
+/// Where entries of `tag` stand in a list the kernel takes: the owner, the
+/// named users, the owning group, the named groups, the mask, then everyone
+/// else. `None` for a tag no list holds.
+fn rank(tag: u16) -> Option<u8> {
+    match tag {
+        ACL_USER_OBJ => Some(0),
+        ACL_USER => Some(1),
+        ACL_GROUP_OBJ => Some(2),
+        ACL_GROUP => Some(3),
+        ACL_MASK => Some(4),
+        ACL_OTHER => Some(5),
+        _ => None,
+    }
+}
+
+/// `entries` as the list they make, held to the rules a carried list keeps
+/// ([`AclFlaw`]), or why they make none.
+///
+/// The kernel takes the tags in [`rank`] order and refuses any other, and
+/// that is checked as it stands. Within the named users, and within the named
+/// groups, it takes the ids in any order and stores them as given; libacl
+/// writes them ascending, and so does this, so that a list is one sequence of
+/// bytes whatever order its writer kept. An entry that names no one carries
+/// an id the kernel ignores, written here as the one libacl writes,
+/// [`ACL_UNDEFINED_ID`].
+fn canonical(mut entries: Vec<AclEntry>) -> Result<Vec<AclEntry>, AclFlaw> {
+    let mut previous = 0;
+    let mut counts = [0usize; 6];
+    for entry in &mut entries {
+        let rank = rank(entry.tag).ok_or(AclFlaw::Tag)?;
+        if entry.perm & !0o7 != 0 {
+            return Err(AclFlaw::Permissions);
+        }
+        if rank < previous {
+            return Err(AclFlaw::Shape);
+        }
+        previous = rank;
+        counts[usize::from(rank)] += 1;
+        if matches!(entry.tag, ACL_USER | ACL_GROUP) {
+            if entry.id == ACL_UNDEFINED_ID {
+                return Err(AclFlaw::UnmappedId);
+            }
+        } else {
+            entry.id = ACL_UNDEFINED_ID;
+        }
+    }
+    let [owner, users, group, groups, masks, other] = counts;
+    if owner != 1 || group != 1 || other != 1 || masks > 1 || (users + groups > 0 && masks == 0) {
+        return Err(AclFlaw::Shape);
+    }
+    entries.sort_by_key(|entry| (rank(entry.tag), entry.id));
+    let repeated = entries.windows(2).any(|pair| {
+        matches!(pair[0].tag, ACL_USER | ACL_GROUP)
+            && pair[0].tag == pair[1].tag
+            && pair[0].id == pair[1].id
+    });
+    if repeated {
+        return Err(AclFlaw::Duplicate);
+    }
+    Ok(entries)
+}
+
 /// A POSIX access control list, as the `system.posix_acl_*` attributes hold
 /// one: a version, then each entry as a tag, its permission bits, and an id.
+///
+/// Every list is one [`canonical`] makes: one the kernel stores and libacl's
+/// checker passes, in the order libacl writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Acl {
     entries: Vec<AclEntry>,
 }
 
 impl Acl {
-    /// Reads a list from an attribute's value, `None` where it is not one the
-    /// kernel would store: another version, or a length that is not a whole
-    /// number of entries.
-    pub(super) fn parse(value: &[u8]) -> Option<Acl> {
-        let (version, rest) = value.split_first_chunk::<4>()?;
+    /// Reads a list from an attribute's value.
+    ///
+    /// `Ok(None)` is a value holding no entry, the version alone or nothing at
+    /// all, which the kernel takes as no list: setting it removes the one
+    /// there is. An error says why the value is no list this crate carries
+    /// ([`AclFlaw`]). The kernel refuses every such value but one naming a
+    /// user or group twice.
+    pub(super) fn parse(value: &[u8]) -> Result<Option<Acl>, AclFlaw> {
+        if value.is_empty() {
+            return Ok(None);
+        }
+        let (version, rest) = value.split_first_chunk::<4>().ok_or(AclFlaw::Version)?;
         if u32::from_le_bytes(*version) != ACL_VERSION {
-            return None;
+            return Err(AclFlaw::Version);
         }
         let (entries, remainder) = rest.as_chunks::<8>();
         if !remainder.is_empty() {
-            return None;
+            return Err(AclFlaw::Length);
         }
-        Some(Acl {
-            entries: entries
-                .iter()
-                .map(|entry| AclEntry {
-                    tag: u16::from_le_bytes([entry[0], entry[1]]),
-                    perm: u16::from_le_bytes([entry[2], entry[3]]),
-                    id: u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
-                })
-                .collect(),
-        })
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let entries = entries
+            .iter()
+            .map(|entry| AclEntry {
+                tag: u16::from_le_bytes([entry[0], entry[1]]),
+                perm: u16::from_le_bytes([entry[2], entry[3]]),
+                id: u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
+            })
+            .collect();
+        canonical(entries).map(|entries| Some(Acl { entries }))
     }
 
     /// The list as an attribute's value.
@@ -247,7 +372,8 @@ impl Acl {
     }
 
     /// The list with each named entry's id read through `uid` or `gid`, or
-    /// `None` where either has no answer for one.
+    /// `None` where either has no answer for one, or the answers make no list:
+    /// two ids read as one.
     pub(super) fn mapped(
         &self,
         uid: impl Fn(u32) -> Option<u32>,
@@ -262,7 +388,7 @@ impl Acl {
             };
             entries.push(AclEntry { id, ..*entry });
         }
-        Some(Acl { entries })
+        canonical(entries).ok().map(|entries| Acl { entries })
     }
 
     /// The list without its named entries and its mask, the owning group's
@@ -282,13 +408,9 @@ impl Acl {
             .map(|entry| match entry.tag {
                 ACL_GROUP_OBJ => AclEntry {
                     perm: entry.perm & mask,
-                    id: ACL_UNDEFINED_ID,
                     ..*entry
                 },
-                _ => AclEntry {
-                    id: ACL_UNDEFINED_ID,
-                    ..*entry
-                },
+                _ => *entry,
             })
             .collect();
         Acl { entries }
@@ -372,24 +494,200 @@ mod tests {
         }
     }
 
+    /// The attribute value of `(tag, perm, id)` triples, in the order given.
+    fn value(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut value = ACL_VERSION.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&perm.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    const NONE: u32 = ACL_UNDEFINED_ID;
+
     #[test]
     fn a_list_reads_back_as_it_was_encoded() {
         let acl = list(&[
-            (ACL_USER_OBJ, 6, ACL_UNDEFINED_ID),
+            (ACL_USER_OBJ, 6, NONE),
             (ACL_USER, 4, 1000),
-            (ACL_GROUP_OBJ, 0, ACL_UNDEFINED_ID),
+            (ACL_GROUP_OBJ, 0, NONE),
             (ACL_GROUP, 6, 27),
-            (ACL_MASK, 6, ACL_UNDEFINED_ID),
-            (ACL_OTHER, 0, ACL_UNDEFINED_ID),
+            (ACL_MASK, 6, NONE),
+            (ACL_OTHER, 0, NONE),
         ]);
-        assert_eq!(Acl::parse(&acl.encode()), Some(acl));
+        assert_eq!(Acl::parse(&acl.encode()), Ok(Some(acl)));
         // Another version, or a stray byte, is not a list the kernel stores.
-        let mut other_version = list(&[]).encode();
+        let mut other_version = value(&[]);
         other_version[0] = 1;
-        assert_eq!(Acl::parse(&other_version), None);
-        let mut ragged = list(&[(ACL_USER_OBJ, 6, ACL_UNDEFINED_ID)]).encode();
+        assert_eq!(Acl::parse(&other_version), Err(AclFlaw::Version));
+        let mut ragged = value(&[(ACL_USER_OBJ, 6, NONE)]);
         ragged.push(0);
-        assert_eq!(Acl::parse(&ragged), None);
+        assert_eq!(Acl::parse(&ragged), Err(AclFlaw::Length));
+    }
+
+    /// Each value below is one the kernel was given through `setxattr` on
+    /// Linux 7.2, and the verdict beside it is what the kernel did with it,
+    /// except where the comment says libacl's checker decides.
+    #[test]
+    fn a_list_is_carried_where_the_kernel_stores_it_and_libacl_passes_it() {
+        let minimal = [
+            (ACL_USER_OBJ, 6, NONE),
+            (ACL_GROUP_OBJ, 4, NONE),
+            (ACL_OTHER, 0, NONE),
+        ];
+        assert_eq!(Acl::parse(&value(&minimal)), Ok(Some(list(&minimal))));
+        // The version alone, or nothing, removes a list rather than setting one.
+        assert_eq!(Acl::parse(&value(&[])), Ok(None));
+        assert_eq!(Acl::parse(b""), Ok(None));
+        // A mask with no named entry is a list of its own.
+        assert!(matches!(
+            Acl::parse(&value(&[
+                (ACL_USER_OBJ, 6, NONE),
+                (ACL_GROUP_OBJ, 0, NONE),
+                (ACL_MASK, 6, NONE),
+                (ACL_OTHER, 0, NONE),
+            ])),
+            Ok(Some(_)),
+        ));
+        let refused = [
+            (
+                AclFlaw::Shape,
+                value(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_OTHER, 0, NONE),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                ]),
+            ),
+            (
+                AclFlaw::Shape,
+                value(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_MASK, 6, NONE),
+                    (ACL_USER, 4, 1000),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ]),
+            ),
+            (
+                AclFlaw::Shape,
+                value(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_USER, 4, 1000),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ]),
+            ),
+            (
+                AclFlaw::Shape,
+                value(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_USER_OBJ, 4, NONE),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ]),
+            ),
+            (
+                AclFlaw::Shape,
+                value(&[(ACL_USER_OBJ, 6, NONE), (ACL_GROUP_OBJ, 4, NONE)]),
+            ),
+            (
+                AclFlaw::Permissions,
+                value(&[
+                    (ACL_USER_OBJ, 0o16, NONE),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ]),
+            ),
+            (
+                AclFlaw::Tag,
+                value(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (0x40, 4, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ]),
+            ),
+            (
+                AclFlaw::UnmappedId,
+                value(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_USER, 4, NONE),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (ACL_MASK, 6, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ]),
+            ),
+            // The kernel stores this one; libacl's checker calls it invalid.
+            (
+                AclFlaw::Duplicate,
+                value(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_USER, 4, 1000),
+                    (ACL_USER, 2, 1000),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (ACL_MASK, 6, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ]),
+            ),
+        ];
+        for (flaw, refused) in refused {
+            assert_eq!(Acl::parse(&refused), Err(flaw), "{refused:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_list_is_read_in_the_order_libacl_writes() {
+        // The kernel stores named ids in whatever order they come, and ignores
+        // the id of an entry that names no one; neither changes the list.
+        let read = Acl::parse(&value(&[
+            (ACL_USER_OBJ, 6, 0),
+            (ACL_USER, 4, 1001),
+            (ACL_USER, 4, 1000),
+            (ACL_GROUP_OBJ, 4, 0),
+            (ACL_MASK, 6, 7),
+            (ACL_OTHER, 0, 0),
+        ]));
+        assert_eq!(
+            read,
+            Ok(Some(list(&[
+                (ACL_USER_OBJ, 6, NONE),
+                (ACL_USER, 4, 1000),
+                (ACL_USER, 4, 1001),
+                (ACL_GROUP_OBJ, 4, NONE),
+                (ACL_MASK, 6, NONE),
+                (ACL_OTHER, 0, NONE),
+            ]))),
+        );
+    }
+
+    #[test]
+    fn a_translation_that_reads_two_ids_as_one_restates_no_list() {
+        let acl = list(&[
+            (ACL_USER_OBJ, 6, NONE),
+            (ACL_USER, 4, 1000),
+            (ACL_USER, 4, 1001),
+            (ACL_GROUP_OBJ, 4, NONE),
+            (ACL_MASK, 6, NONE),
+            (ACL_OTHER, 0, NONE),
+        ]);
+        assert_eq!(acl.mapped(|_| Some(5), Some), None);
+        // An answer that reorders the ids reorders the list with them.
+        let flipped = acl
+            .mapped(|id| Some(2001 - id), Some)
+            .expect("both ids map");
+        assert_eq!(
+            flipped,
+            list(&[
+                (ACL_USER_OBJ, 6, NONE),
+                (ACL_USER, 4, 1000),
+                (ACL_USER, 4, 1001),
+                (ACL_GROUP_OBJ, 4, NONE),
+                (ACL_MASK, 6, NONE),
+                (ACL_OTHER, 0, NONE),
+            ]),
+        );
     }
 
     #[test]
