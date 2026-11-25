@@ -226,10 +226,15 @@ struct UpperEntry {
 
 impl UpperEntry {
     fn of(stat: &Stat) -> UpperEntry {
+        // `st_nlink` is 32 bits on some architectures and 64 on others, so the
+        // conversion is a widening on one and the identity on the other. `allow`
+        // rather than `expect`, for the reason the export's link count gives.
+        #[allow(clippy::useless_conversion)]
+        let nlink = u64::from(stat.st_nlink);
         UpperEntry {
             dev: stat.st_dev,
             ino: stat.st_ino,
-            nlink: stat.st_nlink,
+            nlink,
             mode: stat.st_mode & 0o7777,
             ctime: (stat.st_ctime, stat.st_ctime_nsec as i64),
         }
