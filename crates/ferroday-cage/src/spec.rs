@@ -2315,9 +2315,15 @@ impl CageBuilder {
     /// user's, the caller among them: it names them in the PID namespace they
     /// share, and it is in the caller's process group when it inherits the
     /// caller's standard input. The `hardening` feature's
-    /// `LandlockScope::Signal` is the bound on that reach. With one, a sandbox
-    /// that keeps the caller's session runs in a process group of its own,
-    /// and the caller's processes are out of its sight.
+    /// `LandlockScope::Signal` is the bound on that reach. It can change their
+    /// resource limits, scheduling and I/O priority too, through `prlimit64`,
+    /// `setpriority`, the `sched_set*` calls and `ioprio_set`, which the kernel
+    /// allows against any process of the same user and no Landlock scope
+    /// governs: lowering the caller's `RLIMIT_CPU` ends it. Under the signal
+    /// scope the launch also installs the process filter, which refuses each
+    /// where it names a process other than the command's own. With one, a
+    /// sandbox that keeps the caller's session runs in a process group of its
+    /// own, and the caller's processes are out of its sight.
     ///
     /// When output is captured, those surviving descendants also govern
     /// capture's endpoint: a descendant holding the command's streams keeps

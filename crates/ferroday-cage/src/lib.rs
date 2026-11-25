@@ -350,8 +350,9 @@ pub use observer::{Capped, Excerpt, Observer, Output, Progress};
 pub use reports::Reports;
 pub use resolved::{
     ResolvedCgroup, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
-    ResolvedLandlockNet, ResolvedMount, ResolvedNetworkFilter, ResolvedRlimit, ResolvedRoot,
-    ResolvedStdio, ResolvedStreams, ResolvedSyscallRefusal,
+    ResolvedLandlockNet, ResolvedMount, ResolvedNetworkFilter, ResolvedProcessFilter,
+    ResolvedProcessRefusal, ResolvedRlimit, ResolvedRoot, ResolvedStdio, ResolvedStreams,
+    ResolvedSyscallRefusal,
 };
 #[cfg(feature = "hardening")]
 pub use restrict::{Restriction, RestrictionBuilder};

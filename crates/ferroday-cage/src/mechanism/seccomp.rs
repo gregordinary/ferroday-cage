@@ -1,14 +1,16 @@
 //! The seccomp filters the launch installs, and the classic-BPF vocabulary
 //! they are written in.
 //!
-//! Three kinds of program reach the kernel through [`install`]: a caller's
+//! Four kinds of program reach the kernel through [`install`]: a caller's
 //! hardening policy, compiled at build time by the `hardening` layer; the
 //! [`NetworkFilter`], which a launch carries wherever its sandbox has a network
 //! namespace of its own or its command is held to Landlock's network rights;
+//! [`PROCESS_FILTER`], which a launch carries where the Landlock signal scope
+//! holds a command sharing the PID namespace of processes outside the sandbox;
 //! and [`KEYRING_FILTER`], which a launch carries where it cannot give the
-//! sandbox a session keyring of its own. This module states the last two
+//! sandbox a session keyring of its own. This module states the last three
 //! outright. The opcodes, the `seccomp_data` offsets, the audit architectures,
-//! and the answers below are the one vocabulary all three are written in. They
+//! and the answers below are the one vocabulary all four are written in. They
 //! are named here rather than taken from a binding, so the crate's raw BPF is
 //! self-contained and reviewable.
 
@@ -132,6 +134,9 @@ pub(crate) mod bpf {
     /// Byte offset of the low 32 bits of `seccomp_data.args[2]`, two 64-bit
     /// arguments on from [`OFF_ARG0_LOW`].
     pub(crate) const OFF_ARG2_LOW: u32 = OFF_ARG0_LOW + 16;
+    /// Byte offset of the low 32 bits of `seccomp_data.args[1]`, one 64-bit
+    /// argument on from [`OFF_ARG0_LOW`].
+    pub(crate) const OFF_ARG1_LOW: u32 = OFF_ARG0_LOW + 8;
 }
 
 /// `AUDIT_ARCH_X86_64`: a 64-bit x86 syscall, and an x32 one, which shares
@@ -203,6 +208,11 @@ pub(crate) const ENOSYS: u16 = 38;
 /// `EAFNOSUPPORT`, the error `socket` answers for an address family the
 /// kernel does not offer. The generic number, as [`ENOSYS`] is.
 pub(crate) const EAFNOSUPPORT: u16 = 97;
+
+/// `EPERM`, the error the kernel answers a caller lacking a permission a call
+/// needs, and the one a seccomp policy refuses a call with by default. The
+/// generic number, as [`ENOSYS`] is.
+pub(crate) const EPERM: u16 = 1;
 
 /// `EPROTONOSUPPORT`, the error `socket` answers for a protocol the kernel
 /// does not offer in a family. The generic number, as [`ENOSYS`] is.
@@ -950,6 +960,425 @@ const KEYRING_FILTER_REFUSALS: &[Refusal] = &[
         errno: ENOSYS,
     },
 ];
+
+/// The calls that change a process's resource limits, scheduling, or I/O
+/// priority, by the numbers one syscall table gives them.
+struct ProcessCalls {
+    /// `prlimit64`.
+    prlimit64: u32,
+    /// `sched_setaffinity`.
+    sched_setaffinity: u32,
+    /// `sched_setscheduler`.
+    sched_setscheduler: u32,
+    /// `sched_setparam`.
+    sched_setparam: u32,
+    /// `sched_setattr`.
+    sched_setattr: u32,
+    /// `setpriority`.
+    setpriority: u32,
+    /// `ioprio_set`.
+    ioprio_set: u32,
+}
+
+/// The process calls on x86_64, and through the x32 ABI with
+/// [`X32_SYSCALL_BIT`] set.
+const X86_64_PROCESS_CALLS: ProcessCalls = ProcessCalls {
+    prlimit64: 302,
+    sched_setaffinity: 203,
+    sched_setscheduler: 144,
+    sched_setparam: 142,
+    sched_setattr: 314,
+    setpriority: 141,
+    ioprio_set: 251,
+};
+/// The process calls on 32-bit x86.
+const I386_PROCESS_CALLS: ProcessCalls = ProcessCalls {
+    prlimit64: 340,
+    sched_setaffinity: 241,
+    sched_setscheduler: 156,
+    sched_setparam: 154,
+    sched_setattr: 351,
+    setpriority: 97,
+    ioprio_set: 289,
+};
+/// The process calls on 32-bit arm, under the EABI.
+const ARM_PROCESS_CALLS: ProcessCalls = ProcessCalls {
+    prlimit64: 369,
+    sched_setaffinity: 241,
+    sched_setscheduler: 156,
+    sched_setparam: 154,
+    sched_setattr: 380,
+    setpriority: 97,
+    ioprio_set: 314,
+};
+/// The process calls in the generic syscall table aarch64 and RISC-V share.
+const GENERIC_PROCESS_CALLS: ProcessCalls = ProcessCalls {
+    prlimit64: 261,
+    sched_setaffinity: 122,
+    sched_setscheduler: 119,
+    sched_setparam: 118,
+    sched_setattr: 274,
+    setpriority: 140,
+    ioprio_set: 30,
+};
+
+/// `PRIO_PROCESS`: `setpriority`'s first argument where its second names one
+/// process.
+const PRIO_PROCESS: u32 = 0;
+/// `IOPRIO_WHO_PROCESS`: `ioprio_set`'s first argument where its second names
+/// one process.
+const IOPRIO_WHO_PROCESS: u32 = 1;
+
+/// The process filter for an x86 kernel: x86_64, x32, and 32-bit x86.
+///
+/// ```text
+///   [0]  A = arch
+///   [1]  x86_64 or x32: to [4]
+///   [2]  32-bit x86: to [14]
+///   [3]  any other architecture: kill
+///   [4]  A = nr
+///   [5]  A &= !__X32_SYSCALL_BIT        an x32 call reads as its 64-bit twin
+///   [6]  prlimit64: to [23]
+///   [7]  sched_setaffinity: to [23]
+///   [8]  sched_setscheduler: to [23]
+///   [9]  sched_setparam: to [23]
+///   [10] sched_setattr: to [23]
+///   [11] setpriority: to [25]
+///   [12] ioprio_set: to [27]
+///   [13] allow
+///   [14] A = nr
+///   [15] prlimit64: to [23]
+///   [16] sched_setaffinity: to [23]
+///   [17] sched_setscheduler: to [23]
+///   [18] sched_setparam: to [23]
+///   [19] sched_setattr: to [23]
+///   [20] setpriority: to [25]
+///   [21] ioprio_set: to [27]
+///   [22] allow
+///   [23] A = the low half of args[0]    the pid
+///   [24] 0: to [31], else to [32]
+///   [25] A = the low half of args[0]    setpriority's which
+///   [26] PRIO_PROCESS: to [29], else to [32]
+///   [27] A = the low half of args[0]    ioprio_set's which
+///   [28] IOPRIO_WHO_PROCESS: to [29], else to [32]
+///   [29] A = the low half of args[1]    who
+///   [30] 0: to [31], else to [32]
+///   [31] allow
+///   [32] return EPERM
+/// ```
+const X86_PROCESS_FILTER: [SockFilter; 33] = [
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_X86_64, 2, 0),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_I386, 11, 0),
+    stmt(bpf::RET_K, RET_KILL_PROCESS),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    stmt(bpf::ALU_AND_K, !X32_SYSCALL_BIT),
+    jump(bpf::JMP_JEQ_K, X86_64_PROCESS_CALLS.prlimit64, 16, 0),
+    jump(
+        bpf::JMP_JEQ_K,
+        X86_64_PROCESS_CALLS.sched_setaffinity,
+        15,
+        0,
+    ),
+    jump(
+        bpf::JMP_JEQ_K,
+        X86_64_PROCESS_CALLS.sched_setscheduler,
+        14,
+        0,
+    ),
+    jump(bpf::JMP_JEQ_K, X86_64_PROCESS_CALLS.sched_setparam, 13, 0),
+    jump(bpf::JMP_JEQ_K, X86_64_PROCESS_CALLS.sched_setattr, 12, 0),
+    jump(bpf::JMP_JEQ_K, X86_64_PROCESS_CALLS.setpriority, 13, 0),
+    jump(bpf::JMP_JEQ_K, X86_64_PROCESS_CALLS.ioprio_set, 14, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, I386_PROCESS_CALLS.prlimit64, 7, 0),
+    jump(bpf::JMP_JEQ_K, I386_PROCESS_CALLS.sched_setaffinity, 6, 0),
+    jump(bpf::JMP_JEQ_K, I386_PROCESS_CALLS.sched_setscheduler, 5, 0),
+    jump(bpf::JMP_JEQ_K, I386_PROCESS_CALLS.sched_setparam, 4, 0),
+    jump(bpf::JMP_JEQ_K, I386_PROCESS_CALLS.sched_setattr, 3, 0),
+    jump(bpf::JMP_JEQ_K, I386_PROCESS_CALLS.setpriority, 4, 0),
+    jump(bpf::JMP_JEQ_K, I386_PROCESS_CALLS.ioprio_set, 5, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, 0, 6, 7),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, PRIO_PROCESS, 2, 5),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, IOPRIO_WHO_PROCESS, 0, 3),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG1_LOW),
+    jump(bpf::JMP_JEQ_K, 0, 0, 1),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::RET_K, ret_errno(EPERM)),
+];
+
+/// The process filter for an arm kernel: aarch64, and 32-bit arm natively or
+/// through an arm64 kernel's compat layer.
+///
+/// ```text
+///   [0]  A = arch
+///   [1]  aarch64: to [4]
+///   [2]  32-bit arm: to [13]
+///   [3]  any other architecture: kill
+///   [4]  A = nr
+///   [5]  prlimit64: to [22]
+///   [6]  sched_setaffinity: to [22]
+///   [7]  sched_setscheduler: to [22]
+///   [8]  sched_setparam: to [22]
+///   [9]  sched_setattr: to [22]
+///   [10] setpriority: to [24]
+///   [11] ioprio_set: to [26]
+///   [12] allow
+///   [13] A = nr
+///   [14] prlimit64: to [22]
+///   [15] sched_setaffinity: to [22]
+///   [16] sched_setscheduler: to [22]
+///   [17] sched_setparam: to [22]
+///   [18] sched_setattr: to [22]
+///   [19] setpriority: to [24]
+///   [20] ioprio_set: to [26]
+///   [21] allow
+///   [22] A = the low half of args[0]    the pid
+///   [23] 0: to [30], else to [31]
+///   [24] A = the low half of args[0]    setpriority's which
+///   [25] PRIO_PROCESS: to [28], else to [31]
+///   [26] A = the low half of args[0]    ioprio_set's which
+///   [27] IOPRIO_WHO_PROCESS: to [28], else to [31]
+///   [28] A = the low half of args[1]    who
+///   [29] 0: to [30], else to [31]
+///   [30] allow
+///   [31] return EPERM
+/// ```
+const ARM_PROCESS_FILTER: [SockFilter; 32] = [
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_AARCH64, 2, 0),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_ARM, 10, 0),
+    stmt(bpf::RET_K, RET_KILL_PROCESS),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.prlimit64, 16, 0),
+    jump(
+        bpf::JMP_JEQ_K,
+        GENERIC_PROCESS_CALLS.sched_setaffinity,
+        15,
+        0,
+    ),
+    jump(
+        bpf::JMP_JEQ_K,
+        GENERIC_PROCESS_CALLS.sched_setscheduler,
+        14,
+        0,
+    ),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.sched_setparam, 13, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.sched_setattr, 12, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.setpriority, 13, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.ioprio_set, 14, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, ARM_PROCESS_CALLS.prlimit64, 7, 0),
+    jump(bpf::JMP_JEQ_K, ARM_PROCESS_CALLS.sched_setaffinity, 6, 0),
+    jump(bpf::JMP_JEQ_K, ARM_PROCESS_CALLS.sched_setscheduler, 5, 0),
+    jump(bpf::JMP_JEQ_K, ARM_PROCESS_CALLS.sched_setparam, 4, 0),
+    jump(bpf::JMP_JEQ_K, ARM_PROCESS_CALLS.sched_setattr, 3, 0),
+    jump(bpf::JMP_JEQ_K, ARM_PROCESS_CALLS.setpriority, 4, 0),
+    jump(bpf::JMP_JEQ_K, ARM_PROCESS_CALLS.ioprio_set, 5, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, 0, 6, 7),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, PRIO_PROCESS, 2, 5),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, IOPRIO_WHO_PROCESS, 0, 3),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG1_LOW),
+    jump(bpf::JMP_JEQ_K, 0, 0, 1),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::RET_K, ret_errno(EPERM)),
+];
+
+/// The process filter for a RISC-V kernel: 64-bit, and 32-bit through its
+/// compat layer, both on the generic syscall table.
+///
+/// ```text
+///   [0]  A = arch
+///   [1]  64-bit: to [4]
+///   [2]  32-bit: to [4]
+///   [3]  any other architecture: kill
+///   [4]  A = nr
+///   [5]  prlimit64: to [13]
+///   [6]  sched_setaffinity: to [13]
+///   [7]  sched_setscheduler: to [13]
+///   [8]  sched_setparam: to [13]
+///   [9]  sched_setattr: to [13]
+///   [10] setpriority: to [15]
+///   [11] ioprio_set: to [17]
+///   [12] allow
+///   [13] A = the low half of args[0]    the pid
+///   [14] 0: to [21], else to [22]
+///   [15] A = the low half of args[0]    setpriority's which
+///   [16] PRIO_PROCESS: to [19], else to [22]
+///   [17] A = the low half of args[0]    ioprio_set's which
+///   [18] IOPRIO_WHO_PROCESS: to [19], else to [22]
+///   [19] A = the low half of args[1]    who
+///   [20] 0: to [21], else to [22]
+///   [21] allow
+///   [22] return EPERM
+/// ```
+const RISCV_PROCESS_FILTER: [SockFilter; 23] = [
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV64, 2, 0),
+    jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV32, 1, 0),
+    stmt(bpf::RET_K, RET_KILL_PROCESS),
+    stmt(bpf::LD_W_ABS, bpf::OFF_NR),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.prlimit64, 7, 0),
+    jump(
+        bpf::JMP_JEQ_K,
+        GENERIC_PROCESS_CALLS.sched_setaffinity,
+        6,
+        0,
+    ),
+    jump(
+        bpf::JMP_JEQ_K,
+        GENERIC_PROCESS_CALLS.sched_setscheduler,
+        5,
+        0,
+    ),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.sched_setparam, 4, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.sched_setattr, 3, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.setpriority, 4, 0),
+    jump(bpf::JMP_JEQ_K, GENERIC_PROCESS_CALLS.ioprio_set, 5, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, 0, 6, 7),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, PRIO_PROCESS, 2, 5),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
+    jump(bpf::JMP_JEQ_K, IOPRIO_WHO_PROCESS, 0, 3),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG1_LOW),
+    jump(bpf::JMP_JEQ_K, 0, 0, 1),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::RET_K, ret_errno(EPERM)),
+];
+
+/// The process filter for `family`.
+const fn process_program_for(family: Family) -> &'static [SockFilter] {
+    match family {
+        Family::X86 => &X86_PROCESS_FILTER,
+        Family::Arm => &ARM_PROCESS_FILTER,
+        Family::RiscV => &RISCV_PROCESS_FILTER,
+    }
+}
+
+/// The filter a launch carries where the Landlock signal scope holds a command
+/// that shares the PID namespace of processes outside the sandbox: it refuses
+/// the calls that change another process's resource limits, scheduling, or I/O
+/// priority, which the scope does not govern.
+///
+/// The signal scope keeps the command from signalling a process outside its
+/// Landlock domain. The kernel also lets a process change the limits and the
+/// scheduling of any process whose user ids match its own, and no Landlock
+/// hook governs that: lowering another process's `RLIMIT_CPU` with
+/// `prlimit64` ends it as surely as a signal, and `sched_setaffinity`,
+/// `sched_setscheduler`, `sched_setparam`, `sched_setattr`, `setpriority` and
+/// `ioprio_set` pin and demote it. Behind a PID namespace of the sandbox's own
+/// the command names no process outside it, and nothing is installed. A
+/// restriction, and a sandbox under `pid_namespace(false)`, share the PID
+/// namespace of the calling user's other processes, and there the filter
+/// completes what the scope promises.
+///
+/// Each call runs where it names the caller, with an id of 0, and is answered
+/// `EPERM`, what the kernel answers for a process the caller may not change,
+/// where it names any other: the C library's `setrlimit` and `getrlimit` pass
+/// 0 to `prlimit64`, `nice` passes `PRIO_PROCESS` and 0 to `setpriority`, and
+/// `taskset` and `ionice` running a command pass 0 as well. A filter cannot
+/// tell the caller's own id, or a thread's, from another process's, so a call
+/// naming one is refused too: `pthread_setaffinity_np`, `pthread_setschedparam`
+/// and `pthread_setschedprio` name a thread by its id, and fail. `setpriority`
+/// and `ioprio_set` can also name a process group or every process of a user,
+/// which their first argument says, so only `PRIO_PROCESS` and
+/// `IOPRIO_WHO_PROCESS` with an id of 0 run. Turning the signal scope off
+/// turns the filter off with it.
+///
+/// Only the low 32 bits of each argument are compared: a pid and a `which` are
+/// `int`s, whose high half the kernel discards. Every entry point a kernel of
+/// the build's family presents is checked, as the [`NetworkFilter`] checks
+/// them, and a syscall under any other audit architecture kills the process.
+/// Everything else is allowed.
+pub(crate) const PROCESS_FILTER: &[SockFilter] = process_program_for(HOST);
+
+/// One call the process filter refuses unless it names the caller: the call,
+/// where its arguments name the process, and the errno it answers with.
+///
+/// A second shape beside [`Refusal`], which states the values a call is
+/// refused at, since what is refused here is every value but the one that
+/// names the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessRefusal {
+    /// The syscall's name in the kernel's syscall table.
+    pub(crate) syscall: &'static str,
+    /// The argument naming the process, by its position from 0: the call runs
+    /// only where its low 32 bits hold 0, which names the caller.
+    pub(crate) process_argument: u8,
+    /// Where the first argument says what the process argument names, the
+    /// value naming one process: the call runs only where the first
+    /// argument's low 32 bits hold it. `None` where the process argument
+    /// always names one process.
+    pub(crate) one_process: Option<u32>,
+    /// The errno the call is answered with.
+    pub(crate) errno: u16,
+}
+
+/// A refusal of `syscall`, whose first argument is the pid.
+const fn pid_first(syscall: &'static str) -> ProcessRefusal {
+    ProcessRefusal {
+        syscall,
+        process_argument: 0,
+        one_process: None,
+        errno: EPERM,
+    }
+}
+
+/// What [`PROCESS_FILTER`] refuses, the same at every entry point of every
+/// family, each of which has every one of the calls. Everything else it
+/// allows.
+///
+/// The provenance record reports these. The unit tests hold every family's
+/// program to them: each refusal is made, and nothing else is.
+pub(crate) const PROCESS_FILTER_REFUSALS: &[ProcessRefusal] = &[
+    pid_first("prlimit64"),
+    pid_first("sched_setaffinity"),
+    pid_first("sched_setscheduler"),
+    pid_first("sched_setparam"),
+    pid_first("sched_setattr"),
+    ProcessRefusal {
+        syscall: "setpriority",
+        process_argument: 1,
+        one_process: Some(PRIO_PROCESS),
+        errno: EPERM,
+    },
+    ProcessRefusal {
+        syscall: "ioprio_set",
+        process_argument: 1,
+        one_process: Some(IOPRIO_WHO_PROCESS),
+        errno: EPERM,
+    },
+];
+
+/// Whether a launch of `plan` installs [`PROCESS_FILTER`]: wherever the
+/// Landlock signal scope holds its command and the command shares the PID
+/// namespace of processes outside the sandbox, as a restriction's does and a
+/// sandbox's under `pid_namespace(false)` does.
+///
+/// Read from the plan alone, so the launch and the provenance record cannot
+/// disagree. A scope in the plan of such a launch is one the kernel enforces:
+/// a restriction drops its default scopes on a kernel below Landlock ABI 6,
+/// and refuses one it names there at build, as a sandbox without a PID
+/// namespace refuses the signal scope.
+pub(crate) fn installs_process_filter(plan: &LaunchPlan) -> bool {
+    #[cfg(feature = "hardening")]
+    let scoped = plan.hardening.landlock_scoped & crate::hardening::scope::SIGNAL != 0;
+    #[cfg(not(feature = "hardening"))]
+    let scoped = false;
+    scoped && !plan.pid_namespace
+}
 
 /// `SECCOMP_SET_MODE_FILTER`: install a classic BPF filter.
 const SECCOMP_SET_MODE_FILTER: usize = 1;
@@ -1827,6 +2256,109 @@ mod tests {
         }
     }
 
+    /// Holds `program`, `family`'s process filter, to `refusals`: every number
+    /// an entry point's syscall table reaches, over first and second arguments
+    /// that cover the caller's id, other ids, the values that name one process
+    /// and those beside them, with and without high bits set, is refused where
+    /// a refusal names the call and the arguments do not name the caller, and
+    /// allowed everywhere else.
+    fn assert_refuses_all_but_the_caller(
+        family: Family,
+        program: &[SockFilter],
+        refusals: &[ProcessRefusal],
+    ) {
+        for refusal in refusals {
+            for entry in entry_points(family) {
+                assert!(
+                    entry.number(refusal.syscall).is_some(),
+                    "{entry:?} has no {}",
+                    refusal.syscall
+                );
+            }
+        }
+        assert!(eval::accepted(program), "the kernel takes {program:?}");
+        let values = [
+            0,
+            1,
+            2,
+            3,
+            4242,
+            u64::from(u32::MAX),
+            1 << 32,
+            1 << 32 | 1,
+            u64::MAX << 32 | 4242,
+            u64::MAX,
+        ];
+        for entry in entry_points(family) {
+            for nr in (0..1024).map(|base| base | entry.tag) {
+                for first in values {
+                    for second in values {
+                        // The low 32 bits, as the filter compares them.
+                        let low = [first as u32, second as u32];
+                        let expected = refusals
+                            .iter()
+                            .find(|refusal| entry.number(refusal.syscall) == Some(nr))
+                            .map_or(RET_ALLOW, |refusal| {
+                                let caller = low[usize::from(refusal.process_argument)] == 0
+                                    && refusal.one_process.is_none_or(|one| low[0] == one);
+                                if caller {
+                                    RET_ALLOW
+                                } else {
+                                    ret_errno(refusal.errno)
+                                }
+                            });
+                        let call = Call::new(entry.arch, nr, &[first, second, 0x0804_8000]);
+                        assert_eq!(
+                            eval::execute(program, &call),
+                            Some(expected),
+                            "{entry:?}, nr {nr:#x}, arguments {first:#x} and {second:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_process_filter_refuses_every_process_but_the_caller() {
+        for family in FAMILIES {
+            assert_refuses_all_but_the_caller(
+                family,
+                process_program_for(family),
+                PROCESS_FILTER_REFUSALS,
+            );
+        }
+    }
+
+    #[test]
+    fn the_process_filter_lets_the_c_library_name_the_caller() {
+        // setrlimit through prlimit64 with a pid of 0, nice through
+        // setpriority(PRIO_PROCESS, 0), and ionice running a command through
+        // ioprio_set(IOPRIO_WHO_PROCESS, 0); a thread's own id is refused, as
+        // pthread_setaffinity_np passes it.
+        for family in FAMILIES {
+            let program = process_program_for(family);
+            for entry in entry_points(family) {
+                let call = |name: &str, args: &[u64]| {
+                    run(program, &Call::new(entry.arch, entry.call(name), args))
+                };
+                assert_eq!(call("prlimit64", &[0, 0, 0x1000, 0]), RET_ALLOW);
+                assert_eq!(call("setpriority", &[0, 0, 5]), RET_ALLOW);
+                assert_eq!(call("ioprio_set", &[1, 0, 0x6000]), RET_ALLOW);
+                assert_eq!(
+                    call("sched_setaffinity", &[4243, 128, 0x1000]),
+                    ret_errno(EPERM),
+                    "{entry:?}"
+                );
+                // setpriority's PRIO_PGRP and PRIO_USER, the caller's own group
+                // and user included.
+                for which in [1, 2] {
+                    assert_eq!(call("setpriority", &[which, 0, 5]), ret_errno(EPERM));
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_host_reports_its_own_familys_refusals() {
         for filter in FILTERS {
@@ -1883,7 +2415,7 @@ mod tests {
             let programs = FILTERS
                 .map(|filter| network_program_for(family, filter))
                 .into_iter()
-                .chain([keyring_program_for(family)]);
+                .chain([keyring_program_for(family), process_program_for(family)]);
             for program in programs {
                 assert_eq!(run(program, &call), RET_KILL_PROCESS, "{family:?}");
             }
@@ -1904,6 +2436,7 @@ mod tests {
             assert_eq!(filter.program(), network_program_for(expected, filter));
         }
         assert_eq!(KEYRING_FILTER, keyring_program_for(expected));
+        assert_eq!(PROCESS_FILTER, process_program_for(expected));
     }
 
     #[test]
@@ -1916,7 +2449,23 @@ mod tests {
         assert_eq!(AF_INET6, libc::AF_INET6 as u32);
         assert_eq!(IPPROTO_MPTCP, libc::IPPROTO_MPTCP as u32);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(Ok(X86_64_SOCKET), u32::try_from(libc::SYS_socket));
+        {
+            assert_eq!(Ok(X86_64_SOCKET), u32::try_from(libc::SYS_socket));
+            let calls = X86_64_PROCESS_CALLS;
+            for (number, named) in [
+                (calls.prlimit64, libc::SYS_prlimit64),
+                (calls.sched_setaffinity, libc::SYS_sched_setaffinity),
+                (calls.sched_setscheduler, libc::SYS_sched_setscheduler),
+                (calls.sched_setparam, libc::SYS_sched_setparam),
+                (calls.sched_setattr, libc::SYS_sched_setattr),
+                (calls.setpriority, libc::SYS_setpriority),
+                (calls.ioprio_set, libc::SYS_ioprio_set),
+            ] {
+                assert_eq!(Ok(number), u32::try_from(named));
+            }
+        }
+        // A `c_int` with one C library and a `c_uint` with another.
+        assert_eq!(i64::from(PRIO_PROCESS), i64::from(libc::PRIO_PROCESS));
         #[cfg(target_arch = "x86")]
         {
             assert_eq!(Ok(I386_SOCKET), u32::try_from(libc::SYS_socket));
@@ -1932,6 +2481,7 @@ mod tests {
     fn the_errnos_are_the_kernels() {
         assert_eq!(i32::from(ENOSYS), Errno::NOSYS.raw_os_error());
         assert_eq!(i32::from(EAFNOSUPPORT), Errno::AFNOSUPPORT.raw_os_error());
+        assert_eq!(i32::from(EPERM), Errno::PERM.raw_os_error());
         assert_eq!(
             i32::from(EPROTONOSUPPORT),
             Errno::PROTONOSUPPORT.raw_os_error()

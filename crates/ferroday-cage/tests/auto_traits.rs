@@ -49,6 +49,8 @@ const _: () = assert_send_sync::<ferroday_cage::ResolvedLandlockFs>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedLandlockNet>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedNetworkFilter>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedSyscallRefusal>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedProcessFilter>();
+const _: () = assert_send_sync::<ferroday_cage::ResolvedProcessRefusal>();
 const _: () = assert_send_sync::<ferroday_cage::Stdio>();
 const _: () = assert_send_sync::<ferroday_cage::Exec>();
 // A terminal launch hands back a live descriptor whose whole point is being

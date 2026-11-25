@@ -33,7 +33,8 @@ use rustix::thread::CapabilitySet;
 
 use crate::error::ConfigError;
 use crate::mechanism::seccomp::{
-    self, AUDIT_ARCH_AARCH64, AUDIT_ARCH_RISCV64, AUDIT_ARCH_X86_64, ENOSYS, X32_SYSCALL_BIT, bpf,
+    self, AUDIT_ARCH_AARCH64, AUDIT_ARCH_RISCV64, AUDIT_ARCH_X86_64, ENOSYS, EPERM,
+    X32_SYSCALL_BIT, bpf,
 };
 use crate::mechanism::{HardeningPlan, LandlockNetRule, LandlockRule, ReportedFilter, SockFilter};
 use crate::roster::roster_enum;
@@ -725,6 +726,21 @@ roster_enum! {
         /// processes can signal every one of them. A sandbox sees them under
         /// [`pid_namespace(false)`](crate::CageBuilder::pid_namespace), and a
         /// restriction always does.
+        ///
+        /// No Landlock scope governs changing another process's resource
+        /// limits, scheduling, or I/O priority, which the kernel allows against
+        /// any process of the same user: lowering its `RLIMIT_CPU` ends it as a
+        /// signal would. Wherever this scope holds a command that sees those
+        /// processes, the launch therefore also installs the process filter,
+        /// which refuses `prlimit64`, `sched_setaffinity`, `sched_setscheduler`,
+        /// `sched_setparam`, `sched_setattr`, `setpriority` and `ioprio_set`
+        /// with `EPERM` wherever they name any process but the caller, which
+        /// they name with an id of 0. A thread's id is refused as well, so
+        /// `pthread_setaffinity_np`, `pthread_setschedparam` and
+        /// `pthread_setschedprio` fail there; a command that needs them runs
+        /// without this scope.
+        /// [`ResolvedInputs::process_filter`](crate::ResolvedInputs::process_filter)
+        /// records the filter.
         Signal = scope::SIGNAL => "signal",
         /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`: the command cannot connect to
         /// an abstract `AF_UNIX` socket that a process outside its domain
@@ -869,9 +885,6 @@ impl SeccompAction {
         matches!(self, SeccompAction::Allow | SeccompAction::Log)
     }
 }
-
-/// `EPERM`, the error a denied syscall reports by default.
-const EPERM: u16 = 1;
 
 /// The largest errno a syscall can fail with. The C library reads a raw result
 /// in `-4095..=-1` as a failure with that errno, and any other as a value.

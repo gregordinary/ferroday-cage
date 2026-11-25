@@ -353,6 +353,12 @@ changes what a build produces:
   errno it answers. A configure test that probes vsock, io_uring or Multipath
   TCP reads the refusal as an absent feature. The key is absent under the host
   network without a network grant, which installs no filter.
+- **`process-filter`** — the syscalls [the process
+  filter](how-the-sandbox-is-built.md#the-process-filter) refuses where the
+  signal scope holds a command sharing the host's PID namespace, each by name,
+  with the argument naming the process and the value naming one process where a
+  first argument decides it, and the errno it answers. The key is absent behind
+  a PID namespace of the sandbox's own, and without the signal scope.
 - **`pid-namespace`** — whether the command runs under the sandbox's own init.
   Without one it sees the caller's processes, and its descendants can outlive
   it.

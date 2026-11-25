@@ -27,6 +27,25 @@ consumer upgrading can skip it.
 
 ### Security
 
+- **Breaking.** Wherever the Landlock signal scope holds a command that shares
+  the PID namespace of processes outside the sandbox, in a restriction, whose
+  default it is from Landlock ABI 6, and in a sandbox under
+  `pid_namespace(false)` that names it, the command runs under the process
+  filter, whatever seccomp policy it has. The filter refuses `prlimit64`,
+  `sched_setaffinity`, `sched_setscheduler`, `sched_setparam`, `sched_setattr`,
+  `setpriority` and `ioprio_set` with `EPERM` wherever they name any process
+  but the caller, which they name with an id of 0, and `setpriority` and
+  `ioprio_set` wherever they name a process group or a user. The kernel
+  allows each against every process of the same user, and no Landlock scope
+  governs them, so a scoped command could still end another process of the
+  calling user's by lowering its `RLIMIT_CPU`. `setrlimit`, `nice`, and
+  `taskset` or `ionice` running a command work. A thread named by its own id is
+  refused as well: `pthread_setaffinity_np`, `pthread_setschedparam` and
+  `pthread_setschedprio` fail with `EPERM` there, and a command that needs them
+  turns the signal scope off, which turns the filter off. A host that cannot
+  install the filter fails the launch at the new
+  `SetupStep::InstallProcessFilter`. `ResolvedInputs::process_filter` reports
+  it, through the new `ResolvedProcessFilter` and `ResolvedProcessRefusal`.
 - **Breaking.** Wherever a Landlock network grant applies, in a sandbox under
   any network and in a restriction, the command runs under the network filter,
   which refuses creating a Multipath TCP socket (`IPPROTO_MPTCP` in `AF_INET`

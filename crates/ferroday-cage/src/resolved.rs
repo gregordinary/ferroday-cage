@@ -172,6 +172,17 @@ namespace the sandbox creates, not what may later be plugged into it.
     /// [`hardening`](Self::hardening) is: a configure test that probes one of
     /// these calls reads the refusal as an absent feature.
     pub network_filter: Option<ResolvedNetworkFilter>,
+    /// What the process filter refuses, where the command carries it: wherever
+    /// the hardening layer's `LandlockScope::Signal` holds a command that
+    /// shares the PID namespace of processes outside the sandbox, as a
+    /// restriction's does, and a sandbox's under
+    /// [`pid_namespace(false)`](crate::CageBuilder::pid_namespace).
+    ///
+    /// `None` behind a PID namespace of the sandbox's own, where the command
+    /// names no process outside it, and wherever the signal scope is off,
+    /// which a restriction's kernel below Landlock ABI 6 turns it. It is
+    /// recorded for the reason [`network_filter`](Self::network_filter) is.
+    pub process_filter: Option<ResolvedProcessFilter>,
     /// Whether the command runs in a PID namespace of the sandbox's own, under
     /// the sandbox's init.
     ///
@@ -390,6 +401,59 @@ pub struct ResolvedNetworkFilter {
     /// Each syscall the filter refuses, with the errno it answers in place of
     /// running the call. Every other syscall the filter allows.
     pub refusals: Vec<ResolvedSyscallRefusal>,
+}
+
+/// The seccomp filter a launch installs where the Landlock signal scope holds a
+/// command sharing the PID namespace of processes outside the sandbox,
+/// refusing the calls that change another process's resource limits,
+/// scheduling, or I/O priority, which the scope does not govern.
+///
+/// The guide's [process
+/// filter](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#the-process-filter)
+/// chapter describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+pub struct ResolvedProcessFilter {
+    /// Each syscall the filter refuses unless it names the command itself,
+    /// with the errno it answers otherwise. Every other syscall the filter
+    /// allows.
+    pub refusals: Vec<ResolvedProcessRefusal>,
+}
+
+/// One syscall the process filter refuses unless it names the calling process,
+/// which it does with an id of 0, and the errno the command reads from it
+/// otherwise.
+///
+/// A thread's own id, the caller's pid, and another process's alike are
+/// refused, since a filter cannot tell them apart. The refusal applies at
+/// every entry point the host's kernel presents that has the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
+pub struct ResolvedProcessRefusal {
+    /// The syscall, by its name in the kernel's syscall table.
+    pub syscall: String,
+    /// The argument naming the process, by its position from 0: the call runs
+    /// only where its low 32 bits hold 0.
+    pub process_argument: u8,
+    /// Where the call's first argument says what the process argument names,
+    /// as `setpriority`'s and `ioprio_set`'s do, the value naming one process:
+    /// the call runs only where the first argument's low 32 bits hold it, and
+    /// is refused for a process group or a user whatever the id.
+    ///
+    /// `None` where the process argument always names one process.
+    pub one_process: Option<u32>,
+    /// The errno the call answers with, as the kernel numbers it.
+    pub errno: u16,
 }
 
 /// One syscall a seccomp filter refuses, and the errno the command reads from
@@ -788,6 +852,7 @@ impl ResolvedInputs {
             no_new_privileges: no_new_privileges(plan),
             network: plan.network,
             network_filter: project_network_filter(plan),
+            process_filter: project_process_filter(plan),
             pid_namespace: plan.pid_namespace,
             hostname: project_hostname(plan),
             streams: ResolvedStreams {
@@ -851,6 +916,24 @@ fn project_network_filter(plan: &LaunchPlan) -> Option<ResolvedNetworkFilter> {
                 syscall: refusal.syscall.to_string(),
                 first_argument: refusal.first_argument,
                 third_argument: refusal.third_argument,
+                errno: refusal.errno,
+            })
+            .collect(),
+    })
+}
+
+/// Projects the process filter the launch installs, if it installs one.
+///
+/// The question is the launch's own, asked of the same plan, and the refusals
+/// are the ones the unit tests hold the installed program to.
+fn project_process_filter(plan: &LaunchPlan) -> Option<ResolvedProcessFilter> {
+    seccomp::installs_process_filter(plan).then(|| ResolvedProcessFilter {
+        refusals: seccomp::PROCESS_FILTER_REFUSALS
+            .iter()
+            .map(|refusal| ResolvedProcessRefusal {
+                syscall: refusal.syscall.to_string(),
+                process_argument: refusal.process_argument,
+                one_process: refusal.one_process,
                 errno: refusal.errno,
             })
             .collect(),
@@ -1139,8 +1222,9 @@ mod serde_tests {
 
     use super::{
         ResolvedCgroup, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
-        ResolvedLandlockNet, ResolvedMount, ResolvedNetworkFilter, ResolvedRlimit, ResolvedRoot,
-        ResolvedStdio, ResolvedStreams, ResolvedSyscallRefusal,
+        ResolvedLandlockNet, ResolvedMount, ResolvedNetworkFilter, ResolvedProcessFilter,
+        ResolvedProcessRefusal, ResolvedRlimit, ResolvedRoot, ResolvedStdio, ResolvedStreams,
+        ResolvedSyscallRefusal,
     };
     use crate::cgroup::CgroupLimit;
     use crate::idmap::{IdRange, Identity};
@@ -1149,7 +1233,7 @@ mod serde_tests {
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 78] = [
+    const EXPECTED_RECORD_KEYS: [&str; 84] = [
         "cgroup",
         "cgroup.kind",
         "cgroup.limits",
@@ -1210,6 +1294,12 @@ mod serde_tests {
         "present-as",
         "present-as.gid",
         "present-as.uid",
+        "process-filter",
+        "process-filter.refusals",
+        "process-filter.refusals[].errno",
+        "process-filter.refusals[].one-process",
+        "process-filter.refusals[].process-argument",
+        "process-filter.refusals[].syscall",
         "rlimits",
         "rlimits[].hard",
         "rlimits[].resource",
@@ -1311,6 +1401,14 @@ mod serde_tests {
                     first_argument: Some(2),
                     third_argument: Some(262),
                     errno: 93,
+                }],
+            }),
+            process_filter: Some(ResolvedProcessFilter {
+                refusals: vec![ResolvedProcessRefusal {
+                    syscall: "setpriority".to_string(),
+                    process_argument: 1,
+                    one_process: Some(0),
+                    errno: 1,
                 }],
             }),
             pid_namespace: true,
@@ -1852,6 +1950,85 @@ mod serde_tests {
                 inputs.network_filter.map(|filter| filter.refusals),
                 Some([past_the_network_rights(), out_of_sight()].concat())
             );
+        }
+    }
+
+    /// The process filter reaches the record wherever the signal scope holds a
+    /// command sharing the PID namespace of processes outside the sandbox, and
+    /// nowhere else: not behind a PID namespace of the sandbox's own, and not
+    /// with the scope off.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn the_process_filter_reaches_the_record_where_the_signal_scope_needs_it() {
+        use crate::LandlockScope;
+
+        let refusals = || {
+            let pid_first = |syscall: &str| ResolvedProcessRefusal {
+                syscall: syscall.to_string(),
+                process_argument: 0,
+                one_process: None,
+                errno: 1,
+            };
+            let named_by = |syscall: &str, one_process: u32| ResolvedProcessRefusal {
+                syscall: syscall.to_string(),
+                process_argument: 1,
+                one_process: Some(one_process),
+                errno: 1,
+            };
+            vec![
+                pid_first("prlimit64"),
+                pid_first("sched_setaffinity"),
+                pid_first("sched_setscheduler"),
+                pid_first("sched_setparam"),
+                pid_first("sched_setattr"),
+                // PRIO_PROCESS and IOPRIO_WHO_PROCESS.
+                named_by("setpriority", 0),
+                named_by("ioprio_set", 1),
+            ]
+        };
+        let cage = |pid_namespace: bool, scopes: &[LandlockScope]| {
+            Cage::builder()
+                .rootfs("/tmp")
+                .command("/bin/sh")
+                .pid_namespace(pid_namespace)
+                .landlock_scope(scopes.iter().copied())
+                .build()
+                .map(|cage| cage.resolved_inputs().process_filter)
+        };
+        let restriction = |scopes: Option<&[LandlockScope]>| {
+            let builder = crate::Restriction::builder()
+                .command("/bin/true")
+                .seccomp(crate::SeccompPolicy::Rules(crate::SeccompRules::curated()));
+            let builder = match scopes {
+                Some(scopes) => builder.landlock_scope(scopes.iter().copied()),
+                None => builder,
+            };
+            builder
+                .build()
+                .expect("a valid restriction")
+                .resolved_inputs()
+                .process_filter
+        };
+        let signal = [LandlockScope::Signal];
+        // Behind a PID namespace, or with the scope off, there is nothing to
+        // complete.
+        assert_eq!(cage(true, &signal).expect("a valid sandbox"), None);
+        assert_eq!(cage(false, &[]).expect("a valid sandbox"), None);
+        assert_eq!(restriction(Some(&[])), None);
+        assert_eq!(
+            restriction(Some(&[LandlockScope::AbstractUnixSocket])),
+            None
+        );
+        // A kernel without scopes drops a restriction's default ones and
+        // refuses a sandbox's that no namespace bounds.
+        let enforced = crate::host::landlock_enforces_scope(LandlockScope::Signal);
+        let expected = enforced.then(|| ResolvedProcessFilter {
+            refusals: refusals(),
+        });
+        assert_eq!(restriction(None), expected);
+        match cage(false, &signal) {
+            Ok(filter) => assert_eq!(filter, expected),
+            Err(err) => assert!(!enforced, "{err}"),
         }
     }
 

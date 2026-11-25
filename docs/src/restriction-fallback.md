@@ -112,6 +112,14 @@ isolation, some host-reaching surfaces remain:
 - **Other processes' memory and environment.** Without a Landlock domain, it can
   `ptrace` the calling user's other processes and read their
   `/proc/<pid>/environ`.
+- **Other processes' limits and scheduling.** The kernel lets it change the
+  resource limits, scheduling and I/O priority of every process that user owns,
+  through `prlimit64`, `setpriority`, the `sched_set*` calls and `ioprio_set`,
+  and no Landlock scope governs them. Lowering a process's `RLIMIT_CPU` ends it.
+  Under the signal scope the launch installs [the process
+  filter](how-the-sandbox-is-built.md#the-process-filter), which refuses each
+  where it names a process other than the command's own. It stays open without
+  the scope.
 
 On a kernel with Landlock ABI 6 (Linux 6.12) or later, a restriction closes all
 three. Its default [`landlock_scope`] confines signals and abstract-socket

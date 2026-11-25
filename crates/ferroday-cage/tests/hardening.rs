@@ -244,6 +244,67 @@ fn the_signal_scope_confines_a_sandbox_sharing_the_host_pid_space() {
     );
 }
 
+/// Under the signal scope, a sandbox sharing the host's PID namespace runs
+/// under the process filter, which refuses naming any process but the caller
+/// to the calls that change a process's limits and scheduling, a thread of the
+/// command's own among them. Behind a PID namespace of its own the sandbox
+/// names no process outside it, so the scope brings no filter there, and
+/// neither does a sandbox without the scope.
+#[test]
+fn the_signal_scope_refuses_naming_a_thread_only_without_a_pid_namespace() {
+    if !common::require::userns() || !common::landlock_scope() {
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        common::require::LANDLOCK_SCOPE.skip("no python3 on this host to make the calls with");
+        return;
+    };
+    // A thread of the command's own, named by its id as
+    // `pthread_setaffinity_np` names it, and then the command itself, named
+    // with an id of 0. Each reports the errno it got, or 0.
+    let script = "import os, threading\n\
+                  def attempt(call):\n    \
+                      try:\n        call(); print(0)\n    \
+                      except OSError as error: print(error.errno)\n\
+                  cpus = os.sched_getaffinity(0)\n\
+                  done = threading.Event()\n\
+                  thread = threading.Thread(target=done.wait)\n\
+                  thread.start()\n\
+                  attempt(lambda: os.sched_setaffinity(thread.native_id, cpus))\n\
+                  attempt(lambda: os.sched_setaffinity(0, cpus))\n\
+                  done.set()\n\
+                  thread.join()\n";
+    let launch = |pid_namespace: bool, scopes: &[LandlockScope]| {
+        let cage = common::host_userland()
+            .command(python)
+            .args(["-c", script])
+            .resolv_conf(false)
+            .pid_namespace(pid_namespace)
+            .landlock_scope(scopes.iter().copied())
+            .build()
+            .expect("a valid sandbox configuration");
+        let filtered = cage.resolved_inputs().process_filter.is_some();
+        let output = cage.output().expect("the sandbox launches");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            filtered,
+        )
+    };
+    let signal = [LandlockScope::Signal];
+    let eperm = libc::EPERM;
+    assert_eq!(launch(false, &signal), (format!("{eperm}\n0\n"), true));
+    assert_eq!(launch(true, &signal), ("0\n0\n".to_string(), false));
+    assert_eq!(launch(false, &[]), ("0\n0\n".to_string(), false));
+}
+
 #[test]
 fn a_scope_no_namespace_bounds_builds_only_where_the_kernel_enforces_it() {
     // A build alone, so this needs neither the fixture nor user namespaces. On a

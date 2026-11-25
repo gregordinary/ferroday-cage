@@ -867,6 +867,82 @@ fn the_curated_policy_denies_a_namespace_and_starts_threads_and_processes() {
 }
 
 #[test]
+fn the_signal_scope_keeps_another_process_s_limits_and_scheduling_out_of_reach() {
+    if !common::require::seccomp() || !common::landlock_scope() {
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        common::require::LANDLOCK_SCOPE.skip("no python3 on this host to make the calls with");
+        return;
+    };
+    // A process of the calling user's, outside the restriction. The kernel
+    // lets a process of the same user change its limits and its scheduling,
+    // and no Landlock scope governs either, so the default signal scope brings
+    // the process filter with it, whatever seccomp policy the restriction has:
+    // here none. Each call reports the errno it got, or 0. The command's own
+    // limits, niceness and affinity stay its to change, through the forms that
+    // name the caller with an id of 0. The niceness asked for is the most
+    // there is, which the kernel lets the same user set whatever the
+    // process's is now: a host's scheduler may have raised this test's, and
+    // the process inherits it.
+    let mut other = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a process to reach");
+    let script = format!(
+        "import os, resource\n\
+         def attempt(call):\n    \
+             try:\n        call(); print(0)\n    \
+             except OSError as error: print(error.errno)\n\
+         cpus = os.sched_getaffinity(0)\n\
+         attempt(lambda: resource.prlimit({other}, resource.RLIMIT_CORE, (0, 0)))\n\
+         attempt(lambda: os.setpriority(os.PRIO_PROCESS, {other}, 19))\n\
+         attempt(lambda: os.sched_setaffinity({other}, cpus))\n\
+         attempt(lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))\n\
+         attempt(lambda: os.nice(1))\n\
+         attempt(lambda: os.sched_setaffinity(0, cpus))\n",
+        other = other.id(),
+    );
+    let run = |scopes: Option<&[LandlockScope]>| {
+        let builder = grant_system_trees(Restriction::builder())
+            .command(python)
+            .args(["-c", &script]);
+        let builder = match scopes {
+            Some(scopes) => builder.landlock_scope(scopes.iter().copied()),
+            None => builder,
+        };
+        let restriction = builder.build().expect("a valid restriction configuration");
+        let filtered = restriction.resolved_inputs().process_filter.is_some();
+        let output = restriction.output().expect("the restriction launches");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            filtered,
+        )
+    };
+    let scoped = run(None);
+    // With the signal scope off the filter goes with it, and the command
+    // reaches the other process, which pins the refusals above on the filter
+    // rather than on the host.
+    let unscoped = run(Some(&[LandlockScope::AbstractUnixSocket]));
+    let _ = other.kill();
+    let _ = other.wait();
+    let eperm = libc::EPERM;
+    assert_eq!(
+        scoped,
+        (format!("{eperm}\n{eperm}\n{eperm}\n0\n0\n0\n"), true)
+    );
+    assert_eq!(unscoped, ("0\n0\n0\n0\n0\n0\n".to_string(), false));
+}
+
+#[test]
 fn a_missing_command_is_an_exec_setup_error() {
     if !common::require::seccomp() {
         return;

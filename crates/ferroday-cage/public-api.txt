@@ -2639,6 +2639,7 @@ pub ferroday_cage::SetupStep::HandOverSeccompListener = 71
 pub ferroday_cage::SetupStep::HidePath = 65
 pub ferroday_cage::SetupStep::HoldReadOnlyName = 69
 pub ferroday_cage::SetupStep::InstallNetworkFilter = 58
+pub ferroday_cage::SetupStep::InstallProcessFilter = 75
 pub ferroday_cage::SetupStep::InstallSeccomp = 36
 pub ferroday_cage::SetupStep::InstallSeccompListener = 70
 pub ferroday_cage::SetupStep::JoinCgroup = 67
@@ -3440,6 +3441,7 @@ pub ferroday_cage::ResolvedInputs::network_filter: core::option::Option<ferroday
 pub ferroday_cage::ResolvedInputs::no_new_privileges: bool
 pub ferroday_cage::ResolvedInputs::pid_namespace: bool
 pub ferroday_cage::ResolvedInputs::present_as: core::option::Option<ferroday_cage::Identity>
+pub ferroday_cage::ResolvedInputs::process_filter: core::option::Option<ferroday_cage::ResolvedProcessFilter>
 pub ferroday_cage::ResolvedInputs::rlimits: alloc::vec::Vec<ferroday_cage::ResolvedRlimit>
 pub ferroday_cage::ResolvedInputs::root: ferroday_cage::ResolvedRoot
 pub ferroday_cage::ResolvedInputs::run_as: core::option::Option<ferroday_cage::Identity>
@@ -3492,6 +3494,27 @@ impl core::marker::Unpin for ferroday_cage::ResolvedNetworkFilter
 impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedNetworkFilter
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedNetworkFilter
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedNetworkFilter
+#[non_exhaustive] pub struct ferroday_cage::ResolvedProcessFilter
+pub ferroday_cage::ResolvedProcessFilter::refusals: alloc::vec::Vec<ferroday_cage::ResolvedProcessRefusal>
+impl core::marker::Freeze for ferroday_cage::ResolvedProcessFilter
+impl core::marker::Send for ferroday_cage::ResolvedProcessFilter
+impl core::marker::Sync for ferroday_cage::ResolvedProcessFilter
+impl core::marker::Unpin for ferroday_cage::ResolvedProcessFilter
+impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedProcessFilter
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedProcessFilter
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedProcessFilter
+#[non_exhaustive] pub struct ferroday_cage::ResolvedProcessRefusal
+pub ferroday_cage::ResolvedProcessRefusal::errno: u16
+pub ferroday_cage::ResolvedProcessRefusal::one_process: core::option::Option<u32>
+pub ferroday_cage::ResolvedProcessRefusal::process_argument: u8
+pub ferroday_cage::ResolvedProcessRefusal::syscall: alloc::string::String
+impl core::marker::Freeze for ferroday_cage::ResolvedProcessRefusal
+impl core::marker::Send for ferroday_cage::ResolvedProcessRefusal
+impl core::marker::Sync for ferroday_cage::ResolvedProcessRefusal
+impl core::marker::Unpin for ferroday_cage::ResolvedProcessRefusal
+impl core::marker::UnsafeUnpin for ferroday_cage::ResolvedProcessRefusal
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ResolvedProcessRefusal
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedProcessRefusal
 #[non_exhaustive] pub struct ferroday_cage::ResolvedRlimit
 pub ferroday_cage::ResolvedRlimit::hard: ferroday_cage::limits::Limit
 pub ferroday_cage::ResolvedRlimit::resource: ferroday_cage::limits::Resource

@@ -1134,11 +1134,16 @@ fn exec_command(
         sys::exit_group(127)
     }
 
-    // The network filter, wherever the sandbox has a network namespace of its
-    // own or the command is held to Landlock's network rights: it refuses the
-    // routes out that the namespace or the rights do not cover, and it is not
-    // opt-in, since without it neither boundary is what the configuration
-    // says it is. See `seccomp::NetworkFilter`.
+    // The launch's own filters, each where a boundary the configuration sets
+    // leaves a reach open that a filter closes. The network filter, wherever
+    // the sandbox has a network namespace of its own or the command is held to
+    // Landlock's network rights: it refuses the routes out that the namespace
+    // or the rights do not cover. The process filter, wherever the signal
+    // scope holds a command sharing the PID namespace of processes outside the
+    // sandbox: it refuses changing their limits and scheduling, which the
+    // scope does not cover. Neither is opt-in, since without it the boundary
+    // is not what the configuration says it is. See `seccomp::NetworkFilter`
+    // and `seccomp::PROCESS_FILTER`.
     //
     // Installed here, after the nested user namespace is entered: creating one
     // grants the CAP_SYS_ADMIN that an install without no-new-privileges
@@ -1150,12 +1155,19 @@ fn exec_command(
     // including the identity switch and the exec. Installed before the
     // hardening layer, so a caller's own policy stacks on top of it and, where
     // both answer a syscall with an errno, answers with its own.
-    if let Some(filter) = seccomp::NetworkFilter::of(context.plan)
-        && let Err(errno) =
-            admit_filter_install(context.plan).and_then(|()| seccomp::install(filter.program()))
-    {
-        report(context.report_fd, SetupStep::InstallNetworkFilter, errno, 0);
-        sys::exit_group(127)
+    let filters = [
+        seccomp::NetworkFilter::of(context.plan)
+            .map(|filter| (filter.program(), SetupStep::InstallNetworkFilter)),
+        seccomp::installs_process_filter(context.plan)
+            .then_some((seccomp::PROCESS_FILTER, SetupStep::InstallProcessFilter)),
+    ];
+    for (program, step) in filters.into_iter().flatten() {
+        if let Err(errno) =
+            admit_filter_install(context.plan).and_then(|()| seccomp::install(program))
+        {
+            report(context.report_fd, step, errno, 0);
+            sys::exit_group(127)
+        }
     }
 
     // The opt-in hardening layer and the identity switch, applied last so

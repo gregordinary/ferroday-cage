@@ -52,6 +52,16 @@
 //!   `ptrace` the calling user's other processes, where the host's Yama policy
 //!   permits it, and read their `/proc/<pid>/{environ,mem,maps}`. Any Landlock
 //!   domain refuses both against a process outside it, whatever it grants.
+//! - **Other processes' limits and scheduling.** The kernel lets the command
+//!   change the resource limits, scheduling and I/O priority of every process
+//!   the calling user owns, through `prlimit64`, `setpriority`, the
+//!   `sched_set*` calls and `ioprio_set`, and no Landlock scope governs them:
+//!   lowering a process's `RLIMIT_CPU` ends it. Under the signal scope, a
+//!   restriction's default from ABI 6, the launch installs the process filter,
+//!   which refuses each where it names a process other than the command's
+//!   own, a thread of its own included; see
+//!   [`LandlockScope::Signal`](crate::LandlockScope::Signal). Without the
+//!   scope the reach stays open.
 //! - **The user's keyrings.** The fresh session keyring every launch joins
 //!   ends possession of the caller's session keys, but the user keyring, the
 //!   user session keyring, and the persistent keyring belong to the user rather

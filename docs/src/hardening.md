@@ -164,6 +164,17 @@ abstract socket such a process created. Both reaches stay open between the
 command and the processes it starts. A scope is not a grant, so it enrolls no
 path or port and leaves the filesystem and the network as the grants left them.
 
+No scope covers changing another process's resource limits, scheduling or I/O
+priority. The kernel allows `prlimit64`, `setpriority`, `sched_setaffinity`,
+`sched_setscheduler`, `sched_setparam`, `sched_setattr` and `ioprio_set` against
+any process of the same user, so under [`pid_namespace(false)`] the command could
+lower the caller's `RLIMIT_CPU`, which ends a process past it, or demote its
+scheduling. Wherever `Signal` holds a command that shares the host's PID space,
+the launch therefore also installs [the process
+filter](how-the-sandbox-is-built.md#the-process-filter), which refuses each of
+those calls where it names a process other than the command's own. Behind a PID
+namespace there is no such process to name, and no filter.
+
 Scopes need Landlock ABI 6 (Linux 6.12). Where a namespace also bounds its
 reach, a scope is additive, and an older kernel that offers Landlock narrows it
 away best-effort. Where nothing else bounds the reach, the scope is the

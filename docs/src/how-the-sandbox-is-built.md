@@ -323,6 +323,40 @@ policy's. A host that cannot install the filter fails the launch at
 `SetupStep::InstallNetworkFilter`. [Host requirements](host-requirements.md)
 covers the hosts that cannot.
 
+## The process filter
+
+The Landlock signal scope keeps a command from signalling a process outside its
+domain. It is what bounds a command that shares the PID namespace of the calling
+user's other processes: a [restriction](restriction-fallback.md), whose default
+it is, and a sandbox under `pid_namespace(false)` that names it. The kernel also
+lets a process change the resource limits, the scheduling, and the I/O priority
+of any process of the same user, and no Landlock hook governs that. Lowering a
+process's `RLIMIT_CPU` ends it as surely as a signal. Wherever the scope holds
+such a command, the command therefore carries a second filter of the launch's
+own, installed beside the network filter:
+
+| Call | Runs where it names | Answer otherwise |
+| --- | --- | --- |
+| `prlimit64`, `sched_setaffinity`, `sched_setscheduler`, `sched_setparam`, `sched_setattr` | the caller: a pid of 0 | `EPERM` |
+| `setpriority` | the caller: `PRIO_PROCESS` and an id of 0 | `EPERM` |
+| `ioprio_set` | the caller: `IOPRIO_WHO_PROCESS` and an id of 0 | `EPERM` |
+
+`EPERM` is what the kernel answers for a process the caller may not change. The C
+library's `setrlimit` and `getrlimit`, `nice`, and `taskset` or `ionice` running a
+command all name the caller with an id of 0, and work. A filter cannot tell the
+caller's own pid, or a thread's id, from another process's, so a call naming one
+is refused as well. `pthread_setaffinity_np`, `pthread_setschedparam` and
+`pthread_setschedprio` name a thread by its id, and fail under the filter. A
+command that needs them runs with the signal scope turned off, which turns the
+filter off with it. Behind a PID namespace of the sandbox's own there is no
+process outside it to name, and the filter is not installed. The filter compares
+the low 32 bits of each argument and checks every entry point the host's kernel
+presents, as the network filter does.
+
+`Cage::resolved_inputs` and `Restriction::resolved_inputs` report the filter's
+refusals in `process_filter`. A host that cannot install the filter fails the
+launch at `SetupStep::InstallProcessFilter`.
+
 ## The session keyring
 
 A forked process inherits its parent's session keyring, and no namespace a

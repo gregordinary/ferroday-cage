@@ -243,6 +243,12 @@ wire_enum! {
         /// caller's address space: the command's before its exec, and a launch
         /// stage that supervises from outside.
         SetNotDumpable = 74 => "making a process of the launch not dumpable",
+        /// Install the process filter, the seccomp filter a command carries
+        /// where the Landlock signal scope holds it and it shares the PID
+        /// namespace of processes outside the sandbox, which refuses changing
+        /// their resource limits and scheduling. See the `hardening` feature's
+        /// `LandlockScope::Signal`.
+        InstallProcessFilter = 75 => "installing the process filter",
     }
 }
 
