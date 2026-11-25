@@ -367,10 +367,9 @@ pub(crate) fn configure(
     // Suppress daemon startup and, under the single-identity map, neutralize
     // direct chown/chgrp for the whole configuration, before any maintainer
     // script runs.
+    let stand_ins = StandIns { single };
     write_policy_rc_d(&tree)?;
-    if single {
-        install_ownership_stubs(&tree)?;
-    }
+    stand_ins.before_unpack(&tree)?;
     symlink_awk(&tree)?;
 
     // base-passwd is configured first: it creates /etc/passwd, so the
@@ -399,13 +398,7 @@ pub(crate) fn configure(
     let mut unpack: Vec<&str> = vec!["--force-depends", "--unpack"];
     unpack.extend(installables.iter().map(|p| p.deb_path.as_str()));
     run_dpkg("unpack", staging, Rooting::Whole, &unpack, wave, observer)?;
-
-    if single {
-        install_ownership_stubs(&tree)?;
-    }
-    // After the unpack wave, which lays dpkg's real launcher again, and before
-    // the configure wave whose scripts might call it, as debootstrap does.
-    stub_out(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
+    stand_ins.before_configure(&tree)?;
 
     // Every package is now unpacked, so every preinst has run, and the core
     // packages above are configured; no other package's postinst has run. Lay
@@ -435,10 +428,7 @@ pub(crate) fn configure(
 
     // Restore the real tools, remove the bootstrap-only files and what the
     // waves recorded of the run, then write the finished rootfs's apt sources.
-    if single {
-        restore_ownership_stubs(&tree)?;
-    }
-    restore_stubbed(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
+    stand_ins.restore(&tree)?;
     remove_policy_rc_d(&tree)?;
     clear_run_state(&tree)?;
     if let (Some(epoch), Some(found)) = (source_date_epoch, &found) {
@@ -472,8 +462,10 @@ pub(crate) fn configure(
 /// since the base already supplies all of it. Under the single-identity map it
 /// still neutralizes `chown`/`chgrp` and seeds a merged statoverride, so a
 /// maintainer script that shells out to one of those commands to assign an id
-/// the map cannot represent succeeds; those shims shadow the base's real tools
-/// through the overlay and are removed afterward. The coverage stops exactly
+/// the map cannot represent succeeds. The [stand-ins](StandIns) are the full
+/// bootstrap's, over the upper: one the increment ships is set aside and put
+/// back, and one only the base holds is shadowed and revealed again. The
+/// coverage stops exactly
 /// where [`configure`]'s does — a compiled helper or a POSIX ACL still fails —
 /// and the overlay is not the variable: an increment runs under the map of the
 /// base it increments, so a package needing real ids fails here for the same
@@ -522,9 +514,10 @@ pub(crate) fn configure_delta(
     // direct chown/chgrp and seed the merged statoverride, before any maintainer
     // script runs. The base's own base-passwd is already configured, so `root`
     // resolves from the start; no shadow pre-creation or awk shim is needed.
+    let stand_ins = StandIns { single };
     write_policy_rc_d(&tree)?;
+    stand_ins.before_unpack(&tree)?;
     if single {
-        install_delta_ownership_stubs(&tree)?;
         write_delta_statoverride(lower, &tree, statoverride)?;
     }
 
@@ -542,10 +535,7 @@ pub(crate) fn configure_delta(
         wave,
         observer,
     )?;
-
-    // The base's launcher is shadowed by the stand-in for the configure wave,
-    // after the unpack, which may lay a newer real one into the upper.
-    write_script(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
+    stand_ins.before_configure(&tree)?;
 
     // The caller's pre-configure overlay, after unpack so it overwrites the
     // just-unpacked files — a shipped conffile among them — and before configure
@@ -569,15 +559,12 @@ pub(crate) fn configure_delta(
         observer,
     )?;
 
-    // Reveal the base's real ownership tools through the overlay again, and drop
-    // the daemon-startup policy and what the increment's waves recorded of their
+    // Put back the increment's own programs and reveal the base's, and drop the
+    // daemon-startup policy and what the increment's waves recorded of their
     // run. Removing a record from the upper reveals whatever copy the base holds
     // at that path, which is the base's own; a base this library bootstrapped
     // holds none.
-    if single {
-        restore_delta_ownership_stubs(&tree)?;
-    }
-    unshadow(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)?;
+    stand_ins.restore(&tree)?;
     remove_policy_rc_d(&tree)?;
     clear_run_state(&tree)?;
     if let (Some(epoch), Some(found)) = (source_date_epoch, &found) {
@@ -594,53 +581,6 @@ pub(crate) fn configure_delta(
             .map(|p| p.name.clone())
             .collect::<Vec<_>>(),
     )
-}
-
-/// Shadows the base's ownership tools with success stubs in the upper.
-///
-/// A delta package's maintainer script that `chown`s to an id the
-/// single-identity map cannot represent would fail; the stub makes it succeed
-/// for the duration of the increment's configuration. Unlike the full
-/// bootstrap's stubs, which move the real tool aside, these merely shadow the
-/// base's real tools through the overlay — [`restore_delta_ownership_stubs`]
-/// removes the shadow to reveal them again, since the base's copies persist in
-/// the read-only lower.
-fn install_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
-    for tool in OWNERSHIP_TOOLS {
-        write_script(upper, &format!("usr/bin/{tool}"), OWNERSHIP_STUB)?;
-    }
-    Ok(())
-}
-
-/// Removes the ownership-tool stubs from the upper, revealing the base's real
-/// tools through the overlay again.
-///
-/// Conditional on the file still holding the stub body, for the reason
-/// [`restore_stubbed`]'s deletion is: the increment's own unpack wave
-/// runs after the stubs are written, so a package it installs — or the caller's
-/// pre-configure overlay — may have laid a real tool over one. Removing that
-/// would delete a file the merged database says the increment installed, and
-/// reveal the base's older copy in its place. Anything the read refuses to
-/// follow, a symbolic link at the path among them, survives for the same
-/// reason.
-fn restore_delta_ownership_stubs(upper: &Rooted) -> Result<(), DebianError> {
-    for tool in OWNERSHIP_TOOLS {
-        unshadow(upper, &format!("usr/bin/{tool}"), OWNERSHIP_STUB)?;
-    }
-    Ok(())
-}
-
-/// Removes the stand-in `stub` that shadows a base's program at `path` in an
-/// upper, revealing the base's own again, where the file still holds `stub`.
-///
-/// A file holding anything else is left: the increment's unpack wave, or the
-/// caller's pre-configure overlay, laid it after the stand-in was written, and
-/// the merged database may say the increment installed it.
-fn unshadow(upper: &Rooted, path: &str, stub: &str) -> Result<(), DebianError> {
-    if holds_stub(upper, path, stub) {
-        remove_if_present(upper, path)?;
-    }
-    Ok(())
 }
 
 /// Writes the increment's statoverride into the upper, carrying the base's
@@ -974,6 +914,53 @@ fn remove_policy_rc_d(tree: &Rooted) -> Result<(), DebianError> {
     remove_if_present(tree, POLICY_RC_D)
 }
 
+/// The temporary programs the dpkg waves run with, set up and taken down around
+/// the waves in one order for a full bootstrap and for an increment.
+///
+/// Under the single-identity map, the [ownership tools](OWNERSHIP_TOOLS) are
+/// stubs from before the unpack wave, whose `preinst` scripts may run them, to
+/// the end of the configure wave. The daemon launcher is the stand-in for the
+/// configure wave alone. The unpack wave lays a package's files again, so a
+/// package shipping one of these programs replaces its stub, and the stubs are
+/// written again before the configure wave runs any `postinst`.
+///
+/// Each stub goes through [`stub_out`], so the program at the path before it,
+/// in a whole tree or in an increment's upper, is set aside and put back. In an
+/// upper only the upper's own file is the program: one only the base holds is
+/// shadowed by the stub and revealed again when it is removed, since a
+/// [`Rooted`] over a base reads the upper alone.
+struct StandIns {
+    /// Whether the waves run under the single-identity map.
+    single: bool,
+}
+
+impl StandIns {
+    /// Before the unpack wave, and before any package's script runs.
+    fn before_unpack(&self, tree: &Rooted) -> Result<(), DebianError> {
+        if self.single {
+            install_ownership_stubs(tree)?;
+        }
+        Ok(())
+    }
+
+    /// After the unpack wave, which may have laid a package's real programs
+    /// over the stubs, and before the configure wave, as debootstrap does.
+    fn before_configure(&self, tree: &Rooted) -> Result<(), DebianError> {
+        if self.single {
+            install_ownership_stubs(tree)?;
+        }
+        stub_out(tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)
+    }
+
+    /// After the configure wave: the real programs back where they were.
+    fn restore(&self, tree: &Rooted) -> Result<(), DebianError> {
+        if self.single {
+            restore_ownership_stubs(tree)?;
+        }
+        restore_stubbed(tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB)
+    }
+}
+
 /// Replaces the ownership tools with stubs that succeed, as [`stub_out`]
 /// replaces a program.
 fn install_ownership_stubs(tree: &Rooted) -> Result<(), DebianError> {
@@ -999,17 +986,21 @@ fn restore_ownership_stubs(tree: &Rooted) -> Result<(), DebianError> {
 /// Replaces the program at `path` with the script `stub` for the configure
 /// waves, keeping the real one beside it under a `.fcage-real` suffix.
 ///
-/// The real program is moved aside on the first call only; a second call,
-/// after an unpack wave re-lays the real program, only rewrites the stub.
+/// The first program found at the path is the one moved aside, and only once:
+/// a later call, after an unpack wave re-lays the same program from the same
+/// package, only rewrites the stub. A path holding the stub already has no
+/// program to move, so a stub is never taken for one, which is what keeps a
+/// second call from setting the stub aside where the first found nothing.
 /// Presence is asked of the name rather than of what it resolves to, so a
 /// symbolic link occupying either path counts as the program being there and
 /// is moved aside as one, never followed.
 fn stub_out(tree: &Rooted, path: &str, stub: &str) -> Result<(), DebianError> {
     let saved = format!("{path}.fcage-real");
-    if tree.exists(path).map_err(at("inspecting", tree, path))?
-        && !tree
-            .exists(&saved)
-            .map_err(at("inspecting", tree, &saved))?
+    if !tree
+        .exists(&saved)
+        .map_err(at("inspecting", tree, &saved))?
+        && tree.exists(path).map_err(at("inspecting", tree, path))?
+        && !holds_stub(tree, path, stub)
     {
         tree.rename(path, &saved)
             .map_err(at("moving aside", tree, path))?;
@@ -1020,19 +1011,23 @@ fn stub_out(tree: &Rooted, path: &str, stub: &str) -> Result<(), DebianError> {
 /// Puts back the program [`stub_out`] moved aside from `path`, or removes the
 /// stub where there is no real program to put back.
 ///
-/// The removal is conditional on the file still holding `stub`, so a real
-/// program that arrived after the stub was written survives — as does anything
-/// the read refuses to follow, a symbolic link at the path among them.
+/// Both are conditional on the file still holding `stub`. A program that
+/// arrived after the stub was written, from a caller's pre-configure overlay
+/// or a maintainer script, survives, and the copy set aside is removed, as is
+/// anything else the read refuses to follow, a symbolic link at the path among
+/// them.
 fn restore_stubbed(tree: &Rooted, path: &str, stub: &str) -> Result<(), DebianError> {
     let saved = format!("{path}.fcage-real");
-    if tree
+    let set_aside = tree
         .exists(&saved)
-        .map_err(at("inspecting", tree, &saved))?
-    {
-        tree.rename(&saved, path)
-            .map_err(at("restoring", tree, path))?;
-    } else if holds_stub(tree, path, stub) {
-        remove_if_present(tree, path)?;
+        .map_err(at("inspecting", tree, &saved))?;
+    match (holds_stub(tree, path, stub), set_aside) {
+        (true, true) => tree
+            .rename(&saved, path)
+            .map_err(at("restoring", tree, path))?,
+        (true, false) => remove_if_present(tree, path)?,
+        (false, true) => remove_if_present(tree, &saved)?,
+        (false, false) => {}
     }
     Ok(())
 }
@@ -1277,28 +1272,135 @@ mod tests {
         }
     }
 
+    /// An increment's upper over a base, each a scratch tree, the base holding
+    /// `base_files` and the upper `upper_files` as the extraction left them,
+    /// and the upper opened over the base as a layer's host side opens it.
+    fn increment(
+        tag: &str,
+        base_files: &[(&str, &[u8])],
+        upper_files: &[(&str, &[u8])],
+    ) -> (Scratch, Scratch, Rooted) {
+        let (base, base_tree) = scratch_tree("bootstrap", &format!("{tag}-base"));
+        let (upper, upper_tree) = scratch_tree("bootstrap", &format!("{tag}-upper"));
+        for (path, body) in base_files {
+            base_tree.write(path, body).unwrap();
+        }
+        for (path, body) in upper_files {
+            upper_tree.write(path, body).unwrap();
+        }
+        let tree = upper_tree.over(Some(&base_tree)).unwrap();
+        (base, upper, tree)
+    }
+
     #[test]
-    fn a_delta_restores_only_the_stubs_it_wrote() {
-        // The increment's unpack wave runs after the stubs are written, so a
-        // package it installs can lay a real tool over one. Removing that would
-        // delete a file the merged database says is installed and reveal the
-        // base's older copy through the overlay in its place.
-        let (upper, tree) = scratch_tree("bootstrap", "delta-ownership-stubs");
-        install_delta_ownership_stubs(&tree).expect("the stubs are written");
-        // What an unpack of a real coreutils leaves behind.
-        let real = b"\x7fELF real chown\n";
-        tree.write("usr/bin/chown", real)
-            .expect("the real tool lands");
+    fn an_increment_keeps_the_programs_it_ships_through_the_waves() {
+        // An increment upgrading dpkg and coreutils over an older base. Their
+        // new programs are in the upper before the waves, as the extraction
+        // left them, and the unpack wave lays them again over the stubs.
+        let old_launcher: &[u8] = b"\x7fELF the base's start-stop-daemon\n";
+        let new_launcher: &[u8] = b"\x7fELF the increment's start-stop-daemon\n";
+        let old_chown: &[u8] = b"\x7fELF the base's chown\n";
+        let new_chown: &[u8] = b"\x7fELF the increment's chown\n";
+        let (_base, upper, tree) = increment(
+            "upgrading-increment",
+            &[
+                (START_STOP_DAEMON, old_launcher),
+                ("usr/bin/chown", old_chown),
+                ("usr/bin/chgrp", old_chown),
+            ],
+            &[
+                (START_STOP_DAEMON, new_launcher),
+                ("usr/bin/chown", new_chown),
+                ("usr/bin/chgrp", new_chown),
+            ],
+        );
+        let stand_ins = StandIns { single: true };
+        stand_ins.before_unpack(&tree).unwrap();
+        // The unpack wave lays the packages' files again.
+        for (path, body) in [
+            (START_STOP_DAEMON, new_launcher),
+            ("usr/bin/chown", new_chown),
+            ("usr/bin/chgrp", new_chown),
+        ] {
+            tree.write(path, body).unwrap();
+        }
+        stand_ins.before_configure(&tree).unwrap();
 
-        restore_delta_ownership_stubs(&tree).expect("the stubs are restored");
+        // The configure wave runs with every stand-in in place, the upgraded
+        // chown included.
+        let read = |path: &str| fs::read(upper.join(path)).unwrap();
+        assert_eq!(read(START_STOP_DAEMON), START_STOP_DAEMON_STUB.as_bytes());
+        assert_eq!(read("usr/bin/chown"), OWNERSHIP_STUB.as_bytes());
+        assert_eq!(read("usr/bin/chgrp"), OWNERSHIP_STUB.as_bytes());
 
+        stand_ins.restore(&tree).unwrap();
+        // The increment's own programs, not the stubs and not the base's.
+        assert_eq!(read(START_STOP_DAEMON), new_launcher);
+        assert_eq!(read("usr/bin/chown"), new_chown);
+        assert_eq!(read("usr/bin/chgrp"), new_chown);
+        for path in [START_STOP_DAEMON, "usr/bin/chown", "usr/bin/chgrp"] {
+            assert!(
+                fs::symlink_metadata(upper.join(format!("{path}.fcage-real"))).is_err(),
+                "{path} left its copy behind",
+            );
+        }
+    }
+
+    #[test]
+    fn an_increment_reveals_the_base_programs_it_does_not_ship() {
+        // An increment shipping neither: the stubs shadow the base's programs
+        // through the overlay while the waves run, twice over, and removing
+        // them reveals the base's again.
+        let (_base, upper, tree) = increment(
+            "plain-increment",
+            &[
+                (START_STOP_DAEMON, b"\x7fELF the base's start-stop-daemon\n"),
+                ("usr/bin/chown", b"\x7fELF the base's chown\n"),
+            ],
+            &[],
+        );
+        let stand_ins = StandIns { single: true };
+        stand_ins.before_unpack(&tree).unwrap();
+        stand_ins.before_configure(&tree).unwrap();
         assert_eq!(
-            fs::read(upper.join("usr/bin/chown")).expect("the real tool survives"),
-            real,
+            fs::read(upper.join("usr/bin/chown")).unwrap(),
+            OWNERSHIP_STUB.as_bytes()
+        );
+        stand_ins.restore(&tree).unwrap();
+        for path in [START_STOP_DAEMON, "usr/bin/chown", "usr/bin/chgrp"] {
+            assert!(
+                fs::symlink_metadata(upper.join(path)).is_err(),
+                "the upper still shadows {path}",
+            );
+            assert!(fs::symlink_metadata(upper.join(format!("{path}.fcage-real"))).is_err());
+        }
+
+        // Under a range map the ownership tools are left alone.
+        let (_base, upper, tree) = increment("range-map-increment", &[], &[]);
+        let stand_ins = StandIns { single: false };
+        stand_ins.before_unpack(&tree).unwrap();
+        stand_ins.before_configure(&tree).unwrap();
+        assert!(fs::symlink_metadata(upper.join("usr/bin/chown")).is_err());
+        stand_ins.restore(&tree).unwrap();
+    }
+
+    #[test]
+    fn a_program_that_replaces_a_stub_survives_its_restore() {
+        // A caller's pre-configure overlay, or a maintainer script, lays its
+        // own program over a stand-in. It is kept, and the copy set aside goes.
+        let (staging, tree) = scratch_tree("bootstrap", "replaced-stand-in");
+        tree.write(START_STOP_DAEMON, b"\x7fELF the package's\n")
+            .unwrap();
+        stub_out(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).unwrap();
+        tree.write(START_STOP_DAEMON, b"#!/bin/sh\n# the overlay's\n")
+            .unwrap();
+        restore_stubbed(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).unwrap();
+        assert_eq!(
+            fs::read(staging.join(START_STOP_DAEMON)).unwrap(),
+            b"#!/bin/sh\n# the overlay's\n"
         );
         assert!(
-            !upper.join("usr/bin/chgrp").exists(),
-            "an untouched stub is still removed, revealing the base's tool",
+            fs::symlink_metadata(staging.join(format!("{START_STOP_DAEMON}.fcage-real"))).is_err()
         );
     }
 
@@ -1330,23 +1432,6 @@ mod tests {
         stub_out(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("diverted");
         restore_stubbed(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("restored");
         assert!(fs::symlink_metadata(staging.join(START_STOP_DAEMON)).is_err());
-    }
-
-    #[test]
-    fn an_increment_reveals_the_bases_launcher_unless_it_laid_its_own() {
-        // In an upper the stand-in shadows the base's launcher, and removing it
-        // reveals the base's again. One the increment laid over the stand-in is
-        // the increment's, and stays.
-        let (upper, tree) = scratch_tree("bootstrap", "delta-start-stop-daemon");
-        write_script(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).unwrap();
-        unshadow(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("unshadowed");
-        assert!(!upper.join(START_STOP_DAEMON).exists());
-
-        write_script(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).unwrap();
-        tree.write(START_STOP_DAEMON, b"\x7fELF a newer dpkg's\n")
-            .unwrap();
-        unshadow(&tree, START_STOP_DAEMON, START_STOP_DAEMON_STUB).expect("unshadowed");
-        assert!(upper.join(START_STOP_DAEMON).is_file());
     }
 
     #[test]

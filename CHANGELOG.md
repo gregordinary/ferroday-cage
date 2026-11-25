@@ -227,6 +227,16 @@ consumer upgrading can skip it.
   version that states it, as the package manager specification exempts one. A
   package blocking the other versions of itself was refused as blocking
   itself. A strong blocker, `!!`, still counts against its own version.
+- A layered Debian build whose increment upgrades dpkg keeps the increment's
+  `start-stop-daemon`. The stand-in the configure wave runs with was written
+  over it, and removing the stand-in revealed the base's older launcher, so the
+  layer's database named one dpkg and its launcher was another's.
+- Under the single-identity map, a layered Debian build whose increment
+  upgrades coreutils configures with `chown` and `chgrp` stubbed, as a full
+  bootstrap does. The unpack wave laid the real tools back over the stubs, so a
+  maintainer script changing ownership to an id the map cannot hold failed. A
+  bootstrap now keeps a program that a pre-configure overlay lays over a
+  stand-in, where it put back the copy it had set aside.
 - The embedding chapter's tokio recipe for cancelling a sandbox kills it when
   the async side is dropped, before the kill handle reaches it or after. As
   written, a future dropped before the handle arrived left the sandbox running
