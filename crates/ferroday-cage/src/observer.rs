@@ -241,8 +241,10 @@ impl Observer for Capped {
 ///
 /// Where nothing was left out, [`head`](Self::head) and then
 /// [`tail`](Self::tail) are the whole stream, in order. The memory one holds
-/// never exceeds its head's bound and twice its tail's: the end is kept in a
-/// buffer compacted as it fills, so taking it costs a copy only once per tail's
+/// never exceeds its head's bound and twice its tail's, as allocated and not
+/// only as filled: each buffer grows by doubling up to its bound and no
+/// further, and the end is kept in a buffer compacted before it would pass
+/// twice the tail's bound, so taking it costs a copy only once per tail's
 /// worth of input.
 #[derive(Debug, Clone)]
 pub struct Excerpt {
@@ -275,18 +277,25 @@ impl Excerpt {
         self.total = self.total.saturating_add(chunk.len() as u64);
         let room = self.head_limit.saturating_sub(self.head.len());
         let (first, rest) = chunk.split_at(chunk.len().min(room));
+        reserve_within(&mut self.head, first.len(), self.head_limit);
         self.head.extend_from_slice(first);
+        let recent_limit = self.tail_limit.saturating_mul(2);
         if rest.len() >= self.tail_limit {
             self.recent.clear();
-            self.recent
-                .extend_from_slice(&rest[rest.len() - self.tail_limit..]);
+            let last = &rest[rest.len() - self.tail_limit..];
+            reserve_within(&mut self.recent, last.len(), recent_limit);
+            self.recent.extend_from_slice(last);
             return;
         }
-        self.recent.extend_from_slice(rest);
-        if self.recent.len() > self.tail_limit.saturating_mul(2) {
-            let excess = self.recent.len() - self.tail_limit;
+        // Compacted first, so the buffer never holds more than twice the
+        // tail: what stays is what the tail can still need once `rest` lands
+        // after it.
+        if self.recent.len() + rest.len() > recent_limit {
+            let excess = self.recent.len() - (self.tail_limit - rest.len());
             self.recent.drain(..excess);
         }
+        reserve_within(&mut self.recent, rest.len(), recent_limit);
+        self.recent.extend_from_slice(rest);
     }
 
     /// The stream's first bytes, up to the head's bound.
@@ -308,6 +317,20 @@ impl Excerpt {
     /// How many bytes the stream carried in all.
     pub fn total(&self) -> u64 {
         self.total
+    }
+}
+
+/// Makes room in `buffer` for `additional` more bytes, growing it by doubling,
+/// as a `Vec` does, but to no more than `bound`, which the caller keeps its
+/// length within.
+fn reserve_within(buffer: &mut Vec<u8>, additional: usize, bound: usize) {
+    let needed = buffer.len() + additional;
+    if needed > buffer.capacity() {
+        let grown = buffer
+            .capacity()
+            .saturating_mul(2)
+            .clamp(needed, bound.max(needed));
+        buffer.reserve_exact(grown - buffer.len());
     }
 }
 
@@ -362,8 +385,13 @@ mod tests {
         let mut excerpt = Excerpt::new(head, tail);
         for chunk in stream.chunks(size.max(1)) {
             excerpt.keep(chunk);
+            // As allocated, not only as filled.
             assert!(
-                excerpt.recent.len() <= tail.saturating_mul(2).max(tail),
+                excerpt.head.capacity() <= head,
+                "the head's buffer outgrew its bound"
+            );
+            assert!(
+                excerpt.recent.capacity() <= tail.saturating_mul(2),
                 "the tail's buffer outgrew its bound"
             );
         }

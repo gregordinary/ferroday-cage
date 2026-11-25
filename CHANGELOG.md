@@ -451,6 +451,10 @@ consumer upgrading can skip it.
   `--restrict` the command sees the host's `/dev/pts`, so only Landlock grants
   that leave it out keep it from opening the caller's terminal by its path. The
   help said the command reached nothing of that terminal.
+- An `Excerpt` holds no more memory than its head's bound and twice its
+  tail's, as allocated and not only as filled. Its buffers grew by a `Vec`'s
+  doubling past their bounds, to about twice the head and four times the tail,
+  and the tail's could briefly hold three times its bound.
 
 ### Internal
 
