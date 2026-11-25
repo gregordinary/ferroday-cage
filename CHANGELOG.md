@@ -135,6 +135,11 @@ consumer upgrading can skip it.
 - **Breaking.** `NetStack::forwards` takes the new `Transport`, TCP or UDP,
   beside the destination, since a destination rule can carry one transport and
   not the other.
+- **Breaking.** `ProvisionEvent` loses its `Debian`, `Alpine` and `Gentoo`
+  variants. A userland layer reports its events only to an observer bound with
+  its `observe`, whose result is the provisioner a run takes. A
+  `Provision::observe` observer hears `Entry` and `Read`, and still stops a
+  layer's run.
 
 - **Breaking.** `fcage --netstack` names the stack's nameserver in the
   sandbox's `resolv.conf`, through `CageBuilder::nameservers`, rather than

@@ -447,7 +447,8 @@ pub enum GentooError {
         /// The SHA-512 the bytes actually have.
         actual: Digest,
     },
-    /// The run's observer asked the bootstrap to stop.
+    /// An observer asked the bootstrap to stop: the sink bound with
+    /// [`Gentoo::observe`], or the run's own.
     ///
     /// Surfaces to a caller as [`super::ProvisionError::Cancelled`].
     Cancelled,
@@ -1567,7 +1568,7 @@ impl Provisioner for Gentoo {
     /// file of several hundred megabytes, with no package boundary to break it
     /// up.
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        self.provision_reporting(request, &mut RunObserver { request })
+        self.provision_reporting(request, &mut Unbound { request })
     }
 }
 
@@ -2076,13 +2077,10 @@ fn verify(mut file: File, tarball: &Path, expected: &Digest) -> Result<File, Gen
     Ok(file)
 }
 
-/// Something the Gentoo provisioner is doing, reported to a [`GentooObserver`]
-/// or to a run's observer.
+/// Something the Gentoo provisioner is doing, reported to a [`GentooObserver`].
 ///
-/// Nested in [`ProvisionEvent::Gentoo`](super::ProvisionEvent::Gentoo), so one
-/// observer attached with [`Provision::observe`](super::Provision::observe)
-/// covers every provisioner; [`Gentoo::observe`] binds a sink that receives
-/// these directly, including on the read-half calls no run drives.
+/// [`Gentoo::observe`] binds the sink that receives these, on a run and on the
+/// read-half calls no run drives alike.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum GentooEvent<'a> {
@@ -2344,7 +2342,6 @@ pub trait GentooObserver {
 layer_observer! {
     observer: GentooObserver,
     event: GentooEvent,
-    shared: Gentoo,
     layer: Gentoo,
     field: gentoo,
 }
@@ -2386,9 +2383,9 @@ impl Observed<'_> {
 /// Where a step reports to.
 ///
 /// A step never asks whether anything is listening: [`Silent`] is what an
-/// unobserved call passes, [`RunObserver`] is what a run through
-/// [`provision::ensure`](super::ensure) passes, and a caller's own sink is what
-/// [`Gentoo::observe`] passes.
+/// unobserved call passes, [`Unbound`] is what a run through
+/// [`provision::ensure`](super::ensure) with no sink bound passes, and a
+/// caller's own sink is what [`Gentoo::observe`] passes.
 type Reporting<'a> = &'a mut dyn GentooObserver;
 
 /// Stops where the observer has cancelled the work.
@@ -2913,7 +2910,6 @@ mod tests {
 
     use super::*;
     use crate::ErrorChain;
-    use crate::provision::ProvisionEvent;
     use crate::provision::digest::Algorithm;
     use crate::provision::fetch::fixture::{Canned, Unreachable};
     use crate::provision::openpgp::fixture;
@@ -3931,23 +3927,19 @@ mod tests {
         assert!(gentoo.stage3.is_none(), "nothing was resolved beforehand");
 
         let mut seen: Vec<String> = Vec::new();
+        let mut sink = |event: GentooEvent<'_>| {
+            seen.push(match event {
+                GentooEvent::Fetching { .. } => "fetching".to_string(),
+                GentooEvent::Resolved { stage3 } => format!("resolved {}", stage3.build_id()),
+                GentooEvent::Verifying { .. } => "verifying".to_string(),
+                GentooEvent::Extracting { .. } => "extracting".to_string(),
+                // The install wave's own events, which a bootstrap with no
+                // install list never reaches.
+                other => format!("unexpected {other:?}"),
+            });
+        };
         crate::provision::Provision::new(scratch.join("root"))
-            .observe(&mut |event: ProvisionEvent<'_>| {
-                if let ProvisionEvent::Gentoo(event) = event {
-                    seen.push(match event {
-                        GentooEvent::Fetching { .. } => "fetching".to_string(),
-                        GentooEvent::Resolved { stage3 } => {
-                            format!("resolved {}", stage3.build_id())
-                        }
-                        GentooEvent::Verifying { .. } => "verifying".to_string(),
-                        GentooEvent::Extracting { .. } => "extracting".to_string(),
-                        // The install wave's own events, which a bootstrap
-                        // with no install list never reaches.
-                        other => format!("unexpected {other:?}"),
-                    });
-                }
-            })
-            .run(&mut gentoo)
+            .run(&mut gentoo.observe(&mut sink))
             .expect("the root is provisioned");
         assert_eq!(
             seen.iter()
@@ -3972,9 +3964,9 @@ mod tests {
             resolved: bool,
         }
 
-        impl crate::provision::ProvisionObserver for StopOnResolve {
-            fn progress(&mut self, event: ProvisionEvent<'_>) {
-                if let ProvisionEvent::Gentoo(GentooEvent::Resolved { .. }) = event {
+        impl GentooObserver for StopOnResolve {
+            fn progress(&mut self, event: GentooEvent<'_>) {
+                if let GentooEvent::Resolved { .. } = event {
                     self.resolved = true;
                 }
             }
@@ -3992,17 +3984,13 @@ mod tests {
 
         let mut stop = StopOnResolve { resolved: false };
         let err = crate::provision::Provision::new(&root)
-            .observe(&mut stop)
-            .run(&mut gentoo)
+            .run(&mut gentoo.observe(&mut stop))
             .expect_err("the observer asked it to stop");
         assert!(
             matches!(err, crate::provision::ProvisionError::Cancelled),
             "{err}",
         );
-        assert!(
-            stop.resolved,
-            "the Gentoo events reached the run's observer"
-        );
+        assert!(stop.resolved, "the Gentoo events reached the bound sink");
         assert!(!root.exists(), "no root is published");
         assert!(
             !cache
@@ -4024,9 +4012,9 @@ mod tests {
             asked: usize,
         }
 
-        impl crate::provision::ProvisionObserver for StopMidBody {
-            fn progress(&mut self, event: ProvisionEvent<'_>) {
-                if let ProvisionEvent::Gentoo(GentooEvent::Fetching { .. }) = event {
+        impl GentooObserver for StopMidBody {
+            fn progress(&mut self, event: GentooEvent<'_>) {
+                if let GentooEvent::Fetching { .. } = event {
                     self.fetches += 1;
                 }
             }
@@ -4059,8 +4047,7 @@ mod tests {
             asked: 0,
         };
         let err = crate::provision::Provision::new(&root)
-            .observe(&mut stop)
-            .run(&mut gentoo)
+            .run(&mut gentoo.observe(&mut stop))
             .expect_err("the observer asked it to stop");
         assert!(
             matches!(err, crate::provision::ProvisionError::Cancelled),
@@ -4147,19 +4134,17 @@ mod tests {
         gentoo.cache_dir = Some(cache);
 
         let mut seen: Vec<&str> = Vec::new();
+        let mut sink = |event: GentooEvent<'_>| {
+            seen.push(match event {
+                GentooEvent::Fetching { .. } => "fetching",
+                GentooEvent::Resolved { .. } => "resolved",
+                GentooEvent::Verifying { .. } => "verifying",
+                GentooEvent::Extracting { .. } => "extracting",
+                _ => "other",
+            });
+        };
         crate::provision::Provision::new(scratch.join("root"))
-            .observe(&mut |event: ProvisionEvent<'_>| {
-                if let ProvisionEvent::Gentoo(event) = event {
-                    seen.push(match event {
-                        GentooEvent::Fetching { .. } => "fetching",
-                        GentooEvent::Resolved { .. } => "resolved",
-                        GentooEvent::Verifying { .. } => "verifying",
-                        GentooEvent::Extracting { .. } => "extracting",
-                        _ => "other",
-                    });
-                }
-            })
-            .run(&mut gentoo)
+            .run(&mut gentoo.observe(&mut sink))
             .expect("the planted file is replaced from the archive");
         assert_eq!(
             std::fs::read_to_string(scratch.join("root/etc/marker")).expect("the root holds it"),
@@ -4223,13 +4208,13 @@ mod tests {
         let substitute = scratch.join("substitute.tar");
         std::fs::write(&substitute, tarball_marking(b"bytes nothing verified\n")).unwrap();
 
+        let mut sink = |event: GentooEvent<'_>| {
+            if let GentooEvent::Extracting { .. } = event {
+                std::fs::rename(&substitute, &tarball).expect("the other run publishes");
+            }
+        };
         crate::provision::Provision::new(scratch.join("root"))
-            .observe(&mut |event: ProvisionEvent<'_>| {
-                if let ProvisionEvent::Gentoo(GentooEvent::Extracting { .. }) = event {
-                    std::fs::rename(&substitute, &tarball).expect("the other run publishes");
-                }
-            })
-            .run(&mut gentoo)
+            .run(&mut gentoo.observe(&mut sink))
             .expect("the root is provisioned");
         assert!(!substitute.exists(), "the substitution happened");
         assert_eq!(

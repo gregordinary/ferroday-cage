@@ -72,7 +72,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent};
-use ferroday_cage::provision::{self, ProvisionEvent, Provisioned, Tarball};
+use ferroday_cage::provision::{self, Provisioned, Tarball};
 use ferroday_cage::{Cage, ConfigError, Error, ErrorChain, IdentityMap, Network};
 
 mod common;
@@ -335,13 +335,14 @@ fn run(config: Config) -> ExitCode {
         let (described, published) = match source {
             Source::Archive(mut gentoo, variant) => (
                 format!("the {variant} stage3 the archive publishes"),
-                provision::Provision::new(&config.rootfs)
-                    .observe(&mut |event: ProvisionEvent<'_>| {
-                        if let ProvisionEvent::Gentoo(GentooEvent::Fetching { url, .. }) = event {
+                provision::ensure(
+                    &config.rootfs,
+                    &mut gentoo.observe(&mut |event: GentooEvent<'_>| {
+                        if let GentooEvent::Fetching { url, .. } = event {
                             eprintln!("ebuild-sandbox: fetching {url}");
                         }
-                    })
-                    .run(&mut *gentoo),
+                    }),
+                ),
             ),
             Source::File(path) => (
                 path.display().to_string(),

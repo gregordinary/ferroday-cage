@@ -147,10 +147,13 @@ pub mod gentoo;
 ///
 /// Provisioning a root filesystem is the slow part of a first run — extracting
 /// a 250 MB stage3, fetching and configuring a hundred packages — so a
-/// provisioner reports what it is doing as it goes. The variants a given
-/// provisioner emits are its own business; an observer matches the ones it
-/// cares about and ignores the rest, which `#[non_exhaustive]` requires it to
-/// do anyway.
+/// provisioner reports what it is doing as it goes. This is the vocabulary
+/// every provisioner shares: an archive's entries, and progress through its
+/// source. A provisioner with more to say reports it through an observer of
+/// its own, which a caller binds to that provisioner, as each archive layer's
+/// `observe` does. The variants a given provisioner emits are its own
+/// business; an observer matches the ones it cares about and ignores the rest,
+/// which `#[non_exhaustive]` requires it to do anyway.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ProvisionEvent<'a> {
@@ -175,30 +178,6 @@ pub enum ProvisionEvent<'a> {
         /// The source's total size, when known.
         total: Option<u64>,
     },
-    /// A Debian bootstrap's own, richer event.
-    ///
-    /// The bootstrap reports fetches, resolution, downloads, and the output of
-    /// the `dpkg` waves it runs in a cage — detail the shared vocabulary above
-    /// has no place for. Nesting it here keeps one observer for every
-    /// provisioner rather than one per provisioner.
-    #[cfg(feature = "debian")]
-    Debian(&'a debian::DebianEvent<'a>),
-    /// An Alpine bootstrap's own, richer event.
-    ///
-    /// The bootstrap reports fetches, resolution, downloads, and the output of
-    /// the install scripts it runs in a cage — detail the shared vocabulary
-    /// above has no place for. Nesting it here keeps one observer for every
-    /// provisioner rather than one per provisioner.
-    #[cfg(feature = "alpine")]
-    Alpine(&'a alpine::AlpineEvent<'a>),
-    /// A Gentoo bootstrap's own event.
-    ///
-    /// The bootstrap reports the documents it fetches, what it resolved, and
-    /// the verification and extraction of the tarball — detail the shared
-    /// vocabulary above has no place for. Nesting it here keeps one observer for
-    /// every provisioner rather than one per provisioner.
-    #[cfg(feature = "gentoo")]
-    Gentoo(&'a gentoo::GentooEvent<'a>),
 }
 
 /// A standard stream of a command a provisioner runs in a cage.
@@ -209,8 +188,8 @@ pub enum ProvisionEvent<'a> {
 /// stream whichever archive it provisions from, and the attribution says
 /// nothing about the archive. The Gentoo layer runs no command in a cage, and
 /// its events carry none. The
-/// events themselves stay with their layers, nested in [`ProvisionEvent`] — they
-/// speak each archive's own vocabulary, and this does not.
+/// events themselves stay with their layers, which speak each archive's own
+/// vocabulary, and this does not.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -928,7 +907,10 @@ impl<'obs> Provision<'obs> {
     ///
     /// The observer reaches the provisioner as
     /// [`ProvisionRequest::report`] and [`ProvisionRequest::cancelled`], so
-    /// every provisioner speaks to it the same way. A closure taking a
+    /// every provisioner speaks to it the same way. It hears the shared
+    /// vocabulary, [`ProvisionEvent`], and stops any provisioner; a
+    /// provisioner's own events reach only an observer bound to it, as an
+    /// archive layer's `observe` binds one. A closure taking a
     /// [`ProvisionEvent`] is an observer that reports and never cancels.
     pub fn observe(mut self, observer: &'obs mut dyn ProvisionObserver) -> Provision<'obs> {
         self.observer = Some(observer);

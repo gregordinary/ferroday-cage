@@ -1605,7 +1605,7 @@ impl DebianBuilder {
 
 impl Provisioner for Debian {
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        self.provision_reporting(request, &mut RunObserver { request })
+        self.provision_reporting(request, &mut Unbound { request })
     }
 }
 
@@ -2912,7 +2912,6 @@ pub trait DebianObserver {
 layer_observer! {
     observer: DebianObserver,
     event: DebianEvent,
-    shared: Debian,
     layer: Debian,
     field: debian,
 }

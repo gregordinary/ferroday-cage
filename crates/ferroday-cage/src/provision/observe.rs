@@ -4,9 +4,8 @@
 //! Each layer reports progress in events of its own, through an observer trait
 //! of its own, so that a caller watching one layer matches on that layer's
 //! events and implements that layer's trait. Everything around the trait is the
-//! same for all three and differs only in the event type and the
-//! [`ProvisionEvent`](super::ProvisionEvent) variant that carries it, so it is
-//! declared once, here, by [`layer_observer!`].
+//! same for all three and differs only in the event type, so it is declared
+//! once, here, by [`layer_observer!`].
 
 /// Declares the machinery around a layer's observer trait.
 ///
@@ -25,8 +24,8 @@
 /// - the trait object is a [`Watch`](super::Watch), reporting a fetch as the
 ///   layer's `Fetching` event;
 /// - `Silent`, which reports nowhere and never cancels;
-/// - `RunObserver`, which reports through the run's shared vocabulary and
-///   takes its cancellation from the run;
+/// - `Unbound`, which reports nowhere and takes its cancellation from the
+///   run, for a run with no sink bound;
 /// - `ObservedRun`, which reports to a bound sink and stops when either the
 ///   sink or the run asks;
 /// - the public `Observed`, the layer with a sink bound, its `Debug`, and its
@@ -37,7 +36,6 @@
 /// layer_observer! {
 ///     observer: DebianObserver,
 ///     event: DebianEvent,
-///     shared: Debian,
 ///     layer: Debian,
 ///     field: debian,
 /// }
@@ -46,7 +44,6 @@ macro_rules! layer_observer {
     (
         observer: $Observer:ident,
         event: $Event:ident,
-        shared: $Variant:ident,
         layer: $Layer:ident,
         field: $field:ident $(,)?
     ) => {
@@ -75,23 +72,18 @@ macro_rules! layer_observer {
 
         impl $Observer for Silent {}
 
-        /// An observer that reports nowhere of its own and takes both answers
-        /// from the provisioning run: what an unobserved provisioner uses as a
-        /// [`Provisioner`]($crate::provision::Provisioner).
+        /// An observer that reports nowhere and stops when the provisioning
+        /// run asks: what the layer uses as a
+        /// [`Provisioner`]($crate::provision::Provisioner) with no sink bound.
         ///
-        /// The events still reach the run's own observer, wrapped in the
-        /// shared vocabulary, which is the one channel every provisioner
-        /// reports through.
-        struct RunObserver<'a, 'r> {
+        /// The layer's events are reported only to a sink bound with
+        /// `observe`. The run's own observer speaks the shared vocabulary,
+        /// which has no place for them, and still stops the run.
+        struct Unbound<'a, 'r> {
             request: &'a $crate::provision::ProvisionRequest<'r>,
         }
 
-        impl $Observer for RunObserver<'_, '_> {
-            fn progress(&mut self, event: $Event<'_>) {
-                self.request
-                    .report($crate::provision::ProvisionEvent::$Variant(&event));
-            }
-
+        impl $Observer for Unbound<'_, '_> {
             fn cancelled(&mut self) -> bool {
                 self.request.cancelled()
             }
@@ -100,11 +92,10 @@ macro_rules! layer_observer {
         /// An observer that reports to a sink the caller bound with `observe`
         /// and stops when either that sink or the provisioning run asks it to.
         ///
-        /// The caller chose the richer, layer-specific channel for events, and
-        /// the sink's own `cancelled` stops a run as it stops a resolution or a
-        /// layered build. A
+        /// The sink's own `cancelled` stops a run as it stops a resolution or
+        /// a layered build. A
         /// [`Provision::observe`]($crate::provision::Provision::observe)
-        /// observer can still stop a run it is not reporting on.
+        /// observer, which the layer's events never reach, can still stop it.
         struct ObservedRun<'a, 'r, 'o> {
             sink: &'o mut dyn $Observer,
             request: &'a $crate::provision::ProvisionRequest<'r>,
@@ -148,12 +139,11 @@ macro_rules! layer_observer {
         }
 
         impl $crate::provision::Provisioner for Observed<'_> {
-            /// Reports to the sink bound here rather than to the run's
-            /// observer: the caller chose the richer, layer-specific channel by
-            /// binding it. Either can stop the run: the sink through its own
-            /// `cancelled`, and a
+            /// Reports to the sink bound here, the one observer the layer's
+            /// events reach. Either the sink or the run can stop it: the sink
+            /// through its own `cancelled`, and a
             /// [`Provision::observe`]($crate::provision::Provision::observe)
-            /// observer that is not reporting on it through the run.
+            /// observer through the run.
             fn provision(
                 &mut self,
                 request: &$crate::provision::ProvisionRequest<'_>,

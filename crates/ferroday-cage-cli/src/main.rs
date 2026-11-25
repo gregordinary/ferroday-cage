@@ -56,11 +56,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ferroday_cage::provision::alpine::KeySet as AlpineKeySet;
-use ferroday_cage::provision::debian::{Priority, Repository};
-use ferroday_cage::provision::{
-    Interrupt, ProvisionError, ProvisionEvent, Provisioned, Provisioner,
-};
+use ferroday_cage::provision::alpine::{Alpine, KeySet as AlpineKeySet};
+use ferroday_cage::provision::debian::{Debian, Priority, Repository};
+use ferroday_cage::provision::gentoo::Gentoo;
+use ferroday_cage::provision::{Interrupt, Provision, ProvisionError, Provisioned, Tarball};
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
@@ -5466,7 +5465,7 @@ fn run(options: Options) -> ExitCode {
     // A provisioning run with no command and no profile provisions and exits.
     if options.command_line.is_empty() && options.profile.is_none() {
         let rootfs = rootfs.as_deref().expect("checked at parse time");
-        let provisioner = provisioner.as_deref_mut().expect("checked at parse time");
+        let provisioner = provisioner.as_mut().expect("checked at parse time");
         return match provision(rootfs, provisioner) {
             // The one place reuse is worth saying out loud. Everywhere else the
             // flag is a standing instruction and silence is the point -- it can
@@ -5492,7 +5491,7 @@ fn run(options: Options) -> ExitCode {
         Ok(launch) => launch,
         Err(code) => return code,
     };
-    if let Some(provisioner) = provisioner.as_deref_mut() {
+    if let Some(provisioner) = provisioner.as_mut() {
         let rootfs = rootfs.as_deref().expect("checked at parse time");
         if let Err(code) = provision(rootfs, provisioner) {
             return code;
@@ -6610,6 +6609,18 @@ fn plan_from<P, E: std::error::Error + 'static>(
     })
 }
 
+/// The provisioner a `--provision-*` flag configures.
+///
+/// Named by kind rather than held as a trait object, because a run reports an
+/// archive layer's progress through an observer bound to that layer, which
+/// only the layer's own type can bind.
+enum Selected {
+    Tarball(Tarball),
+    Debian(Debian),
+    Alpine(Alpine),
+    Gentoo(Gentoo),
+}
+
 /// The provisioner a `--provision-*` flag configures, built, or `None` for a
 /// run that provisions nothing.
 ///
@@ -6617,20 +6628,23 @@ fn plan_from<P, E: std::error::Error + 'static>(
 /// plan or pin document that does not read, and a key set this machine cannot
 /// supply are each reported before a launch is composed, and before a
 /// bootstrap spends minutes on a root that would then go unused.
-fn provisioner(options: &Options) -> Result<Option<Box<dyn Provisioner>>, ExitCode> {
+fn provisioner(options: &Options) -> Result<Option<Selected>, ExitCode> {
     if let Some(tarball) = &options.provision_tar {
-        return Ok(Some(Box::new(ferroday_cage::provision::Tarball::new(
-            tarball,
-        ))));
+        return Ok(Some(Selected::Tarball(Tarball::new(tarball))));
     }
     if let Some(suite) = &options.provision_debian {
-        return Ok(Some(Box::new(debian_provisioner(suite, options)?)));
+        return Ok(Some(Selected::Debian(debian_provisioner(suite, options)?)));
     }
     if let Some(release) = &options.provision_alpine {
-        return Ok(Some(Box::new(alpine_provisioner(release, options)?)));
+        return Ok(Some(Selected::Alpine(alpine_provisioner(
+            release, options,
+        )?)));
     }
     if let Some(architecture) = &options.provision_gentoo {
-        return Ok(Some(Box::new(gentoo_provisioner(architecture, options)?)));
+        return Ok(Some(Selected::Gentoo(gentoo_provisioner(
+            architecture,
+            options,
+        )?)));
     }
     Ok(None)
 }
@@ -6650,12 +6664,19 @@ fn provisioner(options: &Options) -> Result<Option<Box<dyn Provisioner>>, ExitCo
 /// by it all the same rather than launch. The launch that may follow an
 /// uninterrupted run keeps `SIGINT` as it was. Where the hold cannot be taken, the run
 /// goes ahead without it, and a `SIGINT` ends `fcage` as it did before.
-fn provision(rootfs: &Path, provisioner: &mut dyn Provisioner) -> Result<Provisioned, ExitCode> {
+fn provision(rootfs: &Path, provisioner: &mut Selected) -> Result<Provisioned, ExitCode> {
     let mut progress = Progress::new(std::io::stderr());
     progress.interrupt = Interrupt::hold().ok();
-    let published = ferroday_cage::provision::Provision::new(rootfs)
-        .observe(&mut progress)
-        .run(provisioner);
+    // A layer reports to the observer bound to it, which stops the run too. A
+    // tarball reports nothing `fcage` prints, so its run's observer only stops
+    // it.
+    let publication = Provision::new(rootfs);
+    let published = match provisioner {
+        Selected::Tarball(tarball) => publication.observe(&mut progress).run(tarball),
+        Selected::Debian(debian) => publication.run(&mut debian.observe(&mut progress)),
+        Selected::Alpine(alpine) => publication.run(&mut alpine.observe(&mut progress)),
+        Selected::Gentoo(gentoo) => publication.run(&mut gentoo.observe(&mut progress)),
+    };
     let interrupted = progress
         .interrupt
         .take()
@@ -6713,6 +6734,20 @@ impl<W: std::io::Write> Progress<W> {
     /// Writes one line of progress.
     fn line(&mut self, line: std::fmt::Arguments<'_>) -> Result<(), output::ReaderGone> {
         output::say_to(&mut self.out, line)
+    }
+
+    /// Reports one step through `write`, unless the reader has already gone.
+    fn report(&mut self, write: impl FnOnce(&mut Self) -> Result<(), output::ReaderGone>) {
+        if self.gone {
+            return;
+        }
+        self.gone = write(self).is_err();
+    }
+
+    /// Whether the run should stop: once nothing reads what it reports, or
+    /// once it is interrupted.
+    fn stops(&self) -> bool {
+        self.gone || self.interrupt.as_ref().is_some_and(Interrupt::requested)
     }
 
     /// Reports a Debian bootstrap's step.
@@ -6909,22 +6944,41 @@ impl<W: std::io::Write> Progress<W> {
     }
 }
 
+/// A tarball's run: its entries and reads go unreported, and the run stops as
+/// a layer's does.
 impl<W: std::io::Write> ferroday_cage::provision::ProvisionObserver for Progress<W> {
-    fn progress(&mut self, event: ProvisionEvent<'_>) {
-        if self.gone {
-            return;
-        }
-        let written = match event {
-            ProvisionEvent::Debian(event) => self.debian(event),
-            ProvisionEvent::Alpine(event) => self.alpine(event),
-            ProvisionEvent::Gentoo(event) => self.gentoo(event),
-            _ => Ok(()),
-        };
-        self.gone = written.is_err();
+    fn cancelled(&mut self) -> bool {
+        self.stops()
+    }
+}
+
+impl<W: std::io::Write> ferroday_cage::provision::debian::DebianObserver for Progress<W> {
+    fn progress(&mut self, event: ferroday_cage::provision::debian::DebianEvent<'_>) {
+        self.report(|progress| progress.debian(&event));
     }
 
     fn cancelled(&mut self) -> bool {
-        self.gone || self.interrupt.as_ref().is_some_and(Interrupt::requested)
+        self.stops()
+    }
+}
+
+impl<W: std::io::Write> ferroday_cage::provision::alpine::AlpineObserver for Progress<W> {
+    fn progress(&mut self, event: ferroday_cage::provision::alpine::AlpineEvent<'_>) {
+        self.report(|progress| progress.alpine(&event));
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.stops()
+    }
+}
+
+impl<W: std::io::Write> ferroday_cage::provision::gentoo::GentooObserver for Progress<W> {
+    fn progress(&mut self, event: ferroday_cage::provision::gentoo::GentooEvent<'_>) {
+        self.report(|progress| progress.gentoo(&event));
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.stops()
     }
 }
 
@@ -8248,8 +8302,7 @@ mod tests {
 
     #[test]
     fn a_provisioning_run_whose_progress_reader_has_gone_stops() {
-        use ferroday_cage::provision::ProvisionObserver as _;
-        use ferroday_cage::provision::debian::DebianEvent;
+        use ferroday_cage::provision::debian::{DebianEvent, DebianObserver as _};
 
         // The reader goes first, so the first line of progress finds the pipe
         // closed, as a `2>&1 | head` does once `head` has its lines.
@@ -8257,7 +8310,7 @@ mod tests {
         drop(reader);
         let mut progress = Progress::new(writer);
         assert!(!progress.cancelled(), "nothing has been written yet");
-        progress.progress(ProvisionEvent::Debian(&DebianEvent::Resolving));
+        progress.progress(DebianEvent::Resolving);
         assert!(
             progress.cancelled(),
             "a run whose progress nobody reads goes on to the end",
@@ -8266,7 +8319,7 @@ mod tests {
         // A reader still there sees the progress, and the run goes on.
         let (mut reader, writer) = std::io::pipe().expect("a pipe");
         let mut progress = Progress::new(writer);
-        progress.progress(ProvisionEvent::Debian(&DebianEvent::Resolving));
+        progress.progress(DebianEvent::Resolving);
         assert!(!progress.cancelled());
         drop(progress);
         let mut seen = String::new();

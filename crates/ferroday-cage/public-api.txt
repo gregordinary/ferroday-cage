@@ -1237,11 +1237,8 @@ impl core::marker::UnsafeUnpin for ferroday_cage::provision::ProvisionError
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ProvisionError
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ProvisionError
 #[non_exhaustive] pub enum ferroday_cage::provision::ProvisionEvent<'a>
-pub ferroday_cage::provision::ProvisionEvent::Alpine(&'a ferroday_cage::provision::alpine::AlpineEvent<'a>)
-pub ferroday_cage::provision::ProvisionEvent::Debian(&'a ferroday_cage::provision::debian::DebianEvent<'a>)
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionEvent::Entry
 pub ferroday_cage::provision::ProvisionEvent::Entry::path: &'a std::path::Path
-pub ferroday_cage::provision::ProvisionEvent::Gentoo(&'a ferroday_cage::provision::gentoo::GentooEvent<'a>)
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionEvent::Read
 pub ferroday_cage::provision::ProvisionEvent::Read::done: u64
 pub ferroday_cage::provision::ProvisionEvent::Read::total: core::option::Option<u64>

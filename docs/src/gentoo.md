@@ -892,31 +892,29 @@ proxy, or a private mirror protocol supplies their own `Fetch`.
 
 ## Progress
 
-A bootstrap reports through the run's observer, as every provisioner does:
+A bootstrap reports its events to a `GentooObserver` bound with
+`Gentoo::observe`, and what that returns is the provisioner a run takes:
 
 ```rust,no_run
-use ferroday_cage::provision::gentoo::GentooEvent;
-use ferroday_cage::provision::{Provision, ProvisionEvent, gentoo::Gentoo};
+use ferroday_cage::provision::Provision;
+use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut gentoo = Gentoo::builder("amd64").variant("amd64-openrc").build()?;
-Provision::new("/var/lib/machines/gentoo")
-    .observe(&mut |event: ProvisionEvent<'_>| match event {
-        ProvisionEvent::Gentoo(GentooEvent::Fetching { url, .. }) => {
-            eprintln!("fetching {url}");
-        }
-        ProvisionEvent::Gentoo(GentooEvent::Resolved { stage3, .. }) => {
-            eprintln!("build {}", stage3.build_id());
-        }
-        _ => {}
-    })
-    .run(&mut gentoo)?;
+let mut sink = |event: GentooEvent<'_>| match event {
+    GentooEvent::Fetching { url, .. } => eprintln!("fetching {url}"),
+    GentooEvent::Resolved { stage3, .. } => eprintln!("build {}", stage3.build_id()),
+    _ => {}
+};
+Provision::new("/var/lib/machines/gentoo").run(&mut gentoo.observe(&mut sink))?;
 # Ok(())
 # }
 ```
 
-A read-half call drives no run and so has no run observer to report through.
-`Gentoo::observe` binds a `GentooObserver` for one call instead, which is how a
+A [`Provision::observe`](provisioning.md#progress-and-cancellation) observer
+hears none of these events, and can still stop the run.
+
+A read-half call drives no run, and binds its sink the same way. That is how a
 caller previewing an install sees what the resolution refused:
 
 ```rust,no_run

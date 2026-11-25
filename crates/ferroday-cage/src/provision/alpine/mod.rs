@@ -1479,7 +1479,6 @@ pub trait AlpineObserver {
 layer_observer! {
     observer: AlpineObserver,
     event: AlpineEvent,
-    shared: Alpine,
     layer: Alpine,
     field: alpine,
 }
@@ -1573,7 +1572,7 @@ impl Provisioner for Alpine {
     /// Reached through [`provision::ensure`](super::ensure), which publishes the
     /// finished tree atomically and removes it on any failure.
     fn provision(&mut self, request: &ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        self.provision_reporting(request, &mut RunObserver { request })
+        self.provision_reporting(request, &mut Unbound { request })
     }
 }
 
@@ -5019,23 +5018,17 @@ mod tests {
         assert!(!watched.exists());
 
         // And from the run's own observer, which is the one a caller driving
-        // several provisioners shares. The Alpine events reach it through the
-        // shared vocabulary.
-        struct StopOnResolve {
-            resolved: bool,
+        // several provisioners shares. The Alpine events never reach it, since
+        // the shared vocabulary has no place for them, and it stops the run
+        // whether a sink is bound or not.
+        struct StopAtOnce {
+            asked: bool,
         }
 
-        impl crate::provision::ProvisionObserver for StopOnResolve {
-            fn progress(&mut self, event: crate::provision::ProvisionEvent<'_>) {
-                if let crate::provision::ProvisionEvent::Alpine(AlpineEvent::Resolved { .. }) =
-                    event
-                {
-                    self.resolved = true;
-                }
-            }
-
+        impl crate::provision::ProvisionObserver for StopAtOnce {
             fn cancelled(&mut self) -> bool {
-                self.resolved
+                self.asked = true;
+                true
             }
         }
 
@@ -5047,18 +5040,46 @@ mod tests {
             .build()
             .expect("the bootstrap configures");
         let stopped = scratch.join("stopped");
-        let mut stop = StopOnResolve { resolved: false };
+        let mut stop = StopAtOnce { asked: false };
         let err = crate::provision::Provision::new(&stopped)
             .observe(&mut stop)
             .run(&mut alpine)
-            .expect_err("the observer asked it to stop");
+            .expect_err("the run's observer asked it to stop");
         assert!(
             matches!(err, crate::provision::ProvisionError::Cancelled),
             "{err}",
         );
         assert!(
-            stop.resolved,
-            "the Alpine events reached the run's observer"
+            stop.asked,
+            "a run with no sink bound asks the run's observer"
+        );
+        assert!(!stopped.exists());
+
+        // A bound sink that never stops leaves the run's observer free to.
+        let mut watch = Watch {
+            seen: Vec::new(),
+            stop: false,
+        };
+        let mut stop = StopAtOnce { asked: false };
+        let err = crate::provision::Provision::new(&stopped)
+            .observe(&mut stop)
+            .run(&mut alpine.observe(&mut watch))
+            .expect_err("the run's observer asked it to stop");
+        assert!(
+            matches!(err, crate::provision::ProvisionError::Cancelled),
+            "{err}",
+        );
+        assert!(
+            stop.asked,
+            "a run with a sink bound asks the run's observer too"
+        );
+        assert!(
+            !watch
+                .seen
+                .iter()
+                .any(|step| step.starts_with("downloading")),
+            "{:?}",
+            watch.seen,
         );
         assert!(!stopped.exists());
     }

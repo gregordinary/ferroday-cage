@@ -119,11 +119,10 @@ let mut sink = print_event;
 provision::ensure(rootfs, &mut debian.observe(&mut sink))?;
 ```
 
-That is the Debian-specific channel, carrying the events only a bootstrap has —
-fetches, resolution, per-package downloads, and dpkg's own output. The same
-events also reach a [`Provision::observe`](provisioning.md#progress-and-cancellation)
-observer, wrapped as `ProvisionEvent::Debian`, for a consumer that wants one
-adapter across every provisioner. Either observer can stop the run.
+That is the channel a bootstrap's own events take: fetches, resolution,
+per-package downloads, and dpkg's own output. A
+[`Provision::observe`](provisioning.md#progress-and-cancellation) observer hears
+only what every provisioner shares, and can stop the run as the sink can.
 
 The sink is a `DebianObserver`, and a closure is one — which is why the example
 passes a function. A caller that also wants to *stop* a bootstrap implements the

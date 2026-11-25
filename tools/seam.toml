@@ -533,11 +533,6 @@ why = "Where a layered build's overlay keeps its work directory, for a test that
 # Code outside the userland side that names an item inside it.
 
 [[reverse]]
-item = "provision::alpine::AlpineEvent"
-code = 1
-why = "`ProvisionEvent::Alpine`, the shared vocabulary's variant carrying the layer's own event."
-
-[[reverse]]
 item = "provision::alpine::AlpineError"
 tests = 3
 why = "The error-convention tests in `failure.rs`, which hold each layer's error to the crate's rules."
@@ -563,11 +558,6 @@ tests = 1
 why = "As above."
 
 [[reverse]]
-item = "provision::debian::DebianEvent"
-code = 1
-why = "`ProvisionEvent::Debian`, as for Alpine."
-
-[[reverse]]
 item = "provision::digest::unhex"
 code = 1
 why = "The tar reader decodes apk's `APK-TOOLS.checksum.SHA1` record."
@@ -591,11 +581,6 @@ why = "As above."
 item = "provision::gentoo::GentooError::io"
 tests = 1
 why = "As above."
-
-[[reverse]]
-item = "provision::gentoo::GentooEvent"
-code = 1
-why = "`ProvisionEvent::Gentoo`, as for Alpine."
 
 # Userland feature gates outside the userland side: `cfg` predicates naming
 # `debian`, `alpine` or `gentoo`, one per predicate.
@@ -638,7 +623,7 @@ code = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/mod.rs"
-code = 37
+code = 34
 tests = 4
 
 [[gate]]

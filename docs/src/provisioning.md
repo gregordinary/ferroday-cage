@@ -139,17 +139,19 @@ let outcome = Provision::new("/var/cache/myapp/trixie")
 # }
 ```
 
-Every provisioner reports through this one channel, so a consumer wiring
-provisioning into a logging system writes one adapter. The `Tarball` provisioner
-reports each entry and its progress through the archive. The [Debian
-provisioner](debian.md) reports its own richer events through the
-`ProvisionEvent::Debian` variant: fetches, resolution, downloads, and dpkg's
-output. It honors the same cancellation check at each mirror, between packages,
+This channel carries what every provisioner shares, and it stops any of them.
+The `Tarball` provisioner reports each entry and its progress through the
+archive.
+
+A userland's bootstrap has more to report, in events of its own, and reports
+them to an observer bound with its `observe`. The [Debian
+provisioner](debian.md) reports fetches, resolution, downloads, and dpkg's
+output. It honors the cancellation check at each mirror, between packages,
 while each package downloads, and between dpkg waves. The [Alpine
-provisioner](alpine.md) reports the same progress through
-`ProvisionEvent::Alpine`, and the [Gentoo provisioner](gentoo.md) through
-`ProvisionEvent::Gentoo`. A consumer reports any of the userlands by changing
-the type it matches on.
+provisioner](alpine.md) and the [Gentoo provisioner](gentoo.md) report the same
+progress in events of their own. One type can implement every userland's
+observer trait, so a consumer wiring provisioning into a logging system still
+writes one adapter.
 
 Where the clean stopping points are is the provisioner's own question. A package
 boundary answers it wherever there is one. A download is the exception, since a

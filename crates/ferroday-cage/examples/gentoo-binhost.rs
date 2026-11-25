@@ -107,8 +107,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use ferroday_cage::provision::Provision;
 use ferroday_cage::provision::gentoo::{Gentoo, GentooEvent, Plan};
-use ferroday_cage::provision::{Provision, ProvisionEvent};
 use ferroday_cage::{Cage, CageBuilder, Error, ErrorChain};
 
 mod common;
@@ -298,14 +298,9 @@ fn run(options: Options) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut progress = |event: ProvisionEvent<'_>| {
-        if let ProvisionEvent::Gentoo(event) = event {
-            report(event);
-        }
-    };
+    let mut progress = |event: GentooEvent<'_>| report(&event);
     let outcome = Provision::new(&options.rootfs)
-        .observe(&mut progress)
-        .run(&mut gentoo)
+        .run(&mut gentoo.observe(&mut progress))
         .map_err(|error| ErrorChain::new(&error).to_string())?;
     eprintln!(
         "{PROGRAM}: the root at {} is {outcome:?}",
