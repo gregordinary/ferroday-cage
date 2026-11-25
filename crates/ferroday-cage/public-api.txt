@@ -1121,6 +1121,24 @@ impl<F: core::ops::function::FnMut(ferroday_cage::provision::gentoo::GentooEvent
 pub fn F::cancelled(&mut self) -> bool
 pub fn F::progress(&mut self, ferroday_cage::provision::gentoo::GentooEvent<'_>)
 pub fn ferroday_cage::provision::gentoo::installed(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<ferroday_cage::provision::gentoo::Installed, ferroday_cage::provision::gentoo::GentooError>
+#[non_exhaustive] pub enum ferroday_cage::provision::ApplyRefusalReason
+pub ferroday_cage::provision::ApplyRefusalReason::Changed
+pub ferroday_cage::provision::ApplyRefusalReason::Link
+pub ferroday_cage::provision::ApplyRefusalReason::Missing
+pub ferroday_cage::provision::ApplyRefusalReason::Occupied
+pub ferroday_cage::provision::ApplyRefusalReason::OtherFilesystem
+pub ferroday_cage::provision::ApplyRefusalReason::ParentMissing
+pub ferroday_cage::provision::ApplyRefusalReason::Protected(ferroday_cage::provision::Protected)
+pub ferroday_cage::provision::ApplyRefusalReason::Unreadable
+impl core::fmt::Display for ferroday_cage::provision::ApplyRefusalReason
+pub fn ferroday_cage::provision::ApplyRefusalReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::ApplyRefusalReason
+impl core::marker::Send for ferroday_cage::provision::ApplyRefusalReason
+impl core::marker::Sync for ferroday_cage::provision::ApplyRefusalReason
+impl core::marker::Unpin for ferroday_cage::provision::ApplyRefusalReason
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::ApplyRefusalReason
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ApplyRefusalReason
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ApplyRefusalReason
 #[non_exhaustive] pub enum ferroday_cage::provision::AttributeSkip
 pub ferroday_cage::provision::AttributeSkip::UnmappedId
 pub ferroday_cage::provision::AttributeSkip::Unsettable
@@ -1204,7 +1222,31 @@ impl core::marker::Unpin for ferroday_cage::provision::FetchError
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::FetchError
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::FetchError
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::FetchError
+#[non_exhaustive] pub enum ferroday_cage::provision::Protected
+pub ferroday_cage::provision::Protected::Name(std::ffi::os_str::OsString)
+pub ferroday_cage::provision::Protected::Path(std::path::PathBuf)
+impl ferroday_cage::provision::Protected
+pub fn ferroday_cage::provision::Protected::defaults() -> alloc::vec::Vec<ferroday_cage::provision::Protected>
+pub fn ferroday_cage::provision::Protected::name(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> ferroday_cage::provision::Protected
+pub fn ferroday_cage::provision::Protected::path(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Protected
+impl core::fmt::Display for ferroday_cage::provision::Protected
+pub fn ferroday_cage::provision::Protected::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::Protected
+impl core::marker::Send for ferroday_cage::provision::Protected
+impl core::marker::Sync for ferroday_cage::provision::Protected
+impl core::marker::Unpin for ferroday_cage::provision::Protected
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::Protected
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Protected
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Protected
 #[non_exhaustive] pub enum ferroday_cage::provision::ProvisionError
+#[non_exhaustive] pub ferroday_cage::provision::ProvisionError::ApplyIncomplete
+pub ferroday_cage::provision::ProvisionError::ApplyIncomplete::applied: alloc::vec::Vec<std::path::PathBuf>
+pub ferroday_cage::provision::ProvisionError::ApplyIncomplete::path: std::path::PathBuf
+pub ferroday_cage::provision::ProvisionError::ApplyIncomplete::source: core::io::error::Error
+pub ferroday_cage::provision::ProvisionError::ApplyIncomplete::target: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::provision::ProvisionError::ApplyRefused
+pub ferroday_cage::provision::ProvisionError::ApplyRefused::refusals: alloc::vec::Vec<ferroday_cage::provision::ApplyRefusal>
+pub ferroday_cage::provision::ProvisionError::ApplyRefused::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::Archive
 pub ferroday_cage::provision::ProvisionError::Archive::offset: u64
 pub ferroday_cage::provision::ProvisionError::Archive::path: std::path::PathBuf
@@ -1318,6 +1360,48 @@ impl core::marker::Unpin for ferroday_cage::provision::Stream
 impl core::marker::UnsafeUnpin for ferroday_cage::provision::Stream
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Stream
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Stream
+pub struct ferroday_cage::provision::Apply<'a>
+impl<'a> ferroday_cage::provision::Apply<'a>
+pub fn ferroday_cage::provision::Apply<'a>::check(&self) -> core::result::Result<alloc::vec::Vec<ferroday_cage::provision::ApplyRefusal>, ferroday_cage::provision::ProvisionError>
+pub fn ferroday_cage::provision::Apply<'a>::filter(self, impl core::ops::function::Fn(&ferroday_cage::provision::Change) -> bool + core::marker::Send + core::marker::Sync + 'a) -> ferroday_cage::provision::Apply<'a>
+pub fn ferroday_cage::provision::Apply<'a>::protect(self, ferroday_cage::provision::Protected) -> ferroday_cage::provision::Apply<'a>
+pub fn ferroday_cage::provision::Apply<'a>::protected(self, impl core::iter::traits::collect::IntoIterator<Item = ferroday_cage::provision::Protected>) -> ferroday_cage::provision::Apply<'a>
+pub fn ferroday_cage::provision::Apply<'a>::run(self) -> core::result::Result<ferroday_cage::provision::ApplyReport, ferroday_cage::provision::ProvisionError>
+pub fn ferroday_cage::provision::Apply<'a>::since(self, std::time::SystemTime) -> ferroday_cage::provision::Apply<'a>
+impl core::fmt::Debug for ferroday_cage::provision::Apply<'_>
+pub fn ferroday_cage::provision::Apply<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Freeze for ferroday_cage::provision::Apply<'a>
+impl<'a> core::marker::Send for ferroday_cage::provision::Apply<'a>
+impl<'a> core::marker::Sync for ferroday_cage::provision::Apply<'a>
+impl<'a> core::marker::Unpin for ferroday_cage::provision::Apply<'a>
+impl<'a> core::marker::UnsafeUnpin for ferroday_cage::provision::Apply<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Apply<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Apply<'a>
+pub struct ferroday_cage::provision::ApplyRefusal
+impl ferroday_cage::provision::ApplyRefusal
+pub fn ferroday_cage::provision::ApplyRefusal::path(&self) -> &std::path::Path
+pub fn ferroday_cage::provision::ApplyRefusal::reason(&self) -> &ferroday_cage::provision::ApplyRefusalReason
+impl core::error::Error for ferroday_cage::provision::ApplyRefusal
+impl core::fmt::Display for ferroday_cage::provision::ApplyRefusal
+pub fn ferroday_cage::provision::ApplyRefusal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::provision::ApplyRefusal
+impl core::marker::Send for ferroday_cage::provision::ApplyRefusal
+impl core::marker::Sync for ferroday_cage::provision::ApplyRefusal
+impl core::marker::Unpin for ferroday_cage::provision::ApplyRefusal
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::ApplyRefusal
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ApplyRefusal
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ApplyRefusal
+pub struct ferroday_cage::provision::ApplyReport
+impl ferroday_cage::provision::ApplyReport
+pub fn ferroday_cage::provision::ApplyReport::applied(&self) -> &[std::path::PathBuf]
+pub fn ferroday_cage::provision::ApplyReport::skipped(&self) -> &[std::path::PathBuf]
+impl core::marker::Freeze for ferroday_cage::provision::ApplyReport
+impl core::marker::Send for ferroday_cage::provision::ApplyReport
+impl core::marker::Sync for ferroday_cage::provision::ApplyReport
+impl core::marker::Unpin for ferroday_cage::provision::ApplyReport
+impl core::marker::UnsafeUnpin for ferroday_cage::provision::ApplyReport
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::ApplyReport
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::ApplyReport
 pub struct ferroday_cage::provision::Available
 impl ferroday_cage::provision::Available
 pub fn ferroday_cage::provision::Available::contains(&self, &str) -> bool
@@ -1365,6 +1449,8 @@ impl core::marker::UnsafeUnpin for ferroday_cage::provision::Change
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::provision::Change
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::provision::Change
 pub struct ferroday_cage::provision::ChangeSet
+impl ferroday_cage::provision::ChangeSet
+pub fn ferroday_cage::provision::ChangeSet::apply(&self, impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::provision::Apply<'_>
 impl ferroday_cage::provision::ChangeSet
 pub fn ferroday_cage::provision::ChangeSet::changes(&self) -> &[ferroday_cage::provision::Change]
 pub fn ferroday_cage::provision::ChangeSet::get_lowers(&self) -> &[std::path::PathBuf]

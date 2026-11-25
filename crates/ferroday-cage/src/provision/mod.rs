@@ -181,7 +181,10 @@ mod xattr;
 pub use available::Available;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 pub(crate) use cache::PackageCache;
-pub use changes::{Change, ChangeKind, ChangeSet, EntryKind};
+pub use changes::{
+    Apply, ApplyRefusal, ApplyRefusalReason, ApplyReport, Change, ChangeKind, ChangeSet, EntryKind,
+    Protected,
+};
 pub use copyin::{AttributeSkip, CopyIn, CopyReport, SkippedAttribute, SkippedEntry, SkippedKind};
 #[cfg(feature = "tarball")]
 pub use export::{Export, ExportEntry, ExportKind, export_tar};
@@ -718,6 +721,27 @@ which arises for the same reason.
         /// The kind of layer it names none of.
         layer: crate::OverlayLayer,
     },
+    /// An [`Apply`] refused changes it was given, and wrote nothing.
+    #[non_exhaustive]
+    ApplyRefused {
+        /// The target, as the caller named it.
+        target: PathBuf,
+        /// Each refused change, with why.
+        refusals: Vec<ApplyRefusal>,
+    },
+    /// An [`Apply`] stopped while giving the entries it staged their names:
+    /// the target holds the changes in `applied` and none after them.
+    #[non_exhaustive]
+    ApplyIncomplete {
+        /// The target, as the caller named it.
+        target: PathBuf,
+        /// The paths of the changes written, in the order they were.
+        applied: Vec<PathBuf>,
+        /// The path of the change the apply stopped at.
+        path: PathBuf,
+        /// What stopped it.
+        source: io::Error,
+    },
 }
 
 impl ProvisionError {
@@ -874,6 +898,34 @@ impl fmt::Display for ProvisionError {
             ProvisionError::OverlayLayerMissing { layer } => {
                 write!(f, "the overlay names no {layer} layer")
             }
+            ProvisionError::ApplyRefused { target, refusals } => {
+                write!(
+                    f,
+                    "cannot apply the changes to {}: {} of them are refused",
+                    target.display(),
+                    refusals.len(),
+                )?;
+                for (at, refusal) in refusals.iter().take(REFUSALS_NAMED).enumerate() {
+                    f.write_str(if at == 0 { " (" } else { "; " })?;
+                    write!(f, "{refusal}")?;
+                }
+                match refusals.len().checked_sub(REFUSALS_NAMED) {
+                    Some(0) | None if refusals.is_empty() => Ok(()),
+                    Some(0) | None => f.write_str(")"),
+                    Some(more) => write!(f, "; and {more} more)"),
+                }
+            }
+            ProvisionError::ApplyIncomplete {
+                target,
+                applied,
+                path,
+                ..
+            } => write!(
+                f,
+                "applying the changes to {} stopped at {path:?}, after {} were applied",
+                target.display(),
+                applied.len(),
+            ),
             #[cfg(feature = "tarball")]
             ProvisionError::ExportUnprivileged { path, reason } => write!(
                 f,
@@ -893,6 +945,10 @@ impl fmt::Display for ProvisionError {
     }
 }
 
+/// How many refused changes [`ProvisionError::ApplyRefused`]'s message names;
+/// its field holds them all.
+const REFUSALS_NAMED: usize = 5;
+
 impl std::error::Error for ProvisionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -903,6 +959,7 @@ impl std::error::Error for ProvisionError {
             } => Some(source),
             ProvisionError::Other { source } => Some(source.as_ref()),
             ProvisionError::RemoveUnprivileged { source, .. } => Some(source),
+            ProvisionError::ApplyIncomplete { source, .. } => Some(source),
             _ => None,
         }
     }

@@ -119,6 +119,22 @@ consumer upgrading can skip it.
   `ProvisionError::EntryRefused`, an overlay naming no upper or no lower with
   `ProvisionError::OverlayLayerMissing`, and an entry the caller cannot read
   is listed as incomplete.
+- A change set can be written into a tree: `ChangeSet::apply` returns an
+  `Apply`, which takes a `filter`, the paths it refuses to change
+  (`Protected`, a path from the target's top or a name at any depth, with
+  `Protected::defaults` covering `.git`, `.envrc`, editor and CI
+  configuration and shell startup files), and a reference time (`since`,
+  the upper's birth time by default). `check` lists the `ApplyRefusal`s
+  without writing; `run` refuses the whole apply with
+  `ProvisionError::ApplyRefused` where a chosen change touches a protected
+  path, or the target changed its path after the reference time, or lacks
+  its directory, or reaches it through a symbolic link. It stages every file
+  and link before giving any its name, carries content with its holes, links,
+  permission bits without the set-id bits, and `user.` attributes and access
+  control lists, and reports what it wrote and the named pipes, sockets and
+  devices it skipped in an `ApplyReport`. An upper changed since it was read
+  is refused with `ProvisionError::SourceChanged`, and a failure while naming
+  is `ProvisionError::ApplyIncomplete`, which says what was applied.
 - An overlay can be mounted at a path inside a sandbox, in a root of any kind,
   the host's own included: `CageBuilder::overlay_at` takes a target and an
   `Overlay`, a `Mount::Overlay` holds an `OverlayMount`, and a profile spells

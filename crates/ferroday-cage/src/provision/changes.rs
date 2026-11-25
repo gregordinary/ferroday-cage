@@ -13,10 +13,15 @@
 //! symbolic link, as [`CopyIn`](super::CopyIn) walks a source. The lowers are
 //! descended the same way, in step with the upper.
 
+mod apply;
+
+pub use apply::{Apply, ApplyRefusal, ApplyRefusalReason, ApplyReport, Protected};
+
 use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use rustix::fs::{self, AtFlags, FileType, OFlags, Stat};
 use rustix::io::Errno;
@@ -108,6 +113,9 @@ pub struct ChangeSet {
     upper: PathBuf,
     lowers: Vec<PathBuf>,
     changes: Vec<Change>,
+    /// When the upper was created, where its filesystem records it: the
+    /// default reference an apply holds the target's changes to.
+    born: Option<SystemTime>,
 }
 
 impl ChangeSet {
@@ -137,6 +145,8 @@ impl ChangeSet {
             });
         }
         let upper_fd = open_layer(upper)?;
+        let born = birth_time(upper_fd.as_fd())
+            .map_err(|errno| ProvisionError::io("reading", upper, errno.into()))?;
         // The lowers in the order the kernel consults them: the last stacked
         // first, the base last.
         let lower_fds = overlay
@@ -153,6 +163,7 @@ impl ChangeSet {
             upper: upper.to_path_buf(),
             lowers: overlay.get_lowers().to_vec(),
             changes: reader.changes,
+            born,
         })
     }
 
@@ -187,6 +198,43 @@ pub struct Change {
     size: Option<u64>,
     differs: Differs,
     readable: bool,
+    /// The upper's entry as the reader found it, for an entry the merged view
+    /// holds now: what an apply holds the upper to, so it writes what was
+    /// read and not what a run went on to write.
+    upper: Option<UpperEntry>,
+}
+
+/// An upper entry as the reader found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UpperEntry {
+    /// Its device and inode, which tell two names of one file apart from two
+    /// files.
+    dev: u64,
+    ino: u64,
+    /// Its link count.
+    nlink: u64,
+    /// Its permission and set-id bits.
+    mode: u32,
+    /// Its change time, seconds and nanoseconds, which any write to it moves.
+    ctime: (i64, i64),
+}
+
+impl UpperEntry {
+    fn of(stat: &Stat) -> UpperEntry {
+        UpperEntry {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            nlink: stat.st_nlink,
+            mode: stat.st_mode & 0o7777,
+            ctime: (stat.st_ctime, stat.st_ctime_nsec as i64),
+        }
+    }
+
+    /// Whether `stat` is still this entry, unchanged since it was read.
+    fn holds(&self, stat: &Stat) -> bool {
+        let now = UpperEntry::of(stat);
+        (now.dev, now.ino, now.ctime) == (self.dev, self.ino, self.ctime)
+    }
 }
 
 impl Change {
@@ -431,6 +479,7 @@ impl Reader {
             size: (now == EntryKind::File).then_some(stat.st_size as u64),
             differs: Differs::default(),
             readable: true,
+            upper: Some(UpperEntry::of(&stat)),
         };
 
         // A directory is opened before anything else is asked of it, so the
@@ -537,6 +586,7 @@ impl Reader {
             size: None,
             differs: Differs::default(),
             readable: true,
+            upper: None,
         });
     }
 }
@@ -903,6 +953,20 @@ fn same_bytes(
 
 /// How much of each file [`same_bytes`] compares at a time.
 const COMPARE_CHUNK: usize = 64 * 1024;
+
+/// When the directory `dir` was created, or `None` where its filesystem does
+/// not record it.
+fn birth_time(dir: BorrowedFd<'_>) -> Result<Option<SystemTime>, Errno> {
+    let statx = fs::statx(dir, c"", AtFlags::EMPTY_PATH, fs::StatxFlags::BTIME)?;
+    if statx.stx_mask & fs::StatxFlags::BTIME.bits() == 0 {
+        return Ok(None);
+    }
+    let since_epoch = Duration::new(
+        u64::try_from(statx.stx_btime.tv_sec).unwrap_or(0),
+        statx.stx_btime.tv_nsec,
+    );
+    Ok(SystemTime::UNIX_EPOCH.checked_add(since_epoch))
+}
 
 /// Opens a layer's top directory, following the path the caller named.
 fn open_layer(layer: &Path) -> Result<OwnedFd, ProvisionError> {

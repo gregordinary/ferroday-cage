@@ -193,3 +193,63 @@ fn an_overlay_the_run_left_alone_has_no_changes() {
     assert!(status.success());
     assert!(ChangeSet::read(&overlay).unwrap().is_empty());
 }
+
+/// A run's changes applied to the tree it started from leave the tree as the
+/// run saw it, but for the named pipe the apply does not carry.
+#[test]
+fn a_run_applied_to_its_tree_leaves_the_tree_as_the_run_saw_it() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("changes-apply");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let tree = tree(&dir);
+    // The upper's birth time is the reference the apply holds the tree to,
+    // less a margin of ten milliseconds; the tree is laid out before that.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let overlay = Overlay::new().lower(&tree).upper(dir.join("upper"));
+    let status = Cage::builder()
+        .rootfs(rootfs)
+        .overlay_at("/work", overlay.clone())
+        .command("/bin/sh")
+        .args(["-c", SCRIPT])
+        .build()
+        .expect("a valid overlay mount")
+        .run()
+        .expect("the sandbox launches");
+    assert!(status.success());
+
+    let changes = ChangeSet::read(&overlay).unwrap();
+    let report = changes.apply(&tree).run().expect("the changes apply");
+    assert_eq!(report.skipped(), [Path::new("added-fifo")]);
+    assert_eq!(report.applied().len(), changes.changes().len() - 1);
+
+    let read = |path: &str| std::fs::read_to_string(tree.join(path)).unwrap();
+    assert_eq!(read("modify"), "changed\n");
+    assert_eq!(read("deep/a/b/f"), "deep\n");
+    assert_eq!(read("rename-to"), "original\n");
+    assert_eq!(read("replace-dir/g"), "new\n");
+    for gone in ["delete", "rename-from", "rmdir", "replace-dir/inner"] {
+        assert!(!tree.join(gone).exists(), "{gone} is removed");
+    }
+    assert!(tree.join("replace-file").is_dir());
+    assert_eq!(
+        std::fs::read_link(tree.join("symlink")).unwrap(),
+        Path::new("modify")
+    );
+    let mode = |path: &str| {
+        std::fs::symlink_metadata(tree.join(path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(mode("chmod"), 0o600);
+    assert_eq!(mode("chmod-dir"), 0o700);
+
+    let left = ChangeSet::read(&overlay).unwrap();
+    let left: Vec<&Path> = left.changes().iter().map(|change| change.path()).collect();
+    assert_eq!(left, [Path::new("added-fifo")]);
+}
