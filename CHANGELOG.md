@@ -202,6 +202,16 @@ consumer upgrading can skip it.
   whole list was narrowed to its owner, owning group and everyone else, which
   gave each user and group it named, a denied one included, their class's
   access. `CopyIn` still reports such a list as `AttributeSkip::UnmappedId`.
+- The tar extractor reads the names in a `SCHILY.acl.access` or
+  `SCHILY.acl.default` record as libacl does. A three-digit octal escape, such
+  as the `\040` GNU tar writes for a space, is the byte it spells, and a `#`
+  inside a name is part of it. An escaped name went unanswered, and a `#` inside
+  one ended its line as a comment.
+- The tar extractor refuses an entry whose access control list text libacl
+  refuses or reads as another name: a comment before the first entry, a
+  permission field longer than three characters, a name beginning with
+  whitespace or a `#`, and an escape of fewer than three digits, or spelling a
+  NUL or a value past a byte.
 
 ### Internal
 

@@ -799,8 +799,10 @@ single-identity map holds only root inside, which is the calling user.
 The text may name users and groups by name, as GNU `tar` does for every one the
 writing host could name. A name means what the root's own `/etc/passwd` and
 `/etc/group` give it, as the root stands when the list is applied, not what the
-host's do. A list the kernel would not store, in either form, refuses its entry
-with `ProvisionError::EntryRefused`.
+host's do. The text is read as libacl reads it. A three-digit escape such as
+`\040` is the byte it spells, and a `#` inside a name is part of the name. A
+list the kernel would not store, in either form, refuses its entry with
+`ProvisionError::EntryRefused`.
 
 An entry naming an id the map has no host id for is left out of its list. So is
 one naming a user or group the root has no account for, where GNU `tar` applies

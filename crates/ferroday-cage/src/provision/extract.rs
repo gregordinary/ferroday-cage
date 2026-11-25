@@ -2388,7 +2388,7 @@ mod list_tests {
         let mut tar = Tar::new();
         tar.dir("etc", 0o755)
             .file("etc/passwd", 0o644, b"admin:x:0:0::/root:/bin/sh\n")
-            .file("etc/group", 0o644, b"admin:x:0:\n");
+            .file("etc/group", 0o644, b"admin:x:0:\ndomain users:x:0:\n");
         pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("0")));
         tar.file("by-id", 0o660, b"x");
         pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("admin")));
@@ -2398,6 +2398,15 @@ mod list_tests {
             &pax_record(b"SCHILY.acl.access", &text("stranger")),
         );
         tar.file("unanswered", 0o4660, b"x");
+        // A name GNU tar writes escaped, as libacl writes it.
+        pax(
+            &mut tar,
+            &pax_record(
+                b"SCHILY.acl.access",
+                b"user::rw-\ngroup::---\ngroup:domain\\040users:rw-\nmask::rw-\nother::---\n",
+            ),
+        );
+        tar.file("escaped", 0o660, b"x");
         extract_archive(
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
@@ -2417,6 +2426,17 @@ mod list_tests {
             Some(unnamed()),
         );
         assert_eq!(mode_of(&root.join("unanswered")), 0o4660);
+        let caller_group = rustix::process::getegid().as_raw();
+        assert_eq!(
+            xattr::get(&root.join("escaped"), "system.posix_acl_access"),
+            Some(acl(&[
+                (0x01, 6, NONE),
+                (0x04, 0, NONE),
+                (0x08, 6, caller_group),
+                (0x10, 6, NONE),
+                (0x20, 0, NONE),
+            ])),
+        );
     }
 
     #[test]

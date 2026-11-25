@@ -512,12 +512,20 @@ pub(super) struct Mapped {
 /// refuses it.
 ///
 /// - Entries are separated by commas or line ends, with whitespace allowed
-///   around them and refused inside one.
-/// - A `#` starts a comment that runs to the end of its line, as `getfacl`'s
-///   `#effective:` comments do.
+///   around them.
 /// - A tag is `user`, `group`, `mask` or `other`, or its first letter.
-/// - Permissions are one or more of `r`, `w`, `x` and `-`, in any order, each
-///   letter at most once.
+/// - A name is read as libacl writes one: `\ooo`, three octal digits, is the
+///   byte they spell, `\\` is a backslash, and a backslash before anything
+///   else is itself. A space, a tab or a `#` inside a name is part of it. A
+///   name that begins with whitespace or a `#` is refused, and so is an escape
+///   spelling a NUL or a value past a byte, which libacl reads as the end of
+///   the name, so that the two would name different accounts.
+/// - Permissions are one to three of `r`, `w`, `x` and `-`, in any order, each
+///   letter at most once, with no whitespace inside.
+/// - A `#` after an entry's permissions, after a comma, or on a later line
+///   starts a comment that runs to the end of its line, as `getfacl`'s
+///   `#effective:` comments do. One before the first entry is refused, as
+///   libacl refuses it.
 /// - Entries come in any order; the list puts them in its own.
 ///
 /// What a name means is the root's that the list lands in, which is not the
@@ -566,19 +574,27 @@ impl AclText {
     pub(super) fn parse(text: &[u8]) -> Result<Option<AclText>, &'static str> {
         let mut entries = Vec::new();
         for line in text.split(|byte| *byte == b'\n') {
-            let line = line
-                .iter()
-                .position(|byte| *byte == b'#')
-                .map_or(line, |comment| &line[..comment]);
-            for entry in line.split(|byte| *byte == b',') {
-                let entry = entry.trim_ascii();
-                if entry.is_empty() {
-                    continue;
+            let mut rest = line;
+            loop {
+                rest = rest.trim_ascii_start();
+                match rest.split_first() {
+                    None => break,
+                    Some((b',', after)) => rest = after,
+                    Some((b'#', _)) if entries.is_empty() => {
+                        return Err("the text of its list begins with a comment");
+                    }
+                    Some((b'#', _)) => break,
+                    Some(_) => {
+                        let (entry, after) = text_entry(rest)?;
+                        entries.push(entry);
+                        rest = after.trim_ascii_start();
+                        match rest.split_first() {
+                            None | Some((b'#', _)) => break,
+                            Some((b',', after)) => rest = after,
+                            Some(_) => return Err("an entry of its list holds whitespace"),
+                        }
+                    }
                 }
-                if entry.iter().any(u8::is_ascii_whitespace) {
-                    return Err("an entry of its list holds whitespace");
-                }
-                entries.push(text_entry(entry)?);
             }
         }
         if entries.is_empty() {
@@ -650,19 +666,37 @@ impl AclText {
 }
 
 #[cfg(feature = "tarball")]
-/// One entry of a list's text: a tag, a qualifier, permissions, and the
-/// fourth field star and bsdtar add, the id beside a name.
-fn text_entry(entry: &[u8]) -> Result<TextEntry, &'static str> {
-    let fields: Vec<&[u8]> = entry.split(|byte| *byte == b':').collect();
-    let (tag, qualifier, perm, id) = match fields[..] {
-        [tag, qualifier, perm] => (tag, qualifier, perm, None),
-        [tag, qualifier, perm, id] => (tag, qualifier, perm, Some(id)),
-        _ => return Err("an entry of its list is not a tag, a qualifier and permissions"),
+/// The entry `text` begins with: a tag, a qualifier, permissions, and the
+/// fourth field star and bsdtar add, the id beside a name. Returned with the
+/// text after it, which begins with whitespace, a comma, a `#`, or nothing.
+///
+/// A qualifier may hold a name, which holds whitespace and `#` as any other
+/// byte, so it ends at a colon or a comma alone. Every other field also ends
+/// at whitespace or a `#`.
+fn text_entry(text: &[u8]) -> Result<(TextEntry, &[u8]), &'static str> {
+    const SHAPE: &str = "an entry of its list is not a tag, a qualifier and permissions";
+    let ends_field = |byte: &u8| matches!(byte, b':' | b',' | b'#') || byte.is_ascii_whitespace();
+    let (tag, rest) = text_field(text, ends_field);
+    let rest = rest.strip_prefix(b":").ok_or(SHAPE)?;
+    let (qualifier, rest) = text_field(rest, |byte| matches!(byte, b':' | b','));
+    let rest = rest.strip_prefix(b":").ok_or(SHAPE)?;
+    let (perm, rest) = text_field(rest, ends_field);
+    let (id, rest) = match rest.strip_prefix(b":") {
+        Some(after) => {
+            let (id, rest) = text_field(after, ends_field);
+            if rest.starts_with(b":") {
+                return Err(SHAPE);
+            }
+            (Some(id), rest)
+        }
+        None => (None, rest),
     };
     let perm = text_perm(perm).ok_or("an entry of its list grants permissions it cannot spell")?;
     let id = id
         .map(|id| text_id(id).ok_or("an entry of its list records an id that is not one"))
         .transpose()?;
+    let qualifier = text_name(qualifier)?;
+    let qualifier = qualifier.as_slice();
     let (tag, who) = match tag {
         b"user" | b"u" => named(qualifier, id, ACL_USER_OBJ, ACL_USER)?,
         b"group" | b"g" => named(qualifier, id, ACL_GROUP_OBJ, ACL_GROUP)?,
@@ -670,7 +704,61 @@ fn text_entry(entry: &[u8]) -> Result<TextEntry, &'static str> {
         b"other" | b"o" => (ACL_OTHER, nobody(qualifier, id)?),
         _ => return Err("an entry of its list has a tag no list holds"),
     };
-    Ok(TextEntry { tag, perm, who })
+    Ok((TextEntry { tag, perm, who }, rest))
+}
+
+#[cfg(feature = "tarball")]
+/// `text` up to the first byte `ends` holds, and the rest from that byte on.
+fn text_field(text: &[u8], ends: impl Fn(&u8) -> bool) -> (&[u8], &[u8]) {
+    text.split_at(text.iter().position(ends).unwrap_or(text.len()))
+}
+
+#[cfg(feature = "tarball")]
+/// The name a qualifier spells, its escapes read as libacl reads them
+/// ([`AclText`]).
+fn text_name(qualifier: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if qualifier
+        .first()
+        .is_some_and(|byte| *byte == b'#' || byte.is_ascii_whitespace())
+    {
+        return Err("an entry of its list names someone beginning with whitespace or a `#`");
+    }
+    let octal = |digit: &u8| u16::from(digit.wrapping_sub(b'0'));
+    let mut name = Vec::with_capacity(qualifier.len());
+    let mut rest = qualifier;
+    while let Some((&byte, after)) = rest.split_first() {
+        rest = after;
+        if byte != b'\\' {
+            name.push(byte);
+            continue;
+        }
+        match rest {
+            [b'\\', after @ ..] => {
+                name.push(b'\\');
+                rest = after;
+            }
+            [
+                high @ b'0'..=b'7',
+                middle @ b'0'..=b'7',
+                low @ b'0'..=b'7',
+                after @ ..,
+            ] => {
+                let value = octal(high) * 64 + octal(middle) * 8 + octal(low);
+                match u8::try_from(value) {
+                    Ok(0) | Err(_) => {
+                        return Err("an entry of its list escapes a NUL or a value past a byte");
+                    }
+                    Ok(escaped) => name.push(escaped),
+                }
+                rest = after;
+            }
+            [b'0'..=b'7', ..] => {
+                return Err("an entry of its list escapes a byte with fewer than three digits");
+            }
+            _ => name.push(b'\\'),
+        }
+    }
+    Ok(name)
 }
 
 #[cfg(feature = "tarball")]
@@ -728,10 +816,11 @@ fn text_id(text: &[u8]) -> Option<u32> {
 }
 
 #[cfg(feature = "tarball")]
-/// The permission bits a list's text spells, `None` where it spells none or
-/// names one twice.
+/// The permission bits a list's text spells, `None` where it spells none,
+/// holds more than three characters, or names one twice, as libacl refuses
+/// each.
 fn text_perm(text: &[u8]) -> Option<u16> {
-    if text.is_empty() {
+    if text.is_empty() || text.len() > 3 {
         return None;
     }
     let mut perm = 0;
@@ -1126,6 +1215,9 @@ mod tests {
             b"u::rw-,g::r--,o::---,d:u::rwx",
             b"u::rw-,u:4242:r--,g::r--,o::---",
             b"u::rw-,g::r--",
+            b"u::rwx-,g::r--,o::---",
+            b"u::----,g::r--,o::---",
+            b"u::rw- g::r--,o::---",
         ] {
             assert!(
                 AclText::parse(text).is_err(),
@@ -1135,7 +1227,7 @@ mod tests {
         }
         // A text holding no entry is no list, as GNU tar writes a directory's
         // default list when it has none.
-        for text in [&b""[..], b"\n", b" , ", b"# nothing\n"] {
+        for text in [&b""[..], b"\n", b" , "] {
             assert_eq!(
                 AclText::parse(text),
                 Ok(None),
@@ -1178,6 +1270,103 @@ mod tests {
             AclText::parse(b"u::rw-,u:5:rw-:5,g::r--,m::rw-,o::---"),
             Ok(Some(_))
         ));
+    }
+
+    #[cfg(feature = "tarball")]
+    #[test]
+    fn a_lists_text_names_and_comments_are_read_where_libacl_reads_them() {
+        // The group a text names, read with a lookup that answers only `name`.
+        let names = |text: &str| {
+            let full = format!("u::rw-\n{text}\ng::r--\nm::rw-\no::---\n");
+            let read = AclText::parse(full.as_bytes())
+                .map_err(|reason| format!("{text}: {reason}"))?
+                .ok_or_else(|| format!("{text}: no list"))?;
+            Ok::<_, String>(read)
+        };
+        let resolves = |text: &str, name: &[u8]| {
+            let read = names(text).unwrap_or_else(|reason| panic!("{reason}"));
+            let acl = read
+                .resolve(|_| None, |asked| (asked == name).then_some(4245))
+                .unwrap_or_else(|flaw| panic!("{text}: {flaw:?}"));
+            assert_eq!(
+                acl.entries
+                    .iter()
+                    .find(|entry| entry.tag == ACL_GROUP)
+                    .map(|entry| entry.id),
+                Some(4245),
+                "{text} names {}",
+                String::from_utf8_lossy(name),
+            );
+        };
+        // Escapes, as libacl writes and reads them: a space, a comma, a tab, a
+        // `#` and a backslash; any three octal digits; a backslash before
+        // anything else is itself.
+        resolves(r"g:domain\040users:r--", b"domain users");
+        resolves(r"g:comma\054g:r--", b"comma,g");
+        resolves(r"g:tab\011g:r--", b"tab\tg");
+        resolves(r"g:hash\043g:r--", b"hash#g");
+        resolves(r"g:back\\slash:r--", br"back\slash");
+        resolves(r"g:back\134slash:r--", br"back\slash");
+        resolves(r"g:back\slashg:r--", br"back\slashg");
+        resolves(r"g:caf\303\251:r--", "café".as_bytes());
+        // A `#` inside a name is part of it, after a space too; so is a space
+        // or a tab inside a name, and one at its end.
+        resolves("g:hash#g:r--", b"hash#g");
+        resolves("g:hash #g:r--", b"hash #g");
+        resolves("g:domain users:r--", b"domain users");
+        resolves("g:trail :r--", b"trail ");
+        // Digits, escaped or not, are an id rather than a name.
+        let read = names(r"g:\064\062\064\062:r--").unwrap();
+        assert!(!read.names_anyone());
+        assert!(matches!(
+            read.resolve(|_| None, |_| None),
+            Ok(acl) if acl.entries.iter().any(|entry| entry.tag == ACL_GROUP && entry.id == 4242),
+        ));
+        // A `#` after the permissions, in them, or after a comma ends its line.
+        for text in [
+            "g:4245:rw-#c",
+            "g:4245:rw- #c",
+            "g:4245:rw-\t#effective:rw-",
+        ] {
+            assert!(names(text).is_ok(), "{text}");
+        }
+        let cut = AclText::parse(b"u::r#w-\ng::r--\no::---").unwrap().unwrap();
+        assert_eq!(cut.resolve(|_| None, |_| None).unwrap().entries[0].perm, 4);
+        assert!(AclText::parse(b"u::rw-,#c,g::r--,o::---").is_err());
+        // A blank first line or leading whitespace is no comment.
+        assert!(matches!(
+            AclText::parse(b"\n  u::rw-,g::r--,o::---"),
+            Ok(Some(_))
+        ));
+        // Each refused below is refused by libacl too, or read by it as a
+        // different name: a comment before the first entry, a `#` in a tag
+        // or beginning a qualifier, an empty permission field, a qualifier
+        // beginning with whitespace, two octal digits, and escapes spelling
+        // a NUL or a value past a byte.
+        for text in [
+            &b"# a comment\n"[..],
+            b"#\nu::rw-,g::r--,o::---",
+            b"  # a comment\nu::rw-,g::r--,o::---",
+            b"u#c::rw-,g::r--,o::---",
+            b"u:#c:rw-,g::r--,o::---",
+            b"u::rw-,g:4245:#c\ng::r--,m::rw-,o::---",
+            b"u::rw-,g: domain users:r--,g::r--,m::rw-,o::---",
+            br"u::rw-,g:x\40y:r--,g::r--,m::rw-,o::---",
+            br"u::rw-,g:x\4:r--,g::r--,m::rw-,o::---",
+            br"u::rw-,g:x\400:r--,g::r--,m::rw-,o::---",
+            br"u::rw-,g:x\401:r--,g::r--,m::rw-,o::---",
+            br"u::rw-,g:x\000y:r--,g::r--,m::rw-,o::---",
+        ] {
+            assert!(
+                AclText::parse(text).is_err(),
+                "{}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        // Permissions are one to three characters, each letter at most once.
+        for perm in ["--", "-", "r", "xw", "-rx"] {
+            assert!(names(&format!("g:4245:{perm}")).is_ok(), "{perm}");
+        }
     }
 
     #[test]
