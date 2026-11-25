@@ -32,7 +32,9 @@
 //! [`streams`] explains.
 //!
 //! The same holds for the native network stack: every `NetStackBuilder` setting
-//! has a `--netstack-*` flag. The provisioners are narrower, and deliberately:
+//! has a `--netstack-*` flag, and a profile's `[netstack]` table carries the
+//! builder's own format, which the library's sandbox format has no key for.
+//! The provisioners are narrower, and deliberately:
 //! each one's bootstrap surface has flags, including the plan and pin documents
 //! that make an install reproducible, but a *layered* build has none. A
 //! provisioner given a base layer produces an increment in a disposable overlay
@@ -63,7 +65,7 @@ use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
     ExitStatus, FsAccess, Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount,
-    NetAccess, NetStack, NetStackError, NetStackHandle, Network, Overlay, Pending,
+    NetAccess, NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Overlay, Pending,
     PresentedIdentity, RawMount, ReadOnly, ResolvedCgroup, ResolvedInputs, Resource,
     RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen,
     SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
@@ -1309,8 +1311,9 @@ const FLAGS: &[Flag] = &[
             "into the sandbox, write to the host, or share a host",
             "namespace are refused, and so is the hardening the",
             "flags would add to; the library's RestrictedProfile",
-            "lists each. The rootfs it names still grants access",
-            "to that host subtree, so pass a rootfs you control",
+            "lists each. A [netstack] table is refused as well.",
+            "The rootfs it names still grants access to that host",
+            "subtree, so pass a rootfs you control",
         ],
         take: Take::One(|options, _flag, value| {
             let path = PathBuf::from(value);
@@ -1822,7 +1825,8 @@ const FLAGS: &[Flag] = &[
             "with no external helper. The sandbox's resolv.conf",
             "names the stack's nameserver, unless --no-resolv-conf,",
             "--no-managed-mounts or --nameserver is given or a",
-            "mount of the run's own claims the file",
+            "mount of the run's own claims the file. A profile's",
+            "[netstack] table configures the stack",
         ],
         take: Take::Bare(|options| {
             options.netstack = true;
@@ -1866,7 +1870,7 @@ const FLAGS: &[Flag] = &[
             "address and the stack answers no IPv4 traffic",
         ],
         take: Take::Bare(|options| {
-            options.netstack_no_ipv4 = true;
+            options.netstack_ipv4 = Some(false);
         }),
         ..Flag::DEFAULTS
     },
@@ -1879,7 +1883,7 @@ const FLAGS: &[Flag] = &[
             "address and the stack answers no IPv6 traffic",
         ],
         take: Take::Bare(|options| {
-            options.netstack_no_ipv6 = true;
+            options.netstack_ipv6 = Some(false);
         }),
         ..Flag::DEFAULTS
     },
@@ -1924,7 +1928,7 @@ const FLAGS: &[Flag] = &[
             "127.0.0.53 stub)",
         ],
         take: Take::Bare(|options| {
-            options.netstack_host_loopback = true;
+            options.netstack_host_loopback = Some(true);
         }),
         ..Flag::DEFAULTS
     },
@@ -1983,7 +1987,7 @@ const FLAGS: &[Flag] = &[
             "resolv.conf",
         ],
         take: Take::Bare(|options| {
-            options.netstack_no_nameserver = true;
+            options.netstack_nameserver = Some(false);
         }),
         ..Flag::DEFAULTS
     },
@@ -2534,6 +2538,38 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--netstack-ipv4",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.netstack_ipv4 = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-ipv6",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.netstack_ipv6 = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-nameserver",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.netstack_nameserver = Some(true);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-no-host-loopback",
+        section: Section::Counterpart,
+        take: Take::Bare(|options| {
+            options.netstack_host_loopback = Some(false);
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--help",
         section: Section::Help,
         short: Some("-h"),
@@ -2570,13 +2606,15 @@ Usage: fcage [--rootfs DIR | --empty-rootfs | --overlay-lower DIR | --profile FI
 /// What `--help` prints below them.
 ///
 /// Prose rather than entries, so it stays written out: it names flags in
-/// sentences, and the ten counterpart toggles are documented here rather
+/// sentences, and the fourteen counterpart toggles are documented here rather
 /// than listed above. A test holds every name it uses to [`FLAGS`], which is
 /// what stops it drifting from the vocabulary it describes.
 const CLOSING: &str = "\
 Each toggle has a counterpart to override a profile in the other direction:
 --isolate-net, --pid-ns, --proc, --dev, --tmp, --resolv-conf,
---managed-mounts, --base-env, --no-stop-with-caller, and --no-path-lookup.
+--managed-mounts, --base-env, --no-stop-with-caller, --no-path-lookup,
+--netstack-ipv4, --netstack-ipv6, --netstack-nameserver, and
+--netstack-no-host-loopback.
 A profile's [hardening] table composes with the hardening flags:
 --landlock-ro, --landlock-rw, --landlock-unix, --landlock-bind, and
 --landlock-connect add grants to it, while --landlock-scope,
@@ -2587,7 +2625,11 @@ seccomp flags are mutually constrained: an allow side (--seccomp-allow,
 --seccomp-allow-rule) cannot be mixed with a deny side (--seccomp-deny,
 --seccomp-deny-rule), and --seccomp curated is a deny side the deny flags
 extend. --seccomp-errno joins whichever policy stands, the flags' or else
-the profile's, and with neither denies only what it names.
+the profile's, and with neither denies only what it names. A profile's
+[netstack] table configures the stack --netstack attaches, and is unused
+without it. --netstack-allow, --netstack-deny, --netstack-host-port, and
+--netstack-publish add to its lists, and the other --netstack-* flags
+replace its settings.
 
 The command path is interpreted inside the sandbox (with --restrict, on the
 host) and must be absolute, unless --path-lookup resolves a name with no
@@ -2799,12 +2841,12 @@ struct Options {
     netstack: bool,
     netstack_cidr: Option<(Ipv4Addr, u8)>,
     netstack_cidr6: Option<(Ipv6Addr, u8)>,
-    netstack_no_ipv4: bool,
-    netstack_no_ipv6: bool,
+    netstack_ipv4: Option<bool>,
+    netstack_ipv6: Option<bool>,
     netstack_interface: Option<String>,
     netstack_mtu: Option<u16>,
-    netstack_host_loopback: bool,
-    netstack_no_nameserver: bool,
+    netstack_host_loopback: Option<bool>,
+    netstack_nameserver: Option<bool>,
     netstack_upstream: Option<SocketAddr>,
     netstack_host_ports: Vec<u16>,
     netstack_publish: Vec<(SocketAddr, u16)>,
@@ -3337,12 +3379,12 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack: false,
         netstack_cidr: None,
         netstack_cidr6: None,
-        netstack_no_ipv4: false,
-        netstack_no_ipv6: false,
+        netstack_ipv4: None,
+        netstack_ipv6: None,
         netstack_interface: None,
         netstack_mtu: None,
-        netstack_host_loopback: false,
-        netstack_no_nameserver: false,
+        netstack_host_loopback: None,
+        netstack_nameserver: None,
         netstack_upstream: None,
         netstack_host_ports: Vec::new(),
         netstack_publish: Vec::new(),
@@ -5182,20 +5224,41 @@ fn toml_diagnostic(error: &impl std::fmt::Display) -> String {
     rendered
 }
 
-/// Loads a profile into a builder, and says whether the profile states
-/// `stop-with-caller`.
+/// The key of a profile's network stack table, `[netstack]`.
 ///
-/// Everything else `fcage` reconciles against its own flags it asks of the
-/// builder. Whether the tie was stated is the one answer the builder does not
-/// hold: it holds the tie's value, which reads the same whether the profile
-/// wrote `false` or said nothing, and only the first stops `fcage`'s own
-/// default from applying, as [`stop_with_caller_default`] describes.
+/// The table is `fcage`'s own, beside the library's sandbox format. A stack is
+/// an attachment of a launch rather than a setting of its sandbox, so
+/// [`CageBuilder`] has no field for one, and the table holds the stack's own
+/// format, [`NetStackBuilder`]'s.
+const NETSTACK_TABLE: &str = "netstack";
+
+/// A profile as `fcage` loads it.
+struct Profile {
+    /// The sandbox it describes.
+    builder: CageBuilder,
+    /// Whether it states `stop-with-caller`.
+    ///
+    /// Everything else `fcage` reconciles against its own flags it asks of the
+    /// builder. Whether the tie was stated is the one answer the builder does
+    /// not hold: it holds the tie's value, which reads the same whether the
+    /// profile wrote `false` or said nothing, and only the first stops
+    /// `fcage`'s own default from applying, as [`stop_with_caller_default`]
+    /// describes.
+    states_stop_with_caller: bool,
+    /// The network stack its `[netstack]` table configures, which a
+    /// `--netstack` run attaches.
+    stack: Option<NetStackBuilder>,
+}
+
+/// Loads a profile: the sandbox it describes, and the network stack its
+/// `[netstack]` table configures, where it has one.
 ///
 /// With `restricted`, the profile is deserialized under the library's
 /// [`RestrictedProfile`] policy, which refuses the operations that map host
-/// resources into the sandbox or share a host namespace; otherwise it is
-/// trusted as code-equivalent configuration.
-fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, bool), String> {
+/// resources into the sandbox or share a host namespace, and a `[netstack]`
+/// table is refused, since a stack's settings reach the host's loopback and
+/// its listeners; otherwise it is trusted as code-equivalent configuration.
+fn load_profile(path: &Path, restricted: bool) -> Result<Profile, String> {
     let text = std::fs::read_to_string(path).map_err(|err| {
         format!(
             "cannot read profile {}: {}",
@@ -5203,7 +5266,7 @@ fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, bool), St
             ErrorChain::new(&err)
         )
     })?;
-    let table: toml::Table = text.parse().map_err(|err| {
+    let mut table: toml::Table = text.parse().map_err(|err| {
         format!(
             "cannot parse profile {}: {}",
             path.display(),
@@ -5211,6 +5274,23 @@ fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, bool), St
         )
     })?;
     let states_stop_with_caller = table.contains_key("stop-with-caller");
+    let stack = match table.remove(NETSTACK_TABLE) {
+        None => None,
+        Some(_) if restricted => {
+            return Err(format!(
+                "cannot load profile {}: a restricted profile cannot configure the network \
+                 stack, so its [{NETSTACK_TABLE}] table is refused",
+                path.display()
+            ));
+        }
+        Some(value) => Some(value.try_into::<NetStackBuilder>().map_err(|err| {
+            format!(
+                "cannot load profile {}: in its [{NETSTACK_TABLE}] table: {}",
+                path.display(),
+                toml_diagnostic(&err)
+            )
+        })?),
+    };
     let builder = if restricted {
         let profile: RestrictedProfile = table.try_into().map_err(|err| {
             format!(
@@ -5229,7 +5309,11 @@ fn load_profile(path: &Path, restricted: bool) -> Result<(CageBuilder, bool), St
             )
         })?
     };
-    Ok((builder, states_stop_with_caller))
+    Ok(Profile {
+        builder,
+        states_stop_with_caller,
+        stack,
+    })
 }
 
 /// Deletes the provisioned rootfs or the overlay upper at `dest`, under the
@@ -5446,15 +5530,43 @@ impl Launch {
     /// profile, the profile against the flags, the standard streams, and the
     /// command.
     fn prepare(options: Options) -> Result<Launch, ExitCode> {
-        let stack = if options.netstack {
-            Some(netstack_from(&options).map_err(fail)?)
-        } else {
-            None
+        let Profile {
+            mut builder,
+            states_stop_with_caller: profile_sets_stop_with_caller,
+            stack: profile_stack,
+        } = match &options.profile {
+            Some(path) => load_profile(path, options.profile_restricted).map_err(fail)?,
+            None => Profile {
+                builder: Cage::builder(),
+                states_stop_with_caller: false,
+                stack: None,
+            },
         };
 
-        let (mut builder, profile_sets_stop_with_caller) = match &options.profile {
-            Some(path) => load_profile(path, options.profile_restricted).map_err(fail)?,
-            None => (Cage::builder(), false),
+        // The stack is built before the sandbox is, so a configuration it
+        // refuses -- a prefix outside its range, an MTU below the floor IPv6
+        // raises, an interface name the kernel would not take, both protocols
+        // turned off -- is reported without a sandbox having been created and
+        // torn down for it. Building it starts nothing: the pump thread is
+        // `attach`'s, and the relay's signal mask has to be in place before it
+        // exists. What the run writes of its reports, and which ports the
+        // kernel chose, are read from the stack's settings first.
+        let mut ruled = false;
+        let mut publications = Vec::new();
+        let stack = if options.netstack {
+            let composed = netstack_builder(&options, profile_stack.unwrap_or_default());
+            ruled = !composed.get_allow().is_empty() || !composed.get_deny().is_empty();
+            publications = composed.get_publications().collect();
+            Some(composed.build().map_err(fail)?)
+        } else {
+            if profile_stack.is_some() {
+                output::say(format_args!(
+                    "fcage: the profile's [{NETSTACK_TABLE}] table is not used: no --netstack \
+                     attaches the stack it configures"
+                ))
+                .map_err(|output::ReaderGone| Failure::ReaderGone.report())?;
+            }
+            None
         };
         // What the profile asked for, read before any flag is applied over it.
         let profile_sets_term = builder.get_envs().any(|(name, _)| name == "TERM");
@@ -5642,7 +5754,6 @@ impl Launch {
             Some(judge_streams(&builder, &CAGE_STREAMS, options.terminal)?)
         };
 
-        let ruled = !options.netstack_allow.is_empty() || !options.netstack_deny.is_empty();
         Ok(Launch {
             builder,
             stack,
@@ -5651,7 +5762,7 @@ impl Launch {
             terminal: options.terminal,
             timeout: options.timeout,
             kill_after: options.kill_after,
-            publications: options.netstack_publish,
+            publications,
             forwards: options.forwards,
         })
     }
@@ -5933,20 +6044,27 @@ fn run_on_a_terminal(
     conclude(terminal::relay(running, pty, signals, timeout, kill_after).map_err(Failure::from))
 }
 
-/// Assembles the native network stack the `--netstack-*` flags describe.
+/// Composes the native network stack a `--netstack` run attaches: the
+/// `--netstack-*` flags over `base`, the stack a profile's `[netstack]` table
+/// configures or the library's defaults.
 ///
-/// Built before the sandbox is, so a configuration the stack refuses -- a
-/// prefix outside its range, an MTU below the floor IPv6 raises, an interface
-/// name the kernel would not take, both protocols turned off -- is reported
-/// without a sandbox having been created and torn down for it. Building the
-/// stack starts nothing: the pump thread is `attach`'s, and the relay's signal
-/// mask has to be in place before it exists.
-fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackError> {
-    let mut stack = NetStack::builder()
-        .ipv4(!options.netstack_no_ipv4)
-        .ipv6(!options.netstack_no_ipv6)
-        .host_loopback(options.netstack_host_loopback)
-        .nameserver(!options.netstack_no_nameserver);
+/// As every flag composes with a profile, the rules, the loopback ports and the
+/// publications extend the table's lists, and each other flag replaces the
+/// setting it names.
+fn netstack_builder(options: &Options, base: NetStackBuilder) -> NetStackBuilder {
+    let mut stack = base;
+    if let Some(enabled) = options.netstack_ipv4 {
+        stack = stack.ipv4(enabled);
+    }
+    if let Some(enabled) = options.netstack_ipv6 {
+        stack = stack.ipv6(enabled);
+    }
+    if let Some(enabled) = options.netstack_host_loopback {
+        stack = stack.host_loopback(enabled);
+    }
+    if let Some(enabled) = options.netstack_nameserver {
+        stack = stack.nameserver(enabled);
+    }
     if let Some(upstream) = options.netstack_upstream {
         stack = stack.upstream(upstream);
     }
@@ -5974,7 +6092,7 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
     if let Some(mtu) = options.netstack_mtu {
         stack = stack.mtu(mtu);
     }
-    stack.build()
+    stack
 }
 
 /// Builds and runs a sandbox held at the pending seam: build, hold the command,
@@ -8176,14 +8294,14 @@ mod tests {
             "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\nstop-with-caller = false\n",
         )
         .expect("the profile is written");
-        let (_, states) = load_profile(&stated, false).expect("the profile loads");
-        assert!(states);
+        let loaded = load_profile(&stated, false).expect("the profile loads");
+        assert!(loaded.states_stop_with_caller);
 
         let silent = dir.join("silent.toml");
         std::fs::write(&silent, "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\n")
             .expect("the profile is written");
-        let (_, states) = load_profile(&silent, false).expect("the profile loads");
-        assert!(!states);
+        let loaded = load_profile(&silent, false).expect("the profile loads");
+        assert!(!loaded.states_stop_with_caller);
     }
 
     #[test]
@@ -8212,12 +8330,153 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_s_netstack_table_configures_the_stack_netstack_attaches() {
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-profile-netstack");
+        let profile = dir.join("profile.toml");
+        std::fs::write(
+            &profile,
+            "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\n\n\
+             [netstack]\nipv6 = false\nmtu = 1400\nhost-loopback = true\n\
+             allow = [\"example.com:443\"]\n\n\
+             [[netstack.publish]]\nhost = \"127.0.0.1:0\"\nguest-port = 80\n",
+        )
+        .expect("the profile is written");
+        let loaded = load_profile(&profile, false).expect("the profile loads");
+        let table = loaded.stack.expect("the profile configures a stack");
+        assert_eq!(table.get_allow(), ["example.com:443".parse().unwrap()]);
+
+        // The flags compose with the table as with the rest of a profile: the
+        // lists extend it, the counterparts turn its toggles either way, and a
+        // value replaces its value.
+        let options = parse_run(&[
+            "--profile",
+            "/p.toml",
+            "--netstack",
+            "--netstack-allow",
+            "pypi.org:443",
+            "--netstack-publish",
+            "8080",
+            "8080",
+            "--netstack-ipv6",
+            "--netstack-no-host-loopback",
+            "--netstack-mtu",
+            "1300",
+            "/bin/true",
+        ])
+        .expect("a valid command line");
+        let composed = netstack_builder(&options, table.clone());
+        assert_eq!(
+            composed.get_allow(),
+            [
+                "example.com:443".parse::<DestinationRule>().unwrap(),
+                "pypi.org:443".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            composed.get_publications().collect::<Vec<_>>(),
+            [
+                ("127.0.0.1:0".parse().unwrap(), 80),
+                ("127.0.0.1:8080".parse().unwrap(), 8080),
+            ]
+        );
+        assert!(composed.get_ipv6());
+        assert!(!composed.get_host_loopback());
+        assert_eq!(composed.get_mtu(), 1300);
+        // A flag that says nothing of a setting leaves the table's.
+        let quiet = parse_run(&["--profile", "/p.toml", "--netstack", "/bin/true"])
+            .expect("a valid command line");
+        let kept = netstack_builder(&quiet, table);
+        assert!(!kept.get_ipv6() && kept.get_host_loopback());
+        assert_eq!(kept.get_mtu(), 1400);
+
+        // A launch attaches the stack the table configures, writes the
+        // refusals its rules make, and knows its publications, to say which
+        // port the kernel chose.
+        let profile = profile.to_str().expect("a UTF-8 scratch path");
+        let prepared = |args: &[&str]| {
+            Launch::prepare(*run_options(args)).unwrap_or_else(|_| panic!("{args:?} composes"))
+        };
+        let launch = prepared(&["--profile", profile, "--netstack"]);
+        assert!(launch.stack.is_some());
+        assert_eq!(launch.shown, Some(netstack::Shown::Refusals));
+        assert_eq!(
+            launch.publications,
+            [("127.0.0.1:0".parse::<SocketAddr>().unwrap(), 80)]
+        );
+        // Without --netstack the table configures nothing that is attached.
+        let launch = prepared(&["--profile", profile]);
+        assert!(launch.stack.is_none());
+        assert!(launch.publications.is_empty());
+    }
+
+    #[test]
+    fn each_netstack_toggle_turns_a_profile_s_setting_either_way() {
+        let compose = |base: NetStackBuilder, flags: &[&str]| {
+            let line: Vec<&str> = ["--rootfs", "/r", "--netstack"]
+                .iter()
+                .chain(flags)
+                .chain(&["/bin/true"])
+                .copied()
+                .collect();
+            netstack_builder(&parse_run(&line).expect("a valid command line"), base)
+        };
+        let off = || {
+            NetStack::builder()
+                .ipv4(false)
+                .ipv6(false)
+                .nameserver(false)
+        };
+        let on = compose(
+            off(),
+            &[
+                "--netstack-ipv4",
+                "--netstack-ipv6",
+                "--netstack-nameserver",
+            ],
+        );
+        assert!(on.get_ipv4() && on.get_ipv6() && on.get_nameserver());
+        let mapped = NetStack::builder().host_loopback(true);
+        assert!(!compose(mapped, &["--netstack-no-host-loopback"]).get_host_loopback());
+        // The last of a pair is the one that holds, as for every toggle.
+        let last = compose(
+            NetStack::builder(),
+            &["--netstack-no-nameserver", "--netstack-nameserver"],
+        );
+        assert!(last.get_nameserver());
+        let last = compose(
+            NetStack::builder(),
+            &["--netstack-ipv4", "--netstack-no-ipv4"],
+        );
+        assert!(!last.get_ipv4());
+    }
+
+    #[test]
+    fn a_netstack_table_the_stack_s_format_refuses_names_the_table() {
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-profile-netstack-refused");
+        let profile = dir.join("profile.toml");
+        for (table, named) in [
+            ("[netstack]\ngateway = \"10.0.2.1\"\n", "gateway"),
+            ("[netstack]\nallow = [\"example.com:0\"]\n", "port 0"),
+            ("netstack = 1\n", "integer"),
+        ] {
+            std::fs::write(&profile, format!("rootfs = \"/tmp\"\n{table}"))
+                .expect("the profile is written");
+            let Err(error) = load_profile(&profile, false) else {
+                panic!("{table:?} loaded");
+            };
+            assert!(error.contains("in its [netstack] table"), "{error}");
+            assert!(error.contains(named), "{error}");
+        }
+    }
+
+    #[test]
     fn a_restricted_profile_carries_nothing_the_flags_would_add_to() {
         // The Landlock flags add grants to a profile's table, and a run-as
         // identity keeps whatever capabilities the profile keeps, so under
         // --restricted-profile a profile carries neither. Nor does it carry a
-        // link, which the setup makes before any confinement applies. The same
-        // profile loads under --profile, which trusts it.
+        // link, which the setup makes before any confinement applies, or a
+        // network stack, whose settings reach the host's loopback and its
+        // listeners. The same profile loads under --profile, which trusts it.
         let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-restricted-refusals");
         let profile = dir.join("profile.toml");
         for (table, refused) in [
@@ -8234,6 +8493,10 @@ mod tests {
                 "[[mount]]\nkind = \"symlink\"\ntarget = \"/var/tmp/x.so\"\n\
                  path = \"/etc/ld.so.preload\"\n",
                 "a symbolic link",
+            ),
+            (
+                "[netstack]\nallow = [\"example.com:443\"]\n",
+                "[netstack] table is refused",
             ),
         ] {
             std::fs::write(&profile, format!("rootfs = \"/tmp\"\n{table}"))
@@ -10002,6 +10265,12 @@ mod tests {
         }
     }
 
+    /// The stack the `--netstack-*` flags in `options` compose with no
+    /// profile beneath them.
+    fn flags_stack(options: &Options) -> Result<NetStack, NetStackError> {
+        netstack_builder(options, NetStack::builder()).build()
+    }
+
     #[test]
     fn profile_flags_set_the_trust_mode() {
         // --profile loads fully trusted.
@@ -10052,7 +10321,7 @@ mod tests {
             Some((Ipv4Addr::new(192, 168, 5, 0), 24))
         );
         assert_eq!(options.netstack_mtu, Some(1400));
-        assert!(options.netstack_host_loopback);
+        assert_eq!(options.netstack_host_loopback, Some(true));
         assert_eq!(options.netstack_host_ports, [5432, 6379]);
         assert_eq!(
             options.netstack_publish,
@@ -10061,7 +10330,7 @@ mod tests {
                 ("[::1]:8443".parse().unwrap(), 443),
             ],
         );
-        netstack_from(&options).expect("the settings compose a stack");
+        flags_stack(&options).expect("the settings compose a stack");
     }
 
     #[test]
@@ -10196,9 +10465,9 @@ mod tests {
 
     #[test]
     fn every_netstack_setting_the_library_offers_has_a_flag_that_reaches_it() {
-        // The stack the flags describe is assembled by `netstack_from`, so
-        // driving that is what proves a flag reaches the builder rather than
-        // only reaching `Options`.
+        // The stack the flags describe is composed by `netstack_builder`, so
+        // reading its settings back is what proves a flag reaches the builder
+        // rather than only reaching `Options`.
         let options = parse_run(&[
             "--rootfs",
             "/r",
@@ -10219,10 +10488,20 @@ mod tests {
             options.netstack_cidr6,
             Some(("fd11:2233::".parse::<Ipv6Addr>().unwrap(), 64))
         );
-        assert!(options.netstack_no_ipv6);
-        assert!(!options.netstack_no_ipv4);
-        assert_eq!(options.netstack_interface.as_deref(), Some("eth9"));
-        netstack_from(&options).expect("the settings compose a stack");
+        let composed = netstack_builder(&options, NetStack::builder());
+        assert_eq!(
+            composed.get_ipv4_cidr(),
+            (Ipv4Addr::new(192, 168, 5, 0), 24)
+        );
+        assert_eq!(
+            composed.get_ipv6_cidr(),
+            ("fd11:2233::".parse::<Ipv6Addr>().unwrap(), 64)
+        );
+        assert!(composed.get_ipv4());
+        assert!(!composed.get_ipv6());
+        assert_eq!(composed.get_interface(), "eth9");
+        assert_eq!(composed.get_mtu(), 1400);
+        composed.build().expect("the settings compose a stack");
 
         // Both protocols off is the one combination the flags can name and the
         // stack has no answer for, and it is the library that says so.
@@ -10235,7 +10514,7 @@ mod tests {
             "/bin/true",
         ])
         .expect("a valid command line");
-        assert!(netstack_from(&neither).is_err());
+        assert!(flags_stack(&neither).is_err());
     }
 
     #[test]
@@ -10331,7 +10610,7 @@ mod tests {
             "192.0.2.53",
             "/bin/true",
         ]);
-        netstack_from(&options).expect("a stack asking that resolver");
+        flags_stack(&options).expect("a stack asking that resolver");
         // The library refuses an upstream for a nameserver turned off, and the
         // flags reach it as they stand.
         let options = run_options(&[
@@ -10343,7 +10622,7 @@ mod tests {
             "192.0.2.53",
             "/bin/true",
         ]);
-        let err = netstack_from(&options).expect_err("an upstream nothing asks");
+        let err = flags_stack(&options).expect_err("an upstream nothing asks");
         assert!(err.to_string().contains("turned off"), "{err}");
     }
 
@@ -10371,7 +10650,7 @@ mod tests {
             ["192.0.2.0/24", "tcp:[2001:db8::/32]:443"]
         );
         assert_eq!(written(&options.netstack_deny), ["192.0.2.7:22"]);
-        let stack = netstack_from(&options).expect("address rules compose a stack");
+        let stack = flags_stack(&options).expect("address rules compose a stack");
         assert!(stack.forwards(Transport::Tcp, "192.0.2.8:22".parse().unwrap()));
         assert!(!stack.forwards(Transport::Tcp, "192.0.2.7:22".parse().unwrap()));
         assert!(!stack.forwards(Transport::Udp, "[2001:db8::1]:443".parse().unwrap()));
@@ -10397,7 +10676,7 @@ mod tests {
                 "/bin/true",
             ])
         };
-        netstack_from(&run_options(&[
+        flags_stack(&run_options(&[
             "--rootfs",
             "/r",
             "--netstack",
@@ -10406,9 +10685,9 @@ mod tests {
             "/bin/true",
         ]))
         .expect("a name rule composes a stack");
-        netstack_from(&name_rule("--netstack-deny"))
+        flags_stack(&name_rule("--netstack-deny"))
             .expect("a deny name rule composes a stack without the nameserver");
-        let err = netstack_from(&name_rule("--netstack-allow"))
+        let err = flags_stack(&name_rule("--netstack-allow"))
             .expect_err("an allow name rule without a nameserver");
         assert!(err.to_string().contains("example.com"), "{err}");
         // And like every --netstack-* flag, each needs --netstack.

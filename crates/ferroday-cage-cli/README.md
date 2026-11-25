@@ -134,6 +134,10 @@ profiles](https://gregordinary.github.io/ferroday-cage/profiles.html#untrusted-p
 section links the list. Flags given alongside a profile override it, and each default-on
 toggle has a counterpart in both directions.
 
+A profile's `[netstack]` table configures the network stack `--netstack` attaches, in the
+library's `NetStackBuilder` format, and the `--netstack-*` flags compose with it. A
+restricted profile cannot carry one.
+
 ## Exit codes
 
 | Code | Meaning |

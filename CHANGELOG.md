@@ -121,6 +121,14 @@ consumer upgrading can skip it.
   `get_ipv6`, `get_ipv4_cidr`, `get_ipv6_cidr`, `get_mtu`, `get_interface`,
   `get_host_loopback`, `get_host_loopback_ports`, `get_publications`,
   `get_nameserver`, `get_upstream`, `get_allow` and `get_deny`.
+- An `fcage` profile's `[netstack]` table configures the network stack
+  `--netstack` attaches, in the stack's own profile format. The `--netstack-*`
+  flags compose with it: `--netstack-allow`, `--netstack-deny`,
+  `--netstack-host-port` and `--netstack-publish` extend its lists, and the
+  rest replace its settings, with the new counterparts `--netstack-ipv4`,
+  `--netstack-ipv6`, `--netstack-nameserver` and `--netstack-no-host-loopback`.
+  Without `--netstack` the table is unused, and `fcage` says so.
+  `--restricted-profile` refuses the table.
 
 ### Changed
 

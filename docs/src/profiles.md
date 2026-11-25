@@ -525,6 +525,15 @@ it:
   entries, and the argument's `index` written `arg=`, as in `--seccomp-allow-rule
   'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno` takes
   `SYSCALL=ERRNO`.
+- A `[netstack]` table configures the [native network
+  stack](userspace-networking.md#the-native-stack) that `--netstack` attaches,
+  in the stack's own format, which [`NetStackBuilder`] reads. Without
+  `--netstack` the table is unused, and `fcage` says so on standard error.
+  `--netstack-allow`, `--netstack-deny`, `--netstack-host-port` and
+  `--netstack-publish` extend its lists, and the other `--netstack-*` flags
+  replace its settings. The table is `fcage`'s. The library's sandbox format
+  has no `netstack` key, since a stack is attached to a launch rather than set
+  on its sandbox.
 
 ```sh
 # The profile's sandbox, its command replaced for one run:
@@ -538,8 +547,10 @@ fcage --profile build.toml --isolate-net
 raw mounts, share the host network, and share the host PID namespace. Load only
 a profile you trust. `--restricted-profile FILE` loads under the restricted
 policy instead, refusing what [Untrusted profiles](#untrusted-profiles)
-describes for a profile from an untrusted source. The root filesystem it names still
-grants access to that host subtree, so pass one you control.
+describes for a profile from an untrusted source. It refuses a `[netstack]`
+table too, whose settings reach the host's loopback and listen on its
+addresses. The root filesystem it names still grants access to that host
+subtree, so pass one you control.
 
 A profile is plain data: loading one performs no filesystem access and
 grants nothing by itself. Validation happens at `build`, launch behavior is
@@ -553,3 +564,4 @@ The same composition is available to any consumer, because a profile is a
 group-based launcher.
 
 [`RestrictedProfile`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictedProfile.html
+[`NetStackBuilder`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html

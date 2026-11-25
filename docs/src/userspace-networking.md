@@ -767,6 +767,17 @@ and `--netstack-host-loopback` maps the gateway address onto host `127.0.0.1`.
 or a workload where the other is unwanted; turning both off is refused, there
 being no stack left to attach.
 
+A profile's `[netstack]` table holds the same settings in the stack's own
+format, and `--netstack` attaches the stack it configures. The flags compose
+with it as with the rest of a profile, as [Profiles at the command
+line](profiles.md#profiles-at-the-command-line) sets out. A policy can
+therefore live in the profile beside the sandbox it bounds:
+
+```toml
+[netstack]
+allow = ["index.crates.io:443", "static.crates.io:443"]
+```
+
 `--netstack-upstream ADDRESS` has the nameserver ask another resolver, on port 53
 or on the port of an `ADDRESS:PORT`, and `--netstack-no-nameserver` turns the
 nameserver off. `--netstack-allow RULE` and `--netstack-deny RULE` give the

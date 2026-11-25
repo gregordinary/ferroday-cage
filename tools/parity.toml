@@ -360,20 +360,20 @@ why = "As the launch builder's."
 name = "stop_with_caller"
 flags = ["--stop-with-caller", "--no-stop-with-caller"]
 
-# The native network stack. Every setting has a flag; the builder's separate
-# serde document has no `--profile` of its own, because the flags say
-# everything it can.
+# The native network stack. Every setting has a flag, and a profile's
+# `[netstack]` table carries the builder's serde document, which the flags
+# compose with as they do with the rest of a profile.
 [[builder]]
 name = "NetStackBuilder"
 path = "ferroday_cage::NetStackBuilder"
 
 [[builder.setting]]
 name = "ipv4"
-flags = ["--netstack-no-ipv4"]
+flags = ["--netstack-no-ipv4", "--netstack-ipv4"]
 
 [[builder.setting]]
 name = "ipv6"
-flags = ["--netstack-no-ipv6"]
+flags = ["--netstack-no-ipv6", "--netstack-ipv6"]
 
 [[builder.setting]]
 name = "ipv4_cidr"
@@ -393,7 +393,7 @@ flags = ["--netstack-interface"]
 
 [[builder.setting]]
 name = "host_loopback"
-flags = ["--netstack-host-loopback"]
+flags = ["--netstack-host-loopback", "--netstack-no-host-loopback"]
 
 [[builder.setting]]
 name = "host_loopback_port"
@@ -405,7 +405,7 @@ flags = ["--netstack-publish"]
 
 [[builder.setting]]
 name = "nameserver"
-flags = ["--netstack-no-nameserver"]
+flags = ["--netstack-no-nameserver", "--netstack-nameserver"]
 
 [[builder.setting]]
 name = "upstream"
