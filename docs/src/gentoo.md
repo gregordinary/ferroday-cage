@@ -452,7 +452,9 @@ again against the newer root.
 
 The stanza order *is* the install order, which is where this format departs from
 the other two layers' plans. That order is a resolution's own output, a
-topological sort over runtime dependencies. A plan that lost it would have to
+topological sort over runtime dependencies, each package after what answers
+its atoms and the alternative chosen for each of its any-of groups. A plan that
+lost it would have to
 derive it again from the index the plan exists to avoid needing.
 
 ### What a merge writes, and what it does not run

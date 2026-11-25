@@ -525,6 +525,11 @@ consumer upgrading can skip it.
   with `ProvisionError::EntryRefused`. It was reported as
   `ProvisionError::EntryUnsafe`, an escape attempt, though a loop the archive
   laid down inside the tree reaches nothing outside it.
+- The Gentoo resolver orders a package after the builds that answer its any-of
+  runtime dependencies, as after those answering its plain ones. A group's
+  chosen alternative carried no ordering, so it could merge after the package
+  that needs it, which the order of merge ordinals, and what a wave that fails
+  part way leaves behind, then showed.
 
 ### Internal
 

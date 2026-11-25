@@ -423,11 +423,10 @@ struct Pending {
     /// Who asked for it, shared by every dependency one build states.
     wanted_by: Rc<str>,
     /// The chosen build whose merge this dependency orders, where it orders
-    /// one: a plain atom of that build's `RDEPEND`.
+    /// one: a plain atom or an any-of group of that build's `RDEPEND`, which
+    /// orders it after whatever answers the atom, or the group's alternative.
     ///
-    /// `None` for the caller's own atoms, for a `PDEPEND`, and for an any-of
-    /// group, whose alternatives were resolved as a choice rather than as a
-    /// requirement of the build that states them.
+    /// `None` for the caller's own atoms and for a `PDEPEND`.
     orders: Option<usize>,
     /// Whether it was held back until the rest of the queue was settled, which
     /// an any-of group holding a blocker is, once.
@@ -597,7 +596,9 @@ fn settle<'a>(
         }
         match &pending.dependency {
             Dependency::One(atom) => run.require(atom, &pending.wanted_by, pending.orders),
-            Dependency::AnyOf(alternatives) => run.any_of(alternatives, &pending.wanted_by),
+            Dependency::AnyOf(alternatives) => {
+                run.any_of(alternatives, &pending.wanted_by, pending.orders);
+            }
         }
     }
 
@@ -918,17 +919,19 @@ impl<'a> Resolution<'a> {
     ///
     /// `wanted_by` is the `CPV` of the build stating the group, since only a
     /// chosen build's dependencies are any-of groups, and a weak blocker does
-    /// not count against it.
+    /// not count against it. `orders` is that build where the group is one of
+    /// its runtime dependencies: it merges after the chosen builds that answer
+    /// the alternative the group is settled by, as after a plain atom's.
     ///
     /// A group can be as long as a dependency class, so the resolution's
     /// bounds are consulted atom by atom rather than only between groups.
-    fn any_of(&mut self, alternatives: &[Vec<Atom>], wanted_by: &Rc<str>) {
+    fn any_of(&mut self, alternatives: &[Vec<Atom>], wanted_by: &Rc<str>, orders: Option<usize>) {
         if let [only] = alternatives {
             for atom in only {
                 if self.stopped() {
                     return;
                 }
-                self.require(atom, wanted_by, None);
+                self.require(atom, wanted_by, orders);
             }
             return;
         }
@@ -947,6 +950,13 @@ impl<'a> Resolution<'a> {
                     return;
                 }
                 Some(true) => {
+                    for atom in together.iter().filter(installs) {
+                        let answered = self.held(atom);
+                        if self.stopped() {
+                            return;
+                        }
+                        self.order_after(orders, answered.flatten());
+                    }
                     self.keep_guarded(alternatives, wanted_by);
                     return;
                 }
@@ -994,7 +1004,7 @@ impl<'a> Resolution<'a> {
             }
             if answerable {
                 for atom in together.iter().filter(installs) {
-                    self.require(atom, wanted_by, None);
+                    self.require(atom, wanted_by, orders);
                 }
                 self.keep_guarded(alternatives, wanted_by);
                 return;
@@ -1060,11 +1070,10 @@ impl<'a> Resolution<'a> {
         let at = self.chosen.push(record.clone());
         self.needs.push(Vec::new());
         for dependency in runtime {
-            let orders = matches!(dependency, Dependency::One(_)).then_some(at);
             self.queue.push(Pending {
                 dependency,
                 wanted_by: Rc::clone(&wanted_by),
-                orders,
+                orders: Some(at),
                 held_back: false,
             });
         }
@@ -1865,7 +1874,8 @@ fn unserved(installed: &Installed, name: &str) -> String {
 /// Puts the chosen builds in an order each can be merged in.
 ///
 /// A topological sort over runtime dependencies alone, each build merging after
-/// the chosen builds that answered its `RDEPEND` atoms (`needs`). `PDEPEND` is
+/// the chosen builds that answered its `RDEPEND` atoms, and the alternative of
+/// each of its any-of groups that settled the group (`needs`). `PDEPEND` is
 /// left out on purpose: it is what portage satisfies *after* a package is
 /// merged, so it belongs to the closure and not to the order, and treating it
 /// as an edge would manufacture cycles the archive deliberately avoids.
@@ -2489,6 +2499,24 @@ USE: amd64
         assert_eq!(
             chosen(&resolved),
             ["app-test/consumer-1", "app-test/fallback-1"]
+        );
+        // And the group orders its build after the alternative that answers
+        // it, as a plain atom does, though the name order would put it first.
+        assert_eq!(
+            installing(&resolved),
+            ["app-test/fallback-1", "app-test/consumer-1"]
+        );
+        // As it does where a build chosen for something else already answers
+        // the alternative.
+        let (resolved, refusals) = run(
+            &root(&["app-test/blocked-1"]),
+            &["app-test/fallback", "app-test/consumer"],
+            &[],
+        );
+        assert!(refusals.is_empty(), "{}", refusals.describe());
+        assert_eq!(
+            installing(&resolved),
+            ["app-test/fallback-1", "app-test/consumer-1"]
         );
         // Without it, the blocker alone matches the group.
         let (resolved, refusals) = run(&root(&[]), &["app-test/consumer"], &[]);
