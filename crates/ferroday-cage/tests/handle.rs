@@ -39,6 +39,35 @@ fn a_deadline_expires_and_a_kill_ends_the_sandbox() {
 }
 
 #[test]
+fn a_supervisor_that_ended_before_a_kill_is_lost_rather_than_killed() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut running = common::shell(rootfs, "sleep 30")
+        .spawn()
+        .expect("the sandbox launches");
+    // The init ends by a signal the handle did not send, as the kernel's
+    // out-of-memory killer would end it: exited, whether or not whatever it
+    // was reparented to has collected it yet.
+    let pid = running.pid();
+    let init = rustix::process::Pid::from_raw(i32::try_from(pid).expect("a pid fits"))
+        .expect("a pid is not zero");
+    rustix::process::kill_process(init, Signal::KILL).expect("the init is signaled");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(common::process_state(pid), None | Some('Z')) {
+        assert!(Instant::now() < deadline, "the init outlived its kill");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    running
+        .kill()
+        .expect("a kill of an ended sandbox is no failure");
+    assert!(
+        matches!(running.wait(), Err(Error::SupervisorLost)),
+        "a kill that reached nothing is not the outcome"
+    );
+}
+
+#[test]
 fn a_kill_without_a_pid_namespace_reports_the_observed_status() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;

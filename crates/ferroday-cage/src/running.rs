@@ -791,8 +791,9 @@ impl<'obs> Running<'obs> {
     /// [`terminate`](Self::terminate), continue the stage as well.
     ///
     /// The killed outcome is reported as `signaled(SIGKILL)` once the signal
-    /// is delivered, and a signal that failed reports nothing, so it cannot
-    /// make a supervisor that died some other way read as killed. A
+    /// is delivered. A signal that failed reports nothing, and nor does one
+    /// that found the supervisor already exited, so neither can make a
+    /// supervisor that died some other way read as killed. A
     /// [`KillHandle`] killing from another thread while this handle waits is
     /// reported the same way: the wait reads whether a kill was delivered only
     /// once any kill in flight has been recorded, so it cannot see the death
@@ -2060,8 +2061,9 @@ fn send_control(control: &OwnedFd, request: &[u8]) -> Result<(), Error> {
 /// cgroup through `cgroup.kill` where the launch has one.
 ///
 /// A supervisor that already exited is not an error. The kill flag is raised
-/// only once the signal is known delivered, or moot, so an unexpected failure
-/// cannot fabricate a killed outcome. The cgroup reaches what the supervisor's
+/// only once the signal is known delivered to a supervisor that had not
+/// exited, so neither a failure nor a supervisor that ended some other way
+/// fabricates a killed outcome. The cgroup reaches what the supervisor's
 /// death does not: without a PID namespace, the descendants that left the
 /// command's process tree, whether the outcome is known yet or not.
 fn send_kill(
@@ -2099,25 +2101,35 @@ fn resume_stage(stage: Option<&OwnedFd>) {
 /// [`delivered`](Self::delivered) reads through the same lock. A waiter that
 /// has seen the supervisor die therefore waits out a kill another thread has
 /// in flight, and is never told that no kill was sent about a death that kill
-/// caused. A signal that failed records nothing, so it cannot make a
-/// supervisor that died some other way read as killed.
+/// caused. A signal that failed records nothing, and nor does one sent to a
+/// supervisor that had already exited, so neither can make a supervisor that
+/// died some other way read as killed.
 #[derive(Debug, Default)]
 struct KillRecord(Mutex<bool>);
 
 impl KillRecord {
-    /// Sends SIGKILL through `pidfd` and records it delivered. A process that
-    /// has already exited (`ESRCH`) counts as killed, since there is nothing
-    /// left for the signal to end.
+    /// Sends SIGKILL through `pidfd` and records it delivered.
+    ///
+    /// A process that has already exited is no failure, and records nothing:
+    /// the kill ended nothing, so the outcome is what the process reported
+    /// before it exited, or a lost supervisor where it reported none, as after
+    /// the kernel's out-of-memory killer. Its exit is asked of the pidfd before
+    /// the signal is sent, because a process that has exited and not been
+    /// reaped still accepts a signal, and one reaped answers `ESRCH`.
     fn send(&self, pidfd: &OwnedFd) -> Result<(), Errno> {
         let mut delivered = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if mechanism::has_exited(pidfd.as_fd()) {
+            return Ok(());
+        }
         match process::pidfd_send_signal(pidfd, Signal::KILL) {
-            Ok(()) | Err(Errno::SRCH) => {
+            Ok(()) => {
                 *delivered = true;
                 Ok(())
             }
+            Err(Errno::SRCH) => Ok(()),
             Err(errno) => Err(errno),
         }
     }
@@ -2468,5 +2480,45 @@ mod tests {
         drop(running);
         drop(copies);
         assert_eq!(collect.into_output(outcome, None).stdout, b"out");
+    }
+
+    #[test]
+    fn a_kill_is_recorded_only_where_it_reached_a_running_process() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Running: the kill is what ends it, and is recorded.
+        let mut running = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a process to kill");
+        let record = KillRecord::default();
+        record.send(&pidfd_of(&running)).expect("the kill is sent");
+        assert!(record.delivered());
+        let status = running.wait().expect("the process is reaped");
+        assert_eq!(status.signal(), Some(Signal::KILL.as_raw()));
+
+        // Exited and not yet reaped: it still accepts a signal, which ends
+        // nothing.
+        let mut exited = std::process::Command::new("true")
+            .spawn()
+            .expect("a process that exits");
+        let pidfd = pidfd_of(&exited);
+        assert!(
+            mechanism::exits_within(pidfd.as_fd(), Duration::from_secs(10)),
+            "the process exits"
+        );
+        let record = KillRecord::default();
+        record
+            .send(&pidfd)
+            .expect("a kill of an exited process is no failure");
+        assert!(!record.delivered());
+        assert!(exited.wait().expect("the process is reaped").success());
+
+        // Reaped: nothing is recorded either.
+        let record = KillRecord::default();
+        record
+            .send(&pidfd)
+            .expect("a kill of a reaped process is no failure");
+        assert!(!record.delivered());
     }
 }

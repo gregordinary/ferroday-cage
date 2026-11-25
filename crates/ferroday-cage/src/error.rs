@@ -1586,8 +1586,8 @@ pub enum Error {
     /// exits; its silent disappearance means it was killed from outside or
     /// exited abnormally, and the command's outcome is unknown. A kill
     /// requested through the handle is not this error: after
-    /// [`Running::kill`], the outcome is reported as termination by
-    /// `SIGKILL`.
+    /// [`Running::kill`] reaches a supervisor that had not exited, the
+    /// outcome is reported as termination by `SIGKILL`.
     ///
     /// [`Running::kill`]: crate::Running::kill
     SupervisorLost,

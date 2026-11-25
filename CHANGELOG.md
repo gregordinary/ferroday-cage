@@ -766,6 +766,10 @@ consumer upgrading can skip it.
   every thread the library starts: the thread that answers a launch's reported
   seccomp refusals and an `Interrupt`'s were missing, and the embedding chapter
   said a launch starts none.
+- A kill through a `Running` or a `KillHandle` that finds the supervisor
+  already exited records nothing, so a supervisor that ended some other way,
+  as by the kernel's out-of-memory killer, reads as `Error::SupervisorLost`.
+  It read as termination by `SIGKILL`.
 
 ### Internal
 
