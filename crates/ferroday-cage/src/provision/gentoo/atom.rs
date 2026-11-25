@@ -300,10 +300,7 @@ impl Atom {
     /// sub-slot" makes those atoms match nothing, which reads as an archive
     /// whose own packages cannot depend on each other.
     fn slot_matches(&self, candidate: &str) -> bool {
-        let (slot, subslot) = match candidate.split_once('/') {
-            Some((slot, subslot)) => (slot, subslot),
-            None => (candidate, candidate),
-        };
+        let (slot, subslot) = super::installed::slot_parts(candidate);
         match &self.slot {
             None | Some(SlotDep::Any) => true,
             Some(SlotDep::Slot(wanted)) => slot == wanted,

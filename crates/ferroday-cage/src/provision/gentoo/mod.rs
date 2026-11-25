@@ -204,6 +204,14 @@ pub(super) const DB_DIR: &str = "var/db/pkg";
 /// reissue an ordinal an entry already carries.
 pub(super) const COUNTER_FILE: &str = "COUNTER";
 
+/// The file inside a database entry naming the MD5 of the binary package it was
+/// merged from, where it was merged from one.
+///
+/// Here for the reason [`COUNTER_FILE`] is: [`vdb`] writes it, and
+/// [`installed`] reads it back to tell which build a replayed plan finds the
+/// root already holding.
+pub(super) const BINPKGMD5_FILE: &str = "BINPKGMD5";
+
 /// The metadata file in which a package states the phase functions its ebuild
 /// defines, space-separated without their `pkg_` or `src_` prefix.
 const DEFINED_PHASES_FILE: &str = "DEFINED_PHASES";
@@ -1122,8 +1130,8 @@ impl Gentoo {
             skipped: installed.skipped(),
         });
         // A plan is a caller saying what to install, so there is nothing to
-        // resolve and no index to fetch. What the root already has at the
-        // version the plan names is not installed again, as a resolution would
+        // resolve and no index to fetch. What the root already holds as the
+        // build the plan names is not installed again, as a resolution would
         // not install it; the rest is held to the root once the containers say
         // what they are, which only the install wave reads.
         if let Some(plan) = &self.plan {
@@ -4698,12 +4706,18 @@ mod tests {
 
     #[test]
     fn a_plan_replayed_over_a_root_that_has_its_package_installs_nothing() {
-        // What the root has at the version the plan names is done, as an atom
-        // the root answers is done: nothing is fetched or merged.
+        // What the root holds as the very build the plan names is done, as an
+        // atom the root answers is done: nothing is fetched or merged.
         let scratch = Scratch::for_test("gentoo", "replay-installed");
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let root = supplied_root(&scratch, "root");
-        registered(&root, "sys-libs", "zlib-1.3.2", "0/1", &[]);
+        registered(
+            &root,
+            "sys-libs",
+            "zlib-1.3.2",
+            "0/1",
+            &[("USE", "minizip amd64\n")],
+        );
         let mut gentoo = provisioner(&key, Box::new(Unreachable::default()));
         // No container is read, so the digest the plan records is never asked.
         gentoo.plan = Some(plan_from(BINHOST, &[]));
@@ -4717,6 +4731,42 @@ mod tests {
             .resolve_packages(&root)
             .expect("the preview reads the root");
         assert!(preview.packages.is_empty(), "{:?}", preview.packages);
+    }
+
+    #[test]
+    fn a_plan_replayed_over_another_build_of_its_version_is_refused() {
+        // The root holds zlib 1.3.2 in the plan's slot, built without the
+        // `minizip` the plan's build has: the version alone is not the build,
+        // so the replay refuses it as occupied rather than report the plan
+        // installed over a build it does not record.
+        let scratch = Scratch::for_test("gentoo", "replay-other-build");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let root = supplied_root(&scratch, "root");
+        registered(
+            &root,
+            "sys-libs",
+            "zlib-1.3.2",
+            "0/1",
+            &[("USE", "amd64\n")],
+        );
+        let err = installing(
+            &key,
+            BINHOST,
+            container(&key, gpkg::fixture::Built::ordinary()),
+            &scratch.join("cache"),
+        )
+        .install_wave(&root, None, &mut Silent)
+        .expect_err("the slot holds another build");
+        assert!(
+            ErrorChain::new(&err)
+                .to_string()
+                .contains("would occupy slot \"0\""),
+            "{err}",
+        );
+        assert!(
+            !root.join("usr/lib/libz.so.1.3.2").exists(),
+            "nothing merged"
+        );
     }
 
     #[test]

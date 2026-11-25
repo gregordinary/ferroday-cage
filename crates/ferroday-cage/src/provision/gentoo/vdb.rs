@@ -64,7 +64,7 @@ use std::path::Path;
 
 use super::gpkg::{IMAGE_DIR, Package};
 use super::plan::PlannedPackage;
-use super::{COUNTER_FILE, DB_DIR, GentooError, MAX_CONTENTS_ENTRIES};
+use super::{BINPKGMD5_FILE, COUNTER_FILE, DB_DIR, GentooError, MAX_CONTENTS_ENTRIES};
 use crate::path;
 use crate::provision::ProvisionError;
 use crate::provision::digest;
@@ -83,10 +83,10 @@ const ROOT_COUNTER: &str = "var/cache/edb/counter";
 /// written to is refused here rather than read into memory.
 const MAX_COUNTER_BYTES: u64 = 64;
 
-/// Two of the three files a merge writes that the container does not carry.
-/// The third is [`COUNTER_FILE`], which a root's reader reads back.
+/// One of the three files a merge writes that the container does not carry.
+/// The other two are [`COUNTER_FILE`] and [`BINPKGMD5_FILE`], which a root's
+/// reader reads back.
 const CONTENTS_FILE: &str = "CONTENTS";
-const BINPKGMD5_FILE: &str = "BINPKGMD5";
 
 /// One installed path, as the merge laid it down.
 ///

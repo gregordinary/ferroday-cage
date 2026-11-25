@@ -374,6 +374,12 @@ consumer upgrading can skip it.
   directory or a named pipe. It read the bytes the record counted as the next
   header, where GNU `tar` skips them, so a member GNU `tar` never sees was
   extracted.
+- A replayed Gentoo plan skips a package only where the root holds the build
+  it names: the version, the slot and sub-slot, the USE flags, and the
+  container where the root's entry records one. It skipped any package the
+  root held at the version, so a replay over a root holding the same version
+  built with other flags installed nothing for it and reported the plan
+  installed. Another build of the version is now refused as occupying its slot.
 
 ### Internal
 

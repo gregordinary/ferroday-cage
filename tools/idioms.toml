@@ -230,15 +230,16 @@ has accepted it as two segments of a mirror URL."""
 path = "crates/ferroday-cage/src/provision/gentoo/installed.rs"
 count = 1
 why = """\
-Not a path: `slot_of` takes the slot out of a `slot/subslot` value."""
+Not a path: `slot_parts` takes the slot and the sub-slot out of a \
+`slot/subslot` value, for `slot_of`, an atom's slot dependency and a replayed \
+plan alike."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/gentoo/atom.rs"
-count = 3
+count = 2
 why = """\
-Not paths: a package's `category/name`, and a slot's `slot/subslot` in a \
-candidate and in a slot dependency, each in the package manager \
-specification's own grammar."""
+Not paths: a package's `category/name`, and a slot dependency's \
+`slot/subslot`, each in the package manager specification's own grammar."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/gentoo/gpkg.rs"

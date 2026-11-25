@@ -518,7 +518,7 @@ report name a package and its version bare.
 | Which `apk-tools` do an Alpine root's repositories offer, and is it the release the resolution's rules were measured against? | `provision::alpine::apk_tools_of`, over ferrata's `Dialect::for_release` |
 | What does a Gentoo root already have installed? | `provision::gentoo::installed` |
 | Which targets does a Gentoo root accept a binary package built for? | `provision::gentoo::Installed::targets`, held by `gpkg::check_target` |
-| Which slot does a `slot/subslot` value name? | `provision::gentoo::installed::slot_of` |
+| Which slot does a `slot/subslot` value name, and which sub-slot? | `provision::gentoo::installed::slot_of`, and `installed::slot_parts` for both, the sub-slot being the slot where none is stated |
 | Where does a Gentoo `name-version` end its name? | `provision::gentoo::version::version_hyphen` |
 | What did one resolution refuse, and how does it read? | `provision::gentoo::resolve::Refusals`, `debian::resolve::Refusals` |
 | What does a finished root not keep of the bootstrap that built it? | `provision::debian::bootstrap::clear_run_state`, `alpine::bootstrap::clear_run_state` |

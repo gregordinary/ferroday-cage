@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use super::atom::{self, Atom, Candidate, Dependency};
 use super::index::{self, MAX_FLAGS_BYTES, MAX_SLOT_BYTES};
 use super::version;
-use super::{COUNTER_FILE, DB_DIR, GentooError};
+use super::{BINPKGMD5_FILE, COUNTER_FILE, DB_DIR, GentooError};
 use crate::provision::rooted::{AncestorLink, Merged, Rooted, merged_lookup};
 
 /// The file inside an entry naming its slot.
@@ -165,6 +165,13 @@ pub struct InstalledPackage {
     /// binary package merged into the root is held to, through
     /// [`Installed::targets`].
     chost: Option<String>,
+    /// The MD5 of the binary package it was merged from, lowercase hex, from
+    /// its `BINPKGMD5` file, where it was merged from one.
+    ///
+    /// Not exposed, for the reason [`counter`](Self::counter) is not: the one
+    /// question asked of it is whether the root already holds the build a
+    /// replayed plan names; see [`resolve::missing`](super::resolve::missing).
+    container_md5: Option<String>,
 }
 
 impl InstalledPackage {
@@ -191,6 +198,12 @@ impl InstalledPackage {
     /// The USE flags the package was built with.
     pub fn use_flags(&self) -> impl Iterator<Item = &str> {
         self.use_flags.split_ascii_whitespace()
+    }
+
+    /// The MD5 of the binary package it was merged from, where the entry
+    /// records one.
+    pub(super) fn container_md5(&self) -> Option<&str> {
+        self.container_md5.as_deref()
     }
 
     /// The blockers the package's runtime dependencies state.
@@ -345,10 +358,24 @@ impl Installed {
                     guards: Vec::new(),
                     counter: None,
                     chost: None,
+                    container_md5: None,
                 })
                 .collect(),
             0,
         )
+    }
+
+    /// The same set, with the package published under `name` recording that
+    /// it was merged from the container whose MD5 is `md5`.
+    #[cfg(test)]
+    pub(super) fn merged_from(mut self, name: &str, md5: &str) -> Installed {
+        let package = self
+            .packages
+            .iter_mut()
+            .find(|package| package.name == name)
+            .expect("the fixture root holds the package");
+        package.container_md5 = Some(md5.to_string());
+        self
     }
 
     /// The same set, with the package published under `name` stating
@@ -829,6 +856,9 @@ fn read_package<E>(
         guards,
         counter: field(COUNTER_FILE)?.and_then(|text| text.parse().ok()),
         chost: field(CHOST_FILE)?.filter(|chost| !chost.is_empty()),
+        container_md5: field(BINPKGMD5_FILE)?
+            .filter(|md5| !md5.is_empty())
+            .map(|md5| md5.to_ascii_lowercase()),
     };
     Ok((package, requires))
 }
@@ -911,7 +941,18 @@ pub(super) fn merged(lower: &Path, upper: &Path) -> Result<Installed, GentooErro
 /// guard — where a question about what a dependent was built against reads the
 /// value whole.
 pub(super) fn slot_of(slot: &str) -> &str {
-    slot.split_once('/').map_or(slot, |(slot, _)| slot)
+    slot_parts(slot).0
+}
+
+/// The slot and the sub-slot a `slot/subslot` value names, the sub-slot being
+/// the slot itself where none is stated.
+///
+/// The format makes an absent sub-slot implicitly the slot, and the archive
+/// relies on it: `dev-db/sqlite` publishes `SLOT: 3` and is depended on as
+/// `:3/3=`. Every question about the sub-slot asks through this, an atom's
+/// slot dependency and a replayed plan's build among them.
+pub(super) fn slot_parts(slot: &str) -> (&str, &str) {
+    slot.split_once('/').unwrap_or((slot, slot))
 }
 
 #[cfg(test)]

@@ -98,12 +98,12 @@
 //! refusal copies out of a record.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::rc::Rc;
 
 use super::atom::{self, Atom, Blocker, Candidate, Dependency, Unmet};
 use super::index::{Index, Record};
-use super::installed::{Installed, InstalledPackage, slot_of};
+use super::installed::{Installed, InstalledPackage, slot_of, slot_parts};
 use super::plan::PlannedPackage;
 use super::version;
 
@@ -1487,25 +1487,48 @@ impl Build for Arriving {
 }
 
 /// The packages of a plan that replaying it over `installed` would install:
-/// every one but those the root already has at exactly the version named.
+/// every one but those the root already holds as the very build named.
 ///
 /// A plan names the builds a resolution chose against one root, and it is
 /// replayed over another -- normally a newer stage3, since the autobuilds tree
-/// keeps a build about five weeks. The resolver's first question of an atom is
-/// whether the root answers it already, and a package the root holds at the
-/// plan's own version answers the plan's, so it is skipped as a resolution
-/// would skip it.
+/// keeps a build about five weeks. A package the root holds as the plan's own
+/// build is skipped, as a resolution would skip it. That is the version named,
+/// in the slot and sub-slot named, built with exactly the flags named, and
+/// merged from the container named where the entry records which.
+///
+/// A package the root holds at the version but as another build is kept, so
+/// the replay's slot check refuses it as occupied and names both. Skipping it
+/// would leave the root holding a build the plan does not record, built with
+/// other flags and so depending on other packages, while the replay reported
+/// that it had installed the plan.
 pub(super) fn missing(installed: &Installed, planned: &[PlannedPackage]) -> Vec<PlannedPackage> {
     planned
         .iter()
         .filter(|planned| {
-            !installed.under(&planned.name).any(|held| {
-                version::compare(held.version(), &planned.version)
-                    == Some(std::cmp::Ordering::Equal)
-            })
+            !installed
+                .under(&planned.name)
+                .any(|held| holds_build(held, planned))
         })
         .cloned()
         .collect()
+}
+
+/// Whether `held` is the build `planned` names; see [`missing`].
+///
+/// A slot without a sub-slot has one all the same, the slot itself, as an
+/// atom reads it, and flags are compared as sets, whatever order or repetition
+/// each spells them in.
+fn holds_build(held: &InstalledPackage, planned: &PlannedPackage) -> bool {
+    version::compare(held.version(), &planned.version) == Some(std::cmp::Ordering::Equal)
+        && slot_parts(held.slot()) == slot_parts(&planned.slot)
+        && held.use_flags().collect::<BTreeSet<_>>()
+            == planned
+                .use_flags
+                .split_ascii_whitespace()
+                .collect::<BTreeSet<_>>()
+        && held
+            .container_md5()
+            .is_none_or(|md5| md5.eq_ignore_ascii_case(&planned.md5))
 }
 
 /// Holds the builds a replayed plan names to the root they are about to be
@@ -3307,20 +3330,68 @@ USE: amd64 compat
     }
 
     #[test]
-    fn a_replayed_plan_skips_what_the_root_has_at_the_version_it_names() {
+    fn a_replayed_plan_skips_only_the_builds_the_root_holds() {
         let plan = Plan::project("amd64", "x86-64", None, archive().records());
-        let root = root(&["sys-libs/zlib-1.3.2", "dev-vcs/git-2.54.0"]);
-        let missing: Vec<String> = missing(&root, &plan.packages)
-            .iter()
-            .map(|planned| format!("{}-{}", planned.name, planned.version))
-            .collect();
-        // zlib 1.3.2 is skipped and 1.3.1 is not: one version of a package is
-        // not another. Both builds of git 2.54.0 are skipped, since the root
-        // records a version and not which build it came from.
-        assert!(!missing.contains(&"sys-libs/zlib-1.3.2".to_string()));
-        assert!(missing.contains(&"sys-libs/zlib-1.3.1".to_string()));
-        assert!(!missing.iter().any(|cpv| cpv.starts_with("dev-vcs/git")));
-        assert_eq!(missing.len(), plan.packages.len() - 3);
+        let build = |name: &str, version: &str, build_id: u64| {
+            plan.packages
+                .iter()
+                .find(|planned| {
+                    planned.name == name
+                        && planned.version == version
+                        && planned.build_id == build_id
+                })
+                .expect("the fixture plan names the build")
+        };
+        let (zlib, git) = (
+            build("sys-libs/zlib", "1.3.2", 1),
+            build("dev-vcs/git", "2.54.0", 8),
+        );
+        let held = |planned: &PlannedPackage, slot: &str, use_flags: &str| {
+            (
+                planned.name.clone(),
+                planned.version.clone(),
+                slot.to_string(),
+                use_flags.to_string(),
+            )
+        };
+        let named = |planned: &PlannedPackage| {
+            format!(
+                "{}-{} build {}",
+                planned.name, planned.version, planned.build_id
+            )
+        };
+        let skipped = |root: &Installed| -> Vec<String> {
+            let missing = missing(root, &plan.packages);
+            plan.packages
+                .iter()
+                .filter(|planned| !missing.contains(planned))
+                .map(named)
+                .collect()
+        };
+        // The root holds zlib 1.3.2 and one build of git 2.54.0 exactly as the
+        // plan names them, the flags spelled in another order: those two are
+        // skipped, and git's other build, with other flags, is not.
+        let reordered: String = git.use_flags.split(' ').rev().collect::<Vec<_>>().join(" ");
+        let root = Installed::of(vec![
+            held(zlib, &zlib.slot, &zlib.use_flags),
+            held(git, &git.slot, &reordered),
+        ]);
+        assert_eq!(skipped(&root), [named(git), named(zlib)]);
+        // The version alone is not the build: another sub-slot, other flags,
+        // or another container recorded, and nothing is skipped.
+        let elsewhere = format!("{}/elsewhere", slot_of(&zlib.slot));
+        for root in [
+            Installed::of(vec![held(zlib, &elsewhere, &zlib.use_flags)]),
+            Installed::of(vec![held(zlib, &zlib.slot, "minizip static-libs")]),
+            Installed::of(vec![held(zlib, &zlib.slot, &zlib.use_flags)])
+                .merged_from("sys-libs/zlib", "00000000000000000000000000000000"),
+        ] {
+            assert!(skipped(&root).is_empty());
+        }
+        // The container the plan names, recorded, is the build.
+        let root = Installed::of(vec![held(zlib, &zlib.slot, &zlib.use_flags)])
+            .merged_from("sys-libs/zlib", &zlib.md5);
+        assert_eq!(skipped(&root), [named(zlib)]);
     }
 
     #[test]

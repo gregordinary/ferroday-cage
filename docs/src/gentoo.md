@@ -434,8 +434,10 @@ A plan is normally replayed over a newer root than it was resolved against,
 since a stage3 build leaves the archive in five weeks. So the replay is held to
 the root it installs into:
 
-- A package the root already has at the version the plan names is skipped, as a
-  resolution would skip it.
+- A package the root already holds as the build the plan names is skipped, as a
+  resolution would skip it. That is the same version, slot and sub-slot, and
+  USE flags, and the same container where the root's entry records one. Another
+  build of the same version is refused below as occupying the slot.
 - The rest are verified before anything is merged. Each one's own signed
   metadata, which its plan entry is held to, is what the checks below read.
 - A package whose slot the root or an earlier entry already holds is refused, as
