@@ -511,6 +511,50 @@ fn terminating_a_started_sandbox_ends_it_once_nothing_is_left() {
 }
 
 #[test]
+fn a_signal_reaches_a_further_command_and_every_process_of_a_started_sandbox() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let usr1 = rustix::process::Signal::USR1.as_raw();
+    let trapping = |code: u8, ready: &str| {
+        Exec::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("trap 'exit {code}' USR1; echo > {ready}; sleep 86399 & wait $!"),
+            ])
+            .stop_with_caller(true)
+    };
+    let mut sandbox = session(rootfs).start().expect("the sandbox starts");
+
+    // A further command's handle signals that command.
+    let mut further = sandbox
+        .exec(&trapping(5, "/tmp/first"))
+        .expect("the further command launches");
+    let (status, _) = exec_script(&sandbox, "while [ ! -s /tmp/first ]; do sleep 0.01; done");
+    assert!(status.success());
+    further.signal(usr1).expect("the signal is sent");
+    let status = common::outcome_within(&mut further, PATIENCE);
+    assert_eq!(status.code(), Some(5), "{status:?}");
+
+    // The started sandbox's handle signals every process of it, and the
+    // sandbox holds once they are gone.
+    let mut further = sandbox
+        .exec(&trapping(6, "/tmp/second"))
+        .expect("the further command launches");
+    let (status, _) = exec_script(&sandbox, "while [ ! -s /tmp/second ]; do sleep 0.01; done");
+    assert!(status.success());
+    sandbox.signal(usr1).expect("the signal is sent");
+    let status = common::outcome_within(&mut further, PATIENCE);
+    assert_eq!(status.code(), Some(6), "{status:?}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(sandbox.try_wait().expect("the handle polls"), None);
+    let (status, out) = exec_script(&sandbox, "echo again");
+    assert!(status.success() && out == "again\n", "{status:?}: {out}");
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+}
+
+#[test]
 fn dropping_a_tied_started_sandboxs_handle_ends_it() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;

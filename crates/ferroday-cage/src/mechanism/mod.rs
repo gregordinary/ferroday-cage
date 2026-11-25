@@ -116,7 +116,7 @@ pub(crate) mod sys;
 pub(crate) use harden::probe_landlock_abi;
 
 pub(crate) use cgroup::{JoinProbe, probe_cgroup_join};
-pub(crate) use child::CONTROL_TERMINATE;
+pub(crate) use child::{CONTROL_SIGNAL, CONTROL_TERMINATE};
 pub(crate) use copyin::{
     COPY_DIR, COPY_END, COPY_FIFO, COPY_FILE, COPY_LEAVE, COPY_LINK, COPY_OWN, COPY_SYMLINK,
     CopyFailure, start_copy_in,

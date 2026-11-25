@@ -87,11 +87,15 @@ means the command is executing.
 - **`terminate()`** requests a graceful stop: the supervisor delivers
   `SIGTERM` to the command process, which may trap it, clean up, or ignore
   it.
+- **`signal(number)`** delivers another signal the same way, such as the
+  `SIGINT` a program forwards from its own terminal. It takes the signals the
+  kernel names and refuses a real-time signal, since a libc keeps some of
+  those for itself.
 - **`kill()`** ends the sandbox: `SIGKILL` to the supervisor through a
   pidfd — immune to pid reuse — which, as namespace init, takes the whole
   namespace with it. Nothing inside survives.
-- **`kill_handle()`** returns a detached handle that can terminate or kill
-  from another thread while one blocks in a wait.
+- **`kill_handle()`** returns a detached handle that can terminate, signal or
+  kill from another thread while one blocks in a wait.
 - **`usage()`** reports, once a wait has returned the outcome, the processor
   time and peak memory the command and its descendants used. See
   [Resource usage](#resource-usage).
@@ -205,7 +209,8 @@ streams, and needs a PID namespace.
 
 [`terminate`] sends `SIGTERM` to every process of such a sandbox, which ends
 once none is left. Its wait then reports an exit code of 0. A process that
-ignores the request keeps it up until a [`kill`]. [`Cage::start_pending`] holds
+ignores the request keeps it up until a [`kill`]. A [`signal`] reaches every
+process of it too, and the sandbox holds once they are gone. [`Cage::start_pending`] holds
 the sandbox at the gate, so a network stack attaches before the handle is given
 out, as it does for a pending launch.
 
@@ -326,6 +331,7 @@ peak below the caller's own is therefore not one the field can show.
 [`run`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.run
 [`spawn`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.spawn
 [`terminate`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.terminate
+[`signal`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.signal
 [`kill`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.kill
 [`Running::usage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.usage
 [`ResourceUsage`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.ResourceUsage.html

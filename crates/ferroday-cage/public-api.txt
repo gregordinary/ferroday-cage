@@ -3067,6 +3067,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Identity
 pub struct ferroday_cage::KillHandle
 impl ferroday_cage::KillHandle
 pub fn ferroday_cage::KillHandle::kill(&self) -> core::result::Result<(), ferroday_cage::Error>
+pub fn ferroday_cage::KillHandle::signal(&self, i32) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::KillHandle::terminate(&self) -> core::result::Result<(), ferroday_cage::Error>
 impl core::marker::Freeze for ferroday_cage::KillHandle
 impl core::marker::Send for ferroday_cage::KillHandle
@@ -3621,6 +3622,7 @@ pub fn ferroday_cage::Running<'obs>::exec_with<'o>(&self, &ferroday_cage::Exec, 
 pub fn ferroday_cage::Running<'obs>::kill(&mut self) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::kill_handle(&self) -> core::result::Result<ferroday_cage::KillHandle, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::pid(&self) -> u32
+pub fn ferroday_cage::Running<'obs>::signal(&mut self, i32) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::take_seccomp_reports(&mut self) -> core::option::Option<ferroday_cage::Reports<ferroday_cage::SeccompReport>>
 pub fn ferroday_cage::Running<'obs>::terminate(&mut self) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::try_wait(&mut self) -> core::result::Result<core::option::Option<ferroday_cage::ExitStatus>, ferroday_cage::Error>

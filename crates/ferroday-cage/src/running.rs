@@ -22,8 +22,8 @@ use crate::error::{ConfigError, Error, ListenRefusal, SetupStep};
 use crate::exec::Exec;
 use crate::mechanism::netns::{self, ListenFailure, Namespaces};
 use crate::mechanism::{
-    self, CONTROL_TERMINATE, CreatedTarget, LaunchPlan, ManagedPlaceholders, MountOp,
-    STATUS_RECORD_LEN, wait_syscall_error,
+    self, CONTROL_SIGNAL, CONTROL_TERMINATE, CreatedTarget, LaunchPlan, ManagedPlaceholders,
+    MountOp, STATUS_RECORD_LEN, wait_syscall_error,
 };
 use crate::observer::{Collect, Observer, Output};
 use crate::poll;
@@ -743,6 +743,31 @@ impl<'obs> Running<'obs> {
     /// termination of a sandbox that has already exited is not an error.
     pub fn terminate(&mut self) -> Result<(), Error> {
         send_terminate(&self.control, self.reap.as_ref())
+    }
+
+    /// Delivers `signal` to the command, as [`terminate`](Self::terminate)
+    /// delivers `SIGTERM`.
+    ///
+    /// `signal` is a signal's number, as [`ExitStatus::signal`] reports one,
+    /// and one of the signals the kernel names: `SIGINT` is 2, `SIGHUP` 1. A
+    /// real-time signal is refused, since a libc keeps some of them for its own
+    /// use and which ones differs between libcs.
+    ///
+    /// The signal reaches the command's process alone, not the processes it
+    /// started, as a termination does. It travels through the sandbox's
+    /// supervisor, since a PID namespace's init receives from outside the
+    /// namespace only the signals it handles. For a sandbox started with no
+    /// command of its own, by [`Cage::start`](crate::Cage::start), every process
+    /// of the sandbox is sent it, and the sandbox holds once they are gone,
+    /// where a termination would end it. Signaling a sandbox that has already
+    /// exited is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Signal`] where `signal` names none of the signals the kernel
+    /// names, with `EINVAL` beneath it, or where the request cannot be sent.
+    pub fn signal(&mut self, signal: i32) -> Result<(), Error> {
+        send_signal(&self.control, self.reap.as_ref(), signal)
     }
 
     /// Kills the sandbox: SIGKILL to the supervisor.
@@ -1586,6 +1611,15 @@ impl KillHandle {
         send_terminate(&self.control, self.stage.as_ref())
     }
 
+    /// Delivers a signal to the command. See [`Running::signal`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Running::signal`].
+    pub fn signal(&self, signal: i32) -> Result<(), Error> {
+        send_signal(&self.control, self.stage.as_ref(), signal)
+    }
+
     /// Kills the sandbox: SIGKILL to the supervisor. See [`Running::kill`],
     /// including how a wait on another thread reports it.
     pub fn kill(&self) -> Result<(), Error> {
@@ -1995,11 +2029,27 @@ fn check_terminal_composes(plan: &LaunchPlan) -> Result<(), Error> {
     Ok(())
 }
 
-/// Sends the termination request byte; a sandbox that already exited took
-/// its socket end with it, which is not an error.
+/// Sends the termination request.
 fn send_terminate(control: &OwnedFd, stage: Option<&OwnedFd>) -> Result<(), Error> {
     resume_stage(stage);
-    match rustix::net::send(control, &[CONTROL_TERMINATE], SendFlags::NOSIGNAL) {
+    send_control(control, &[CONTROL_TERMINATE])
+}
+
+/// Sends the request that delivers `signal` to the command, refusing a number
+/// that names none of the signals the kernel names with `EINVAL`, as `kill`
+/// refuses one it does not know.
+fn send_signal(control: &OwnedFd, stage: Option<&OwnedFd>, signal: i32) -> Result<(), Error> {
+    let number = Signal::from_named_raw(signal)
+        .and_then(|signal| u8::try_from(signal.as_raw()).ok())
+        .ok_or_else(|| signal_error(Errno::INVAL))?;
+    resume_stage(stage);
+    send_control(control, &[CONTROL_SIGNAL, number])
+}
+
+/// Sends one request on the control socket. A sandbox that already exited
+/// took its socket end with it, which is not an error.
+fn send_control(control: &OwnedFd, request: &[u8]) -> Result<(), Error> {
+    match rustix::net::send(control, request, SendFlags::NOSIGNAL) {
         Ok(_) => Ok(()),
         Err(Errno::PIPE | Errno::CONNRESET | Errno::NOTCONN) => Ok(()),
         Err(errno) => Err(signal_error(errno)),

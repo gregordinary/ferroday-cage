@@ -2108,12 +2108,13 @@ enum Watch {
 ///
 /// Sleeps in one poll over the children's signal descriptor, the supervised
 /// process's pidfd, and the control socket. Control traffic is a termination
-/// request (SIGTERM to the command), a request to end the sandbox, or a hangup
-/// — the caller exited or dropped the last handle — which ends the sandbox the
-/// same way when `stop_with_caller` is set and is otherwise ignored; see
-/// [`end_sandbox`]. When the supervised process exits, its wait status
-/// goes out over the status pipe and the supervisor exits; as namespace init,
-/// that exit makes the kernel kill every remaining namespace member.
+/// request (SIGTERM to the command), a signal to deliver to the command, a
+/// request to end the sandbox, or a hangup — the caller exited or dropped the
+/// last handle — which ends the sandbox the same way when `stop_with_caller`
+/// is set and is otherwise ignored; see [`end_sandbox`]. When the supervised
+/// process exits, its wait status goes out over the status pipe and the
+/// supervisor exits; as namespace init, that exit makes the kernel kill every
+/// remaining namespace member.
 ///
 /// Every child's exit, stop, or continuation wakes the poll through
 /// `SIGCHLD`, so a zombie is collected as soon as it exits, an orphan that
@@ -2204,8 +2205,9 @@ fn supervise(
         }
 
         if ready(Watch::Control) {
-            let mut byte = [0u8; 1];
-            match rustix::io::read(context.control_fd, &mut byte) {
+            // Each request is one packet; a shorter one fills the front.
+            let mut request = [0u8; 2];
+            match rustix::io::read(context.control_fd, &mut request) {
                 // Hangup: every caller-side handle is gone. A hangup stays
                 // readable, so the socket is not polled again.
                 Ok(0) => {
@@ -2214,12 +2216,12 @@ fn supervise(
                     }
                     watch_control = false;
                 }
-                Ok(_) => match byte[0] {
+                Ok(read) => match (request[0], read) {
                     // Termination is a request to the command, not the
                     // namespace: SIGTERM is deliverable and trappable there,
                     // docker-stop style. ESRCH means it already exited; the
                     // wait below handles the rest.
-                    CONTROL_TERMINATE => match child {
+                    (CONTROL_TERMINATE, _) => match child {
                         Some(child) => {
                             let _ = process::kill_process(child, Signal::TERM);
                         }
@@ -2230,7 +2232,20 @@ fn supervise(
                             let _ = sys::kill_all(Signal::TERM);
                         }
                     },
-                    CONTROL_END => end_sandbox(role, child),
+                    // A signal is the command's too, forwarded as termination
+                    // is, since an init receives from outside its namespace
+                    // only the signals it has a handler for. It ends nothing
+                    // of the sandbox's own: with no command, every process is
+                    // sent it, and the sandbox holds once they are gone.
+                    (CONTROL_SIGNAL, 2) => {
+                        if let Some(signal) = Signal::from_named_raw(i32::from(request[1])) {
+                            let _ = match child {
+                                Some(child) => process::kill_process(child, signal),
+                                None => sys::kill_all(signal),
+                            };
+                        }
+                    }
+                    (CONTROL_END, _) => end_sandbox(role, child),
                     _ => {}
                 },
                 Err(Errno::INTR) => {}
@@ -2300,6 +2315,10 @@ fn supervise(
 
 /// The control-socket request byte for graceful termination.
 pub(crate) const CONTROL_TERMINATE: u8 = b'T';
+
+/// The control-socket request byte that delivers a signal to the command, the
+/// signal's number the request's second byte.
+pub(crate) const CONTROL_SIGNAL: u8 = b'S';
 
 /// The control-socket request byte that ends the sandbox, as a hangup does
 /// under [`stop_with_caller`](crate::CageBuilder::stop_with_caller).

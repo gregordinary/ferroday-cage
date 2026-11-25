@@ -7,7 +7,10 @@ use common::{Collect, process_exists, wait_gone};
 
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, Stdio};
+use ferroday_cage::{Cage, Error, Running, Stdio};
+use rustix::io::Errno;
+use rustix::pipe::{PipeFlags, pipe_with};
+use rustix::process::Signal;
 
 #[test]
 fn a_deadline_expires_and_a_kill_ends_the_sandbox() {
@@ -341,6 +344,99 @@ fn waits_are_fused_and_late_signals_are_not_errors() {
     running
         .terminate()
         .expect("terminating an exited sandbox is a no-op");
+    running
+        .signal(Signal::INT.as_raw())
+        .expect("signaling an exited sandbox is a no-op");
+}
+
+/// How long a test waits for an outcome it expects promptly.
+const PATIENCE: Duration = Duration::from_secs(30);
+
+/// Launches `script` under the fixture's shell, with a PID namespace or
+/// without, and returns once the script has written to its standard output, a
+/// pipe: a command whose traps are set, for a signal to find.
+fn ready_shell(rootfs: &std::path::Path, pid_namespace: bool, script: &str) -> Running<'static> {
+    let (ready, said) = pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+    let running = Cage::builder()
+        .rootfs(rootfs)
+        .pid_namespace(pid_namespace)
+        .stop_with_caller(true)
+        .stdout(Stdio::from_fd(said))
+        .command("/bin/sh")
+        .args(["-c", script])
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn()
+        .expect("the sandbox launches");
+    assert!(
+        common::readable_by(&ready, Instant::now() + PATIENCE),
+        "the script never said it was ready"
+    );
+    running
+}
+
+#[test]
+fn a_signal_reaches_the_command_through_its_supervisor() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // With a PID namespace the supervisor is the command's init, which takes
+    // from outside only the signals it handles; without one it is the launch
+    // stage. Either forwards the signal to the command.
+    let script = "trap 'kill $!; exit 3' INT; trap 'kill $!; exit 4' HUP; echo ready; \
+                  sleep 30 & wait $!";
+    for pid_namespace in [true, false] {
+        let mut running = ready_shell(rootfs, pid_namespace, script);
+        running
+            .signal(Signal::INT.as_raw())
+            .expect("the signal is sent");
+        let status = common::outcome_within(&mut running, PATIENCE);
+        assert_eq!(status.code(), Some(3), "PID namespace {pid_namespace}");
+
+        // A kill handle signals from wherever it is held.
+        let mut running = ready_shell(rootfs, pid_namespace, script);
+        let handle = running.kill_handle().expect("a kill handle is available");
+        std::thread::spawn(move || handle.signal(Signal::HUP.as_raw()))
+            .join()
+            .expect("the signaling thread finishes")
+            .expect("the signal is sent");
+        let status = common::outcome_within(&mut running, PATIENCE);
+        assert_eq!(status.code(), Some(4), "PID namespace {pid_namespace}");
+    }
+}
+
+#[test]
+fn a_signal_the_kernel_does_not_name_is_refused() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut running = common::sleeper(rootfs)
+        .spawn()
+        .expect("the sandbox launches");
+    let handle = running.kill_handle().expect("a kill handle is available");
+    // Zero asks after a process rather than signaling it, the real-time
+    // signals are a libc's as much as the command's, and the rest name none.
+    for number in [0, -1, 34, 64, 65, 256] {
+        for refused in [running.signal(number), handle.signal(number)] {
+            match refused {
+                Err(Error::Signal { source, .. }) => assert_eq!(
+                    source.raw_os_error(),
+                    Some(Errno::INVAL.raw_os_error()),
+                    "{number}"
+                ),
+                other => panic!("{number}: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        running
+            .wait_timeout(Duration::from_millis(100))
+            .expect("the wait completes"),
+        None,
+        "nothing reached the command"
+    );
+    running.kill().expect("the kill is delivered");
+    running.wait().expect("the outcome is collected");
 }
 
 #[test]

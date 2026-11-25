@@ -107,6 +107,12 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `Running::signal` and `KillHandle::signal` deliver a signal to the command by
+  its number, as `terminate` delivers `SIGTERM`: through the sandbox's
+  supervisor, to the command's process alone, and for a sandbox started with no
+  command to every process of it, which then holds. A number that names none of
+  the signals the kernel names, a real-time signal among them, is refused with
+  `Error::Signal`.
 - `fcage --serve SOCKET` starts the sandbox with no command and serves further
   commands in it on a unix socket it creates at `SOCKET`, mode 0600, in a
   directory only the caller's user can write, and removes once done. A program
