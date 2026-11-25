@@ -185,10 +185,12 @@ wire_enum! {
         AllocateTerminal = 56 => "allocating the sandbox's pseudoterminal",
         /// Hand the primary of the sandbox's pseudoterminal back to the caller.
         SendTerminal = 57 => "handing the sandbox's pseudoterminal to the caller",
-        /// Install the seccomp filter a sandbox with a network namespace of its
-        /// own carries, which refuses the routes out that the namespace does
-        /// not cover. See [`Network::Isolated`](crate::Network::Isolated).
-        InstallNetworkFilter = 58 => "installing the network namespace's seccomp filter",
+        /// Install the network filter, the seccomp filter a command carries
+        /// where its sandbox has a network namespace of its own or it is held
+        /// to Landlock's network rights, which refuses the routes out that the
+        /// namespace or the rights do not cover. See
+        /// [`Network::Isolated`](crate::Network::Isolated).
+        InstallNetworkFilter = 58 => "installing the network filter",
         /// Mount the tmpfs an empty root is made of, on top of the sandbox's
         /// inherited root. See [`CageBuilder::empty_rootfs`](crate::CageBuilder::empty_rootfs).
         MountEmptyRoot = 59 => "mounting the empty root",

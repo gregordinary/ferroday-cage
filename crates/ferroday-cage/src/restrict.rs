@@ -15,8 +15,10 @@
 //!   paths, but with no filesystem grant the command sees the entire host
 //!   filesystem;
 //! - a Landlock network grant restricts *TCP* bind and connect to the granted
-//!   ports, but leaves UDP, other socket families, and — with no network grant
-//!   — all networking unrestricted;
+//!   ports, and has the network filter refuse the Multipath TCP and SMC
+//!   sockets that would reach TCP services past it, but leaves UDP, other
+//!   socket families, and — with no network grant — all networking
+//!   unrestricted;
 //! - a seccomp filter restricts syscalls, but confines neither the filesystem
 //!   nor the network.
 //!
@@ -670,16 +672,23 @@ impl RestrictionBuilder {
     ///
     /// Configuring any grant — filesystem or network — enrolls the command in
     /// Landlock. A network grant governs TCP bind and connect only: the command
-    /// may bind only ports granted [`NetAccess::BIND`] and connect only to
-    /// ports granted [`NetAccess::CONNECT`], and every other TCP bind and
-    /// connect is denied. Because a restriction runs on the host, these grants
-    /// govern the command's access to the host network.
+    /// may bind a TCP socket only to ports granted [`NetAccess::BIND`] and
+    /// connect one only to ports granted [`NetAccess::CONNECT`], and every
+    /// other TCP bind and connect is denied. Because a restriction runs on the
+    /// host, these grants govern the command's TCP access to the host network.
     ///
-    /// Landlock's network rights confine TCP alone. UDP, raw sockets, and
-    /// other socket families are not restricted by a network grant, and a
-    /// restriction that must deny them needs a seccomp filter on the socket
-    /// syscalls. An abstract `AF_UNIX` socket, such as the session bus's or the
-    /// X server's, is the exception: the default
+    /// Landlock's network rights confine TCP sockets alone. A Multipath TCP or
+    /// an SMC socket falls back to TCP and so reaches every TCP service, and
+    /// no right governs it, so a restriction with a network grant runs its
+    /// command under the network filter, which refuses creating either, and
+    /// refuses `io_uring_setup` and x86's `socketcall`, which create sockets
+    /// out of a filter's sight. The filter needs seccomp, and a host that
+    /// cannot install it fails the launch at
+    /// [`SetupStep::InstallNetworkFilter`](crate::SetupStep::InstallNetworkFilter).
+    /// UDP, raw sockets, and other socket families are not restricted by a
+    /// network grant, and a restriction that must deny them needs a seccomp
+    /// filter on the socket syscalls. An abstract `AF_UNIX` socket, such as the
+    /// session bus's or the X server's, is the exception: the default
     /// [`landlock_scope`](Self::landlock_scope) confines connections to one.
     ///
     /// Network rights require Landlock ABI 4. A sandbox on an older kernel

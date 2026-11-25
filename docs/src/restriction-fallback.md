@@ -62,8 +62,14 @@ process that appears sandboxed.
 [`landlock_net`] grants TCP bind and connect on a named port. Configuring any
 grant — filesystem or network — enrolls the command in Landlock, so a
 restriction whose only grant is a network one denies every TCP bind and connect
-it did not name, and the filesystem stays open. It governs TCP alone: UDP, raw
-sockets, and other socket families, `AF_UNIX` among them, are untouched.
+it did not name, and the filesystem stays open. It governs TCP sockets alone:
+UDP, raw sockets, and other socket families, `AF_UNIX` among them, are
+untouched. A Multipath TCP or an SMC socket is not a TCP socket, and falls back
+to TCP with a peer that does not speak it, so a restriction with a network grant
+runs its command under [the network
+filter](how-the-sandbox-is-built.md#the-network-filter), which refuses creating
+either, as a cage's does. The filter is a seccomp filter, so such a restriction
+needs seccomp as well as Landlock.
 
 Network rights need Landlock ABI 4, where filesystem rights need only ABI 1. A
 sandbox narrows a network grant away on an older kernel, with its network
@@ -260,10 +266,12 @@ restriction with any Landlock grant at build, with
 one with a network grant the same way. A seccomp-only restriction runs on
 either, without the default scopes a kernel below ABI 6 cannot enforce. One
 that names its scopes is refused there instead, with
-[`ConfigError::LandlockScopeUnenforceable`]. [`host::landlock_abi`] reports the
-kernel's Landlock ABI, [`host::landlock_enforces_scope`] and its siblings whether
-the kernel enforces a scope or a right, and [`host::seccomp_available`] whether
-this process can install a seccomp filter.
+[`ConfigError::LandlockScopeUnenforceable`]. A restriction with a network grant
+installs the network filter, which a host that cannot install a seccomp filter
+fails at launch. [`host::landlock_abi`] reports the kernel's Landlock ABI,
+[`host::landlock_enforces_scope`] and its siblings whether the kernel enforces a
+scope or a right, and [`host::seccomp_available`] whether this process can
+install a seccomp filter.
 
 ## On the command line
 

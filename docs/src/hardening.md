@@ -100,9 +100,18 @@ let status = Cage::builder()
 [`NetAccess`] composes two primitives with `|`: `BIND` (bind a TCP socket to the
 port) and `CONNECT` (connect a TCP socket to the port). The example lets the
 command listen on 8080 and reach HTTPS services on 443, and denies every other
-bind and connect — enrolling a network grant denies all network access not
+TCP bind and connect — enrolling a network grant denies every TCP port not
 granted, exactly as a filesystem grant denies all paths not granted. A `BIND`
 grant on port `0` permits binding to a kernel-assigned ephemeral port.
+
+The rights govern TCP sockets and nothing else: UDP, `AF_UNIX`, and every other
+family are as open as the network the command runs on. A Multipath TCP or an
+SMC socket is not a TCP socket either, and falls back to TCP with a peer that
+does not speak it, so it would reach any TCP service. Wherever a network grant
+applies, the command therefore runs under [the network
+filter](how-the-sandbox-is-built.md#the-network-filter), which refuses creating
+either, and refuses the two routes that create sockets out of a filter's sight.
+The filter needs seccomp, under a host network as under an isolated one.
 
 Network rights arrive in Landlock ABI 4. On an older kernel that still offers
 Landlock they are narrowed away best-effort, the same downgrade an unsupported
@@ -354,8 +363,9 @@ at all.
 
 A sandbox with a network namespace of its own already carries a filter of the
 launch's own. It refuses vsock, io_uring, and socket creation through x86's
-`socketcall`, as [The network
-filter](how-the-sandbox-is-built.md#the-network-filter) describes. A policy here
+`socketcall`, and under a network grant Multipath TCP and SMC sockets, as [The
+network filter](how-the-sandbox-is-built.md#the-network-filter) describes. A
+restriction or a host-network sandbox carries it under a network grant. A policy here
 is installed after it. Where both refuse a syscall with an errno, the command
 sees the policy's. Under the curated policy, `io_uring_setup` therefore fails
 with `EPERM` rather than the network filter's `ENOSYS`.
@@ -827,9 +837,9 @@ configures it, rather than dropping the restrictions silently.
 
 ## Order and interaction
 
-A sandbox with a network namespace of its own installs the network filter first.
-It does so right after the command enters its nested user namespace, before
-anything on this page.
+A sandbox with a network namespace of its own, and a command under a network
+grant, installs the network filter first. It does so right after the command
+enters its nested user namespace, before anything on this page.
 
 The restrictions are applied to the command in a fixed order, wrapped around
 the identity switch: the securebits are locked (when a non-root identity keeps

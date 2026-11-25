@@ -9,7 +9,8 @@ tarball provisioner uses to confine extraction to its destination.
 
 The default network posture also needs seccomp filtering. A sandbox with a
 network namespace of its own installs a filter, which closes the routes out that
-the namespace does not cover. [The network
+the namespace does not cover. So does a sandbox or a restriction with a Landlock
+network grant, for the sockets the grant does not govern. [The network
 filter](how-the-sandbox-is-built.md#the-network-filter) describes it.
 
 A kernel built without `CONFIG_SECCOMP_FILTER` fails such a launch at
@@ -19,7 +20,8 @@ profile refuses the `seccomp` syscall.
 reports whether this process can install a filter. It installs one in a
 short-lived child, so it answers for both cases. A Debian or Alpine bootstrap
 runs its packages' scripts in such sandboxes, and asks the same before it
-downloads anything. `Network::Host` installs no network filter.
+downloads anything. `Network::Host` installs no network filter unless a
+Landlock network grant applies.
 
 Any launch, a restriction's included, installs a second filter where the kernel
 refuses it a session keyring of its own: on a kernel built without key support,
@@ -264,7 +266,8 @@ An i386 userland runs on an amd64 host as it would on its own, with two
 exceptions:
 
 - **Sockets under the network filter.** Under a network posture with a
-  namespace of its own, a 32-bit program built against glibc creates no socket.
+  namespace of its own, or a Landlock network grant, a 32-bit program built
+  against glibc creates no socket.
   That C library creates every socket through `socketcall`, which [the network
   filter](how-the-sandbox-is-built.md#the-network-filter) refuses with
   `EAFNOSUPPORT`, the answer for an address family the kernel does not offer. A

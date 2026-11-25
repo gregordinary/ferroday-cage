@@ -27,6 +27,23 @@ consumer upgrading can skip it.
 
 ### Security
 
+- **Breaking.** Wherever a Landlock network grant applies, in a sandbox under
+  any network and in a restriction, the command runs under the network filter,
+  which refuses creating a Multipath TCP socket (`IPPROTO_MPTCP` in `AF_INET`
+  or `AF_INET6`) with `EPROTONOSUPPORT`, and an SMC socket with
+  `EAFNOSUPPORT` (`AF_SMC`) or `EPROTONOSUPPORT` (`IPPROTO_SMC`). Landlock's
+  network rights govern TCP sockets alone, and both kinds fall back to TCP, so
+  a command granted connect on one port reached every TCP service through
+  either. Where the sandbox has no network namespace of its own, the filter also
+  refuses `io_uring_setup` with `ENOSYS` and socket creation through x86's
+  `socketcall` with `EAFNOSUPPORT`, as it does where one does. A consumer must
+  act on three consequences under a host network or in a restriction with a
+  network grant: io_uring is unavailable, a 32-bit x86 program built against
+  glibc creates no socket, and a host that cannot install a seccomp filter
+  fails the launch at `SetupStep::InstallNetworkFilter`.
+  `ResolvedInputs::network_filter` reports the filter there too, and
+  `ResolvedSyscallRefusal` gains `third_argument`, the protocol a `socket`
+  refusal names. `fcage --landlock-bind`'s help names what a grant governs.
 - The `agent-tools` example no longer lets the command it confines write a
   gitdir the user's git reads. It held `.git/hooks` and `.git/config` read-only
   inside a writable `.git`, so a command could replace `.git`, or write a

@@ -608,10 +608,14 @@ letter_set_text! {
 /// A set of Landlock network access rights, granted on a TCP port by
 /// [`CageBuilder::landlock_net`].
 ///
-/// Landlock's network rights cover TCP alone: these govern TCP bind and
-/// connect and nothing else. UDP, raw sockets, and other socket families are
-/// outside a network grant's reach, and so is `AF_UNIX`. A connection to an
-/// abstract socket outside the sandbox is confined by
+/// Landlock's network rights cover TCP sockets alone: these govern a TCP
+/// socket's bind and connect and nothing else. A Multipath TCP or an SMC
+/// socket is not a TCP socket, though it falls back to TCP and so reaches
+/// every TCP service; wherever a network grant applies, the launch's network
+/// filter refuses creating one, with `io_uring_setup` and x86's `socketcall`,
+/// which create sockets out of a filter's sight. UDP, raw sockets, and other
+/// socket families are outside a network grant's reach, and so is `AF_UNIX`.
+/// A connection to an abstract socket outside the sandbox is confined by
 /// [`LandlockScope::AbstractUnixSocket`] instead, or by a sandbox's network
 /// namespace.
 ///

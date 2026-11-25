@@ -2403,7 +2403,8 @@ const FLAGS: &[Flag] = &[
         help: &[
             "Allow binding a TCP socket to PORT under a Landlock",
             "ruleset (repeatable; enrolling any network grant denies",
-            "every bind and connect not granted; port 0 permits a",
+            "every TCP bind and connect not granted, and refuses",
+            "Multipath TCP and SMC sockets; port 0 permits a",
             "kernel-assigned ephemeral port; needs Landlock ABI 4)",
         ],
         restriction: true,

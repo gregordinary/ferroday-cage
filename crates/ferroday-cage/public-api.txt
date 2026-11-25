@@ -3518,6 +3518,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedStreams
 pub ferroday_cage::ResolvedSyscallRefusal::errno: u16
 pub ferroday_cage::ResolvedSyscallRefusal::first_argument: core::option::Option<u32>
 pub ferroday_cage::ResolvedSyscallRefusal::syscall: alloc::string::String
+pub ferroday_cage::ResolvedSyscallRefusal::third_argument: core::option::Option<u32>
 impl core::marker::Freeze for ferroday_cage::ResolvedSyscallRefusal
 impl core::marker::Send for ferroday_cage::ResolvedSyscallRefusal
 impl core::marker::Sync for ferroday_cage::ResolvedSyscallRefusal

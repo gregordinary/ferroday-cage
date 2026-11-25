@@ -158,14 +158,17 @@ namespace the sandbox creates, not what may later be plugged into it.
 "
     )]
     pub network: Network,
-    /// What the network filter refuses, where the sandbox carries it: under
+    /// What the network filter refuses, where the command carries it: under
     /// [`Network::Isolated`] and [`Network::None`], which give the sandbox a
-    /// network namespace of its own.
+    /// network namespace of its own, and wherever a Landlock network grant
+    /// holds the command to Landlock's network rights, under any network and
+    /// in a restriction.
     ///
-    /// `None` under [`Network::Host`] and for a restriction, neither of which
-    /// installs the filter. The filter is the library's own rather than a
+    /// `None` under [`Network::Host`] and for a restriction, unless a network
+    /// grant applies there. The filter is the library's own rather than a
     /// policy of the caller's, so what it refuses follows the library version
-    /// rather than the configuration. It is recorded for the reason
+    /// and which of the two boundaries the launch has, rather than anything
+    /// else of the configuration. It is recorded for the reason
     /// [`hardening`](Self::hardening) is: a configure test that probes one of
     /// these calls reads the refusal as an absent feature.
     pub network_filter: Option<ResolvedNetworkFilter>,
@@ -369,10 +372,13 @@ pub enum ResolvedStdio {
     Fd,
 }
 
-/// The seccomp filter a built sandbox with a network namespace of its own
-/// installs, closing the routes out that such a namespace does not cover.
+/// The seccomp filter a launch installs where its sandbox has a network
+/// namespace of its own, or its command is held to Landlock's network rights,
+/// closing the routes out that the namespace or the rights do not cover.
 ///
-/// [`Network`] describes the routes and why each answer is the one it is.
+/// The guide's [network
+/// filter](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#the-network-filter)
+/// chapter describes the routes and why each answer is the one it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -408,8 +414,13 @@ pub struct ResolvedSyscallRefusal {
     /// call is refused: the address family for `socket`, and the call number
     /// for `socketcall`.
     ///
-    /// `None` where the call is refused whatever its arguments.
+    /// `None` where the refusal does not depend on it.
     pub first_argument: Option<u32>,
+    /// The value the low 32 bits of the call's third argument hold where the
+    /// call is refused: the protocol for `socket`.
+    ///
+    /// `None` where the refusal does not depend on it.
+    pub third_argument: Option<u32>,
     /// The errno the call answers with, as the kernel numbers it.
     pub errno: u16,
 }
@@ -832,12 +843,14 @@ fn project_root(plan: &LaunchPlan) -> ResolvedRoot {
 /// The question is the launch's own, asked of the same plan, and the refusals
 /// are the ones the unit tests hold the installed program to.
 fn project_network_filter(plan: &LaunchPlan) -> Option<ResolvedNetworkFilter> {
-    seccomp::installs_network_filter(plan).then(|| ResolvedNetworkFilter {
-        refusals: seccomp::NETWORK_FILTER_REFUSALS
+    seccomp::NetworkFilter::of(plan).map(|filter| ResolvedNetworkFilter {
+        refusals: filter
+            .refusals()
             .iter()
             .map(|refusal| ResolvedSyscallRefusal {
                 syscall: refusal.syscall.to_string(),
                 first_argument: refusal.first_argument,
+                third_argument: refusal.third_argument,
                 errno: refusal.errno,
             })
             .collect(),
@@ -1136,7 +1149,7 @@ mod serde_tests {
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 77] = [
+    const EXPECTED_RECORD_KEYS: [&str; 78] = [
         "cgroup",
         "cgroup.kind",
         "cgroup.limits",
@@ -1191,6 +1204,7 @@ mod serde_tests {
         "network-filter.refusals[].errno",
         "network-filter.refusals[].first-argument",
         "network-filter.refusals[].syscall",
+        "network-filter.refusals[].third-argument",
         "no-new-privileges",
         "pid-namespace",
         "present-as",
@@ -1294,8 +1308,9 @@ mod serde_tests {
             network_filter: Some(ResolvedNetworkFilter {
                 refusals: vec![ResolvedSyscallRefusal {
                     syscall: "socket".to_string(),
-                    first_argument: Some(40),
-                    errno: 97,
+                    first_argument: Some(2),
+                    third_argument: Some(262),
+                    errno: 93,
                 }],
             }),
             pid_namespace: true,
@@ -1687,6 +1702,66 @@ mod serde_tests {
         );
     }
 
+    /// A refusal of `syscall` where its first and third arguments are these,
+    /// answering `errno`.
+    fn refusal(
+        syscall: &str,
+        first_argument: Option<i32>,
+        third_argument: Option<i32>,
+        errno: i32,
+    ) -> ResolvedSyscallRefusal {
+        let word = |value: i32| u32::try_from(value).expect("a family or a protocol fits a u32");
+        ResolvedSyscallRefusal {
+            syscall: syscall.to_string(),
+            first_argument: first_argument.map(word),
+            third_argument: third_argument.map(word),
+            errno: u16::try_from(errno).expect("an errno fits a u16"),
+        }
+    }
+
+    /// What the network filter refuses past a network namespace, the
+    /// sockets out of a filter's sight aside.
+    fn past_a_namespace() -> Vec<ResolvedSyscallRefusal> {
+        vec![refusal(
+            "socket",
+            Some(libc::AF_VSOCK),
+            None,
+            libc::EAFNOSUPPORT,
+        )]
+    }
+
+    /// What the network filter refuses past the network rights, the sockets
+    /// out of a filter's sight aside: SMC by its family and by its protocol,
+    /// and Multipath TCP.
+    #[cfg(feature = "hardening")]
+    fn past_the_network_rights() -> Vec<ResolvedSyscallRefusal> {
+        const AF_SMC: i32 = 43;
+        const IPPROTO_SMC: i32 = 256;
+        let mut refusals = vec![refusal("socket", Some(AF_SMC), None, libc::EAFNOSUPPORT)];
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            for protocol in [libc::IPPROTO_MPTCP, IPPROTO_SMC] {
+                refusals.push(refusal(
+                    "socket",
+                    Some(family),
+                    Some(protocol),
+                    libc::EPROTONOSUPPORT,
+                ));
+            }
+        }
+        refusals
+    }
+
+    /// The sockets out of a filter's sight, which every form of the network
+    /// filter refuses.
+    fn out_of_sight() -> Vec<ResolvedSyscallRefusal> {
+        let mut refusals = vec![refusal("io_uring_setup", None, None, libc::ENOSYS)];
+        if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+            // SYS_SOCKET, the call number socketcall creates a socket under.
+            refusals.push(refusal("socketcall", Some(1), None, libc::EAFNOSUPPORT));
+        }
+        refusals
+    }
+
     /// The network filter reaches the record under the two postures that
     /// install it, refusal by refusal, and is absent where nothing installs
     /// it, so a host-network record renders as one made before the filter
@@ -1702,21 +1777,7 @@ mod serde_tests {
                 .expect("a valid sandbox configuration")
                 .resolved_inputs()
         };
-        let refusal =
-            |syscall: &str, first_argument: Option<u32>, errno: i32| ResolvedSyscallRefusal {
-                syscall: syscall.to_string(),
-                first_argument,
-                errno: u16::try_from(errno).expect("an errno fits a u16"),
-            };
-        let vsock = u32::try_from(libc::AF_VSOCK).expect("a family fits a u32");
-        let mut expected = vec![
-            refusal("socket", Some(vsock), libc::EAFNOSUPPORT),
-            refusal("io_uring_setup", None, libc::ENOSYS),
-        ];
-        if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
-            // SYS_SOCKET, the call number socketcall creates a socket under.
-            expected.push(refusal("socketcall", Some(1), libc::EAFNOSUPPORT));
-        }
+        let expected = [past_a_namespace(), out_of_sight()].concat();
         for network in [Network::Isolated, Network::None] {
             let filter = record(network)
                 .network_filter
@@ -1730,11 +1791,47 @@ mod serde_tests {
         assert!(!rendered.contains("network-filter"), "{rendered}");
     }
 
-    /// A restriction creates no network namespace and installs no network
-    /// filter, and its record says so.
+    /// A network grant has the filter refuse the sockets the grant does not
+    /// govern, under every network, beside what a network namespace has it
+    /// refuse.
     #[cfg(feature = "hardening")]
     #[test]
-    fn a_restriction_records_no_network_filter() {
+    fn a_network_grant_reaches_the_record_as_the_network_filter_it_adds_to() {
+        let record = |network: Network| {
+            Cage::builder()
+                .rootfs("/tmp")
+                .command("/bin/sh")
+                .network(network)
+                .landlock_net(crate::NetAccess::CONNECT, 443)
+                .build()
+                .expect("a valid sandbox configuration")
+                .resolved_inputs()
+                .network_filter
+                .unwrap_or_else(|| panic!("{network:?} records no network filter"))
+                .refusals
+        };
+        let namespaced = [
+            past_a_namespace(),
+            past_the_network_rights(),
+            out_of_sight(),
+        ]
+        .concat();
+        assert_eq!(record(Network::Isolated), namespaced);
+        assert_eq!(record(Network::None), namespaced);
+        // A host-network grant the kernel cannot enforce is refused at build.
+        if crate::host::landlock_enforces_net(crate::NetAccess::CONNECT) {
+            assert_eq!(
+                record(Network::Host),
+                [past_the_network_rights(), out_of_sight()].concat()
+            );
+        }
+    }
+
+    /// A restriction creates no network namespace, and installs the network
+    /// filter where a network grant applies alone, and its record says so.
+    #[cfg(feature = "hardening")]
+    #[test]
+    fn a_restriction_records_the_network_filter_where_a_grant_applies() {
         let inputs = crate::Restriction::builder()
             .command("/bin/true")
             .seccomp(crate::SeccompPolicy::Rules(crate::SeccompRules::curated()))
@@ -1742,6 +1839,20 @@ mod serde_tests {
             .expect("a valid restriction")
             .resolved_inputs();
         assert_eq!(inputs.network_filter, None);
+        // A restriction's network grant the kernel cannot enforce is refused
+        // at build.
+        if crate::host::landlock_enforces_net(crate::NetAccess::CONNECT) {
+            let inputs = crate::Restriction::builder()
+                .command("/bin/true")
+                .landlock_net(crate::NetAccess::CONNECT, 443)
+                .build()
+                .expect("a valid restriction")
+                .resolved_inputs();
+            assert_eq!(
+                inputs.network_filter.map(|filter| filter.refusals),
+                Some([past_the_network_rights(), out_of_sight()].concat())
+            );
+        }
     }
 
     /// A run-as identity reaches the record with the no-new-privileges flag the

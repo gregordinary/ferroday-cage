@@ -907,7 +907,7 @@ fn same_terminal(input: BorrowedFd<'_>, output: BorrowedFd<'_>) -> bool {
            [`SeccompPolicy::Program`](crate::SeccompPolicy::Program)."
 )]
 // Every build carries the type, since every sandbox with a network namespace
-// of its own installs `seccomp::NETWORK_FILTER`. Only the `hardening` feature
+// of its own installs `seccomp::NetworkFilter`. Only the `hardening` feature
 // exports it, and only there does a caller have a program to hand the crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
@@ -1089,11 +1089,15 @@ impl HardeningPlan {
     /// which has no network namespace, and `host_pids` one without a PID
     /// namespace. Each leaves Landlock the only boundary on one reach:
     ///
-    /// - Under host networking, a network grant bounds the host network, so a
-    ///   kernel that masks it away (below ABI 4, or without the LSM) is
-    ///   refused with `HostNetworkLandlockUnenforceable`. So is
+    /// - Under host networking, a network grant bounds the command's TCP
+    ///   sockets on the host network, so a kernel that masks it away (below
+    ///   ABI 4, or without the LSM) is refused with
+    ///   `HostNetworkLandlockUnenforceable`. So is
     ///   [`LandlockScope::AbstractUnixSocket`](crate::LandlockScope::AbstractUnixSocket),
-    ///   the only bound on the host's abstract sockets.
+    ///   the only bound on the host's abstract sockets. The grant governs no
+    ///   other socket: the network filter refuses MPTCP and SMC, the two others
+    ///   that reach a TCP service, and UDP and every other family stay the
+    ///   host's.
     /// - Without a PID namespace,
     ///   [`LandlockScope::Signal`](crate::LandlockScope::Signal) is the only
     ///   bound on signalling the host's processes.

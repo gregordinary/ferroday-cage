@@ -1135,21 +1135,24 @@ fn exec_command(
     }
 
     // The network filter, wherever the sandbox has a network namespace of its
-    // own: it refuses the routes out that a network namespace does not cover,
-    // and it is not opt-in, since without it the namespace's isolation is not
-    // what the network posture says it is. See `seccomp::NETWORK_FILTER`.
+    // own or the command is held to Landlock's network rights: it refuses the
+    // routes out that the namespace or the rights do not cover, and it is not
+    // opt-in, since without it neither boundary is what the configuration
+    // says it is. See `seccomp::NetworkFilter`.
     //
     // Installed here, after the nested user namespace is entered: creating one
     // grants the CAP_SYS_ADMIN that an install without no-new-privileges
     // requires, and nothing has set no-new-privileges yet. The hardening layer
     // and the identity switch set it below, and only where a hardening
     // control, a run-as identity, or a presented identity asks for it. A
-    // filter survives every step below, including the identity switch and the
-    // exec. Installed before the hardening layer, so a caller's own policy
-    // stacks on top of it and, where both answer a syscall with an errno,
-    // answers with its own.
-    if seccomp::installs_network_filter(context.plan)
-        && let Err(errno) = seccomp::install(seccomp::NETWORK_FILTER)
+    // restriction enters no namespace, and `admit_filter_install` sets the
+    // flag it always runs under first. A filter survives every step below,
+    // including the identity switch and the exec. Installed before the
+    // hardening layer, so a caller's own policy stacks on top of it and, where
+    // both answer a syscall with an errno, answers with its own.
+    if let Some(filter) = seccomp::NetworkFilter::of(context.plan)
+        && let Err(errno) =
+            admit_filter_install(context.plan).and_then(|()| seccomp::install(filter.program()))
     {
         report(context.report_fd, SetupStep::InstallNetworkFilter, errno, 0);
         sys::exit_group(127)
@@ -2884,15 +2887,9 @@ const KEYCTL_JOIN_SESSION_KEYRING: usize = 1;
 /// inherits it, so none reads, links, or searches a key through any
 /// operation, whatever the policy allows.
 ///
-/// The install needs no-new-privileges, or `CAP_SYS_ADMIN` in the calling
-/// process's user namespace. A container's launch stage holds the capability
-/// here, in the user namespace it has just created, so the flag is left as the
-/// launch would otherwise leave it: unset, unless a hardening control, a
-/// run-as identity, or a presented identity sets it later. A restriction
-/// creates no namespace, and always runs under no-new-privileges, which its
-/// hardening sets before the exec; setting it here, before the install, changes
-/// nothing the command sees. A filter that cannot be installed fails the
-/// launch at this step, and so does a join refused with any other errno.
+/// The install needs what [`admit_filter_install`] sets. A filter that cannot
+/// be installed fails the launch at this step, and so does a join refused with
+/// any other errno.
 /// `EDQUOT`, the calling user's key quota spent, is reported as
 /// [`Error::KeyQuotaExhausted`](crate::Error::KeyQuotaExhausted).
 ///
@@ -2908,14 +2905,30 @@ fn replace_session_keyring(plan: &LaunchPlan) -> Result<(), Errno> {
     match join_anonymous_session_keyring() {
         Ok(()) => Ok(()),
         Err(Errno::PERM | Errno::NOSYS) => {
-            match plan.confinement {
-                super::Confinement::Container => {}
-                #[cfg(feature = "hardening")]
-                super::Confinement::Restriction => thread::set_no_new_privs(true)?,
-            }
+            admit_filter_install(plan)?;
             seccomp::install(seccomp::KEYRING_FILTER)
         }
         Err(errno) => Err(errno),
+    }
+}
+
+/// Sets what the kernel requires of a seccomp filter's install that a launch
+/// of `plan` holds nothing else for: no-new-privileges, where the launch
+/// creates no user namespace.
+///
+/// The install needs no-new-privileges, or `CAP_SYS_ADMIN` in the calling
+/// process's user namespace. A container's stages hold the capability, in the
+/// user namespace each has entered or created, so the flag is left as the
+/// launch would otherwise leave it: unset, unless a hardening control, a
+/// run-as identity, or a presented identity sets it later. A restriction
+/// creates no namespace, and always runs under no-new-privileges, which its
+/// hardening sets before the exec; setting it earlier, before an install,
+/// changes nothing the command sees.
+fn admit_filter_install(plan: &LaunchPlan) -> Result<(), Errno> {
+    match plan.confinement {
+        super::Confinement::Container => Ok(()),
+        #[cfg(feature = "hardening")]
+        super::Confinement::Restriction => thread::set_no_new_privs(true),
     }
 }
 

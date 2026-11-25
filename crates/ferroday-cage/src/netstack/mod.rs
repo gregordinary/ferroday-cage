@@ -433,7 +433,10 @@ impl NetStack {
     /// [`NetStackError::LandlockNetUnenforceable`] where the kernel cannot
     /// enforce the grant: below Landlock ABI 4, or without the LSM. The stack
     /// gives the sandbox outbound TCP, so the grant is then the only bound on
-    /// the ports the command reaches through it.
+    /// the ports the command's TCP sockets reach through it, beside the
+    /// stack's own destination rules. The grant governs TCP sockets alone; the
+    /// sandbox's network filter refuses the Multipath TCP and SMC sockets that
+    /// would reach a TCP service past it.
     ///
     /// When the configuration enables IPv6, the guest address is usable
     /// immediately where the stack could disable duplicate address detection

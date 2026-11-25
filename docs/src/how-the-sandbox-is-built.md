@@ -171,8 +171,9 @@ model](process-model.md) describes.
     limits](hardening.md#resource-limits), and enters a nested user namespace
     (below). With that map written, it makes itself not dumpable and unblocks
     its signals, as step 1 says. It then installs the [network
-    filter](#the-network-filter) where
-    the sandbox has its own network namespace, applies any hardening, and calls
+    filter](#the-network-filter) where the sandbox has its own network
+    namespace or a Landlock network grant applies, applies any hardening, and
+    calls
     `execve`, resolved inside the new root. The hardening layer applies in two halves around the switch to the
     configured [run-as
     identity](identity-maps.md#running-as-a-non-root-identity), when one is
@@ -256,32 +257,49 @@ namespace as `Error::NamespaceLimitReached`, naming the limits.
 
 ## The network filter
 
+A launch can give a command's network two boundaries, and each leaves routes
+open. The command closes them with a seccomp filter, installed right after it
+enters its nested user namespace, or at the same step in a restriction, which
+enters none.
+
 Under `Network::Isolated` and `Network::None`, the sandbox has a network
 namespace of its own. The namespace governs every address family that routes
-through it, and three routes out do not pass through a network namespace at all.
-The command closes them with a seccomp filter, installed right after it enters
-its nested user namespace:
+through it, and vsock does not pass through a network namespace at all.
 
-| Route | Why the namespace misses it | Answer |
-| --- | --- | --- |
-| `socket` with `AF_VSOCK` | vsock reaches the hypervisor's host from a virtual machine guest, and the host's own services where the host runs vsock loopback, whatever the namespace | `EAFNOSUPPORT` |
-| `io_uring_setup` | A ring creates and connects sockets itself, out of any syscall filter's sight | `ENOSYS` |
-| `socketcall` creating a socket, on x86 | The call passes the address family by pointer, which a filter cannot read, and 64-bit code reaches it through `int 0x80` | `EAFNOSUPPORT` |
+A [Landlock network grant](hardening.md#landlock-network-rules), under any
+network and in a [restriction](restriction-fallback.md), holds the command to
+Landlock's network rights. They govern the bind and connect of a TCP socket and
+of no other. A Multipath TCP socket and an SMC socket are not TCP sockets, and
+each falls back to plain TCP with a peer that does not speak it, so either
+reaches every TCP service whatever the grant says.
+
+The filter refuses what the boundaries a launch has leave open:
+
+| Route | Why the boundary misses it | Where | Answer |
+| --- | --- | --- | --- |
+| `socket` with `AF_VSOCK` | vsock reaches the hypervisor's host from a virtual machine guest, and the host's own services where the host runs vsock loopback, whatever the namespace | A namespace | `EAFNOSUPPORT` |
+| `socket` with `AF_SMC` | An SMC socket falls back to TCP | A grant | `EAFNOSUPPORT` |
+| `socket` with `AF_INET` or `AF_INET6` and `IPPROTO_MPTCP` or `IPPROTO_SMC` | A Multipath TCP socket falls back to TCP, and so does an SMC one created this way | A grant | `EPROTONOSUPPORT` |
+| `io_uring_setup` | A ring creates and connects sockets itself, out of any syscall filter's sight | Either | `ENOSYS` |
+| `socketcall` creating a socket, on x86 | The call passes the address family and the protocol by pointer, which a filter cannot read, and 64-bit code reaches it through `int 0x80` | Either | `EAFNOSUPPORT` |
 
 Each answer is the one a kernel without the facility gives. A program that
-probes for vsock or io_uring therefore reads it as absent. The filter compares
-only the low 32 bits of a socket's family, because the kernel reads it as an
+probes for vsock or io_uring therefore reads it as absent, and one that asks for
+Multipath TCP where it can have it goes on with plain TCP, which the grant
+governs. TCP, UDP and every other family are created as usual, and a grant leaves
+all but TCP as open as the network it runs on. The filter compares only the low
+32 bits of a socket's family and protocol, because the kernel reads each as an
 `int`. A family with high bits set is still `AF_VSOCK`, and is refused. The
 filter checks every entry point the host's kernel presents: the 64-bit ABI, x32,
 and the 32-bit compat layer. A syscall under any other architecture kills the
 process, and no kernel the build runs on makes one.
 
 The `socketcall` refusal has a cost. A 32-bit x86 program built against glibc
-creates every socket through `socketcall`, so in such a sandbox it creates none,
+creates every socket through `socketcall`, so under the filter it creates none,
 a Unix-domain socket included. A program built against musl tries the direct
 `socket` call first, and a 64-bit program always makes it, so neither is
-affected. A 32-bit glibc userland that needs sockets runs under `Network::Host`,
-which carries no filter.
+affected. A 32-bit glibc userland that needs sockets runs under `Network::Host`
+with no network grant, which carries no filter.
 
 The refusal answers `EAFNOSUPPORT`, as `socket` does for a family the kernel
 does not offer, so a program that opens a socket only for an optional facility
@@ -295,7 +313,9 @@ provenance record shows which calls a command under it cannot make.
 The filter is installed before anything sets no-new-privileges. The hardening
 layer and the identity switch set it later, and only for a hardening control, a
 run-as identity, or a presented identity. Creating the nested user namespace
-grants the capability the kernel requires in its place.
+grants the capability the kernel requires in its place. A restriction creates
+no namespace, and runs under no-new-privileges whatever it configures, so it sets
+the flag before the install.
 
 A [seccomp policy](hardening.md#seccomp-syscall-filters) is installed after the
 filter. Where both refuse a syscall with an errno, the command sees the

@@ -2,10 +2,11 @@
 //! they are written in.
 //!
 //! Three kinds of program reach the kernel through [`install`]: a caller's
-//! hardening policy, compiled at build time by the `hardening` layer;
-//! [`NETWORK_FILTER`], which every sandbox with a network namespace of its own
-//! carries; and [`KEYRING_FILTER`], which a launch carries where it cannot give
-//! the sandbox a session keyring of its own. This module states the last two
+//! hardening policy, compiled at build time by the `hardening` layer; the
+//! [`NetworkFilter`], which a launch carries wherever its sandbox has a network
+//! namespace of its own or its command is held to Landlock's network rights;
+//! and [`KEYRING_FILTER`], which a launch carries where it cannot give the
+//! sandbox a session keyring of its own. This module states the last two
 //! outright. The opcodes, the `seccomp_data` offsets, the audit architectures,
 //! and the answers below are the one vocabulary all three are written in. They
 //! are named here rather than taken from a binding, so the crate's raw BPF is
@@ -35,9 +36,10 @@ pub(crate) mod bpf {
     /// with `k`. Only the hardening layer's fragments use it.
     #[cfg(feature = "hardening")]
     pub(crate) const JMP_JSET_K: u16 = 0x45;
-    /// `BPF_JMP | BPF_JA`: jump forward `k` instructions unconditionally. Only
-    /// the hardening layer's fragments use it.
-    #[cfg(any(feature = "hardening", test))]
+    /// `BPF_JMP | BPF_JA`: jump forward `k` instructions unconditionally. The
+    /// hardening layer's fragments use it, and a form of the network filter
+    /// puts `ja 0`, which goes on to the next instruction, in place of a test
+    /// it leaves out.
     pub(crate) const JMP_JA: u16 = 0x05;
     /// `BPF_RET | BPF_K`: return `k` as the seccomp action.
     pub(crate) const RET_K: u16 = 0x06;
@@ -127,6 +129,9 @@ pub(crate) mod bpf {
     } else {
         20
     };
+    /// Byte offset of the low 32 bits of `seccomp_data.args[2]`, two 64-bit
+    /// arguments on from [`OFF_ARG0_LOW`].
+    pub(crate) const OFF_ARG2_LOW: u32 = OFF_ARG0_LOW + 16;
 }
 
 /// `AUDIT_ARCH_X86_64`: a 64-bit x86 syscall, and an x32 one, which shares
@@ -199,8 +204,23 @@ pub(crate) const ENOSYS: u16 = 38;
 /// kernel does not offer. The generic number, as [`ENOSYS`] is.
 pub(crate) const EAFNOSUPPORT: u16 = 97;
 
+/// `EPROTONOSUPPORT`, the error `socket` answers for a protocol the kernel
+/// does not offer in a family. The generic number, as [`ENOSYS`] is.
+pub(crate) const EPROTONOSUPPORT: u16 = 93;
+
+/// `AF_INET`.
+const AF_INET: u32 = 2;
+/// `AF_INET6`.
+const AF_INET6: u32 = 10;
 /// `AF_VSOCK`, the vsock address family.
 const AF_VSOCK: u32 = 40;
+/// `AF_SMC`, the address family of Shared Memory Communications sockets.
+const AF_SMC: u32 = 43;
+/// `IPPROTO_SMC` (Linux 6.11): an SMC socket created in `AF_INET` or
+/// `AF_INET6`.
+const IPPROTO_SMC: u32 = 256;
+/// `IPPROTO_MPTCP` (Linux 5.6): a Multipath TCP socket.
+const IPPROTO_MPTCP: u32 = 262;
 /// `SYS_SOCKET`, the call number under which `socketcall` creates a socket.
 const SYS_SOCKET: u32 = 1;
 /// `io_uring_setup`, under the number every architecture shares, as each
@@ -272,7 +292,9 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
 
-/// The network filter for an x86 kernel: x86_64, x32, and 32-bit x86.
+/// The network filter for an x86 kernel, x86_64, x32 and 32-bit x86, with
+/// every test any of its forms makes; [`Forms::of`] leaves out the tests a form
+/// does not make.
 ///
 /// ```text
 ///   [0]  A = arch
@@ -282,23 +304,31 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 ///   [4]  A = nr
 ///   [5]  A &= !__X32_SYSCALL_BIT        an x32 call reads as its 64-bit twin
 ///   [6]  socket: to [17]
-///   [7]  io_uring_setup: to [21]
+///   [7]  io_uring_setup: to [29]
 ///   [8]  allow
 ///   [9]  A = nr
 ///   [10] socket: to [17]
 ///   [11] socketcall: to [14]
-///   [12] io_uring_setup: to [21]
+///   [12] io_uring_setup: to [29]
 ///   [13] allow
 ///   [14] A = the low half of args[0]    socketcall's call number
-///   [15] SYS_SOCKET: to [20]
+///   [15] SYS_SOCKET: to [27]
 ///   [16] allow
 ///   [17] A = the low half of args[0]    socket's address family
-///   [18] AF_VSOCK: to [20]
-///   [19] allow
-///   [20] return EAFNOSUPPORT
-///   [21] return ENOSYS
+///   [18] AF_VSOCK: to [27]              a namespace's
+///   [19] AF_SMC: to [27]                the network rights'
+///   [20] AF_INET: to [23]               the network rights'
+///   [21] AF_INET6: to [23]              the network rights'
+///   [22] allow
+///   [23] A = the low half of args[2]    socket's protocol
+///   [24] IPPROTO_MPTCP: to [28]
+///   [25] IPPROTO_SMC: to [28]
+///   [26] allow
+///   [27] return EAFNOSUPPORT
+///   [28] return EPROTONOSUPPORT
+///   [29] return ENOSYS
 /// ```
-const X86_NETWORK_FILTER: [SockFilter; 22] = [
+const X86_NETWORK_FILTER: [SockFilter; 30] = [
     stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_X86_64, 2, 0),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_I386, 6, 0),
@@ -306,25 +336,34 @@ const X86_NETWORK_FILTER: [SockFilter; 22] = [
     stmt(bpf::LD_W_ABS, bpf::OFF_NR),
     stmt(bpf::ALU_AND_K, !X32_SYSCALL_BIT),
     jump(bpf::JMP_JEQ_K, X86_64_SOCKET, 10, 0),
-    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 13, 0),
+    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 21, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_NR),
     jump(bpf::JMP_JEQ_K, I386_SOCKET, 6, 0),
     jump(bpf::JMP_JEQ_K, I386_SOCKETCALL, 2, 0),
-    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 8, 0),
+    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 16, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
-    jump(bpf::JMP_JEQ_K, SYS_SOCKET, 4, 0),
+    jump(bpf::JMP_JEQ_K, SYS_SOCKET, 11, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
-    jump(bpf::JMP_JEQ_K, AF_VSOCK, 1, 0),
+    jump(bpf::JMP_JEQ_K, AF_VSOCK, 8, 0),
+    jump(bpf::JMP_JEQ_K, AF_SMC, 7, 0),
+    jump(bpf::JMP_JEQ_K, AF_INET, 2, 0),
+    jump(bpf::JMP_JEQ_K, AF_INET6, 1, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG2_LOW),
+    jump(bpf::JMP_JEQ_K, IPPROTO_MPTCP, 3, 0),
+    jump(bpf::JMP_JEQ_K, IPPROTO_SMC, 2, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::RET_K, ret_errno(EAFNOSUPPORT)),
+    stmt(bpf::RET_K, ret_errno(EPROTONOSUPPORT)),
     stmt(bpf::RET_K, ret_errno(ENOSYS)),
 ];
 
-/// The network filter for an arm kernel: aarch64, and 32-bit arm natively or
-/// through an arm64 kernel's compat layer.
+/// The network filter for an arm kernel, aarch64 and 32-bit arm natively or
+/// through an arm64 kernel's compat layer, with every test any of its forms
+/// makes.
 ///
 /// 32-bit arm's `socketcall` belongs to the OABI. An arm kernel built with
 /// OABI compatibility offers no seccomp filters at all, and an arm64 kernel's
@@ -338,40 +377,57 @@ const X86_NETWORK_FILTER: [SockFilter; 22] = [
 ///   [3]  any other architecture: kill
 ///   [4]  A = nr
 ///   [5]  socket: to [12]
-///   [6]  io_uring_setup: to [16]
+///   [6]  io_uring_setup: to [24]
 ///   [7]  allow
 ///   [8]  A = nr
 ///   [9]  socket: to [12]
-///   [10] io_uring_setup: to [16]
+///   [10] io_uring_setup: to [24]
 ///   [11] allow
 ///   [12] A = the low half of args[0]    socket's address family
-///   [13] AF_VSOCK: to [15]
-///   [14] allow
-///   [15] return EAFNOSUPPORT
-///   [16] return ENOSYS
+///   [13] AF_VSOCK: to [22]              a namespace's
+///   [14] AF_SMC: to [22]                the network rights'
+///   [15] AF_INET: to [18]               the network rights'
+///   [16] AF_INET6: to [18]              the network rights'
+///   [17] allow
+///   [18] A = the low half of args[2]    socket's protocol
+///   [19] IPPROTO_MPTCP: to [23]
+///   [20] IPPROTO_SMC: to [23]
+///   [21] allow
+///   [22] return EAFNOSUPPORT
+///   [23] return EPROTONOSUPPORT
+///   [24] return ENOSYS
 /// ```
-const ARM_NETWORK_FILTER: [SockFilter; 17] = [
+const ARM_NETWORK_FILTER: [SockFilter; 25] = [
     stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_AARCH64, 2, 0),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_ARM, 5, 0),
     stmt(bpf::RET_K, RET_KILL_PROCESS),
     stmt(bpf::LD_W_ABS, bpf::OFF_NR),
     jump(bpf::JMP_JEQ_K, GENERIC_SOCKET, 6, 0),
-    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 9, 0),
+    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 17, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_NR),
     jump(bpf::JMP_JEQ_K, ARM_SOCKET, 2, 0),
-    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 5, 0),
+    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 13, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
-    jump(bpf::JMP_JEQ_K, AF_VSOCK, 1, 0),
+    jump(bpf::JMP_JEQ_K, AF_VSOCK, 8, 0),
+    jump(bpf::JMP_JEQ_K, AF_SMC, 7, 0),
+    jump(bpf::JMP_JEQ_K, AF_INET, 2, 0),
+    jump(bpf::JMP_JEQ_K, AF_INET6, 1, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG2_LOW),
+    jump(bpf::JMP_JEQ_K, IPPROTO_MPTCP, 3, 0),
+    jump(bpf::JMP_JEQ_K, IPPROTO_SMC, 2, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::RET_K, ret_errno(EAFNOSUPPORT)),
+    stmt(bpf::RET_K, ret_errno(EPROTONOSUPPORT)),
     stmt(bpf::RET_K, ret_errno(ENOSYS)),
 ];
 
-/// The network filter for a RISC-V kernel: 64-bit, and 32-bit through its
-/// compat layer, both on the generic syscall table.
+/// The network filter for a RISC-V kernel, 64-bit and 32-bit through its
+/// compat layer, both on the generic syscall table, with every test any of its
+/// forms makes.
 ///
 /// ```text
 ///   [0]  A = arch
@@ -380,29 +436,103 @@ const ARM_NETWORK_FILTER: [SockFilter; 17] = [
 ///   [3]  any other architecture: kill
 ///   [4]  A = nr
 ///   [5]  socket: to [8]
-///   [6]  io_uring_setup: to [12]
+///   [6]  io_uring_setup: to [20]
 ///   [7]  allow
 ///   [8]  A = the low half of args[0]    socket's address family
-///   [9]  AF_VSOCK: to [11]
-///   [10] allow
-///   [11] return EAFNOSUPPORT
-///   [12] return ENOSYS
+///   [9]  AF_VSOCK: to [18]              a namespace's
+///   [10] AF_SMC: to [18]                the network rights'
+///   [11] AF_INET: to [14]               the network rights'
+///   [12] AF_INET6: to [14]              the network rights'
+///   [13] allow
+///   [14] A = the low half of args[2]    socket's protocol
+///   [15] IPPROTO_MPTCP: to [19]
+///   [16] IPPROTO_SMC: to [19]
+///   [17] allow
+///   [18] return EAFNOSUPPORT
+///   [19] return EPROTONOSUPPORT
+///   [20] return ENOSYS
 /// ```
-const RISCV_NETWORK_FILTER: [SockFilter; 13] = [
+const RISCV_NETWORK_FILTER: [SockFilter; 21] = [
     stmt(bpf::LD_W_ABS, bpf::OFF_ARCH),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV64, 2, 0),
     jump(bpf::JMP_JEQ_K, AUDIT_ARCH_RISCV32, 1, 0),
     stmt(bpf::RET_K, RET_KILL_PROCESS),
     stmt(bpf::LD_W_ABS, bpf::OFF_NR),
     jump(bpf::JMP_JEQ_K, GENERIC_SOCKET, 2, 0),
-    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 5, 0),
+    jump(bpf::JMP_JEQ_K, IO_URING_SETUP, 13, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::LD_W_ABS, bpf::OFF_ARG0_LOW),
-    jump(bpf::JMP_JEQ_K, AF_VSOCK, 1, 0),
+    jump(bpf::JMP_JEQ_K, AF_VSOCK, 8, 0),
+    jump(bpf::JMP_JEQ_K, AF_SMC, 7, 0),
+    jump(bpf::JMP_JEQ_K, AF_INET, 2, 0),
+    jump(bpf::JMP_JEQ_K, AF_INET6, 1, 0),
+    stmt(bpf::RET_K, RET_ALLOW),
+    stmt(bpf::LD_W_ABS, bpf::OFF_ARG2_LOW),
+    jump(bpf::JMP_JEQ_K, IPPROTO_MPTCP, 3, 0),
+    jump(bpf::JMP_JEQ_K, IPPROTO_SMC, 2, 0),
     stmt(bpf::RET_K, RET_ALLOW),
     stmt(bpf::RET_K, ret_errno(EAFNOSUPPORT)),
+    stmt(bpf::RET_K, ret_errno(EPROTONOSUPPORT)),
     stmt(bpf::RET_K, ret_errno(ENOSYS)),
 ];
+
+/// A family's network filter in each form a launch installs it in.
+///
+/// Each family's program is written once, with every test any form makes. A
+/// form leaves a test out by putting `ja 0`, a jump to the next instruction, in
+/// its place, so the test's refusal is never reached and every offset around
+/// it stays as written. What is left behind the jump is unreachable, which the
+/// kernel's verifier allows.
+struct Forms<const N: usize> {
+    /// Under a network namespace of the sandbox's own alone.
+    namespace: [SockFilter; N],
+    /// Under Landlock's network rights alone.
+    rights: [SockFilter; N],
+    /// Under both.
+    both: [SockFilter; N],
+}
+
+impl<const N: usize> Forms<N> {
+    /// The forms of `program`, whose instructions at the positions `namespace`
+    /// lists test for a refusal only a namespace needs, and at the positions
+    /// `rights` lists for one only the network rights need.
+    const fn of(program: [SockFilter; N], namespace: &[usize], rights: &[usize]) -> Forms<N> {
+        Forms {
+            namespace: without(program, rights),
+            rights: without(program, namespace),
+            both: program,
+        }
+    }
+
+    /// The form `filter` names.
+    fn get(&'static self, filter: NetworkFilter) -> &'static [SockFilter] {
+        match filter {
+            NetworkFilter::Namespace => &self.namespace,
+            NetworkFilter::Rights => &self.rights,
+            NetworkFilter::NamespaceAndRights => &self.both,
+        }
+    }
+}
+
+/// `program` with the instruction at each of `tests` replaced by `ja 0`.
+const fn without<const N: usize>(mut program: [SockFilter; N], tests: &[usize]) -> [SockFilter; N] {
+    let mut each = 0;
+    while each < tests.len() {
+        program[tests[each]] = stmt(bpf::JMP_JA, 0);
+        each += 1;
+    }
+    program
+}
+
+/// [`X86_NETWORK_FILTER`]'s forms: the test at 18 is a namespace's, and those
+/// at 19 through 21 the network rights'.
+static X86_NETWORK_FILTERS: Forms<30> = Forms::of(X86_NETWORK_FILTER, &[18], &[19, 20, 21]);
+/// [`ARM_NETWORK_FILTER`]'s forms: the test at 13 is a namespace's, and those
+/// at 14 through 16 the network rights'.
+static ARM_NETWORK_FILTERS: Forms<25> = Forms::of(ARM_NETWORK_FILTER, &[13], &[14, 15, 16]);
+/// [`RISCV_NETWORK_FILTER`]'s forms: the test at 9 is a namespace's, and those
+/// at 10 through 12 the network rights'.
+static RISCV_NETWORK_FILTERS: Forms<21> = Forms::of(RISCV_NETWORK_FILTER, &[9], &[10, 11, 12]);
 
 /// The kernel families a build can run on, each with the syscall entry points
 /// its kernel presents.
@@ -430,69 +560,134 @@ const HOST: Family = if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
     Family::RiscV
 };
 
-/// The network filter for `family`.
-const fn network_program_for(family: Family) -> &'static [SockFilter] {
+/// `filter` for `family`.
+fn network_program_for(family: Family, filter: NetworkFilter) -> &'static [SockFilter] {
     match family {
-        Family::X86 => &X86_NETWORK_FILTER,
-        Family::Arm => &ARM_NETWORK_FILTER,
-        Family::RiscV => &RISCV_NETWORK_FILTER,
+        Family::X86 => X86_NETWORK_FILTERS.get(filter),
+        Family::Arm => ARM_NETWORK_FILTERS.get(filter),
+        Family::RiscV => RISCV_NETWORK_FILTERS.get(filter),
     }
 }
 
-/// The filter a sandbox with a network namespace of its own carries, closing
-/// the routes out that the namespace does not cover.
+/// The filter a launch installs where a boundary of its network leaves routes
+/// open, closing them: the network filter, in the form its boundaries call
+/// for.
 ///
-/// A network namespace governs the address families that route through it,
-/// and the launch leaves the sandbox only its loopback. Three routes do not
-/// pass through a network namespace at all, and the filter closes each:
+/// Two boundaries leave routes open. A network namespace governs the address
+/// families that route through it, and the launch leaves the sandbox only its
+/// loopback. Landlock's network rights govern TCP sockets alone. Three routes
+/// pass by one or both:
 ///
-/// - **vsock.** An `AF_VSOCK` socket reaches the hypervisor's host from a
-///   virtual machine guest, and the host's own services wherever the host
-///   runs vsock loopback, from whichever network namespace it was created in.
-///   `socket` with that family is answered `EAFNOSUPPORT`, as a kernel built
-///   without vsock answers it, so a program that probes for vsock reads it as
-///   absent. Only the low 32 bits of the family are compared: `socket` takes
-///   an `int` and the kernel discards the rest, so a family with high bits set
-///   is still `AF_VSOCK` to the kernel, and is refused.
-/// - **io_uring.** A ring creates sockets itself, out of a filter's sight.
+/// - **vsock**, past a namespace. An `AF_VSOCK` socket reaches the
+///   hypervisor's host from a virtual machine guest, and the host's own
+///   services wherever the host runs vsock loopback, from whichever network
+///   namespace it was created in. `socket` with that family is answered
+///   `EAFNOSUPPORT`, as a kernel built without vsock answers it, so a program
+///   that probes for vsock reads it as absent.
+/// - **MPTCP and SMC**, past the network rights. A Multipath TCP socket,
+///   `IPPROTO_MPTCP` in `AF_INET` or `AF_INET6`, and an SMC socket, `AF_SMC`
+///   or `IPPROTO_SMC` in those two families, are not TCP sockets, so no right
+///   governs their bind or connect, and each falls back to plain TCP with a
+///   peer that does not speak it: every TCP service is theirs to reach. An
+///   MPTCP or an `IPPROTO_SMC` socket is answered `EPROTONOSUPPORT`, as a
+///   kernel without the protocol answers it, and an `AF_SMC` one
+///   `EAFNOSUPPORT`, as one without the family does. A program that asks for
+///   MPTCP where it can have it goes on with TCP.
+/// - **Sockets out of a filter's sight**, past either, since a filter is what
+///   closes the routes above. A ring creates sockets itself, so
 ///   `io_uring_setup` is answered `ENOSYS`, as a kernel built without io_uring
 ///   answers it. The other io_uring calls act on a ring that only
 ///   `io_uring_setup` creates, and no descriptor reaches the sandbox but those
-///   the caller grants it.
-/// - **socketcall.** 32-bit x86 code creates sockets through `socketcall`,
-///   which passes the family by pointer, where a filter cannot read it. A
-///   64-bit process reaches the call too, through `int 0x80`. Its socket
-///   creation is answered `EAFNOSUPPORT` whatever the family. That is the
-///   answer `socket` gives for a family the kernel does not offer, which a
-///   program probing for an optional facility reads as the facility being
-///   absent: `useradd` opens the kernel's audit socket this way, and on this
-///   answer goes on without auditing where another would abort it. A 32-bit
-///   glibc program creates every socket through `socketcall`, so it creates
-///   none in such a sandbox. musl tries the direct call first and is
-///   unaffected, as is every 64-bit program. 32-bit arm's `socketcall` is out
-///   of reach, as [`ARM_NETWORK_FILTER`] states, and no other architecture has
-///   the call.
+///   the caller grants it. 32-bit x86 code creates sockets through
+///   `socketcall`, which passes the family and the protocol by pointer, where
+///   a filter cannot read them, and a 64-bit process reaches the call through
+///   `int 0x80`. Its socket creation is answered `EAFNOSUPPORT` whatever the
+///   family. That is the answer `socket` gives for a family the kernel does
+///   not offer, which a program probing for an optional facility reads as the
+///   facility being absent: `useradd` opens the kernel's audit socket this
+///   way, and on this answer goes on without auditing where another would
+///   abort it. A 32-bit glibc program creates every socket through
+///   `socketcall`, so it creates none under the filter. musl tries the direct
+///   call first and is unaffected, as is every 64-bit program. 32-bit arm's
+///   `socketcall` is out of reach, as [`ARM_NETWORK_FILTER`] states, and no
+///   other architecture has the call.
+///
+/// Only the low 32 bits of a family or a protocol are compared: `socket` takes
+/// `int`s and the kernel discards the rest, so a family with high bits set is
+/// still `AF_VSOCK` to the kernel, and is refused.
 ///
 /// Every entry point a kernel of the build's family presents is checked: the
 /// 64-bit ABI, x32 under x86_64's audit architecture, and the 32-bit compat
 /// layer. A syscall under any other audit architecture kills the process, as
 /// the hardening layer's filters do. No such syscall reaches a kernel this
 /// build runs on. Everything else is allowed.
-///
-/// [`NETWORK_FILTER_REFUSALS`] states the same refusals as data.
-pub(crate) const NETWORK_FILTER: &[SockFilter] = network_program_for(HOST);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkFilter {
+    /// Under a network namespace of the sandbox's own: vsock, and the sockets
+    /// out of a filter's sight.
+    Namespace,
+    /// Under Landlock's network rights: MPTCP, SMC, and the sockets out of a
+    /// filter's sight.
+    Rights,
+    /// Under both: every route the two forms above close.
+    NamespaceAndRights,
+}
 
-/// One syscall a filter of this module refuses: the call, the value its first
-/// argument holds where the refusal depends on one, and the errno it answers
-/// in place of running the call.
+impl NetworkFilter {
+    /// The network filter a launch of `plan` installs, or `None` where it
+    /// installs none: wherever its sandbox has a network namespace of its own,
+    /// and wherever its command is held to Landlock's network rights, which a
+    /// network grant does in a sandbox of any network and in a restriction.
+    ///
+    /// The launch asks this before it installs the filter, and the provenance
+    /// record asks it before it reports the filter, so the two cannot disagree.
+    /// It is read from the plan alone: a grant a kernel below Landlock ABI 4
+    /// narrows away still has the network rights' form installed, whose
+    /// refusals then send a program that asks for MPTCP to plain TCP.
+    pub(crate) fn of(plan: &LaunchPlan) -> Option<NetworkFilter> {
+        let namespace = plan.unshare.contains(UnshareFlags::NEWNET);
+        #[cfg(feature = "hardening")]
+        let rights = plan.hardening.landlock_net_handled != 0;
+        #[cfg(not(feature = "hardening"))]
+        let rights = false;
+        match (namespace, rights) {
+            (true, false) => Some(NetworkFilter::Namespace),
+            (false, true) => Some(NetworkFilter::Rights),
+            (true, true) => Some(NetworkFilter::NamespaceAndRights),
+            (false, false) => None,
+        }
+    }
+
+    /// The filter's program, for the build's family.
+    pub(crate) fn program(self) -> &'static [SockFilter] {
+        network_program_for(HOST, self)
+    }
+
+    /// What the filter refuses, each refusal applying at every entry point of
+    /// the build's family that has the call. Everything else it allows.
+    ///
+    /// The provenance record reports these. The unit tests hold every
+    /// family's lists to its programs: each refusal is made, and nothing else
+    /// is.
+    pub(crate) fn refusals(self) -> &'static [Refusal] {
+        network_refusals_for(HOST, self)
+    }
+}
+
+/// One syscall a filter of this module refuses: the call, the values its
+/// first and third arguments hold where the refusal depends on them, and the
+/// errno it answers in place of running the call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Refusal {
     /// The syscall's name in the kernel's syscall table, which is the same at
     /// every entry point that has the call, where its number is not.
     pub(crate) syscall: &'static str,
     /// The value the low 32 bits of the first argument hold where the call is
-    /// refused, or `None` where every call is.
+    /// refused, or `None` where the refusal does not depend on it.
     pub(crate) first_argument: Option<u32>,
+    /// The value the low 32 bits of the third argument hold where the call is
+    /// refused, or `None` where the refusal does not depend on it.
+    pub(crate) third_argument: Option<u32>,
     /// The errno the call is answered with.
     pub(crate) errno: u16,
 }
@@ -501,43 +696,94 @@ pub(crate) struct Refusal {
 const VSOCK_SOCKET: Refusal = Refusal {
     syscall: "socket",
     first_argument: Some(AF_VSOCK),
+    third_argument: None,
     errno: EAFNOSUPPORT,
 };
+/// `socket` creating an `AF_SMC` socket.
+const SMC_SOCKET: Refusal = Refusal {
+    syscall: "socket",
+    first_argument: Some(AF_SMC),
+    third_argument: None,
+    errno: EAFNOSUPPORT,
+};
+/// `socket` creating a socket of `protocol` in `family`, one family a TCP
+/// socket is created in.
+const fn protocol_socket(family: u32, protocol: u32) -> Refusal {
+    Refusal {
+        syscall: "socket",
+        first_argument: Some(family),
+        third_argument: Some(protocol),
+        errno: EPROTONOSUPPORT,
+    }
+}
+/// `socket` creating an MPTCP socket in `AF_INET`.
+const MPTCP_INET_SOCKET: Refusal = protocol_socket(AF_INET, IPPROTO_MPTCP);
+/// `socket` creating an SMC socket in `AF_INET`.
+const SMC_INET_SOCKET: Refusal = protocol_socket(AF_INET, IPPROTO_SMC);
+/// `socket` creating an MPTCP socket in `AF_INET6`.
+const MPTCP_INET6_SOCKET: Refusal = protocol_socket(AF_INET6, IPPROTO_MPTCP);
+/// `socket` creating an SMC socket in `AF_INET6`.
+const SMC_INET6_SOCKET: Refusal = protocol_socket(AF_INET6, IPPROTO_SMC);
 /// `io_uring_setup`, whatever it is asked.
 const RING_SETUP: Refusal = Refusal {
     syscall: "io_uring_setup",
     first_argument: None,
+    third_argument: None,
     errno: ENOSYS,
 };
 /// `socketcall` creating a socket of any family.
 const SOCKETCALL_SOCKET: Refusal = Refusal {
     syscall: "socketcall",
     first_argument: Some(SYS_SOCKET),
+    third_argument: None,
     errno: EAFNOSUPPORT,
 };
 
-/// What `family`'s network filter refuses.
-const fn network_refusals_for(family: Family) -> &'static [Refusal] {
-    match family {
-        Family::X86 => &[VSOCK_SOCKET, RING_SETUP, SOCKETCALL_SOCKET],
-        Family::Arm | Family::RiscV => &[VSOCK_SOCKET, RING_SETUP],
+/// What `family`'s form of `filter` refuses: the socket creation a form
+/// refuses, in the order its program tests for it, and then the sockets out of
+/// a filter's sight.
+fn network_refusals_for(family: Family, filter: NetworkFilter) -> &'static [Refusal] {
+    use NetworkFilter::{Namespace, NamespaceAndRights, Rights};
+    match (family, filter) {
+        (Family::X86, Namespace) => &[VSOCK_SOCKET, RING_SETUP, SOCKETCALL_SOCKET],
+        (Family::X86, Rights) => &[
+            SMC_SOCKET,
+            MPTCP_INET_SOCKET,
+            SMC_INET_SOCKET,
+            MPTCP_INET6_SOCKET,
+            SMC_INET6_SOCKET,
+            RING_SETUP,
+            SOCKETCALL_SOCKET,
+        ],
+        (Family::X86, NamespaceAndRights) => &[
+            VSOCK_SOCKET,
+            SMC_SOCKET,
+            MPTCP_INET_SOCKET,
+            SMC_INET_SOCKET,
+            MPTCP_INET6_SOCKET,
+            SMC_INET6_SOCKET,
+            RING_SETUP,
+            SOCKETCALL_SOCKET,
+        ],
+        (Family::Arm | Family::RiscV, Namespace) => &[VSOCK_SOCKET, RING_SETUP],
+        (Family::Arm | Family::RiscV, Rights) => &[
+            SMC_SOCKET,
+            MPTCP_INET_SOCKET,
+            SMC_INET_SOCKET,
+            MPTCP_INET6_SOCKET,
+            SMC_INET6_SOCKET,
+            RING_SETUP,
+        ],
+        (Family::Arm | Family::RiscV, NamespaceAndRights) => &[
+            VSOCK_SOCKET,
+            SMC_SOCKET,
+            MPTCP_INET_SOCKET,
+            SMC_INET_SOCKET,
+            MPTCP_INET6_SOCKET,
+            SMC_INET6_SOCKET,
+            RING_SETUP,
+        ],
     }
-}
-
-/// What [`NETWORK_FILTER`] refuses, each refusal applying at every entry point
-/// of the build's family that has the call. Everything else it allows.
-///
-/// The provenance record reports these. The unit tests hold the list to the
-/// programs, every family's: each refusal is made, and nothing else is.
-pub(crate) const NETWORK_FILTER_REFUSALS: &[Refusal] = network_refusals_for(HOST);
-
-/// Whether a launch of `plan` installs [`NETWORK_FILTER`]: wherever its
-/// sandbox has a network namespace of its own.
-///
-/// The launch asks this before it installs the filter, and the provenance
-/// record asks it before it reports the filter, so the two cannot disagree.
-pub(crate) fn installs_network_filter(plan: &LaunchPlan) -> bool {
-    plan.unshare.contains(UnshareFlags::NEWNET)
 }
 
 /// The keyring filter for an x86 kernel: x86_64, x32, and 32-bit x86.
@@ -667,7 +913,7 @@ const fn keyring_program_for(family: Family) -> &'static [SockFilter] {
 ///
 /// `ENOSYS` is what a kernel built without key support answers, so a program
 /// that probes for the keyring reads it as absent. Every entry point a kernel
-/// of the build's family presents is checked, as [`NETWORK_FILTER`] checks
+/// of the build's family presents is checked, as the [`NetworkFilter`] checks
 /// them, and a syscall under any other audit architecture kills the process.
 /// Everything else is allowed.
 ///
@@ -688,16 +934,19 @@ const KEYRING_FILTER_REFUSALS: &[Refusal] = &[
     Refusal {
         syscall: "add_key",
         first_argument: None,
+        third_argument: None,
         errno: ENOSYS,
     },
     Refusal {
         syscall: "request_key",
         first_argument: None,
+        third_argument: None,
         errno: ENOSYS,
     },
     Refusal {
         syscall: "keyctl",
         first_argument: None,
+        third_argument: None,
         errno: ENOSYS,
     },
 ];
@@ -857,8 +1106,8 @@ pub(crate) fn hands_over(program: &[SockFilter], arch: u32, channel: RawFd) -> b
         .is_some_and(|ret| matches!(ret & RET_ACTION_FULL, RET_ALLOW | RET_LOG))
 }
 
-/// Whether this process can install a seccomp filter, found by installing
-/// [`NETWORK_FILTER`] in a forked child that does nothing else and exits.
+/// Whether this process can install a seccomp filter, found by installing the
+/// [`NetworkFilter`] in a forked child that does nothing else and exits.
 ///
 /// Whatever refuses a launch's install refuses this one, so the answer is
 /// exact: a kernel built without `CONFIG_SECCOMP_FILTER` answers the install
@@ -892,8 +1141,8 @@ pub(crate) fn installable() -> bool {
 /// that fails, as one does where `/proc` is not mounted, changes no answer.
 fn install_in_probe() -> i32 {
     let _ = super::child::sweep_fds_keeping(&[]);
-    let installed =
-        rustix::thread::set_no_new_privs(true).is_ok() && install(NETWORK_FILTER).is_ok();
+    let installed = rustix::thread::set_no_new_privs(true).is_ok()
+        && install(NetworkFilter::Namespace.program()).is_ok();
     if installed { 0 } else { 1 }
 }
 
@@ -1103,15 +1352,23 @@ pub(crate) mod eval {
     /// Runs `program` over `call` as the kernel does, returning the
     /// `SECCOMP_RET_*` value it answers, or `None` for a program the kernel's
     /// verifier would refuse, which [`accepted`] decides.
+    pub(crate) fn answer(program: &[SockFilter], call: &Call) -> Option<u32> {
+        if !accepted(program) {
+            return None;
+        }
+        execute(program, call)
+    }
+
+    /// Runs `program` over `call` without asking [`accepted`] first, for a
+    /// caller that has asked it once of a program it runs many calls over. A
+    /// program the verifier would refuse answers `None` only where the call
+    /// meets what it refuses.
     ///
     /// Division by a zero index register ends the program with 0, as the
     /// kernel's does, and a shift by the index register takes its low five
     /// bits. Every jump goes forward, so the run ends within the program's
     /// length.
-    pub(crate) fn answer(program: &[SockFilter], call: &Call) -> Option<u32> {
-        if !accepted(program) {
-            return None;
-        }
+    pub(super) fn execute(program: &[SockFilter], call: &Call) -> Option<u32> {
         let data = call.data();
         let mut accumulator = 0u32;
         let mut index = 0u32;
@@ -1273,19 +1530,43 @@ mod tests {
 
     const FAMILIES: [Family; 3] = [Family::X86, Family::Arm, Family::RiscV];
 
+    const FILTERS: [NetworkFilter; 3] = [
+        NetworkFilter::Namespace,
+        NetworkFilter::Rights,
+        NetworkFilter::NamespaceAndRights,
+    ];
+
+    /// Whether `filter` closes the route past a network namespace, vsock.
+    fn closes_vsock(filter: NetworkFilter) -> bool {
+        filter != NetworkFilter::Rights
+    }
+
+    /// Whether `filter` closes the routes past the network rights, MPTCP and
+    /// SMC.
+    fn closes_mptcp_and_smc(filter: NetworkFilter) -> bool {
+        filter != NetworkFilter::Namespace
+    }
+
     #[test]
-    fn every_entry_point_refuses_a_vsock_socket() {
+    fn every_entry_point_refuses_a_vsock_socket_where_a_namespace_is() {
         for family in FAMILIES {
-            let program = network_program_for(family);
-            for entry in entry_points(family) {
-                let socket = entry.call("socket");
-                for kind in [1, 2, 5] {
-                    let call = Call::new(entry.arch, socket, &[u64::from(AF_VSOCK), kind, 0]);
-                    assert_eq!(
-                        run(program, &call),
-                        ret_errno(EAFNOSUPPORT),
-                        "{entry:?}, socket {socket:#x}, type {kind}"
-                    );
+            for filter in FILTERS {
+                let program = network_program_for(family, filter);
+                let expected = if closes_vsock(filter) {
+                    ret_errno(EAFNOSUPPORT)
+                } else {
+                    RET_ALLOW
+                };
+                for entry in entry_points(family) {
+                    let socket = entry.call("socket");
+                    for kind in [1, 2, 5] {
+                        let call = Call::new(entry.arch, socket, &[u64::from(AF_VSOCK), kind, 0]);
+                        assert_eq!(
+                            run(program, &call),
+                            expected,
+                            "{filter:?}, {entry:?}, socket {socket:#x}, type {kind}"
+                        );
+                    }
                 }
             }
         }
@@ -1295,7 +1576,7 @@ mod tests {
     fn high_bits_do_not_hide_the_vsock_family() {
         // The kernel reads the family as an int, so these are all AF_VSOCK.
         for family in FAMILIES {
-            let program = network_program_for(family);
+            let program = network_program_for(family, NetworkFilter::Namespace);
             for entry in entry_points(family) {
                 for domain in [1 << 32 | 40, u64::MAX << 32 | 40] {
                     let call = Call::new(entry.arch, entry.call("socket"), &[domain, 1, 0]);
@@ -1310,15 +1591,90 @@ mod tests {
     }
 
     #[test]
+    fn every_entry_point_refuses_mptcp_and_smc_where_the_network_rights_are() {
+        // Stream sockets, nonblocking and close-on-exec ones, and datagram
+        // ones, whose protocol the kernel refuses itself and the filter
+        // answers the same.
+        let kinds = [1, 1 | 0o4000 | 0o2000000, 2];
+        for family in FAMILIES {
+            for filter in FILTERS {
+                let program = network_program_for(family, filter);
+                let refused = |errno| {
+                    if closes_mptcp_and_smc(filter) {
+                        ret_errno(errno)
+                    } else {
+                        RET_ALLOW
+                    }
+                };
+                for entry in entry_points(family) {
+                    let socket = entry.call("socket");
+                    for kind in kinds {
+                        // The kernel reads the family and the protocol as
+                        // ints, so high bits hide neither.
+                        for domain in [AF_INET, AF_INET6].map(u64::from) {
+                            for domain in [domain, 1 << 32 | domain] {
+                                for protocol in [IPPROTO_MPTCP, IPPROTO_SMC].map(u64::from) {
+                                    for protocol in [protocol, u64::MAX << 32 | protocol] {
+                                        let call = Call::new(
+                                            entry.arch,
+                                            socket,
+                                            &[domain, kind, protocol],
+                                        );
+                                        assert_eq!(
+                                            run(program, &call),
+                                            refused(EPROTONOSUPPORT),
+                                            "{filter:?}, {entry:?}, domain {domain:#x}, \
+                                             protocol {protocol:#x}"
+                                        );
+                                    }
+                                }
+                                // TCP, by its number and by none, and UDP and
+                                // SCTP, which no network right governs and no
+                                // fallback carries to a TCP service.
+                                for protocol in [0, 6, 17, 132] {
+                                    let call =
+                                        Call::new(entry.arch, socket, &[domain, kind, protocol]);
+                                    assert_eq!(
+                                        run(program, &call),
+                                        RET_ALLOW,
+                                        "{filter:?}, {entry:?}, domain {domain:#x}, \
+                                         protocol {protocol}"
+                                    );
+                                }
+                            }
+                        }
+                        // SMC over IPv4 and over IPv6, its two protocols.
+                        for protocol in [0, 1] {
+                            let domain = u64::from(AF_SMC);
+                            let call = Call::new(entry.arch, socket, &[domain, kind, protocol]);
+                            assert_eq!(
+                                run(program, &call),
+                                refused(EAFNOSUPPORT),
+                                "{filter:?}, {entry:?}, AF_SMC, protocol {protocol}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_other_family_is_allowed() {
         // AF_UNIX, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, and the families
-        // either side of AF_VSOCK.
+        // either side of AF_VSOCK and of AF_SMC.
         for family in FAMILIES {
-            let program = network_program_for(family);
-            for entry in entry_points(family) {
-                for domain in [1, 2, 10, 16, 17, 39, 41] {
-                    let call = Call::new(entry.arch, entry.call("socket"), &[domain, 1, 0]);
-                    assert_eq!(run(program, &call), RET_ALLOW, "{entry:?}, domain {domain}");
+            for filter in FILTERS {
+                let program = network_program_for(family, filter);
+                for entry in entry_points(family) {
+                    for domain in [1, 2, 10, 16, 17, 39, 41, 42, 44] {
+                        let call = Call::new(entry.arch, entry.call("socket"), &[domain, 1, 0]);
+                        assert_eq!(
+                            run(program, &call),
+                            RET_ALLOW,
+                            "{filter:?}, {entry:?}, domain {domain}"
+                        );
+                    }
                 }
             }
         }
@@ -1327,20 +1683,26 @@ mod tests {
     #[test]
     fn every_entry_point_refuses_io_uring_setup() {
         for family in FAMILIES {
-            let program = network_program_for(family);
-            for entry in entry_points(family) {
-                let nr = entry.call("io_uring_setup");
-                let call = Call::new(entry.arch, nr, &[1, 0x1000]);
-                assert_eq!(
-                    run(program, &call),
-                    ret_errno(ENOSYS),
-                    "{entry:?}, nr {nr:#x}"
-                );
-                // io_uring_enter and io_uring_register act on a ring only
-                // io_uring_setup creates.
-                for other in ["io_uring_enter", "io_uring_register"] {
-                    let call = Call::new(entry.arch, entry.call(other), &[3, 1, 1, 0]);
-                    assert_eq!(run(program, &call), RET_ALLOW, "{entry:?}, {other}");
+            for filter in FILTERS {
+                let program = network_program_for(family, filter);
+                for entry in entry_points(family) {
+                    let nr = entry.call("io_uring_setup");
+                    let call = Call::new(entry.arch, nr, &[1, 0x1000]);
+                    assert_eq!(
+                        run(program, &call),
+                        ret_errno(ENOSYS),
+                        "{filter:?}, {entry:?}, nr {nr:#x}"
+                    );
+                    // io_uring_enter and io_uring_register act on a ring only
+                    // io_uring_setup creates.
+                    for other in ["io_uring_enter", "io_uring_register"] {
+                        let call = Call::new(entry.arch, entry.call(other), &[3, 1, 1, 0]);
+                        assert_eq!(
+                            run(program, &call),
+                            RET_ALLOW,
+                            "{filter:?}, {entry:?}, {other}"
+                        );
+                    }
                 }
             }
         }
@@ -1348,30 +1710,37 @@ mod tests {
 
     #[test]
     fn socketcall_cannot_create_a_socket() {
-        // The family is behind the pointer in args[1], so every socket
-        // creation is refused, with the answer `socket` gives for a family
-        // the kernel does not offer; the other calls socketcall carries run.
+        // The family and the protocol are behind the pointer in args[1], so
+        // every socket creation is refused, with the answer `socket` gives for
+        // a family the kernel does not offer; the other calls socketcall
+        // carries run.
         for family in FAMILIES {
-            let program = network_program_for(family);
-            for entry in entry_points(family) {
-                let Some(socketcall) = entry.number("socketcall") else {
-                    continue;
-                };
-                let arch = entry.arch;
-                for pointer in [0, 0x0804_8000] {
-                    let call = Call::new(arch, socketcall, &[u64::from(SYS_SOCKET), pointer]);
-                    assert_eq!(
-                        run(program, &call),
-                        ret_errno(EAFNOSUPPORT),
-                        "pointer {pointer:#x}"
-                    );
-                }
-                let high = Call::new(arch, socketcall, &[1 << 32 | u64::from(SYS_SOCKET), 0]);
-                assert_eq!(run(program, &high), ret_errno(EAFNOSUPPORT));
-                // SYS_BIND through SYS_SENDMMSG.
-                for call_number in 2..=20 {
-                    let call = Call::new(arch, socketcall, &[call_number, 0x0804_8000]);
-                    assert_eq!(run(program, &call), RET_ALLOW, "call {call_number}");
+            for filter in FILTERS {
+                let program = network_program_for(family, filter);
+                for entry in entry_points(family) {
+                    let Some(socketcall) = entry.number("socketcall") else {
+                        continue;
+                    };
+                    let arch = entry.arch;
+                    for pointer in [0, 0x0804_8000] {
+                        let call = Call::new(arch, socketcall, &[u64::from(SYS_SOCKET), pointer]);
+                        assert_eq!(
+                            run(program, &call),
+                            ret_errno(EAFNOSUPPORT),
+                            "{filter:?}, pointer {pointer:#x}"
+                        );
+                    }
+                    let high = Call::new(arch, socketcall, &[1 << 32 | u64::from(SYS_SOCKET), 0]);
+                    assert_eq!(run(program, &high), ret_errno(EAFNOSUPPORT), "{filter:?}");
+                    // SYS_BIND through SYS_SENDMMSG.
+                    for call_number in 2..=20 {
+                        let call = Call::new(arch, socketcall, &[call_number, 0x0804_8000]);
+                        assert_eq!(
+                            run(program, &call),
+                            RET_ALLOW,
+                            "{filter:?}, call {call_number}"
+                        );
+                    }
                 }
             }
         }
@@ -1381,8 +1750,10 @@ mod tests {
     /// point's syscall table reaches, each over first arguments that cover
     /// every address family and every socketcall call number, with and without
     /// high bits set, is refused where a stated refusal covers it and allowed
-    /// everywhere else. A refusal the list omits therefore fails as surely as
-    /// one the program does not make.
+    /// everywhere else. Third arguments covering every protocol a refusal
+    /// names, and those either side of each, are paired with the families a
+    /// refusal reads one under and their neighbours. A refusal the list omits
+    /// therefore fails as surely as one the program does not make.
     fn assert_refuses_exactly(family: Family, program: &[SockFilter], refusals: &[Refusal]) {
         for refusal in refusals {
             assert!(
@@ -1392,26 +1763,50 @@ mod tests {
                 "{family:?} states a refusal of a call it has no entry point for: {refusal:?}"
             );
         }
-        let firsts: Vec<u64> = (0..=64)
-            .chain([1 << 32 | 1, 1 << 32 | 40, u64::MAX << 32 | 40, u64::MAX])
+        assert!(eval::accepted(program), "the kernel takes {program:?}");
+        let firsts = (0..=64).chain([1 << 32 | 1, 1 << 32 | 40, u64::MAX << 32 | 40, u64::MAX]);
+        let thirds = [
+            1,
+            6,
+            255,
+            256,
+            257,
+            261,
+            262,
+            263,
+            1 << 32 | 262,
+            u64::MAX << 32 | 256,
+            u64::MAX,
+        ];
+        let paired = [1, 2, 3, 9, 10, 11, 43, 1 << 32 | 2, u64::MAX << 32 | 10];
+        let arguments: Vec<(u64, u64)> = firsts
+            .map(|first| (first, 0))
+            .chain(
+                paired
+                    .into_iter()
+                    .flat_map(|first| thirds.map(|third| (first, third))),
+            )
             .collect();
         for entry in entry_points(family) {
             for nr in (0..1024).map(|base| base | entry.tag) {
-                for &first in &firsts {
+                for &(first, third) in &arguments {
                     // The low 32 bits, as the filter compares them.
-                    let low = first as u32;
+                    let (low, low_third) = (first as u32, third as u32);
                     let expected = refusals
                         .iter()
                         .find(|refusal| {
                             entry.number(refusal.syscall) == Some(nr)
                                 && refusal.first_argument.is_none_or(|value| value == low)
+                                && refusal
+                                    .third_argument
+                                    .is_none_or(|value| value == low_third)
                         })
                         .map_or(RET_ALLOW, |refusal| ret_errno(refusal.errno));
-                    let call = Call::new(entry.arch, nr, &[first, 0x0804_8000, 0]);
+                    let call = Call::new(entry.arch, nr, &[first, 0x0804_8000, third]);
                     assert_eq!(
-                        run(program, &call),
-                        expected,
-                        "{entry:?}, nr {nr:#x}, first argument {first:#x}"
+                        eval::execute(program, &call),
+                        Some(expected),
+                        "{entry:?}, nr {nr:#x}, arguments {first:#x} and {third:#x}"
                     );
                 }
             }
@@ -1421,40 +1816,23 @@ mod tests {
     #[test]
     fn each_program_refuses_exactly_what_its_refusals_state() {
         for family in FAMILIES {
-            assert_refuses_exactly(
-                family,
-                network_program_for(family),
-                network_refusals_for(family),
-            );
+            for filter in FILTERS {
+                assert_refuses_exactly(
+                    family,
+                    network_program_for(family, filter),
+                    network_refusals_for(family, filter),
+                );
+            }
             assert_refuses_exactly(family, keyring_program_for(family), KEYRING_FILTER_REFUSALS);
         }
     }
 
     #[test]
-    fn every_entry_point_refuses_the_key_calls() {
-        // Whatever the operation or the key a call names, as a policy that
-        // allowed some operations would not.
-        for family in FAMILIES {
-            let program = keyring_program_for(family);
-            for entry in entry_points(family) {
-                for name in ["add_key", "request_key", "keyctl"] {
-                    let nr = entry.call(name);
-                    for first in [0, 1, 11, 0xffff_fffd, u64::MAX] {
-                        let call = Call::new(entry.arch, nr, &[first, 0x0804_8000, 0]);
-                        assert_eq!(
-                            run(program, &call),
-                            ret_errno(ENOSYS),
-                            "{entry:?}, {name}, first argument {first:#x}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn the_host_reports_its_own_familys_refusals() {
-        assert_eq!(NETWORK_FILTER_REFUSALS, network_refusals_for(HOST));
+        for filter in FILTERS {
+            assert_eq!(filter.refusals(), network_refusals_for(HOST, filter));
+            assert_eq!(filter.program(), network_program_for(HOST, filter));
+        }
     }
 
     #[test]
@@ -1473,12 +1851,22 @@ mod tests {
             (Family::RiscV, AUDIT_ARCH_RISCV32, 172),
         ];
         for (family, arch, nr) in cases {
-            let call = Call::new(arch, nr, &[u64::from(AF_VSOCK), u64::from(SYS_SOCKET)]);
-            assert_eq!(
-                run(network_program_for(family), &call),
-                RET_ALLOW,
-                "{family:?}, arch {arch:#x}, nr {nr}"
-            );
+            for filter in FILTERS {
+                let call = Call::new(
+                    arch,
+                    nr,
+                    &[
+                        u64::from(AF_VSOCK),
+                        u64::from(SYS_SOCKET),
+                        u64::from(IPPROTO_MPTCP),
+                    ],
+                );
+                assert_eq!(
+                    run(network_program_for(family, filter), &call),
+                    RET_ALLOW,
+                    "{family:?}, {filter:?}, arch {arch:#x}, nr {nr}"
+                );
+            }
         }
     }
 
@@ -1492,7 +1880,11 @@ mod tests {
         ];
         for (family, arch) in foreign {
             let call = Call::new(arch, 39, &[]);
-            for program in [network_program_for(family), keyring_program_for(family)] {
+            let programs = FILTERS
+                .map(|filter| network_program_for(family, filter))
+                .into_iter()
+                .chain([keyring_program_for(family)]);
+            for program in programs {
                 assert_eq!(run(program, &call), RET_KILL_PROCESS, "{family:?}");
             }
         }
@@ -1508,7 +1900,9 @@ mod tests {
             Family::RiscV
         };
         assert_eq!(HOST, expected);
-        assert_eq!(NETWORK_FILTER, network_program_for(expected));
+        for filter in FILTERS {
+            assert_eq!(filter.program(), network_program_for(expected, filter));
+        }
         assert_eq!(KEYRING_FILTER, keyring_program_for(expected));
     }
 
@@ -1518,6 +1912,9 @@ mod tests {
         // target's, so each is read into the filter's own type to compare.
         assert_eq!(Ok(IO_URING_SETUP), u32::try_from(libc::SYS_io_uring_setup));
         assert_eq!(AF_VSOCK, libc::AF_VSOCK as u32);
+        assert_eq!(AF_INET, libc::AF_INET as u32);
+        assert_eq!(AF_INET6, libc::AF_INET6 as u32);
+        assert_eq!(IPPROTO_MPTCP, libc::IPPROTO_MPTCP as u32);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(Ok(X86_64_SOCKET), u32::try_from(libc::SYS_socket));
         #[cfg(target_arch = "x86")]
@@ -1535,6 +1932,10 @@ mod tests {
     fn the_errnos_are_the_kernels() {
         assert_eq!(i32::from(ENOSYS), Errno::NOSYS.raw_os_error());
         assert_eq!(i32::from(EAFNOSUPPORT), Errno::AFNOSUPPORT.raw_os_error());
+        assert_eq!(
+            i32::from(EPROTONOSUPPORT),
+            Errno::PROTONOSUPPORT.raw_os_error()
+        );
     }
 
     // -- The evaluator: every instruction the kernel's verifier accepts -------

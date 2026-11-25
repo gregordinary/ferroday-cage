@@ -1,16 +1,20 @@
-//! Integration tests for the filter a sandbox with a network namespace of its
-//! own carries, which refuses the routes out that a network namespace does not
-//! cover: vsock, io_uring, and on x86 the socket creation `socketcall` hides.
+//! Integration tests for the network filter, which a sandbox with a network
+//! namespace of its own carries, and a command held to Landlock's network
+//! rights. It refuses the routes out that a network namespace does not cover,
+//! vsock, and the sockets the network rights do not govern that reach a TCP
+//! service, Multipath TCP and SMC, beside the routes that create sockets out
+//! of a filter's sight: io_uring, and on x86 the socket creation `socketcall`
+//! hides.
 //!
 //! The probe is this test binary, run again inside a sandbox on an empty root
-//! holding the host's own userland, bound read-only, so the calls under test
-//! are made directly rather than through a tool that might not make them. A probe run
-//! prints one line per route. Each test compares a sandbox under
-//! [`Network::Host`], which carries no filter, with the postures that do, so a
-//! refusal the host's kernel would have made anyway is told apart from one the
-//! filter made. Each also holds the cage's provenance record to what the probe
-//! saw: the record states the refusals a command observes, and none where it
-//! observes none.
+//! holding the host's own userland, bound read-only, or in a restriction, so
+//! the calls under test are made directly rather than through a tool that
+//! might not make them. A probe run prints one line per route. Each test
+//! compares a sandbox under [`Network::Host`] with no network grant, which
+//! carries no filter, with the postures that do, so a refusal the host's
+//! kernel would have made anyway is told apart from one the filter made. Each
+//! also holds the provenance record to what the probe saw: the record states
+//! the refusals a command observes, and none where it observes none.
 
 #![allow(unsafe_code)]
 
@@ -25,6 +29,17 @@ const PROBE: &str = "FERRODAY_CAGE_TEST_NETWORK_FILTER_PROBE";
 
 /// Where the test binary is bound inside the sandbox.
 const PROBE_PATH: &str = "/probe";
+
+/// Names the port on the IPv4 loopback the probe of the TCP routes connects
+/// to.
+const PORT: &str = "FERRODAY_CAGE_TEST_NETWORK_FILTER_PORT";
+
+/// `AF_SMC`, the address family of SMC sockets, which libc does not name.
+const AF_SMC: libc::c_int = 43;
+
+/// `IPPROTO_SMC`, an SMC socket created in `AF_INET` or `AF_INET6`, which libc
+/// does not name.
+const IPPROTO_SMC: libc::c_int = 256;
 
 /// What a route reported: success, or the errno it failed with.
 type Outcome = Result<(), i32>;
@@ -71,6 +86,56 @@ fn socket(domain: libc::c_long) -> libc::c_long {
     unsafe { libc::syscall(libc::SYS_socket, domain, libc::SOCK_STREAM, 0) }
 }
 
+/// Creates a stream socket of `domain` and `protocol` through the build's own
+/// `socket`.
+// `allow` rather than `expect`: widening an int to a long is the identity on a
+// 32-bit target, where the conversion lint fires, and on no other.
+#[allow(clippy::useless_conversion)]
+fn stream_socket(domain: libc::c_int, protocol: libc::c_int) -> libc::c_long {
+    let (domain, protocol) = (libc::c_long::from(domain), libc::c_long::from(protocol));
+    let stream = libc::c_long::from(libc::SOCK_STREAM);
+    // SAFETY: socket takes three integers and touches no memory of ours.
+    unsafe { libc::syscall(libc::SYS_socket, domain, stream, protocol) }
+}
+
+/// Prints the outcome of a route whose call returns no descriptor.
+fn report_outcome(route: &str, outcome: Outcome) {
+    match outcome {
+        Ok(()) => println!("route {route} ok"),
+        Err(errno) => println!("route {route} errno {errno}"),
+    }
+}
+
+/// Connects a stream socket of `protocol` in `AF_INET` to `port` on the IPv4
+/// loopback, failing with the errno `socket` or `connect` answered.
+fn connect_loopback(protocol: libc::c_int, port: u16) -> Outcome {
+    let last = || Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    // SAFETY: socket takes three integers and touches no memory of ours.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, protocol) };
+    if fd < 0 {
+        return last();
+    }
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
+        .expect("a sockaddr_in's size fits a socklen_t");
+    // SAFETY: the address is a whole sockaddr_in, which connect reads as many
+    // bytes of as `length` says, and `fd` is the socket just created.
+    let connected =
+        unsafe { libc::connect(fd, (&raw const address).cast::<libc::sockaddr>(), length) };
+    let outcome = if connected == 0 { Ok(()) } else { last() };
+    // SAFETY: closing the socket this function created, which nothing else
+    // holds.
+    unsafe { libc::close(fd) };
+    outcome
+}
+
 // `allow` rather than `expect`: widening an int to a long is the identity on a
 // 32-bit target, where the conversion lint fires, and on no other.
 #[test]
@@ -93,6 +158,29 @@ fn probe_native() {
     // which `params` is, zeroed as the call requires.
     let ring = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, params.as_mut_ptr()) };
     report("io_uring", ring);
+    println!("probe done");
+}
+
+/// Reports whether the command can create a socket of each kind a network
+/// grant leaves to the network filter, and connect a TCP socket and a
+/// Multipath TCP one to the port [`PORT`] names.
+#[test]
+fn probe_tcp_routes() {
+    if !probing() {
+        return;
+    }
+    let port = std::env::var(PORT)
+        .expect("the test names a port")
+        .parse()
+        .expect("a port number");
+    let (inet, inet6, mptcp) = (libc::AF_INET, libc::AF_INET6, libc::IPPROTO_MPTCP);
+    report("tcp", stream_socket(inet, 0));
+    report("mptcp", stream_socket(inet, mptcp));
+    report("mptcp6", stream_socket(inet6, mptcp));
+    report("smc", stream_socket(AF_SMC, 0));
+    report("smc-inet", stream_socket(inet, IPPROTO_SMC));
+    report_outcome("tcp-connect", connect_loopback(0, port));
+    report_outcome("mptcp-connect", connect_loopback(mptcp, port));
     println!("probe done");
 }
 
@@ -247,18 +335,35 @@ fn probe_compat() {
 /// reported and what the sandbox's provenance record says its network filter
 /// refuses.
 fn probe(network: Network, test: &str) -> (Report, Option<ResolvedNetworkFilter>) {
+    probe_with(network, test, |builder| builder)
+}
+
+/// [`probe`], with the sandbox's builder passed through `configure` before it
+/// is built.
+fn probe_with(
+    network: Network,
+    test: &str,
+    configure: impl FnOnce(ferroday_cage::CageBuilder) -> ferroday_cage::CageBuilder,
+) -> (Report, Option<ResolvedNetworkFilter>) {
     let exe = std::env::current_exe().expect("the test binary has a path");
-    let cage = common::host_userland()
+    let builder = common::host_userland()
         .command(PROBE_PATH)
         .args(common::rerun_args(test))
         .env(PROBE, "1")
         .network(network)
         .resolv_conf(false)
-        .bind_ro(&exe, PROBE_PATH)
+        .bind_ro(&exe, PROBE_PATH);
+    let cage = configure(builder)
         .build()
         .expect("a valid sandbox configuration");
     let recorded = cage.resolved_inputs().network_filter;
     let output = cage.output().expect("the sandbox launches");
+    (read_report(&output), recorded)
+}
+
+/// What a probe run reported, route by route, or `None` where a signal ended
+/// it before it reported them all.
+fn read_report(output: &ferroday_cage::Output) -> Report {
     let stdout = String::from_utf8_lossy(&output.stdout);
     if output.status.signal().is_some() || !stdout.contains("probe done") {
         assert!(
@@ -266,7 +371,7 @@ fn probe(network: Network, test: &str) -> (Report, Option<ResolvedNetworkFilter>
             "the probe failed without reporting:\n{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr),
         );
-        return (None, recorded);
+        return None;
     }
     let routes = stdout
         .lines()
@@ -280,7 +385,7 @@ fn probe(network: Network, test: &str) -> (Report, Option<ResolvedNetworkFilter>
             (route.to_string(), outcome)
         })
         .collect();
-    (Some(routes), recorded)
+    Some(routes)
 }
 
 /// Whether this host can build a sandbox that installs the filter, reporting
@@ -297,19 +402,24 @@ fn outcome(report: &BTreeMap<String, Outcome>, route: &str) -> Outcome {
         .unwrap_or_else(|| panic!("the probe reported no {route} route: {report:?}"))
 }
 
-/// The errno the record says `syscall` answers with where its first argument
-/// is `first_argument`, failing the test where the record states no such
-/// refusal.
+/// The errno the record says `syscall` answers with where its first and
+/// third arguments are `first_argument` and `third_argument`, failing the test
+/// where the record states no such refusal.
 fn recorded_errno(
     filter: Option<&ResolvedNetworkFilter>,
     syscall: &str,
     first_argument: Option<u32>,
+    third_argument: Option<u32>,
 ) -> i32 {
     let filter = filter.expect("a filtered sandbox records its network filter");
     let refusal = filter
         .refusals
         .iter()
-        .find(|refusal| refusal.syscall == syscall && refusal.first_argument == first_argument)
+        .find(|refusal| {
+            refusal.syscall == syscall
+                && refusal.first_argument == first_argument
+                && refusal.third_argument == third_argument
+        })
         .unwrap_or_else(|| panic!("the record states no refusal of {syscall}: {filter:?}"));
     i32::from(refusal.errno)
 }
@@ -334,12 +444,22 @@ fn an_isolated_network_refuses_vsock_and_io_uring() {
         // The record states the answers the command saw.
         assert_eq!(
             outcome(&filtered, "vsock"),
-            Err(recorded_errno(recorded.as_ref(), "socket", Some(vsock))),
+            Err(recorded_errno(
+                recorded.as_ref(),
+                "socket",
+                Some(vsock),
+                None
+            )),
             "{network:?}"
         );
         assert_eq!(
             outcome(&filtered, "io_uring"),
-            Err(recorded_errno(recorded.as_ref(), "io_uring_setup", None)),
+            Err(recorded_errno(
+                recorded.as_ref(),
+                "io_uring_setup",
+                None,
+                None
+            )),
             "{network:?}"
         );
         #[cfg(target_pointer_width = "64")]
@@ -405,7 +525,12 @@ fn an_isolated_network_closes_the_32_bit_entry_points() {
         // SYS_SOCKET, the call number socketcall creates a socket under.
         assert_eq!(
             outcome(&filtered, "i386-socketcall-unix"),
-            Err(recorded_errno(recorded.as_ref(), "socketcall", Some(1))),
+            Err(recorded_errno(
+                recorded.as_ref(),
+                "socketcall",
+                Some(1),
+                None
+            )),
             "{network:?}"
         );
         // socketcall hides the family, so no socket is created through it,
@@ -535,4 +660,143 @@ fn a_bootstrap_refuses_a_host_without_seccomp_before_downloading() {
             "{key}: {reached}"
         );
     }
+}
+
+/// A port on the IPv4 loopback a listener of this test's accepts on for as
+/// long as the test runs, and a port beside it, which a grant can name in its
+/// place.
+#[cfg(feature = "hardening")]
+fn listening_port() -> (u16, u16) {
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+    let port = listener.local_addr().expect("a bound address").port();
+    std::thread::spawn(move || while listener.accept().is_ok() {});
+    (port, port.checked_add(1).unwrap_or(port - 1))
+}
+
+/// Holds a probe of the TCP routes made under a grant of connect on a port
+/// other than the listener's to the filter's refusals, and the record to what
+/// the probe saw: a TCP socket is created and its connect refused by the
+/// grant, and every socket the grant does not govern that reaches a TCP
+/// service is refused by the filter, as the record states.
+#[cfg(feature = "hardening")]
+fn assert_refused_past_the_grant(
+    context: &str,
+    report: &BTreeMap<String, Outcome>,
+    recorded: Option<&ResolvedNetworkFilter>,
+) {
+    let word = |value: libc::c_int| u32::try_from(value).expect("a family or a protocol fits");
+    assert_eq!(outcome(report, "tcp"), Ok(()), "{context}");
+    assert_eq!(
+        outcome(report, "tcp-connect"),
+        Err(libc::EACCES),
+        "{context}"
+    );
+    let mptcp = Some(libc::IPPROTO_MPTCP);
+    for (route, family, protocol, errno) in [
+        ("mptcp", libc::AF_INET, mptcp, libc::EPROTONOSUPPORT),
+        ("mptcp6", libc::AF_INET6, mptcp, libc::EPROTONOSUPPORT),
+        ("smc", AF_SMC, None, libc::EAFNOSUPPORT),
+        (
+            "smc-inet",
+            libc::AF_INET,
+            Some(IPPROTO_SMC),
+            libc::EPROTONOSUPPORT,
+        ),
+        ("mptcp-connect", libc::AF_INET, mptcp, libc::EPROTONOSUPPORT),
+    ] {
+        assert_eq!(outcome(report, route), Err(errno), "{context}: {route}");
+        let stated = recorded_errno(recorded, "socket", Some(word(family)), protocol.map(word));
+        assert_eq!(outcome(report, route), Err(stated), "{context}: {route}");
+    }
+}
+
+/// Says so where the host itself refuses what [`assert_refused_past_the_grant`]
+/// holds the filter to, as `open`, a probe with no filter, shows, rather than
+/// pass quietly on a refusal that is not evidence of the filter.
+#[cfg(feature = "hardening")]
+fn report_unmet_premises(open: &BTreeMap<String, Outcome>) {
+    assert_eq!(outcome(open, "tcp-connect"), Ok(()), "with no grant");
+    if outcome(open, "mptcp-connect").is_err() {
+        common::require::premise_unmet(format!(
+            "this host refuses a Multipath TCP connection itself ({:?}), so the MPTCP checks \
+             cannot tell the filter from the kernel",
+            outcome(open, "mptcp-connect")
+        ));
+    }
+    if outcome(open, "smc").is_err() {
+        common::require::premise_unmet(format!(
+            "this host refuses an SMC socket itself ({:?}), so the SMC check cannot tell the \
+             filter from the kernel",
+            outcome(open, "smc")
+        ));
+    }
+}
+
+/// A sandbox's network grant governs its TCP sockets, and the filter refuses
+/// the sockets that would reach a TCP service past it, under the host's
+/// network and under one of the sandbox's own.
+#[test]
+#[cfg(feature = "hardening")]
+fn a_network_grant_leaves_a_sandbox_no_socket_past_it() {
+    if !host_runs_the_filter() || !common::landlock_net() {
+        return;
+    }
+    let (port, ungranted) = listening_port();
+    let routes = |network: Network, grant: Option<u16>| {
+        let (report, recorded) = probe_with(network, "probe_tcp_routes", |builder| {
+            let builder = builder.env(PORT, port.to_string());
+            match grant {
+                Some(granted) => builder.landlock_net(ferroday_cage::NetAccess::CONNECT, granted),
+                None => builder,
+            }
+        });
+        (report.expect("the probe reports"), recorded)
+    };
+    let (open, unfiltered) = routes(Network::Host, None);
+    assert_eq!(unfiltered, None, "the host network records no filter");
+    for network in [Network::Host, Network::Isolated] {
+        let (report, recorded) = routes(network, Some(ungranted));
+        assert_refused_past_the_grant(&format!("{network:?}"), &report, recorded.as_ref());
+    }
+    report_unmet_premises(&open);
+}
+
+/// A restriction's network grant governs its TCP sockets on the host's network,
+/// and the filter refuses the sockets that would reach a TCP service past it.
+#[test]
+#[cfg(feature = "hardening")]
+fn a_network_grant_leaves_a_restriction_no_socket_past_it() {
+    use ferroday_cage::{NetAccess, Restriction, SeccompPolicy, SeccompRules};
+
+    if !common::require::seccomp() || !common::landlock_net() {
+        return;
+    }
+    let (port, ungranted) = listening_port();
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let routes = |grant: Option<u16>| {
+        let builder = Restriction::builder()
+            .command(&exe)
+            .args(common::rerun_args("probe_tcp_routes"))
+            .env(PROBE, "1")
+            .env(PORT, port.to_string());
+        // Without a grant, the curated policy is what the restriction
+        // confines with, which refuses no socket.
+        let builder = match grant {
+            Some(granted) => builder.landlock_net(NetAccess::CONNECT, granted),
+            None => builder.seccomp(SeccompPolicy::Rules(SeccompRules::curated())),
+        };
+        let restriction = builder.build().expect("a valid restriction configuration");
+        let recorded = restriction.resolved_inputs().network_filter;
+        let output = restriction.output().expect("the restriction launches");
+        (read_report(&output).expect("the probe reports"), recorded)
+    };
+    let (open, unfiltered) = routes(None);
+    assert_eq!(
+        unfiltered, None,
+        "a restriction without a grant records no filter"
+    );
+    let (report, recorded) = routes(Some(ungranted));
+    assert_refused_past_the_grant("a restriction", &report, recorded.as_ref());
+    report_unmet_premises(&open);
 }

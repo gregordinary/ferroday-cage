@@ -348,10 +348,11 @@ changes what a build produces:
   pending launch is not visible here, being established after the cage is built.
 - **`network-filter`** — the syscalls [the network
   filter](how-the-sandbox-is-built.md#the-network-filter) refuses under an
-  isolated or a denied network, each by name, with the value its first argument
-  holds where that decides it, and the errno it answers. A configure test that
-  probes vsock or io_uring reads the refusal as an absent feature. The key is
-  absent under the host network, which installs no filter.
+  isolated or a denied network, or a Landlock network grant, each by name, with
+  the values its first and third arguments hold where they decide it, and the
+  errno it answers. A configure test that probes vsock, io_uring or Multipath
+  TCP reads the refusal as an absent feature. The key is absent under the host
+  network without a network grant, which installs no filter.
 - **`pid-namespace`** — whether the command runs under the sandbox's own init.
   Without one it sees the caller's processes, and its descendants can outlive
   it.

@@ -236,7 +236,12 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 /// A host that cannot install the filter fails the launch at
 /// [`SetupStep::InstallNetworkFilter`](crate::SetupStep::InstallNetworkFilter).
 /// [`host::seccomp_available`](crate::host::seccomp_available) reports whether
-/// this process can install one. [`Host`](Self::Host) carries no filter.
+/// this process can install one. [`Host`](Self::Host) carries no filter of
+/// its own. Under any posture, a Landlock network grant of the hardening layer
+/// has the filter refuse the sockets the grant does not govern that reach a
+/// TCP service, as [the network
+/// filter](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#the-network-filter)
+/// sets out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -4553,10 +4558,22 @@ impl CageBuilder {
     ///
     /// Configuring any grant — filesystem or network — enrolls the sandbox in
     /// Landlock. A network grant then governs both TCP bind and connect: the
-    /// command may bind only ports granted [`NetAccess::BIND`] and connect only
-    /// to ports granted [`NetAccess::CONNECT`], and every other bind and
-    /// connect is denied. A grant of `port` `0` for [`NetAccess::BIND`] permits
-    /// binding to a kernel-assigned ephemeral port.
+    /// command may bind a TCP socket only to ports granted [`NetAccess::BIND`]
+    /// and connect one only to ports granted [`NetAccess::CONNECT`], and every
+    /// other TCP bind and connect is denied. A grant of `port` `0` for
+    /// [`NetAccess::BIND`] permits binding to a kernel-assigned ephemeral port.
+    ///
+    /// Landlock's network rights govern TCP sockets and no other. Two other
+    /// kinds of socket reach a TCP service, since each falls back to plain TCP
+    /// with a peer that does not speak it: Multipath TCP, and SMC. Wherever a
+    /// network grant applies, the command therefore runs under the [network
+    /// filter](https://gregordinary.github.io/ferroday-cage/how-the-sandbox-is-built.html#the-network-filter),
+    /// which refuses creating either, as a kernel without them would, and
+    /// refuses the two routes that create a socket out of a filter's sight:
+    /// `io_uring_setup`, and on x86 `socketcall`. UDP and every other family
+    /// stay outside a grant's reach, and so does `AF_UNIX`. A host that
+    /// cannot install the filter fails the launch at
+    /// [`SetupStep::InstallNetworkFilter`](crate::SetupStep::InstallNetworkFilter).
     ///
     /// Network rights require Landlock ABI 4. On an older kernel that offers
     /// Landlock they are narrowed away best-effort, exactly as an unsupported
