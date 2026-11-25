@@ -134,8 +134,12 @@ model](process-model.md) describes.
     the new root with
     `openat2` and `RESOLVE_IN_ROOT`, so a symlink inside the rootfs — even
     an absolute one — resolves within the rootfs and can never address the
-    host; the mount syscalls then reach the resolved target through its
-    `/proc/self/fd` path. Missing mount targets are created; a directory
+    host. Each mount is made detached and attached onto the resolved target's
+    descriptor with `move_mount`: the fresh `/proc`, the tmpfs and `devpts`
+    mounts are created through `fsopen` and `fsmount`, and a bind is a clone of
+    its source. A raw mount is the exception, made with `mount(2)` as given,
+    which reaches the target through its `/proc/self/fd` path. Missing mount
+    targets are created; a directory
     stays afterwards, a file does not (see [What a launch leaves in the
     root](#what-a-launch-leaves-in-the-root)). A read-only bind is cloned
     detached, made read-only with `mount_setattr` and `AT_RECURSIVE` while

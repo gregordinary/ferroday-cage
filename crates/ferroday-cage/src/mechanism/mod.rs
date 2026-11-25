@@ -140,7 +140,7 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags};
 use rustix::fs::RawMode;
 use rustix::io::Errno;
-use rustix::mount::{MountFlags, MountPropagationFlags};
+use rustix::mount::{MountAttrFlags, MountFlags, MountPropagationFlags};
 use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 use rustix::pipe::{self, PipeFlags};
 use rustix::process::Signal;
@@ -1196,20 +1196,93 @@ pub(crate) struct MountDir {
     pub(crate) mode: RawMode,
 }
 
+/// A filesystem instance the launch creates for the sandbox, as the mount API
+/// takes one: the type `fsopen` opens a context for, the parameters `fsconfig`
+/// sets on it, and the attributes `fsmount` gives the mount it makes.
+///
+/// The mount is made detached and attached onto its target's descriptor, so
+/// nothing resolves a path to place it, and the launch holds a descriptor of
+/// the mount itself; see `child::fresh_mount`. Each one the launch makes is a
+/// constant: the managed profile's, the launch's own tmpfs, and the procfs a
+/// probe mounts as a launch does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FreshFs {
+    /// The filesystem type.
+    pub(crate) fstype: &'static CStr,
+    /// The parameters, in the order they are set.
+    pub(crate) params: &'static [FsParam],
+    /// The attributes of the mount.
+    pub(crate) attributes: MountAttrFlags,
+}
+
+/// One parameter `fsconfig` sets on a filesystem context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsParam {
+    /// A flag, set with `FSCONFIG_SET_FLAG`.
+    Flag(&'static CStr),
+    /// A key and its value, set with `FSCONFIG_SET_STRING`.
+    String(&'static CStr, &'static CStr),
+}
+
+impl FreshFs {
+    /// The `MS_*` flags that give a mount these attributes, as a report of the
+    /// mount states them.
+    pub(crate) fn mount_flags(&self) -> MountFlags {
+        [
+            (MountAttrFlags::MOUNT_ATTR_RDONLY, MountFlags::RDONLY),
+            (MountAttrFlags::MOUNT_ATTR_NOSUID, MountFlags::NOSUID),
+            (MountAttrFlags::MOUNT_ATTR_NODEV, MountFlags::NODEV),
+            (MountAttrFlags::MOUNT_ATTR_NOEXEC, MountFlags::NOEXEC),
+            (MountAttrFlags::MOUNT_ATTR_NOATIME, MountFlags::NOATIME),
+            (
+                MountAttrFlags::MOUNT_ATTR_STRICTATIME,
+                MountFlags::STRICTATIME,
+            ),
+            (
+                MountAttrFlags::MOUNT_ATTR_NODIRATIME,
+                MountFlags::NODIRATIME,
+            ),
+        ]
+        .into_iter()
+        .filter(|(attribute, _)| self.attributes.contains(*attribute))
+        .fold(MountFlags::empty(), |flags, (_, flag)| flags | flag)
+    }
+
+    /// The parameters as the data string `mount(2)` takes, as a report of the
+    /// mount states them: comma-separated, a flag by its name and a value as
+    /// `key=value`.
+    pub(crate) fn data(&self) -> String {
+        let mut data = String::new();
+        for param in self.params {
+            if !data.is_empty() {
+                data.push(',');
+            }
+            match param {
+                FsParam::Flag(key) => data.push_str(&key.to_string_lossy()),
+                FsParam::String(key, value) => {
+                    data.push_str(&key.to_string_lossy());
+                    data.push('=');
+                    data.push_str(&value.to_string_lossy());
+                }
+            }
+        }
+        data
+    }
+}
+
 /// The action a [`MountOp`] performs once its target exists.
 #[derive(Debug, Clone)]
 pub(crate) enum MountAction {
-    /// Mount a tmpfs.
+    /// Mount a tmpfs of the sandbox's own.
     Tmpfs {
         /// Rootfs-relative mount target.
         target: CString,
-        /// Mount flags for the tmpfs.
-        flags: MountFlags,
-        /// Filesystem data string (`mode=...`).
-        data: CString,
+        /// The tmpfs.
+        fs: FreshFs,
     },
     /// Mount a fresh procfs instance, presenting the sandbox's own PID
-    /// namespace.
+    /// namespace: [`FRESH_PROCFS`](procfs::FRESH_PROCFS), which the procfs
+    /// probe mounts too.
     Procfs {
         /// Rootfs-relative mount target.
         target: CString,
@@ -1218,8 +1291,8 @@ pub(crate) enum MountAction {
     Devpts {
         /// Rootfs-relative mount target.
         target: CString,
-        /// Filesystem data string.
-        data: CString,
+        /// The devpts instance.
+        fs: FreshFs,
     },
     /// Recursively bind a host path onto a rootfs target.
     Bind {

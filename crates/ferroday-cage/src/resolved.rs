@@ -992,23 +992,21 @@ fn split_env(entry: &CString) -> (OsString, OsString) {
 /// Projects one internal mount action onto the public shape.
 fn project_mount(action: &MountAction) -> ResolvedMount {
     match action {
-        MountAction::Tmpfs {
-            target,
-            flags,
-            data,
-        } => ResolvedMount::Tmpfs {
+        // A filesystem the launch makes through the mount API is stated as
+        // `mount(2)` would make it, the form a raw mount takes.
+        MountAction::Tmpfs { target, fs } => ResolvedMount::Tmpfs {
             target: sandbox_path(target),
             // Widened to match `RawMount::get_flags`, which is `u64` so the
             // public surface does not depend on the kernel type's width.
-            flags: u64::from(flags.bits()),
-            data: lossy(data),
+            flags: u64::from(fs.mount_flags().bits()),
+            data: fs.data(),
         },
         MountAction::Procfs { target } => ResolvedMount::Procfs {
             target: sandbox_path(target),
         },
-        MountAction::Devpts { target, data } => ResolvedMount::Devpts {
+        MountAction::Devpts { target, fs } => ResolvedMount::Devpts {
             target: sandbox_path(target),
-            data: lossy(data),
+            data: fs.data(),
         },
         MountAction::Bind {
             source,
@@ -1076,12 +1074,6 @@ fn optional(value: &CString) -> Option<OsString> {
     } else {
         Some(OsString::from_vec(value.as_bytes().to_vec()))
     }
-}
-
-/// Reads a frozen data string. These are composed by the crate itself from
-/// ASCII literals, so the conversion never actually loses anything.
-fn lossy(value: &CString) -> String {
-    String::from_utf8_lossy(value.as_bytes()).into_owned()
 }
 
 #[cfg(test)]

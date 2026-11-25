@@ -13,18 +13,22 @@
 //! table to read. This forks a throwaway child that unshares a user, a mount
 //! and a PID namespace, single-identity-maps itself, and forks once more so
 //! that the grandchild is the new PID namespace's first process. That process
-//! mounts a procfs as the launch's [`MountAction::Procfs`] step does, with the
-//! launch's flags. The children keep the post-fork discipline the launch
-//! stages keep (see [`child`](super::child)).
+//! mounts a procfs as the launch's [`MountAction::Procfs`] step does: the same
+//! [`FRESH_PROCFS`], made through the same mount API calls. The children keep
+//! the post-fork discipline the launch stages keep (see
+//! [`child`](super::child)).
 //!
 //! [`MountAction::Procfs`]: super::MountAction::Procfs
 
+use std::os::fd::AsFd;
+
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
-use rustix::mount::{self, MountFlags, MountPropagationFlags};
+use rustix::mount::{self, MountAttrFlags, MountPropagationFlags};
 use rustix::thread::UnshareFlags;
 
-use super::child::{MapDuty, MapPaths, enter_mapped_namespace};
-use super::sys;
+use super::child::{MapDuty, MapPaths, attach, enter_mapped_namespace, fresh_mount};
+use super::{FreshFs, sys};
 
 /// The outcome of the procfs probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +42,17 @@ pub(crate) enum ProcfsProbe {
     Inconclusive,
 }
 
-/// The flags a fresh procfs is mounted with, by a launch and by the probe
-/// alike: the rule the kernel applies weighs a new mount's flags against the
-/// existing procfs's, so the probe asks with the launch's own.
-pub(super) const FRESH_PROCFS_FLAGS: MountFlags = MountFlags::NOSUID
-    .union(MountFlags::NODEV)
-    .union(MountFlags::NOEXEC);
+/// The procfs a launch mounts for a sandbox with a PID namespace of its own,
+/// and the probe mounts as a launch does: the rule the kernel applies weighs a
+/// new mount's flags against the existing procfs's, so the probe asks with the
+/// launch's own.
+pub(super) const FRESH_PROCFS: FreshFs = FreshFs {
+    fstype: c"proc",
+    params: &[],
+    attributes: MountAttrFlags::MOUNT_ATTR_NOSUID
+        .union(MountAttrFlags::MOUNT_ATTR_NODEV)
+        .union(MountAttrFlags::MOUNT_ATTR_NOEXEC),
+};
 
 /// The grandchild mounted the procfs.
 const EXIT_MOUNTED: i32 = 0;
@@ -112,7 +121,8 @@ fn probe_child(uid_line: &[u8], gid_line: &[u8]) -> i32 {
 /// `/proc` is a target the probe's caller already has, and in this private
 /// mount namespace a procfs stacked on it changes nothing outside. The kernel
 /// weighs every procfs the namespace holds rather than the one under the
-/// target, so the target does not decide the answer.
+/// target, so the target does not decide the answer: `fsmount` gives it, and
+/// the attach that follows is the launch's own next step.
 fn mount_in_namespace() -> i32 {
     if mount::mount_change(
         c"/",
@@ -122,10 +132,18 @@ fn mount_in_namespace() -> i32 {
     {
         return EXIT_SETUP_FAILED;
     }
-    match mount::mount(c"proc", c"/proc", c"proc", FRESH_PROCFS_FLAGS, c"") {
+    // A target the caller lacks says nothing about the rule.
+    let Ok(target) = rustix::fs::open(
+        c"/proc",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return EXIT_SETUP_FAILED;
+    };
+    match fresh_mount(&FRESH_PROCFS).and_then(|procfs| attach(procfs.as_fd(), target.as_fd())) {
         Ok(()) => EXIT_MOUNTED,
-        // A target the caller lacks says nothing about the rule.
-        Err(Errno::NOENT | Errno::NOTDIR) => EXIT_SETUP_FAILED,
+        // A kernel without the mount API says nothing about the rule either.
+        Err(Errno::NOSYS) => EXIT_SETUP_FAILED,
         Err(_) => EXIT_REFUSED,
     }
 }

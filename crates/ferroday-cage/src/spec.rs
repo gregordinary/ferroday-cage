@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode};
 use rustix::io::Errno;
-use rustix::mount::MountFlags;
+use rustix::mount::{MountAttrFlags, MountFlags};
 use rustix::thread::UnshareFlags;
 
 use crate::cgroup::{CgroupLimit, CgroupSettings};
@@ -18,9 +18,9 @@ use crate::error::{ConfigError, Error, OverlayLayer};
 use crate::idmap::{self, IdMapper, Identity, IdentityMap, PresentedIdentity};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
-    self, Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, ManagedTarget,
-    MountAction, MountDir, MountOp, NestedMap, NestedPlan, OverlayPlan, PresentPlan, RlimitPlan,
-    RootPlan, RunAsPlan, StdioPlan,
+    self, Arrival, Confinement, FreshFs, FsParam, IdentityPlan, LaunchPlan, ManagedPlaceholders,
+    ManagedTarget, MountAction, MountDir, MountOp, NestedMap, NestedPlan, OverlayPlan, PresentPlan,
+    RlimitPlan, RootPlan, RunAsPlan, StdioPlan,
 };
 use crate::observer::{Observer, Output};
 use crate::path;
@@ -165,6 +165,37 @@ const MAX_NAMESERVERS: usize = 3;
 /// through a sandbox and then deployed, where a `/tmp` no unprivileged process
 /// can write to is a broken image.
 const STICKY_DIR_MODE: RawMode = 0o1777;
+
+/// The managed `/dev`: a tmpfs whose root has an ordinary directory's mode,
+/// `nosuid` and `nodev`; see [`Lowering::push_dev`].
+const DEV_TMPFS: FreshFs = FreshFs {
+    fstype: c"tmpfs",
+    params: &[FsParam::String(c"mode", c"0755")],
+    attributes: MountAttrFlags::MOUNT_ATTR_NOSUID.union(MountAttrFlags::MOUNT_ATTR_NODEV),
+};
+
+/// The managed `/tmp` and `/dev/shm`: a world-writable sticky tmpfs, `nosuid`
+/// and `nodev`.
+const STICKY_TMPFS: FreshFs = FreshFs {
+    fstype: c"tmpfs",
+    params: &[FsParam::String(c"mode", c"1777")],
+    attributes: MountAttrFlags::MOUNT_ATTR_NOSUID.union(MountAttrFlags::MOUNT_ATTR_NODEV),
+};
+
+/// The managed `/dev/pts`: a devpts instance of the sandbox's own, `nosuid`
+/// and `noexec`.
+///
+/// No `gid` parameter: the conventional tty group is not mapped under the
+/// default single-identity map, and an unmapped gid fails the mount.
+const DEVPTS: FreshFs = FreshFs {
+    fstype: c"devpts",
+    params: &[
+        FsParam::Flag(c"newinstance"),
+        FsParam::String(c"ptmxmode", c"0666"),
+        FsParam::String(c"mode", c"0620"),
+    ],
+    attributes: MountAttrFlags::MOUNT_ATTR_NOSUID.union(MountAttrFlags::MOUNT_ATTR_NOEXEC),
+};
 
 /// The symlinks created inside the sandbox's `/dev`, as (name, content).
 const DEV_SYMLINKS: [(&str, &str); 5] = [
@@ -5390,8 +5421,7 @@ impl Lowering {
                 create_file: None,
                 action: MountAction::Tmpfs {
                     target: rel_cstring(&["dev"])?,
-                    flags: MountFlags::NOSUID | MountFlags::NODEV,
-                    data: c"mode=0755".to_owned(),
+                    fs: DEV_TMPFS,
                 },
             },
             "/dev".to_string(),
@@ -5438,10 +5468,7 @@ impl Lowering {
                 create_file: None,
                 action: MountAction::Devpts {
                     target: rel_cstring(&["dev", "pts"])?,
-                    // No gid= option: the conventional tty group is not
-                    // mapped under the default single-identity map and an
-                    // unmapped gid fails the mount.
-                    data: c"newinstance,ptmxmode=0666,mode=0620".to_owned(),
+                    fs: DEVPTS,
                 },
             },
             "/dev/pts".to_string(),
@@ -5452,8 +5479,7 @@ impl Lowering {
                 create_file: None,
                 action: MountAction::Tmpfs {
                     target: rel_cstring(&["dev", "shm"])?,
-                    flags: MountFlags::NOSUID | MountFlags::NODEV,
-                    data: c"mode=1777".to_owned(),
+                    fs: STICKY_TMPFS,
                 },
             },
             "/dev/shm".to_string(),
@@ -5468,8 +5494,7 @@ impl Lowering {
                 create_file: None,
                 action: MountAction::Tmpfs {
                     target: rel_cstring(&["tmp"])?,
-                    flags: MountFlags::NOSUID | MountFlags::NODEV,
-                    data: c"mode=1777".to_owned(),
+                    fs: STICKY_TMPFS,
                 },
             },
             "/tmp".to_string(),
@@ -7273,6 +7298,43 @@ mod tests {
                 .contains(&"/etc/resolv.conf".to_string())
         );
         assert!(cage.plan.configure_loopback);
+    }
+
+    #[test]
+    fn the_managed_filesystems_are_reported_as_mount_states_them() {
+        // The launch makes them through the mount API, and the record states
+        // them as the flags and data string `mount(2)` takes, as it does a raw
+        // mount: what a hand-built profile spells to get the same mounts.
+        let mounts = sh_in("/tmp").build().unwrap().resolved_inputs().mounts;
+        let fresh = |at: &str| {
+            mounts
+                .iter()
+                .find(|mount| mount.get_target() == Path::new(at))
+                .cloned()
+                .unwrap_or_else(|| panic!("no mount at {at}: {mounts:?}"))
+        };
+        // MS_NOSUID | MS_NODEV, for each tmpfs.
+        for (at, data) in [
+            ("/dev", "mode=0755"),
+            ("/dev/shm", "mode=1777"),
+            ("/tmp", "mode=1777"),
+        ] {
+            assert_eq!(
+                fresh(at),
+                crate::ResolvedMount::Tmpfs {
+                    target: PathBuf::from(at),
+                    flags: 0x6,
+                    data: data.to_string(),
+                },
+            );
+        }
+        assert_eq!(
+            fresh("/dev/pts"),
+            crate::ResolvedMount::Devpts {
+                target: PathBuf::from("/dev/pts"),
+                data: "newinstance,ptmxmode=0666,mode=0620".to_string(),
+            },
+        );
     }
 
     #[test]

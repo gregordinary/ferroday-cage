@@ -63,9 +63,14 @@
 //! Mount targets are resolved against the new-root descriptor with
 //! `openat2` and `RESOLVE_IN_ROOT`, so an absolute symlink inside the
 //! rootfs resolves within the rootfs and cannot reach the host tree during
-//! the pre-pivot window. The mount syscalls then address the resolved
-//! descriptor through its `/proc/self/fd` path, formatted into a stack
-//! buffer; the host `/proc` is still mounted at that point.
+//! the pre-pivot window. What a step mounts is made detached and attached
+//! onto the resolved descriptor with `move_mount`: a filesystem of the
+//! sandbox's own through `fsopen` and `fsmount` (see [`fresh_mount`]), a bind
+//! as a clone of its source's tree, an overlay through the same calls. A raw
+//! mount is the one step `mount(2)` makes, verbatim, and it and the remount
+//! that stands in for `mount_setattr` below Linux 5.12 address the descriptor
+//! through its `/proc/self/fd` path, formatted into a stack buffer; the host
+//! `/proc` is still mounted at that point.
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -96,7 +101,8 @@ use super::resolve;
 use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
-    IdentityPlan, JoinTarget, LaunchPlan, MountAction, MountOp, OverlayPlan, RootPlan,
+    FreshFs, FsParam, IdentityPlan, JoinTarget, LaunchPlan, MountAction, MountOp, OverlayPlan,
+    RootPlan,
     STATUS_DUMPED, STATUS_EXITED, STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
 };
 use crate::error::SetupStep;
@@ -3110,48 +3116,21 @@ fn execute_op(
                 .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
             read_only_in_place(target.as_fd())
         }
-        MountAction::Tmpfs {
+        // A procfs is made from inside the new PID namespace, so the instance
+        // presents the sandbox's processes and nothing else.
+        MountAction::Tmpfs { target, fs } | MountAction::Devpts { target, fs } => {
+            let step = match op.action {
+                MountAction::Devpts { .. } => SetupStep::MountDevpts,
+                _ => SetupStep::MountTmpfs,
+            };
+            mount_fresh(root, target, fs, step)
+        }
+        MountAction::Procfs { target } => mount_fresh(
+            root,
             target,
-            flags,
-            data,
-        } => {
-            let target = open_in_root(root, target, OFlags::PATH | OFlags::DIRECTORY)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-            mount::mount(
-                c"tmpfs",
-                fd_path(&target).as_cstr(),
-                c"tmpfs",
-                *flags,
-                data.as_c_str(),
-            )
-            .map_err(|errno| (SetupStep::MountTmpfs, errno))
-        }
-        MountAction::Procfs { target } => {
-            // Mounted from inside the new PID namespace, so the instance
-            // presents the sandbox's processes and nothing else.
-            let target = open_in_root(root, target, OFlags::PATH | OFlags::DIRECTORY)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-            mount::mount(
-                c"proc",
-                fd_path(&target).as_cstr(),
-                c"proc",
-                super::procfs::FRESH_PROCFS_FLAGS,
-                c"",
-            )
-            .map_err(|errno| (SetupStep::MountProc, errno))
-        }
-        MountAction::Devpts { target, data } => {
-            let target = open_in_root(root, target, OFlags::PATH | OFlags::DIRECTORY)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-            mount::mount(
-                c"devpts",
-                fd_path(&target).as_cstr(),
-                c"devpts",
-                MountFlags::NOSUID | MountFlags::NOEXEC,
-                data.as_c_str(),
-            )
-            .map_err(|errno| (SetupStep::MountDevpts, errno))
-        }
+            &super::procfs::FRESH_PROCFS,
+            SetupStep::MountProc,
+        ),
         MountAction::Bind {
             source,
             target,
@@ -3211,6 +3190,20 @@ fn execute_op(
         }
     };
     done.map(|()| None)
+}
+
+/// Mounts the filesystem instance `fs` describes onto the directory `target`
+/// names in `root`, reporting a failure of the mount as `step`.
+fn mount_fresh(
+    root: BorrowedFd<'_>,
+    target: &CStr,
+    fs: &FreshFs,
+    step: SetupStep,
+) -> Result<(), (SetupStep, Errno)> {
+    let target = open_in_root(root, target, OFlags::PATH | OFlags::DIRECTORY)
+        .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+    let mount = fresh_mount(fs).map_err(|errno| (step, errno))?;
+    attach(mount.as_fd(), target.as_fd()).map_err(|errno| (step, errno))
 }
 
 /// Hides what `target` names in `root`: an empty tmpfs over a directory, and an
@@ -3417,7 +3410,7 @@ pub(super) fn open_frozen(path: &CStr, oflags: OFlags) -> Result<OwnedFd, Errno>
 
 /// Attaches the detached mount `mount` names onto the mount target `target`
 /// names.
-fn attach(mount: BorrowedFd<'_>, target: BorrowedFd<'_>) -> Result<(), Errno> {
+pub(super) fn attach(mount: BorrowedFd<'_>, target: BorrowedFd<'_>) -> Result<(), Errno> {
     mount::move_mount(
         mount,
         c"",
@@ -3596,10 +3589,38 @@ fn mount_host_root() -> Result<OwnedFd, Errno> {
 /// Creates a tmpfs of the sandbox's own, mode `0755`, detached, carrying
 /// `attributes`, and returns a descriptor of it.
 pub(super) fn empty_tmpfs(attributes: mount::MountAttrFlags) -> Result<OwnedFd, Errno> {
-    let context = mount::fsopen(c"tmpfs", mount::FsOpenFlags::FSOPEN_CLOEXEC)?;
-    mount::fsconfig_set_string(&context, c"mode", c"0755")?;
+    fresh_mount(&FreshFs {
+        fstype: c"tmpfs",
+        params: &[FsParam::String(c"mode", c"0755")],
+        attributes,
+    })
+}
+
+/// Creates the filesystem instance `fs` describes, detached, and returns a
+/// descriptor of its mount: how the launch makes every filesystem of the
+/// sandbox's own, a raw mount's aside.
+///
+/// The instance belongs to the namespaces of the process that opens its
+/// context, so a procfs made here presents this process's PID namespace. The
+/// source is the type's name, as a `mount(2)` naming it would record, so the
+/// sandbox's mount table reads as before. The mount is attached to nothing: the
+/// caller attaches it onto a target's descriptor with [`attach`], and keeps the
+/// descriptor of the mount where a later step reaches into it.
+pub(super) fn fresh_mount(fs: &FreshFs) -> Result<OwnedFd, Errno> {
+    let context = mount::fsopen(fs.fstype, mount::FsOpenFlags::FSOPEN_CLOEXEC)?;
+    mount::fsconfig_set_string(&context, c"source", fs.fstype)?;
+    for param in fs.params {
+        match *param {
+            FsParam::Flag(key) => mount::fsconfig_set_flag(&context, key)?,
+            FsParam::String(key, value) => mount::fsconfig_set_string(&context, key, value)?,
+        }
+    }
     mount::fsconfig_create(&context)?;
-    mount::fsmount(&context, mount::FsMountFlags::FSMOUNT_CLOEXEC, attributes)
+    mount::fsmount(
+        &context,
+        mount::FsMountFlags::FSMOUNT_CLOEXEC,
+        fs.attributes,
+    )
 }
 
 /// Attaches the detached mount `root` names on top of `/`, as a root the

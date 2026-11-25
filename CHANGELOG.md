@@ -523,6 +523,12 @@ consumer upgrading can skip it.
 - The managed `/dev` tmpfs is mounted `nodev`, as the managed `/dev/shm` and
   `/tmp` are. Each device node bound into it is a mount of its own, which the
   kernel asks of when the node is opened, so the nodes work as before.
+- The launch makes the managed `/proc`, `/dev`, `/dev/pts`, `/dev/shm` and
+  `/tmp` through `fsopen` and `fsmount`, detached, and attaches each onto its
+  target's descriptor with `move_mount`, as it attaches a bind, an overlay and a
+  hidden path. It mounted them with `mount(2)` through the target's
+  `/proc/self/fd` path, which reached through the host's `/proc`.
+  `host::procfs_blocker` mounts its procfs the same way.
 
 ### Fixed
 
