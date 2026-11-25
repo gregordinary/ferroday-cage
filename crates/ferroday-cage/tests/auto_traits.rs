@@ -61,6 +61,8 @@ const _: () = assert_send_sync::<ferroday_cage::ParseCgroupLimitError>();
 const _: () = assert_send_sync::<ferroday_cage::CgroupReach>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedCgroup>();
 const _: () = assert_send_sync::<ferroday_cage::Output>();
+const _: () = assert_send_sync::<ferroday_cage::Capped>();
+const _: () = assert_send_sync::<ferroday_cage::Excerpt>();
 const _: () = assert_send_sync::<ferroday_cage::KillHandle>();
 
 // Errors cross thread boundaries constantly — a worker returning one to a

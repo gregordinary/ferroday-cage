@@ -259,8 +259,8 @@ impl Restriction {
     ///
     /// The restriction's counterpart of [`Cage::output`](crate::Cage::output),
     /// with the same unbounded-capture caution: for a command whose output
-    /// volume the caller does not control, stream through an [`Observer`] that
-    /// caps what it keeps instead.
+    /// volume the caller does not control, run it with a
+    /// [`Capped`](crate::Capped) observer instead.
     pub fn output(&self) -> Result<Output, Error> {
         Running::output(&self.plan)
     }

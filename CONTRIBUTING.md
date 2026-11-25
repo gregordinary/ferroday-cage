@@ -507,6 +507,7 @@ report name a package and its version bare.
 | Take a lock file | `provision::lock_exclusive` |
 | Write a file beside its destination and publish it by rename | `provision::Staged`, or `provision::write_atomically` for bytes in hand |
 | Hold what an untrusted producer writes to a ceiling | `provision::LimitedWriter` |
+| Keep what a command writes within a bound, without failing it for writing more | `observer::Capped`, which keeps each stream's beginning and end as an `Excerpt`, where `LimitedWriter` refuses a producer past its ceiling |
 | How do two versions of a package format compare? | `provision::gentoo::version::compare`, `ferrata::version::Version`'s order (read with `alpine::DIALECT.version`), `debian::version::compare` |
 | Does this candidate satisfy this dependency's version constraint? | `provision::gentoo::atom::Atom::matches`, `ferrata::dependency::Dependency::admits` (read with `alpine::DIALECT.dependency`) and, for an Alpine package by its own name or a name it provides, `ferrata::record::Record::answers`, `debian::version::Constraint::satisfied_by` |
 | What version does a `Provides`-style entry supply a name at? | `ferrata::record::Provide::version`, `provision::debian::version::Constraint::exact_version` |

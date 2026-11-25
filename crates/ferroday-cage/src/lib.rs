@@ -331,7 +331,7 @@ pub use netstack::{
     DestinationRule, FlowAdmission, FlowRefusal, NetStack, NetStackBuilder, NetStackError,
     NetStackHandle, NetStackReport, NetStackReports, ParseDestinationRuleError, Transport,
 };
-pub use observer::{Observer, Output, Progress};
+pub use observer::{Capped, Excerpt, Observer, Output, Progress};
 pub use resolved::{
     ResolvedCgroup, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
     ResolvedLandlockNet, ResolvedMount, ResolvedNetworkFilter, ResolvedRlimit, ResolvedRoot,

@@ -27,6 +27,13 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `Capped`, an observer that keeps the beginning and the end of each stream a
+  command writes, up to the bounds `Capped::new` is given, and counts what it
+  leaves out between them, as an `Excerpt` per stream with `head`, `tail`,
+  `omitted` and `total`. It is the bounded counterpart of `Cage::output` and
+  `Restriction::output`, whose capture stays unbounded, for a command whose
+  output volume the caller does not control.
+
 - The native network stack serves the guest's DNS. Its nameserver answers on
   port 53, over UDP and TCP, at host 3 of each network, `10.0.2.3` and `fd00::3`
   by default, and relays each query to the first nameserver the host's

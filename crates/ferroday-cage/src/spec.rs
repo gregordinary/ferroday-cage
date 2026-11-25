@@ -671,8 +671,9 @@ impl Cage {
     /// What it keeps is unbounded: a command that writes without stopping is
     /// held entirely in memory. For a command whose output volume the caller
     /// does not control — model-generated code, an untrusted build — use
-    /// [`run_with`](Self::run_with) with an [`Observer`] that caps what it
-    /// retains, or [`spawn_with`](Self::spawn_with) with a deadline.
+    /// [`run_with`](Self::run_with) with a [`Capped`](crate::Capped) observer,
+    /// which keeps each stream's beginning and end, and pair it with a deadline
+    /// through [`spawn_with`](Self::spawn_with).
     ///
     /// Capture reaches the command's descendants too, and with it the endpoint
     /// of the wait; see [`Running::wait`](crate::Running::wait) for the case

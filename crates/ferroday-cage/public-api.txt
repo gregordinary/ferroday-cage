@@ -2657,6 +2657,22 @@ impl core::marker::Unpin for ferroday_cage::CageBuilder
 impl core::marker::UnsafeUnpin for ferroday_cage::CageBuilder
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::CageBuilder
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::CageBuilder
+#[non_exhaustive] pub struct ferroday_cage::Capped
+pub ferroday_cage::Capped::stderr: ferroday_cage::Excerpt
+pub ferroday_cage::Capped::stdout: ferroday_cage::Excerpt
+impl ferroday_cage::Capped
+pub fn ferroday_cage::Capped::new(usize, usize) -> ferroday_cage::Capped
+impl ferroday_cage::Observer for ferroday_cage::Capped
+pub fn ferroday_cage::Capped::progress(&mut self, ferroday_cage::Progress)
+pub fn ferroday_cage::Capped::stderr(&mut self, &[u8])
+pub fn ferroday_cage::Capped::stdout(&mut self, &[u8])
+impl core::marker::Freeze for ferroday_cage::Capped
+impl core::marker::Send for ferroday_cage::Capped
+impl core::marker::Sync for ferroday_cage::Capped
+impl core::marker::Unpin for ferroday_cage::Capped
+impl core::marker::UnsafeUnpin for ferroday_cage::Capped
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Capped
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Capped
 pub struct ferroday_cage::DestinationRule
 impl core::fmt::Display for ferroday_cage::DestinationRule
 pub fn ferroday_cage::DestinationRule::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2699,6 +2715,22 @@ impl<'a> core::marker::Unpin for ferroday_cage::ErrorChain<'a>
 impl<'a> core::marker::UnsafeUnpin for ferroday_cage::ErrorChain<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ErrorChain<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for ferroday_cage::ErrorChain<'a>
+pub struct ferroday_cage::Excerpt
+impl ferroday_cage::Excerpt
+pub fn ferroday_cage::Excerpt::head(&self) -> &[u8]
+pub fn ferroday_cage::Excerpt::omitted(&self) -> u64
+pub fn ferroday_cage::Excerpt::tail(&self) -> &[u8]
+pub fn ferroday_cage::Excerpt::total(&self) -> u64
+impl core::cmp::Eq for ferroday_cage::Excerpt
+impl core::cmp::PartialEq for ferroday_cage::Excerpt
+pub fn ferroday_cage::Excerpt::eq(&self, &ferroday_cage::Excerpt) -> bool
+impl core::marker::Freeze for ferroday_cage::Excerpt
+impl core::marker::Send for ferroday_cage::Excerpt
+impl core::marker::Sync for ferroday_cage::Excerpt
+impl core::marker::Unpin for ferroday_cage::Excerpt
+impl core::marker::UnsafeUnpin for ferroday_cage::Excerpt
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Excerpt
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Excerpt
 pub struct ferroday_cage::ExitStatus(_)
 impl ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::code(&self) -> core::option::Option<i32>
@@ -3461,6 +3493,10 @@ pub trait ferroday_cage::Observer
 pub fn ferroday_cage::Observer::progress(&mut self, ferroday_cage::Progress)
 pub fn ferroday_cage::Observer::stderr(&mut self, &[u8])
 pub fn ferroday_cage::Observer::stdout(&mut self, &[u8])
+impl ferroday_cage::Observer for ferroday_cage::Capped
+pub fn ferroday_cage::Capped::progress(&mut self, ferroday_cage::Progress)
+pub fn ferroday_cage::Capped::stderr(&mut self, &[u8])
+pub fn ferroday_cage::Capped::stdout(&mut self, &[u8])
 impl<F: core::ops::function::FnMut(ferroday_cage::Progress)> ferroday_cage::Observer for F
 pub fn F::progress(&mut self, ferroday_cage::Progress)
 pub fn F::stderr(&mut self, &[u8])

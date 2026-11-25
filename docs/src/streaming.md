@@ -36,9 +36,8 @@ What `output` keeps is unbounded, which is the right default for a command
 whose output the caller controls and the wrong one for a command whose output
 it does not. A command that writes without stopping is held entirely in
 memory. For model-generated code, an untrusted build, or anything else that
-might not stop, stream through an observer that caps what it retains — the
-next section shows one — and pair it with a deadline from [the process
-model](process-model.md).
+might not stop, run it with the [`Capped`](#capping-what-you-keep) observer
+instead, and pair it with a deadline from [the process model](process-model.md).
 
 ## The observer
 
@@ -84,60 +83,44 @@ handle with the observer attached for the handle's lifetime.
 
 ### Capping what you keep
 
-An observer decides for itself how much to retain, which is what makes it the
-right tool for a command whose output volume the caller does not control:
+`Capped` is the observer for a command whose output volume the caller does not
+control. It keeps the first and the last bytes of each stream, up to the bounds
+given, and counts what falls between them. The beginning says what the command
+set out to do. The end holds what it reported last, which is where a compiler's
+error or a test run's summary is.
 
 ```rust,no_run
-use ferroday_cage::{Cage, Observer};
-
-/// Keeps at most `LIMIT` bytes of each stream and counts the rest.
-#[derive(Default)]
-struct Capped {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    dropped: usize,
-}
-
-const LIMIT: usize = 1 << 20;
-
-/// Keeps what of `chunk` fits in `kept` below `LIMIT`, and returns how much
-/// did not.
-fn keep(kept: &mut Vec<u8>, chunk: &[u8]) -> usize {
-    let room = LIMIT.saturating_sub(kept.len());
-    let (fits, spilled) = chunk.split_at(chunk.len().min(room));
-    kept.extend_from_slice(fits);
-    spilled.len()
-}
-
-impl Observer for Capped {
-    fn stdout(&mut self, chunk: &[u8]) {
-        self.dropped += keep(&mut self.stdout, chunk);
-    }
-
-    fn stderr(&mut self, chunk: &[u8]) {
-        self.dropped += keep(&mut self.stderr, chunk);
-    }
-}
+use ferroday_cage::{Cage, Capped};
 
 fn main() -> ferroday_cage::Result<()> {
-    let mut capped = Capped::default();
     let cage = Cage::builder()
         .rootfs("/srv/rootfs/alpine")
         .command("/usr/bin/analyze")
         .build()?;
+    // The first and the last 32 KiB of each stream.
+    let mut capped = Capped::new(32 * 1024, 32 * 1024);
     cage.run_with(&mut capped)?;
-    if capped.dropped > 0 {
-        eprintln!("dropped {} bytes past the cap", capped.dropped);
+
+    let out = &capped.stdout;
+    print!("{}", String::from_utf8_lossy(out.head()));
+    if out.omitted() > 0 {
+        println!("[{} bytes left out]", out.omitted());
     }
+    print!("{}", String::from_utf8_lossy(out.tail()));
     Ok(())
 }
 ```
 
-The command still runs to completion — the pump keeps draining the pipes, so
-nothing blocks — but the caller keeps at most `LIMIT` bytes of each stream,
-whatever the command writes. Bounding the *time* as well is
-[`wait_deadline`](process-model.md)'s job, and bounding what the command can
-consume while it runs is [`rlimit`](hardening.md#resource-limits)'s.
+The command still runs to completion. The pump keeps draining the pipes, so
+nothing blocks, and nothing is refused for writing more. A stream no longer
+than the two bounds together is kept whole, and `head` then `tail` is the
+stream. The bounds count bytes, so a cut can fall inside a line or a UTF-8
+sequence, and how an excerpt is shown, with a marker where bytes were left out,
+is the caller's.
+
+Bounding the *time* as well is [`wait_deadline`](process-model.md)'s job, and
+bounding what the command can consume while it runs is
+[`rlimit`](hardening.md#resource-limits)'s.
 
 ## Launch progress
 
