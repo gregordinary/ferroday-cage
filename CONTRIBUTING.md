@@ -489,6 +489,7 @@ report name a package and its version bare.
 | Open a directory inside a tree being provisioned | `provision::containment::open_dir`, or `containment::open_dir_path` after a fork |
 | Open the directory one name of a held directory holds, never through a link | `provision::containment::open_child_dir`, after a fork as well |
 | Create the missing directories of a chain inside a tree | `provision::containment::create_dirs` |
+| Create the missing directories on the host above a tree a sandbox writes, owner-only | `provision::create_private_dirs`, at `provision::PRIVATE_DIR_MODE`, which a launch's overlay layers take a level at a time |
 | Replace whatever holds a name in a tree with a new entry, an empty directory included | `provision::containment::replacing`, over `containment::remove_at`, and `containment::link_replacing` for a hard link, to which a name already holding its target is done |
 | Write into an overlay upper where the mounted overlay would place it | `provision::containment::copy_up`, which the extractor and `Rooted::over` take over a base |
 | Is this entry an overlay whiteout, or this directory opaque? | `provision::containment::is_whiteout`, `containment::is_opaque` |

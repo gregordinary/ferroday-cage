@@ -1317,6 +1317,12 @@ impl Remove {
 /// into a removal of its target, but the parent's own path components are
 /// trusted to be the caller's.
 ///
+/// What a sandbox writes into the rootfs is live on the host: a file it makes
+/// setuid is setuid to the calling user there, for any user who can reach it.
+/// So the missing directories above `dest` are created owner-only, at mode
+/// `0700`, and a parent that already exists, which keeps its mode, belongs
+/// where no other user can reach the rootfs through it.
+///
 /// Before the rename, the staging tree's filesystem is synced, so a crash
 /// after publication cannot leave truncated files behind the completed
 /// rename.
@@ -1375,7 +1381,7 @@ fn ensure_inner(
         });
     };
     let parent = crate::path::parent_of(dest);
-    fs::create_dir_all(parent).map_err(|err| ProvisionError::io("creating", parent, err))?;
+    create_private_dirs(parent).map_err(|err| ProvisionError::io("creating", parent, err))?;
 
     // Held until this function returns, on the failure paths as on success.
     let _lock =
@@ -1601,6 +1607,35 @@ fn lock_name(name: &std::ffi::OsStr) -> OsString {
 fn lock_path(dest: &Path) -> Option<PathBuf> {
     let name = dest.file_name()?;
     Some(crate::path::parent_of(dest).join(lock_name(name)))
+}
+
+/// The mode of a directory the library creates on the host above a tree a
+/// sandbox writes: a provisioned root, or an overlay upper.
+///
+/// Owner-only, because what a sandbox writes is live on the host. A file it
+/// makes setuid is setuid to the host id that owns it, the calling user's for
+/// what the sandbox's root made, and a directory it makes world-writable, as
+/// a root's `/tmp` is, any local user can write into. A directory only its
+/// owner can search closes the tree beneath it to every other user. The
+/// tree's own top cannot be that directory: it is the sandbox's `/`, or the
+/// merged directory an upper stands for, and keeps the mode the sandbox's
+/// other ids need there.
+pub(crate) const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Creates the directory `dir` and every missing directory above it at
+/// [`PRIVATE_DIR_MODE`]: the directories a tree a sandbox writes lies in, as
+/// far as the library makes them. A directory already there keeps the mode its
+/// owner gave it.
+///
+/// The process umask narrows the mode as it narrows any `mkdir`'s, and can
+/// only remove the owner's own bits from it.
+pub(crate) fn create_private_dirs(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(PRIVATE_DIR_MODE)
+        .create(dir)
 }
 
 /// How many times [`lock_exclusive`] takes its lock again after the file it
@@ -2351,6 +2386,23 @@ mod tests {
         assert_eq!(ensure(&dest, &mut Touch).unwrap(), Provisioned::Created);
         assert!(dest.join("marker").is_file());
         assert_eq!(ensure(&dest, &mut Fail).unwrap(), Provisioned::Existing);
+    }
+
+    #[test]
+    fn ensure_creates_the_missing_directories_above_the_rootfs_owner_only() {
+        // What a sandbox writes into the root is live on the host, so the
+        // directories the library makes above it close it to other users. One
+        // that was already there keeps its own mode.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = Scratch::for_test("provision", "private-parents");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = dir.join("roots/alpine/rootfs");
+        assert_eq!(ensure(&dest, &mut Touch).unwrap(), Provisioned::Created);
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&dir.join("roots")), PRIVATE_DIR_MODE);
+        assert_eq!(mode(&dir.join("roots/alpine")), PRIVATE_DIR_MODE);
+        assert_eq!(mode(&dir), 0o755);
     }
 
     #[test]

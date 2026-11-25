@@ -496,7 +496,8 @@ impl Alpine {
     /// to discard the increment.
     ///
     /// `upper` is created if absent, along with the overlay work directory
-    /// beside it. The identity map, cache directory, additional repositories and
+    /// beside it, and any missing directory above it owner-only, since what
+    /// the increment holds is live on the host. The identity map, cache directory, additional repositories and
     /// pre-configure overlay configured on the builder all apply exactly as to a
     /// full bootstrap, and [`extract_only`](AlpineBuilder::extract_only) stages
     /// the increment's files and registers them without running a script.

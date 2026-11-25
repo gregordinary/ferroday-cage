@@ -352,7 +352,9 @@ pub(crate) struct Staging {
 
 impl Staging {
     /// Begins staging into `upper`, creating it and its missing parents where
-    /// nothing holds its name.
+    /// nothing holds its name. A parent is created owner-only, at
+    /// [`PRIVATE_DIR_MODE`](super::PRIVATE_DIR_MODE), since what the increment
+    /// holds is live on the host.
     ///
     /// # Errors
     ///
@@ -364,7 +366,7 @@ impl Staging {
         id_mapper: Option<Arc<dyn IdMapper>>,
     ) -> Result<Staging, ProvisionError> {
         let creating = |err| ProvisionError::io("creating the overlay upper", upper, err);
-        std::fs::create_dir_all(crate::path::parent_of(upper)).map_err(creating)?;
+        super::create_private_dirs(crate::path::parent_of(upper)).map_err(creating)?;
         // Created here or found there, decided by the one call that would
         // create it: a name another process takes between a check and a
         // creation is then the other process's, and is left alone.
@@ -478,6 +480,14 @@ mod tests {
         let staging =
             Staging::begin(&fresh, IdentityMap::Single, None).expect("the upper is created");
         assert!(fresh.is_dir(), "the upper and its parents are created");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(dir.join("nested")).unwrap().permissions(),
+        );
+        assert_eq!(
+            mode & 0o7777,
+            super::super::PRIVATE_DIR_MODE,
+            "a parent is made owner-only",
+        );
         std::fs::write(fresh.join("partial"), b"x").unwrap();
         drop(staging);
         assert!(!fresh.exists(), "an upper the staging created is removed");

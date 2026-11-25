@@ -159,6 +159,15 @@ consumer upgrading can skip it.
   non-empty directory deeper down is renamed up to the top under a `.removing-`
   name before it is emptied. A removal that fails partway leaves such names
   behind.
+- The directories the library creates on the host above a tree a sandbox
+  writes are owner-only, mode 0700: `ensure`'s destination's missing parents, a
+  layered build's upper's, and those of an overlay's upper and work directory
+  at a launch. They took the umask's mode, usually 0755. What a sandbox writes
+  is live on the host, so a file it made setuid was setuid to the calling user
+  for any local user who could reach the tree, and its `/tmp` was writable by
+  them. A directory that already exists keeps its mode. The guide's
+  provisioning chapter gains "Who can reach a root", and `hardening.md` no
+  longer says the root's `nosuid` covers what the command writes on the host.
 
 ### Added
 

@@ -1261,6 +1261,13 @@ impl Mount {
 /// calling user controls, not a world-writable one such as `/var/tmp` — the same
 /// requirement [`CageBuilder::rootfs`] states for a plain root.
 ///
+/// No other user should reach the upper either. What the sandbox writes there
+/// is live on the host: a file it makes setuid is setuid to the calling user
+/// for anyone who can reach it, and a directory it makes world-writable is
+/// theirs to write into. The missing directories above the upper and the work
+/// directory are created owner-only, mode `0700`. One that already exists keeps
+/// its mode.
+///
 /// An entry already at either path is adopted only when it is a directory
 /// belonging to the calling user, and is otherwise refused with
 /// [`ConfigError::OverlayDirUnowned`], so a symbolic link another user planted
@@ -5310,14 +5317,25 @@ struct CreatedDirs(Vec<PathBuf>);
 impl CreatedDirs {
     /// Creates `dir` and every missing directory above it, as `create_dir_all`
     /// does, recording each one created.
+    ///
+    /// Each is created owner-only, at
+    /// [`PRIVATE_DIR_MODE`](crate::provision::PRIVATE_DIR_MODE), as the
+    /// directories above a provisioned root are: what the sandbox writes into
+    /// the upper is live on the host. A level at a time rather than through
+    /// `provision::create_private_dirs`, since each one created is recorded.
     fn create_all(&mut self, dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt as _;
+
         if dir.as_os_str().is_empty() || dir.is_dir() {
             return Ok(());
         }
         if let Some(parent) = dir.parent() {
             self.create_all(parent)?;
         }
-        match std::fs::create_dir(dir) {
+        match std::fs::DirBuilder::new()
+            .mode(crate::provision::PRIVATE_DIR_MODE)
+            .create(dir)
+        {
             Ok(()) => {
                 self.record(dir.to_path_buf());
                 Ok(())
@@ -11525,6 +11543,11 @@ read-only = true
         assert_eq!(prepared, std::fs::canonicalize(&fresh).unwrap());
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode(&fresh), OVERLAY_DIR_MODE);
+        assert_eq!(
+            mode(&scratch.join("nested")),
+            crate::provision::PRIVATE_DIR_MODE,
+            "a missing directory above the layer is made owner-only",
+        );
 
         // Preparing it a second time adopts it: it is a directory this user
         // owns, which is exactly what the first call left. An adopted directory

@@ -125,6 +125,12 @@ cost = "move"
 why = "As above, and in the transports."
 
 [[reach]]
+item = "provision::PRIVATE_DIR_MODE"
+tests = 1
+cost = "share"
+why = "The mode of the directories above a tree a sandbox writes, which `ensure` and a launch's overlay make too."
+
+[[reach]]
 item = "provision::Staged"
 code = 3
 cost = "share"
@@ -287,6 +293,12 @@ item = "provision::copyin::reown"
 code = 1
 cost = "share"
 why = "As above: the re-owning pass itself."
+
+[[reach]]
+item = "provision::create_private_dirs"
+code = 1
+cost = "share"
+why = "The missing directories above a layered build's upper, made as `ensure` makes a destination's."
 
 [[reach]]
 item = "provision::extract::Extraction"

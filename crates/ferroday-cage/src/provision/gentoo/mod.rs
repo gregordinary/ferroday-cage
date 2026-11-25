@@ -1717,8 +1717,9 @@ impl Gentoo {
     /// portage reading the merged root sees the base's and the increment's
     /// together.
     ///
-    /// `upper` is created where it is absent. A call that fails and created it
-    /// removes it, since a failure hands the caller no handle to drop. An
+    /// `upper` is created where it is absent, and any missing directory above it
+    /// owner-only, since what the increment holds is live on the host. A call
+    /// that fails and created it removes it, since a failure hands the caller no handle to drop. An
     /// `upper` that already existed is the caller's, and a failure leaves it in
     /// place, holding whatever the call merged into it. A resolution or a plan
     /// that is refused is refused before anything is merged.

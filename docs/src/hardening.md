@@ -781,9 +781,11 @@ reasonably assume are covered, and are not:
   the calling user could modify on the host. A Landlock grant narrows this; so
   does [`overlay_rootfs`](provisioning.md#keeping-a-provisioned-root-pristine),
   which leaves the base untouched and sends every write to a disposable upper.
-  The root is mounted `nosuid`, so what the command writes into the tree cannot
-  be executed back with elevated ids — but the tree's contents are still the
-  command's to change.
+  The root is mounted `nosuid` inside the sandbox, so a file the command makes
+  setuid raises no ids there. On the host the bit is live: such a file is
+  setuid to the calling user for anyone who can reach the tree, as [Who can
+  reach a root](provisioning.md#who-can-reach-a-root) sets out. The tree's
+  contents are the command's to change.
 - **A file's metadata, under Landlock.** Landlock governs a file's contents and
   a directory's entries. It does not govern `chmod`, `chown`, extended
   attributes, timestamps, `stat`, or `chdir`, which reach any path the command

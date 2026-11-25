@@ -51,6 +51,31 @@ with the root filesystem, so create and destroy round-trip cleanly. Removal is
 idempotent, so `remove` also clears the lock a *failed* provision left beside no
 tree at all.
 
+## Who can reach a root
+
+What a sandbox writes into a root is live on the host. A file it makes setuid,
+as a distribution's root ships `su` and `passwd`, is setuid to the host id that
+owns it. For what the sandbox's root made, that is the calling user, and under a
+range map, the host id the map gives the sandbox's owner. Another local user who
+can reach the file, on a filesystem not mounted `nosuid`, runs it as that id. A
+directory the sandbox makes world-writable, as every root's `/tmp` is, any local
+user who can reach it can write into, and the sandbox reads what they put there.
+Inside the sandbox the root is mounted `nosuid`, so a setuid bit raises no ids
+there. None of this depends on where the tree came from: a root a trusted
+archive provisioned holds the distribution's setuid programs, and a sandbox run
+in it can make more.
+
+So keep every root and every overlay upper a sandbox has written where no other
+user can reach it: below a directory only the calling user can search, or on a
+filesystem mounted `nosuid`. The tree's own top cannot be that directory. It is
+the sandbox's `/`, or the merged directory an upper stands for, and keeps the
+mode the sandbox's other ids need there.
+
+The library creates every directory it makes above such a tree owner-only, at
+mode `0700`. Those are the destination's missing parents in `ensure`, an upper's
+in a layered build, and those of an overlay's upper and work directory at a
+launch. A directory that already exists keeps the mode its owner gave it.
+
 ## Progress and cancellation
 
 Provisioning is the slow part of a first run. `Provision` — the configurable
@@ -831,8 +856,9 @@ A setuid bit applying verbatim is what a root filesystem needs, since
 where the extracting user is already root. On the host it is a live bit. The
 extracted file is setuid **to the calling user**. Another local user who can
 reach the destination directory, on a filesystem not mounted `nosuid`, can
-therefore run it as the calling user. Extract an untrusted archive into a
-directory only the calling user can reach, or onto a `nosuid` filesystem.
+therefore run it as the calling user. Keep the root where only the calling user
+can reach it, or on a `nosuid` filesystem, whatever the archive, as [Who can
+reach a root](#who-can-reach-a-root) sets out.
 
 [An ebuild development sandbox](ebuild-sandbox.md) works this into a consumer.
 Given a stage3 tarball already on the host, it provisions the root through
@@ -910,7 +936,9 @@ place. An overlay that names its own work directory removes it with a
 Put the upper under a directory the calling user controls, not a world-writable
 one such as `/var/tmp`. That is the same requirement `rootfs` carries, for a
 sharper reason. The upper is where the sandbox's writes land, and where the
-caller reads its result back afterwards.
+caller reads its result back afterwards. Other users must not reach it either,
+for the reason [Who can reach a root](#who-can-reach-a-root) gives, and the
+directories the library makes above it are owner-only.
 
 The library creates the upper and its work directory with `mkdirat` against
 their parent. It adopts an existing entry only when it is a directory the
