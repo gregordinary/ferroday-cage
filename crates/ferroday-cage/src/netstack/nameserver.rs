@@ -32,10 +32,25 @@
 //! connection is answered with SERVFAIL instead, since its resolver waits on the
 //! connection rather than asking again. A query the resolver refuses is answered
 //! with SERVFAIL too, so the guest learns of it at once.
+//!
+//! The destination rules decide each question before it is relayed
+//! ([`Policy::decide_question`]). A name they refuse is answered NXDOMAIN, with
+//! the reason as an Extended DNS Error where the guest's resolver reads EDNS,
+//! and nothing is relayed. Under name rules a question for a name's HTTPS or
+//! SVCB records is answered with none, since those records carry the keys a
+//! client would encrypt its server name with. Each question is reported, as it
+//! is relayed, refused or answered with no records.
+//!
+//! Each answer the upstream gives, under any rules or none, is read for the
+//! addresses it gives the asked name, and each is pinned to that name
+//! ([`Pins`]) before the answer goes back, so the guest's first connection to
+//! an address finds its name there. A pin names a flow's destination in its
+//! report, and is what a name rule admits a flow by.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustix::event::PollFlags;
@@ -46,6 +61,9 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::IpEndpoint;
 
 use super::dns::{self, Query, Rcode, Refusal};
+use super::pins::Pins;
+use super::policy::Policy;
+use super::report::{NetStackReport, Reporter};
 use super::udp::deliverable;
 use crate::mechanism::netns::socket_for;
 
@@ -149,6 +167,9 @@ struct Exchange {
     /// The query as the guest sent it, which goes upstream as it stands and
     /// which a reply the nameserver writes itself repeats the question of.
     query: Vec<u8>,
+    /// The name the query asks about, which the answer's addresses are pinned
+    /// to.
+    name: Arc<str>,
     /// The query's transaction id, which its answer carries.
     id: u16,
     /// The socket connected to the upstream, nonblocking.
@@ -208,6 +229,8 @@ pub(super) struct Nameserver {
     exchanges: Vec<Exchange>,
     sessions: Vec<Session>,
     outbox: VecDeque<Datagram>,
+    /// The names the upstream's answers resolved, by address.
+    pins: Pins,
     /// The buffer every read copies through, allocated once.
     scratch: Box<[u8]>,
 }
@@ -221,27 +244,69 @@ impl Nameserver {
             exchanges: Vec::new(),
             sessions: Vec::new(),
             outbox: VecDeque::new(),
+            pins: Pins::default(),
             scratch: vec![0; MAX_MESSAGE].into_boxed_slice(),
         }
     }
 
+    /// The names the upstream's answers resolved, by the addresses they gave.
+    pub(super) fn pins(&self) -> &Pins {
+        &self.pins
+    }
+
     /// Takes a datagram the guest at `guest` sent to the nameserver at
-    /// `server`: relays a query, answers one it does not relay, and drops
-    /// anything else.
+    /// `server`: decides a query by `policy` and relays it or answers it,
+    /// reporting it to `reports`; answers a message that is not a query it
+    /// relays; and drops anything else.
     pub(super) fn query_datagram(
         &mut self,
         guest: IpEndpoint,
         server: IpEndpoint,
         message: &[u8],
+        policy: &Policy,
+        reports: &mut Reporter,
         now: Instant,
     ) {
         let origin = Origin::Datagram { guest, server };
         match dns::read_query(message) {
-            Ok(query) => self.relay(origin, query, now),
+            Ok(query) => self.take(origin, guest, query, policy, reports, now),
             Err(Refusal::Unanswerable) => {}
             Err(Refusal::Answer(rcode)) => {
                 if let Some(reply) = dns::refusal(message, rcode) {
                     self.deliver(origin, reply);
+                }
+            }
+        }
+    }
+
+    /// Decides `query`, from the guest at `guest` by way of `origin`, by
+    /// `policy`: answers it NXDOMAIN where the rules refuse its name, with no
+    /// records where name rules withhold the records it asks for, and relays it
+    /// otherwise. Reports what became of it to `reports`.
+    fn take(
+        &mut self,
+        origin: Origin,
+        guest: IpEndpoint,
+        query: Query<'_>,
+        policy: &Policy,
+        reports: &mut Reporter,
+        now: Instant,
+    ) {
+        let name: Arc<str> = query.name().into();
+        let record_type = query.record_type();
+        match policy.decide_question(&name) {
+            Err(refusal) => {
+                self.deliver(origin, dns::blocked(&query, &refusal.to_string()));
+                reports
+                    .offer(|| NetStackReport::question_refused(guest, &name, record_type, refusal));
+            }
+            Ok(_) if policy.has_names() && dns::is_service_binding(record_type) => {
+                self.deliver(origin, dns::no_records(&query));
+                reports.offer(|| NetStackReport::withheld(guest, &name, record_type));
+            }
+            Ok(admission) => {
+                if self.relay(origin, query, Arc::clone(&name), now) {
+                    reports.offer(|| NetStackReport::relayed(guest, &name, record_type, admission));
                 }
             }
         }
@@ -289,15 +354,16 @@ impl Nameserver {
         true
     }
 
-    /// Relays `query`, already read as one, from `origin`: a socket of its own
-    /// toward the upstream, over the transport `origin` asked on.
+    /// Relays `query`, already read as one and asking about `name`, from
+    /// `origin`: a socket of its own toward the upstream, over the transport
+    /// `origin` asked on. Answers whether it went upstream.
     ///
     /// A datagram past [`MAX_EXCHANGES`] is dropped, as a lossy network drops
     /// one, and the guest's resolver asks again. A query on a TCP connection
     /// past it is answered with SERVFAIL instead: its resolver waits on the
     /// connection rather than retrying a lost datagram. So is a query whose
     /// socket cannot be made.
-    fn relay(&mut self, origin: Origin, query: Query<'_>, now: Instant) {
+    fn relay(&mut self, origin: Origin, query: Query<'_>, name: Arc<str>, now: Instant) -> bool {
         let stream = matches!(origin, Origin::Session(_));
         let full = self
             .exchanges
@@ -306,7 +372,7 @@ impl Nameserver {
             .count()
             >= MAX_EXCHANGES;
         if full && !stream {
-            return;
+            return false;
         }
         let message = query.message();
         let opened = if full {
@@ -320,7 +386,7 @@ impl Nameserver {
             Ok(host) => host,
             Err(_) => {
                 self.deliver(origin, dns::failure(&query, Rcode::ServerFailure));
-                return;
+                return false;
             }
         };
         let stream = stream.then(|| {
@@ -341,12 +407,14 @@ impl Nameserver {
         self.exchanges.push(Exchange {
             origin,
             query: message.to_vec(),
+            name,
             id: query.id(),
             host,
             stream,
             deadline: now + EXCHANGE_DEADLINE,
             done: false,
         });
+        true
     }
 
     /// How many of the TCP connection `handle`'s queries are in flight
@@ -417,11 +485,17 @@ impl Nameserver {
         self.exchanges.len()
     }
 
-    /// Moves everything: the guest TCP connections' queries in and answers
-    /// out, and every exchange's query up and answer back. Returns whether
-    /// anything moved.
-    pub(super) fn service(&mut self, sockets: &mut SocketSet<'static>, now: Instant) -> bool {
-        let mut progress = self.serve_sessions(sockets, now);
+    /// Moves everything: the guest TCP connections' queries in, decided by
+    /// `policy` and reported to `reports`, and their answers out, and every
+    /// exchange's query up and answer back. Returns whether anything moved.
+    pub(super) fn service(
+        &mut self,
+        sockets: &mut SocketSet<'static>,
+        policy: &Policy,
+        reports: &mut Reporter,
+        now: Instant,
+    ) -> bool {
+        let mut progress = self.serve_sessions(sockets, policy, reports, now);
         progress |= self.serve_exchanges();
         // The answers just delivered to sessions go out on this pass rather
         // than waiting on the next.
@@ -429,20 +503,25 @@ impl Nameserver {
         progress
     }
 
-    /// Reads each session's complete queries and relays them, then flushes
-    /// its backlog and closes it once the guest has finished and everything is
-    /// answered.
-    fn serve_sessions(&mut self, sockets: &mut SocketSet<'static>, now: Instant) -> bool {
+    /// Reads each session's complete queries and takes them as a datagram's
+    /// are taken.
+    fn serve_sessions(
+        &mut self,
+        sockets: &mut SocketSet<'static>,
+        policy: &Policy,
+        reports: &mut Reporter,
+        now: Instant,
+    ) -> bool {
         let mut progress = false;
         let mut index = 0;
         while index < self.sessions.len() {
-            let handle = self.sessions[index].handle;
+            let (handle, guest) = (self.sessions[index].handle, self.sessions[index].guest);
             while let Some(query) = self.next_query(index, sockets) {
                 progress = true;
                 self.sessions[index].last_active = now;
                 let origin = Origin::Session(handle);
                 match dns::read_query(&query) {
-                    Ok(read) => self.relay(origin, read, now),
+                    Ok(read) => self.take(origin, guest, read, policy, reports, now),
                     // A response, or a fragment of a header, has nothing to
                     // repeat and is passed over, as a datagram's is.
                     Err(Refusal::Unanswerable) => {}
@@ -558,10 +637,18 @@ impl Nameserver {
             }
         }
         for (index, answer) in finished {
-            let origin = self.exchanges[index].origin;
-            let Ok(query) = dns::read_query(&self.exchanges[index].query) else {
+            let exchange = &self.exchanges[index];
+            let origin = exchange.origin;
+            let Ok(query) = dns::read_query(&exchange.query) else {
                 continue;
             };
+            // Pinned before the answer goes, so the guest's first connection
+            // to an address it gives finds the name there.
+            if let Some(answer) = &answer {
+                for address in dns::answer_addresses(&query, answer) {
+                    self.pins.pin(address, &exchange.name);
+                }
+            }
             let message = match (answer, origin) {
                 (Some(answer), Origin::Datagram { server, .. })
                     if answer.len() > deliverable(self.mtu, &server) =>
@@ -982,6 +1069,7 @@ mod tests {
         nameserver.exchanges.push(Exchange {
             origin: Origin::Session(handle),
             query: query.clone(),
+            name: Arc::from("example.com"),
             id: 11,
             host,
             stream: Some(Stream {
@@ -1015,6 +1103,7 @@ mod tests {
         nameserver.exchanges.push(Exchange {
             origin: Origin::Datagram { guest, server },
             query: query.clone(),
+            name: Arc::from("example.com"),
             id: 9,
             host,
             stream: None,

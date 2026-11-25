@@ -16,8 +16,10 @@
 //! interface answers it with a reset.
 //!
 //! Each decision is reported through the engine's [`Reporter`]: a TCP attempt
-//! where ingestion decides it, a refused UDP datagram there too, and a carried
-//! UDP flow where a service pass opens it.
+//! where ingestion decides it, a refused UDP datagram there too, a carried UDP
+//! flow where a service pass opens it, and a question where the nameserver
+//! takes it. A flow is decided by its address and by the names the nameserver
+//! resolved to it ([`Pins`]).
 //!
 //! The interface owns the gateway addresses, answers ARP, neighbor
 //! discovery, and ICMP echo for them itself, and accepts any destination
@@ -48,6 +50,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, Timespec};
@@ -61,6 +64,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpo
 
 use super::device::TapDevice;
 use super::nameserver::{self, Nameserver};
+use super::pins::Pins;
 use super::policy::Transport;
 use super::prefix;
 use super::report::{FlowAdmission, FlowRefusal, NetStackReport, Reporter};
@@ -630,17 +634,22 @@ impl Engine {
         }
         // The destination is decided before the budget, so a refused one is
         // reported for its own reason whatever the stack holds.
-        let decided = host_target(Transport::Tcp, dst, &self.plan).and_then(|carried| {
-            match self.held(false) >= tcp::MAX_FLOWS {
-                true => Err(FlowRefusal::TooManyFlows),
+        let decided = host_target(Transport::Tcp, dst, &self.plan, self.pins()).and_then(
+            |carried| match self.held(false) >= tcp::MAX_FLOWS {
+                true => Err(Refused {
+                    refusal: FlowRefusal::TooManyFlows,
+                    name: carried.name,
+                }),
                 false => Ok(carried),
-            }
-        });
+            },
+        );
         let carried = match decided {
             Ok(carried) => carried,
-            Err(refusal) => {
-                self.reports
-                    .offer(|| NetStackReport::refused(Transport::Tcp, src, dst, refusal));
+            Err(refused) => {
+                self.reports.offer(|| {
+                    let name = refused.name.as_deref();
+                    NetStackReport::refused(Transport::Tcp, src, dst, name, refused.refusal)
+                });
                 return;
             }
         };
@@ -653,7 +662,8 @@ impl Engine {
             Ok(flow) => {
                 self.flows.push(flow);
                 self.reports.offer(|| {
-                    NetStackReport::admitted(Transport::Tcp, src, dst, carried.admission)
+                    let name = carried.name.as_deref();
+                    NetStackReport::admitted(Transport::Tcp, src, dst, name, carried.admission)
                 });
             }
             // The host side could not even start (say, IPv6 without an
@@ -764,12 +774,18 @@ impl Engine {
             }
             return;
         }
-        if let Err(refusal) = host_target(Transport::Udp, dst, &self.plan) {
+        if let Err(refused) = host_target(Transport::Udp, dst, &self.plan, self.pins()) {
             let now = std::time::Instant::now();
-            self.udp.refuse(src, dst, refusal, now, &mut self.reports);
+            self.udp.refuse(src, dst, refused, now, &mut self.reports);
             return;
         }
         self.udp.ensure_port(dst.port, &mut self.sockets);
+    }
+
+    /// The names the stack's nameserver resolved, by address, where it serves
+    /// one.
+    fn pins(&self) -> Option<&Pins> {
+        self.nameserver.as_ref().map(Nameserver::pins)
     }
 
     /// Services every flow once, both protocols, and the nameserver. Returns
@@ -789,7 +805,8 @@ impl Engine {
             now,
         );
         if let Some(nameserver) = &mut self.nameserver {
-            progress |= nameserver.service(&mut self.sockets, now);
+            progress |=
+                nameserver.service(&mut self.sockets, &self.plan.policy, &mut self.reports, now);
             // The answers go out through the port socket their queries came in
             // on, which the first query to the nameserver kept.
             if nameserver.has_datagrams()
@@ -876,7 +893,13 @@ impl Engine {
 /// A destination past those is then held to the caller's destination rules
 /// ([`Policy::decide`](super::policy::Policy::decide)), which refuse what a
 /// deny rule matches, and what no allow rule admits where there are allow
-/// rules. Without rules the refusals above are the whole policy.
+/// rules. A name rule matches the names `pins` holds at the destination's
+/// address, the ones the stack's nameserver resolved to it; `None` holds none.
+/// Without rules the refusals above are the whole policy.
+///
+/// The answer names the destination by the name a name rule matched where one
+/// decided, and otherwise by the name most recently resolved to its address,
+/// for the flow's report.
 ///
 /// A destination in a special-purpose block that falls in the guest's subnet
 /// too, as a subnet the caller configures may make one, is refused for its
@@ -907,30 +930,37 @@ pub(super) fn host_target(
     transport: Transport,
     dst: IpEndpoint,
     plan: &Plan,
-) -> Result<Carried, FlowRefusal> {
+    pins: Option<&Pins>,
+) -> Result<Carried, Refused> {
     let address = IpAddr::from(dst.addr);
-    match address {
+    let names = pins.into_iter().flat_map(move |pins| pins.names(address));
+    let latest = names.clone().next();
+    let refused = |refusal| Refused {
+        refusal,
+        name: latest.cloned(),
+    };
+    let fixed = match address {
         IpAddr::V4(addr) => {
-            let v4 = plan.v4.as_ref().ok_or(FlowRefusal::ProtocolDisabled)?;
+            let v4 = plan
+                .v4
+                .as_ref()
+                .ok_or_else(|| refused(FlowRefusal::ProtocolDisabled))?;
             if addr == v4.gateway {
-                return gateway(
-                    plan,
-                    SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, dst.port)),
-                );
+                let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, dst.port));
+                return gateway(plan, loopback, latest).map_err(refused);
             }
-            if let Some(refusal) = refusal_v4(addr, Some(v4)) {
-                return Err(refusal);
-            }
+            refusal_v4(addr, Some(v4))
         }
         IpAddr::V6(addr) => {
-            let v6 = plan.v6.as_ref().ok_or(FlowRefusal::ProtocolDisabled)?;
+            let v6 = plan
+                .v6
+                .as_ref()
+                .ok_or_else(|| refused(FlowRefusal::ProtocolDisabled))?;
             if addr == v6.gateway {
-                return gateway(
-                    plan,
-                    SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, dst.port)),
-                );
+                let loopback = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, dst.port));
+                return gateway(plan, loopback, latest).map_err(refused);
             }
-            let refusal = if addr.is_unspecified() {
+            if addr.is_unspecified() {
                 Some(FlowRefusal::Unspecified)
             } else if addr.is_multicast() {
                 Some(FlowRefusal::Multicast)
@@ -953,39 +983,64 @@ pub(super) fn host_target(
                 Some(FlowRefusal::GuestNetwork)
             } else {
                 None
-            };
-            if let Some(refusal) = refusal {
-                return Err(refusal);
             }
         }
+    };
+    if let Some(refusal) = fixed {
+        return Err(refused(refusal));
     }
-    let admission = plan.policy.decide(transport, address, dst.port)?;
-    Ok(Carried {
-        target: SocketAddr::new(address, dst.port),
-        admission,
-    })
+    let (decision, matched) = plan
+        .policy
+        .decide(transport, address, dst.port, names.clone());
+    let name = matched.or(latest).cloned();
+    match decision {
+        Ok(admission) => Ok(Carried {
+            target: SocketAddr::new(address, dst.port),
+            admission,
+            name,
+        }),
+        Err(refusal) => Err(Refused { refusal, name }),
+    }
 }
 
-/// Where the stack carries a flow it admits, and what admitted it:
-/// [`host_target`]'s answer for a destination it does not refuse.
+/// Where the stack carries a flow it admits, what admitted it, and the name
+/// resolved to its destination: [`host_target`]'s answer for a destination it
+/// does not refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Carried {
     /// The host socket address the flow is carried to.
     pub(super) target: SocketAddr,
     /// What admitted the flow, for its report.
     pub(super) admission: FlowAdmission,
+    /// The name the flow's report names its destination by.
+    pub(super) name: Option<Arc<str>>,
+}
+
+/// Why the stack refuses a flow, and the name resolved to its destination:
+/// [`host_target`]'s answer for a destination it refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Refused {
+    /// Why, for the flow's report.
+    pub(super) refusal: FlowRefusal,
+    /// The name the flow's report names its destination by.
+    pub(super) name: Option<Arc<str>>,
 }
 
 /// The gateway's answer: carried to `loopback`, the host's loopback on the
 /// port the guest addressed, where the plan maps that port, and refused on any
-/// other.
-fn gateway(plan: &Plan, loopback: SocketAddr) -> Result<Carried, FlowRefusal> {
+/// other. `name` is the name resolved to the gateway's address, if any.
+fn gateway(
+    plan: &Plan,
+    loopback: SocketAddr,
+    name: Option<&Arc<str>>,
+) -> Result<Carried, FlowRefusal> {
     if !plan.host_loopback.admits(loopback.port()) {
         return Err(FlowRefusal::GatewayUnmapped);
     }
     Ok(Carried {
         target: loopback,
         admission: FlowAdmission::HostLoopback,
+        name: name.cloned(),
     })
 }
 
@@ -1074,14 +1129,16 @@ mod tests {
 
     /// Where the stack carries a flow to `dst`, or `None` where it refuses it.
     fn target(transport: Transport, dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
-        host_target(transport, dst, plan)
+        host_target(transport, dst, plan, None)
             .ok()
             .map(|carried| carried.target)
     }
 
     /// Why the stack refuses a flow to `dst`, or `None` where it carries it.
     fn refusal(transport: Transport, dst: IpEndpoint, plan: &Plan) -> Option<FlowRefusal> {
-        host_target(transport, dst, plan).err()
+        host_target(transport, dst, plan, None)
+            .err()
+            .map(|refused| refused.refusal)
     }
 
     #[test]
@@ -1314,7 +1371,7 @@ mod tests {
     #[test]
     fn a_carried_flow_names_what_admitted_it() {
         let admission = |plan: &Plan, dst| {
-            host_target(Transport::Tcp, dst, plan)
+            host_target(Transport::Tcp, dst, plan, None)
                 .expect("the stack carries the flow")
                 .admission
         };
@@ -2974,18 +3031,21 @@ mod tests {
                     Transport::Tcp,
                     from_guest(GUEST_PORT),
                     to(GATEWAY, port),
+                    None,
                     FlowAdmission::HostLoopback,
                 ),
                 NetStackReport::refused(
                     Transport::Tcp,
                     from_guest(GUEST_PORT),
                     to(GATEWAY, UNMAPPED),
+                    None,
                     FlowRefusal::GatewayUnmapped,
                 ),
                 NetStackReport::refused(
                     Transport::Tcp,
                     from_guest(GUEST_PORT),
                     metadata,
+                    None,
                     FlowRefusal::LinkLocal,
                 ),
             ]
@@ -3028,12 +3088,14 @@ mod tests {
                     Transport::Tcp,
                     from_guest(30_000),
                     to(GATEWAY, port),
+                    None,
                     FlowRefusal::TooManyFlows,
                 ),
                 NetStackReport::refused(
                     Transport::Tcp,
                     from_guest(30_001),
                     to(GATEWAY, UNMAPPED),
+                    None,
                     FlowRefusal::GatewayUnmapped,
                 ),
             ]
@@ -3057,6 +3119,7 @@ mod tests {
                 Transport::Udp,
                 from_guest(guest_port),
                 to(GATEWAY, UNMAPPED),
+                None,
                 FlowRefusal::GatewayUnmapped,
             ))
         );
@@ -3080,8 +3143,244 @@ mod tests {
                 Transport::Udp,
                 from_guest(40_000),
                 to(GATEWAY, port),
+                None,
                 FlowAdmission::HostLoopback,
             )]
+        );
+    }
+
+    // -- Names ----------------------------------------------------------------
+
+    /// The stack's nameserver under the default plan.
+    const NAMESERVER: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+
+    /// A query for `name`'s records of `record_type`, under `id`.
+    fn dns_query(id: u16, name: &str, record_type: u16) -> Vec<u8> {
+        let mut query = id.to_be_bytes().to_vec();
+        query.extend_from_slice(&[0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        for label in name.split('.') {
+            query.push(u8::try_from(label.len()).expect("a label's length"));
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&record_type.to_be_bytes());
+        query.extend_from_slice(&[0, 1]);
+        query
+    }
+
+    /// The guest's query `query`, from its `guest_port` to the nameserver, as
+    /// a frame.
+    fn query_frame(guest_port: u16, query: &[u8]) -> Vec<u8> {
+        let udp = datagram(from_guest(guest_port), to(NAMESERVER, 53), query);
+        ipv4(GUEST, NAMESERVER, IpProtocol::Udp, &udp)
+    }
+
+    /// An engine over `tap` whose nameserver asks `upstream`, and the
+    /// receiving end of its reports.
+    fn naming_engine(
+        tap: OwnedFd,
+        plan: Plan,
+        upstream: StdSocketAddr,
+    ) -> (Engine, NetStackReports) {
+        let (reporter, reports) = Reporter::new();
+        match Engine::new(tap, plan, Vec::new(), Some(upstream), reporter) {
+            Ok(engine) => (engine, reports),
+            Err(_) => panic!("the engine could not gather entropy"),
+        }
+    }
+
+    /// The payloads of the UDP datagrams the engine has sent the guest.
+    fn datagrams_to_guest(guest: &OwnedFd) -> Vec<Vec<u8>> {
+        let mut sent = Vec::new();
+        let mut frame = [0u8; 2048];
+        while let Ok(read) = rustix::io::read(guest, &mut frame) {
+            let Ok(ethernet) = EthernetFrame::new_checked(&frame[..read]) else {
+                continue;
+            };
+            let Ok(ip) = Ipv4Packet::new_checked(ethernet.payload()) else {
+                continue;
+            };
+            if ethernet.ethertype() == EthernetProtocol::Ipv4
+                && ip.next_header() == IpProtocol::Udp
+                && let Ok(udp) = UdpPacket::new_checked(ip.payload())
+            {
+                sent.push(udp.payload().to_vec());
+            }
+        }
+        sent
+    }
+
+    /// Has the guest ask `name` through `engine`, and the test's `upstream`
+    /// answer it with `address`, then serves the engine until the answer is
+    /// pinned.
+    fn resolve(engine: &mut Engine, upstream: &UdpSocket, name: &str, address: Ipv4Addr) {
+        let query = dns_query(0x4242, name, 1);
+        let frame = query_frame(5353, &query);
+        assert!(engine.consider(classify(&frame)));
+        deliver(engine, &frame);
+        let mut asked = [0u8; 512];
+        upstream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a read timeout");
+        let (len, from) = upstream
+            .recv_from(&mut asked)
+            .expect("the query went upstream");
+        assert_eq!(asked[..len], query[..], "relayed as the guest sent it");
+        let mut answer = query.clone();
+        answer[2] |= 0x80;
+        answer[3] = 0x80;
+        answer[7] = 1;
+        answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4]);
+        answer.extend_from_slice(&address.octets());
+        upstream
+            .send_to(&answer, from)
+            .expect("the answer goes back");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while engine
+            .pins()
+            .is_none_or(|pins| pins.names(address.into()).next().is_none())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the answer was pinned"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            engine.service();
+        }
+    }
+
+    #[test]
+    fn a_flow_is_named_by_the_answer_that_resolved_its_address() {
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a host socket binds");
+        let address = upstream.local_addr().expect("an address");
+        let (tap, _guest) = tap_pair();
+        let (mut engine, reports) = naming_engine(tap, NetStack::default().plan, address);
+
+        let pinned = Ipv4Addr::new(198, 51, 100, 7);
+        resolve(&mut engine, &upstream, "named.example", pinned);
+        engine.consider(classify(&syn_from(GUEST_PORT, to(pinned, 443))));
+        engine.consider(classify(&syn_from(
+            GUEST_PORT,
+            to(Ipv4Addr::new(198, 51, 100, 8), 443),
+        )));
+        assert_eq!(
+            reported(&reports),
+            [
+                NetStackReport::relayed(
+                    from_guest(5353),
+                    "named.example",
+                    1,
+                    FlowAdmission::Default
+                ),
+                NetStackReport::admitted(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    to(pinned, 443),
+                    Some("named.example"),
+                    FlowAdmission::Default,
+                ),
+                NetStackReport::admitted(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    to(Ipv4Addr::new(198, 51, 100, 8), 443),
+                    None,
+                    FlowAdmission::Default,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_rule_admits_what_its_name_resolved_to_and_answers_the_rest() {
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a host socket binds");
+        let address = upstream.local_addr().expect("an address");
+        let (tap, guest) = tap_pair();
+        let plan = ruled(&["named.example"], &[], None);
+        let (mut engine, reports) = naming_engine(tap, plan, address);
+        let rule: super::super::DestinationRule = "named.example".parse().unwrap();
+        // The guest's address resolution teaches the stack its hardware
+        // address, which the answers below go to.
+        guest_sends(&mut engine, &resolve_gateway());
+        let _ = datagrams_to_guest(&guest);
+
+        // A name no rule admits is answered at once, and never asked upstream.
+        let refused = dns_query(0x0101, "other.example", 1);
+        let frame = query_frame(5354, &refused);
+        assert!(engine.consider(classify(&frame)));
+        deliver(&mut engine, &frame);
+        engine
+            .iface
+            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        let answers = datagrams_to_guest(&guest);
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0][..2], [0x01, 0x01]);
+        assert_eq!(answers[0][3] & 0x0f, 3, "NXDOMAIN");
+        // An HTTPS question for an admitted name is answered with no records.
+        let https = dns_query(0x0102, "named.example", 65);
+        let frame = query_frame(5355, &https);
+        deliver(&mut engine, &frame);
+        engine
+            .iface
+            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        let answers = datagrams_to_guest(&guest);
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0][3] & 0x0f, 0, "NOERROR");
+        assert_eq!(answers[0][6..8], [0, 0], "no records");
+        upstream
+            .set_nonblocking(true)
+            .expect("the upstream reads without waiting");
+        assert!(
+            upstream.recv_from(&mut [0u8; 512]).is_err(),
+            "nothing was asked upstream"
+        );
+        upstream
+            .set_nonblocking(false)
+            .expect("the upstream waits again");
+
+        let pinned = Ipv4Addr::new(198, 51, 100, 7);
+        resolve(&mut engine, &upstream, "named.example", pinned);
+        let literal = Ipv4Addr::new(198, 51, 100, 8);
+        engine.consider(classify(&syn_from(GUEST_PORT, to(pinned, 443))));
+        engine.consider(classify(&syn_from(GUEST_PORT, to(literal, 443))));
+        engine.consider(classify(&datagram_from(40_000, to(pinned, 443))));
+        assert_eq!(
+            reported(&reports),
+            [
+                NetStackReport::question_refused(
+                    from_guest(5354),
+                    "other.example",
+                    1,
+                    FlowRefusal::NotAllowed
+                ),
+                NetStackReport::withheld(from_guest(5355), "named.example", 65),
+                NetStackReport::relayed(
+                    from_guest(5353),
+                    "named.example",
+                    1,
+                    FlowAdmission::Allowed { rule: rule.clone() }
+                ),
+                NetStackReport::admitted(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    to(pinned, 443),
+                    Some("named.example"),
+                    FlowAdmission::Allowed { rule: rule.clone() },
+                ),
+                NetStackReport::refused(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    to(literal, 443),
+                    None,
+                    FlowRefusal::NotResolved,
+                ),
+                NetStackReport::refused(
+                    Transport::Udp,
+                    from_guest(40_000),
+                    to(pinned, 443),
+                    Some("named.example"),
+                    FlowRefusal::NameOverUdp { rule },
+                ),
+            ]
         );
     }
 }

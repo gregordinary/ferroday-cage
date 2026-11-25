@@ -306,12 +306,16 @@ the text `fcage` and the stack's profile format take as well:
 |---|---|
 | `192.0.2.7`, `2001:db8::1` | the address |
 | `192.0.2.0/24`, `2001:db8::/32` | every address in the network |
+| `example.com` | the name, by way of the stack's [nameserver](#names) |
+| `*.example.com` | every name below `example.com`, at any depth, and not `example.com` itself |
 | `RULE:443`, `RULE:80,443`, `RULE:8000-8999` | the rule, on those ports alone |
 | `tcp:RULE`, `udp:RULE` | the rule, over that transport alone |
 
 An IPv6 address or network with ports is bracketed, as in `[2001:db8::1]:443`.
 Unbracketed, its colons are its own and it carries no ports. An address rule
-covers TCP and UDP unless a transport says otherwise.
+covers TCP and UDP unless a transport says otherwise. A name rule admits TCP
+alone, so `udp:` does not qualify one. A name is compared without regard to
+case.
 
 The rules decide a destination together:
 
@@ -358,41 +362,103 @@ Some of the stack's behaviour sits outside the rules:
 - The gateway's [loopback mapping](#what-answers-and-what-checks-reachability)
   and the [published ports](#publishing-a-port) are grants of their own, and a
   rule neither widens nor narrows them.
-- So is the [nameserver](#dns), which relays the guest's queries to a resolver
-  of the host's. A query carries whatever its name spells to that resolver and
-  on to the servers it asks, so the nameserver is a way out the rules do not
-  bound. A caller whose rules must be the guest's only way out turns it off.
+- A connection to the [nameserver](#dns) is the stack's own too. The rules
+  decide the questions it relays instead, as [names](#names) describes.
 - An IPv4 rule covers the address's NAT64 spelling, `64:ff9b::a.b.c.d`, too,
   since a translator carries a flow there to the IPv4 address. A deny rule
   cannot be passed by way of the translator.
 
-The grammar reads a name as well, `example.com` or `*.example.com`. The stack
-decides each flow by its address, though, so
-[`build`][`NetStackBuilder::build`] refuses a name rule with
-[`NetStackError::RuleInvalid`], as it refuses an allow rule over every name
-(`*`) or every name under one label (`*.com`). Parsing refuses a name whose last
-label is a number, such as `2130706433` or `127.1`, which a resolver may read as
-an address.
+#### Names
+
+A name rule works through the stack's [nameserver](#dns), which the sandbox's
+`resolv.conf` has to name. The nameserver holds each question to the rules
+before it relays anything:
+
+- A deny name rule without ports refuses the names it matches.
+- Once any allow rule is given, a name no allow name rule matches is refused.
+  An address rule admits no name.
+- A question for any other name is relayed to the host's resolver.
+
+A refused name is answered NXDOMAIN, and its question never leaves the stack.
+Both glibc and musl take NXDOMAIN at once and as final. A refused lookup
+therefore fails without a wait and without a retry. Where the guest's resolver reads EDNS,
+the answer carries Extended DNS Error 15, "Blocked", with the reason, which
+`dig` shows.
+
+The nameserver reads each answer it relays. Every address the answer gives the
+asked name, through any aliases on the way, is pinned to that name for the
+sandbox's life. A record's time to live does not end a pin. Programs hold an
+address past it, and a content network's records often live under a minute.
+A record in the answer for some other name pins nothing.
+
+A flow is then held to the names pinned at its address:
+
+- An allow name rule admits a TCP flow to an address pinned to a name it
+  matches.
+- It admits no UDP flow there. A QUIC client falls back to TCP.
+- It admits no address in a private range: `10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, `100.64.0.0/10` and `fc00::/7`. A name anyone can register
+  can be resolved to the host's own network, and a wildcard over such names
+  would otherwise reach it.
+- A deny name rule refuses a flow on its ports to an address pinned to a name it
+  matches. It refuses both transports, unless `tcp:` qualifies it.
+
+An address rule admits what a name rule leaves out. Under allow rules, the stack
+refuses a flow to an address it resolved no name to, unless an address rule
+admits it. Such an address is a literal, or one the guest learned from a
+resolver of its own. Under deny rules alone such a flow is carried, so a deny
+name rule holds only where the guest resolves through the stack.
+
+Under any name rule, the nameserver answers a question for a name's HTTPS or
+SVCB records with none. Those records carry the keys a client encrypts its
+server name with.
+
+A name rule is only as strong as the tie between a name and its addresses:
+
+- Several names share an address wherever a content network serves them. A flow
+  to an admitted name's address reaches whichever of its sites the guest asks
+  for.
+- The name a flow is held to is the one the guest asked for. The aliases its
+  answer passes through are not held to the rules.
+- A guest can spell data into names below an admitted wildcard, and those
+  questions reach that zone's own servers. Questions for every name the rules
+  refuse stay in the stack.
+
+[`build`][`NetStackBuilder::build`] refuses `*`, and a wildcard over the names
+under one label such as `*.com`, as an allow rule, since either admits nearly
+every name. It refuses a name rule of either kind where the nameserver is turned
+off, since nothing then resolves its names. Both refusals are
+[`NetStackError::RuleInvalid`]. Parsing refuses a name whose last
+label is a number, such as `2130706433` or `127.1`, since some resolvers read
+such a name as an address.
 
 ### Reports
 
 The stack reports each decision it takes about a flow of the guest's. A flow is
 a TCP connection attempt, or the datagrams between one port of the guest's and
 one UDP destination. A [`NetStackReport`] names the transport, the guest's end,
-and the destination, and then what admitted the flow or why the stack refused
-it:
+and the destination, with the name the nameserver resolved to the destination's
+address where it resolved one. It then says what admitted the flow or why the
+stack refused it:
 
 - A [`FlowAdmission`] says what admitted the flow: no rule refuses it, a named
   allow rule admits it, or the gateway's loopback mapping carries it.
 - A [`FlowRefusal`] says why the stack refused it: no allow rule admits it, or a
-  named deny rule refuses it. Otherwise it names the kind of destination the
-  stack always refuses, or says the stack already carries all the flows it
-  holds.
+  named deny rule refuses it. A name rule's refusals say no name was resolved to
+  the address. Otherwise they name the rule that leaves out a UDP flow or a
+  private address.
+  Otherwise it names the kind of destination the stack always refuses, or says
+  the stack already carries all the flows it holds.
+
+The nameserver's questions are reported too, each once: relayed to the host's
+resolver, refused, or answered with no HTTPS or SVCB records. A question's
+report names the guest's end, the name, the record type, and the decision.
 
 A report writes as one line:
 
 ```text
-refused tcp from 10.0.2.15:41234 to 198.51.100.7:443: no allow rule admits it
+carried tcp from 10.0.2.15:41236 to 192.0.2.7:443 (example.com): the allow rule example.com admits it
+refused the AAAA question for example.net from 10.0.2.15:53140: no allow rule admits it
 ```
 
 [`take_reports`][`NetStackHandle::take_reports`] hands over the receiving end, a
@@ -437,7 +503,8 @@ the stack making them. The reports end once the stack has stopped and
 every queued report has been read, so a thread reading them ends after `stop`.
 
 The stack's own grants are not reported: the connections a published port
-accepts, and the guest's queries to the nameserver.
+accepts, and a connection or datagram to the nameserver. Its questions have
+reports of their own.
 
 ### What answers, and what checks reachability
 
@@ -588,6 +655,10 @@ handle.stop()?;
 # }
 ```
 
+Under [destination rules](#names), the nameserver answers a question for a name
+the rules refuse itself. The addresses its answers give are what a name rule
+admits a flow by.
+
 Each query goes upstream on a socket of its own, over the transport the guest
 asked on. An answer too long for one packet is answered truncated, which sends
 the guest's resolver to TCP. The nameserver relays at most 64 queries at once,
@@ -630,7 +701,8 @@ being no stack left to attach.
 `--netstack-upstream ADDRESS` has the nameserver ask another resolver, on port 53
 or on the port of an `ADDRESS:PORT`, and `--netstack-no-nameserver` turns the
 nameserver off. `--netstack-allow RULE` and `--netstack-deny RULE` give the
-[destination rules](#destination-rules), each as often as needed. `--netstack-host-port PORT` maps one port of the gateway onto
+[destination rules](#destination-rules), by address or by name, each as often
+as needed. `--netstack-host-port PORT` maps one port of the gateway onto
 host loopback.
 
 Under destination rules, `fcage` writes each refusal the stack
@@ -641,9 +713,9 @@ connection failed:
 fcage: the network stack refused tcp from 10.0.2.15:41234 to 192.0.2.1:443: no allow rule admits it
 ```
 
-`--netstack-log` writes every report, the flows the stack carries too. With no
-rules that is a log of where the sandbox goes, which is how to learn what an
-allowlist needs.
+`--netstack-log` writes every report, the flows the stack carries and the
+questions it relays too. With no rules that is a log of where the sandbox goes,
+by name, which is how to learn what an allowlist needs.
 `--netstack-publish HOST GUEST_PORT` publishes a guest port, where `HOST` is an
 `ADDRESS:PORT` or a bare port on `127.0.0.1`. A publication on port 0 has
 `fcage` report the port the kernel chose, on standard error, before the command

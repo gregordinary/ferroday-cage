@@ -62,29 +62,45 @@ consumer upgrading can skip it.
   started with its defaults a launch fails this way. The profile is read from
   `/proc/self/attr/apparmor/current`, from Linux 5.8.
 - The native network stack takes destination rules. `NetStackBuilder::allow`
-  and `NetStackBuilder::deny` each take a `DestinationRule`: an address or a
-  network, optionally with ports (`:443`, `:80,443`, `:8000-8999`) and a
-  transport (`tcp:` or `udp:`), an IPv6 one with ports in brackets. A deny rule
-  that matches refuses a destination; once any allow rule is given, a
+  and `NetStackBuilder::deny` each take a `DestinationRule`: an address, a
+  network or a name, optionally with ports (`:443`, `:80,443`, `:8000-8999`)
+  and a transport (`tcp:` or `udp:`), an IPv6 address with ports in brackets. A
+  deny rule that matches refuses a destination; once any allow rule is given, a
   destination no allow rule admits is refused. The stack's fixed refusals
-  stand under every rule, and the gateway's loopback mapping, the published
-  ports and the nameserver are outside the rules. An IPv4 rule covers the
-  address's NAT64 spelling too. A rule parses from text and writes back with
-  `Display`, and a malformed one is refused with the new
-  `ParseDestinationRuleError`. The grammar reads a name, and `build` refuses a
-  name rule, and an allow rule over every name or every name under one label,
-  with the new `NetStackError::RuleInvalid`. The stack's profile format gains
-  the `allow` and `deny` keys, and `fcage` the `--netstack-allow RULE` and
+  stand under every rule, and the gateway's loopback mapping and the published
+  ports are outside the rules. An IPv4 rule covers the address's NAT64
+  spelling too. A rule parses from text and writes back with `Display`, and a
+  malformed one is refused with the new `ParseDestinationRuleError`. `build`
+  refuses an allow rule over every name or every name under one label, and a
+  name rule where the nameserver is turned off, with the new
+  `NetStackError::RuleInvalid`. The stack's profile format gains the `allow`
+  and `deny` keys, and `fcage` the `--netstack-allow RULE` and
   `--netstack-deny RULE` flags.
+- A name rule, `example.com` or `*.example.com` for the names below it, works
+  through the stack's nameserver. The nameserver answers a question for a name
+  the rules refuse with NXDOMAIN, carrying Extended DNS Error 15 and the reason
+  where the query reads EDNS, and relays nothing. Once any allow rule is given,
+  a name no allow name rule admits is refused. Each address an answer gives the
+  asked name, through its aliases, is pinned to that name for the attachment's
+  life. An allow name rule admits a TCP flow to a pinned address of its name,
+  but no UDP flow and no address in a private range, which an address rule
+  admits. Under allow name rules, a flow to an address no name was resolved to
+  is refused. A deny name rule refuses a flow to a pinned address of its name
+  over either transport. Under any name rule, a question for a name's HTTPS or
+  SVCB records is answered with none.
 - The native network stack reports each flow of the guest's it carries or
-  refuses. `NetStackHandle::take_reports` hands over the new `NetStackReports`,
+  refuses, and each question its nameserver relays, refuses, or answers with no
+  records. `NetStackHandle::take_reports` hands over the new `NetStackReports`,
   the receiving end of a queue of 1024 reports that the stack never waits on: a
-  report it has no room for is dropped and counted. Each `NetStackReport` names
-  the transport, the guest's end and the destination, with a `FlowAdmission`
-  saying what admitted the flow or a `FlowRefusal` saying why the stack refused
-  it, naming the rule where one decided, and writes as one line. A TCP attempt
-  is reported once, and a refused UDP flow once until it has sat idle for two
-  minutes. `Transport` writes as `tcp` or `udp`.
+  report it has no room for is dropped and counted. A flow's `NetStackReport`
+  names the transport, the guest's end, the destination and the name the
+  nameserver resolved to it, and a question's names the guest's end, the name
+  and the record type. A report of something carried or relayed holds a
+  `FlowAdmission` saying what admitted it, and one of something refused a
+  `FlowRefusal` saying why, naming the rule where one decided. Each writes as
+  one line. A TCP attempt is reported once, and a
+  refused UDP flow once until it has sat idle for two minutes. `Transport`
+  writes as `tcp` or `udp`.
 - `fcage` writes each refusal the network stack reports on standard error under
   `--netstack-allow` or `--netstack-deny`, and every report under the new
   `--netstack-log`.

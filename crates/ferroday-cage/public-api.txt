@@ -1961,7 +1961,12 @@ pub ferroday_cage::FlowRefusal::GuestNetwork
 pub ferroday_cage::FlowRefusal::LinkLocal
 pub ferroday_cage::FlowRefusal::Loopback
 pub ferroday_cage::FlowRefusal::Multicast
+#[non_exhaustive] pub ferroday_cage::FlowRefusal::NameOverUdp
+pub ferroday_cage::FlowRefusal::NameOverUdp::rule: ferroday_cage::DestinationRule
 pub ferroday_cage::FlowRefusal::NotAllowed
+pub ferroday_cage::FlowRefusal::NotResolved
+#[non_exhaustive] pub ferroday_cage::FlowRefusal::PrivateBehindName
+pub ferroday_cage::FlowRefusal::PrivateBehindName::rule: ferroday_cage::DestinationRule
 pub ferroday_cage::FlowRefusal::ProtocolDisabled
 pub ferroday_cage::FlowRefusal::TooManyFlows
 pub ferroday_cage::FlowRefusal::Unspecified
@@ -2125,12 +2130,28 @@ impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackError
 pub ferroday_cage::NetStackReport::FlowAdmitted::admission: ferroday_cage::FlowAdmission
 pub ferroday_cage::NetStackReport::FlowAdmitted::destination: core::net::socket_addr::SocketAddr
 pub ferroday_cage::NetStackReport::FlowAdmitted::guest: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::FlowAdmitted::name: core::option::Option<alloc::string::String>
 pub ferroday_cage::NetStackReport::FlowAdmitted::transport: ferroday_cage::Transport
 #[non_exhaustive] pub ferroday_cage::NetStackReport::FlowRefused
 pub ferroday_cage::NetStackReport::FlowRefused::destination: core::net::socket_addr::SocketAddr
 pub ferroday_cage::NetStackReport::FlowRefused::guest: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::FlowRefused::name: core::option::Option<alloc::string::String>
 pub ferroday_cage::NetStackReport::FlowRefused::refusal: ferroday_cage::FlowRefusal
 pub ferroday_cage::NetStackReport::FlowRefused::transport: ferroday_cage::Transport
+#[non_exhaustive] pub ferroday_cage::NetStackReport::QuestionRefused
+pub ferroday_cage::NetStackReport::QuestionRefused::guest: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::QuestionRefused::name: alloc::string::String
+pub ferroday_cage::NetStackReport::QuestionRefused::record_type: u16
+pub ferroday_cage::NetStackReport::QuestionRefused::refusal: ferroday_cage::FlowRefusal
+#[non_exhaustive] pub ferroday_cage::NetStackReport::QuestionRelayed
+pub ferroday_cage::NetStackReport::QuestionRelayed::admission: ferroday_cage::FlowAdmission
+pub ferroday_cage::NetStackReport::QuestionRelayed::guest: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::QuestionRelayed::name: alloc::string::String
+pub ferroday_cage::NetStackReport::QuestionRelayed::record_type: u16
+#[non_exhaustive] pub ferroday_cage::NetStackReport::QuestionWithheld
+pub ferroday_cage::NetStackReport::QuestionWithheld::guest: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::QuestionWithheld::name: alloc::string::String
+pub ferroday_cage::NetStackReport::QuestionWithheld::record_type: u16
 impl ferroday_cage::NetStackReport
 pub fn ferroday_cage::NetStackReport::is_refusal(&self) -> bool
 impl core::fmt::Display for ferroday_cage::NetStackReport

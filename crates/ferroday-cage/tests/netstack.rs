@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::dns::{KNOWN_NAME, Resolver};
+use common::dns::{KNOWN_NAME, Record, Resolver};
 use common::{Collect, sleeper, wait_gone};
 
 use std::io::{Read, Write};
@@ -15,8 +15,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use ferroday_cage::{
-    Cage, FlowAdmission, FlowRefusal, NetStack, NetStackError, NetStackReport, Network, RawMount,
-    Transport,
+    Cage, CageBuilder, FlowAdmission, FlowRefusal, NetStack, NetStackError, NetStackReport,
+    Network, RawMount, Transport,
 };
 
 #[test]
@@ -710,30 +710,38 @@ fn summary(report: &NetStackReport) -> Summary {
             destination,
             admission,
             ..
-        } => {
-            let decision = match admission {
-                FlowAdmission::Allowed { rule, .. } => format!("allowed by {rule}"),
-                other => format!("carried as {other:?}"),
-            };
-            (transport, guest, destination, decision)
-        }
+        } => (transport, guest, destination, admitted_as(admission)),
         NetStackReport::FlowRefused {
             transport,
             guest,
             destination,
             refusal,
             ..
-        } => {
-            let decision = match refusal {
-                FlowRefusal::Denied { rule, .. } => format!("denied by {rule}"),
-                other => format!("refused as {other:?}"),
-            };
-            (transport, guest, destination, decision)
-        }
+        } => (transport, guest, destination, refused_as(refusal)),
         other => panic!("a report of something other than a flow: {other}"),
     };
     assert_eq!(guest.ip(), IpAddr::from([10, 0, 2, 15]), "{report}");
     (*transport, *destination, decision)
+}
+
+/// What admitted a flow or a question, as a test compares it, naming the rule
+/// where one decided.
+fn admitted_as(admission: &FlowAdmission) -> String {
+    match admission {
+        FlowAdmission::Allowed { rule, .. } => format!("allowed by {rule}"),
+        other => format!("carried as {other:?}"),
+    }
+}
+
+/// Why a flow or a question was refused, as a test compares it, naming the
+/// rule where one decided.
+fn refused_as(refusal: &FlowRefusal) -> String {
+    match refusal {
+        FlowRefusal::Denied { rule, .. } => format!("denied by {rule}"),
+        FlowRefusal::PrivateBehindName { rule, .. } => format!("private behind {rule}"),
+        FlowRefusal::NameOverUdp { rule, .. } => format!("over udp under {rule}"),
+        other => format!("refused as {other:?}"),
+    }
 }
 
 /// The summary of a flow over TCP to `destination`.
@@ -1555,5 +1563,397 @@ fn a_tcp_connection_to_the_nameserver_carries_each_of_its_queries() {
         resolver.asked(),
         (0, 2),
         "each query went upstream over TCP"
+    );
+}
+
+// Name rules: the nameserver holds each question to the rules, and a flow is
+// admitted by the names its answers resolved. The addresses are documentation
+// ones, which a carried flow's host connect starts toward and nothing answers,
+// so these tests need the host's route outward that `routable` reports.
+
+/// What the name-rule tests' zone resolves its names to.
+const ADMITTED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+const REFUSED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 8);
+const EDGE: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
+const STRAY: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
+const PRIVATE: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
+
+/// The stand-in resolver the name-rule tests ask, with records of a second's
+/// life.
+fn naming_resolver() -> Resolver {
+    Resolver::serving(
+        vec![
+            (
+                "admitted.example",
+                vec![
+                    ("admitted.example", Record::A(ADMITTED)),
+                    ("admitted.example", Record::Https),
+                ],
+            ),
+            (
+                "refused.example",
+                vec![("refused.example", Record::A(REFUSED))],
+            ),
+            (
+                "alias.example",
+                vec![
+                    ("alias.example", Record::Cname("edge.cdn.example")),
+                    ("edge.cdn.example", Record::A(EDGE)),
+                    ("stray.example", Record::A(STRAY)),
+                ],
+            ),
+            (
+                "private.example",
+                vec![("private.example", Record::A(PRIVATE))],
+            ),
+        ],
+        1,
+    )
+}
+
+/// A stack asking `resolver`, with `allow` and `deny` rules given as text.
+fn naming(resolver: &Resolver, allow: &[&str], deny: &[&str]) -> NetStack {
+    let text = |rules: &[&str]| -> Vec<String> { rules.iter().map(ToString::to_string).collect() };
+    ruled(
+        NetStack::builder().upstream(resolver.address()),
+        &text(allow),
+        &text(deny),
+    )
+}
+
+/// Runs `script` in the sandbox `cage` builds, its `resolv.conf` naming the
+/// stack's nameserver, with `stack` attached, and returns what it printed,
+/// every report the stack made, and how long the command ran.
+fn run_naming(
+    cage: CageBuilder,
+    stack: &NetStack,
+    script: &str,
+) -> (String, Vec<NetStackReport>, Duration) {
+    let mut observer = Collect::default();
+    let pending = cage
+        .nameservers(stack.nameservers())
+        .command("/bin/sh")
+        .args(["-c", script])
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let mut handle = stack.attach(&pending).expect("the stack attaches");
+    let reports = handle
+        .take_reports()
+        .expect("a fresh handle holds its reports");
+    let started = Instant::now();
+    let mut running = pending.proceed().expect("the command is released");
+    common::outcome_within(&mut running, Duration::from_secs(30));
+    let took = started.elapsed();
+    drop(running);
+    handle.stop().expect("the stack stops cleanly");
+    (
+        String::from_utf8_lossy(&observer.stdout).into_owned(),
+        std::iter::from_fn(|| reports.recv().ok()).collect(),
+        took,
+    )
+}
+
+/// The question reports among `reports`, each as its name and its decision:
+/// relayed by default or by a named rule, refused for a reason, or withheld.
+fn questions(reports: &[NetStackReport]) -> Vec<(String, String)> {
+    reports
+        .iter()
+        .filter_map(|report| match report {
+            NetStackReport::QuestionRelayed {
+                name, admission, ..
+            } => Some((name.clone(), admitted_as(admission))),
+            NetStackReport::QuestionRefused { name, refusal, .. } => {
+                Some((name.clone(), refused_as(refusal)))
+            }
+            NetStackReport::QuestionWithheld { name, .. } => {
+                Some((name.clone(), "withheld".to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The flow reports among `reports`, each as its transport, its destination,
+/// the name resolved to it, and its decision.
+fn flows(reports: &[NetStackReport]) -> Vec<(Transport, SocketAddr, Option<String>, String)> {
+    reports
+        .iter()
+        .filter_map(|report| match report {
+            NetStackReport::FlowAdmitted {
+                transport,
+                destination,
+                name,
+                admission,
+                ..
+            } => Some((
+                *transport,
+                *destination,
+                name.clone(),
+                admitted_as(admission),
+            )),
+            NetStackReport::FlowRefused {
+                transport,
+                destination,
+                name,
+                refusal,
+                ..
+            } => Some((*transport, *destination, name.clone(), refused_as(refusal))),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_name_the_rules_refuse_does_not_resolve_and_fails_at_once() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    // musl's resolver from the fixture's root, and glibc's from the host's,
+    // where the host has one.
+    let mut libraries = vec![("musl", Cage::builder().rootfs(rootfs))];
+    if Path::new("/usr/bin/getent").exists() {
+        libraries.push(("glibc", Cage::builder().host_rootfs()));
+    }
+    for (library, cage) in libraries {
+        for (allow, deny) in [
+            (&["admitted.example"][..], &[][..]),
+            (&[], &["refused.example"]),
+        ] {
+            let resolver = naming_resolver();
+            let stack = naming(&resolver, allow, deny);
+            let (printed, reports, _) = run_naming(
+                cage.clone(),
+                &stack,
+                "getent hosts admitted.example; echo admitted=$?; \
+                 getent hosts refused.example; echo refused=$?",
+            );
+            let under = format!("{library} under allow {allow:?}, deny {deny:?}");
+            assert!(printed.contains("198.51.100.7"), "{under}: {printed}");
+            assert!(printed.contains("admitted=0"), "{under}: {printed}");
+            assert!(printed.contains("refused=2"), "{under}: {printed}");
+            assert!(!printed.contains("198.51.100.8"), "{under}: {printed}");
+            assert_eq!(resolver.asked_for("refused.example"), 0, "{under}");
+            assert!(resolver.asked_for("admitted.example") > 0, "{under}");
+            let (relayed, refused) = match allow.is_empty() {
+                true => ("carried as Default", "denied by refused.example"),
+                false => ("allowed by admitted.example", "refused as NotAllowed"),
+            };
+            let asked = questions(&reports);
+            assert!(!asked.is_empty(), "{under}");
+            for (name, decision) in asked {
+                let expected = match name.as_str() {
+                    "admitted.example" => relayed,
+                    "refused.example" => refused,
+                    other => panic!("{under}: a question for {other}"),
+                };
+                assert_eq!(decision, expected, "{under}: {name}");
+            }
+
+            // A refused name ends the lookup at once, where a refusal of
+            // another kind would cost the resolver its timeout.
+            let (printed, _, took) = run_naming(
+                cage.clone(),
+                &stack,
+                "getent hosts refused.example; echo refused=$?",
+            );
+            assert!(printed.contains("refused=2"), "{under}: {printed}");
+            assert!(took < Duration::from_secs(3), "{under}: {took:?}");
+        }
+    }
+}
+
+#[test]
+fn a_name_rule_admits_tcp_to_what_its_answers_resolved_for_the_sandboxs_life() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    if routable().is_none() {
+        return;
+    }
+    // The answer reaches its address through an alias, beside a record for a
+    // name off its chain, and lives a second; the connections come after two.
+    let resolver = naming_resolver();
+    let stack = naming(&resolver, &["alias.example"], &[]);
+    let (printed, reports, _) = run_naming(
+        Cage::builder().rootfs(rootfs),
+        &stack,
+        &format!(
+            "getent hosts alias.example; sleep 2; \
+             /usr/bin/nc -w 1 {EDGE} 443 < /dev/null; \
+             /usr/bin/nc -w 1 {STRAY} 443 < /dev/null; \
+             echo datagram | /usr/bin/nc -u -w 1 {EDGE} 443; true"
+        ),
+    );
+    assert!(printed.contains("198.51.100.9"), "{printed}");
+    let alias = || Some("alias.example".to_string());
+    assert_eq!(
+        flows(&reports),
+        [
+            (
+                Transport::Tcp,
+                (EDGE, 443).into(),
+                alias(),
+                "allowed by alias.example".to_string()
+            ),
+            (
+                Transport::Tcp,
+                (STRAY, 443).into(),
+                None,
+                "refused as NotResolved".to_string()
+            ),
+            (
+                Transport::Udp,
+                (EDGE, 443).into(),
+                alias(),
+                "over udp under alias.example".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_name_rule_admits_no_private_address_and_an_address_rule_does() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    if routable().is_none() {
+        return;
+    }
+    let script =
+        format!("getent hosts private.example; /usr/bin/nc -w 1 {PRIVATE} 443 < /dev/null; true");
+    let named = || Some("private.example".to_string());
+    for (allow, decision) in [
+        (&["private.example"][..], "private behind private.example"),
+        (
+            &["private.example", "10.255.255.1"],
+            "allowed by 10.255.255.1",
+        ),
+    ] {
+        let resolver = naming_resolver();
+        let stack = naming(&resolver, allow, &[]);
+        let (printed, reports, _) = run_naming(Cage::builder().rootfs(rootfs), &stack, &script);
+        assert!(printed.contains("10.255.255.1"), "{allow:?}: {printed}");
+        assert_eq!(
+            flows(&reports),
+            [(
+                Transport::Tcp,
+                (PRIVATE, 443).into(),
+                named(),
+                decision.to_string()
+            )],
+            "{allow:?}"
+        );
+    }
+}
+
+/// A shell `printf` format writing `bytes`, each as an octal escape.
+fn printf_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("\\{byte:03o}")).collect()
+}
+
+/// A query under `id` for `name`'s records of `record_type`, with recursion
+/// desired, and an OPT record where `edns` says.
+fn raw_query(id: u16, name: &str, record_type: u16, edns: bool) -> Vec<u8> {
+    let mut query = id.to_be_bytes().to_vec();
+    query.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, u8::from(edns)]);
+    for label in name.split('.') {
+        query.push(u8::try_from(label.len()).expect("a label's length"));
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&record_type.to_be_bytes());
+    query.extend_from_slice(&[0, 1]);
+    if edns {
+        query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+    }
+    query
+}
+
+/// Lowercase hex, a space after each byte, as `od -An -tx1` writes it once
+/// `tr` joins its lines.
+fn spaced_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x} ")).collect()
+}
+
+#[test]
+fn the_nameserver_gives_its_reason_and_withholds_service_bindings() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let resolver = naming_resolver();
+    let stack = naming(&resolver, &["admitted.example"], &[]);
+    let ask = |query: Vec<u8>| {
+        format!(
+            "printf '{}' | /usr/bin/nc -u -w 2 10.0.2.3 53 | od -An -v -tx1 | tr -s ' \\n' ' '; \
+             echo",
+            printf_bytes(&query)
+        )
+    };
+    let script = [
+        ask(raw_query(0x1234, "refused.example", 1, true)),
+        ask(raw_query(0x1235, "refused.example", 1, false)),
+        ask(raw_query(0x1236, "admitted.example", 65, true)),
+    ]
+    .join("; ");
+    let (printed, reports, _) = run_naming(Cage::builder().rootfs(rootfs), &stack, &script);
+    let lines: Vec<&str> = printed.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), 3, "{printed}");
+
+    // NXDOMAIN, with Extended DNS Error 15 and the reason where the query reads
+    // EDNS, and the code alone where it does not.
+    let reason = "no allow rule admits it";
+    assert!(
+        lines[0].starts_with("12 34 81 83 00 01 00 00 00 00 00 01"),
+        "{}",
+        lines[0]
+    );
+    let mut option = vec![0, 15];
+    option.extend_from_slice(&u16::try_from(2 + reason.len()).unwrap().to_be_bytes());
+    option.extend_from_slice(&[0, 15]);
+    option.extend_from_slice(reason.as_bytes());
+    assert!(
+        lines[0].ends_with(spaced_hex(&option).trim_end()),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("12 35 81 83 00 01 00 00 00 00 00 00"),
+        "{}",
+        lines[1]
+    );
+    // An admitted name's HTTPS records: none, and none asked for upstream.
+    assert!(
+        lines[2].starts_with("12 36 81 80 00 01 00 00 00 00 00 01"),
+        "{}",
+        lines[2]
+    );
+    assert_eq!(resolver.asked(), (0, 0), "nothing was relayed");
+    assert_eq!(
+        questions(&reports),
+        [
+            (
+                "refused.example".to_string(),
+                "refused as NotAllowed".to_string()
+            ),
+            (
+                "refused.example".to_string(),
+                "refused as NotAllowed".to_string()
+            ),
+            ("admitted.example".to_string(), "withheld".to_string()),
+        ]
     );
 }

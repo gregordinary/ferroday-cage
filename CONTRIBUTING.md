@@ -614,12 +614,16 @@ report name a package and its version bare.
 | Is the managed `resolv.conf` wanted, or has a mount of the caller's claimed it, or the file its link leads to? | `CageBuilder::get_resolv_conf`, over `spec::claims_resolv_conf` and `spec::claims_target` |
 | Give a sandbox a `resolv.conf` naming chosen nameservers, where it reads one | `CageBuilder::nameservers`, lowered by `Lowering::push_nameservers` |
 | Make a file of the launch's own, empty or holding given bytes, to mount over a target | `mechanism::child::own_file`, which a hidden file and a placed one share |
-| Does the network stack carry the guest's traffic over this transport to this destination, and if not, why not? | `NetStack::forwards`, over `netstack::pump::host_target`, which settles the refusals no rule lifts, naming which as a `FlowRefusal`, and then asks `netstack::policy::Policy::decide`, which names the rule that decided |
+| Does the network stack carry the guest's traffic over this transport to this destination, and if not, why not? | `NetStack::forwards`, over `netstack::pump::host_target`, which settles the refusals no rule lifts, naming which as a `FlowRefusal`, and then asks `netstack::policy::Policy::decide` of the address and the names pinned at it, which names the rule that decided |
+| Do the destination rules admit a question the stack's nameserver would relay? | `netstack::policy::Policy::decide_question` |
+| Which names did the stack's nameserver resolve to an address? | `netstack::pins::Pins`, which the nameserver fills from `netstack::dns::answer_addresses` |
 | Read a destination rule, or write one back | `DestinationRule`'s `FromStr` and `Display`, which the builder, the stack's profile format and `fcage` share |
 | Hand the caller a decision the network stack took, without the pump waiting on a reader | `netstack::report::Reporter`, whose `offer` never waits, and which the caller reads as `NetStackReports`, and for a refused UDP flow `netstack::udp::UdpTables::refuse`, which reports it once. `fcage`'s own lines have the CLI's `Reports`, a crate apart |
 | A prefix length's mask, whether a network holds an address, and the IPv4 address NAT64's well-known prefix embeds | `netstack::prefix` |
 | Which IPv4 address of the host's own does a test reach a server on through the network stack? | the testkit's `require::routable_v4` |
-| Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `truncated` |
+| Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `blocked`, `no_records`, `truncated` |
+| Which addresses does an answer give the name its question asked about, through its aliases? | `netstack::dns::answer_addresses` |
+| What spelling is a DNS name compared and reported in? | `netstack::dns::Query::name`, over the module's one name walk |
 | Which resolver does the host ask, as its `resolv.conf` names it? | `netstack::nameserver::host_upstream`, over `nameserver::first_nameserver` |
 | Declare what surrounds a layer's observer trait: a closure as an observer, a download's view of it, a run's, and the layer with a sink bound | `provision::observe::layer_observer!` |
 | Report a step over a wire, by number | `wire::wire_enum!` |

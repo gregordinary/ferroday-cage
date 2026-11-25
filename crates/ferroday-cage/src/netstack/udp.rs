@@ -54,9 +54,10 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use super::Plan;
 use super::nameserver::Nameserver;
+use super::pins::Pins;
 use super::policy::Transport;
-use super::pump::host_target;
-use super::report::{FlowAdmission, FlowRefusal, NetStackReport, Reporter};
+use super::pump::{Carried, Refused, host_target};
+use super::report::{FlowRefusal, NetStackReport, Reporter};
 use crate::mechanism::netns::socket_for;
 
 /// The most guest UDP flows tracked at once. A datagram that would open a
@@ -277,8 +278,8 @@ impl UdpTables {
     }
 
     /// Records that the stack refuses the flow from `guest` to `destination`
-    /// for `refusal`, and reports it where this is the flow's first datagram,
-    /// or its first since it sat idle for [`IDLE_TIMEOUT`].
+    /// as `refused` says, and reports it where this is the flow's first
+    /// datagram, or its first since it sat idle for [`IDLE_TIMEOUT`].
     ///
     /// The table holds [`MAX_FLOWS`] refused flows. A refusal past that takes
     /// the place of the one seen longest ago, which is reported again if the
@@ -287,17 +288,19 @@ impl UdpTables {
         &mut self,
         guest: IpEndpoint,
         destination: IpEndpoint,
-        refusal: FlowRefusal,
+        refused: Refused,
         now: Instant,
         reports: &mut Reporter,
     ) {
-        note_refusal(&mut self.refused, guest, destination, refusal, now, reports);
+        note_refusal(&mut self.refused, guest, destination, refused, now, reports);
     }
 
     /// Moves both directions of every flow: the guest's datagrams out to
     /// the host, and the host's replies back to the guest. A datagram to the
-    /// stack's nameserver goes to `nameserver` instead. A flow that opens, or
-    /// that the stack refuses, is reported to `reports`. Returns whether
+    /// stack's nameserver goes to `nameserver` instead, which decides its
+    /// question by the plan's rules, and a flow is decided by them and by the
+    /// names `nameserver` resolved. A flow that opens, or that the stack
+    /// refuses, is reported to `reports`, as a question is. Returns whether
     /// anything moved.
     pub(super) fn service(
         &mut self,
@@ -377,15 +380,32 @@ impl UdpTables {
                 // `host_target` refuses, so a datagram to it opens no flow.
                 if plan.serves(destination) {
                     if let Some(nameserver) = nameserver.as_deref_mut() {
-                        nameserver.query_datagram(guest, destination, &scratch[..len], now);
+                        let message = &scratch[..len];
+                        nameserver.query_datagram(
+                            guest,
+                            destination,
+                            message,
+                            &plan.policy,
+                            reports,
+                            now,
+                        );
                     }
                     continue;
                 }
-                match forward_out(flows, guest, destination, &scratch[..len], plan, now) {
-                    Forwarded::Opened(admission) => {
+                let pins = nameserver.as_deref().map(Nameserver::pins);
+                match forward_out(flows, guest, destination, &scratch[..len], plan, pins, now) {
+                    Forwarded::Opened(carried) => {
                         entry.flows += 1;
                         reports.offer(|| {
-                            NetStackReport::admitted(Transport::Udp, guest, destination, admission)
+                            let name = carried.name.as_deref();
+                            let admission = carried.admission;
+                            NetStackReport::admitted(
+                                Transport::Udp,
+                                guest,
+                                destination,
+                                name,
+                                admission,
+                            )
                         });
                     }
                     Forwarded::Refused(refusal) => {
@@ -535,16 +555,17 @@ enum Forwarded {
     Carried,
     /// It opened a flow for its endpoint pair, which the caller counts against
     /// the destination's port and reports, admitted as this says.
-    Opened(FlowAdmission),
-    /// The stack refuses its flow, for this reason.
-    Refused(FlowRefusal),
+    Opened(Carried),
+    /// The stack refuses its flow, as this says.
+    Refused(Refused),
     /// No flow could be opened for it on the host: it is dropped, and the next
     /// datagram of the pair tries again.
     Lost,
 }
 
 /// Sends one guest datagram out its host flow, opening a flow in `flows` if the
-/// endpoint pair is new and policy admits the destination.
+/// endpoint pair is new and policy admits the destination, by its address and
+/// the names `pins` holds at it.
 ///
 /// Takes the flow table rather than the whole of [`UdpTables`] so its caller can
 /// hold the shared scratch buffer across the call.
@@ -554,6 +575,7 @@ fn forward_out(
     destination: IpEndpoint,
     payload: &[u8],
     plan: &Plan,
+    pins: Option<&Pins>,
     now: Instant,
 ) -> Forwarded {
     if let Some(flow) = flows
@@ -567,12 +589,15 @@ fn forward_out(
     }
     // The destination is decided before the budget, so a refused one is
     // reported for its own reason whatever the table holds.
-    let carried = match host_target(Transport::Udp, destination, plan) {
+    let carried = match host_target(Transport::Udp, destination, plan, pins) {
         Ok(carried) => carried,
-        Err(refusal) => return Forwarded::Refused(refusal),
+        Err(refused) => return Forwarded::Refused(refused),
     };
     if flows.len() >= MAX_FLOWS {
-        return Forwarded::Refused(FlowRefusal::TooManyFlows);
+        return Forwarded::Refused(Refused {
+            refusal: FlowRefusal::TooManyFlows,
+            name: carried.name,
+        });
     }
     let Ok(host) = connect_host(carried.target) else {
         return Forwarded::Lost;
@@ -587,12 +612,13 @@ fn forward_out(
         last_active: now,
         dead: false,
     });
-    Forwarded::Opened(carried.admission)
+    Forwarded::Opened(carried)
 }
 
 /// Records in `refused` that the stack refuses the flow from `guest` to
-/// `destination`, and reports the refusal where the flow is new to the table
-/// or sat idle there for [`IDLE_TIMEOUT`]; see [`UdpTables::refuse`].
+/// `destination`, as `decision` says, and reports the refusal where the flow is
+/// new to the table or sat idle there for [`IDLE_TIMEOUT`]; see
+/// [`UdpTables::refuse`].
 ///
 /// Takes the table rather than the whole of [`UdpTables`] for the reason
 /// [`forward_out`] does.
@@ -600,7 +626,7 @@ fn note_refusal(
     refused: &mut Vec<RefusedFlow>,
     guest: IpEndpoint,
     destination: IpEndpoint,
-    refusal: FlowRefusal,
+    decision: Refused,
     now: Instant,
     reports: &mut Reporter,
 ) {
@@ -628,7 +654,10 @@ fn note_refusal(
         }
     };
     if news {
-        reports.offer(|| NetStackReport::refused(Transport::Udp, guest, destination, refusal));
+        reports.offer(|| {
+            let name = decision.name.as_deref();
+            NetStackReport::refused(Transport::Udp, guest, destination, name, decision.refusal)
+        });
     }
 }
 
@@ -647,6 +676,7 @@ fn connect_host(target: SocketAddr) -> Result<OwnedFd, Errno> {
 mod tests {
     use rustix::net::AddressFamily;
 
+    use super::super::report::FlowAdmission;
     use super::*;
 
     /// A connected socket pair standing in for a flow's host side: the first
@@ -960,8 +990,18 @@ mod tests {
             Transport::Udp,
             guest(port),
             destination,
+            None,
             FlowRefusal::GatewayUnmapped,
         )
+    }
+
+    /// The refusal of the gateway's unmapped port, to an address no name was
+    /// resolved to.
+    fn unnamed() -> Refused {
+        Refused {
+            refusal: FlowRefusal::GatewayUnmapped,
+            name: None,
+        }
     }
 
     #[test]
@@ -971,13 +1011,7 @@ mod tests {
         let destination = endpoint(10, 0, 2, 2, 9);
         let start = Instant::now();
         let refuse = |tables: &mut UdpTables, reporter: &mut Reporter, at| {
-            tables.refuse(
-                guest(40_000),
-                destination,
-                FlowRefusal::GatewayUnmapped,
-                at,
-                reporter,
-            );
+            tables.refuse(guest(40_000), destination, unnamed(), at, reporter);
         };
 
         // Datagrams closer together than the idle timeout keep the flow, so
@@ -1008,8 +1042,7 @@ mod tests {
         let ports = (first_port..).take(MAX_FLOWS + 1);
         for (offset, port) in ports.clone().enumerate() {
             let at = start + Duration::from_millis(u64::try_from(offset).unwrap());
-            let refusal = FlowRefusal::GatewayUnmapped;
-            tables.refuse(guest(port), destination, refusal, at, &mut reporter);
+            tables.refuse(guest(port), destination, unnamed(), at, &mut reporter);
         }
         assert_eq!(tables.refused.len(), MAX_FLOWS);
         assert_eq!(reported(&reports).len(), MAX_FLOWS + 1);
@@ -1018,8 +1051,7 @@ mod tests {
         // second is still held.
         let later = start + Duration::from_secs(1);
         for port in [first_port + 1, first_port] {
-            let refusal = FlowRefusal::GatewayUnmapped;
-            tables.refuse(guest(port), destination, refusal, later, &mut reporter);
+            tables.refuse(guest(port), destination, unnamed(), later, &mut reporter);
         }
         assert_eq!(reported(&reports), [unmapped(first_port, destination)]);
     }
@@ -1040,26 +1072,60 @@ mod tests {
 
         let first_port = 20_000;
         for guest_port in (first_port..).take(MAX_FLOWS) {
-            let forwarded = forward_out(&mut flows, guest(guest_port), gateway, b"x", &plan, now);
+            let forwarded = forward_out(
+                &mut flows,
+                guest(guest_port),
+                gateway,
+                b"x",
+                &plan,
+                None,
+                now,
+            );
             assert!(
-                matches!(forwarded, Forwarded::Opened(FlowAdmission::HostLoopback)),
+                matches!(
+                    forwarded,
+                    Forwarded::Opened(Carried {
+                        admission: FlowAdmission::HostLoopback,
+                        ..
+                    })
+                ),
                 "{forwarded:?}"
             );
         }
-        let again = forward_out(&mut flows, guest(first_port), gateway, b"x", &plan, now);
+        let again = forward_out(
+            &mut flows,
+            guest(first_port),
+            gateway,
+            b"x",
+            &plan,
+            None,
+            now,
+        );
         assert!(matches!(again, Forwarded::Carried), "{again:?}");
 
         // One past the budget is refused for it, and a destination refused for
         // a reason of its own is refused for that reason, budget or none.
-        let past = forward_out(&mut flows, guest(30_000), gateway, b"x", &plan, now);
+        let past = forward_out(&mut flows, guest(30_000), gateway, b"x", &plan, None, now);
         assert!(
-            matches!(past, Forwarded::Refused(FlowRefusal::TooManyFlows)),
+            matches!(
+                past,
+                Forwarded::Refused(Refused {
+                    refusal: FlowRefusal::TooManyFlows,
+                    ..
+                })
+            ),
             "{past:?}"
         );
         let unmapped = endpoint(10, 0, 2, 2, 9);
-        let refused = forward_out(&mut flows, guest(30_000), unmapped, b"x", &plan, now);
+        let refused = forward_out(&mut flows, guest(30_000), unmapped, b"x", &plan, None, now);
         assert!(
-            matches!(refused, Forwarded::Refused(FlowRefusal::GatewayUnmapped)),
+            matches!(
+                refused,
+                Forwarded::Refused(Refused {
+                    refusal: FlowRefusal::GatewayUnmapped,
+                    ..
+                })
+            ),
             "{refused:?}"
         );
     }
