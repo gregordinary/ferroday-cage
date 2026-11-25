@@ -492,6 +492,11 @@ consumer upgrading can skip it.
   recorded the path in `lib/apk/db/installed` as it stood, so the archive's text
   after the newline read back as fields of the record, or as a record of its
   own for a package the root does not hold.
+- The Alpine provisioner records a package's size in `lib/apk/db/installed` as
+  the index stated it, rather than as the length of the file a mirror served.
+  The signature segment is covered by no digest, so a package served with
+  another signature recorded another size, and two bootstraps of one plan
+  could differ.
 
 ### Internal
 

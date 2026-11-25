@@ -1660,7 +1660,14 @@ struct Acquired {
     /// The package's entry in the cache, which the extraction opens again and
     /// the errors name.
     path: PathBuf,
-    /// The file's length, which the record states as `S:`.
+    /// The size the record states as `S:`: the index's, which the plan
+    /// records, or the file's length where the index stated none.
+    ///
+    /// The index's rather than the file's because the two can differ for the
+    /// one package. The signature segment is covered by no digest, so a mirror
+    /// can serve another signature over the same control and data segments,
+    /// and the package still answers the plan. Recording the index's, a root
+    /// built twice from one plan records one size whichever mirror served it.
     size: u64,
 }
 
@@ -2034,10 +2041,13 @@ fn read_acquired(
     architecture: &str,
 ) -> Result<(Acquired, File), AlpineError> {
     let subject = planned.file_name();
-    let size = file
-        .metadata()
-        .map_err(AlpineError::at("measuring a package", path))?
-        .len();
+    let size = match planned.size {
+        Some(size) => size,
+        None => file
+            .metadata()
+            .map_err(AlpineError::at("measuring a package", path))?
+            .len(),
+    };
     let package = apk::read_package(
         &subject,
         &mut apk::Segments::new(&mut file),
@@ -3955,6 +3965,32 @@ mod tests {
         )
         .expect("the package answers the plan entry");
         acquired
+    }
+
+    #[test]
+    fn the_recorded_size_is_the_index_s_and_not_the_file_s() {
+        // The signature segment is covered by no digest, so a package served
+        // with a longer signature still answers the plan; what the database
+        // records is the size the index stated, whichever file was served.
+        let scratch = Scratch::new("alpine-recorded-size");
+        let empty = ferroday_cage_testkit::tar::Tar::new().finish();
+        let container = container_of(
+            "pkgname = tool\npkgver = 1-r0\narch = x86_64\nsize = 1\n",
+            &empty,
+        );
+        let mut planned = planned_from(&container, "x86_64");
+        let path = scratch.join(planned.file_name());
+        cache::seed(&path, &container);
+
+        planned.size = Some(container.len() as u64 + 632);
+        assert_eq!(
+            acquired_at(&path, &planned).size,
+            container.len() as u64 + 632
+        );
+
+        // Where the index stated none, the file's own length is what there is.
+        planned.size = None;
+        assert_eq!(acquired_at(&path, &planned).size, container.len() as u64);
     }
 
     #[test]
