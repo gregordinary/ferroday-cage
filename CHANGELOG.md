@@ -386,6 +386,13 @@ consumer upgrading can skip it.
   matched a thousand builds through an atom tens of kilobytes long, made a
   resolution's refusals name about a gigabyte. A conflict shares its blocker's
   text with the others the blocker makes.
+- Extraction gives a directory reached by more than one spelling, through a
+  link such as a merged-`/usr` root's `lib`, the metadata of the last entry
+  that describes it, as GNU `tar` does, and the same metadata on every run. It
+  kept one record per spelling, so a directory a file implied through one
+  spelling could take `0755` after an entry stated it `0700` through the other,
+  and two entries under two spellings ended in whichever order a hash map
+  chose.
 
 ### Internal
 

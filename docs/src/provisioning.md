@@ -769,7 +769,10 @@ filesystem:
   FIFOs are extracted. Of the extended attributes an archive records, only
   the POSIX access control lists are applied, as below.
 - A later entry for the same path replaces the earlier one, matching tar's
-  behavior. Sparse members fail with `ProvisionError::EntryUnsupported`,
+  behavior. For a directory that holds whatever path reached it: an entry for
+  `usr/lib/private/` and a later one for `lib/private/`, where `lib` links to
+  `usr/lib`, describe one directory, and the later one's metadata is what it
+  ends with. A directory no entry describes is `0755`. Sparse members fail with `ProvisionError::EntryUnsupported`,
   whichever GNU format wrote them. That is the old `S` type, and the pax
   formats 0.0, 0.1 and 1.0, whose headers claim a regular file. Multi-volume
   members fail the same way.

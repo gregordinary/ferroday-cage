@@ -110,6 +110,63 @@ pub(crate) enum Placement {
     Skip,
 }
 
+/// The metadata the deferred pass gives directories, keyed by what each
+/// directory is rather than by how a path spelled it.
+///
+/// One directory has as many spellings as the tree has links to it on the
+/// way, and a merged-`/usr` root is laid down through both `lib` and
+/// `usr/lib`. Keyed by spelling, two records for one directory both applied,
+/// in an order the map chose, and one implied by a child's path could undo
+/// one an entry stated. Keyed by device and inode, a later entry for the
+/// directory replaces an earlier one, under whichever spelling, as every other
+/// extractor reads the archive. The directory is reopened by the spelling it
+/// was last reached by, and its identity is checked there before anything is
+/// applied, so metadata never lands on what took the directory's place.
+#[derive(Default)]
+struct DeferredDirs {
+    dirs: HashMap<(u64, u64), Deferred>,
+    /// The next record's place in the order records were made.
+    next: u64,
+}
+
+/// One directory's deferred metadata.
+struct Deferred {
+    /// The path the directory was last reached by, slash-joined.
+    path: Vec<u8>,
+    meta: DirMeta,
+    /// When the record was last made, which orders directories of one depth
+    /// the same way on every run.
+    order: u64,
+}
+
+impl DeferredDirs {
+    /// Records `meta` as what an entry states of the directory `stat`
+    /// describes, at `path`, in place of anything recorded of it before.
+    fn state(&mut self, stat: &rustix::fs::Stat, path: Vec<u8>, meta: DirMeta) {
+        let order = self.next;
+        self.next += 1;
+        self.dirs
+            .insert(identity(stat), Deferred { path, meta, order });
+    }
+
+    /// Records `meta` of the directory `stat` describes, at `path`, where
+    /// nothing has stated it: a directory carried up from a layered
+    /// extraction's base keeps the base's metadata until an entry states its
+    /// own.
+    fn carry(&mut self, stat: &rustix::fs::Stat, path: Vec<u8>, meta: DirMeta) {
+        let order = self.next;
+        if let std::collections::hash_map::Entry::Vacant(vacant) = self.dirs.entry(identity(stat)) {
+            vacant.insert(Deferred { path, meta, order });
+            self.next += 1;
+        }
+    }
+}
+
+/// A directory's identity: its device and inode.
+fn identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev, stat.st_ino)
+}
+
 /// Metadata of a directory entry, applied after all entries have been
 /// extracted so that a read-only directory cannot block the extraction of
 /// its own contents.
@@ -302,12 +359,12 @@ pub(crate) struct Extraction {
     root_fd: OwnedFd,
     /// The base the root is an overlay upper over, where it is one.
     lower_fd: Option<OwnedFd>,
-    /// Deferred directory metadata, keyed by slash-joined path. Implied
-    /// directories (created for a child before their own entry appears, or
-    /// never described at all) default to 0755 with their creation time. A
-    /// later directory entry for a path replaces an earlier one, so the
-    /// last archive to describe a directory wins.
-    dir_meta: HashMap<Vec<u8>, DirMeta>,
+    /// Deferred directory metadata, keyed by the directory itself. A later
+    /// directory entry for a directory replaces an earlier one, so the last
+    /// archive to describe a directory wins. Implied directories (created for
+    /// a child before their own entry appears, or never described at all) are
+    /// given 0755 when they are made, and have no record.
+    dir_meta: DeferredDirs,
     /// The root directory's own metadata, applied by [`finalize`](Self::finalize)
     /// once every entry is written. `None` until something states it.
     root_meta: Option<DirMeta>,
@@ -336,7 +393,7 @@ impl Extraction {
         Ok(Extraction {
             root_fd: open_root(root)?,
             lower_fd: None,
-            dir_meta: HashMap::new(),
+            dir_meta: DeferredDirs::default(),
             root_meta: None,
             root_mode_fixed: false,
             under: None,
@@ -668,9 +725,9 @@ struct Parent {
 /// resolution then goes where the mounted overlay would.
 ///
 /// A directory created here is a parent the archive implied but never named,
-/// and gets the conventional `0755`, or, where it stands in for one of the
-/// base's, the base's own mode and modification time. Both are recorded in
-/// `dir_meta`, the deferred-metadata map the caller applies once every entry is
+/// and gets the conventional `0755` at once, or, where it stands in for one of
+/// the base's, the base's own mode and modification time. Those are recorded in
+/// `dir_meta`, the deferred metadata the caller applies once every entry is
 /// written, rather than applied: the parent's contents are still to be
 /// created, and a mode denying its owner write or search would refuse them. It
 /// is created `0700` until they are.
@@ -678,7 +735,7 @@ fn open_parent(
     tree: Tree<'_>,
     components: &[Vec<u8>],
     entry_path: &[u8],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<Parent, ProvisionError> {
     let parent = &components[..components.len() - 1];
     let mut lower = None;
@@ -699,31 +756,38 @@ fn open_parent(
     Ok(Parent { dir, lower })
 }
 
-/// Records the mode of a directory a chain walk made for the deferred pass.
+/// Gives a directory a chain walk made its mode, or records it for the
+/// deferred pass.
 ///
-/// An implied directory gets [`IMPLIED_DIR_MODE`]. One carried up from a
-/// layered extraction's base keeps the base's mode and modification time,
-/// which is what the merged view showed before the root held it; the deferred
-/// pass restores the time last, since a directory's time moves as its contents
-/// are written. The base's owner and group, where they are not the ones the
-/// carry gave it, are recorded in `owed` for the caller to give once its
-/// writes are done.
+/// An implied directory gets [`IMPLIED_DIR_MODE`] at once, through the
+/// descriptor the walk made it with: it leaves the owner writing and searching
+/// the directory, so there is nothing to defer, and an entry that names the
+/// directory later records its own. One carried up from a layered extraction's
+/// base keeps the base's mode and modification time, which is what the merged
+/// view showed before the root held it, and those wait for the deferred pass:
+/// the base's mode may refuse the writes still to come, and a directory's time
+/// moves as its contents are written. The base's owner and group, where they
+/// are not the ones the carry gave it, are recorded in `owed` for the caller to
+/// give once its writes are done.
 fn place_made(
     made: Made<'_>,
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
     owed: &RefCell<Vec<Owed>>,
 ) -> Result<(), Errno> {
     if let Some(record) = containment::owed(&made)? {
         owed.borrow_mut().push(record);
     }
-    let meta = match made.copied {
-        Some(stat) => DirMeta::of(
-            stat.st_mode & 0o7777,
-            Some(containment::modified(stat).tv_sec),
+    match made.copied {
+        Some(stat) => dir_meta.carry(
+            &rustix::fs::fstat(made.dir)?,
+            made.path.to_vec(),
+            DirMeta::of(
+                stat.st_mode & 0o7777,
+                Some(containment::modified(stat).tv_sec),
+            ),
         ),
-        None => DirMeta::of(IMPLIED_DIR_MODE, None),
-    };
-    dir_meta.entry(made.path.to_vec()).or_insert(meta);
+        None => rustix::fs::fchmod(made.dir, Mode::from_raw_mode(IMPLIED_DIR_MODE))?,
+    }
     Ok(())
 }
 
@@ -766,7 +830,7 @@ fn prepare_dir(
     tree: Tree<'_>,
     components: &[Vec<u8>],
     entry_path: &[u8],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let Some(base) = tree.lower else {
         return Ok(());
@@ -938,7 +1002,7 @@ fn extract_file<R: Read>(
     archive: &mut TarReader<R>,
     entry: &Entry,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
@@ -1000,7 +1064,7 @@ fn extract_dir(
     tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
@@ -1033,7 +1097,11 @@ fn extract_dir(
         }
     }
 
-    dir_meta.insert(join(components), DirMeta::of_entry(entry));
+    let made =
+        rustix::fs::statat(&parent.dir, &leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| {
+            ProvisionError::io("inspecting", bytes_to_path(&entry.path), errno.into())
+        })?;
+    dir_meta.state(&made, join(components), DirMeta::of_entry(entry));
     Ok(())
 }
 
@@ -1042,7 +1110,7 @@ fn extract_symlink(
     tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     if entry.link_target.is_empty() {
         return Err(entry_refused(&entry.path, "the symlink target is empty"));
@@ -1093,7 +1161,7 @@ fn extract_hardlink(
     tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     // The context is the entry's own path — the archive member at fault — while
     // the noun names which of its two paths was rejected.
@@ -1131,7 +1199,7 @@ fn extract_fifo(
     tree: Tree<'_>,
     entry: &Entry,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
@@ -1225,14 +1293,23 @@ fn remove_at(parent: &OwnedFd, leaf: &CString, entry_path: &[u8]) -> Result<(), 
 /// lands only after the directory's contents are complete.
 fn apply_dir_meta(
     root: BorrowedFd<'_>,
-    dir_meta: HashMap<Vec<u8>, DirMeta>,
+    dir_meta: DeferredDirs,
     lists: &ListIds<'_>,
 ) -> Result<(), ProvisionError> {
-    let mut entries: Vec<(Vec<u8>, DirMeta)> = dir_meta.into_iter().collect();
-    entries.sort_by_key(|(path, _)| std::cmp::Reverse(depth(path)));
-    for (path, meta) in entries {
+    let mut entries: Vec<((u64, u64), Deferred)> = dir_meta.dirs.into_iter().collect();
+    entries.sort_by_key(|(_, deferred)| (std::cmp::Reverse(depth(&deferred.path)), deferred.order));
+    for (id, Deferred { path, meta, .. }) in entries {
         let components: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
-        let fd = match open_dir_meta_fd(root, &components) {
+        let opened = open_dir_meta_fd(root, &components).and_then(|fd| {
+            // Reached by the path it was last reached by, and only where that
+            // is still the directory: one a later entry put in its place has
+            // metadata of its own, or none.
+            match identity(&rustix::fs::fstat(&fd)?) == id {
+                true => Ok(fd),
+                false => Err(Errno::NOENT),
+            }
+        });
+        let fd = match opened {
             Ok(fd) => fd,
             // The directory was removed by a later entry (NOENT), replaced by a
             // non-directory (NOTDIR), or replaced by a symlink where a
@@ -1495,7 +1572,7 @@ pub(crate) fn overlay_tree(
         owed: &owed,
         lists: &lists,
     };
-    let mut dir_meta = HashMap::new();
+    let mut dir_meta = DeferredDirs::default();
     overlay_dir(tree, source_fd, source, &mut dir_meta)?;
     apply_dir_meta(root_fd.as_fd(), dir_meta, &lists)?;
     match over {
@@ -1541,7 +1618,7 @@ fn overlay_dir(
     tree: Tree<'_>,
     source: OwnedFd,
     source_path: &Path,
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let mut components: Vec<Vec<u8>> = Vec::new();
     let mut stack = vec![overlay_level(source, source_path.to_path_buf())?];
@@ -1645,7 +1722,7 @@ fn overlay_mkdir(
     tree: Tree<'_>,
     mode: u32,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let path = join(components);
     let parent = open_parent(tree, components, &path, dir_meta)?;
@@ -1681,7 +1758,11 @@ fn overlay_mkdir(
         }
     };
     if created {
-        dir_meta.insert(path, DirMeta::of(mode, None));
+        let made =
+            rustix::fs::statat(&parent.dir, &leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| {
+                ProvisionError::io("inspecting", bytes_to_path(&path), errno.into())
+            })?;
+        dir_meta.state(&made, path, DirMeta::of(mode, None));
     }
     Ok(())
 }
@@ -1697,7 +1778,7 @@ fn overlay_file(
     entry: &Path,
     mode: u32,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let path = join(components);
     let parent = open_parent(tree, components, &path, dir_meta)?;
@@ -1742,7 +1823,7 @@ fn overlay_symlink(
     tree: Tree<'_>,
     target: &CStr,
     components: &[Vec<u8>],
-    dir_meta: &mut HashMap<Vec<u8>, DirMeta>,
+    dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     let path = join(components);
     let parent = open_parent(tree, components, &path, dir_meta)?;
@@ -2148,6 +2229,65 @@ mod mode_tests {
             let found = std::fs::symlink_metadata(root.join(name)).expect("the pipe is laid");
             assert!(found.file_type().is_fifo(), "{name}");
             assert_eq!(found.permissions().mode() & 0o7777, mode, "{name}");
+        }
+    }
+}
+
+// Which metadata a directory reached by more than one spelling ends with.
+#[cfg(test)]
+mod alias_tests {
+    use super::{Placement, TarReader, extract_archive};
+    use crate::scratch::Scratch;
+    use ferroday_cage_testkit::tar::Tar;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn extracted(tar: &Tar, name: &str) -> Scratch {
+        let root = Scratch::for_test("extract", name);
+        extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect("the archive extracts");
+        root
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .expect("the directory is there")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn a_directory_implied_through_an_alias_keeps_the_mode_an_entry_states() {
+        // `lib/private` is made for the file beneath it, through the link, and
+        // `usr/lib/private` then states the directory private. GNU tar ends
+        // with 0700, and so does this: the implied directory's own mode was
+        // given when it was made, and the entry is the last word.
+        let mut tar = Tar::new();
+        tar.dir("usr/", 0o755)
+            .dir("usr/lib/", 0o755)
+            .symlink("lib", "usr/lib")
+            .file("lib/private/key", 0o600, b"secret")
+            .dir("usr/lib/private/", 0o700);
+        let root = extracted(&tar, "alias-implied");
+        assert_eq!(mode_of(&root.join("usr/lib/private")), 0o700);
+    }
+
+    #[test]
+    fn the_last_entry_for_a_directory_wins_under_either_spelling() {
+        // Two entries for one directory, through a link, each with its own
+        // mode: the later is what GNU tar leaves, on every run.
+        for run in 0..8 {
+            let mut tar = Tar::new();
+            tar.dir("x/", 0o755)
+                .symlink("y", "x")
+                .dir("x/d/", 0o700)
+                .dir("y/d/", 0o750);
+            let root = extracted(&tar, &format!("alias-last-{run}"));
+            assert_eq!(mode_of(&root.join("x/d")), 0o750, "run {run}");
         }
     }
 }
