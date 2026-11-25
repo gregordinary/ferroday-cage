@@ -1084,12 +1084,14 @@ impl Cgroup {
         let cpu = read_text(&self.dir, "cpu.stat").unwrap_or_default();
         let micros = |key: &str| keyed(&cpu, key).map(Duration::from_micros);
         let events = read_text(&self.dir, "memory.events").unwrap_or_default();
+        let pids_events = read_text(&self.dir, "pids.events").unwrap_or_default();
         CgroupUsage {
             user_time: micros("user_usec"),
             system_time: micros("system_usec"),
             peak_memory_bytes: read_number(&self.dir, "memory.peak"),
             peak_processes: read_number(&self.dir, "pids.peak"),
             oom_kills: keyed(&events, "oom_kill"),
+            refused_processes: keyed(&pids_events, "max"),
         }
     }
 }
@@ -1136,6 +1138,7 @@ pub(crate) struct CgroupUsage {
     pub(crate) peak_memory_bytes: Option<u64>,
     pub(crate) peak_processes: Option<u64>,
     pub(crate) oom_kills: Option<u64>,
+    pub(crate) refused_processes: Option<u64>,
 }
 
 /// Writes `+controller` to `parent`'s `cgroup.subtree_control`.
@@ -1154,8 +1157,8 @@ fn open_write(dir: &OwnedFd, file: &str) -> Result<OwnedFd, Errno> {
     )
 }
 
-/// The most a file of a cgroup's interface is read to: `cpu.stat` and
-/// `memory.events` are a few hundred bytes.
+/// The most a file of a cgroup's interface is read to: `cpu.stat`,
+/// `memory.events` and `pids.events` are a few hundred bytes.
 const MAX_INTERFACE_FILE: u64 = 64 << 10;
 
 /// Reads a file of a cgroup's interface whole.

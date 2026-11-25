@@ -132,6 +132,9 @@ consumer upgrading can skip it.
   true`, and `fcage --seccomp-relax` joins the curated policy the flags or a
   profile set. A relaxation of rules that do not start from the roster, or of
   a syscall it holds no entry for, is refused at build.
+- `ResourceUsage::cgroup_refused_processes` counts the times the sandbox's
+  cgroup refused the tree a process or thread at its `pids-max`, from
+  `pids.events`. The `agent-tools` example prints it.
 - `fcage --host-report` prints what the host offers a sandbox, as TOML: user
   namespaces, the Landlock ABI, seccomp, a procfs of the sandbox's own, range
   maps, this process's cgroup, and a security module's confinement, each a

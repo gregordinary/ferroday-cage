@@ -625,6 +625,7 @@ let output = Cage::builder()
 if let Some(usage) = output.usage {
     println!("peak memory of the whole tree: {:?}", usage.cgroup_peak_memory_bytes);
     println!("OOM kills: {:?}", usage.cgroup_oom_kills);
+    println!("processes refused at pids-max: {:?}", usage.cgroup_refused_processes);
 }
 # Ok(())
 # }

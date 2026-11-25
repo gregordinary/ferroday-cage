@@ -188,10 +188,14 @@ fn a_tree_is_held_to_its_process_limit_and_accounted_whole() {
         .cgroup_peak_processes
         .expect("the pids controller is offered");
     assert!(peak <= 8, "the tree held {peak} processes: {usage:?}");
+    // Twenty-one wanted against eight allowed; how many were refused depends
+    // on how many sleepers ended before the loop did, so the count is held to
+    // being one at all.
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("fork")
-            || usage.cgroup_peak_processes == Some(8),
-        "the limit refused forks: {output:?}",
+        usage
+            .cgroup_refused_processes
+            .is_some_and(|refused| refused >= 1),
+        "the limit refused forks and counted them: {output:?}",
     );
     assert!(usage.cgroup_user_time.is_some(), "{usage:?}");
     assert!(

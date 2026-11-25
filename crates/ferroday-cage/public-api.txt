@@ -3315,6 +3315,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ResolvedSyscallRefu
 pub ferroday_cage::ResourceUsage::cgroup_oom_kills: core::option::Option<u64>
 pub ferroday_cage::ResourceUsage::cgroup_peak_memory_bytes: core::option::Option<u64>
 pub ferroday_cage::ResourceUsage::cgroup_peak_processes: core::option::Option<u64>
+pub ferroday_cage::ResourceUsage::cgroup_refused_processes: core::option::Option<u64>
 pub ferroday_cage::ResourceUsage::cgroup_system_time: core::option::Option<core::time::Duration>
 pub ferroday_cage::ResourceUsage::cgroup_user_time: core::option::Option<core::time::Duration>
 pub ferroday_cage::ResourceUsage::peak_rss_bytes: core::option::Option<u64>

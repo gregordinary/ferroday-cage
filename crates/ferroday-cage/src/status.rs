@@ -262,6 +262,12 @@ pub struct ResourceUsage {
     /// most likely killed for memory. `None` where the cgroup has no memory
     /// controller, or without a cgroup.
     pub cgroup_oom_kills: Option<u64>,
+    /// How many times the tree was refused a new process or thread because the
+    /// cgroup held as many as its [`PidsMax`](crate::CgroupLimit::PidsMax)
+    /// allows: `pids.events`' `max`. A process the command started saw each as
+    /// `fork` or `clone` failing with `EAGAIN`. `None` where the cgroup has no
+    /// pids controller, or without a cgroup.
+    pub cgroup_refused_processes: Option<u64>,
 }
 
 impl ResourceUsage {
@@ -278,6 +284,7 @@ impl ResourceUsage {
         cgroup_peak_memory_bytes: None,
         cgroup_peak_processes: None,
         cgroup_oom_kills: None,
+        cgroup_refused_processes: None,
     };
 
     /// What the supervisor read for the processes it collected, before
@@ -315,6 +322,7 @@ impl ResourceUsage {
             peak_memory_bytes: cgroup_peak_memory_bytes,
             peak_processes: cgroup_peak_processes,
             oom_kills: cgroup_oom_kills,
+            refused_processes: cgroup_refused_processes,
         } = tree;
         // The supervisor reads no cgroup, so its report carries none of the
         // tree's figures.
@@ -327,6 +335,7 @@ impl ResourceUsage {
             cgroup_peak_memory_bytes: _,
             cgroup_peak_processes: _,
             cgroup_oom_kills: _,
+            cgroup_refused_processes: _,
         } = processes.unwrap_or(ResourceUsage::NONE);
         let joined = ResourceUsage {
             user_time,
@@ -337,6 +346,7 @@ impl ResourceUsage {
             cgroup_peak_memory_bytes,
             cgroup_peak_processes,
             cgroup_oom_kills,
+            cgroup_refused_processes,
         };
         (joined != ResourceUsage::NONE).then_some(joined)
     }

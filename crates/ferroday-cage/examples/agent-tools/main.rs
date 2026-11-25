@@ -1021,6 +1021,13 @@ fn report(status: ExitStatus, usage: Option<ResourceUsage>) {
             eprintln!("agent-tools: the memory limit ended {kills} processes of the tree")
         }
     }
+    match usage.cgroup_refused_processes {
+        None | Some(0) => {}
+        Some(1) => eprintln!("agent-tools: the process limit refused the tree a process once"),
+        Some(refused) => {
+            eprintln!("agent-tools: the process limit refused the tree a process {refused} times")
+        }
+    }
 }
 
 /// The documented command lines, and the profile beside this file, held to the
