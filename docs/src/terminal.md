@@ -385,16 +385,18 @@ the environment, so four decisions belong to the program driving the session:
   returns. Those matter only to a program that provisions while it relays a
   session.
 
-  Nothing restores the mask, deliberately: a relay that unblocked on the way out
-  would leave a window in which the signals it exists to handle were fatal
+  The relay restores no mask, deliberately: a relay that unblocked on the way
+  out would leave a window in which the signals it exists to handle were fatal
   again, and a program that relays one session usually relays another. What
   follows from that is the handle's lifetime. Dropping it closes the descriptor
   and unblocks nothing, so the eight signals stay blocked with nowhere to be
   read from and the process then ignores `SIGINT`, `SIGTERM`, `SIGHUP` and
   `SIGQUIT` entirely — a shell's `^C` and a supervisor's `SIGTERM` both do
-  nothing, and only `SIGKILL` is left. For `fcage` the handle lives to process
-  exit; a longer-lived program holds it for the program's life, which is also
-  the one-per-process shape the type asks for.
+  nothing, and only `SIGKILL` is left. A longer-lived program holds the handle
+  for the program's life, which is also the one-per-process shape the type asks
+  for. A program done relaying gives the signals back with `Signals::release`,
+  which restores the mask the install found. `fcage` does that as soon as its
+  one session ends, so a `^C` while it winds down still ends it.
 
   That permanence belongs to a *successful* install. A call that blocks the set
   and then cannot open the descriptor — descriptor exhaustion, a seccomp policy

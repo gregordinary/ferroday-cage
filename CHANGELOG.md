@@ -230,6 +230,11 @@ consumer upgrading can skip it.
   `--netstack-ipv6`, `--netstack-nameserver` and `--netstack-no-host-loopback`.
   Without `--netstack` the table is unused, and `fcage` says so.
   `--restricted-profile` refuses the table.
+- `relay::Signals::release` gives a program done relaying its signals back:
+  it restores the signal mask the install found and closes the descriptor.
+  `fcage` releases them as soon as its terminal session ends, or fails to
+  start, where it left them blocked with nothing reading them, so a `^C` or a
+  `SIGTERM` while it wound down did nothing.
 
 ### Changed
 

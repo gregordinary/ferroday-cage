@@ -60,7 +60,7 @@ use ferroday_cage::provision::alpine::{Alpine, KeySet as AlpineKeySet};
 use ferroday_cage::provision::debian::{Debian, Priority, Repository};
 use ferroday_cage::provision::gentoo::Gentoo;
 use ferroday_cage::provision::{Interrupt, Provision, ProvisionError, Provisioned, Tarball};
-use ferroday_cage::relay::{Escalation, RelayError, Signals};
+use ferroday_cage::relay::{Escalation, RelayError};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
     ExitStatus, FsAccess, Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount,
@@ -6245,7 +6245,7 @@ fn run_on_a_terminal(
     timeout: Option<Duration>,
     kill_after: Duration,
 ) -> ExitCode {
-    let signals = match Signals::install() {
+    let signals = match terminal::HeldSignals::install() {
         Ok(signals) => signals,
         Err(error) => return conclude(Err(error.into())),
     };
@@ -6336,7 +6336,7 @@ fn run_pending(
     // behind the relay's back. Nothing is allocated for a run without a
     // terminal.
     let signals = if terminal {
-        match Signals::install() {
+        match terminal::HeldSignals::install() {
             Ok(signals) => Some(signals),
             Err(error) => return finish(relay, Err(error.into())),
         }
@@ -6575,7 +6575,7 @@ fn run_restricted(mut options: Options) -> ExitCode {
         // The restriction's terminal comes from the host's own /dev/ptmx, the
         // one its command sees, so the fallback gets the same interactive
         // story a cage does.
-        let signals = match Signals::install() {
+        let signals = match terminal::HeldSignals::install() {
             Ok(signals) => signals,
             Err(error) => return conclude(Err(error.into())),
         };

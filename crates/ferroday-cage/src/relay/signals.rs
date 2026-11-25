@@ -89,18 +89,18 @@ pub(super) const RELAYED: [Signal; 8] = [
 ///
 /// # Keep the handle for as long as the program should answer a signal
 ///
-/// Dropping it closes the descriptor and does not unblock anything, because
-/// nothing here restores the mask. From that point the eight signals are
-/// blocked with nowhere to be read from, so the process ignores them entirely:
-/// a shell's `^C` and a supervisor's `SIGTERM` both do nothing, and `SIGKILL` is
-/// what is left.
+/// Dropping it closes the descriptor and does not unblock anything. From that
+/// point the eight signals are blocked with nowhere to be read from, so the
+/// process ignores them entirely: a shell's `^C` and a supervisor's `SIGTERM`
+/// both do nothing, and `SIGKILL` is what is left.
 ///
-/// For a program whose whole job is one session — `fcage --terminal` is the
-/// worked example — the handle lives to process exit and the question does not
-/// arise. For a library consumer relaying a session inside a longer-lived
-/// program, which is the consumer this module was extracted for, holding the
-/// handle for the program's life is the shape to build: it is the same handle
-/// every later session needs, and one process wants exactly one.
+/// For a library consumer relaying sessions inside a longer-lived program,
+/// which is the consumer this module was extracted for, holding the handle for
+/// the program's life is the shape to build: it is the same handle every later
+/// session needs, and one process wants exactly one. A program that is done
+/// relaying, as `fcage --terminal` is once its one session ends, gives the
+/// signals back with [`release`](Self::release) instead, so a `^C` while it
+/// winds down still ends it.
 ///
 /// # What it costs
 ///
@@ -124,6 +124,9 @@ pub(super) const RELAYED: [Signal; 8] = [
 pub struct Signals {
     /// The `signalfd`. Non-blocking, so draining it never stalls the loop.
     fd: OwnedFd,
+    /// The signal mask the installing thread ran under before, which
+    /// [`release`](Self::release) restores.
+    previous: SigSet,
 }
 
 impl Signals {
@@ -184,7 +187,36 @@ impl Signals {
             let _ = unsafe { sys::sigprocmask(How::SetMask, Some(&previous)) };
             RelayError::io("opening the signal descriptor", io::Error::from(errno))
         })?;
-        Ok(Signals { fd })
+        Ok(Signals { fd, previous })
+    }
+
+    /// Gives the relayed signals back to the process: discards those that
+    /// arrived since the relay last read them, restores the mask the
+    /// installing thread had before [`install`](Self::install), and closes the
+    /// descriptor.
+    ///
+    /// For a program done relaying. From here a signal takes the action it took
+    /// before the install, so a `^C` or a `SIGTERM` while the program winds
+    /// down ends it rather than being ignored. Call it on the thread that
+    /// installed, whose mask it restores. A thread started since keeps the
+    /// blocked mask it inherited, so a process-directed signal is delivered to
+    /// the installing thread.
+    ///
+    /// The discarded signals arrived after the session they were for had
+    /// ended: a terminal resized, or a `^C` pressed as the command exited,
+    /// which the program's own exit already answers.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::Io`] where the mask cannot be restored; the signals then
+    /// stay blocked, as they would were the handle dropped.
+    pub fn release(self) -> Result<(), RelayError> {
+        while self.next()?.is_some() {}
+        // SAFETY: `previous` is a field of exactly the type the call takes,
+        // live for the call, and is the mask the installing thread ran under.
+        unsafe { sys::sigprocmask(How::SetMask, Some(&self.previous)) }
+            .map(drop)
+            .map_err(RelayError::at("restoring the signal mask"))
     }
 
     /// The descriptor, for the relay's poll set.
@@ -537,6 +569,35 @@ mod tests {
             }
         }
 
+        set_mask_here(How::Unblock, &mine);
+    }
+
+    #[test]
+    fn a_release_gives_back_the_mask_the_install_found() {
+        // A program done relaying takes its signals back, so a ^C while it
+        // winds down ends it; a signal it had blocked itself stays blocked.
+        let mut mine = SigSet::empty();
+        mine.insert(Signal::INT);
+        set_mask_here(How::Block, &mine);
+        let signals = Signals::install().expect("the signal descriptor opens");
+        assert!(
+            mask_here().contains(Signal::TERM),
+            "the install blocks the set"
+        );
+        // One that arrived after the session, discarded rather than delivered.
+        raise_here(Signal::WINCH);
+        signals.release().expect("the mask is restored");
+
+        let after = mask_here();
+        assert!(
+            after.contains(Signal::INT),
+            "the caller's own block was lifted"
+        );
+        for signal in RELAYED {
+            if signal != Signal::INT {
+                assert!(!after.contains(signal), "{signal:?} is still blocked");
+            }
+        }
         set_mask_here(How::Unblock, &mine);
     }
 

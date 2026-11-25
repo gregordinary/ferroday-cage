@@ -41,6 +41,33 @@ pub fn terminal_for_caller() -> Terminal {
     }
 }
 
+/// The relay's signals, installed for a run's one session and given back to
+/// the process when this drops.
+///
+/// The library blocks the relayed signals for as long as the process lives,
+/// and a dropped handle leaves them blocked with nothing reading them, so
+/// `fcage` winding down after its session, or failing before it, would ignore
+/// a `^C` and a `SIGTERM`. `fcage` relays one session, so it gives them back
+/// as soon as that session is over, or will not happen.
+pub struct HeldSignals(Option<Signals>);
+
+impl HeldSignals {
+    /// Installs the relay's signals; see [`Signals::install`].
+    pub fn install() -> Result<HeldSignals, RelayError> {
+        Signals::install().map(|signals| HeldSignals(Some(signals)))
+    }
+}
+
+impl Drop for HeldSignals {
+    fn drop(&mut self) {
+        if let Some(signals) = self.0.take() {
+            // Left blocked where the mask cannot be restored, as a dropped
+            // handle leaves them; there is nothing else to do about it.
+            let _ = signals.release();
+        }
+    }
+}
+
 /// Drives an interactive session to its end and returns the command's outcome.
 ///
 /// `Ok(None)` means the timeout expired, whatever became of the command
@@ -49,10 +76,14 @@ pub fn terminal_for_caller() -> Terminal {
 pub fn relay(
     mut running: Running<'_>,
     pty: Pty,
-    signals: Signals,
+    signals: HeldSignals,
     timeout: Option<Duration>,
     kill_after: Duration,
 ) -> Result<Option<ExitStatus>, RelayError> {
+    let held = signals
+        .0
+        .as_ref()
+        .expect("installed signals are held until dropped");
     let interactive = caller_is_terminal();
     if interactive {
         // The hook is the binary's to install: setting one is process-global,
@@ -71,5 +102,5 @@ pub fn relay(
     Relay::new(stdin.as_fd(), stdout.as_fd())
         .raw(interactive)
         .escalation(Escalation::new(timeout, kill_after))
-        .run(&mut running, &pty, &signals)
+        .run(&mut running, &pty, held)
 }
