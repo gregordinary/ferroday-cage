@@ -689,6 +689,9 @@ consumer upgrading can skip it.
   text holding blanks or line ends and no entry, which was read as no list. A
   mask's or everyone else's entry with its empty qualifier left out
   (`mask:rwx`) is read.
+- A list a text gives with more entries than an attribute's value holds,
+  8,191, refuses its entry with `ProvisionError::EntryRefused`. Setting the
+  list failed with the kernel's `E2BIG`, as an I/O error.
 
 ### Fixed
 

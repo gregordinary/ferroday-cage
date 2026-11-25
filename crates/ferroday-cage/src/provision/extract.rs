@@ -48,6 +48,7 @@ use std::rc::Rc;
 
 use file_acl::Acl;
 use file_acl::text::{self, Prefer};
+use file_acl::xattr::MAX_ENTRIES;
 use rustix::fs::Timespec;
 use rustix::fs::{
     AtFlags, FileType, Mode, OFlags, ResolveFlags, Timestamps, UTIME_OMIT, XattrFlags,
@@ -302,7 +303,9 @@ impl ListIds<'_> {
     /// at all.
     ///
     /// A list the kernel would not store, in either form, refuses the entry,
-    /// since nothing about the entry's access could then be relied on.
+    /// since nothing about the entry's access could then be relied on. A list
+    /// a text gives with more entries than an attribute's value holds is one
+    /// ([`file_acl::xattr::MAX_ENTRIES`]); a value cannot be longer.
     fn stated(&self, records: &AclRecords, path: &Path) -> Result<Stated, ProvisionError> {
         let refused = |reason: String| ProvisionError::EntryRefused {
             path: path.to_path_buf(),
@@ -336,13 +339,21 @@ impl ListIds<'_> {
         let user = |name: &[u8]| users.get(name).copied();
         let group = |name: &[u8]| groups.get(name).copied();
         let Some(value) = value else {
-            return match parsed {
-                None => Ok(Stated::Nothing),
-                Some(parsed) => parsed
-                    .resolve_partial(user, group, Prefer::Name)
-                    .map(|partial| Stated::List(partial.list))
-                    .map_err(|flaw| unreadable(&flaw)),
+            let Some(parsed) = parsed else {
+                return Ok(Stated::Nothing);
             };
+            let list = parsed
+                .resolve_partial(user, group, Prefer::Name)
+                .map_err(|flaw| unreadable(&flaw))?
+                .list;
+            if list.entries().len() > MAX_ENTRIES {
+                return Err(refused(format!(
+                    "the access control list its text gives has {} entries, more than the \
+                     {MAX_ENTRIES} an attribute's value holds",
+                    list.entries().len()
+                )));
+            }
+            return Ok(Stated::List(list));
         };
         let from_text = parsed
             .map(|parsed| parsed.resolve(user, group, Prefer::Name))
@@ -3017,6 +3028,38 @@ mod list_tests {
         );
         assert!(reason.contains("no account"), "{reason}");
         assert!(reason.contains("stranger"), "{reason}");
+    }
+
+    #[test]
+    fn a_lists_text_longer_than_an_attribute_holds_refuses_its_entry() {
+        // The four entries naming no one, and `named` users by id, which need
+        // no account.
+        let text = |named: u32| {
+            let mut text = b"user::rw-\ngroup::r--\nmask::r--\nother::---\n".to_vec();
+            for id in 1..=named {
+                text.extend_from_slice(format!("user:{id}:r--\n").as_bytes());
+            }
+            pax_record(b"SCHILY.acl.access", &text)
+        };
+        let reason = refusal("text-too-long", &text(8188));
+        assert!(
+            reason.contains("its text gives has 8192 entries, more than the 8191"),
+            "{reason}"
+        );
+        // One fewer is the longest list a value holds, and is not refused for
+        // its length: the filesystem has the last word on it.
+        let mut tar = Tar::new();
+        pax(&mut tar, &text(8187));
+        tar.file("file", 0o640, b"x");
+        let outcome = extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &Scratch::for_test("extract", "text-longest"),
+            &mut |_, _| Ok(Placement::Write),
+            &mut || false,
+        );
+        if let Err(ProvisionError::EntryRefused { reason, .. }) = &outcome {
+            panic!("the longest list is refused: {reason}");
+        }
     }
 
     #[test]
