@@ -42,6 +42,7 @@
 //! comparison, setting by setting, and a check holds it to the code.
 
 mod forward;
+mod netstack;
 mod output;
 mod streams;
 mod terminal;
@@ -62,10 +63,10 @@ use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
     ExitStatus, FsAccess, Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount,
-    NetAccess, NetStack, NetStackHandle, Network, Overlay, PresentedIdentity, RawMount, ReadOnly,
-    ResolvedCgroup, ResolvedInputs, Resource, RestrictedProfile, Restriction, RestrictionBuilder,
-    Running, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
-    Symlink,
+    NetAccess, NetStack, NetStackError, NetStackHandle, Network, Overlay, Pending,
+    PresentedIdentity, RawMount, ReadOnly, ResolvedCgroup, ResolvedInputs, Resource,
+    RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen,
+    SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
 };
 use serde::Deserialize as _;
 
@@ -2042,6 +2043,20 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--netstack-log",
+        section: Section::Networking,
+        help: &[
+            "Write each flow the network stack carries or refuses",
+            "on standard error, one line each, naming the rule",
+            "that decided it. Under --netstack-allow or",
+            "--netstack-deny, refusals are written without it",
+        ],
+        take: Take::Bare(|options| {
+            options.netstack_log = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--restrict",
         section: Section::Hardening,
         help: &[
@@ -2787,6 +2802,7 @@ struct Options {
     netstack_publish: Vec<(SocketAddr, u16)>,
     netstack_allow: Vec<DestinationRule>,
     netstack_deny: Vec<DestinationRule>,
+    netstack_log: bool,
     /// The `--forward-loopback` listeners, each with its target on the host.
     forwards: Vec<(SocketAddr, forward::Target)>,
 }
@@ -3324,6 +3340,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack_publish: Vec::new(),
         netstack_allow: Vec::new(),
         netstack_deny: Vec::new(),
+        netstack_log: false,
         forwards: Vec::new(),
     };
 
@@ -5398,6 +5415,8 @@ struct Launch {
     builder: CageBuilder,
     /// The native network stack, for a `--netstack` run.
     stack: Option<NetStack>,
+    /// Which of the stack's reports the run writes, where it writes any.
+    shown: Option<netstack::Shown>,
     /// The standard streams the launch hands over, judged, or `None` where a
     /// pseudoterminal of the sandbox's own replaces all three.
     streams: Option<streams::Judged>,
@@ -5615,9 +5634,11 @@ impl Launch {
             Some(judge_streams(&builder, &CAGE_STREAMS, options.terminal)?)
         };
 
+        let ruled = !options.netstack_allow.is_empty() || !options.netstack_deny.is_empty();
         Ok(Launch {
             builder,
             stack,
+            shown: netstack::Shown::of(options.netstack_log, ruled),
             streams,
             terminal: options.terminal,
             timeout: options.timeout,
@@ -5632,6 +5653,7 @@ impl Launch {
         let Launch {
             builder,
             stack,
+            shown,
             streams,
             terminal,
             timeout,
@@ -5650,6 +5672,7 @@ impl Launch {
             return run_pending(
                 builder,
                 stack,
+                shown,
                 &publications,
                 forwards,
                 terminal,
@@ -5950,6 +5973,8 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
 /// attach the native network stack and make the `--forward-loopback`
 /// listeners, then release it, so the network and the listeners are up before
 /// the command's first instruction.
+///
+/// `shown` is which of the stack's reports the run writes, where it writes any.
 #[expect(
     clippy::too_many_arguments,
     reason = "the parts of one launch, each a field of `Launch`, which hands them over whole"
@@ -5957,6 +5982,7 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
 fn run_pending(
     builder: CageBuilder,
     stack: Option<NetStack>,
+    shown: Option<netstack::Shown>,
     publications: &[(SocketAddr, u16)],
     forwards: Vec<(SocketAddr, forward::Target)>,
     terminal: bool,
@@ -6001,33 +6027,23 @@ fn run_pending(
         Ok(handle) => handle,
         Err(error) => return finish(relay, Err(Failure::Fcage(error.into()))),
     };
-    // Stops what the run started, once the sandbox is gone or was never
-    // released: the forwards first, since nothing reaches their listeners
-    // without the sandbox, with their reports written, then the stack. A stack that does not stop cleanly
-    // is reported; it loses no data, so it is a warning rather than the run's
-    // outcome, and it is returned for the caller to print once the stream
-    // relays have delivered the command's output.
-    let stop = |forwards: Option<forward::Forwards>, handle: Option<NetStackHandle>| {
-        if let Some(forwards) = forwards {
-            forwards.stop();
-        }
-        handle.map(NetStackHandle::stop).transpose()
+    let mut beside = Beside {
+        handle,
+        ..Beside::default()
     };
-    let started = match forward::Forwards::start(&pending, forwards) {
-        Ok(started) => Some(started),
-        Err(failure) => {
-            drop(pending);
-            let _ = stop(None, handle);
-            return finish(relay, Err(failure));
-        }
-    };
+    if let Err(failure) = beside.start_forwards_and_reports(&pending, forwards, shown) {
+        drop(pending);
+        let _ = beside.stop();
+        return finish(relay, Err(failure));
+    }
     // A publication that left the port to the kernel is useless until the
     // caller knows which one it got. Said before the command is released, and
     // before a terminal session takes the caller's terminal into raw mode. A
     // reader that has gone is told nothing, so the command is not released:
     // dropping the pending launch tears the sandbox down, and the stack stops
     // with it.
-    let published = handle
+    let published = beside
+        .handle
         .as_ref()
         .map_or_else(Vec::new, |handle| handle.published().to_vec());
     for ((requested, guest_port), bound) in publications.iter().zip(published) {
@@ -6039,14 +6055,14 @@ fn run_pending(
         {
             drop(pending);
             // A stack that does not stop cleanly has nowhere left to say so.
-            let _ = stop(started, handle);
+            let _ = beside.stop();
             return finish(relay, Err(Failure::ReaderGone));
         }
     }
     let running = match pending.proceed() {
         Ok(running) => running,
         Err(error) => {
-            let _ = stop(started, handle);
+            let _ = beside.stop();
             return finish(relay, Err(error.into()));
         }
     };
@@ -6059,7 +6075,7 @@ fn run_pending(
         }
         _ => wait_with_deadline(running, timeout, kill_after).map_err(Failure::from),
     };
-    let stopped = stop(started, handle);
+    let stopped = beside.stop();
     let delivered = settle(relay);
     // Printed after the stream relays have delivered the command's output, so
     // it lands after that output, and after the terminal relay has restored the
@@ -6071,6 +6087,93 @@ fn run_pending(
         ));
     }
     settled_code(outcome, delivered)
+}
+
+/// What a run held at the pending seam starts beside the sandbox: the native
+/// network stack, the forwards, and the threads that write their reports.
+#[derive(Default)]
+struct Beside {
+    /// The attached stack.
+    handle: Option<NetStackHandle>,
+    /// The `--forward-loopback` forwards.
+    forwards: Option<forward::Forwards>,
+    /// The thread handing on the stack's reports, where the run writes any.
+    stack_reports: Option<netstack::StackReports>,
+    /// The thread every report of the run's goes through to standard error,
+    /// where the run writes any.
+    reports: Option<output::Reports>,
+}
+
+impl Beside {
+    /// Starts the forwards `wanted` names and the reporting the run asks for:
+    /// the stack's reports `shown` selects, and the thread both write through.
+    ///
+    /// A failure is the run's, and leaves what had started for
+    /// [`stop`](Self::stop).
+    fn start_forwards_and_reports(
+        &mut self,
+        pending: &Pending<'_>,
+        wanted: Vec<(SocketAddr, forward::Target)>,
+        shown: Option<netstack::Shown>,
+    ) -> Result<(), Failure> {
+        let shown = shown.filter(|_| self.handle.is_some());
+        if wanted.is_empty() && shown.is_none() {
+            return Ok(());
+        }
+        let reports = self.reports.insert(output::Reports::start().map_err(|err| {
+            Failure::Fcage(
+                format!(
+                    "starting the thread that writes the run's reports: {}",
+                    ErrorChain::new(&err)
+                )
+                .into(),
+            )
+        })?);
+        let reporter = reports.reporter();
+        if let (Some(shown), Some(handle)) = (shown, self.handle.as_mut()) {
+            let taken = handle
+                .take_reports()
+                .expect("a handle just attached still holds its reports");
+            let started =
+                netstack::StackReports::start(taken, shown, reporter.clone()).map_err(|err| {
+                    Failure::Fcage(
+                        format!(
+                            "starting the thread that writes the network stack's reports: {}",
+                            ErrorChain::new(&err)
+                        )
+                        .into(),
+                    )
+                })?;
+            self.stack_reports = Some(started);
+        }
+        if !wanted.is_empty() {
+            self.forwards = Some(forward::Forwards::start(pending, wanted, &reporter)?);
+        }
+        Ok(())
+    }
+
+    /// Stops what started, once the sandbox is gone or was never released: the
+    /// forwards first, since nothing reaches their listeners without the
+    /// sandbox, then the stack, and then the reports, once every report of
+    /// both is written. So `fcage`'s own last lines follow them.
+    ///
+    /// A stack that does not stop cleanly is returned rather than reported: it
+    /// loses no data, so it is a warning rather than the run's outcome, for the
+    /// caller to print once the stream relays have delivered the command's
+    /// output.
+    fn stop(self) -> Result<(), NetStackError> {
+        if let Some(forwards) = self.forwards {
+            forwards.stop();
+        }
+        let stopped = self.handle.map(NetStackHandle::stop).transpose();
+        if let Some(stack_reports) = self.stack_reports {
+            stack_reports.finish();
+        }
+        if let Some(reports) = self.reports {
+            reports.finish();
+        }
+        stopped.map(|_| ())
+    }
 }
 
 /// Names the native stack's nameserver in the sandbox's `resolv.conf`, so the
@@ -10284,6 +10387,14 @@ mod tests {
         assert!(err.to_string().contains("example.com"), "{err}");
         // And like every --netstack-* flag, each needs --netstack.
         let err = parse_error(&["--rootfs", "/r", "--netstack-allow", "192.0.2.0/24", "/x"]);
+        assert!(err.contains("require --netstack"), "{err}");
+    }
+
+    #[test]
+    fn the_log_flag_reaches_the_launch_and_needs_the_stack() {
+        let options = run_options(&["--rootfs", "/r", "--netstack", "--netstack-log", "/x"]);
+        assert!(options.netstack_log);
+        let err = parse_error(&["--rootfs", "/r", "--netstack-log", "/x"]);
         assert!(err.contains("require --netstack"), "{err}");
     }
 

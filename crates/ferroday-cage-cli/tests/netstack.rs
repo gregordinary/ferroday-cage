@@ -1,6 +1,7 @@
 //! Integration tests for `fcage --netstack`: what the built binary refuses
-//! before a native network stack carries a sandbox's traffic, and the names a
-//! sandbox resolves through the stack's nameserver.
+//! before a native network stack carries a sandbox's traffic, the names a
+//! sandbox resolves through the stack's nameserver, and the stack's reports it
+//! writes on standard error.
 //!
 //! The tests skip explicitly, on stderr, on a host that cannot create
 //! unprivileged user namespaces or offers no seccomp. Every run is bounded, so
@@ -128,4 +129,118 @@ fn netstack_resolves_through_the_stack_s_nameserver_under_the_host_root() {
     let (ok, stdout, stderr) = resolve_known_name(&["--host-rootfs"], getent);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("192.0.2.1"), "{stdout}\n{stderr}");
+}
+
+/// Runs `fcage --rootfs ROOTFS --netstack` with `args`, then `/bin/sh -c
+/// script`, and returns what it said on stderr.
+fn stderr_of(rootfs: &str, args: &[&str], script: &str) -> String {
+    let mut command = Command::new(FCAGE);
+    command
+        .args(["--rootfs", rootfs, "--netstack"])
+        .args(args)
+        .args(["--", "/bin/sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = common::run_bounded(&mut command, PATIENCE);
+    assert!(output.status.success(), "{}", output.status);
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The lines `fcage` wrote of the network stack's reports, each with the
+/// guest's port, which the guest's kernel chooses, left out.
+fn stack_lines(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("fcage: the network stack "))
+        .map(|line| {
+            let (before, after) = line
+                .split_once("from 10.0.2.15:")
+                .unwrap_or_else(|| panic!("a report names the guest: {line}"));
+            let (_, after) = after
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("a port follows the guest: {line}"));
+            format!("{before}from 10.0.2.15 {after}")
+        })
+        .collect()
+}
+
+/// Under destination rules each refusal is written on standard error, saying
+/// why, and a flow the stack carries is not.
+#[test]
+fn refusals_are_written_under_destination_rules() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let rootfs = rootfs.to_str().expect("a UTF-8 fixture path");
+    let mapped = std::net::TcpListener::bind("127.0.0.1:0").expect("a host listener binds");
+    let port = mapped.local_addr().expect("an address").port().to_string();
+    let stderr = stderr_of(
+        rootfs,
+        &[
+            "--netstack-host-port",
+            &port,
+            "--netstack-allow",
+            "tcp:198.51.100.0/24:443",
+        ],
+        &format!(
+            "/usr/bin/nc -w 1 10.0.2.2 {port} < /dev/null; \
+             /usr/bin/nc -w 1 192.0.2.1 443 < /dev/null; \
+             /usr/bin/nc -w 1 169.254.169.254 80 < /dev/null; true"
+        ),
+    );
+    assert_eq!(
+        stack_lines(&stderr),
+        [
+            "fcage: the network stack refused tcp from 10.0.2.15 to 192.0.2.1:443: no allow rule \
+             admits it",
+            "fcage: the network stack refused tcp from 10.0.2.15 to 169.254.169.254:80: a \
+             link-local address, where the cloud metadata services answer, is always refused",
+        ],
+        "{stderr}"
+    );
+}
+
+/// Without rules nothing is written, and `--netstack-log` writes every flow,
+/// carried or refused.
+#[test]
+fn the_log_writes_every_flow_and_nothing_is_written_without_it() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let rootfs = rootfs.to_str().expect("a UTF-8 fixture path");
+    let mapped = std::net::TcpListener::bind("127.0.0.1:0").expect("a host listener binds");
+    let port = mapped.local_addr().expect("an address").port().to_string();
+    let script = format!(
+        "/usr/bin/nc -w 1 10.0.2.2 {port} < /dev/null; \
+         /usr/bin/nc -w 1 10.0.2.2 9 < /dev/null; true"
+    );
+
+    let quiet = stderr_of(rootfs, &["--netstack-host-port", &port], &script);
+    assert_eq!(stack_lines(&quiet), Vec::<String>::new(), "{quiet}");
+
+    let logged = stderr_of(
+        rootfs,
+        &["--netstack-host-port", &port, "--netstack-log"],
+        &script,
+    );
+    assert_eq!(
+        stack_lines(&logged),
+        [
+            format!(
+                "fcage: the network stack carried tcp from 10.0.2.15 to 10.0.2.2:{port}: the \
+                 gateway's port is mapped to the host's loopback"
+            ),
+            "fcage: the network stack refused tcp from 10.0.2.15 to 10.0.2.2:9: the gateway's \
+             port is not mapped to the host's loopback"
+                .to_string(),
+        ],
+        "{logged}"
+    );
 }

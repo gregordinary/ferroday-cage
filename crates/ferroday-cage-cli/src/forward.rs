@@ -23,9 +23,10 @@
 //! A forward reports on standard error, and never waits on it to: its thread
 //! carries every connection, and a reader that stops taking standard error
 //! must not stall them. Its lines go through a [`Reporter`] to the one thread
-//! every forward of a run shares, which writes them, and drops and counts any
-//! past what it holds; see [`output`](crate::output). The run's end waits for that
-//! thread to write what it holds before `fcage` writes its own last lines.
+//! every report of a run goes through, the network stack's included, which
+//! writes them, and drops and counts any past what it holds; see
+//! [`output`](crate::output). The run's end waits for that thread to write what
+//! it holds before `fcage` writes its own last lines.
 //!
 //! # Bounds
 //!
@@ -106,7 +107,7 @@ use rustix::net::{
 use rustix::pipe::{self, PipeFlags};
 
 use crate::Failure;
-use crate::output::{Reporter, Reports};
+use crate::output::Reporter;
 
 /// The most connections one forward holds at once, counting those whose
 /// connection to the target is still being made. A connection accepted past it
@@ -235,46 +236,29 @@ enum Attempt {
     Busy,
 }
 
-/// A run's forwards, and the thread that writes their reports.
+/// A run's forwards.
 pub(crate) struct Forwards {
     /// Each forward, running.
     running: Vec<Forward>,
-    /// The thread writing their reports; `None` for a run without a forward.
-    reports: Option<Reports>,
 }
 
 impl Forwards {
     /// Starts a forward for each of `wanted` on the pending sandbox's
-    /// loopback, and the one thread that writes their reports.
+    /// loopback, each reporting through `reporter`.
     ///
     /// A failure stops what had started, and is the run's.
     pub(crate) fn start(
         pending: &Pending<'_>,
         wanted: Vec<(SocketAddr, Target)>,
+        reporter: &Reporter,
     ) -> Result<Forwards, Failure> {
         let mut forwards = Forwards {
             running: Vec::with_capacity(wanted.len()),
-            reports: None,
         };
-        if wanted.is_empty() {
-            return Ok(forwards);
-        }
-        let reports = Reports::start().map_err(|err| {
-            Failure::Fcage(
-                format!(
-                    "starting the thread that writes the forwards' reports: {}",
-                    ErrorChain::new(&err)
-                )
-                .into(),
-            )
-        })?;
-        let reporter = reports.reporter();
-        forwards.reports = Some(reports);
         for (address, target) in wanted {
             match Forward::start(pending, address, target, reporter.clone()) {
                 Ok(forward) => forwards.running.push(forward),
                 Err(failure) => {
-                    drop(reporter);
                     forwards.stop();
                     return Err(failure);
                 }
@@ -283,13 +267,12 @@ impl Forwards {
         Ok(forwards)
     }
 
-    /// Ends every forward, then waits for their reports to be written.
+    /// Ends every forward. What they reported is written by the run's reports
+    /// thread, which the run finishes once everything that reports through it
+    /// has stopped.
     pub(crate) fn stop(self) {
         for forward in self.running {
             forward.stop();
-        }
-        if let Some(reports) = self.reports {
-            reports.finish();
         }
     }
 }
@@ -931,6 +914,7 @@ impl Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Reports;
     use crate::output::tests::Kept;
     use std::io::{Read, Write};
     use std::net::TcpStream;

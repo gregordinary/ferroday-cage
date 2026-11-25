@@ -85,6 +85,9 @@ consumer upgrading can skip it.
   it, naming the rule where one decided, and writes as one line. A TCP attempt
   is reported once, and a refused UDP flow once until it has sat idle for two
   minutes. `Transport` writes as `tcp` or `udp`.
+- `fcage` writes each refusal the network stack reports on standard error under
+  `--netstack-allow` or `--netstack-deny`, and every report under the new
+  `--netstack-log`.
 
 ### Changed
 

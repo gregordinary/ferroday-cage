@@ -88,10 +88,12 @@ directory among them, is refused before anything starts.
 The isolated network is loopback-only by default. `--netstack` attaches a native userspace
 TCP/IP stack for IPv4 and IPv6 with no helper binary, outbound and to any port
 `--netstack-publish` opens on the host. `--netstack-allow` and `--netstack-deny` bound where
-it goes outbound. `--forward-loopback PORT TARGET` gives the command
-one way out instead. The command connects to `PORT` on its loopback, and `fcage` carries each
-connection to a unix socket or an address on the host. `--share-net` gives the command the
-host's network.
+it goes outbound. Under them, each connection or UDP flow the stack refuses is reported on
+standard error, saying why, and `--netstack-log` reports every one.
+
+Instead of a stack, `--forward-loopback PORT TARGET` gives the command one way out. The
+command connects to `PORT` on its loopback, and `fcage` carries each connection to a unix
+socket or an address on the host. `--share-net` gives the command the host's network.
 
 A sandbox can also run over the host's own tree. `--host-rootfs` roots it on the host's
 filesystem, read-only, with `/home`, `/root`, `/run`, `/var/run` and `/var/tmp` hidden. A

@@ -632,6 +632,18 @@ or on the port of an `ADDRESS:PORT`, and `--netstack-no-nameserver` turns the
 nameserver off. `--netstack-allow RULE` and `--netstack-deny RULE` give the
 [destination rules](#destination-rules), each as often as needed. `--netstack-host-port PORT` maps one port of the gateway onto
 host loopback.
+
+Under destination rules, `fcage` writes each refusal the stack
+[reports](#reports) on standard error, so the command's caller reads why a
+connection failed:
+
+```text
+fcage: the network stack refused tcp from 10.0.2.15:41234 to 192.0.2.1:443: no allow rule admits it
+```
+
+`--netstack-log` writes every report, the flows the stack carries too. With no
+rules that is a log of where the sandbox goes, which is how to learn what an
+allowlist needs.
 `--netstack-publish HOST GUEST_PORT` publishes a guest port, where `HOST` is an
 `ADDRESS:PORT` or a bare port on `127.0.0.1`. A publication on port 0 has
 `fcage` report the port the kernel chose, on standard error, before the command
