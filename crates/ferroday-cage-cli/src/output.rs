@@ -40,7 +40,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::JoinHandle;
 
@@ -74,9 +74,42 @@ pub fn report(line: fmt::Arguments<'_>) {
 
 /// Writes `line` and a newline to `out`, answering [`ReaderGone`] where the
 /// reader has gone and dropping any other failure.
+///
+/// Every such line goes to standard error. While an interactive `--terminal`
+/// run holds the caller's terminal in raw mode, and standard error is a
+/// terminal, the newline is a carriage return and a line feed: raw mode turns
+/// off the output processing that adds the return, and a bare line feed would
+/// start the next line where this one ended.
 pub fn say_to(out: &mut dyn Write, line: fmt::Arguments<'_>) -> Result<(), ReaderGone> {
-    let written = out.write_fmt(line).and_then(|()| out.write_all(b"\n"));
+    let end: &[u8] = if RAW_TERMINAL.load(Ordering::Relaxed) {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
+    let written = out.write_fmt(line).and_then(|()| out.write_all(end));
     gone_or_dropped(written.and_then(|()| out.flush()))
+}
+
+/// Whether standard error is the caller's terminal, held in raw mode by a
+/// `--terminal` run's relay; see [`say_to`].
+static RAW_TERMINAL: AtomicBool = AtomicBool::new(false);
+
+/// Ends `fcage`'s lines for a terminal in raw mode until it drops, where
+/// `raw` says standard error is one. The relay holds it while it runs.
+pub struct RawLines(());
+
+impl RawLines {
+    /// Ends lines for a raw terminal from now on, where `raw`.
+    pub fn hold(raw: bool) -> RawLines {
+        RAW_TERMINAL.store(raw, Ordering::Relaxed);
+        RawLines(())
+    }
+}
+
+impl Drop for RawLines {
+    fn drop(&mut self) {
+        RAW_TERMINAL.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Writes `bytes` to `out` as they are: the output of a command a provisioner
@@ -287,6 +320,34 @@ pub(crate) mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Set in the child [`a_line_ends_for_a_terminal_in_raw_mode`] starts: the
+    /// ending is process-wide, so the child changes its own.
+    const RAW_CHILD: &str = "FCAGE_TEST_RAW_LINES";
+
+    #[test]
+    fn a_line_ends_for_a_terminal_in_raw_mode() {
+        if std::env::var_os(RAW_CHILD).is_some() {
+            let kept = Kept::default();
+            let _ = say_to(&mut kept.clone(), format_args!("before"));
+            let held = RawLines::hold(true);
+            let _ = say_to(&mut kept.clone(), format_args!("raw"));
+            drop(held);
+            let _ = say_to(&mut kept.clone(), format_args!("after"));
+            print!("{}", kept.text().escape_debug());
+            return;
+        }
+        let child = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun(
+                "output::tests::a_line_ends_for_a_terminal_in_raw_mode",
+            )
+            .env(RAW_CHILD, "1"),
+            std::time::Duration::from_secs(60),
+        );
+        let printed = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success(), "{printed}");
+        assert!(printed.contains("before\\nraw\\r\\nafter\\n"), "{printed}");
     }
 
     /// A [`Kept`] that holds its first write until the test lets it go.

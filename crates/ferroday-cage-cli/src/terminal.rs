@@ -63,6 +63,11 @@ pub fn relay(
     }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    // Lines `fcage` writes while the relay runs, a network stack's or a
+    // forward's reports among them, go to a terminal in raw mode where standard
+    // error is one.
+    let raw_stderr = interactive && termios::tcgetattr(rustix::stdio::stderr()).is_ok();
+    let _lines = crate::output::RawLines::hold(raw_stderr);
     Relay::new(stdin.as_fd(), stdout.as_fd())
         .raw(interactive)
         .escalation(Escalation::new(timeout, kill_after))

@@ -437,6 +437,11 @@ consumer upgrading can skip it.
   allows, or whose `USE` holds a word that is no flag. Both reached a caller
   unchecked, through `InstalledPackage::slot` and `use_flags`, and a `SLOT`
   holding a newline forged a line of `fcage`'s package listing.
+- `fcage --terminal` ends the lines it writes while it holds the caller's
+  terminal in raw mode, a network stack's or a forward's reports among them,
+  with a carriage return and a line feed where standard error is a terminal.
+  Raw mode turns off the processing that adds the return, so each line began
+  where the last one ended.
 
 ### Internal
 
