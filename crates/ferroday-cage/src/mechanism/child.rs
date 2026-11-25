@@ -1676,11 +1676,11 @@ fn delegate_nested_map(
         Err(errno) => return Err((SetupStep::NestedMapGate, errno, 0)),
     }
 
-    // The gid map before the uid map, which is the order `establish_map` writes
-    // them in; neither ordering is forced for a privileged writer, and matching
-    // the self-written path leaves one order to know. `setgroups` is left at
-    // `allow` — a privileged writer needs no denial, and denying it would cost
-    // the supplementary groups a run-as identity sets.
+    // The gid map, then the uid map, the order `establish_map` writes them in.
+    // Neither order is forced for a privileged writer, and the caller's
+    // delegates for the launch's own map write the uid map first. `setgroups`
+    // is left at `allow` — a privileged writer needs no denial, and denying it
+    // would cost the supplementary groups a run-as identity sets.
     let pid = command.as_raw_nonzero().get() as u32;
     for (file, lines, step) in [
         (
