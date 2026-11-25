@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{CgroupLimit, CgroupRefusal, Error, Stdio, host};
+use ferroday_cage::{CgroupLimit, CgroupRefusal, Error, Exec, Stdio, host};
 
 /// Limits whose controllers the tests' sandboxes need the parent to offer.
 const LIMITS: [CgroupLimit; 2] = [CgroupLimit::PidsMax(8), CgroupLimit::MemoryMax(64 << 20)];
@@ -470,6 +470,56 @@ fn remove_once_empty(cgroup: &Path, within: Duration) {
             cgroup.display()
         );
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_further_command_runs_in_the_sandboxs_cgroup_and_ends_with_its_kill() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    // The further command is charged to the sandbox's cgroup, and its stage,
+    // which supervises it from outside, is not: a kill of the sandbox's tree
+    // ends the command and leaves the stage to report it, as `SIGKILL`.
+    for pid_namespace in [true, false] {
+        let own = own_parent(parent, &format!("exec-{pid_namespace}"));
+        let mut sandbox = sh_in(&own, "exec sleep 30")
+            .pid_namespace(pid_namespace)
+            .stop_with_caller(true)
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn()
+            .expect("the sandbox launches");
+        let mut further = sandbox
+            .exec(
+                &Exec::new("/bin/sleep")
+                    .arg("30")
+                    .stop_with_caller(true)
+                    .stdout(Stdio::Null),
+            )
+            .expect("the further command launches");
+        let (_, members) = sole_sandbox_cgroup(&own);
+        assert!(
+            members.contains(&further.pid()),
+            "pid namespace {pid_namespace}: the further command is in the leaf: {members:?}"
+        );
+        let stage = common::process_parent(further.pid()).expect("the command has a parent");
+        assert!(
+            !members.contains(&stage),
+            "pid namespace {pid_namespace}: its stage is not: {members:?}"
+        );
+        sandbox.kill().expect("the kill is delivered");
+        sandbox.wait().expect("the outcome is collected");
+        let status = further
+            .wait()
+            .expect("the further command's outcome is collected");
+        assert_eq!(status.signal(), Some(9), "pid namespace {pid_namespace}");
+        drop(further);
+        drop(sandbox);
+        remove_once_empty(&own, Duration::from_secs(10));
     }
 }
 

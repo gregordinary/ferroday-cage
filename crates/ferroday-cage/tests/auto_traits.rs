@@ -49,6 +49,7 @@ const _: () = assert_send_sync::<ferroday_cage::ResolvedLandlockNet>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedNetworkFilter>();
 const _: () = assert_send_sync::<ferroday_cage::ResolvedSyscallRefusal>();
 const _: () = assert_send_sync::<ferroday_cage::Stdio>();
+const _: () = assert_send_sync::<ferroday_cage::Exec>();
 // A terminal launch hands back a live descriptor whose whole point is being
 // driven from a second thread: a reader beside the wait, a resize beside both.
 const _: () = assert_send_sync::<ferroday_cage::Terminal>();

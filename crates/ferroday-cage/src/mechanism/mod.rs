@@ -1797,12 +1797,18 @@ pub(crate) const STDERR_FILENO: RawFd = 2;
 ///
 /// The caller's terminal is lent to the sandbox here, as [`Foreground`]
 /// decides, and the decision travels to the init in the context.
+///
+/// `join` is a pidfd of the process that holds a running sandbox's namespaces,
+/// where the launch is a further command joining that sandbox: the launch
+/// stage joins them rather than creating its own, and no map gate is made,
+/// since the namespace it joins is mapped already.
 fn fork_launch(
     plan: &LaunchPlan,
     observe: bool,
     gated: bool,
     terminal: Option<&Terminal>,
     cgroup_procs: Option<BorrowedFd<'_>>,
+    join: Option<BorrowedFd<'_>>,
 ) -> Result<ParentSide, Error> {
     refuse_directory_streams(plan, observe, terminal.is_some())?;
     let foreground = Foreground::lend(plan, observe, terminal.is_some())?;
@@ -1853,8 +1859,8 @@ fn fork_launch(
     let (host_sock, cage_sock) = seqpacket().map_err(spawn_error)?;
     // The map gate, created only when a delegate writes the map: one
     // seqpacket pair carries ready out and go back, the shape the control
-    // socket already set.
-    let map_gate = if plan.identity.is_ranged() {
+    // socket already set. A joining launch establishes no map of its own.
+    let map_gate = if plan.identity.is_ranged() && join.is_none() {
         Some(seqpacket().map_err(spawn_error)?)
     } else {
         None
@@ -1947,6 +1953,7 @@ fn fork_launch(
                 take_foreground: foreground.is_some(),
                 hidden: &hidden,
                 cgroup_procs_fd: cgroup_procs,
+                join_fd: join,
             };
             child::stage_a(&context)
         }
@@ -2122,12 +2129,14 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &ParentSide) -> Result<(), 
 
 /// Decides how the launch stage is reaped for a command that is now running.
 ///
-/// Without a PID namespace the launch stage stays outside as the command's
-/// parent and is reaped by the handle once the status arrives, so its pidfd is
-/// returned; with one it has already exited and is reaped here, best-effort in
-/// case the application reaps child processes of its own.
-fn reap_after(pid_namespace: bool, stage: Forked) -> Option<OwnedFd> {
-    if pid_namespace {
+/// Where an init supervises the command inside the sandbox's PID namespace
+/// (`inside`), the launch stage has already exited and is reaped here,
+/// best-effort in case the application reaps child processes of its own.
+/// Otherwise, without a PID namespace or in a launch joining a running
+/// sandbox, the launch stage stays outside as the command's parent and is
+/// reaped by the handle once the status arrives, so its pidfd is returned.
+fn reap_after(inside: bool, stage: Forked) -> Option<OwnedFd> {
+    if inside {
         let _ = stage.reap();
         None
     } else {
@@ -2162,9 +2171,18 @@ pub(crate) fn await_exit(pidfd: BorrowedFd<'_>) -> Result<(), Errno> {
 /// A failed poll answers `false`: the callers act only on a process known to
 /// be gone.
 pub(crate) fn has_exited(pidfd: BorrowedFd<'_>) -> bool {
+    exits_within(pidfd, Duration::ZERO)
+}
+
+/// Whether the process a pidfd refers to exits within `patience`, waiting no
+/// longer than that for it; [`has_exited`] asks without waiting.
+///
+/// A failed poll answers `false`, as there, and so does a signal interrupting
+/// the wait: the callers act only on a process known to be gone.
+pub(crate) fn exits_within(pidfd: BorrowedFd<'_>, patience: Duration) -> bool {
     let mut fds = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
     matches!(
-        rustix::event::poll(&mut fds, Some(&rustix::event::Timespec::default())),
+        rustix::event::poll(&mut fds, Some(&crate::poll::timeout(patience))),
         Ok(ready) if ready > 0
     )
 }
@@ -2198,18 +2216,24 @@ fn abort_launch(stage: &Forked, supervisor: &OwnedFd) {
 /// never published may have left a process running that this side cannot name,
 /// and one whose init's pidfd did not arrive has an end this side cannot wait
 /// for, and the targets of either are left where they are.
+///
+/// `join` is a pidfd of the process holding a running sandbox's namespaces,
+/// where the launch is a further command joining it; see [`fork_launch`]. The
+/// launch stage then supervises the command from outside, as it does without a
+/// PID namespace, and the handle anchors on the command.
 pub(crate) fn spawn(
     plan: &LaunchPlan,
     observe: bool,
     terminal: Option<&Terminal>,
     cgroup_procs: Option<BorrowedFd<'_>>,
+    join: Option<BorrowedFd<'_>>,
     progress: &mut dyn FnMut(Progress),
     created: &mut Vec<CreatedTarget>,
 ) -> Result<(Launched, Option<OwnedFd>), Error> {
     progress(Progress::Launching);
     #[cfg(feature = "hardening")]
     let (listening, seccomp_reports) = prepare_listener(plan)?;
-    let mut parent = fork_launch(plan, observe, false, terminal, cgroup_procs)?;
+    let mut parent = fork_launch(plan, observe, false, terminal, cgroup_procs, join)?;
     #[cfg(feature = "hardening")]
     hand_listener(listening, &mut parent);
     // A range map is established before the supervisor is published, so a
@@ -2256,7 +2280,7 @@ pub(crate) fn spawn(
                     status: parent.status_read,
                     stdout: parent.stdout,
                     stderr: parent.stderr,
-                    reap: reap_after(plan.pid_namespace, parent.stage),
+                    reap: reap_after(plan.pid_namespace && join.is_none(), parent.stage),
                     foreground: parent.foreground,
                     #[cfg(feature = "hardening")]
                     seccomp_reports,
@@ -2473,7 +2497,7 @@ pub(crate) fn spawn_pending(
     progress(Progress::Launching);
     #[cfg(feature = "hardening")]
     let (listening, seccomp_reports) = prepare_listener(plan)?;
-    let mut parent = fork_launch(plan, observe, true, terminal, cgroup_procs)?;
+    let mut parent = fork_launch(plan, observe, true, terminal, cgroup_procs, None)?;
     #[cfg(feature = "hardening")]
     hand_listener(listening, &mut parent);
     // The map precedes the supervisor's publication, so by the time the

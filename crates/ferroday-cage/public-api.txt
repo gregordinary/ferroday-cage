@@ -1742,6 +1742,7 @@ pub ferroday_cage::ConfigError::CommandNotAbsolute::lookup_offered: bool
 pub ferroday_cage::ConfigError::EmbeddedNul::value: std::ffi::os_str::OsString
 #[non_exhaustive] pub ferroday_cage::ConfigError::EnvNameInvalid
 pub ferroday_cage::ConfigError::EnvNameInvalid::name: std::ffi::os_str::OsString
+pub ferroday_cage::ConfigError::ExecIntoRestriction
 #[non_exhaustive] pub ferroday_cage::ConfigError::HostNetworkLandlockUnenforceable
 pub ferroday_cage::ConfigError::HostNetworkLandlockUnenforceable::abi: core::option::Option<i32>
 #[non_exhaustive] pub ferroday_cage::ConfigError::HostnameInvalid
@@ -1912,6 +1913,7 @@ pub ferroday_cage::Error::NamespaceLimitReached::step: ferroday_cage::SetupStep
 #[non_exhaustive] pub ferroday_cage::Error::ProcfsRefused
 pub ferroday_cage::Error::ProcfsRefused::blocker: ferroday_cage::host::ProcfsBlocker
 pub ferroday_cage::Error::ProcfsRefused::source: core::io::error::Error
+pub ferroday_cage::Error::SandboxEnded
 #[non_exhaustive] pub ferroday_cage::Error::SeccompListenerHeld
 pub ferroday_cage::Error::SeccompListenerHeld::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::Error::Setup
@@ -2477,6 +2479,7 @@ pub ferroday_cage::SetupStep::InstallNetworkFilter = 58
 pub ferroday_cage::SetupStep::InstallSeccomp = 36
 pub ferroday_cage::SetupStep::InstallSeccompListener = 70
 pub ferroday_cage::SetupStep::JoinCgroup = 67
+pub ferroday_cage::SetupStep::JoinSandbox = 72
 pub ferroday_cage::SetupStep::LandlockAddRule = 34
 pub ferroday_cage::SetupStep::LandlockCreateRuleset = 33
 pub ferroday_cage::SetupStep::LandlockRestrictSelf = 35
@@ -2776,6 +2779,35 @@ impl core::marker::Unpin for ferroday_cage::Excerpt
 impl core::marker::UnsafeUnpin for ferroday_cage::Excerpt
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Excerpt
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Excerpt
+pub struct ferroday_cage::Exec
+impl ferroday_cage::Exec
+pub fn ferroday_cage::Exec::arg(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
+pub fn ferroday_cage::Exec::args<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<std::ffi::os_str::OsStr>
+pub fn ferroday_cage::Exec::current_dir(self, impl core::convert::AsRef<std::path::Path>) -> Self
+pub fn ferroday_cage::Exec::env(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
+pub fn ferroday_cage::Exec::envs<I, K, V>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = (K, V)>, K: core::convert::AsRef<std::ffi::os_str::OsStr>, V: core::convert::AsRef<std::ffi::os_str::OsStr>
+pub fn ferroday_cage::Exec::get_args(&self) -> &[std::ffi::os_str::OsString]
+pub fn ferroday_cage::Exec::get_command(&self) -> &std::path::Path
+pub fn ferroday_cage::Exec::get_current_dir(&self) -> core::option::Option<&std::path::Path>
+pub fn ferroday_cage::Exec::get_envs(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&std::ffi::os_str::OsStr, &std::ffi::os_str::OsStr)>
+pub fn ferroday_cage::Exec::get_path_lookup(&self) -> bool
+pub fn ferroday_cage::Exec::get_stderr(&self) -> &ferroday_cage::Stdio
+pub fn ferroday_cage::Exec::get_stdin(&self) -> &ferroday_cage::Stdio
+pub fn ferroday_cage::Exec::get_stdout(&self) -> &ferroday_cage::Stdio
+pub fn ferroday_cage::Exec::get_stop_with_caller(&self) -> bool
+pub fn ferroday_cage::Exec::new(impl core::convert::AsRef<std::path::Path>) -> ferroday_cage::Exec
+pub fn ferroday_cage::Exec::path_lookup(self, bool) -> Self
+pub fn ferroday_cage::Exec::stderr(self, ferroday_cage::Stdio) -> Self
+pub fn ferroday_cage::Exec::stdin(self, ferroday_cage::Stdio) -> Self
+pub fn ferroday_cage::Exec::stdout(self, ferroday_cage::Stdio) -> Self
+pub fn ferroday_cage::Exec::stop_with_caller(self, bool) -> Self
+impl core::marker::Freeze for ferroday_cage::Exec
+impl core::marker::Send for ferroday_cage::Exec
+impl core::marker::Sync for ferroday_cage::Exec
+impl core::marker::Unpin for ferroday_cage::Exec
+impl core::marker::UnsafeUnpin for ferroday_cage::Exec
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Exec
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Exec
 pub struct ferroday_cage::ExitStatus(_)
 impl ferroday_cage::ExitStatus
 pub fn ferroday_cage::ExitStatus::code(&self) -> core::option::Option<i32>
@@ -3409,6 +3441,8 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::RestrictionBuild
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::RestrictionBuilder
 pub struct ferroday_cage::Running<'obs>
 impl<'obs> ferroday_cage::Running<'obs>
+pub fn ferroday_cage::Running<'obs>::exec(&self, &ferroday_cage::Exec) -> core::result::Result<ferroday_cage::Running<'static>, ferroday_cage::Error>
+pub fn ferroday_cage::Running<'obs>::exec_with<'o>(&self, &ferroday_cage::Exec, &'o mut dyn ferroday_cage::Observer) -> core::result::Result<ferroday_cage::Running<'o>, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::kill(&mut self) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::kill_handle(&self) -> core::result::Result<ferroday_cage::KillHandle, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::pid(&self) -> u32

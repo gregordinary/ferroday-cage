@@ -167,13 +167,34 @@ pub(super) struct Context<'a> {
     /// The `cgroup.procs` of the sandbox's leaf cgroup, when the launch has a
     /// cgroup: the launch stage writes itself into it before anything else.
     pub(super) cgroup_procs_fd: Option<BorrowedFd<'a>>,
+    /// A pidfd of the process that holds a running sandbox's namespaces, when
+    /// this launch is a further command joining that sandbox rather than a
+    /// sandbox of its own: its init, or without a PID namespace the launch
+    /// stage that supervises its first command from outside. The launch stage
+    /// joins those namespaces in place of creating its own; see
+    /// [`join_sandbox`].
+    pub(super) join_fd: Option<BorrowedFd<'a>>,
 }
 
 impl Context<'_> {
-    /// Whether the init takes a process group of its own in the caller's
-    /// session; see [`LaunchPlan::own_process_group`].
+    /// Whether the process that forks the command gives it a process group of
+    /// its own in the caller's session: the init, or for a joining launch the
+    /// command itself; see [`LaunchPlan::own_process_group`].
     fn own_process_group(&self) -> bool {
         self.plan.own_process_group(self.terminal.is_some())
+    }
+
+    /// Whether this launch joins a running sandbox; see
+    /// [`join_fd`](Self::join_fd).
+    fn joins(&self) -> bool {
+        self.join_fd.is_some()
+    }
+
+    /// Whether the launch stage supervises the command from outside the
+    /// sandbox's PID namespace: where the sandbox has none, and wherever the
+    /// launch joins a running sandbox, whose init is the first command's.
+    fn supervised_outside(&self) -> bool {
+        self.joins() || !self.plan.pid_namespace
     }
 }
 
@@ -226,9 +247,15 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // The sandbox's leaf cgroup, before any namespace: every process forked
     // from here on is charged to the cgroup above it that holds the limits,
     // and the cgroup namespace the unshare below creates is rooted at the
-    // leaf, below them. `0` names the writing process.
-    if let Some(procs) = context.cgroup_procs_fd {
-        rustix::io::write(procs, b"0").map_err(|errno| (SetupStep::JoinCgroup, errno, 0))?;
+    // leaf, below them. A joining launch's stage stays where the caller is:
+    // it supervises a further command from outside the sandbox, and a kill of
+    // the sandbox's tree must not take that command's supervisor with it, or
+    // nothing would report the command's end. Its command joins instead, first
+    // of all.
+    if let Some(procs) = context.cgroup_procs_fd
+        && !context.joins()
+    {
+        join_cgroup(procs)?;
     }
 
     // New namespaces, owned by the new user namespace, over which this
@@ -236,8 +263,10 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // unprivileged operations against namespaces this process owns. With a
     // PID namespace requested, this process stays outside it; the child
     // process forked next is its PID 1. A restriction creates no namespaces
-    // at all — that is its defining degradation.
-    if matches!(plan.confinement, super::Confinement::Container) {
+    // at all — that is its defining degradation. Nor does a launch that joins a
+    // running sandbox: it joins that sandbox's below, once the descriptors it
+    // keeps are the only ones left.
+    if matches!(plan.confinement, super::Confinement::Container) && !context.joins() {
         // SAFETY: `unshare_unsafe` is unsafe only because UnshareFlags::FILES
         // can invalidate file descriptors observed by other threads; the flags
         // frozen at build time never include the descriptor table, and this
@@ -256,28 +285,14 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // by the time the command image starts.
     sweep_fds(context).map_err(|errno| (SetupStep::SweepFds, errno, 0))?;
 
-    // The session keyring, the one piece of the caller's session the sweep
-    // cannot reach because it is a credential rather than a descriptor. Every
-    // sandbox stage is forked from this process, so replacing it here replaces
-    // it for all of them, in a restriction as in a container, and so does the
-    // filter installed where it cannot be replaced.
-    replace_session_keyring(plan).map_err(|errno| (SetupStep::ReplaceSessionKeyring, errno, 0))?;
-
-    // Establish the identity map, after the sweep so the map gate survives
-    // it, and before any further fork so every sandbox stage runs in a
-    // fully mapped namespace. This stage is the process that unshared, so
-    // its /proc/self map files name the new namespace.
-    if matches!(plan.confinement, super::Confinement::Container) {
-        establish_identity_map(context)?;
-    }
-
-    // Without a PID namespace this stage is the delegate for the command's
-    // nested identity map, and the host's `/proc` is the procfs that indexes
-    // it: the command shares this PID namespace, so the pid the fork below
-    // returns names it there. Opened now rather than after the fork, because
-    // the command's `pivot_root` acts on the mount namespace this stage shares
-    // with it and would change what the path resolves to.
-    let procfs = if !plan.pid_namespace && delegates_nested_map(context) {
+    // Where this stage supervises from outside the sandbox's PID namespace, it
+    // is the delegate for the command's nested identity map, and the host's
+    // `/proc` is the procfs that indexes it: the pid the fork below returns
+    // names the command there, in the PID namespace this stage is in. Opened
+    // now rather than after the fork, because the command's `pivot_root` acts
+    // on the mount namespace this stage shares with it and would change what
+    // the path resolves to, and before a join, which changes it the same way.
+    let procfs = if context.supervised_outside() && delegates_nested_map(context) {
         Some(
             rustix::fs::open(
                 c"/proc",
@@ -289,14 +304,36 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     } else {
         None
     };
+
+    if let Some(target) = context.join_fd {
+        join_sandbox(target, plan).map_err(|errno| (SetupStep::JoinSandbox, errno, 0))?;
+    }
+
+    // The session keyring, the one piece of the caller's session the sweep
+    // cannot reach because it is a credential rather than a descriptor. Every
+    // sandbox stage is forked from this process, so replacing it here replaces
+    // it for all of them, in a restriction as in a container, and so does the
+    // filter installed where it cannot be replaced.
+    replace_session_keyring(plan).map_err(|errno| (SetupStep::ReplaceSessionKeyring, errno, 0))?;
+
+    // Establish the identity map, after the sweep so the map gate survives
+    // it, and before any further fork so every sandbox stage runs in a
+    // fully mapped namespace. This stage is the process that unshared, so
+    // its /proc/self map files name the new namespace. A joining launch
+    // entered a namespace whose map is in force already.
+    if matches!(plan.confinement, super::Confinement::Container) && !context.joins() {
+        establish_identity_map(context)?;
+    }
+
     // The gate the map is established across, created immediately before the
     // fork so that this stage and the command are its only holders.
     let seam = nested_seam(procfs)?;
 
     // Where the init takes a process group of its own, it forks the command
     // only once this stage is gone, and watches for that through a pidfd of
-    // this stage that it inherits; see `await_launch_stage`.
-    let launch_stage = if context.own_process_group() {
+    // this stage that it inherits; see `await_launch_stage`. A joining launch
+    // has no init, and its command takes the group itself.
+    let launch_stage = if context.own_process_group() && !context.joins() {
         Some(
             process::pidfd_open(process::getpid(), PidfdFlags::empty())
                 .map_err(|errno| (SetupStep::AwaitLaunchStage, errno, 0))?,
@@ -305,20 +342,30 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
         None
     };
 
-    let fork_step = if plan.pid_namespace {
-        SetupStep::ForkInit
-    } else {
+    let fork_step = if context.supervised_outside() {
         SetupStep::ForkCommand
+    } else {
+        SetupStep::ForkInit
     };
     // SAFETY: the child process continues with frozen data and raw syscalls
     // only, per this module's constraints, and never returns.
     match unsafe { sys::fork() }.map_err(|errno| (fork_step, errno, 0))? {
         sys::Fork::Child => {
-            if plan.pid_namespace {
+            if !context.supervised_outside() {
                 // The init unblocks its own signals, once it has left the
                 // caller's process group; see `take_process_group`.
                 stage_init(context, launch_stage)
             } else {
+                // A joining command enters the sandbox's cgroup before anything
+                // else, and leaves the caller's process group as the init does
+                // for a first command, for the same reason, with every signal
+                // still blocked as the fork left it.
+                if context.joins() {
+                    if let Some(procs) = context.cgroup_procs_fd {
+                        join_cgroup(procs)?;
+                    }
+                    take_process_group(context)?;
+                }
                 unblock_signals().map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
                 // The command keeps its own end of the gate and drops the
                 // delegate's side of the seam, which is not its to hold.
@@ -373,7 +420,7 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                     return Err(failure);
                 }
             }
-            if plan.pid_namespace {
+            if !context.supervised_outside() {
                 // The init supervises itself from inside the namespace;
                 // this stage's work is done.
                 sys::exit_group(0)
@@ -471,14 +518,16 @@ fn start_own_session(context: &Context<'_>) -> Result<(), Failure> {
 /// is not a background read. It does so before the command exists, so the
 /// command never touches the terminal from a background group.
 ///
-/// Called by the init, first, with every signal still blocked as the fork left
-/// it, and that is a requirement rather than an order of convenience. The group
+/// Called by the init, first, or for a launch that joins a running sandbox by
+/// its command, first, with every signal still blocked as the fork left it, and
+/// that is a requirement rather than an order of convenience. The group
 /// is a background group of the terminal until the call that makes it the
 /// foreground, and the kernel answers that call from a background group by
 /// sending `SIGTTOU` to the group and restarting the call, unless the caller
 /// blocks or ignores the signal. The init, the namespace's PID 1, ignores a
 /// signal at its default disposition, so with `SIGTTOU` unblocked the call
-/// would restart forever. Blocked, the kernel lets the call through.
+/// would restart forever, and a joining command, which is no PID 1, would be
+/// stopped. Blocked, the kernel lets the call through.
 ///
 /// The init's own `setpgid` creates the group, and the launch stage does not
 /// set it a second time from outside, as a shell does for a job it is about to
@@ -718,18 +767,20 @@ fn abandon_command(command: Pid) {
     let _ = frame::retry_on_intr!(process::waitpid(Some(command), WaitOptions::empty()));
 }
 
-/// Stage command without a PID namespace: setup and exec in one process,
-/// supervised from outside by stage A. In a container the setup is the full
-/// sandbox sequence; in a restriction there is nothing to build and only the
-/// working directory changes.
+/// Stage command, supervised from outside by the launch stage: setup and exec
+/// in one process. In a container without a PID namespace the setup is the
+/// full sandbox sequence. In a restriction there is nothing to build, and in a
+/// launch that joins a running sandbox everything is built already, so only
+/// the working directory changes.
 fn stage_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     let setup = start_own_session(context).and_then(|()| match context.plan.confinement {
+        _ if context.joins() => enter_workdir(context),
         // The setup opens no procfs here: without a PID namespace the delegate
         // for the nested map is the launch stage, outside, which holds the
         // host's own.
         super::Confinement::Container => setup_sandbox(context).map(|_| ()),
         #[cfg(feature = "hardening")]
-        super::Confinement::Restriction => setup_restriction(context),
+        super::Confinement::Restriction => enter_workdir(context),
     });
     let replica = setup.and_then(|()| open_terminal(context));
     match replica {
@@ -741,9 +792,10 @@ fn stage_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
     }
 }
 
-/// The restriction setup: no namespaces to configure and no root to swap —
-/// only the working directory changes, resolved against the host filesystem,
-/// before the hardening and the exec.
+/// The setup of a command whose root is in place already: no namespaces to
+/// configure and no root to swap, only the working directory to change,
+/// before the hardening and the exec. A restriction's root is the host's, and
+/// a joining command's is the running sandbox's, which the join made its root.
 ///
 /// The root is the working directory a plan carrying none means, exactly as it
 /// is for a cage: `validate_workdir` collapses `/` to no workdir at all, so an
@@ -752,14 +804,46 @@ fn stage_command(context: &Context<'_>, nested_gate: Option<OwnedFd>) -> ! {
 /// nothing, so it says so here. Without it the command would inherit the
 /// caller's own directory, which is a different command each time it is
 /// launched from somewhere else.
-#[cfg(feature = "hardening")]
-fn setup_restriction(context: &Context<'_>) -> Result<(), Failure> {
+fn enter_workdir(context: &Context<'_>) -> Result<(), Failure> {
     let workdir = match &context.plan.workdir {
         Some(workdir) => workdir.as_c_str(),
         None => c"/",
     };
     process::chdir(workdir).map_err(|errno| (SetupStep::ChdirWorkdir, errno, 0))?;
     Ok(())
+}
+
+/// Moves this process into the sandbox's leaf cgroup through its
+/// `cgroup.procs`, where `0` names the writing process.
+fn join_cgroup(procs: BorrowedFd<'_>) -> Result<(), Failure> {
+    rustix::io::write(procs, b"0")
+        .map(drop)
+        .map_err(|errno| (SetupStep::JoinCgroup, errno, 0))
+}
+
+/// Joins a running sandbox: enters, with one `setns` through a pidfd of the
+/// process that holds them, every namespace the sandbox's own launch created.
+///
+/// The namespaces named are exactly the plan's unshare flags, which are the
+/// running sandbox's, since a joining launch's plan is its sandbox's with the
+/// command's own fields replaced. A flag the sandbox did not unshare would name
+/// the holder's instance of that namespace, the caller's own, over which the
+/// joined user namespace grants nothing, and the call would fail.
+///
+/// The kernel enters the user namespace first and the others with the
+/// capabilities its root holds, which this process has as the namespace's
+/// owner. Joining the mount namespace makes its root this process's root and
+/// working directory: the sandbox's own, as its pivot left it. A PID namespace
+/// is the one this process's children are created in, so the command is forked
+/// after this, and this process stays in the caller's, outside the sandbox's.
+///
+/// A holder that has exited answers `ESRCH`: the sandbox has ended. One that
+/// exits after this, before the fork, fails the fork with `ENOMEM` instead.
+fn join_sandbox(target: BorrowedFd<'_>, plan: &LaunchPlan) -> Result<(), Errno> {
+    thread::move_into_thread_name_spaces(
+        target,
+        thread::ThreadNameSpaceType::from_bits_retain(plan.unshare.bits()),
+    )
 }
 
 /// Wires the command's standard streams and executes the command.
@@ -2340,6 +2424,9 @@ fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
         context.stderr_fd,
         context.terminal_channel_fd,
         context.listener_channel_fd,
+        context.join_fd,
+        // A joining launch's command joins the cgroup after the sweep.
+        context.cgroup_procs_fd.filter(|_| context.joins()),
     ]
     .map(|channel| channel.map_or(-1 as RawFd, |fd| fd.as_raw_fd()));
     sweep_fds_keeping(&keep)

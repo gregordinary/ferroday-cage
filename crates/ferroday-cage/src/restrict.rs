@@ -150,6 +150,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
+use std::sync::Arc;
 
 use rustix::thread::UnshareFlags;
 
@@ -211,8 +212,9 @@ const BASE_ENV: [(&str, &str); 1] = [("PATH", spec::BASE_PATH)];
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Restriction {
-    /// The frozen launch plan the mechanism executes.
-    plan: LaunchPlan,
+    /// The frozen launch plan the mechanism executes, shared with the handles
+    /// its launches return.
+    plan: Arc<LaunchPlan>,
 }
 
 impl Restriction {
@@ -906,7 +908,7 @@ impl RestrictionBuilder {
         hardening.keep_caps = Some(0);
 
         Ok(Restriction {
-            plan: LaunchPlan {
+            plan: Arc::new(LaunchPlan {
                 confinement: Confinement::Restriction,
                 // A restriction creates no user namespace: there is no map
                 // to establish, no identity to switch to or to present, and
@@ -954,7 +956,7 @@ impl RestrictionBuilder {
                 cgroup,
                 cgroup_unapplied,
                 hardening,
-            },
+            }),
         })
     }
 }

@@ -844,6 +844,61 @@ name = "raw"
 kind = "positional"
 why = "Raw mode follows whether `fcage`'s own standard input is a terminal, which the shell decides."
 
+# A further command run in a running sandbox.
+[[builder]]
+name = "Exec"
+path = "ferroday_cage::Exec"
+
+[[builder.setting]]
+name = "arg"
+kind = "library"
+why = "`fcage` runs one command per invocation and keeps no sandbox running for another command to join. The tool would have to grow a session mode first: one invocation that holds a sandbox and runs the commands others send it."
+
+[[builder.setting]]
+name = "args"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "current_dir"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "env"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "envs"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "path_lookup"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "stderr"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "stdin"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "stdout"
+kind = "library"
+why = "As `arg`."
+
+[[builder.setting]]
+name = "stop_with_caller"
+kind = "library"
+why = "As `arg`."
+
 # The provisioners' own collaborators.
 [[builder]]
 name = "debian::RepositoryBuilder"

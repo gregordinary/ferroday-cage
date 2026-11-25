@@ -231,6 +231,9 @@ wire_enum! {
         /// the launch's own. `EDEADLK` where the filter would refuse the hand-over
         /// itself, which the stage checks before installing it.
         HandOverSeccompListener = 71 => "handing the seccomp filter's listener to the caller",
+        /// Join a running sandbox's namespaces, for a further command run in
+        /// it; see `Running::exec`.
+        JoinSandbox = 72 => "joining the running sandbox's namespaces",
     }
 }
 
@@ -1012,6 +1015,11 @@ rendered as text.
     /// then sends it; a filter refusing the send would hold the stage waiting
     /// for an answer only the listener it holds could give.
     SeccompReportsUndelivered,
+    /// A further command was to run in a restriction, through
+    /// `Running::exec`. A restriction creates no namespaces for a second
+    /// command to join, so there is nothing to run it in; launching the
+    /// restriction again with the other command is the same thing.
+    ExecIntoRestriction,
 }
 
 impl fmt::Display for ConfigError {
@@ -1091,6 +1099,10 @@ impl fmt::Display for ConfigError {
             ConfigError::SeccompReportsUndelivered => f.write_str(
                 "seccomp reports are on, and the policy refuses sendmsg, which hands the \
                  reports' listener to the caller; allow sendmsg, or turn the reports off",
+            ),
+            ConfigError::ExecIntoRestriction => f.write_str(
+                "a restriction has no namespaces for a further command to join; launch the \
+                 restriction again with that command instead",
             ),
             ConfigError::MountTargetInvalid { path } => write!(
                 f,
@@ -1740,6 +1752,15 @@ pub enum Error {
         /// The error the kernel returned for the install, `EBUSY`.
         source: io::Error,
     },
+    /// The sandbox a further command was to run in has ended: the process
+    /// holding its namespaces had exited by the time the command joined, or
+    /// exited before the command could be started there. See
+    /// `Running::exec`.
+    ///
+    /// No syscall failure is carried, as none is the cause: the join answers
+    /// `ESRCH` and a fork into an ended PID namespace `ENOMEM`, and either only
+    /// says the same thing again.
+    SandboxEnded,
 }
 
 /// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
@@ -1924,6 +1945,9 @@ impl fmt::Display for Error {
                 "the seccomp filter's refusals cannot be reported: a filter this process \
                  already runs under holds the one listener a process may have",
             ),
+            Error::SandboxEnded => {
+                f.write_str("the sandbox has ended, so no further command can run in it")
+            }
             Error::MountRefused {
                 step,
                 confinement,
@@ -1950,9 +1974,9 @@ impl std::error::Error for Error {
     /// Every OS failure this type carries is an [`io::Error`], so every one of
     /// them is returned here, including the syscall a recognized exhaustion
     /// came from. The variants that answer `None` carry nothing, since no
-    /// syscall failed: [`SupervisorLost`](Self::SupervisorLost) and
-    /// [`SupervisorUnreceived`](Self::SupervisorUnreceived) are absences the
-    /// library noticed, [`StreamIsDirectory`](Self::StreamIsDirectory) and
+    /// syscall failed: [`SupervisorLost`](Self::SupervisorLost),
+    /// [`SupervisorUnreceived`](Self::SupervisorUnreceived) and
+    /// [`SandboxEnded`](Self::SandboxEnded) are absences the library noticed, [`StreamIsDirectory`](Self::StreamIsDirectory) and
     /// [`ListenRefused`](Self::ListenRefused) are refusals it made before it
     /// made any, and [`Listen`](Self::Listen) answers `None` where its helper
     /// ended without saying why.
@@ -1979,6 +2003,7 @@ impl std::error::Error for Error {
                 .map(|source| source as &(dyn std::error::Error + 'static)),
             Error::SupervisorLost
             | Error::SupervisorUnreceived
+            | Error::SandboxEnded
             | Error::StreamIsDirectory { .. }
             | Error::ListenRefused { .. }
             | Error::CgroupRefused { .. } => None,

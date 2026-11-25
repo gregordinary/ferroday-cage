@@ -608,8 +608,10 @@ impl RawMount {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Cage {
-    /// The frozen launch plan the mechanism executes.
-    plan: LaunchPlan,
+    /// The frozen launch plan the mechanism executes, shared with the handles
+    /// its launches return, which a further command joining the sandbox is
+    /// planned from.
+    plan: Arc<LaunchPlan>,
 }
 
 impl Cage {
@@ -3312,7 +3314,7 @@ impl CageBuilder {
         };
 
         Ok(Cage {
-            plan: LaunchPlan {
+            plan: Arc::new(LaunchPlan {
                 confinement: Confinement::Container,
                 identity,
                 nested: Some(nested),
@@ -3348,7 +3350,7 @@ impl CageBuilder {
                 cgroup_unapplied,
                 #[cfg(feature = "hardening")]
                 hardening,
-            },
+            }),
         })
     }
 }
@@ -6648,6 +6650,7 @@ mod tests {
                 .unwrap()
                 .plan
                 .workdir
+                .clone()
         };
         assert_eq!(workdir("/build").as_deref(), Some(c"/build"));
         assert_eq!(workdir("/"), None);
@@ -8890,7 +8893,7 @@ mod tests {
         std::fs::write(rootfs.join("etc/shipped"), b"already here").unwrap();
         let canonical = std::fs::canonicalize(&rootfs).unwrap();
         let placeholders =
-            |builder: CageBuilder| builder.build().unwrap().plan.managed_placeholders;
+            |builder: CageBuilder| builder.build().unwrap().plan.managed_placeholders.clone();
 
         // The paths are recorded relative to the root's writable layer, and
         // resolved against a descriptor for it when the time comes to remove
@@ -8967,6 +8970,7 @@ mod tests {
                 .unwrap()
                 .plan
                 .managed_placeholders
+                .clone()
         };
 
         // Nothing at the hidden path: the hide mounts nothing, and the bind
@@ -9046,7 +9050,7 @@ mod tests {
         std::fs::write(dir.join("host-side/real/entry"), b"host").unwrap();
 
         let placeholders =
-            |builder: CageBuilder| builder.build().unwrap().plan.managed_placeholders;
+            |builder: CageBuilder| builder.build().unwrap().plan.managed_placeholders.clone();
         let recorded = placeholders(
             Cage::builder()
                 .rootfs(&rootfs)

@@ -255,6 +255,7 @@ packages from a binary package host into it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod error;
+mod exec;
 mod failure;
 // The guide's Rust blocks, compiled as doctests of this crate. Every feature is
 // named because the guide documents the whole library, and the module is a
@@ -322,6 +323,7 @@ mod wire;
 
 pub use cgroup::{CgroupLimit, CgroupReach, CgroupRefusal, ParseCgroupLimitError};
 pub use error::{ConfigError, Error, ListenRefusal, OverlayLayer, SetupStep};
+pub use exec::Exec;
 pub use failure::ErrorChain;
 #[cfg(feature = "hardening")]
 pub use hardening::{

@@ -145,6 +145,13 @@ required-features = ["tarball"]
 name = "handle"
 required-features = ["tarball"]
 
+# Further commands run in a running sandbox, against the rootfs fixture; the
+# hardening and restriction cases are gated on `hardening` within the binary,
+# and the range-map case on a working delegate.
+[[test]]
+name = "exec"
+required-features = ["tarball"]
+
 # The terminal tests launch real sandboxes against the rootfs fixture; the
 # run-as case additionally needs a range-map delegate and is gated on `subid`
 # within the binary.

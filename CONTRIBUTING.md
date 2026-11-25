@@ -566,7 +566,7 @@ report name a package and its version bare.
 | Name a filesystem entry no concurrent caller can collide with | `host::unique_hex` |
 | Fill a buffer from the kernel's randomness | `host::fill_random` |
 | Fork, exec, exit, change signal state, or read signals from a descriptor, without libc | `mechanism::sys` |
-| Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
+| Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::exits_within` for a bounded wait, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
 | Fork a helper child and signal or reap it whatever else in the caller reaps | `mechanism::sys::fork_with_pidfd`, which hands back a `mechanism::Forked`, or `mechanism::sys::probe` for a probe whose exit code is its answer |
 | Write a forked child's own identity map, or take the child into a mapped user namespace of its own | `mechanism::child::establish_map`, and `child::enter_mapped_namespace` for the whole entry, other namespaces beside it included |
 | Keep a descriptor the launch creates off the standard streams' numbers | `mechanism::above_stdio` in the caller, and in the sandbox's processes the launch stage's `child::hold_closed_streams`, which holds each number the caller left closed before any stage creates a descriptor |
@@ -603,7 +603,9 @@ report name a package and its version bare.
 | Can this caller write a range map directly, without a delegate? | `idmap::direct_write_refusal`, over `idmap::effective_capabilities`, which `DirectMapper` asks of a request and `host::range_map_blocker` of no extent at all |
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |
 | What does the single-identity map write? | `idmap::single_identity_lines` |
-| Validate the command a sandbox or a restriction executes | `spec::validate_command` |
+| Validate the command a sandbox or a restriction executes | `spec::validate_command`, and `spec::lookup_candidates` for the paths a bare name is executed through |
+| Compose a command's environment over a base, or read a composed one back as variables | `spec::compose_env`, `spec::env_pairs`, which an `Exec` composes over its launch's environment with |
+| Enter a running sandbox, for a further command run in it | `mechanism::child::join_sandbox`, in the launch stage of a launch whose context names the process holding the sandbox's namespaces, which `Running::exec` makes |
 | Which syscall number, or which errno, does a name spell for a seccomp policy? | `SeccompRules::syscall`, `SeccompRules::errno` |
 | Does a seccomp policy let no call of a syscall run, whatever its arguments? | `SeccompPolicy::never_runs` |
 | Write a classic-BPF seccomp program by hand, or install one | `mechanism::seccomp`: its `bpf` opcodes and offsets, its audit architectures, and `seccomp::install` |

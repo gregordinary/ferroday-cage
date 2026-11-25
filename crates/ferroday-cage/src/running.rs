@@ -18,7 +18,8 @@ use rustix::process::Signal;
 
 use crate::Network;
 use crate::cgroup::Cgroup;
-use crate::error::{Error, ListenRefusal};
+use crate::error::{ConfigError, Error, ListenRefusal, SetupStep};
+use crate::exec::Exec;
 use crate::mechanism::netns::{self, ListenFailure, Namespaces};
 use crate::mechanism::{
     self, CONTROL_TERMINATE, CreatedTarget, LaunchPlan, ManagedPlaceholders, MountOp,
@@ -167,6 +168,85 @@ pub struct Running<'obs> {
     /// reports its refusals, until the caller takes it.
     #[cfg(feature = "hardening")]
     seccomp_reports: Option<mechanism::SeccompReports>,
+    /// The sandbox a further command joins through this handle; see
+    /// [`exec`](Self::exec). `None` for a restriction, which has no namespaces
+    /// to join.
+    sandbox: Option<Sandbox>,
+}
+
+/// The sandbox a handle's command runs in, as a further command joins it.
+#[derive(Clone)]
+enum Sandbox {
+    /// The handle is the launch's own: the plan it launched, the process its
+    /// launch left holding the namespaces, and its cgroup are the sandbox's.
+    Launched(Arc<LaunchPlan>),
+    /// The handle is a further command's, which shares what the sandbox's own
+    /// handle made for it, so a command it starts joins the same sandbox.
+    Joined(Arc<Joinable>),
+}
+
+impl Sandbox {
+    /// What a launch of `plan` leaves a further command to join: a container's
+    /// sandbox, and nothing for a restriction.
+    fn of(plan: &Arc<LaunchPlan>) -> Option<Sandbox> {
+        matches!(plan.confinement, mechanism::Confinement::Container)
+            .then(|| Sandbox::Launched(Arc::clone(plan)))
+    }
+}
+
+/// What a further command joins a running sandbox through.
+struct Joinable {
+    /// The plan of the sandbox's own launch, which a further command's plan is
+    /// the launch's with the command replaced; see `Exec::plan`.
+    plan: Arc<LaunchPlan>,
+    /// A pidfd of the process holding the sandbox's namespaces: its init, or
+    /// without a PID namespace the launch stage that supervises its first
+    /// command from outside. Either lives exactly as long as the sandbox, so
+    /// its exit is the sandbox's end.
+    holder: OwnedFd,
+    /// The sandbox's cgroup, whose leaf a further command's launch stage joins.
+    /// Held as a kill handle holds it, for as long as the further command's
+    /// handle lives; killing and removing it stay the sandbox's own handle's.
+    cgroup: Option<Arc<Cgroup>>,
+}
+
+/// How long a further command's launch waits, after a failure an ending
+/// sandbox causes, for the sandbox's holder to be seen exiting.
+///
+/// A holder that is exiting gives up its namespaces before its exit shows on
+/// its pidfd, and an init then ends its PID namespace, waiting for every member
+/// to be gone. Meanwhile the join answers `ESRCH`, and a fork into the
+/// namespace `ENOMEM`. The members are killed, so the wait is short, and a
+/// failure that is genuinely memory's costs this long once.
+const ENDING_PATIENCE: Duration = Duration::from_secs(1);
+
+/// The error a further command's failed launch reports: [`Error::SandboxEnded`]
+/// where the sandbox's end is what failed it, and `err` otherwise.
+///
+/// A failure is the sandbox's end where the holder has exited by the time it
+/// is read. The two an ending holder causes before its exit shows on its pidfd,
+/// the join's `ESRCH` and the fork's `ENOMEM`, give it [`ENDING_PATIENCE`] to
+/// be seen exiting.
+fn sandbox_ended(err: Error, holder: BorrowedFd<'_>) -> Error {
+    let caused_by_an_ending_holder = |step: SetupStep, source: &std::io::Error| {
+        let errno = source.raw_os_error();
+        match step {
+            SetupStep::JoinSandbox => errno == Some(Errno::SRCH.raw_os_error()),
+            SetupStep::ForkCommand => errno == Some(Errno::NOMEM.raw_os_error()),
+            _ => false,
+        }
+    };
+    let patience = match &err {
+        Error::Setup { step, source, .. } if caused_by_an_ending_holder(*step, source) => {
+            ENDING_PATIENCE
+        }
+        _ => Duration::ZERO,
+    };
+    if mechanism::exits_within(holder, patience) {
+        Error::SandboxEnded
+    } else {
+        err
+    }
 }
 
 /// Which channel one of the pump's poll slots watches, and where its readiness
@@ -288,7 +368,7 @@ enum Channel {
 impl<'obs> Running<'obs> {
     /// Launches the plan and wraps the caller-side channels.
     pub(crate) fn launch(
-        plan: &LaunchPlan,
+        plan: &Arc<LaunchPlan>,
         mut observer: Option<&'obs mut dyn Observer>,
     ) -> Result<Running<'obs>, Error> {
         let observe = observer.is_some();
@@ -307,6 +387,7 @@ impl<'obs> Running<'obs> {
                     observe,
                     None,
                     procs,
+                    None,
                     &mut |event| {
                         if let Some(observer) = observer.as_deref_mut() {
                             observer.progress(event);
@@ -326,7 +407,8 @@ impl<'obs> Running<'obs> {
             observer,
             started.placeholders,
             ready,
-            started.cgroup,
+            started.cgroup.map(Arc::new),
+            Sandbox::of(plan),
         ))
     }
 
@@ -334,7 +416,7 @@ impl<'obs> Running<'obs> {
     /// returns the outcome with everything the command wrote: what
     /// [`Cage::output`](crate::Cage::output) and its restriction counterpart
     /// return.
-    pub(crate) fn output(plan: &LaunchPlan) -> Result<Output, Error> {
+    pub(crate) fn output(plan: &Arc<LaunchPlan>) -> Result<Output, Error> {
         let mut collect = Collect::default();
         let (status, usage) = {
             let mut running = Running::launch(plan, Some(&mut collect))?;
@@ -350,7 +432,7 @@ impl<'obs> Running<'obs> {
     /// No observer, so no progress milestone is reported and nothing is
     /// captured: the terminal is the command's output, and the caller reads it.
     pub(crate) fn launch_terminal(
-        plan: &LaunchPlan,
+        plan: &Arc<LaunchPlan>,
         terminal: &Terminal,
     ) -> Result<(Running<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
@@ -358,7 +440,15 @@ impl<'obs> Running<'obs> {
         let started = start(
             plan,
             |procs, created| {
-                mechanism::spawn(plan, false, Some(terminal), procs, &mut |_| {}, created)
+                mechanism::spawn(
+                    plan,
+                    false,
+                    Some(terminal),
+                    procs,
+                    None,
+                    &mut |_| {},
+                    created,
+                )
             },
             |launched| launched.pidfd.as_fd(),
         )?;
@@ -371,19 +461,24 @@ impl<'obs> Running<'obs> {
                 None,
                 started.placeholders,
                 ready,
-                started.cgroup,
+                started.cgroup.map(Arc::new),
+                Sandbox::of(plan),
             ),
             Pty::new(primary),
         ))
     }
 
     /// Wraps the caller-side channels of an already-launched sandbox.
+    ///
+    /// `cgroup` is the cgroup this handle kills and removes, and `sandbox` what
+    /// a further command joins through it.
     fn from_launched(
         launched: mechanism::Launched,
         observer: Option<&'obs mut dyn Observer>,
         placeholders: PlaceholderGuard,
         ready: Readiness,
-        cgroup: Option<Cgroup>,
+        cgroup: Option<Arc<Cgroup>>,
+        sandbox: Option<Sandbox>,
     ) -> Running<'obs> {
         let buf = if observer.is_some() {
             vec![0; PUMP_BUF]
@@ -409,10 +504,11 @@ impl<'obs> Running<'obs> {
             _placeholders: placeholders,
             foreground: launched.foreground,
             ready,
-            cgroup: cgroup.map(Arc::new),
+            cgroup,
             cgroup_read: false,
             #[cfg(feature = "hardening")]
             seccomp_reports: launched.seccomp_reports,
+            sandbox,
         }
     }
 
@@ -704,6 +800,156 @@ impl<'obs> Running<'obs> {
             kill_sent: Arc::clone(&self.kill_sent),
             cgroup: self.cgroup.clone(),
         })
+    }
+
+    /// Runs a further command in this handle's sandbox, confined as its first
+    /// command is, and returns a handle to it.
+    ///
+    /// The command joins the sandbox the handle's own command runs in: its
+    /// root and every mount its setup made, its processes, its network and any
+    /// network stack attached to it, its hostname, its IPC namespace, and its
+    /// cgroup and limits. It enters a nested user and mount namespace of its
+    /// own, as the first command did, copied from the sandbox's setup rather
+    /// than from the first command's, so a read-only bind is as read-only to it
+    /// and a mount the first command made in its own namespace is not seen. Its
+    /// identity, resource limits and hardening are the launch's, applied afresh:
+    /// it is a Landlock domain and a seccomp filter of its own, with the same
+    /// rules. [`Exec`] says what the exec states itself.
+    ///
+    /// Like [`Cage::spawn`](crate::Cage::spawn), this blocks until the command
+    /// is executing, so a failure of its setup, its exec included, is reported
+    /// here. It costs a fork, the join, the nested namespace and the hardening,
+    /// and none of the sandbox's own setup.
+    ///
+    /// # Commands side by side
+    ///
+    /// Each command is a user namespace of its own, so one cannot `ptrace`
+    /// another, or read another's `/proc/<pid>/environ`, `fd` or `mem`. Each can
+    /// see the others in `/proc` and signal them, as every process of the
+    /// sandbox can, unless the hardening sets Landlock's signal scope, under
+    /// which each command is a domain the others cannot signal. A command can
+    /// therefore end or stop another, a further command still being set up
+    /// included, which leaves this call waiting.
+    ///
+    /// # Lifetime
+    ///
+    /// The returned handle governs the further command and not the sandbox: its
+    /// [`terminate`](Self::terminate) and [`kill`](Self::kill) signal that
+    /// command alone, as a launch without a PID namespace does, and what the
+    /// command started runs on until the sandbox ends. Its
+    /// [`stop_with_caller`](Exec::stop_with_caller) ends the command, not the
+    /// sandbox. A further command's handle runs further commands in the same
+    /// sandbox.
+    ///
+    /// The sandbox ends as it always does, with its first command. With a PID
+    /// namespace that ends every further command too, which reports `SIGKILL`.
+    /// Without one a further command runs on, as the first command's own
+    /// descendants do, unless a kill of the sandbox's cgroup ends it.
+    ///
+    /// Inside the sandbox the command's parent is outside its PID namespace, so
+    /// `getppid` answers 0, and a process it leaves behind is reparented to the
+    /// sandbox's init. Its [`usage`](Self::usage) is what the command and the
+    /// descendants it waited for used, without the cgroup's figures, which are
+    /// the sandbox's and stay on its own handle.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SandboxEnded`] where the sandbox has ended, before or while the
+    /// command joined it, and
+    /// [`ConfigError::ExecIntoRestriction`](crate::ConfigError::ExecIntoRestriction)
+    /// on a restriction's handle, which has nothing to join. A command the
+    /// launch's composition refuses is a configuration error, as at build. The
+    /// join itself fails as [`Error::Setup`] at
+    /// [`SetupStep::JoinSandbox`](crate::SetupStep::JoinSandbox), where the
+    /// caller runs under a seccomp policy that refuses `setns`, for one.
+    pub fn exec(&self, exec: &Exec) -> Result<Running<'static>, Error> {
+        Running::join(self.joinable()?, exec, None)
+    }
+
+    /// Runs a further command in this handle's sandbox, capturing its output
+    /// for the observer, and returns a handle to it.
+    ///
+    /// Like [`exec`](Self::exec), with the capture
+    /// [`Cage::spawn_with`](crate::Cage::spawn_with) makes for a first command.
+    pub fn exec_with<'o>(
+        &self,
+        exec: &Exec,
+        observer: &'o mut dyn Observer,
+    ) -> Result<Running<'o>, Error> {
+        Running::join(self.joinable()?, exec, Some(observer))
+    }
+
+    /// What a further command joins this handle's sandbox through.
+    ///
+    /// The sandbox's own handle makes it from the plan it launched, a
+    /// duplicate of the pidfd of the process holding the namespaces, and the
+    /// cgroup. A further command's handle shares the one it was made with.
+    fn joinable(&self) -> Result<Arc<Joinable>, Error> {
+        let plan = match &self.sandbox {
+            None => return Err(ConfigError::ExecIntoRestriction.into()),
+            Some(Sandbox::Joined(joinable)) => return Ok(Arc::clone(joinable)),
+            Some(Sandbox::Launched(plan)) => plan,
+        };
+        // With a PID namespace the anchor is the init. Without one it is the
+        // first command, in nested namespaces of its own, and the sandbox's are
+        // held by the launch stage this handle reaps, which is gone once reaped.
+        let holder = if plan.pid_namespace {
+            Some(&self.pidfd)
+        } else {
+            self.reap.as_ref()
+        };
+        let holder = holder
+            .ok_or(Error::SandboxEnded)?
+            .try_clone()
+            .map_err(|source| Error::Spawn { source })?;
+        Ok(Arc::new(Joinable {
+            plan: Arc::clone(plan),
+            holder,
+            cgroup: self.cgroup.clone(),
+        }))
+    }
+
+    /// Launches `exec` into the sandbox `joinable` names and wraps its
+    /// channels.
+    fn join(
+        joinable: Arc<Joinable>,
+        exec: &Exec,
+        mut observer: Option<&'obs mut dyn Observer>,
+    ) -> Result<Running<'obs>, Error> {
+        if mechanism::has_exited(joinable.holder.as_fd()) {
+            return Err(Error::SandboxEnded);
+        }
+        let plan = exec.plan(&joinable.plan)?;
+        let observe = observer.is_some();
+        if observe {
+            check_capture_composes(&plan)?;
+        }
+        let ready = Readiness::new()?;
+        let spawned = mechanism::spawn(
+            &plan,
+            observe,
+            None,
+            joinable.cgroup.as_deref().map(Cgroup::procs),
+            Some(joinable.holder.as_fd()),
+            &mut |event| {
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer.progress(event);
+                }
+            },
+            // A joining launch mounts nothing, so it creates no target.
+            &mut Vec::new(),
+        );
+        let (launched, primary) =
+            spawned.map_err(|err| sandbox_ended(err, joinable.holder.as_fd()))?;
+        debug_assert!(primary.is_none(), "a launch with no terminal returns none");
+        Ok(Running::from_launched(
+            launched,
+            observer,
+            PlaceholderGuard::default(),
+            ready,
+            None,
+            Some(Sandbox::Joined(joinable)),
+        ))
     }
 
     /// Whether every channel has settled: the streams at end-of-file, the
@@ -1336,12 +1582,15 @@ pub struct Pending<'obs> {
     placeholders: PlaceholderGuard,
     /// The sandbox's cgroup, handed to the [`Running`] this becomes.
     cgroup: Option<Cgroup>,
+    /// What a further command joins the sandbox through, handed to the
+    /// [`Running`] this becomes.
+    sandbox: Option<Sandbox>,
 }
 
 impl<'obs> Pending<'obs> {
     /// Launches the plan in the gated shape and wraps it.
     pub(crate) fn launch(
-        plan: &LaunchPlan,
+        plan: &Arc<LaunchPlan>,
         mut observer: Option<&'obs mut dyn Observer>,
     ) -> Result<Pending<'obs>, Error> {
         let observe = observer.is_some();
@@ -1375,6 +1624,7 @@ impl<'obs> Pending<'obs> {
             observer,
             placeholders: started.placeholders,
             cgroup: started.cgroup,
+            sandbox: Sandbox::of(plan),
         })
     }
 
@@ -1386,7 +1636,7 @@ impl<'obs> Pending<'obs> {
     /// nothing writes to the terminal while the launch is held, so the caller
     /// attaches its network stack and proceeds with the primary already in hand.
     pub(crate) fn launch_terminal(
-        plan: &LaunchPlan,
+        plan: &Arc<LaunchPlan>,
         terminal: &Terminal,
     ) -> Result<(Pending<'static>, Pty), Error> {
         check_terminal_composes(plan)?;
@@ -1406,6 +1656,7 @@ impl<'obs> Pending<'obs> {
                 observer: None,
                 placeholders: started.placeholders,
                 cgroup: started.cgroup,
+                sandbox: Sandbox::of(plan),
             },
             Pty::new(primary),
         ))
@@ -1602,7 +1853,8 @@ impl<'obs> Pending<'obs> {
             observer,
             std::mem::take(&mut self.placeholders),
             ready,
-            self.cgroup.take(),
+            self.cgroup.take().map(Arc::new),
+            self.sandbox.take(),
         ))
     }
 }
@@ -1938,6 +2190,7 @@ mod tests {
             PlaceholderGuard::default(),
             Readiness::new().expect("an epoll set"),
             None,
+            None,
         );
 
         let thread = rustix::thread::gettid().as_raw_nonzero().get();
@@ -1996,6 +2249,7 @@ mod tests {
             PlaceholderGuard::default(),
             Readiness::new().expect("an epoll set"),
             None,
+            None,
         );
         // One wait reads the record and the next sees the supervisor gone.
         let outcome = (0..3).find_map(|_| {
@@ -2051,6 +2305,7 @@ mod tests {
             Some(&mut collect),
             PlaceholderGuard::default(),
             Readiness::new().expect("an epoll set"),
+            None,
             None,
         );
         let quiet = |running: &Running<'_>| {
