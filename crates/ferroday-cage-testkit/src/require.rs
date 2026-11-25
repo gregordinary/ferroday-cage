@@ -26,6 +26,7 @@
 
 use std::fmt::Display;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 
 /// A host facility some tests need, and the variable that asserts they ran.
@@ -44,8 +45,10 @@ pub const USERNS: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_USERNS
 /// large enough for what a test maps.
 pub const SUBID: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_SUBID");
 
-/// The native network stack's host facilities: `/dev/net/tun`, and the IPv6
-/// loopback its IPv6 flows are tested against.
+/// The native network stack's host facilities: `/dev/net/tun`, the IPv6
+/// loopback its IPv6 flows are tested against, and an IPv4 address of the
+/// host's own on a route outward, which its destination rules are tested
+/// against ([`routable_v4`]).
 pub const TUN: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_TUN");
 
 /// Overlay-rooted sandboxes, and the overlay markers a test lays into an upper
@@ -289,6 +292,49 @@ pub fn tun() -> bool {
         Err(err) => {
             TUN.skip(format!("/dev/net/tun is unavailable: {err}"));
             false
+        }
+    }
+}
+
+/// The host's own IPv4 address on its route outward: the source a connection
+/// the host makes leaves from.
+///
+/// The native network stack carries a guest's flow to that address as it would
+/// to any other routable destination, so a test of the stack's destination
+/// rules connects the guest to a server listening there. Loopback, where a
+/// test's servers otherwise listen, is a destination the stack always refuses,
+/// whatever the rules say.
+///
+/// Found by connecting a UDP socket toward `192.0.2.1`, a documentation
+/// address, which sends nothing and has the kernel choose the source it would
+/// use. Where the host has no such route, or the route leaves from an address
+/// the stack always refuses, [`TUN`] reports the skip and the answer is
+/// `None`.
+#[track_caller]
+pub fn routable_v4() -> Option<Ipv4Addr> {
+    let probe = || -> std::io::Result<SocketAddr> {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+        socket.local_addr()
+    };
+    match probe() {
+        Ok(SocketAddr::V4(source))
+            if !source.ip().is_loopback()
+                && !source.ip().is_link_local()
+                && !source.ip().is_unspecified() =>
+        {
+            Some(*source.ip())
+        }
+        Ok(source) => {
+            TUN.skip(format!(
+                "the host's route outward leaves from {}, which the native stack refuses",
+                source.ip()
+            ));
+            None
+        }
+        Err(err) => {
+            TUN.skip(format!("the host has no IPv4 route outward: {err}"));
+            None
         }
     }
 }

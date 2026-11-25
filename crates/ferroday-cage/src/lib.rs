@@ -327,7 +327,10 @@ pub use limits::{Limit, Resource};
 #[cfg(feature = "hardening")]
 pub use mechanism::SockFilter;
 #[cfg(feature = "netstack")]
-pub use netstack::{NetStack, NetStackBuilder, NetStackError, NetStackHandle};
+pub use netstack::{
+    DestinationRule, NetStack, NetStackBuilder, NetStackError, NetStackHandle,
+    ParseDestinationRuleError, Transport,
+};
 pub use observer::{Observer, Output, Progress};
 pub use resolved::{
     ResolvedCgroup, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,

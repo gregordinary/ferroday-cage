@@ -180,11 +180,13 @@ network the stack always places the gateway at host 2, its nameserver at host
 | Host-loopback mapping | off | [`host_loopback`][`NetStackBuilder::host_loopback`], [`host_loopback_port`][`NetStackBuilder::host_loopback_port`] |
 | Published ports | none | [`publish`][`NetStackBuilder::publish`] |
 | Nameserver | on, asking the host's resolver | [`nameserver`][`NetStackBuilder::nameserver`], [`upstream`][`NetStackBuilder::upstream`] |
+| Destination rules | none | [`allow`][`NetStackBuilder::allow`], [`deny`][`NetStackBuilder::deny`] |
 
 With the `serde` feature the builder is also the stack's profile format: it
 serializes and deserializes as the stack specification, for embedding in a
 consumer's own configuration. Keys are kebab-case, unknown keys are rejected,
-and the CIDR fields read and write as `"address/len"` strings.
+the CIDR fields read and write as `"address/len"` strings, and the `allow` and
+`deny` lists hold each rule as its text.
 
 ### The handle owns the stack
 
@@ -244,9 +246,8 @@ The stack is an egress NAT. A destination it accepts is reached from the host's
 own network position and source address. The guest therefore reaches what the
 host reaches, the host's network neighbors included. A host service bound to a
 wildcard address, `0.0.0.0` or `::`, answers on the host's own addresses. The
-guest reaches it there, though its loopback address is refused. A caller that
-must bound egress confines it outside the stack, with a host firewall or an
-[external stack](#bring-your-own-stack) of its own.
+guest reaches it there, though its loopback address is refused. A caller bounds
+that with [destination rules](#destination-rules).
 
 A [Landlock network rule](hardening.md#landlock-network-rules) bounds egress by
 port from inside the sandbox, and the stack carries nothing past it. Once a
@@ -294,6 +295,83 @@ guest's point of view, so it resolves a hardware address before it sends a
 segment, and the stack answers ARP and neighbor discovery only for the gateway.
 Nothing replies, and the connection fails a few seconds later, when the guest's
 own address resolution gives up.
+
+### Destination rules
+
+[`allow`][`NetStackBuilder::allow`] and [`deny`][`NetStackBuilder::deny`]
+bound where the guest's flows go. Each takes a [`DestinationRule`], parsed from
+the text `fcage` and the stack's profile format take as well:
+
+| Rule | Matches |
+|---|---|
+| `192.0.2.7`, `2001:db8::1` | the address |
+| `192.0.2.0/24`, `2001:db8::/32` | every address in the network |
+| `RULE:443`, `RULE:80,443`, `RULE:8000-8999` | the rule, on those ports alone |
+| `tcp:RULE`, `udp:RULE` | the rule, over that transport alone |
+
+An IPv6 address or network with ports is bracketed, as in `[2001:db8::1]:443`.
+Unbracketed, its colons are its own and it carries no ports. An address rule
+covers TCP and UDP unless a transport says otherwise.
+
+The rules decide a destination together:
+
+- A deny rule that matches refuses it, whatever else matches.
+- Once any allow rule is given, a destination no allow rule admits is refused.
+- With deny rules alone, a destination no deny rule refuses is carried.
+- With no rules, the stack carries what it always has.
+
+So allow rules alone read as "only these", and deny rules alone as "everything
+but these":
+
+```rust
+# use ferroday_cage::{NetStack, Transport};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// Only the mirror's network, and only over HTTPS.
+let mirror = NetStack::builder()
+    .allow("tcp:203.0.113.0/24:443".parse()?)
+    .build()?;
+assert!(mirror.forwards(Transport::Tcp, "203.0.113.9:443".parse()?));
+assert!(!mirror.forwards(Transport::Tcp, "198.51.100.1:443".parse()?));
+
+// Everything but the local network.
+let outward = NetStack::builder()
+    .deny("192.168.0.0/16".parse()?)
+    .deny("fc00::/7".parse()?)
+    .build()?;
+assert!(outward.forwards(Transport::Udp, "198.51.100.1:53".parse()?));
+assert!(!outward.forwards(Transport::Tcp, "192.168.1.1:80".parse()?));
+# Ok(())
+# }
+```
+
+A refused destination is refused as the stack refuses any other: a TCP
+connection is reset and a datagram is dropped. The rules belong to the stack's
+configuration, so every attachment of one `NetStack` applies them, and they do
+not change while a sandbox runs.
+
+Some of the stack's behaviour sits outside the rules:
+
+- The refusals above stand under every rule. No rule admits loopback,
+  link-local, multicast, AWS's IPv6 instance services, or the guest's own
+  subnet.
+- The gateway's [loopback mapping](#what-answers-and-what-checks-reachability)
+  and the [published ports](#publishing-a-port) are grants of their own, and a
+  rule neither widens nor narrows them.
+- So is the [nameserver](#dns), which relays the guest's queries to a resolver
+  of the host's. A query carries whatever its name spells to that resolver and
+  on to the servers it asks, so the nameserver is a way out the rules do not
+  bound. A caller whose rules must be the guest's only way out turns it off.
+- An IPv4 rule covers the address's NAT64 spelling, `64:ff9b::a.b.c.d`, too,
+  since a translator carries a flow there to the IPv4 address. A deny rule
+  cannot be passed by way of the translator.
+
+The grammar reads a name as well, `example.com` or `*.example.com`. The stack
+decides each flow by its address, though, so
+[`build`][`NetStackBuilder::build`] refuses a name rule with
+[`NetStackError::RuleInvalid`], as it refuses an allow rule over every name
+(`*`) or every name under one label (`*.com`). Parsing refuses a name whose last
+label is a number, such as `2130706433` or `127.1`, which a resolver may read as
+an address.
 
 ### What answers, and what checks reachability
 
@@ -485,7 +563,8 @@ being no stack left to attach.
 
 `--netstack-upstream ADDRESS` has the nameserver ask another resolver, on port 53
 or on the port of an `ADDRESS:PORT`, and `--netstack-no-nameserver` turns the
-nameserver off. `--netstack-host-port PORT` maps one port of the gateway onto
+nameserver off. `--netstack-allow RULE` and `--netstack-deny RULE` give the
+[destination rules](#destination-rules), each as often as needed. `--netstack-host-port PORT` maps one port of the gateway onto
 host loopback.
 `--netstack-publish HOST GUEST_PORT` publishes a guest port, where `HOST` is an
 `ADDRESS:PORT` or a bare port on `127.0.0.1`. A publication on port 0 has
@@ -600,6 +679,11 @@ outside the sandbox and is not filtered.
 [`NetStackBuilder::publish`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.publish
 [`NetStackBuilder::nameserver`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.nameserver
 [`NetStackBuilder::upstream`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.upstream
+[`NetStackBuilder::allow`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.allow
+[`NetStackBuilder::deny`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.deny
+[`NetStackBuilder::build`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.build
+[`DestinationRule`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.DestinationRule.html
+[`NetStackError::RuleInvalid`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.NetStackError.html#variant.RuleInvalid
 [`NetStackHandle::published`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.published
 [`NetStackHandle`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html
 [`NetStackHandle::stop`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.stop

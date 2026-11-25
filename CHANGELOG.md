@@ -61,8 +61,27 @@ consumer upgrading can skip it.
   container runtime's default profile refuses every mount, so inside a container
   started with its defaults a launch fails this way. The profile is read from
   `/proc/self/attr/apparmor/current`, from Linux 5.8.
+- The native network stack takes destination rules. `NetStackBuilder::allow`
+  and `NetStackBuilder::deny` each take a `DestinationRule`: an address or a
+  network, optionally with ports (`:443`, `:80,443`, `:8000-8999`) and a
+  transport (`tcp:` or `udp:`), an IPv6 one with ports in brackets. A deny rule
+  that matches refuses a destination; once any allow rule is given, a
+  destination no allow rule admits is refused. The stack's fixed refusals
+  stand under every rule, and the gateway's loopback mapping, the published
+  ports and the nameserver are outside the rules. An IPv4 rule covers the
+  address's NAT64 spelling too. A rule parses from text and writes back with
+  `Display`, and a malformed one is refused with the new
+  `ParseDestinationRuleError`. The grammar reads a name, and `build` refuses a
+  name rule, and an allow rule over every name or every name under one label,
+  with the new `NetStackError::RuleInvalid`. The stack's profile format gains
+  the `allow` and `deny` keys, and `fcage` the `--netstack-allow RULE` and
+  `--netstack-deny RULE` flags.
 
 ### Changed
+
+- **Breaking.** `NetStack::forwards` takes the new `Transport`, TCP or UDP,
+  beside the destination, since a destination rule can carry one transport and
+  not the other.
 
 - **Breaking.** `fcage --netstack` names the stack's nameserver in the
   sandbox's `resolv.conf`, through `CageBuilder::nameservers`, rather than
@@ -122,6 +141,15 @@ consumer upgrading can skip it.
   of untrusted input, reached through a `fuzzing` module that exists only under
   `--cfg fuzzing`. The first target reads a guest's DNS message as the stack's
   nameserver does. CI's new `fuzz` job builds every target on a pinned nightly.
+- The network stack's prefix arithmetic, a prefix length's mask and whether a
+  network holds an address, is `netstack::prefix`'s, which the address plan,
+  the tap's netmask and the destination rules share. Each computed its own mask
+  before. `netstack::prefix::nat64_embedded` moved there from the pump.
+  `tools/idioms.toml` records the shape.
+- The testkit's `require::routable_v4` names the host's own IPv4 address on its
+  route outward, which the destination rules' tests reach, since the stack
+  refuses loopback whatever the rules say. `FERRODAY_CAGE_REQUIRE_TUN` governs
+  its skip.
 
 ## [0.6.0] - 2026-11-13
 

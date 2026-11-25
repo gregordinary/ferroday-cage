@@ -411,6 +411,14 @@ flags = ["--netstack-no-nameserver"]
 name = "upstream"
 flags = ["--netstack-upstream"]
 
+[[builder.setting]]
+name = "allow"
+flags = ["--netstack-allow"]
+
+[[builder.setting]]
+name = "deny"
+flags = ["--netstack-deny"]
+
 # The Debian bootstrap.
 [[builder]]
 name = "DebianBuilder"

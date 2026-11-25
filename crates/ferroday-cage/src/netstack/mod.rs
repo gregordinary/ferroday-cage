@@ -19,8 +19,10 @@
 //! address, through the host's own addresses. Multicast, broadcast, loopback,
 //! and link-local destinations are refused, and link-local covers the IPv4
 //! cloud metadata services. AWS's IPv6 instance services, `fd00:ec2::/32` with
-//! the metadata service at `fd00:ec2::254`, are refused too. A caller that must
-//! bound egress further confines it outside the stack. One exception is
+//! the metadata service at `fd00:ec2::254`, are refused too, under any
+//! configuration. A caller bounds the rest with destination rules:
+//! [`allow`](NetStackBuilder::allow) names what the guest may reach, and
+//! [`deny`](NetStackBuilder::deny) what it may not. One exception is
 //! deliberate: [`host_loopback`](NetStackBuilder::host_loopback) and
 //! [`host_loopback_port`](NetStackBuilder::host_loopback_port) map connections
 //! to the gateway address onto the host's loopback. A refused TCP connection is
@@ -80,6 +82,8 @@ use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use crate::running::Pending;
 
+pub use policy::{DestinationRule, ParseDestinationRuleError, Transport};
+
 mod device;
 mod dns;
 #[cfg(fuzzing)]
@@ -93,6 +97,8 @@ pub(crate) mod fuzzing {
     }
 }
 mod nameserver;
+mod policy;
+mod prefix;
 mod pump;
 mod sniff;
 mod tap;
@@ -180,6 +186,8 @@ struct Plan {
     /// The resolver the nameserver asks, where the configuration names one;
     /// otherwise the host's, read when the stack attaches.
     upstream: Option<SocketAddr>,
+    /// The caller's destination rules.
+    policy: policy::Policy,
 }
 
 impl Plan {
@@ -289,32 +297,42 @@ impl NetStack {
         NetStackBuilder::default()
     }
 
-    /// Whether the stack carries the guest's traffic to `destination` on to the
-    /// host.
+    /// Whether the stack carries the guest's traffic over `transport` to
+    /// `destination` on to the host.
     ///
-    /// This is the forwarding policy every attachment applies, asked of one
-    /// destination, TCP and UDP alike. It answers `false` for a destination the
-    /// stack refuses: loopback, link-local, multicast, AWS's IPv6 instance
-    /// services, the guest's own subnet, and a protocol the configuration turns
-    /// off. The gateway address is carried only on a port
-    /// [`host_loopback`](NetStackBuilder::host_loopback) or
-    /// [`host_loopback_port`](NetStackBuilder::host_loopback_port) admits.
+    /// This is the forwarding decision every attachment makes, asked of one
+    /// destination. It answers `false` for a destination the stack refuses
+    /// under any configuration: loopback, link-local, multicast, AWS's IPv6
+    /// instance services, the guest's own subnet, and a protocol the
+    /// configuration turns off. It answers `false` too for one the
+    /// configuration's [`allow`](NetStackBuilder::allow) and
+    /// [`deny`](NetStackBuilder::deny) rules refuse. The gateway address is
+    /// carried only on a port [`host_loopback`](NetStackBuilder::host_loopback)
+    /// or [`host_loopback_port`](NetStackBuilder::host_loopback_port) admits,
+    /// whatever the rules say.
     ///
     /// A caller composing the guest's configuration asks this rather than
     /// restating the rules: one that turns the stack's nameserver off, say, and
     /// gives the guest a resolver of its own to reach through the stack.
     ///
     /// ```
-    /// use ferroday_cage::NetStack;
+    /// use ferroday_cage::{NetStack, Transport};
     ///
     /// let stack = NetStack::default();
-    /// assert!(stack.forwards("192.0.2.53:53".parse().unwrap()));
+    /// assert!(stack.forwards(Transport::Udp, "192.0.2.53:53".parse().unwrap()));
     /// // systemd-resolved's stub, and AWS's IPv4 resolver.
-    /// assert!(!stack.forwards("127.0.0.53:53".parse().unwrap()));
-    /// assert!(!stack.forwards("169.254.169.253:53".parse().unwrap()));
+    /// assert!(!stack.forwards(Transport::Udp, "127.0.0.53:53".parse().unwrap()));
+    /// assert!(!stack.forwards(Transport::Udp, "169.254.169.253:53".parse().unwrap()));
+    ///
+    /// let bounded = NetStack::builder()
+    ///     .allow("tcp:192.0.2.0/24".parse().unwrap())
+    ///     .build()
+    ///     .unwrap();
+    /// assert!(bounded.forwards(Transport::Tcp, "192.0.2.53:53".parse().unwrap()));
+    /// assert!(!bounded.forwards(Transport::Udp, "192.0.2.53:53".parse().unwrap()));
     /// ```
-    pub fn forwards(&self, destination: SocketAddr) -> bool {
-        pump::host_target(destination.into(), &self.plan).is_some()
+    pub fn forwards(&self, transport: Transport, destination: SocketAddr) -> bool {
+        pump::host_target(transport, destination.into(), &self.plan).is_some()
     }
 
     /// The addresses the stack's nameserver answers on, for the sandbox's
@@ -326,15 +344,17 @@ impl NetStack {
     /// nameserver off.
     ///
     /// The stack serves these, so [`forwards`](Self::forwards) answers `false`
-    /// for them: nothing to them is carried on to the host.
+    /// for them: nothing to them is carried on to the host. The destination
+    /// rules do not decide them either, since the nameserver is the stack's
+    /// own.
     ///
     /// ```
-    /// use ferroday_cage::NetStack;
+    /// use ferroday_cage::{NetStack, Transport};
     ///
     /// let stack = NetStack::default();
     /// let named: Vec<String> = stack.nameservers().iter().map(|a| a.to_string()).collect();
     /// assert_eq!(named, ["10.0.2.3", "fd00::3"]);
-    /// assert!(!stack.forwards("10.0.2.3:53".parse().unwrap()));
+    /// assert!(!stack.forwards(Transport::Udp, "10.0.2.3:53".parse().unwrap()));
     /// ```
     pub fn nameservers(&self) -> Vec<IpAddr> {
         if !self.plan.nameserver {
@@ -622,7 +642,7 @@ impl Drop for NetStackHandle {
 /// With the `serde` feature the builder serializes and deserializes as the
 /// stack specification, for embedding in a consumer's own configuration.
 /// Keys are kebab-case; unknown keys are rejected; the CIDR fields read and
-/// write as strings. In TOML:
+/// write as strings, and each destination rule as its text. In TOML:
 ///
 /// ```toml
 /// ipv4-cidr = "10.0.2.0/24"
@@ -630,6 +650,8 @@ impl Drop for NetStackHandle {
 /// mtu = 1500
 /// interface = "tap0"
 /// host-loopback-ports = [5432]
+/// allow = ["192.0.2.0/24", "[2001:db8::/32]:443"]
+/// deny = ["192.0.2.7:22"]
 ///
 /// [[publish]]
 /// host = "127.0.0.1:8080"
@@ -656,6 +678,8 @@ pub struct NetStackBuilder {
     nameserver: bool,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     upstream: Option<SocketAddr>,
+    allow: Vec<DestinationRule>,
+    deny: Vec<DestinationRule>,
 }
 
 impl Default for NetStackBuilder {
@@ -672,6 +696,8 @@ impl Default for NetStackBuilder {
             publish: Vec::new(),
             nameserver: true,
             upstream: None,
+            allow: Vec::new(),
+            deny: Vec::new(),
         }
     }
 }
@@ -835,6 +861,60 @@ impl NetStackBuilder {
         self
     }
 
+    /// Admits the destinations `rule` matches. Repeatable; none by default.
+    ///
+    /// Once any allow rule is given, the stack refuses every destination no
+    /// allow rule admits, so the allow rules name everything the guest's flows
+    /// may reach: an allow rule of `192.0.2.0/24` reads as "only
+    /// `192.0.2.0/24`". A
+    /// [`deny`](Self::deny) rule that matches refuses a destination whatever
+    /// an allow rule says.
+    ///
+    /// The rules decide the destinations the stack would otherwise carry.
+    /// Those it refuses under any configuration, loopback and link-local among
+    /// them, stay refused, and no rule admits them. The gateway's
+    /// [loopback mapping](Self::host_loopback), the
+    /// [published ports](Self::publish) and the stack's own
+    /// [nameserver](Self::nameserver) are grants of their own, which the rules
+    /// do not decide. The nameserver relays the guest's queries to a resolver of
+    /// the host's, so a caller whose rules must be the guest's only way out
+    /// turns it off.
+    ///
+    /// The stack decides a flow by its address, so [`build`](Self::build)
+    /// refuses a [name rule](DestinationRule) with
+    /// [`NetStackError::RuleInvalid`].
+    ///
+    /// ```
+    /// use ferroday_cage::{NetStack, Transport};
+    ///
+    /// let stack = NetStack::builder()
+    ///     .allow("192.0.2.0/24".parse()?)
+    ///     .allow("[2001:db8::/32]:443".parse()?)
+    ///     .deny("192.0.2.7:22".parse()?)
+    ///     .build()?;
+    /// assert!(stack.forwards(Transport::Tcp, "192.0.2.8:22".parse()?));
+    /// assert!(!stack.forwards(Transport::Tcp, "192.0.2.7:22".parse()?));
+    /// assert!(!stack.forwards(Transport::Tcp, "[2001:db8::1]:80".parse()?));
+    /// assert!(!stack.forwards(Transport::Tcp, "203.0.113.9:443".parse()?));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn allow(mut self, rule: DestinationRule) -> Self {
+        self.allow.push(rule);
+        self
+    }
+
+    /// Refuses the destinations `rule` matches, whatever an
+    /// [`allow`](Self::allow) rule admits. Repeatable; none by default.
+    ///
+    /// With deny rules alone, the stack carries every destination no deny rule
+    /// refuses: a deny rule of `192.168.0.0/16` reads as "everything but
+    /// `192.168.0.0/16`". What the rules decide, and what they leave to
+    /// grants of their own, is as [`allow`](Self::allow) describes.
+    pub fn deny(mut self, rule: DestinationRule) -> Self {
+        self.deny.push(rule);
+        self
+    }
+
     /// Validates the configuration and freezes it into a [`NetStack`].
     pub fn build(self) -> Result<NetStack, NetStackError> {
         if !self.ipv4 && !self.ipv6 {
@@ -853,7 +933,7 @@ impl NetStackBuilder {
                     return Err(invalid("the IPv4 prefix length must be between 1 and 27"));
                 }
                 let base = u32::from(network);
-                if base & !(u32::MAX << (32 - prefix_len)) != 0 {
+                if !prefix::is_network(IpAddr::V4(network), prefix_len) {
                     return Err(invalid("the address has bits set past the prefix"));
                 }
                 if network.is_loopback()
@@ -885,7 +965,7 @@ impl NetStackBuilder {
                     return Err(invalid("the IPv6 prefix length must be between 1 and 120"));
                 }
                 let base = u128::from(network);
-                if base & !(u128::MAX << (128 - prefix_len)) != 0 {
+                if !prefix::is_network(IpAddr::V6(network), prefix_len) {
                     return Err(invalid("the address has bits set past the prefix"));
                 }
                 if base == 0 || network.is_multicast() || (network.segments()[0] & 0xffc0) == 0xfe80
@@ -946,6 +1026,27 @@ impl NetStackBuilder {
                 return Err(refused("the unspecified address names no resolver"));
             }
         }
+        for rule in &self.allow {
+            if rule.is_broad_wildcard() {
+                return Err(NetStackError::RuleInvalid {
+                    rule: rule.clone(),
+                    reason: "an allow rule over every name, or every name under one label, \
+                             admits nearly every destination",
+                });
+            }
+        }
+        if let Some(rule) = self
+            .allow
+            .iter()
+            .chain(&self.deny)
+            .find(|rule| rule.is_name())
+        {
+            return Err(NetStackError::RuleInvalid {
+                rule: rule.clone(),
+                reason: "the stack decides a flow by its address, so a name rule would match \
+                         nothing",
+            });
+        }
         Ok(NetStack {
             plan: Plan {
                 v4,
@@ -959,6 +1060,10 @@ impl NetStackBuilder {
                 publish: self.publish,
                 nameserver: self.nameserver,
                 upstream: self.upstream,
+                policy: policy::Policy {
+                    allow: self.allow,
+                    deny: self.deny,
+                },
             },
         })
     }
@@ -1149,6 +1254,15 @@ pub enum NetStackError {
         /// What makes it unusable.
         reason: &'static str,
     },
+    /// A destination rule given to [`NetStackBuilder::allow`] or
+    /// [`NetStackBuilder::deny`] cannot be used as it was given.
+    #[non_exhaustive]
+    RuleInvalid {
+        /// The rule as it was given to the builder.
+        rule: DestinationRule,
+        /// What makes it unusable.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for NetStackError {
@@ -1231,6 +1345,9 @@ impl fmt::Display for NetStackError {
             NetStackError::UpstreamInvalid { upstream, reason } => {
                 write!(f, "cannot ask {upstream} for the sandbox's DNS: {reason}")
             }
+            NetStackError::RuleInvalid { rule, reason } => {
+                write!(f, "cannot use the destination rule {rule}: {reason}")
+            }
         }
     }
 }
@@ -1240,8 +1357,9 @@ impl std::error::Error for NetStackError {
     ///
     /// The configuration refusals — an unusable prefix, an MTU below the
     /// minimum, an invalid interface name, no protocols, an unusable
-    /// publication or upstream, a shared namespace, an unenforceable network
-    /// grant — carry no inner error: nothing failed, the request was refused.
+    /// publication, upstream or rule, a shared namespace, an unenforceable
+    /// network grant — carry no inner error: nothing failed, the request was
+    /// refused.
     /// [`HelperLost`](Self::HelperLost) carries none either: the helper's
     /// silence is the failure. Nor does [`PumpPanicked`](Self::PumpPanicked):
     /// the panic is the failure, and its message went to the panic hook.
@@ -1462,6 +1580,67 @@ mod tests {
             .upstream("127.0.0.53:53".parse().unwrap())
             .build()
             .expect("a loopback resolver is the stack's to ask");
+    }
+
+    #[test]
+    fn the_destination_rules_reach_the_plan_in_order() {
+        let stack = NetStack::builder()
+            .allow("192.0.2.0/24".parse().unwrap())
+            .deny("192.0.2.7".parse().unwrap())
+            .allow("198.51.100.0/24:443".parse().unwrap())
+            .build()
+            .expect("address rules build");
+        let written = |rules: &[DestinationRule]| -> Vec<String> {
+            rules.iter().map(ToString::to_string).collect()
+        };
+        assert_eq!(
+            written(&stack.plan.policy.allow),
+            ["192.0.2.0/24", "198.51.100.0/24:443"]
+        );
+        assert_eq!(written(&stack.plan.policy.deny), ["192.0.2.7"]);
+        let open = NetStack::default().plan.policy;
+        assert!(open.allow.is_empty() && open.deny.is_empty());
+    }
+
+    #[test]
+    fn a_rule_the_stack_cannot_use_is_refused() {
+        let rule = |text: &str| text.parse::<DestinationRule>().unwrap();
+        for (builder, refused, said) in [
+            // An allow rule that admits nearly everything, as a rule of any
+            // kind would be refused where the stack matched names.
+            (NetStack::builder().allow(rule("*")), "*", "every name"),
+            (
+                NetStack::builder().allow(rule("tcp:*.com:443")),
+                "tcp:*.com:443",
+                "every name",
+            ),
+            // A name rule, allow or deny: the stack decides by address.
+            (
+                NetStack::builder().allow(rule("example.com")),
+                "example.com",
+                "match nothing",
+            ),
+            (
+                NetStack::builder()
+                    .allow(rule("192.0.2.0/24"))
+                    .deny(rule("*.example.com")),
+                "*.example.com",
+                "match nothing",
+            ),
+            (
+                NetStack::builder().deny(rule("*.com")),
+                "*.com",
+                "match nothing",
+            ),
+        ] {
+            let err = builder.build().expect_err(refused);
+            match &err {
+                NetStackError::RuleInvalid { rule, .. } => assert_eq!(rule.to_string(), refused),
+                other => panic!("{refused}: {other}"),
+            }
+            assert!(err.to_string().contains(said), "{err}");
+            assert!(err.to_string().contains(refused), "{err}");
+        }
     }
 
     #[test]
@@ -1737,6 +1916,33 @@ mod tests {
             !unset.contains("upstream"),
             "an unset upstream is left out: {unset}"
         );
+
+        // The destination rules: each a string in the rule grammar, written
+        // back in its one spelling.
+        let builder: NetStackBuilder = toml::from_str(
+            "allow = [\"192.0.2.0/24\", \"[2001:DB8::/32]:443\"]\ndeny = [\"udp:192.0.2.7\"]\n\n\
+             [[publish]]\nhost = \"127.0.0.1:8080\"\nguest-port = 80\n",
+        )
+        .expect("the profile parses");
+        assert_eq!(
+            builder.allow,
+            [
+                "192.0.2.0/24".parse::<DestinationRule>().unwrap(),
+                "[2001:db8::/32]:443".parse().unwrap(),
+            ],
+        );
+        assert_eq!(builder.deny, ["udp:192.0.2.7".parse().unwrap()]);
+        let serialized = toml::to_string(&builder).expect("the builder serializes");
+        assert!(
+            serialized.contains("\"[2001:db8::/32]:443\""),
+            "a rule renders as its text: {serialized}"
+        );
+        let reparsed: NetStackBuilder = toml::from_str(&serialized).expect("and round-trips");
+        assert_eq!(reparsed.allow, builder.allow);
+        assert_eq!(reparsed.deny, builder.deny);
+        let err = toml::from_str::<NetStackBuilder>("allow = [\"example.com:0\"]")
+            .expect_err("a rule outside the grammar is refused");
+        assert!(err.to_string().contains("port 0"), "{err}");
     }
 
     /// Every key the builder's serde format can carry, pinned as the profile
@@ -1749,11 +1955,15 @@ mod tests {
             .host_loopback(true)
             .host_loopback_port(5432)
             .publish("127.0.0.1:8080".parse().unwrap(), 80)
-            .upstream("127.0.0.53:53".parse().unwrap());
+            .upstream("127.0.0.53:53".parse().unwrap())
+            .allow("192.0.2.0/24".parse().unwrap())
+            .deny("192.0.2.7".parse().unwrap());
         let rendered = toml::to_string(&builder).expect("the builder serializes");
         assert_eq!(
             crate::spec::serde_tests::profile_keys(&rendered),
             [
+                "allow",
+                "deny",
                 "host-loopback",
                 "host-loopback-ports",
                 "interface",

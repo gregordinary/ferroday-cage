@@ -47,6 +47,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use super::Plan;
 use super::nameserver::Nameserver;
+use super::policy::Transport;
 use super::pump::host_target;
 use crate::mechanism::netns::socket_for;
 
@@ -494,7 +495,7 @@ fn forward_out(
     if flows.len() >= MAX_FLOWS {
         return false;
     }
-    let Some(target) = host_target(destination, plan) else {
+    let Some(target) = host_target(Transport::Udp, destination, plan) else {
         return false;
     };
     let Ok(host) = connect_host(target) else {

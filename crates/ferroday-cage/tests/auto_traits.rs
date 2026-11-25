@@ -283,6 +283,9 @@ mod netstack {
     const _: () = assert_send_sync::<netstack::NetStackBuilder>();
     const _: () = assert_send_sync::<netstack::NetStackError>();
     const _: () = assert_send_sync::<netstack::NetStackHandle>();
+    const _: () = assert_send_sync::<netstack::DestinationRule>();
+    const _: () = assert_send_sync::<netstack::ParseDestinationRuleError>();
+    const _: () = assert_send_sync::<netstack::Transport>();
 }
 
 // ---------------------------------------------------------------------------

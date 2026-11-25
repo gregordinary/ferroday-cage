@@ -57,6 +57,8 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpo
 
 use super::device::TapDevice;
 use super::nameserver::{self, Nameserver};
+use super::policy::Transport;
+use super::prefix;
 use super::sniff::{self, Sniff};
 use super::tcp::{self, TcpFlow};
 use super::udp::UdpTables;
@@ -615,7 +617,7 @@ impl Engine {
         if self.held(false) >= tcp::MAX_FLOWS {
             return;
         }
-        let Some(target) = host_target(dst, &self.plan) else {
+        let Some(target) = host_target(Transport::Tcp, dst, &self.plan) else {
             return;
         };
         let mut socket = tcp::guest_facing_socket();
@@ -732,7 +734,7 @@ impl Engine {
             }
             return;
         }
-        if host_target(dst, &self.plan).is_none() {
+        if host_target(Transport::Udp, dst, &self.plan).is_none() {
             return;
         }
         self.udp.ensure_port(dst.port, &mut self.sockets);
@@ -805,16 +807,17 @@ impl Engine {
     }
 }
 
-/// Applies the forwarding policy to a guest-addressed destination,
-/// returning the host socket address to connect to, or `None` for a
-/// destination the stack refuses (the interface answers those with a
+/// Applies the forwarding policy to a guest-addressed destination over
+/// `transport`, returning the host socket address to connect to, or `None` for
+/// a destination the stack refuses (the interface answers those with a
 /// reset).
 ///
 /// This is an egress NAT: an accepted destination is reached from the host's
-/// own network position and source IP, so the sandbox can reach whatever the
-/// host can, an SSRF-style egress that is by design.
+/// own network position and source IP, so without destination rules the
+/// sandbox can reach whatever the host can, an SSRF-style egress that is by
+/// design.
 ///
-/// The refusals are:
+/// The refusals no configuration lifts are:
 ///
 /// - Multicast, broadcast, unspecified, loopback, and link-local destinations,
 ///   in both families. Refusing loopback specifically shields host services
@@ -827,33 +830,45 @@ impl Engine {
 ///   compatible `::a.b.c.d` alike — so an IPv4 refusal cannot be re-expressed in
 ///   the other family.
 /// - An address under NAT64's well-known prefix, `64:ff9b::/96`, whose embedded
-///   IPv4 address the IPv4 rules refuse; see [`nat64_embedded`].
+///   IPv4 address the IPv4 rules refuse; see [`prefix::nat64_embedded`].
 /// - The guest's own subnet, which is a private link between the guest and this
 ///   stack. Forwarding it would send the guest's on-link traffic to the host's
 ///   view of those addresses instead, colliding with a real LAN wherever the two
 ///   overlap. This subsumes the subnet's broadcast address.
 ///
+/// A destination past those is then held to the caller's destination rules
+/// ([`Policy::admits`](super::policy::Policy::admits)), which refuse what a
+/// deny rule matches, and what no allow rule admits where there are allow
+/// rules. Without rules the refusals above are the whole policy.
+///
 /// Every refusal but the guest's own subnet is answered with a reset: the guest
 /// routes those destinations through the gateway, so its segment arrives, finds
 /// no listener waiting for it, and the interface resets it. The subnet is
-/// different in kind. Those addresses are on-link, so the guest resolves a
-/// hardware address before sending anything, and the interface answers ARP and
-/// neighbor discovery only for the addresses it owns — the gateway. Nothing
-/// replies, and the connection fails when the guest's own address resolution
-/// gives up. That property is [held by ingestion](self), not by the interface:
-/// under `any_ip` smoltcp would answer for every on-link address, and a stack
-/// that did would be claiming to be each of them and then resetting.
+/// different in kind. Those addresses are on-link from the guest's point of
+/// view, so it resolves a hardware address before sending anything, and the
+/// interface answers ARP and neighbor discovery only for the addresses it owns
+/// — the gateway. Nothing replies, and the connection fails when the guest's
+/// own address resolution gives up. That property is [held by
+/// ingestion](self), not by the interface: under `any_ip` smoltcp would answer
+/// for every on-link address, and a stack that did would be claiming to be
+/// each of them and then resetting.
 ///
-/// The refusals do not shield a host service bound to a wildcard address
-/// (`0.0.0.0` or `::`): that service is reachable through the host's own
-/// routable IP, which is an ordinary accepted destination, and RFC 1918 LAN
-/// peers are reachable too, as is a metadata service at any routable address
-/// but AWS's. A caller that needs to bound egress must confine the destination
-/// itself. The gateway address is the one special case: on a port
-/// `host_loopback` or `host_loopback_port` admits, a connection to it maps to
-/// the host's loopback, port preserved, and on any other port it is refused.
-pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
-    match IpAddr::from(dst.addr) {
+/// Without rules, the refusals do not shield a host service bound to a
+/// wildcard address (`0.0.0.0` or `::`): that service is reachable through the
+/// host's own routable IP, which is an ordinary accepted destination, and RFC
+/// 1918 LAN peers are reachable too, as is a metadata service at any routable
+/// address but AWS's. A deny rule over them, or allow rules that leave them
+/// out, is how a caller bounds that. The gateway address is the one special
+/// case, outside the rules: on a port `host_loopback` or `host_loopback_port`
+/// admits, a connection to it maps to the host's loopback, port preserved, and
+/// on any other port it is refused.
+pub(super) fn host_target(
+    transport: Transport,
+    dst: IpEndpoint,
+    plan: &Plan,
+) -> Option<SocketAddr> {
+    let address = IpAddr::from(dst.addr);
+    match address {
         IpAddr::V4(addr) => {
             let v4 = plan.v4.as_ref()?;
             if addr == v4.gateway {
@@ -865,7 +880,6 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
             if refuses_v4(addr, Some(v4)) {
                 return None;
             }
-            Some(SocketAddr::from((addr, dst.port)))
         }
         IpAddr::V6(addr) => {
             let v6 = plan.v6.as_ref()?;
@@ -875,10 +889,9 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
                     .admits(dst.port)
                     .then(|| SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, dst.port)));
             }
-            let mask = u128::MAX << (128 - u32::from(v6.prefix_len));
-            let on_link = prefix_bits(addr) & mask == prefix_bits(v6.gateway) & mask;
-            let translated_refusal =
-                nat64_embedded(addr).is_some_and(|embedded| refuses_v4(embedded, plan.v4.as_ref()));
+            let on_link = prefix::contains(IpAddr::V6(v6.gateway), v6.prefix_len, address);
+            let translated_refusal = prefix::nat64_embedded(addr)
+                .is_some_and(|embedded| refuses_v4(embedded, plan.v4.as_ref()));
             if addr.is_unspecified()
                 || addr.is_multicast()
                 || addr.is_loopback()
@@ -893,9 +906,11 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
             {
                 return None;
             }
-            Some(SocketAddr::from((addr, dst.port)))
         }
     }
+    plan.policy
+        .admits(transport, address, dst.port)
+        .then_some(SocketAddr::new(address, dst.port))
 }
 
 /// Whether the IPv4 rules refuse `addr`, other than as the gateway: the
@@ -907,8 +922,7 @@ pub(super) fn host_target(dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
 /// guest's subnet, and refused as one.
 fn refuses_v4(addr: std::net::Ipv4Addr, v4: Option<&PlanV4>) -> bool {
     let on_link = v4.is_some_and(|v4| {
-        let mask = u32::MAX << (32 - u32::from(v4.prefix_len));
-        u32::from(addr) & mask == u32::from(v4.gateway) & mask
+        prefix::contains(IpAddr::V4(v4.gateway), v4.prefix_len, IpAddr::V4(addr))
     });
     addr.is_unspecified()
         // 0.0.0.0/8: `is_unspecified` covers only 0.0.0.0 itself, and the rest
@@ -919,35 +933,6 @@ fn refuses_v4(addr: std::net::Ipv4Addr, v4: Option<&PlanV4>) -> bool {
         || addr.is_loopback()
         || addr.is_link_local()
         || on_link
-}
-
-/// The IPv4 address `addr` embeds under NAT64's well-known prefix,
-/// `64:ff9b::/96`, or `None` for an address outside it.
-///
-/// A host on an IPv6-only network reaches IPv4 destinations through a
-/// translator, and the guest reaches what the host reaches, so the prefix as a
-/// whole is carried. The translator connects to the embedded IPv4 address from
-/// its own position, which is the host's where the translator runs on the
-/// host. So an embedded address is held to the IPv4 rules. That keeps an IPv4
-/// refusal from being re-expressed through the translator, as the mapped and
-/// compatible forms would re-express it through the host's own stack.
-///
-/// Only the well-known prefix says so in the address. A network-specific
-/// prefix, the local-use `64:ff9b:1::/48` among them, is indistinguishable
-/// from any other routable address, and a caller on such a network confines
-/// it outside the stack.
-fn nat64_embedded(addr: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    match addr.segments() {
-        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] => Some(std::net::Ipv4Addr::from(
-            u32::from(high) << 16 | u32::from(low),
-        )),
-        _ => None,
-    }
-}
-
-/// An IPv6 address as the integer its prefix comparison needs.
-fn prefix_bits(addr: std::net::Ipv6Addr) -> u128 {
-    u128::from_be_bytes(addr.octets())
 }
 
 /// Whether `addr` is in `fd00:ec2::/32`, the block AWS serves its IPv6 instance
@@ -1007,11 +992,11 @@ mod tests {
     fn ordinary_destinations_pass_through_unchanged() {
         let plan = plan(false);
         assert_eq!(
-            host_target(v4(203, 0, 113, 9, 443), &plan),
+            host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
             Some("203.0.113.9:443".parse().unwrap()),
         );
         assert_eq!(
-            host_target(v6("2001:db8::1", 443), &plan),
+            host_target(Transport::Tcp, v6("2001:db8::1", 443), &plan),
             Some("[2001:db8::1]:443".parse().unwrap()),
         );
     }
@@ -1038,7 +1023,7 @@ mod tests {
             v6("::127.0.0.1", 80),
             v6("::203.0.113.9", 80),
         ] {
-            assert_eq!(host_target(dst, &plan), None, "{dst}");
+            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
         }
     }
 
@@ -1053,13 +1038,13 @@ mod tests {
             v6("fd00:ec2::253", 53),
             v6("fd00:ec2:ffff::1", 443),
         ] {
-            assert_eq!(host_target(dst, &plan), None, "{dst}");
+            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
         }
         // The block is exactly a /32: its neighbours are ordinary unique local
         // destinations.
         for dst in [v6("fd00:ec3::254", 80), v6("fd00:ec1:ffff::1", 80)] {
             assert_eq!(
-                host_target(dst, &plan),
+                host_target(Transport::Tcp, dst, &plan),
                 Some(SocketAddr::from((IpAddr::from(dst.addr), dst.port))),
                 "{dst}",
             );
@@ -1081,12 +1066,12 @@ mod tests {
             v6("64:ff9b::0.1.2.3", 80),
             v6("64:ff9b::224.0.0.1", 80),
         ] {
-            assert_eq!(host_target(dst, &plan), None, "{dst}");
+            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
         }
         // What the IPv4 rules carry, a translator is asked to carry too: an
         // IPv6-only host reaches the IPv4 world this way.
         assert_eq!(
-            host_target(v6("64:ff9b::203.0.113.9", 443), &plan),
+            host_target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &plan),
             Some("[64:ff9b::cb00:7109]:443".parse().unwrap()),
         );
         // Only the well-known /96 embeds an address in its last 32 bits. Its
@@ -1096,7 +1081,7 @@ mod tests {
             v6("64:ff9b:0:0:0:1:a9fe:a9fe", 80),
         ] {
             assert_eq!(
-                host_target(dst, &plan),
+                host_target(Transport::Tcp, dst, &plan),
                 Some(SocketAddr::from((IpAddr::from(dst.addr), dst.port))),
                 "{dst}",
             );
@@ -1109,11 +1094,11 @@ mod tests {
             .expect("a v6-only configuration is valid")
             .plan;
         assert_eq!(
-            host_target(v6("64:ff9b::10.0.2.7", 80), &v6_only),
+            host_target(Transport::Tcp, v6("64:ff9b::10.0.2.7", 80), &v6_only),
             Some("[64:ff9b::a00:207]:80".parse().unwrap()),
         );
         assert_eq!(
-            host_target(v6("64:ff9b::169.254.169.254", 80), &v6_only),
+            host_target(Transport::Tcp, v6("64:ff9b::169.254.169.254", 80), &v6_only),
             None
         );
     }
@@ -1133,11 +1118,11 @@ mod tests {
             v6("fd00::15", 80),
             v6("fd00::7", 80),
         ] {
-            assert_eq!(host_target(dst, &plan), None, "{dst}");
+            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
         }
         // A neighbouring subnet is not the guest's own and still forwards.
         assert_eq!(
-            host_target(v4(10, 0, 3, 7, 80), &plan),
+            host_target(Transport::Tcp, v4(10, 0, 3, 7, 80), &plan),
             Some("10.0.3.7:80".parse().unwrap()),
         );
     }
@@ -1145,16 +1130,22 @@ mod tests {
     #[test]
     fn the_gateway_is_refused_by_default_and_maps_with_host_loopback() {
         let closed = plan(false);
-        assert_eq!(host_target(v4(10, 0, 2, 2, 8080), &closed), None);
-        assert_eq!(host_target(v6("fd00::2", 8080), &closed), None);
+        assert_eq!(
+            host_target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &closed),
+            None
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v6("fd00::2", 8080), &closed),
+            None
+        );
 
         let open = plan(true);
         assert_eq!(
-            host_target(v4(10, 0, 2, 2, 8080), &open),
+            host_target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &open),
             Some("127.0.0.1:8080".parse().unwrap()),
         );
         assert_eq!(
-            host_target(v6("fd00::2", 8080), &open),
+            host_target(Transport::Tcp, v6("fd00::2", 8080), &open),
             Some("[::1]:8080".parse().unwrap()),
         );
     }
@@ -1169,15 +1160,18 @@ mod tests {
             .expect("a valid configuration")
             .plan;
         assert_eq!(
-            host_target(v4(10, 0, 2, 2, 5432), &plan),
+            host_target(Transport::Tcp, v4(10, 0, 2, 2, 5432), &plan),
             Some("127.0.0.1:5432".parse().unwrap()),
         );
         assert_eq!(
-            host_target(v6("fd00::2", 5432), &plan),
+            host_target(Transport::Tcp, v6("fd00::2", 5432), &plan),
             Some("[::1]:5432".parse().unwrap()),
         );
-        assert_eq!(host_target(v4(10, 0, 2, 2, 5433), &plan), None);
-        assert_eq!(host_target(v6("fd00::2", 80), &plan), None);
+        assert_eq!(
+            host_target(Transport::Tcp, v4(10, 0, 2, 2, 5433), &plan),
+            None
+        );
+        assert_eq!(host_target(Transport::Tcp, v6("fd00::2", 80), &plan), None);
     }
 
     #[test]
@@ -1196,7 +1190,7 @@ mod tests {
         ] {
             let plan = plan.expect("a valid configuration").plan;
             assert_eq!(
-                host_target(v4(10, 0, 2, 2, 8080), &plan),
+                host_target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &plan),
                 Some("127.0.0.1:8080".parse().unwrap()),
             );
         }
@@ -1208,7 +1202,174 @@ mod tests {
             .ipv6(false)
             .build()
             .expect("a v4-only configuration is valid");
-        assert_eq!(host_target(v6("2001:db8::1", 443), &stack.plan), None);
+        assert_eq!(
+            host_target(Transport::Tcp, v6("2001:db8::1", 443), &stack.plan),
+            None
+        );
+    }
+
+    /// The default plan under `allow` and `deny` rules, given as text.
+    fn ruled(allow: &[&str], deny: &[&str], host_loopback_port: Option<u16>) -> Plan {
+        let mut builder = NetStack::builder();
+        for rule in allow {
+            builder = builder.allow(rule.parse().unwrap());
+        }
+        for rule in deny {
+            builder = builder.deny(rule.parse().unwrap());
+        }
+        if let Some(port) = host_loopback_port {
+            builder = builder.host_loopback_port(port);
+        }
+        builder.build().expect("address rules build").plan
+    }
+
+    #[test]
+    fn allow_rules_carry_what_they_admit_and_nothing_else() {
+        let plan = ruled(&["203.0.113.0/24:443", "udp:198.51.100.53:53"], &[], None);
+        assert_eq!(
+            host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
+            Some("203.0.113.9:443".parse().unwrap()),
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v4(203, 0, 113, 9, 80), &plan),
+            None
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v4(198, 51, 100, 7, 443), &plan),
+            None
+        );
+        assert_eq!(
+            host_target(Transport::Udp, v4(198, 51, 100, 53, 53), &plan),
+            Some("198.51.100.53:53".parse().unwrap()),
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v4(198, 51, 100, 53, 53), &plan),
+            None
+        );
+        // An IPv4 allow rule leaves IPv6 refused, and the reverse.
+        assert_eq!(
+            host_target(Transport::Tcp, v6("2001:db8::1", 443), &plan),
+            None
+        );
+    }
+
+    #[test]
+    fn deny_rules_alone_carry_everything_else() {
+        let plan = ruled(&[], &["192.168.0.0/16", "2001:db8::/32"], None);
+        assert_eq!(
+            host_target(Transport::Tcp, v4(192, 168, 1, 1, 80), &plan),
+            None
+        );
+        assert_eq!(
+            host_target(Transport::Udp, v4(192, 168, 1, 1, 53), &plan),
+            None
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v6("2001:db8::1", 443), &plan),
+            None
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
+            Some("203.0.113.9:443".parse().unwrap()),
+        );
+        assert_eq!(
+            host_target(Transport::Udp, v6("2001:db9::1", 443), &plan),
+            Some("[2001:db9::1]:443".parse().unwrap()),
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_beats_an_allow_rule_for_the_flow_it_names() {
+        let plan = ruled(&["203.0.113.0/24"], &["tcp:203.0.113.9:22"], None);
+        assert_eq!(
+            host_target(Transport::Tcp, v4(203, 0, 113, 9, 22), &plan),
+            None
+        );
+        assert_eq!(
+            host_target(Transport::Udp, v4(203, 0, 113, 9, 22), &plan),
+            Some("203.0.113.9:22".parse().unwrap()),
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v4(203, 0, 113, 10, 22), &plan),
+            Some("203.0.113.10:22".parse().unwrap()),
+        );
+    }
+
+    #[test]
+    fn no_rule_admits_what_the_stack_always_refuses() {
+        // Allow rules over everything still leave each fixed refusal standing:
+        // they are settled before any rule is read.
+        let plan = ruled(&["0.0.0.0/0", "::/0"], &[], None);
+        for dst in [
+            v4(127, 0, 0, 1, 80),
+            v4(169, 254, 169, 254, 80),
+            v4(224, 0, 0, 1, 80),
+            v4(0, 1, 2, 3, 80),
+            v4(10, 0, 2, 7, 80),
+            v4(10, 0, 2, 2, 80),
+            v6("::1", 80),
+            v6("fe80::1", 80),
+            v6("fd00:ec2::254", 80),
+            v6("::ffff:203.0.113.9", 80),
+            v6("64:ff9b::169.254.169.254", 80),
+            v6("fd00::7", 80),
+        ] {
+            for transport in [Transport::Tcp, Transport::Udp] {
+                assert_eq!(host_target(transport, dst, &plan), None, "{dst}");
+            }
+        }
+        assert_eq!(
+            host_target(Transport::Tcp, v4(203, 0, 113, 9, 80), &plan),
+            Some("203.0.113.9:80".parse().unwrap()),
+        );
+    }
+
+    #[test]
+    fn the_gateways_loopback_mapping_sits_outside_the_rules() {
+        // A policy that admits nothing the guest could reach, and a deny over
+        // the whole of both families: the mapped port still maps, being a grant
+        // of its own, and the gateway's other ports stay refused.
+        for plan in [
+            ruled(&["192.0.2.0/32"], &[], Some(5432)),
+            ruled(&[], &["0.0.0.0/0", "::/0"], Some(5432)),
+        ] {
+            assert_eq!(
+                host_target(Transport::Tcp, v4(10, 0, 2, 2, 5432), &plan),
+                Some("127.0.0.1:5432".parse().unwrap()),
+            );
+            assert_eq!(
+                host_target(Transport::Udp, v6("fd00::2", 5432), &plan),
+                Some("[::1]:5432".parse().unwrap()),
+            );
+            assert_eq!(
+                host_target(Transport::Tcp, v4(10, 0, 2, 2, 5433), &plan),
+                None
+            );
+            assert_eq!(
+                host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
+                None
+            );
+            // The nameserver is the stack's own: served, never forwarded.
+            assert!(plan.serves(v4(10, 0, 2, 3, 53)));
+        }
+    }
+
+    #[test]
+    fn a_translated_destination_is_held_to_the_ipv4_rules() {
+        let denied = ruled(&[], &["203.0.113.0/24"], None);
+        assert_eq!(
+            host_target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &denied),
+            None
+        );
+        let allowed = ruled(&["203.0.113.0/24"], &[], None);
+        assert_eq!(
+            host_target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &allowed),
+            Some("[64:ff9b::cb00:7109]:443".parse().unwrap()),
+        );
+        assert_eq!(
+            host_target(Transport::Tcp, v6("64:ff9b::198.51.100.1", 443), &allowed),
+            None
+        );
     }
 
     #[test]
@@ -1240,17 +1401,19 @@ mod tests {
         ] {
             for dst in resolvers {
                 let destination = SocketAddr::from((IpAddr::from(dst.addr), dst.port));
-                assert_eq!(
-                    stack.forwards(destination),
-                    host_target(dst, &stack.plan).is_some(),
-                    "{dst}",
-                );
+                for transport in [Transport::Tcp, Transport::Udp] {
+                    assert_eq!(
+                        stack.forwards(transport, destination),
+                        host_target(transport, dst, &stack.plan).is_some(),
+                        "{dst} over {transport:?}",
+                    );
+                }
             }
         }
         let stack = NetStack::default();
-        assert!(stack.forwards("9.9.9.9:53".parse().unwrap()));
-        assert!(!stack.forwards("169.254.169.253:53".parse().unwrap()));
-        assert!(!stack.forwards("[fd00:ec2::253]:53".parse().unwrap()));
+        assert!(stack.forwards(Transport::Udp, "9.9.9.9:53".parse().unwrap()));
+        assert!(!stack.forwards(Transport::Udp, "169.254.169.253:53".parse().unwrap()));
+        assert!(!stack.forwards(Transport::Udp, "[fd00:ec2::253]:53".parse().unwrap()));
     }
 
     // -- The pump driven over a socket pair ----------------------------------

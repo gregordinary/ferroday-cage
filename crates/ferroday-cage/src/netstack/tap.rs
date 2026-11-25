@@ -364,7 +364,7 @@ fn build_tap(context: &HelperContext<'_>) -> Result<OwnedFd, (Step, Errno)> {
     }
     if let Some(v4) = &context.plan.v4 {
         set_v4_address(&inet, context.name, v4.guest).map_err(|errno| (Step::SetV4Addr, errno))?;
-        let mask = Ipv4Addr::from(u32::MAX << (32 - u32::from(v4.prefix_len)));
+        let mask = Ipv4Addr::from(super::prefix::mask_v4(v4.prefix_len));
         set_v4_netmask(&inet, context.name, mask).map_err(|errno| (Step::SetV4Mask, errno))?;
     }
     bring_up(&inet, context.name)?;

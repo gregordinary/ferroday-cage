@@ -2052,6 +2052,9 @@ pub ferroday_cage::NetStackError::PublishInvalid::reason: &'static str
 pub ferroday_cage::NetStackError::Pump::op: &'static str
 pub ferroday_cage::NetStackError::Pump::source: core::option::Option<core::io::error::Error>
 pub ferroday_cage::NetStackError::PumpPanicked
+#[non_exhaustive] pub ferroday_cage::NetStackError::RuleInvalid
+pub ferroday_cage::NetStackError::RuleInvalid::reason: &'static str
+pub ferroday_cage::NetStackError::RuleInvalid::rule: ferroday_cage::DestinationRule
 pub ferroday_cage::NetStackError::SharedNamespace
 #[non_exhaustive] pub ferroday_cage::NetStackError::Spawn
 pub ferroday_cage::NetStackError::Spawn::source: core::io::error::Error
@@ -2415,6 +2418,16 @@ impl core::marker::Unpin for ferroday_cage::Stdio
 impl core::marker::UnsafeUnpin for ferroday_cage::Stdio
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Stdio
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Stdio
+#[non_exhaustive] pub enum ferroday_cage::Transport
+pub ferroday_cage::Transport::Tcp
+pub ferroday_cage::Transport::Udp
+impl core::marker::Freeze for ferroday_cage::Transport
+impl core::marker::Send for ferroday_cage::Transport
+impl core::marker::Sync for ferroday_cage::Transport
+impl core::marker::Unpin for ferroday_cage::Transport
+impl core::marker::UnsafeUnpin for ferroday_cage::Transport
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Transport
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Transport
 #[non_exhaustive] pub struct ferroday_cage::Bind
 impl ferroday_cage::Bind
 pub fn ferroday_cage::Bind::get_source(&self) -> &std::path::Path
@@ -2556,6 +2569,23 @@ impl core::marker::Unpin for ferroday_cage::CageBuilder
 impl core::marker::UnsafeUnpin for ferroday_cage::CageBuilder
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::CageBuilder
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::CageBuilder
+pub struct ferroday_cage::DestinationRule
+impl core::fmt::Display for ferroday_cage::DestinationRule
+pub fn ferroday_cage::DestinationRule::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for ferroday_cage::DestinationRule
+pub type ferroday_cage::DestinationRule::Err = ferroday_cage::ParseDestinationRuleError
+pub fn ferroday_cage::DestinationRule::from_str(&str) -> core::result::Result<ferroday_cage::DestinationRule, ferroday_cage::ParseDestinationRuleError>
+impl serde_core::ser::Serialize for ferroday_cage::DestinationRule
+pub fn ferroday_cage::DestinationRule::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for ferroday_cage::DestinationRule
+pub fn ferroday_cage::DestinationRule::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for ferroday_cage::DestinationRule
+impl core::marker::Send for ferroday_cage::DestinationRule
+impl core::marker::Sync for ferroday_cage::DestinationRule
+impl core::marker::Unpin for ferroday_cage::DestinationRule
+impl core::marker::UnsafeUnpin for ferroday_cage::DestinationRule
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::DestinationRule
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::DestinationRule
 #[non_exhaustive] pub struct ferroday_cage::DirectMapper
 impl ferroday_cage::DirectMapper
 pub fn ferroday_cage::DirectMapper::new() -> ferroday_cage::DirectMapper
@@ -2751,7 +2781,7 @@ pub struct ferroday_cage::NetStack
 impl ferroday_cage::NetStack
 pub fn ferroday_cage::NetStack::attach(&self, &ferroday_cage::Pending<'_>) -> core::result::Result<ferroday_cage::NetStackHandle, ferroday_cage::NetStackError>
 pub fn ferroday_cage::NetStack::builder() -> ferroday_cage::NetStackBuilder
-pub fn ferroday_cage::NetStack::forwards(&self, core::net::socket_addr::SocketAddr) -> bool
+pub fn ferroday_cage::NetStack::forwards(&self, ferroday_cage::Transport, core::net::socket_addr::SocketAddr) -> bool
 pub fn ferroday_cage::NetStack::nameservers(&self) -> alloc::vec::Vec<core::net::ip_addr::IpAddr>
 impl core::default::Default for ferroday_cage::NetStack
 pub fn ferroday_cage::NetStack::default() -> Self
@@ -2764,7 +2794,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStack
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStack
 pub struct ferroday_cage::NetStackBuilder
 impl ferroday_cage::NetStackBuilder
+pub fn ferroday_cage::NetStackBuilder::allow(self, ferroday_cage::DestinationRule) -> Self
 pub fn ferroday_cage::NetStackBuilder::build(self) -> core::result::Result<ferroday_cage::NetStack, ferroday_cage::NetStackError>
+pub fn ferroday_cage::NetStackBuilder::deny(self, ferroday_cage::DestinationRule) -> Self
 pub fn ferroday_cage::NetStackBuilder::host_loopback(self, bool) -> Self
 pub fn ferroday_cage::NetStackBuilder::host_loopback_port(self, u16) -> Self
 pub fn ferroday_cage::NetStackBuilder::interface(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -2853,6 +2885,19 @@ impl core::marker::Unpin for ferroday_cage::ParseCgroupLimitError
 impl core::marker::UnsafeUnpin for ferroday_cage::ParseCgroupLimitError
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParseCgroupLimitError
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParseCgroupLimitError
+pub struct ferroday_cage::ParseDestinationRuleError
+impl ferroday_cage::ParseDestinationRuleError
+pub fn ferroday_cage::ParseDestinationRuleError::text(&self) -> &str
+impl core::error::Error for ferroday_cage::ParseDestinationRuleError
+impl core::fmt::Display for ferroday_cage::ParseDestinationRuleError
+pub fn ferroday_cage::ParseDestinationRuleError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::ParseDestinationRuleError
+impl core::marker::Send for ferroday_cage::ParseDestinationRuleError
+impl core::marker::Sync for ferroday_cage::ParseDestinationRuleError
+impl core::marker::Unpin for ferroday_cage::ParseDestinationRuleError
+impl core::marker::UnsafeUnpin for ferroday_cage::ParseDestinationRuleError
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ParseDestinationRuleError
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ParseDestinationRuleError
 pub struct ferroday_cage::ParseFsAccessError
 impl ferroday_cage::ParseFsAccessError
 pub fn ferroday_cage::ParseFsAccessError::text(&self) -> &str

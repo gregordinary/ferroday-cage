@@ -263,6 +263,14 @@ count = 1
 why = "Not a path: a profile's network in `address/length` form."
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/netstack/policy.rs"
+count = 1
+why = """\
+Not a path: a destination rule's network in `address/length` form, whose \
+address may be of either family and whose length defaults to the family's \
+width, which the profile's single-family network above does not take."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage-cli/src/main.rs"
 count = 2
 why = "Not paths: `--netstack-cidr` and `--netstack-cidr6`, each an `address/length`."
@@ -348,6 +356,23 @@ count = 2
 why = """\
 Both are a plural Rust field naming a singular TOML table, which no \
 `rename_all` derives: `rlimits` -> `rlimit` and `mounts` -> `mount`."""
+
+[[idiom]]
+name = "a prefix length's mask"
+# `MAX <<` and `MAX.checked_shl` over the two address widths: how a mask is
+# shifted into place.
+pattern = 'u(?:32|128)::MAX(?:\s*<<|\s*\.checked_shl)'
+answer = """\
+`netstack::prefix`: `mask_v4` and `mask_v6` for the mask itself, `contains` for \
+whether a network holds an address, and `is_network` for whether an address \
+names a network. A prefix of length 0 shifts by the whole width, which `<<` \
+refuses, and a mask shifted at each site is a site that has to remember it: \
+the destination rules take `0.0.0.0/0` and `::/0`."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/netstack/prefix.rs"
+count = 2
+why = "The answer."
 
 [[idiom]]
 name = "reading a nameserver out of a resolv.conf"

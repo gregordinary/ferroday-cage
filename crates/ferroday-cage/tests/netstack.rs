@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, NetStack, NetStackError, Network, RawMount};
+use ferroday_cage::{Cage, NetStack, NetStackError, Network, RawMount, Transport};
 
 #[test]
 fn attach_creates_the_guest_interface() {
@@ -228,7 +228,12 @@ fn abandoning_the_pending_launch_after_attach() {
 /// banner and echoes a line back. Returns its port and a receiver that
 /// yields whatever the peer sent.
 fn banner_listener(banner: &'static [u8]) -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    banner_listener_on(Ipv4Addr::LOCALHOST, banner)
+}
+
+/// [`banner_listener`], bound to `address`.
+fn banner_listener_on(address: Ipv4Addr, banner: &'static [u8]) -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind((address, 0)).expect("a host listener binds");
     let port = listener
         .local_addr()
         .expect("the listener has an address")
@@ -520,7 +525,12 @@ fn the_default_policy_blocks_a_host_local_service() {
 /// A host UDP socket that echoes the first datagram back to its sender and
 /// reports what it received. Returns its port and the receiver.
 fn udp_echo() -> (u16, mpsc::Receiver<Vec<u8>>) {
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback UDP socket binds");
+    udp_echo_on(Ipv4Addr::LOCALHOST)
+}
+
+/// [`udp_echo`], bound to `address`.
+fn udp_echo_on(address: Ipv4Addr) -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let socket = UdpSocket::bind((address, 0)).expect("a host UDP socket binds");
     let port = socket
         .local_addr()
         .expect("the socket has an address")
@@ -609,6 +619,240 @@ fn udp_reaches_a_host_socket_through_a_named_port() {
         .build()
         .expect("a valid stack configuration");
     udp_round_trip(rootfs, port, received, stack);
+}
+
+// -- Destination rules -----------------------------------------------------
+//
+// The rules decide only what the stack would otherwise carry, which loopback
+// never is, so the servers these tests reach listen on the host's own routable
+// address.
+
+/// The host's own routable IPv4 address, where these tests' servers listen, or
+/// `None`, with the skip reported, where the host has none the stack carries
+/// flows to.
+fn routable() -> Option<Ipv4Addr> {
+    let address = common::require::routable_v4()?;
+    // A host whose own address falls in the guest's network would see every
+    // flow to it refused as the guest's on-link traffic, rules or none.
+    let carried = NetStack::default().forwards(Transport::Tcp, (address, 80).into());
+    common::require::TUN
+        .holds(
+            carried,
+            format!("the stack refuses the host's own address {address}"),
+        )
+        .then_some(address)
+}
+
+/// A stack with `allow` and `deny` rules, given as text, over `builder`.
+fn ruled(builder: ferroday_cage::NetStackBuilder, allow: &[String], deny: &[String]) -> NetStack {
+    let builder = allow.iter().fold(builder, |builder, rule| {
+        builder.allow(rule.parse().expect("an allow rule"))
+    });
+    deny.iter()
+        .fold(builder, |builder, rule| {
+            builder.deny(rule.parse().expect("a deny rule"))
+        })
+        .build()
+        .expect("address rules build")
+}
+
+/// Runs `script` in a sandbox with `stack` attached, for at most ten seconds,
+/// and returns whether it exited successfully in that time and what it
+/// printed. One still running then is killed.
+fn run_under(rootfs: &Path, stack: &NetStack, script: &str) -> (bool, String) {
+    let mut observer = Collect::default();
+    let pending = common::shell(rootfs, script)
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = stack.attach(&pending).expect("the stack attaches");
+    let mut running = pending.proceed().expect("the command is released");
+    let status = running.wait_timeout(Duration::from_secs(10)).ok().flatten();
+    if status.is_none() {
+        let _ = running.kill();
+        let _ = running.wait();
+    }
+    drop(running);
+    handle.stop().expect("the stack stops cleanly");
+    (
+        status.is_some_and(|status| status.success()),
+        String::from_utf8_lossy(&observer.stdout).into_owned(),
+    )
+}
+
+/// Whether a host server's receiver stays empty: the guest never reached it.
+fn never_reached(received: &mpsc::Receiver<Vec<u8>>) -> bool {
+    received.recv_timeout(Duration::from_millis(500)).is_err()
+}
+
+#[test]
+fn an_allow_rule_carries_its_range_and_refuses_the_rest() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let Some(host) = routable() else {
+        return;
+    };
+    let connect = |port| format!("echo ping | /usr/bin/nc -w 3 {host} {port}");
+
+    let (port, received) = banner_listener_on(host, b"admitted\n");
+    let stack = ruled(NetStack::builder(), &[format!("{host}/32:{port}")], &[]);
+    let (ok, stdout) = run_under(rootfs, &stack, &connect(port));
+    assert!(ok && stdout.contains("admitted"), "{stdout}");
+    let from_guest = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the host's server heard from the guest");
+    assert_eq!(String::from_utf8_lossy(&from_guest).trim(), "ping");
+
+    // An allow rule that leaves the host out refuses it, as one admitting the
+    // host on another port does.
+    for allow in ["192.0.2.0/24".to_string(), format!("{host}:1")] {
+        let (port, received) = banner_listener_on(host, b"refused\n");
+        let stack = ruled(NetStack::builder(), std::slice::from_ref(&allow), &[]);
+        let (ok, stdout) = run_under(rootfs, &stack, &connect(port));
+        assert!(!ok && !stdout.contains("refused"), "{allow}: {stdout}");
+        assert!(never_reached(&received), "{allow}");
+    }
+}
+
+#[test]
+fn a_deny_rule_refuses_what_an_allow_rule_admits_and_alone_admits_the_rest() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let Some(host) = routable() else {
+        return;
+    };
+    let both = |denied: u16, carried: u16| {
+        format!(
+            "/usr/bin/nc -w 3 {host} {denied} < /dev/null; \
+             echo ping | /usr/bin/nc -w 3 {host} {carried}"
+        )
+    };
+    for allow in [vec![format!("{host}/32")], vec![]] {
+        let (denied, denied_received) = banner_listener_on(host, b"denied\n");
+        let (carried, carried_received) = banner_listener_on(host, b"carried\n");
+        let stack = ruled(
+            NetStack::builder(),
+            &allow,
+            &[format!("tcp:{host}:{denied}")],
+        );
+        let (_, stdout) = run_under(rootfs, &stack, &both(denied, carried));
+        assert!(
+            !stdout.contains("denied") && stdout.contains("carried"),
+            "under {allow:?}: {stdout}"
+        );
+        assert!(never_reached(&denied_received), "under {allow:?}");
+        carried_received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the carried port's server heard from the guest");
+    }
+}
+
+#[test]
+fn a_transport_rule_carries_its_own_transport_alone() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let Some(host) = routable() else {
+        return;
+    };
+    let send = |port| format!("echo datagram | /usr/bin/nc -u -w 2 {host} {port}");
+
+    let (port, received) = udp_echo_on(host);
+    let stack = ruled(NetStack::builder(), &[format!("udp:{host}")], &[]);
+    let (_, stdout) = run_under(rootfs, &stack, &send(port));
+    let from_guest = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the host's socket received the guest's datagram");
+    assert_eq!(String::from_utf8_lossy(&from_guest).trim(), "datagram");
+    assert_eq!(stdout.trim(), "datagram", "the echo reached the guest");
+
+    let (port, received) = udp_echo_on(host);
+    let stack = ruled(NetStack::builder(), &[format!("tcp:{host}")], &[]);
+    let (_, stdout) = run_under(rootfs, &stack, &send(port));
+    assert!(never_reached(&received), "a TCP rule carried a datagram");
+    assert!(stdout.trim().is_empty(), "{stdout}");
+}
+
+#[test]
+fn rules_that_admit_nothing_leave_the_stacks_own_grants() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let everything = ["0.0.0.0/0".to_string(), "::/0".to_string()];
+
+    // The gateway's loopback mapping and the nameserver, under a deny over
+    // both families whole.
+    let (port, received) = banner_listener(b"mapped\n");
+    let resolver = Resolver::new(1);
+    let stack = ruled(
+        NetStack::builder()
+            .host_loopback_port(port)
+            .upstream(resolver.address()),
+        &[],
+        &everything,
+    );
+    let mut observer = Collect::default();
+    let pending = Cage::builder()
+        .rootfs(rootfs)
+        .nameservers(stack.nameservers())
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!("echo ping | /usr/bin/nc -w 3 10.0.2.2 {port}; getent hosts {KNOWN_NAME}"),
+        ])
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = stack.attach(&pending).expect("the stack attaches");
+    let mut running = pending.proceed().expect("the command is released");
+    common::outcome_within(&mut running, Duration::from_secs(30));
+    drop(running);
+    handle.stop().expect("the stack stops cleanly");
+    let printed = String::from_utf8_lossy(&observer.stdout);
+    assert!(printed.contains("mapped"), "{printed}");
+    assert!(
+        printed.contains("192.0.2.1"),
+        "the name resolved: {printed}"
+    );
+    received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the mapped port's server heard from the guest");
+
+    // A published port, under the same deny.
+    let mut observer = Collect::default();
+    let pending = common::shell(rootfs, "echo hello from the guest | /usr/bin/nc -l -p 8000")
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let stack = ruled(
+        NetStack::builder().publish((Ipv4Addr::LOCALHOST, 0).into(), 8000),
+        &[],
+        &everything,
+    );
+    let handle = stack.attach(&pending).expect("the stack attaches");
+    let address = handle.published()[0];
+    let mut running = pending.proceed().expect("the command is released");
+    let (stream, greeting) = connect_published(address);
+    assert_eq!(greeting, "hello from the guest\n");
+    stream
+        .shutdown(std::net::Shutdown::Both)
+        .expect("the host closes");
+    common::outcome_within(&mut running, Duration::from_secs(10));
+    drop(running);
+    handle.stop().expect("the stack stops cleanly");
 }
 
 #[test]

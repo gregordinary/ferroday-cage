@@ -60,11 +60,12 @@ use ferroday_cage::provision::{
 };
 use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
-    Bind, Cage, CageBuilder, Capability, CgroupLimit, Error, ErrorChain, ExitStatus, FsAccess,
-    Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount, NetAccess, NetStack,
-    NetStackHandle, Network, Overlay, PresentedIdentity, RawMount, ReadOnly, ResolvedCgroup,
-    ResolvedInputs, Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running,
-    SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
+    Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
+    ExitStatus, FsAccess, Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount,
+    NetAccess, NetStack, NetStackHandle, Network, Overlay, PresentedIdentity, RawMount, ReadOnly,
+    ResolvedCgroup, ResolvedInputs, Resource, RestrictedProfile, Restriction, RestrictionBuilder,
+    Running, SeccompArg, SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio,
+    Symlink,
 };
 use serde::Deserialize as _;
 
@@ -2002,6 +2003,45 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--netstack-allow",
+        section: Section::Networking,
+        placeholder: "RULE",
+        help: &[
+            "Carry the sandbox's traffic only to what RULE admits",
+            "(repeatable): an ADDRESS or ADDRESS/LEN, with :PORTS",
+            "such as :443, :80,443 or :8000-8999 (an IPv6 one in",
+            "brackets), and tcp: or udp: for one transport. Once",
+            "one is given, everything no allow rule admits is",
+            "refused. Loopback, link-local and the sandbox's own",
+            "network stay refused whatever the rules say",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .netstack_allow
+                .push(parse_destination_rule(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-deny",
+        section: Section::Networking,
+        placeholder: "RULE",
+        help: &[
+            "Refuse the sandbox's traffic to what RULE matches,",
+            "whatever an allow rule admits (repeatable; the form",
+            "--netstack-allow takes). With deny rules alone,",
+            "everything else is carried",
+        ],
+        take: Take::One(|options, flag, value| {
+            options
+                .netstack_deny
+                .push(parse_destination_rule(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--restrict",
         section: Section::Hardening,
         help: &[
@@ -2745,6 +2785,8 @@ struct Options {
     netstack_upstream: Option<SocketAddr>,
     netstack_host_ports: Vec<u16>,
     netstack_publish: Vec<(SocketAddr, u16)>,
+    netstack_allow: Vec<DestinationRule>,
+    netstack_deny: Vec<DestinationRule>,
     /// The `--forward-loopback` listeners, each with its target on the host.
     forwards: Vec<(SocketAddr, forward::Target)>,
 }
@@ -3280,6 +3322,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack_upstream: None,
         netstack_host_ports: Vec::new(),
         netstack_publish: Vec::new(),
+        netstack_allow: Vec::new(),
+        netstack_deny: Vec::new(),
         forwards: Vec::new(),
     };
 
@@ -4078,6 +4122,14 @@ fn parse_upstream(flag: &str, value: &str) -> Result<SocketAddr, String> {
     value
         .parse::<SocketAddr>()
         .map_err(|_| format!("{flag} expects ADDRESS or ADDRESS:PORT, not {value:?}"))
+}
+
+/// Parses a destination rule for `--netstack-allow` or `--netstack-deny`, in
+/// the grammar [`DestinationRule`] reads.
+fn parse_destination_rule(flag: &str, value: &str) -> Result<DestinationRule, String> {
+    value
+        .parse::<DestinationRule>()
+        .map_err(|error| format!("{flag}: {error}"))
 }
 
 /// Parses an IPv4 `address/prefix` for `--netstack-cidr`.
@@ -5872,6 +5924,12 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
     }
     for (host, guest_port) in &options.netstack_publish {
         stack = stack.publish(*host, *guest_port);
+    }
+    for rule in &options.netstack_allow {
+        stack = stack.allow(rule.clone());
+    }
+    for rule in &options.netstack_deny {
+        stack = stack.deny(rule.clone());
     }
     if let Some((network, prefix_len)) = options.netstack_cidr {
         stack = stack.ipv4_cidr(network, prefix_len);
@@ -10179,6 +10237,57 @@ mod tests {
     }
 
     #[test]
+    fn the_destination_rule_flags_reach_the_stack() {
+        use ferroday_cage::Transport;
+
+        let options = run_options(&[
+            "--rootfs",
+            "/r",
+            "--netstack",
+            "--netstack-allow",
+            "192.0.2.0/24",
+            "--netstack-allow",
+            "tcp:[2001:db8::/32]:443",
+            "--netstack-deny",
+            "192.0.2.7:22",
+            "/bin/true",
+        ]);
+        let written = |rules: &[DestinationRule]| -> Vec<String> {
+            rules.iter().map(ToString::to_string).collect()
+        };
+        assert_eq!(
+            written(&options.netstack_allow),
+            ["192.0.2.0/24", "tcp:[2001:db8::/32]:443"]
+        );
+        assert_eq!(written(&options.netstack_deny), ["192.0.2.7:22"]);
+        let stack = netstack_from(&options).expect("address rules compose a stack");
+        assert!(stack.forwards(Transport::Tcp, "192.0.2.8:22".parse().unwrap()));
+        assert!(!stack.forwards(Transport::Tcp, "192.0.2.7:22".parse().unwrap()));
+        assert!(!stack.forwards(Transport::Udp, "[2001:db8::1]:443".parse().unwrap()));
+        assert!(!stack.forwards(Transport::Tcp, "203.0.113.9:443".parse().unwrap()));
+
+        // A rule outside the grammar is a usage error naming its flag.
+        for flag in ["--netstack-allow", "--netstack-deny"] {
+            let err = parse_error(&["--rootfs", "/r", "--netstack", flag, "example.com:0", "/x"]);
+            assert!(err.starts_with(flag) && err.contains("port 0"), "{err}");
+        }
+        // One the library cannot use is refused where the stack is built.
+        let options = run_options(&[
+            "--rootfs",
+            "/r",
+            "--netstack",
+            "--netstack-deny",
+            "example.com",
+            "/bin/true",
+        ]);
+        let err = netstack_from(&options).expect_err("a name rule");
+        assert!(err.to_string().contains("example.com"), "{err}");
+        // And like every --netstack-* flag, each needs --netstack.
+        let err = parse_error(&["--rootfs", "/r", "--netstack-allow", "192.0.2.0/24", "/x"]);
+        assert!(err.contains("require --netstack"), "{err}");
+    }
+
+    #[test]
     fn netstack_modifiers_require_netstack() {
         let err = parse_run(&["--rootfs", "/r", "--netstack-mtu", "1400", "/bin/true"])
             .err()
@@ -10282,6 +10391,7 @@ mod tests {
             "--netstack-host-port" | "--landlock-bind" | "--landlock-connect" => &["80"],
             "--netstack-publish" => &["8080", "80"],
             "--netstack-upstream" | "--nameserver" => &["127.0.0.53"],
+            "--netstack-allow" | "--netstack-deny" => &["192.0.2.0/24"],
             "--landlock-scope" => &["signal"],
             "--seccomp" => &["curated"],
             "--seccomp-allow"
