@@ -1158,9 +1158,12 @@ impl HardeningPlan {
 /// One frozen mount operation.
 ///
 /// Every target path is a rootfs-relative `CString` the sandbox stage
-/// resolves against the new-root descriptor with `RESOLVE_IN_ROOT`, so
-/// rootfs-internal absolute symlinks cannot escape into the host during the
-/// pre-pivot window.
+/// resolves with `RESOLVE_IN_ROOT`, so rootfs-internal absolute symlinks
+/// cannot escape into the host during the pre-pivot window: against the
+/// new-root descriptor, or, beneath an earlier op's mount, against that mount's
+/// descriptor, from the part of the path beneath that op's target. Which op
+/// that is follows from the paths alone, as [`spec::covers`](crate::spec::covers)
+/// answers it, which is how the build reads the profile too.
 #[derive(Debug, Clone)]
 pub(crate) struct MountOp {
     /// Mount-target directories to create first, outermost first. Existing
@@ -1461,6 +1464,28 @@ impl MountAction {
             }
             MountAction::Overlay { target, .. } => Some((target, Arrival::Overlay)),
             MountAction::Symlink { .. } => None,
+        }
+    }
+
+    /// The rootfs-relative path whose anchor the launch resolves this
+    /// action's paths from: its target, or the directory a link is made in,
+    /// empty at the root's top level.
+    ///
+    /// Every path an op names lies at or beneath it: the target, the
+    /// directories made on the way to it, a file bind's target, and the
+    /// directory a path made read-only has its name in.
+    pub(crate) fn anchored_path(&self) -> &CStr {
+        match self {
+            MountAction::Symlink { parent, .. } => parent,
+            MountAction::Tmpfs { target, .. }
+            | MountAction::Procfs { target }
+            | MountAction::Devpts { target, .. }
+            | MountAction::Bind { target, .. }
+            | MountAction::Raw { target, .. }
+            | MountAction::Hide { target }
+            | MountAction::File { target, .. }
+            | MountAction::ReadOnly { target, .. }
+            | MountAction::Overlay { target, .. } => target,
         }
     }
 }
@@ -2068,14 +2093,9 @@ fn fork_launch(
     #[cfg(not(feature = "hardening"))]
     let listener_channel: Option<(OwnedFd, OwnedFd)> = None;
 
-    // The slots the setup keeps each hidden directory's tmpfs in until the
-    // profile is in place, allocated here because the child cannot allocate.
-    let hidden: Vec<std::cell::Cell<Option<OwnedFd>>> = plan
-        .ops
-        .iter()
-        .filter(|op| matches!(op.action, MountAction::Hide { .. }))
-        .map(|_| std::cell::Cell::new(None))
-        .collect();
+    // One slot per mount op, where the setup keeps what an op mounted while it
+    // still needs it, allocated here because the child cannot allocate.
+    let mounts: Vec<child::MountSlot> = plan.ops.iter().map(|_| Default::default()).collect();
 
     // SAFETY: the child-process branch only constructs a struct of references
     // on its own stack and runs `child::stage_a`, which performs raw rustix
@@ -2109,7 +2129,7 @@ fn fork_launch(
                     .as_ref()
                     .map(|(_, sandbox)| sandbox.as_fd()),
                 take_foreground: foreground.is_some(),
-                hidden: &hidden,
+                mounts: &mounts,
                 cgroup_procs_fd: cgroup_procs,
                 join,
             };

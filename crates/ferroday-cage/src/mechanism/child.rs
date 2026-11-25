@@ -60,17 +60,20 @@
 //! async-signal-safe wrapper of the one syscall; the [`mechanism`](super)
 //! documentation states why that is safe here.
 //!
-//! Mount targets are resolved against the new-root descriptor with
-//! `openat2` and `RESOLVE_IN_ROOT`, so an absolute symlink inside the
-//! rootfs resolves within the rootfs and cannot reach the host tree during
-//! the pre-pivot window. What a step mounts is made detached and attached
-//! onto the resolved descriptor with `move_mount`: a filesystem of the
-//! sandbox's own through `fsopen` and `fsmount` (see [`fresh_mount`]), a bind
-//! as a clone of its source's tree, an overlay through the same calls. A raw
-//! mount is the one step `mount(2)` makes, verbatim, and it and the remount
-//! that stands in for `mount_setattr` below Linux 5.12 address the descriptor
-//! through its `/proc/self/fd` path, formatted into a stack buffer; the host
-//! `/proc` is still mounted at that point.
+//! Mount targets are resolved against the new-root descriptor with `openat2`
+//! and `RESOLVE_IN_ROOT`, so an absolute symlink inside the rootfs resolves
+//! within the rootfs and cannot reach the host tree during the pre-pivot
+//! window. A target beneath an earlier mount of the profile is resolved the
+//! same way from that mount's own descriptor, which the setup keeps while a
+//! later step needs it, so it lands in that mount whatever renames the
+//! directories above it meanwhile; see [`Profile`]. What a step mounts is made
+//! detached and attached onto the resolved descriptor with `move_mount`: a
+//! filesystem of the sandbox's own through `fsopen` and `fsmount` (see
+//! [`fresh_mount`]), a bind as a clone of its source's tree, an overlay through
+//! the same calls. A raw mount is the one step `mount(2)` makes, verbatim, and
+//! it and the remount that stands in for `mount_setattr` below Linux 5.12
+//! address the descriptor through its `/proc/self/fd` path, formatted into a
+//! stack buffer; the host `/proc` is still mounted at that point.
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -106,6 +109,7 @@ use super::{
     STATUS_DUMPED, STATUS_EXITED, STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
 };
 use crate::error::SetupStep;
+use crate::spec::covers;
 
 /// Everything the stages touch: the frozen plan plus the pointer arrays,
 /// identity-map lines, and channel descriptors assembled by the caller
@@ -171,10 +175,12 @@ pub(super) struct Context<'a> {
     /// terminal, standard input: the caller decided at the launch that it
     /// lends the terminal, as [`Foreground`](super::Foreground) describes.
     pub(super) take_foreground: bool,
-    /// One slot per hidden path of the profile, allocated by the caller, where
-    /// the setup keeps each hidden directory's tmpfs until the profile is in
-    /// place and the tmpfs is made read-only. The caller's copy stays empty.
-    pub(super) hidden: &'a [Cell<Option<OwnedFd>>],
+    /// One slot per op of the mount profile, allocated by the caller, where the
+    /// setup keeps the descriptor of what an op mounted while a later step
+    /// resolves a path beneath it, and a hidden directory's tmpfs until the
+    /// profile is in place and the tmpfs is made read-only. The caller's copy
+    /// stays empty.
+    pub(super) mounts: &'a [MountSlot],
     /// The `cgroup.procs` of the sandbox's leaf cgroup, when the launch has a
     /// cgroup: the launch stage writes itself into it before anything else.
     pub(super) cgroup_procs_fd: Option<BorrowedFd<'a>>,
@@ -2001,23 +2007,18 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
 
     // The mount profile: host bind sources are still resolvable (the host
     // tree is mounted until the pivot), and every target resolves inside
-    // the new root. A hidden directory's tmpfs is kept, in a slot the caller
-    // allocated, until nothing more is made in it.
-    let mut slots = context.hidden.iter();
-    for (index, op) in plan.ops.iter().enumerate() {
-        let detail = index as u32 + 1;
-        let hidden = execute_op(newroot.as_fd(), op, index, context.report_fd)
-            .map_err(|(step, errno)| (step, errno, detail))?;
-        if let Some(hidden) = hidden {
-            match slots.next() {
-                Some(slot) => slot.set(Some(hidden)),
-                // The caller allocates a slot for every hidden path, so this
-                // is not reached; made read-only at once, the directory still
-                // hides, and only a mount beneath it would fail.
-                None => read_only_mount(hidden.as_fd())
-                    .map_err(|errno| (SetupStep::HidePath, errno, detail))?,
-            }
-        }
+    // the new root, from the mount it lies beneath (see `Profile`). What an op
+    // mounted is kept, in the slot the caller allocated for it, while a later
+    // step still resolves beneath it, and a hidden directory's tmpfs until
+    // nothing more is made in it.
+    let profile = Profile {
+        root: newroot.as_fd(),
+        ops: &plan.ops,
+        slots: context.mounts,
+    };
+    for index in 0..plan.ops.len() {
+        execute_op(&profile, index, context.report_fd)
+            .map_err(|(step, errno)| (step, errno, index as u32 + 1))?;
     }
 
     // The procfs the command's nested identity map will be written through,
@@ -2034,9 +2035,19 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
 
     // Last of all, once nothing more is made in them: every hidden
     // directory, and an empty root.
-    for slot in context.hidden {
-        if let Some(hidden) = slot.take() {
-            read_only_mount(hidden.as_fd()).map_err(|errno| (SetupStep::HidePath, errno, 0))?;
+    for (index, op) in plan.ops.iter().enumerate() {
+        let Some(slot) = context.mounts.get(index) else {
+            continue;
+        };
+        if let (MountAction::Hide { .. }, Some(hidden)) = (&op.action, slot.mount.take()) {
+            let made = is_directory(hidden.as_fd())
+                .and_then(|directory| match directory {
+                    true => read_only_mount(hidden.as_fd()),
+                    false => Ok(()),
+                })
+                .map_err(|errno| (SetupStep::HidePath, errno, index as u32 + 1));
+            slot.mount.set(Some(hidden));
+            made?;
         }
     }
     if matches!(plan.root, RootPlan::Empty) {
@@ -2048,9 +2059,14 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     // clones carries the flags it ends with.
     for (index, op) in plan.ops.iter().enumerate() {
         if let MountAction::ReadOnly { parent, .. } = &op.action {
-            hold_name(newroot.as_fd(), parent)
+            hold_name(&profile, index, parent)
                 .map_err(|(step, errno)| (step, errno, index as u32 + 1))?;
         }
+    }
+
+    // Nothing past the profile resolves beneath a mount it kept.
+    for slot in context.mounts {
+        drop(slot.mount.take());
     }
 
     process::fchdir(&newroot).map_err(|errno| (SetupStep::EnterRootfs, errno, 0))?;
@@ -3075,178 +3091,525 @@ fn share_target(file: &OwnedFd) -> Result<(), Errno> {
     taken
 }
 
-/// Executes one frozen mount op, the plan's `index`th, against the new root.
+/// The mount profile as the setup executes it: the frozen ops, the new root
+/// their paths are resolved against, and a slot per op, where the setup keeps
+/// what the op mounted for as long as it needs it again.
 ///
-/// Returns a hidden directory's tmpfs, which the setup makes read-only once
-/// the profile is in place, and `None` for every other op.
+/// A path beneath an earlier mount is resolved from that mount's descriptor
+/// rather than from the root, and so lands in that mount, which is where the
+/// build places it: [`covers`] reads the profile by its paths alone, for the
+/// targets the launch creates and removes again, for the procfs the nested map
+/// is written through, and for what a host root must already hold. Resolved
+/// from the root, the path would follow whatever holds its directories when
+/// its step runs. A process writing a root two sandboxes share could rename a
+/// mount point between two steps: the mount moves with the directory it stands
+/// on, and a hide or a path made read-only beneath it would land on nothing, or
+/// on an entry of that process's own, while the command found the mount under
+/// the new name with nothing hidden in it.
+///
+/// A lookup that starts at a mount's root does not cross a mount stacked on
+/// that root, which a step reaching the same place by another path makes: the
+/// host root's `/var/run` hide, which follows the host's link to `/run` and
+/// lands on the `/run` hide. So each step that brings a mount to rest on the
+/// root of one the setup holds records it there (see [`MountSlot`]), and a path
+/// beneath that root is resolved from the mount on top, which is what the
+/// command sees.
+struct Profile<'a> {
+    /// The new root.
+    root: BorrowedFd<'a>,
+    /// The ops, in the order they run.
+    ops: &'a [MountOp],
+    /// One slot per op, allocated by the caller.
+    slots: &'a [MountSlot],
+}
+
+/// What the setup keeps of one op of the mount profile, in a slot the caller
+/// allocates, since the setup cannot.
+#[derive(Default)]
+pub(super) struct MountSlot {
+    /// What the op mounted, while a later step resolves a path beneath it or
+    /// stacks onto it, and a hidden directory's tmpfs until it is made
+    /// read-only.
+    mount: Cell<Option<OwnedFd>>,
+    /// The later op whose mount came to rest on this one's root and stands
+    /// over its whole tree.
+    covered_by: Cell<Option<usize>>,
+}
+
+/// Where a path of an op is resolved from: beneath the target of the `op`th
+/// op, which is what [`covers`] places it beneath, from the mount of the
+/// `held`th, which stands on top of that target's mount.
+#[derive(Clone, Copy)]
+struct Anchor {
+    /// The op whose target the path lies at or beneath.
+    op: usize,
+    /// The op whose mount the path is resolved from.
+    held: usize,
+}
+
+impl Profile<'_> {
+    /// Where a path the `before`th op names is resolved from: the latest op
+    /// before it whose mount stands at or above `path`, of those whose mount
+    /// the setup holds, or `None` where there is none and `path` is resolved
+    /// from the root.
+    ///
+    /// A hide that found nothing mounted nothing and holds no slot, so a path
+    /// beneath it lands where it would with no hide, as the build reads it.
+    fn anchor(&self, before: usize, path: &CStr) -> Option<Anchor> {
+        self.anchor_where(before, path, |_| true)
+    }
+
+    /// [`anchor`](Self::anchor), of the mounts that stand strictly above
+    /// `path`: a lookup of `path` from one crosses by name whatever is mounted
+    /// at `path` itself.
+    fn anchor_above(&self, before: usize, path: &CStr) -> Option<Anchor> {
+        self.anchor_where(before, path, |target| target != path)
+    }
+
+    /// The latest op before the `before`th whose mount the setup holds and
+    /// whose target covers `path` and is one `admits` takes, and the mount on
+    /// top of it of those an op before the `before`th made.
+    fn anchor_where(
+        &self,
+        before: usize,
+        path: &CStr,
+        admits: impl Fn(&CStr) -> bool,
+    ) -> Option<Anchor> {
+        let ops = self.ops.get(..before).unwrap_or(self.ops);
+        let op = ops.iter().enumerate().rev().find_map(|(at, op)| {
+            let (target, _) = op.action.arrival()?;
+            (covers(target, path) && admits(target) && self.holds(at)).then_some(at)
+        })?;
+        // Each cover is a later op, so the walk ends.
+        let mut held = op;
+        while let Some(over) = self.slots.get(held).and_then(|slot| slot.covered_by.get())
+            && over < before
+            && self.holds(over)
+        {
+            held = over;
+        }
+        Some(Anchor { op, held })
+    }
+
+    /// Whether the setup holds the mount the `at`th op made.
+    fn holds(&self, at: usize) -> bool {
+        self.slots.get(at).is_some_and(|slot| {
+            let held = slot.mount.take();
+            let holds = held.is_some();
+            slot.mount.set(held);
+            holds
+        })
+    }
+
+    /// The part of `path` beneath the target of the op `anchor` names, empty
+    /// where `path` is that target, or `None` where `path` is not at or beneath
+    /// it. Without an anchor, `path` is the root's whole.
+    fn beneath<'p>(&self, anchor: Option<Anchor>, path: &'p CStr) -> Option<&'p CStr> {
+        let Some(anchor) = anchor else {
+            return Some(path);
+        };
+        let (target, _) = self.ops.get(anchor.op)?.action.arrival()?;
+        if !covers(target, path) {
+            return None;
+        }
+        // What follows the target is its terminator alone, or a slash and the
+        // rest of the path.
+        let rest = path.to_bytes_with_nul().get(target.to_bytes().len()..)?;
+        CStr::from_bytes_with_nul(rest.strip_prefix(b"/").unwrap_or(rest)).ok()
+    }
+
+    /// Calls `f` with the descriptor a path beneath `anchor` is resolved from:
+    /// the mount it names, or the root without an anchor.
+    ///
+    /// The descriptor is lent out of its slot for the call, so `f` does not ask
+    /// the profile for an anchor of its own. A slot that holds nothing is a
+    /// defect, since [`anchor`](Self::anchor) names only one that does, and is
+    /// reported as a bad descriptor, since this process must not panic.
+    fn within<R>(
+        &self,
+        anchor: Option<Anchor>,
+        f: impl FnOnce(BorrowedFd<'_>) -> Result<R, (SetupStep, Errno)>,
+    ) -> Result<R, (SetupStep, Errno)> {
+        let Some(anchor) = anchor else {
+            return f(self.root);
+        };
+        let Some(slot) = self.slots.get(anchor.held) else {
+            return Err((SetupStep::OpenMountTarget, Errno::BADF));
+        };
+        let Some(held) = slot.mount.take() else {
+            return Err((SetupStep::OpenMountTarget, Errno::BADF));
+        };
+        let done = f(held.as_fd());
+        slot.mount.set(Some(held));
+        done
+    }
+
+    /// The op before the `before`th whose mount the setup holds and has its
+    /// root where `place` is, if any: the mount a step that brings its own to
+    /// rest at `place` stacks onto.
+    fn held_at(&self, before: usize, place: BorrowedFd<'_>) -> Result<Option<usize>, Errno> {
+        for at in (0..before.min(self.slots.len())).rev() {
+            let Some(slot) = self.slots.get(at) else {
+                continue;
+            };
+            let Some(held) = slot.mount.take() else {
+                continue;
+            };
+            let same = same_place(place, held.as_fd());
+            slot.mount.set(Some(held));
+            if same? {
+                return Ok(Some(at));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Whether `a` and `b` name the same directory of the same mount.
+///
+/// The mount is told by its id, which `statx` reports from Linux 5.8. Before
+/// it, or where `statx` is refused, two names of one directory are taken for
+/// one place: a tmpfs of the launch's own is one mount wherever it is named,
+/// and a bind's root is its source's, which only another bind of that source
+/// shares.
+fn same_place(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> Result<bool, Errno> {
+    let ask = |fd| {
+        fs::statx(
+            fd,
+            c"",
+            AtFlags::EMPTY_PATH,
+            StatxFlags::INO | StatxFlags::MNT_ID,
+        )
+    };
+    let (a, b) = match (ask(a), ask(b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(Errno::NOSYS | Errno::PERM), _) | (_, Err(Errno::NOSYS | Errno::PERM)) => {
+            let (a, b) = (fs::fstat(a)?, fs::fstat(b)?);
+            return Ok((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino));
+        }
+        (Err(errno), _) | (_, Err(errno)) => return Err(errno),
+    };
+    let mount_ids = StatxFlags::from_bits_retain(a.stx_mask & b.stx_mask);
+    let mounts = !mount_ids.contains(StatxFlags::MNT_ID) || a.stx_mnt_id == b.stx_mnt_id;
+    Ok(mounts
+        && (a.stx_dev_major, a.stx_dev_minor, a.stx_ino)
+            == (b.stx_dev_major, b.stx_dev_minor, b.stx_ino))
+}
+
+/// Whether a later op of `ops` resolves a path beneath what the `index`th
+/// mounts, so the setup keeps that mount's descriptor until the profile is in
+/// place.
+fn anchors_later(ops: &[MountOp], index: usize) -> bool {
+    let Some((target, _)) = ops.get(index).and_then(|op| op.action.arrival()) else {
+        return false;
+    };
+    ops.get(index + 1..)
+        .unwrap_or_default()
+        .iter()
+        .any(|later| covers(target, later.action.anchored_path()))
+}
+
+/// A mount target as the setup holds it: the descriptor of the earlier mount
+/// whose target it is, or one opened beneath that mount.
+enum Target<'a> {
+    /// The earlier mount's own descriptor.
+    Anchor(BorrowedFd<'a>),
+    /// A descriptor opened beneath it.
+    Opened(OwnedFd),
+}
+
+impl Target<'_> {
+    /// The target's descriptor.
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Target::Anchor(fd) => *fd,
+            Target::Opened(fd) => fd.as_fd(),
+        }
+    }
+
+    /// Where a mount brought to rest on this target stands, once the anchor's
+    /// descriptor is no longer lent.
+    fn place(self) -> Place {
+        match self {
+            Target::Anchor(_) => Place::Anchor,
+            Target::Opened(fd) => Place::Opened(fd),
+        }
+    }
+}
+
+/// Where an op brought a mount of its own to rest.
+enum Place {
+    /// Nowhere: a link, a hide of nothing, a raw remount or propagation change.
+    Nowhere,
+    /// On the root of the mount its anchor holds.
+    Anchor,
+    /// On the target opened beneath the anchor.
+    Opened(OwnedFd),
+}
+
+/// Opens what `rest` names beneath `at` as [`open_in_root`] does, or lends `at`
+/// itself where `rest` is empty: a target that is an earlier mount's own
+/// target, which a step stacks onto. `O_DIRECTORY` holds for `at` as an open
+/// would hold to it.
+fn open_target<'a>(at: BorrowedFd<'a>, rest: &CStr, oflags: OFlags) -> Result<Target<'a>, Errno> {
+    if !rest.is_empty() {
+        return open_in_root(at, rest, oflags).map(Target::Opened);
+    }
+    if oflags.contains(OFlags::DIRECTORY) && !is_directory(at)? {
+        return Err(Errno::NOTDIR);
+    }
+    Ok(Target::Anchor(at))
+}
+
+/// Whether `fd` names a directory.
+fn is_directory(fd: BorrowedFd<'_>) -> Result<bool, Errno> {
+    fs::fstat(fd).map(|stat| fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::Directory)
+}
+
+/// Executes the profile's `index`th op, and keeps what it mounted where the
+/// setup needs it again: where a later step resolves beneath it or stacks onto
+/// its root, and a hidden directory's tmpfs, to make it read-only once the
+/// profile is in place.
+///
+/// Every path the op names is resolved from its anchor (see [`Profile`]): its
+/// target, the directories made on the way to it, and the file a bind needs
+/// there. A raw mount is made by path, which leaves no descriptor of what it
+/// mounted, so where the setup needs it again, its target is opened once it is
+/// mounted, by name from the nearest mount above it, which crosses into it. A
+/// later step lands in it as long as nothing renames the directories between
+/// the two in that moment.
 fn execute_op(
-    root: BorrowedFd<'_>,
-    op: &MountOp,
+    profile: &Profile<'_>,
     index: usize,
     report_fd: BorrowedFd<'_>,
-) -> Result<Option<OwnedFd>, (SetupStep, Errno)> {
-    // Create missing mount-target directories, one component at a time.
-    // The parent directory is resolved in-root first, so a symlinked
-    // component is followed only within the rootfs; an existing entry —
-    // directory or symlink — is left alone.
-    for dir in &op.dirs {
-        let mode = Mode::from_raw_mode(dir.mode);
-        let created = if dir.parent.is_empty() {
-            create_mount_dir(root, dir.leaf.as_c_str(), mode)
-        } else {
-            let parent = open_in_root(root, &dir.parent, OFlags::PATH | OFlags::DIRECTORY)
-                .map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
-            create_mount_dir(parent.as_fd(), dir.leaf.as_c_str(), mode)
-        };
-        created.map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
-    }
+) -> Result<(), (SetupStep, Errno)> {
+    let Some(op) = profile.ops.get(index) else {
+        return Ok(());
+    };
+    let path = op.action.anchored_path();
+    let anchor = profile.anchor(index, path);
+    let (place, mut mounted) = profile.within(anchor, |at| {
+        // Create missing mount-target directories beneath the anchor, one
+        // component at a time; those at and above its target stood when its
+        // own step resolved that target through them. Each parent is resolved
+        // in-root first, so a symlinked component is followed only within the
+        // anchor's tree; an existing entry — directory or symlink — is left
+        // alone.
+        for dir in &op.dirs {
+            let Some(parent) = profile.beneath(anchor, &dir.parent) else {
+                continue;
+            };
+            let failed = |errno| (SetupStep::CreateMountTarget, errno);
+            let parent =
+                open_target(at, parent, OFlags::PATH | OFlags::DIRECTORY).map_err(failed)?;
+            create_mount_dir(parent.as_fd(), &dir.leaf, Mode::from_raw_mode(dir.mode))
+                .map_err(failed)?;
+        }
 
-    // The target of a file bind must exist before a file can be bound onto
-    // it; create it empty where the root ships nothing at that path.
-    if let Some(file) = &op.create_file {
-        hold_file_target(root, file, index, report_fd)
-            .map_err(|errno| (SetupStep::CreateMountTarget, errno))?;
-    }
+        // The target of a file bind must exist before a file can be bound onto
+        // it; create it empty where the tree holds nothing at that path. One
+        // that is the anchor's own target is a mount, there already.
+        if let Some(file) = op.create_file.as_deref() {
+            match profile.beneath(anchor, file) {
+                Some(file) if !file.is_empty() => hold_file_target(at, file, index, report_fd)
+                    .map_err(|errno| (SetupStep::CreateMountTarget, errno))?,
+                _ => {}
+            }
+        }
 
-    let done = match &op.action {
-        MountAction::Hide { target } => return hide(root, target),
-        MountAction::File { target, contents } => return place_file(root, target, contents),
-        MountAction::ReadOnly { target, .. } => {
-            let target = open_in_root(root, target, OFlags::PATH)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-            read_only_in_place(target.as_fd())
+        let rest = profile
+            .beneath(anchor, path)
+            .ok_or((SetupStep::OpenMountTarget, Errno::INVAL))?;
+        perform(profile.root, &op.action, at, rest)
+    })?;
+
+    // The mount this one came to rest on the root of, if the setup holds it.
+    let stacked = match place {
+        Place::Nowhere => None,
+        Place::Anchor => anchor.map(|anchor| anchor.held),
+        Place::Opened(place) => profile
+            .held_at(index, place.as_fd())
+            .map_err(|errno| (SetupStep::OpenMountTarget, errno))?,
+    };
+    let kept = stacked.is_some() || anchors_later(profile.ops, index);
+    if let MountAction::Raw { target, .. } = &op.action
+        && kept
+    {
+        let above = profile.anchor_above(index, target);
+        mounted = Some(profile.within(above, |at| {
+            let rest = profile
+                .beneath(above, target)
+                .ok_or((SetupStep::OpenMountTarget, Errno::INVAL))?;
+            open_in_root(at, rest, OFlags::PATH)
+                .map_err(|errno| (SetupStep::OpenMountTarget, errno))
+        })?);
+    }
+    let Some(slot) = profile.slots.get(index) else {
+        return Ok(());
+    };
+    if let Some(mount) = mounted
+        && (kept || matches!(op.action, MountAction::Hide { .. }))
+    {
+        slot.mount.set(Some(mount));
+        if let Some(under) = stacked.and_then(|under| profile.slots.get(under)) {
+            under.covered_by.set(Some(index));
+        }
+    }
+    Ok(())
+}
+
+/// Performs `action` on its target, which `rest` names beneath `at`, and
+/// returns where it brought a mount to rest, with that mount where it holds a
+/// descriptor of it: every action but a raw mount, which `mount(2)` makes by
+/// path. `root` is the new root, which a file of the launch's own is made
+/// beside.
+fn perform(
+    root: BorrowedFd<'_>,
+    action: &MountAction,
+    at: BorrowedFd<'_>,
+    rest: &CStr,
+) -> Result<(Place, Option<OwnedFd>), (SetupStep, Errno)> {
+    let open =
+        |oflags| open_target(at, rest, oflags).map_err(|errno| (SetupStep::OpenMountTarget, errno));
+    let (target, mount) = match action {
+        MountAction::Hide { .. } => match hide(root, at, rest)? {
+            Some((target, mount)) => (target, mount),
+            None => return Ok((Place::Nowhere, None)),
+        },
+        MountAction::File { contents, .. } => {
+            let target = open(OFlags::PATH)?;
+            let mount = place_file(root, target.as_fd(), contents)?;
+            (target, mount)
+        }
+        MountAction::ReadOnly { .. } => {
+            let target = open(OFlags::PATH)?;
+            let mount = read_only_in_place(target.as_fd())?;
+            (target, mount)
         }
         // A procfs is made from inside the new PID namespace, so the instance
         // presents the sandbox's processes and nothing else.
-        MountAction::Tmpfs { target, fs } | MountAction::Devpts { target, fs } => {
-            let step = match op.action {
-                MountAction::Devpts { .. } => SetupStep::MountDevpts,
-                _ => SetupStep::MountTmpfs,
-            };
-            mount_fresh(root, target, fs, step)
+        MountAction::Tmpfs { fs, .. } => {
+            let target = open(OFlags::PATH | OFlags::DIRECTORY)?;
+            let mount = mount_fresh(target.as_fd(), fs, SetupStep::MountTmpfs)?;
+            (target, mount)
         }
-        MountAction::Procfs { target } => mount_fresh(
-            root,
-            target,
-            &super::procfs::FRESH_PROCFS,
-            SetupStep::MountProc,
-        ),
+        MountAction::Devpts { fs, .. } => {
+            let target = open(OFlags::PATH | OFlags::DIRECTORY)?;
+            let mount = mount_fresh(target.as_fd(), fs, SetupStep::MountDevpts)?;
+            (target, mount)
+        }
+        MountAction::Procfs { .. } => {
+            let target = open(OFlags::PATH | OFlags::DIRECTORY)?;
+            let fs = &super::procfs::FRESH_PROCFS;
+            let mount = mount_fresh(target.as_fd(), fs, SetupStep::MountProc)?;
+            (target, mount)
+        }
         MountAction::Bind {
-            source,
-            target,
-            read_only,
+            source, read_only, ..
         } => {
-            let target = open_in_root(root, target, OFlags::PATH)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-            bind(source, target.as_fd(), *read_only)
+            let target = open(OFlags::PATH)?;
+            let mount = bind(source, target.as_fd(), *read_only)?;
+            (target, mount)
         }
-        MountAction::Overlay { overlay, target } => {
-            let target = open_in_root(root, target, OFlags::PATH | OFlags::DIRECTORY)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
-            mount_overlay_at(overlay, target.as_fd())
+        MountAction::Overlay { overlay, .. } => {
+            let target = open(OFlags::PATH | OFlags::DIRECTORY)?;
+            let mount = mount_overlay_at(overlay, target.as_fd())?;
+            (target, mount)
         }
         MountAction::Raw {
             source,
-            target,
             fstype,
             flags,
             data,
+            ..
         } => {
             // Only the target is interpreted: resolved in-root like every
             // other target. Source, type, flags, and data pass through.
-            let target = open_in_root(root, target, OFlags::PATH)
-                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+            let target = open(OFlags::PATH)?;
             mount::mount(
                 source.as_c_str(),
-                fd_path(&target).as_cstr(),
+                fd_path(&target.as_fd()).as_cstr(),
                 fstype.as_c_str(),
                 *flags,
                 data.as_c_str(),
             )
-            .map_err(|errno| (SetupStep::MountRaw, errno))
+            .map_err(|errno| (SetupStep::MountRaw, errno))?;
+            let place = match super::Arrival::of_raw(*flags) {
+                Some(_) => target.place(),
+                None => Place::Nowhere,
+            };
+            return Ok((place, None));
         }
-        MountAction::Symlink {
-            parent,
-            leaf,
-            content,
-        } => {
+        MountAction::Symlink { leaf, content, .. } => {
             // A link at the root's top level has no parent to resolve: it is
             // made in the root itself.
-            let parent = match parent.is_empty() {
-                true => None,
-                false => Some(
-                    open_in_root(root, parent, OFlags::PATH | OFlags::DIRECTORY)
-                        .map_err(|errno| (SetupStep::OpenMountTarget, errno))?,
-                ),
-            };
-            let dir = parent.as_ref().map_or(root, AsFd::as_fd);
-            match fs::symlinkat(content.as_c_str(), dir, leaf.as_c_str()) {
-                Ok(()) => Ok(()),
+            let dir = open(OFlags::PATH | OFlags::DIRECTORY)?;
+            return match fs::symlinkat(content.as_c_str(), dir.as_fd(), leaf.as_c_str()) {
+                Ok(()) => Ok((Place::Nowhere, None)),
                 // The link this op makes, made by an earlier launch over the
                 // same persistent root.
-                Err(Errno::EXIST) if links_to(dir, leaf, content) => Ok(()),
+                Err(Errno::EXIST) if links_to(dir.as_fd(), leaf, content) => {
+                    Ok((Place::Nowhere, None))
+                }
                 Err(errno) => Err((SetupStep::CreateSymlink, errno)),
-            }
+            };
         }
     };
-    done.map(|()| None)
+    Ok((target.place(), Some(mount)))
 }
 
 /// Mounts the filesystem instance `fs` describes onto the directory `target`
-/// names in `root`, reporting a failure of the mount as `step`.
+/// names, reporting a failure of the mount as `step`, and returns the mount.
 fn mount_fresh(
-    root: BorrowedFd<'_>,
-    target: &CStr,
+    target: BorrowedFd<'_>,
     fs: &FreshFs,
     step: SetupStep,
-) -> Result<(), (SetupStep, Errno)> {
-    let target = open_in_root(root, target, OFlags::PATH | OFlags::DIRECTORY)
-        .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+) -> Result<OwnedFd, (SetupStep, Errno)> {
     let mount = fresh_mount(fs).map_err(|errno| (step, errno))?;
-    attach(mount.as_fd(), target.as_fd()).map_err(|errno| (step, errno))
+    attach(mount.as_fd(), target).map_err(|errno| (step, errno))?;
+    Ok(mount)
 }
 
-/// Hides what `target` names in `root`: an empty tmpfs over a directory, and an
-/// empty read-only file of the launch's own over anything else. Nothing at the
-/// path hides nothing.
+/// Hides what `rest` names beneath `at`: an empty tmpfs over a directory, and
+/// an empty read-only file of the launch's own over anything else. Nothing at
+/// the path hides nothing.
 ///
-/// Returns a hidden directory's tmpfs, writable, so that a later op can still
-/// make a mount point in it; the setup makes it read-only once the profile is
-/// in place. A hidden file is read-only from the start: nothing is made in a
-/// file.
-fn hide(root: BorrowedFd<'_>, target: &CStr) -> Result<Option<OwnedFd>, (SetupStep, Errno)> {
-    let at = match open_in_root(root, target, OFlags::PATH) {
-        Ok(at) => at,
+/// Returns the target and what it mounted there: a hidden directory's tmpfs,
+/// writable, so that a later op can still make a mount point in it, which the
+/// setup makes read-only once the profile is in place, or the file. A hidden
+/// file is read-only from the start: nothing is made in a file.
+fn hide<'a>(
+    root: BorrowedFd<'_>,
+    at: BorrowedFd<'a>,
+    rest: &CStr,
+) -> Result<Option<(Target<'a>, OwnedFd)>, (SetupStep, Errno)> {
+    let target = match open_target(at, rest, OFlags::PATH) {
+        Ok(target) => target,
         Err(Errno::NOENT) => return Ok(None),
         Err(errno) => return Err((SetupStep::OpenMountTarget, errno)),
     };
     let failed = |errno| (SetupStep::HidePath, errno);
-    let directory = fs::fstat(&at)
-        .map(|stat| fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::Directory)
-        .map_err(failed)?;
-    if directory {
+    if is_directory(target.as_fd()).map_err(failed)? {
         let tmpfs = empty_tmpfs(OWN_TMPFS_ATTRIBUTES).map_err(failed)?;
-        attach(tmpfs.as_fd(), at.as_fd()).map_err(failed)?;
-        return Ok(Some(tmpfs));
+        attach(tmpfs.as_fd(), target.as_fd()).map_err(failed)?;
+        return Ok(Some((target, tmpfs)));
     }
     let file = own_file(root, &[]).map_err(failed)?;
-    attach_tree(file, at.as_fd(), true, SetupStep::HidePath)?;
-    Ok(None)
+    let file = attach_tree(file, target.as_fd(), true, SetupStep::HidePath)?;
+    Ok(Some((target, file)))
 }
 
 /// Places a read-only file of the launch's own, holding `contents`, over the
-/// file `target` names in `root`, which must exist: the build has the launch
-/// create it where the root holds nothing there.
+/// file `target` names, which must exist: the build has the launch create it
+/// where the tree holds nothing there. Returns the file's mount. `root` is the
+/// new root, which the file is made beside; see [`own_file`].
 fn place_file(
     root: BorrowedFd<'_>,
-    target: &CStr,
+    target: BorrowedFd<'_>,
     contents: &[u8],
-) -> Result<Option<OwnedFd>, (SetupStep, Errno)> {
-    let at = open_in_root(root, target, OFlags::PATH)
-        .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+) -> Result<OwnedFd, (SetupStep, Errno)> {
     let file = own_file(root, contents).map_err(|errno| (SetupStep::PlaceFile, errno))?;
-    attach_tree(file, at.as_fd(), true, SetupStep::PlaceFile)?;
-    Ok(None)
+    attach_tree(file, target, true, SetupStep::PlaceFile)
 }
 
 /// A regular file holding `contents`, as a detached mount of its own ready to
@@ -3294,8 +3657,8 @@ const OWN_FILE: &CStr = c"file";
 const OWN_FILE_MODE: u32 = 0o644;
 
 /// Makes the tree at `target` read-only where it stands: a clone of it, every
-/// mount beneath it included, read-only, bound onto it.
-fn read_only_in_place(target: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
+/// mount beneath it included, read-only, bound onto it. Returns the clone.
+fn read_only_in_place(target: BorrowedFd<'_>) -> Result<OwnedFd, (SetupStep, Errno)> {
     let tree = clone_tree(target).map_err(|errno| (SetupStep::ReadOnlyPath, errno))?;
     attach_tree(tree, target, true, SetupStep::ReadOnlyPath)
 }
@@ -3316,25 +3679,39 @@ const MAX_HELD_DIRECTORIES: usize = 4096;
 /// caller's own git, reading a working tree after the command.
 ///
 /// `parent` is the directory the name is in, root-relative and empty where
-/// that is the root, resolved inside the root as the target was. The walk
-/// climbs from it through `..` and stops at the first mount root, which its
-/// own mount cannot rename, or at the sandbox's root. A kernel that does not
-/// say whether a directory is a mount root (before Linux 5.8) has every
-/// directory up to the sandbox's root held instead: one that is already a
-/// mount root gains a mount stacked on it, and nothing is lost.
+/// that is the root, the parent of the `index`th op's target, resolved from the
+/// anchor that op's target was resolved from (see [`Profile`]). The walk climbs
+/// from it through `..` and stops at the first mount root, which its own mount
+/// cannot rename, or at the sandbox's root. A parent that is the anchor's own
+/// target is a mount root already. A kernel that does not say whether a
+/// directory is a mount root (before Linux 5.8) has every directory up to the
+/// sandbox's root held instead: one that is already a mount root gains a mount
+/// stacked on it, and nothing is lost.
 ///
 /// Each hold is a clone of the directory's tree with every mount beneath it,
 /// so the read-only bind and each hold below stay in view, and runs after the
 /// empty root and every hidden directory are made read-only, so a hold cloned
 /// from one of them is as read-only as it.
-fn hold_name(root: BorrowedFd<'_>, parent: &CStr) -> Result<(), (SetupStep, Errno)> {
+fn hold_name(profile: &Profile<'_>, index: usize, parent: &CStr) -> Result<(), (SetupStep, Errno)> {
     if parent.is_empty() {
         return Ok(());
     }
     let held = |errno| (SetupStep::HoldReadOnlyName, errno);
     let opened = |errno| (SetupStep::OpenMountTarget, errno);
-    let top = fs::fstat(root).map_err(held)?;
-    let mut dir = open_in_root(root, parent, OFlags::PATH | OFlags::DIRECTORY).map_err(opened)?;
+    let top = fs::fstat(profile.root).map_err(held)?;
+    let anchor = profile.anchor(index, parent);
+    let start = profile.within(anchor, |at| {
+        let rest = profile
+            .beneath(anchor, parent)
+            .ok_or(opened(Errno::INVAL))?;
+        match open_target(at, rest, OFlags::PATH | OFlags::DIRECTORY).map_err(opened)? {
+            Target::Opened(dir) => Ok(Some(dir)),
+            Target::Anchor(_) => Ok(None),
+        }
+    })?;
+    let Some(mut dir) = start else {
+        return Ok(());
+    };
     for _ in 0..MAX_HELD_DIRECTORIES {
         let at = fs::fstat(&dir).map_err(held)?;
         if (at.st_dev, at.st_ino) == (top.st_dev, top.st_ino)
@@ -3456,7 +3833,11 @@ fn links_to(dir: BorrowedFd<'_>, leaf: &CStr, content: &CStr) -> bool {
 /// names, which by then is the bind. No path is resolved again, but the bind
 /// is writable for that moment, and only the bind itself is covered: its
 /// submounts keep their own flags.
-fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (SetupStep, Errno)> {
+fn bind(
+    source: &CStr,
+    target: BorrowedFd<'_>,
+    read_only: bool,
+) -> Result<OwnedFd, (SetupStep, Errno)> {
     let failed = |errno| (SetupStep::BindMount, errno);
     let source = open_frozen(source, OFlags::empty()).map_err(failed)?;
     let tree = clone_tree(source.as_fd()).map_err(failed)?;
@@ -3466,10 +3847,11 @@ fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (S
 /// Mounts the overlay `overlay` onto the mount target `target` names, its
 /// layers opened as the overlay root's are, without following a link, and
 /// through [`mount_overlay`] as that root is mounted, `nosuid` included.
+/// Returns the overlay's mount.
 fn mount_overlay_at(
     overlay: &OverlayPlan,
     target: BorrowedFd<'_>,
-) -> Result<(), (SetupStep, Errno)> {
+) -> Result<OwnedFd, (SetupStep, Errno)> {
     let failed = |errno| (SetupStep::MountOverlay, errno);
     let (base, stacked) = overlay
         .lower
@@ -3488,14 +3870,14 @@ fn mount_overlay_at(
 
 /// Attaches a detached clone, `tree`, onto the mount target `target` names,
 /// read-only throughout when `read_only` asks, with the restriction made
-/// before the attach as [`bind`] sets out. A failure of the attach is reported
-/// as `step`, the operation the clone serves.
+/// before the attach as [`bind`] sets out, and returns it, attached. A failure
+/// of the attach is reported as `step`, the operation the clone serves.
 fn attach_tree(
     tree: OwnedFd,
     target: BorrowedFd<'_>,
     read_only: bool,
     step: SetupStep,
-) -> Result<(), (SetupStep, Errno)> {
+) -> Result<OwnedFd, (SetupStep, Errno)> {
     let remount_after = read_only
         && match mount_setattr(tree.as_fd(), MOUNT_ATTR_RDONLY, true) {
             Ok(()) => false,
@@ -3507,7 +3889,7 @@ fn attach_tree(
         remount_top(tree.as_fd(), MountFlags::RDONLY)
             .map_err(|errno| (SetupStep::RemountReadOnly, errno))?;
     }
-    Ok(())
+    Ok(tree)
 }
 
 /// Marks the sandbox's root mount, and every mount the rootfs bind carried
@@ -4187,6 +4569,339 @@ mod tests {
         assert!(
             !dir.join("absent").exists(),
             "a file was created through the link",
+        );
+    }
+
+    /// A frozen op with nothing to create, performing `action`.
+    fn op(action: MountAction) -> MountOp {
+        MountOp {
+            dirs: Vec::new(),
+            create_file: None,
+            action,
+        }
+    }
+
+    /// A slot holding a descriptor, as one whose op mounted something.
+    fn held_slot() -> MountSlot {
+        let slot = MountSlot::default();
+        let held =
+            fs::open(c"/", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).expect("the root opens");
+        slot.mount.set(Some(held));
+        slot
+    }
+
+    #[test]
+    fn a_path_is_resolved_from_the_latest_held_mount_above_it() {
+        let ops = [
+            op(MountAction::Tmpfs {
+                target: c"work".into(),
+                fs: super::super::procfs::FRESH_PROCFS,
+            }),
+            op(MountAction::Hide {
+                target: c"work/secrets".into(),
+            }),
+            op(MountAction::Bind {
+                source: c"/srv/tree".into(),
+                target: c"work/tree".into(),
+                read_only: false,
+            }),
+            op(MountAction::Symlink {
+                parent: c"work/tree".into(),
+                leaf: c"link".into(),
+                content: c"target".into(),
+            }),
+        ];
+        // The hide found nothing, so it holds no slot.
+        let slots = [
+            held_slot(),
+            MountSlot::default(),
+            held_slot(),
+            MountSlot::default(),
+        ];
+        let root = open_root(std::path::Path::new("/"));
+        let profile = Profile {
+            root: root.as_fd(),
+            ops: &ops,
+            slots: &slots,
+        };
+        let anchored = |before, path: &CStr| {
+            let anchor = profile.anchor(before, path);
+            (
+                anchor.map(|anchor| anchor.op),
+                profile.beneath(anchor, path).map(CStr::to_owned),
+            )
+        };
+
+        // Beneath the hide of nothing, the tmpfs under it.
+        assert_eq!(
+            anchored(2, c"work/secrets/key"),
+            (Some(0), Some(c"secrets/key".into())),
+        );
+        // The bind is later, and nearer.
+        assert_eq!(
+            anchored(3, c"work/tree/a/b"),
+            (Some(2), Some(c"a/b".into())),
+        );
+        // A target that is a mount's own is that mount, with nothing beneath.
+        assert_eq!(anchored(3, c"work/tree"), (Some(2), Some(c"".into())));
+        // Only the ops before the one asking count.
+        assert_eq!(
+            anchored(2, c"work/tree/a"),
+            (Some(0), Some(c"tree/a".into()))
+        );
+        // A path no mount covers is the root's whole, and so is a sibling
+        // whose name only begins like a target.
+        assert_eq!(anchored(4, c"etc/x"), (None, Some(c"etc/x".into())));
+        assert_eq!(anchored(4, c"workshop"), (None, Some(c"workshop".into())));
+        // Strictly above: the mount at the path itself is crossed by name.
+        let above = profile.anchor_above(4, c"work/tree");
+        assert_eq!(above.map(|anchor| anchor.op), Some(0));
+        assert_eq!(profile.beneath(above, c"work/tree"), Some(c"tree"));
+    }
+
+    #[test]
+    fn a_path_beneath_a_mount_resolves_from_whatever_stacked_on_its_root() {
+        let ops = [
+            op(MountAction::Hide {
+                target: c"run".into(),
+            }),
+            op(MountAction::Hide {
+                target: c"var/run".into(),
+            }),
+        ];
+        let slots = [held_slot(), held_slot()];
+        // The second hide reached the first's root through a link.
+        slots[0].covered_by.set(Some(1));
+        let root = open_root(std::path::Path::new("/"));
+        let profile = Profile {
+            root: root.as_fd(),
+            ops: &ops,
+            slots: &slots,
+        };
+        let anchor = profile.anchor(2, c"run/x").expect("the hide covers it");
+        // Beneath the first hide's target, from the second's mount.
+        assert_eq!((anchor.op, anchor.held), (0, 1));
+        assert_eq!(profile.beneath(Some(anchor), c"run/x"), Some(c"x"));
+        // An op that ran before the cover resolves from the first.
+        let anchor = profile.anchor(1, c"run/x").expect("the hide covers it");
+        assert_eq!((anchor.op, anchor.held), (0, 0));
+    }
+
+    /// Forks a child that enters a user and a mount namespace of its own,
+    /// executes the first of `ops` against `root`, waits while `between` runs
+    /// in this process, then executes the rest and answers with `check`'s
+    /// code. `check` and the ops run under the post-fork discipline.
+    fn run_profile(
+        root: &CStr,
+        ops: &[MountOp],
+        between: impl FnOnce(),
+        check: impl FnOnce() -> i32,
+    ) -> Option<i32> {
+        let (uid_line, gid_line) = crate::idmap::single_identity_lines();
+        let slots: Vec<MountSlot> = ops.iter().map(|_| MountSlot::default()).collect();
+        let null = fs::open(c"/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+            .expect("/dev/null opens");
+        let (parent_end, child_end) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("the socket pair is created");
+        // SAFETY: the child makes raw syscalls only, over data allocated
+        // before the fork, and ends in `exit_group`.
+        match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
+            sys::PidfdFork::Child => {
+                let duty = MapDuty::Write {
+                    paths: MapPaths::SELF,
+                    uid_line: &uid_line,
+                    gid_line: &gid_line,
+                };
+                let keep = [child_end.as_raw_fd(), null.as_raw_fd()];
+                if enter_mapped_namespace(&keep, thread::UnshareFlags::NEWNS, duty, None).is_err()
+                    || mount::mount_change(
+                        c"/",
+                        MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+                    )
+                    .is_err()
+                {
+                    sys::exit_group(100)
+                }
+                let Ok(root) = fs::open(
+                    root,
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) else {
+                    sys::exit_group(101)
+                };
+                let profile = Profile {
+                    root: root.as_fd(),
+                    ops,
+                    slots: &slots,
+                };
+                if execute_op(&profile, 0, null.as_fd()).is_err() {
+                    sys::exit_group(102)
+                }
+                let mut byte = [0u8; 1];
+                if rustix::io::write(&child_end, b"1").is_err()
+                    || rustix::io::read(&child_end, &mut byte).is_err()
+                {
+                    sys::exit_group(103)
+                }
+                for index in 1..ops.len() {
+                    if execute_op(&profile, index, null.as_fd()).is_err() {
+                        sys::exit_group(104)
+                    }
+                }
+                sys::exit_group(check())
+            }
+            sys::PidfdFork::ParentOf(child) => {
+                drop(child_end);
+                let mut byte = [0u8; 1];
+                let ready = rustix::io::read(&parent_end, &mut byte);
+                if ready == Ok(1) {
+                    between();
+                    let _ = rustix::io::write(&parent_end, b"1");
+                }
+                child.reap().expect("the child is collected")
+            }
+        }
+    }
+
+    /// The bytes a file holds, up to 16, or `None` where it cannot be read.
+    /// Post-fork safe.
+    fn contents(path: &CStr) -> Option<([u8; 16], usize)> {
+        let file = fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+        let mut buf = [0u8; 16];
+        let len = rustix::io::read(&file, &mut buf).ok()?;
+        Some((buf, len))
+    }
+
+    /// A path as a C string.
+    fn c_path(path: &std::path::Path) -> std::ffi::CString {
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("the path holds no NUL")
+    }
+
+    #[test]
+    fn a_rename_between_two_ops_cannot_move_a_later_one_out_of_the_mount_above_it() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        // Another process writing the root renames the bind's mount point after
+        // the bind and before the ops beneath it, and puts entries of its own
+        // under the old name. The bind moves with its mount point, and the
+        // hide and the path made read-only follow it there.
+        let dir = Scratch::new("anchored-rename");
+        let base = std::fs::canonicalize(dir.path()).expect("the scratch directory resolves");
+        let (root, project) = (base.join("root"), base.join("project"));
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join(".env"), b"secret").unwrap();
+        std::fs::write(project.join(".git/config"), b"config").unwrap();
+
+        let ops = [
+            op(MountAction::Bind {
+                source: c_path(&project),
+                target: c"work".into(),
+                read_only: false,
+            }),
+            op(MountAction::Hide {
+                target: c"work/.env".into(),
+            }),
+            op(MountAction::ReadOnly {
+                target: c"work/.git".into(),
+                parent: c"work".into(),
+            }),
+        ];
+        let moved_env = c_path(&root.join("moved/.env"));
+        let moved_config = c_path(&root.join("moved/.git/config"));
+        let decoy_env = c_path(&root.join("work/.env"));
+        let decoy_config = c_path(&root.join("work/.git/config"));
+        let code = run_profile(
+            &c_path(&root),
+            &ops,
+            || {
+                std::fs::rename(root.join("work"), root.join("moved")).unwrap();
+                std::fs::create_dir_all(root.join("work/.git")).unwrap();
+                std::fs::write(root.join("work/.env"), b"decoy").unwrap();
+                std::fs::write(root.join("work/.git/config"), b"decoy").unwrap();
+            },
+            || {
+                let writable = |path: &CStr| {
+                    fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty()).map(drop)
+                };
+                match contents(&moved_env) {
+                    Some((_, 0)) => {}
+                    _ => return 1,
+                }
+                match contents(&decoy_env) {
+                    Some((buf, 5)) if &buf[..5] == b"decoy" => {}
+                    _ => return 2,
+                }
+                if writable(&moved_config) != Err(Errno::ROFS) {
+                    return 3;
+                }
+                if writable(&decoy_config).is_err() {
+                    return 4;
+                }
+                0
+            },
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "1: the bound .env was not hidden; 2: the root's own .env was; 3: the bound \
+             .git was left writable; 4: the root's own .git was made read-only; 100 and \
+             up: the child could not set up",
+        );
+    }
+
+    #[test]
+    fn a_mount_stacked_on_another_through_a_link_takes_the_paths_beneath_it() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        // A host root hides `/run` and `/var/run`, a link to it, so the second
+        // hide's tmpfs lands on the first's. A link made at a path beneath
+        // `/run` is made in the tmpfs on top, where it can be seen.
+        let dir = Scratch::new("anchored-stack");
+        let base = std::fs::canonicalize(dir.path()).expect("the scratch directory resolves");
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        std::fs::create_dir_all(root.join("var")).unwrap();
+        std::os::unix::fs::symlink("../run", root.join("var/run")).unwrap();
+
+        let ops = [
+            op(MountAction::Hide {
+                target: c"run".into(),
+            }),
+            op(MountAction::Hide {
+                target: c"var/run".into(),
+            }),
+            op(MountAction::Symlink {
+                parent: c"run".into(),
+                leaf: c"marker".into(),
+                content: c"made".into(),
+            }),
+        ];
+        let marker = c_path(&root.join("run/marker"));
+        let code = run_profile(
+            &c_path(&root),
+            &ops,
+            || {},
+            || {
+                let mut target = [0u8; 8];
+                match fs::readlinkat_raw(fs::CWD, marker.as_c_str(), &mut target[..]) {
+                    Ok(len) if &target[..len] == b"made" => 0,
+                    _ => 1,
+                }
+            },
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "1: the link was made in the tmpfs underneath; 100 and up: the child could not \
+             set up",
         );
     }
 

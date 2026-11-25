@@ -4471,9 +4471,11 @@ fn procfs_root_writable(source: &CStr) -> Option<bool> {
 /// Both are rootfs-relative and carry no leading slash, as the launch freezes
 /// every target, so the comparison is a plain component-aligned prefix test.
 /// It is the one answer to whether a path is at or under a mount target, which
-/// the procfs requirement, the managed `resolv.conf` bind, and the placeholder
-/// bookkeeping all ask.
-fn covers(mount: &CStr, covered: &CStr) -> bool {
+/// the procfs requirement, the managed `resolv.conf` bind, the placeholder
+/// bookkeeping, and the launch's resolution of a target beneath an earlier
+/// mount all ask. The launch asks it after the fork, which it allows: it
+/// compares bytes, and neither allocates nor panics.
+pub(crate) fn covers(mount: &CStr, covered: &CStr) -> bool {
     let (mount, covered) = (mount.to_bytes(), covered.to_bytes());
     covered.starts_with(mount) && (covered.len() == mount.len() || covered[mount.len()] == b'/')
 }

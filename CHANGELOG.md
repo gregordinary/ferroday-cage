@@ -118,6 +118,18 @@ consumer upgrading can skip it.
   rest, and one that holds nothing a further command joins, a further
   command's and a restriction's, is not dumpable once its command is forked. A
   process of the sandbox can still stop a command short of its exec.
+- A mount whose target lies beneath an earlier mount of the profile lands in
+  that mount, whatever renames the directories above it during the launch. Each
+  target was resolved from the sandbox's root, so a process writing a root two
+  sandboxes share could rename a bind's mount point between two steps of a
+  launch, which carries the bind away to the new name: a `hide` or a `read_only`
+  path beneath the bind then landed on nothing, or on an entry of that process's
+  own, while the command found the bind under the new name with nothing hidden
+  and nothing read-only in it. The launch keeps a descriptor of each mount a
+  later step resolves beneath, and resolves that step's paths from it. A raw
+  mount, which `mount(2)` makes by path, is opened again by name from the
+  nearest mount above it once it is made, and is covered as long as nothing
+  renames that path in the same moment.
 
 ### Added
 

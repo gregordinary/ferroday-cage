@@ -131,28 +131,33 @@ model](process-model.md) describes.
     sources are host paths, canonical at build time, and are opened as the
     root's path is, refusing a symbolic link, while the host tree is still
     mounted; each bind is cloned from that descriptor. Targets resolve against
-    the new root with
-    `openat2` and `RESOLVE_IN_ROOT`, so a symlink inside the rootfs — even
-    an absolute one — resolves within the rootfs and can never address the
-    host. Each mount is made detached and attached onto the resolved target's
-    descriptor with `move_mount`: the fresh `/proc`, the tmpfs and `devpts`
-    mounts are created through `fsopen` and `fsmount`, and a bind is a clone of
-    its source. A raw mount is the exception, made with `mount(2)` as given,
-    which reaches the target through its `/proc/self/fd` path. Missing mount
-    targets are created; a directory
-    stays afterwards, a file does not (see [What a launch leaves in the
+    the new root with `openat2` and `RESOLVE_IN_ROOT`, so a symlink inside the
+    rootfs — even an absolute one — resolves within the rootfs and can never
+    address the host. A target beneath an earlier mount of the profile
+    resolves the same way from that mount, through a descriptor the init keeps
+    of it, so it lands in that mount even where another process sharing the
+    root renames a directory above it during the launch, which would carry the
+    mount away to another name. A mount the profile stacks on another's root,
+    by reaching it through a link, takes the targets beneath it, as it does
+    what the command sees there. Each mount is made detached and attached onto
+    the resolved target's descriptor with `move_mount`: the fresh `/proc`, the
+    tmpfs and `devpts` mounts are created through `fsopen` and `fsmount`, and
+    a bind is a clone of its source. A raw mount is the exception, made with
+    `mount(2)` as given, which reaches the target through its `/proc/self/fd`
+    path. Missing mount targets are created; a directory stays afterwards, a
+    file does not (see [What a launch leaves in the
     root](#what-a-launch-leaves-in-the-root)). A read-only bind is cloned
     detached, made read-only with `mount_setattr` and `AT_RECURSIVE` while
-    still detached, and only then attached, so the bind and every mount beneath
-    it are read-only from the moment a path can reach them. On a kernel before
-    5.12, which lacks `mount_setattr`, the bind is attached first and its top
-    mount then remounted read-only through the clone's descriptor (carrying
-    along the flags the user namespace holds locked): it is writable for that
-    moment, and any submounts of the source keep their own flags. The restriction becomes a
-    boundary at step 15, where the command enters a nested user namespace and
-    the kernel locks it — see [A read-only bind is a
-    boundary](#a-read-only-bind-is-a-boundary). An empty root is made read-only
-    once the profile is in place.
+    still detached, and only then attached, so the bind and every mount
+    beneath it are read-only from the moment a path can reach them. On a
+    kernel before 5.12, which lacks `mount_setattr`, the bind is attached
+    first and its top mount then remounted read-only through the clone's
+    descriptor (carrying along the flags the user namespace holds locked): it
+    is writable for that moment, and any submounts of the source keep their
+    own flags. The restriction becomes a boundary at step 15, where the
+    command enters a nested user namespace and the kernel locks it — see [A
+    read-only bind is a boundary](#a-read-only-bind-is-a-boundary). An empty
+    root is made read-only once the profile is in place.
 14. **Pivot.** The init enters the new mount and calls
     `pivot_root(".", ".")`, stacking the old root on the same mount point,
     then lazily detaches the old root and changes directory to the new `/`.
