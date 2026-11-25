@@ -4778,6 +4778,12 @@ impl CageBuilder {
     /// capabilities, so operations gated on one are refused. The bounding and
     /// ambient sets are cleared too, so no capability can be regained across
     /// `execve`.
+    ///
+    /// A command that creates a user namespace of its own still holds every
+    /// capability inside it, as any process does, over what that namespace
+    /// owns: the namespaces it creates beside it, and none of the sandbox's.
+    /// The [curated seccomp roster](crate::SeccompRules::curated) refuses
+    /// creating one, which closes that too.
     pub fn drop_all_capabilities(mut self) -> Self {
         self.hardening.drop_all_capabilities();
         self

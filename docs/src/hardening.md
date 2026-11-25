@@ -492,7 +492,11 @@ let status = Cage::builder()
 The drop narrows the bounding, ambient, permitted, effective, and inheritable
 sets, so a dropped capability cannot be regained across the command's `execve`.
 It drops every capability the running kernel defines, including any added to
-the kernel after this library was built.
+the kernel after this library was built. A command that creates a user
+namespace of its own still holds every capability inside it, as any process
+does, over what that namespace owns: the namespaces it creates beside it, and
+none of the sandbox's. The [curated seccomp roster](#seccomp-syscall-filters)
+refuses creating one, which closes that too.
 
 A capability posture composes with a non-root [run-as
 identity](identity-maps.md#running-as-a-non-root-identity). Without a keep

@@ -594,6 +594,10 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- `CageBuilder::drop_all_capabilities` and the guide's capability drop state
+  that a command creating a user namespace of its own holds every capability
+  inside it, over what that namespace owns, unless a seccomp policy refuses
+  creating one, as the curated roster does.
 - `Exec`'s documentation and the guide's further commands state that each
   command of a sandbox is a Landlock domain of its own, so under the scopes and
   the unix-socket restriction one command cannot signal another, nor connect to
