@@ -75,13 +75,21 @@ fn a_sandbox_says_its_limits_are_not_applied_however_it_starts() {
 
 #[test]
 fn a_restriction_says_its_limits_are_not_applied_however_it_starts() {
+    let abi = ferroday_cage::host::landlock_abi();
     if !(common::require::seccomp()
-        && common::require::landlock(ferroday_cage::host::landlock_abi()))
+        && common::require::landlock(abi)
+        && common::require::landlock_resolve_unix(
+            abi,
+            ferroday_cage::host::landlock_enforces_fs(ferroday_cage::FsAccess::RESOLVE_UNIX),
+        ))
     {
         return;
     }
     // A restriction with cgroup limits builds only where its command can
-    // neither write the cgroup's files nor call clone3, required or not.
+    // neither write the cgroup's files, call clone3, nor reach a service
+    // manager's socket, required or not: the last takes the unix-socket
+    // restriction, which a restriction holds by default where Landlock offers
+    // it.
     let restricted = ["--restrict", "--landlock-ro", "/", "--seccomp", "curated"];
     assert_notice("plain", &restricted);
     assert_notice("terminal", &[&restricted[..], &["--terminal"]].concat());

@@ -360,6 +360,23 @@ pub fn landlock_net(abi: Option<i32>, enforced: bool) -> bool {
     }
 }
 
+/// Whether the kernel's Landlock enforces the unix-socket restriction, given
+/// what `host::landlock_abi` reported and what `host::landlock_enforces_fs`
+/// answered for `FsAccess::RESOLVE_UNIX`, reporting the skip through
+/// [`premise_unmet`] where it does not.
+///
+/// No variable governs it: CI's kernels predate Landlock ABI 9, which brings
+/// it.
+#[track_caller]
+pub fn landlock_resolve_unix(abi: Option<i32>, enforced: bool) -> bool {
+    if !enforced {
+        premise_unmet(format_args!(
+            "the unix-socket restriction needs Landlock ABI 9, and the kernel offers {abi:?}"
+        ));
+    }
+    enforced
+}
+
 /// Whether the kernel's Landlock enforces scopes, given what
 /// `host::landlock_abi` reported and what `host::landlock_enforces_scope`
 /// answered.
