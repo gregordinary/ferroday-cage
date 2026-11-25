@@ -374,7 +374,7 @@ why = "The decimal reader every format goes through."
 item = "provision::number::digits_in"
 code = 1
 cost = "move"
-why = "A run of digits inside an HTTP header."
+why = "A run of hexadecimal digits: an HTTP chunk size."
 
 [[reach]]
 item = "provision::number::is_digits"

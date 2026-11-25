@@ -247,7 +247,7 @@ impl Fetch for HttpFetch {
         let deadline = self
             .request_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
-        if let Some(path) = strip_scheme(url, "file://") {
+        if let Some(path) = after_scheme(url, "file") {
             return fetch_file(url, path, sink, cap, deadline);
         }
         let mut current = url.to_string();
@@ -744,7 +744,7 @@ impl HttpFetch {
                 io::Error::new(io::ErrorKind::InvalidData, reason),
             )
         };
-        if strip_scheme(to, "http://").is_none() {
+        if after_scheme(to, "http").is_none() {
             return Err(refuse(format!(
                 "the redirect leads to {to:?}, and a redirect is followed only to another \
                  http:// URL; {TLS_REMEDY}"
@@ -1035,15 +1035,17 @@ fn resolve_redirect(base: &str, location: &str) -> String {
     }
 }
 
-/// Strips `scheme` from `url`, comparing it case-insensitively.
+/// What follows `scheme` and its `://` in `url`, where `url` names that
+/// scheme as [`scheme_of`](super::fetch::scheme_of) reads one, compared
+/// case-insensitively.
 ///
 /// Only the scheme is case-insensitive; the rest of the URL is returned exactly
 /// as written, since a path is not.
-fn strip_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
-    let prefix = url.get(..scheme.len())?;
-    prefix
+fn after_scheme<'u>(url: &'u str, scheme: &str) -> Option<&'u str> {
+    let named = super::fetch::scheme_of(url)?;
+    named
         .eq_ignore_ascii_case(scheme)
-        .then(|| &url[scheme.len()..])
+        .then(|| &url[named.len() + "://".len()..])
 }
 
 /// Parses an `http://host[:port]/path` URL, or answers why it is not one this
@@ -1074,7 +1076,7 @@ fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
              of which a request line can hold as written",
         ));
     }
-    let rest = strip_scheme(url, "http://")
+    let rest = after_scheme(url, "http")
         .ok_or_else(|| format!("this fetcher speaks only http:// and file://; {TLS_REMEDY}"))?;
     let (authority, path) = match rest.find('/') {
         Some(slash) => (&rest[..slash], &rest[slash..]),
@@ -3076,7 +3078,7 @@ mod tests {
 
     /// The local path the fetcher reads for `url`, or the refusal.
     fn read_back(url: &str) -> Result<std::path::PathBuf, FetchError> {
-        let rest = strip_scheme(url, "file://").expect("a file:// URL");
+        let rest = after_scheme(url, "file").expect("a file:// URL");
         decode_file_path(url, local_file_path(url, rest)?)
     }
 
