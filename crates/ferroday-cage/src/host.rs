@@ -502,9 +502,15 @@ fn cgroup_directory(membership: &str, mountinfo: &str) -> Option<PathBuf> {
 /// apart: a sandbox maps its identities onto the caller's, so `SO_PEERCRED`
 /// reports a sandboxed process with the caller's own uid and gid, and a check
 /// of the uid admits it. Its user namespace does: every sandbox's process runs
-/// in a namespace nested below the caller's. A
-/// [`Restriction`](crate::Restriction)'s command runs in the caller's own, so
-/// it is not told apart here, and a socket it can reach is one it can use.
+/// in a namespace nested below the caller's.
+// A restriction exists only where the hardening feature is built, and a link to
+// it does not resolve elsewhere, so the sentence naming it is written for that
+// build alone.
+#[cfg_attr(
+    feature = "hardening",
+    doc = "A [`Restriction`](crate::Restriction)'s command runs in the caller's own, so it \
+           is not told apart here, and a socket it can reach is one it can use."
+)]
 ///
 /// The peer is the process that called `connect`. The kernel names it most
 /// exactly from Linux 6.11, by a pidfd and the namespace the pidfd's process
