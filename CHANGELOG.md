@@ -408,6 +408,11 @@ consumer upgrading can skip it.
   writer nothing, linked a few thousand times, kept an export streaming zeros
   for a day. The encoder now tells the walk to skip such an entry, and the
   sink's ceiling bounds the export as the documentation says.
+- `Running::kill` and `terminate`, and a `KillHandle`'s, continue the launch
+  stage of a sandbox without a PID namespace. The command runs as the stage's
+  own user and could stop it, as `kill -STOP $PPID` does, and the stopped
+  stage then never collected the command's outcome, so a wait after a kill
+  never ended.
 
 ### Internal
 

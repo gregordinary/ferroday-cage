@@ -56,6 +56,41 @@ fn a_kill_without_a_pid_namespace_reports_the_observed_status() {
     assert!(running.usage().is_some(), "the observed kill carries usage");
 }
 
+#[test]
+fn a_kill_ends_a_wait_whose_launch_stage_the_command_stopped() {
+    // Without a PID namespace the command runs as the launch stage's own user,
+    // and the stage supervises it from outside: stopped, it would collect and
+    // report nothing, and the wait after a kill would never end.
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    for script in ["kill -STOP $PPID; sleep 30", "kill -STOP $PPID; exit 7"] {
+        let mut running = Cage::builder()
+            .rootfs(rootfs)
+            .pid_namespace(false)
+            .command("/bin/sh")
+            .args(["-c", script])
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn()
+            .expect("the sandbox launches");
+        let stopped = running
+            .wait_timeout(Duration::from_millis(500))
+            .expect("the deadline wait completes");
+        assert_eq!(stopped, None, "{script}: the stage reports nothing stopped");
+        running.kill().expect("the kill is delivered");
+        let status = running
+            .wait_timeout(Duration::from_secs(10))
+            .expect("the wait completes")
+            .unwrap_or_else(|| panic!("{script}: the wait outlasted the kill"));
+        assert!(
+            status.signal() == Some(9) || status.code() == Some(7),
+            "{script}: {status:?}"
+        );
+        assert!(running.usage().is_some(), "{script}: the stage reported");
+    }
+}
+
 /// A busybox shell loop costing a third of a second of processor time on an
 /// ordinary host, and never less than [`LOOP_FLOOR`].
 const CPU_LOOP: &str = "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done";

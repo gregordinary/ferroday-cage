@@ -592,7 +592,7 @@ impl<'obs> Running<'obs> {
     /// deadline and [`kill`](Self::kill) for a bounded stop. Requesting
     /// termination of a sandbox that has already exited is not an error.
     pub fn terminate(&mut self) -> Result<(), Error> {
-        send_terminate(&self.control)
+        send_terminate(&self.control, self.reap.as_ref())
     }
 
     /// Kills the sandbox: SIGKILL to the supervisor.
@@ -610,7 +610,10 @@ impl<'obs> Running<'obs> {
     /// The kill is delivered through a pidfd and cannot hit a recycled pid.
     /// Killing a sandbox that has already exited is not an error. After a
     /// kill, [`wait`](Self::wait) still pumps the output produced before
-    /// the kill and then reports the outcome.
+    /// the kill and then reports the outcome. Without a PID namespace the
+    /// launch stage collects that outcome from outside the command, which runs
+    /// as the stage's own user and can stop it, so a kill, and a
+    /// [`terminate`](Self::terminate), continue the stage as well.
     ///
     /// The killed outcome is reported as `signaled(SIGKILL)` once the signal
     /// is delivered, and a signal that failed reports nothing, so it cannot
@@ -620,7 +623,12 @@ impl<'obs> Running<'obs> {
     /// once any kill in flight has been recorded, so it cannot see the death
     /// the kill caused and take it for a lost supervisor.
     pub fn kill(&mut self) -> Result<(), Error> {
-        send_kill(&self.pidfd, &self.kill_sent, self.cgroup.as_deref())
+        send_kill(
+            &self.pidfd,
+            self.reap.as_ref(),
+            &self.kill_sent,
+            self.cgroup.as_deref(),
+        )
     }
 
     /// Returns a handle that can terminate or kill the sandbox from another
@@ -637,6 +645,7 @@ impl<'obs> Running<'obs> {
         };
         Ok(KillHandle {
             pidfd: duplicate(&self.pidfd)?,
+            stage: self.reap.as_ref().map(duplicate).transpose()?,
             control: duplicate(&self.control)?,
             kill_sent: Arc::clone(&self.kill_sent),
             cgroup: self.cgroup.clone(),
@@ -1191,6 +1200,9 @@ fn remove_placeholder(root: &Rooted, placeholder: &Placeholder) {
 #[derive(Debug)]
 pub struct KillHandle {
     pidfd: OwnedFd,
+    /// The launch stage, where it is the supervisor outside the command's
+    /// process, as without a PID namespace; see [`resume_stage`].
+    stage: Option<OwnedFd>,
     control: OwnedFd,
     kill_sent: Arc<KillRecord>,
     /// The sandbox's cgroup, shared with the [`Running`] and every other kill
@@ -1202,13 +1214,18 @@ impl KillHandle {
     /// Requests graceful termination: SIGTERM to the command. See
     /// [`Running::terminate`].
     pub fn terminate(&self) -> Result<(), Error> {
-        send_terminate(&self.control)
+        send_terminate(&self.control, self.stage.as_ref())
     }
 
     /// Kills the sandbox: SIGKILL to the supervisor. See [`Running::kill`],
     /// including how a wait on another thread reports it.
     pub fn kill(&self) -> Result<(), Error> {
-        send_kill(&self.pidfd, &self.kill_sent, self.cgroup.as_deref())
+        send_kill(
+            &self.pidfd,
+            self.stage.as_ref(),
+            &self.kill_sent,
+            self.cgroup.as_deref(),
+        )
     }
 }
 
@@ -1605,7 +1622,8 @@ fn check_terminal_composes(plan: &LaunchPlan) -> Result<(), Error> {
 
 /// Sends the termination request byte; a sandbox that already exited took
 /// its socket end with it, which is not an error.
-fn send_terminate(control: &OwnedFd) -> Result<(), Error> {
+fn send_terminate(control: &OwnedFd, stage: Option<&OwnedFd>) -> Result<(), Error> {
+    resume_stage(stage);
     match rustix::net::send(control, &[CONTROL_TERMINATE], SendFlags::NOSIGNAL) {
         Ok(_) => Ok(()),
         Err(Errno::PIPE | Errno::CONNRESET | Errno::NOTCONN) => Ok(()),
@@ -1623,11 +1641,29 @@ fn send_terminate(control: &OwnedFd) -> Result<(), Error> {
 /// command's process tree, whether the outcome is known yet or not.
 fn send_kill(
     pidfd: &OwnedFd,
+    stage: Option<&OwnedFd>,
     kill_sent: &KillRecord,
     cgroup: Option<&Cgroup>,
 ) -> Result<(), Error> {
     kill_sent.send(pidfd).map_err(signal_error)?;
+    resume_stage(stage);
     cgroup.map_or(Ok(()), Cgroup::kill).map_err(signal_error)
+}
+
+/// Continues the launch stage, where it supervises the command from outside
+/// it, so it collects the command's outcome and reports it.
+///
+/// Without a PID namespace the command runs as the stage's own user, so it can
+/// stop the stage, as `kill -STOP $PPID` does. A stopped stage forwards no
+/// termination and reports no outcome, and a wait after a kill would never
+/// end. `SIGCONT` is enough: the kill or the termination it accompanies ends
+/// the command, which is what could stop the stage again, while the stage
+/// still reports what the command used. A stage already gone is no matter,
+/// and nor is a failure: the kill's own delivery is what is reported.
+fn resume_stage(stage: Option<&OwnedFd>) {
+    if let Some(stage) = stage {
+        let _ = process::pidfd_send_signal(stage, Signal::CONT);
+    }
 }
 
 /// Whether a SIGKILL this library sent the supervisor was delivered, shared by
