@@ -138,11 +138,11 @@ pub struct Running<'obs> {
     /// Whether a kill was delivered through this handle or a [`KillHandle`];
     /// decides how a status pipe that closes without a record is read.
     kill_sent: Arc<KillRecord>,
-    /// A pidfd of the launch stage, for the handle to reap once the status
-    /// arrives (no PID namespace); the in-namespace init is not the caller's
-    /// child process. A pidfd rather than a raw pid so the reap cannot alias a
-    /// recycled pid.
-    reap: Option<OwnedFd>,
+    /// The launch stage, for the handle to reap once the status arrives (no
+    /// PID namespace, or a further command); the in-namespace init is not the
+    /// caller's child process. Reaped through its pidfd, so the reap cannot
+    /// alias a recycled pid.
+    reap: Option<mechanism::Forked>,
     /// Whether the supervisor has been seen to exit; see
     /// [`awaiting_supervisor`](Self::awaiting_supervisor).
     supervisor_exited: bool,
@@ -207,6 +207,9 @@ struct Joinable {
     /// command from outside. Either lives exactly as long as the sandbox, so
     /// its exit is the sandbox's end.
     holder: OwnedFd,
+    /// The holder's pid in the caller's PID namespace; see
+    /// [`JoinTarget`](mechanism::JoinTarget).
+    holder_pid: u32,
     /// The sandbox's cgroup, whose leaf a further command's launch stage joins.
     /// Held as a kill handle holds it, for as long as the further command's
     /// handle lives; killing and removing it stay the sandbox's own handle's.
@@ -745,7 +748,7 @@ impl<'obs> Running<'obs> {
     /// deadline and [`kill`](Self::kill) for a bounded stop. Requesting
     /// termination of a sandbox that has already exited is not an error.
     pub fn terminate(&mut self) -> Result<(), Error> {
-        send_terminate(&self.control, self.reap.as_ref())
+        send_terminate(&self.control, self.stage())
     }
 
     /// Delivers `signal` to the command, as [`terminate`](Self::terminate)
@@ -770,7 +773,7 @@ impl<'obs> Running<'obs> {
     /// [`Error::Signal`] where `signal` names none of the signals the kernel
     /// names, with `EINVAL` beneath it, or where the request cannot be sent.
     pub fn signal(&mut self, signal: i32) -> Result<(), Error> {
-        send_signal(&self.control, self.reap.as_ref(), signal)
+        send_signal(&self.control, self.stage(), signal)
     }
 
     /// Kills the sandbox: SIGKILL to the supervisor.
@@ -804,10 +807,16 @@ impl<'obs> Running<'obs> {
     pub fn kill(&mut self) -> Result<(), Error> {
         send_kill(
             &self.pidfd,
-            self.reap.as_ref(),
+            self.stage(),
             &self.kill_sent,
             self.cgroup.as_deref(),
         )
+    }
+
+    /// The pidfd of the launch stage that supervises the command from outside
+    /// it, where one does; see [`resume_stage`].
+    fn stage(&self) -> Option<BorrowedFd<'_>> {
+        self.reap.as_ref().map(mechanism::Forked::pidfd)
     }
 
     /// Returns a handle that can terminate or kill the sandbox from another
@@ -818,14 +827,14 @@ impl<'obs> Running<'obs> {
     /// [`Error::KillHandle`] where the handle's descriptors cannot be
     /// duplicated, typically because the process has run out of them.
     pub fn kill_handle(&self) -> Result<KillHandle, Error> {
-        let duplicate = |fd: &OwnedFd| {
-            fd.try_clone()
+        let duplicate = |fd: BorrowedFd<'_>| {
+            fd.try_clone_to_owned()
                 .map_err(|source| Error::KillHandle { source })
         };
         Ok(KillHandle {
-            pidfd: duplicate(&self.pidfd)?,
-            stage: self.reap.as_ref().map(duplicate).transpose()?,
-            control: duplicate(&self.control)?,
+            pidfd: duplicate(self.pidfd.as_fd())?,
+            stage: self.stage().map(duplicate).transpose()?,
+            control: duplicate(self.control.as_fd())?,
             kill_sent: Arc::clone(&self.kill_sent),
             cgroup: self.cgroup.clone(),
         })
@@ -955,17 +964,20 @@ impl<'obs> Running<'obs> {
         // first command, in nested namespaces of its own, and the sandbox's are
         // held by the launch stage this handle reaps, which is gone once reaped.
         let holder = if plan.pid_namespace {
-            Some(&self.pidfd)
+            Some((self.pidfd.as_fd(), self.pid))
         } else {
-            self.reap.as_ref()
+            self.reap
+                .as_ref()
+                .map(|stage| (stage.pidfd(), stage.pid().as_raw_nonzero().get() as u32))
         };
+        let (holder, holder_pid) = holder.ok_or(Error::SandboxEnded)?;
         let holder = holder
-            .ok_or(Error::SandboxEnded)?
-            .try_clone()
+            .try_clone_to_owned()
             .map_err(|source| Error::Spawn { source })?;
         Ok(Arc::new(Joinable {
             plan: Arc::clone(plan),
             holder,
+            holder_pid,
             cgroup: self.cgroup.clone(),
         }))
     }
@@ -1004,7 +1016,10 @@ impl<'obs> Running<'obs> {
             observe,
             terminal,
             cgroup.as_ref().map(Cgroup::procs),
-            Some(joinable.holder.as_fd()),
+            Some(mechanism::JoinTarget {
+                holder: joinable.holder.as_fd(),
+                pid: joinable.holder_pid,
+            }),
             &mut |event| {
                 if let Some(observer) = observer.as_deref_mut() {
                     observer.progress(event);
@@ -1062,7 +1077,7 @@ impl<'obs> Running<'obs> {
         if let Some(foreground) = &mut self.foreground {
             foreground.hand_back();
         }
-        if let Some(pidfd) = self.reap.take() {
+        if let Some(stage) = self.reap.take() {
             // Reap the launch stage through its pidfd, so the wait targets
             // exactly that process and cannot alias a pid a concurrent reaper
             // freed and the OS recycled. Best-effort: the launch stage exits
@@ -1070,7 +1085,7 @@ impl<'obs> Running<'obs> {
             // reaper may even have collected it first. Reaped before the
             // cgroup below is removed, since the stage joined the cgroup, and
             // the kernel removes none that still holds a process.
-            let _ = mechanism::reap_via_pidfd(pidfd.as_fd());
+            let _ = stage.reap();
         }
         // The cgroup's own account of the tree, read once the outcome is known
         // and before the cgroup is removed. It stands alone where the
@@ -1612,7 +1627,7 @@ impl KillHandle {
     /// Requests graceful termination: SIGTERM to the command. See
     /// [`Running::terminate`].
     pub fn terminate(&self) -> Result<(), Error> {
-        send_terminate(&self.control, self.stage.as_ref())
+        send_terminate(&self.control, self.stage.as_ref().map(AsFd::as_fd))
     }
 
     /// Delivers a signal to the command. See [`Running::signal`].
@@ -1621,7 +1636,7 @@ impl KillHandle {
     ///
     /// As [`Running::signal`].
     pub fn signal(&self, signal: i32) -> Result<(), Error> {
-        send_signal(&self.control, self.stage.as_ref(), signal)
+        send_signal(&self.control, self.stage.as_ref().map(AsFd::as_fd), signal)
     }
 
     /// Kills the sandbox: SIGKILL to the supervisor. See [`Running::kill`],
@@ -1629,7 +1644,7 @@ impl KillHandle {
     pub fn kill(&self) -> Result<(), Error> {
         send_kill(
             &self.pidfd,
-            self.stage.as_ref(),
+            self.stage.as_ref().map(AsFd::as_fd),
             &self.kill_sent,
             self.cgroup.as_deref(),
         )
@@ -2034,7 +2049,7 @@ fn check_terminal_composes(plan: &LaunchPlan) -> Result<(), Error> {
 }
 
 /// Sends the termination request.
-fn send_terminate(control: &OwnedFd, stage: Option<&OwnedFd>) -> Result<(), Error> {
+fn send_terminate(control: &OwnedFd, stage: Option<BorrowedFd<'_>>) -> Result<(), Error> {
     resume_stage(stage);
     send_control(control, &[CONTROL_TERMINATE])
 }
@@ -2042,7 +2057,7 @@ fn send_terminate(control: &OwnedFd, stage: Option<&OwnedFd>) -> Result<(), Erro
 /// Sends the request that delivers `signal` to the command, refusing a number
 /// that names none of the signals the kernel names with `EINVAL`, as `kill`
 /// refuses one it does not know.
-fn send_signal(control: &OwnedFd, stage: Option<&OwnedFd>, signal: i32) -> Result<(), Error> {
+fn send_signal(control: &OwnedFd, stage: Option<BorrowedFd<'_>>, signal: i32) -> Result<(), Error> {
     let number = Signal::from_named_raw(signal)
         .and_then(|signal| u8::try_from(signal.as_raw()).ok())
         .ok_or_else(|| signal_error(Errno::INVAL))?;
@@ -2071,7 +2086,7 @@ fn send_control(control: &OwnedFd, request: &[u8]) -> Result<(), Error> {
 /// command's process tree, whether the outcome is known yet or not.
 fn send_kill(
     pidfd: &OwnedFd,
-    stage: Option<&OwnedFd>,
+    stage: Option<BorrowedFd<'_>>,
     kill_sent: &KillRecord,
     cgroup: Option<&Cgroup>,
 ) -> Result<(), Error> {
@@ -2090,7 +2105,7 @@ fn send_kill(
 /// the command, which is what could stop the stage again, while the stage
 /// still reports what the command used. A stage already gone is no matter,
 /// and nor is a failure: the kill's own delivery is what is reported.
-fn resume_stage(stage: Option<&OwnedFd>) {
+fn resume_stage(stage: Option<BorrowedFd<'_>>) {
     if let Some(stage) = stage {
         let _ = process::pidfd_send_signal(stage, Signal::CONT);
     }

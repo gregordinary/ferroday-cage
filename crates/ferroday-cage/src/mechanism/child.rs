@@ -91,8 +91,8 @@ use super::resolve;
 use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
-    IdentityPlan, LaunchPlan, MountAction, MountOp, OverlayPlan, RootPlan, STATUS_DUMPED,
-    STATUS_EXITED, STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
+    IdentityPlan, JoinTarget, LaunchPlan, MountAction, MountOp, OverlayPlan, RootPlan,
+    STATUS_DUMPED, STATUS_EXITED, STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
 };
 use crate::error::SetupStep;
 
@@ -167,13 +167,12 @@ pub(super) struct Context<'a> {
     /// The `cgroup.procs` of the sandbox's leaf cgroup, when the launch has a
     /// cgroup: the launch stage writes itself into it before anything else.
     pub(super) cgroup_procs_fd: Option<BorrowedFd<'a>>,
-    /// A pidfd of the process that holds a running sandbox's namespaces, when
-    /// this launch is a further command joining that sandbox rather than a
-    /// sandbox of its own: its init, or without a PID namespace the launch
-    /// stage that supervises its first command from outside. The launch stage
-    /// joins those namespaces in place of creating its own; see
-    /// [`join_sandbox`].
-    pub(super) join_fd: Option<BorrowedFd<'a>>,
+    /// The process that holds a running sandbox's namespaces, when this
+    /// launch is a further command joining that sandbox rather than a sandbox
+    /// of its own: its init, or without a PID namespace the launch stage that
+    /// supervises its first command from outside. The launch stage joins those
+    /// namespaces in place of creating its own; see [`join_sandbox`].
+    pub(super) join: Option<JoinTarget<'a>>,
 }
 
 impl Context<'_> {
@@ -185,9 +184,9 @@ impl Context<'_> {
     }
 
     /// Whether this launch joins a running sandbox; see
-    /// [`join_fd`](Self::join_fd).
+    /// [`join`](Self::join).
     fn joins(&self) -> bool {
-        self.join_fd.is_some()
+        self.join.is_some()
     }
 
     /// Whether the launch stage supervises the command from outside the
@@ -305,8 +304,8 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
         None
     };
 
-    if let Some(target) = context.join_fd {
-        join_sandbox(target, plan).map_err(|errno| (SetupStep::JoinSandbox, errno, 0))?;
+    if let Some(target) = context.join {
+        join_sandbox(target, plan.unshare).map_err(|errno| (SetupStep::JoinSandbox, errno, 0))?;
     }
 
     // The session keyring, the one piece of the caller's session the sweep
@@ -865,29 +864,131 @@ fn join_cgroup(procs: BorrowedFd<'_>) -> Result<(), Failure> {
         .map_err(|errno| (SetupStep::JoinCgroup, errno, 0))
 }
 
-/// Joins a running sandbox: enters, with one `setns` through a pidfd of the
-/// process that holds them, every namespace the sandbox's own launch created.
+/// Joins a running sandbox: enters every namespace the sandbox's own launch
+/// created, `namespaces`, the plan's unshare flags.
 ///
-/// The namespaces named are exactly the plan's unshare flags, which are the
-/// running sandbox's, since a joining launch's plan is its sandbox's with the
-/// command's own fields replaced. A flag the sandbox did not unshare would name
-/// the holder's instance of that namespace, the caller's own, over which the
-/// joined user namespace grants nothing, and the call would fail.
+/// Those flags are the running sandbox's, since a joining launch's plan is its
+/// sandbox's with the command's own fields replaced. A flag the sandbox did not
+/// unshare would name the holder's instance of that namespace, the caller's
+/// own, over which the joined user namespace grants nothing, and the join would
+/// fail.
 ///
-/// The kernel enters the user namespace first and the others with the
-/// capabilities its root holds, which this process has as the namespace's
-/// owner. Joining the mount namespace makes its root this process's root and
-/// working directory: the sandbox's own, as its pivot left it. A PID namespace
-/// is the one this process's children are created in, so the command is forked
-/// after this, and this process stays in the caller's, outside the sandbox's.
+/// The user namespace is entered first and the others with the capabilities
+/// its root holds, which this process has as the namespace's owner. Joining the
+/// mount namespace makes its root this process's root and working directory:
+/// the sandbox's own, as its pivot left it. A PID namespace is the one this
+/// process's children are created in, so the command is forked after this, and
+/// this process stays in the caller's, outside the sandbox's.
 ///
 /// A holder that has exited answers `ESRCH`: the sandbox has ended. One that
 /// exits after this, before the fork, fails the fork with `ENOMEM` instead.
-fn join_sandbox(target: BorrowedFd<'_>, plan: &LaunchPlan) -> Result<(), Errno> {
-    thread::move_into_thread_name_spaces(
-        target,
-        thread::ThreadNameSpaceType::from_bits_retain(plan.unshare.bits()),
-    )
+fn join_sandbox(target: JoinTarget<'_>, namespaces: thread::UnshareFlags) -> Result<(), Errno> {
+    SandboxEntry::new(target, namespaces).enter(namespaces)
+}
+
+/// The namespaces a launch unshares, each with the name of its
+/// `/proc/<pid>/ns` entry, in the order a join enters them: the user namespace
+/// first, for the capabilities joining each of the others takes.
+const NAMESPACE_FILES: [(thread::UnshareFlags, &CStr); 7] = [
+    (thread::UnshareFlags::NEWUSER, c"user"),
+    (thread::UnshareFlags::NEWNS, c"mnt"),
+    (thread::UnshareFlags::NEWUTS, c"uts"),
+    (thread::UnshareFlags::NEWIPC, c"ipc"),
+    (thread::UnshareFlags::NEWPID, c"pid"),
+    (thread::UnshareFlags::NEWCGROUP, c"cgroup"),
+    (thread::UnshareFlags::NEWNET, c"net"),
+];
+
+/// A running sandbox's namespaces, as a launch joining it enters them.
+///
+/// Through a pidfd of the holder, with one `setns` (Linux 5.8). A kernel that
+/// joins nothing through a pidfd answers that `setns` with `EINVAL`, and the
+/// namespaces are then opened through `/proc/<pid>/ns` under the holder's pid,
+/// in the procfs of the caller's mount namespace, and entered one by one.
+///
+/// That is the read-then-check pattern
+/// [`Namespaces::of`](super::netns::Namespaces::of) holds a pid to, in a form a
+/// process after a fork can take, with every descriptor on the stack: every
+/// file is opened before the pidfd is asked whether the holder has exited, so a
+/// holder still running was running when they were opened, and they are its.
+/// One that has exited is refused with `ESRCH`, as a pidfd's join refuses it.
+struct SandboxEntry<'a> {
+    /// The holder, by pidfd and by pid.
+    target: JoinTarget<'a>,
+    /// Every namespace the sandbox has.
+    sandbox: thread::UnshareFlags,
+    /// Each namespace of [`sandbox`](Self::sandbox), at its place in
+    /// [`NAMESPACE_FILES`], once the pidfd's join was refused; empty until
+    /// then.
+    opened: [Option<OwnedFd>; NAMESPACE_FILES.len()],
+}
+
+impl<'a> SandboxEntry<'a> {
+    /// The sandbox `target` holds, which has the namespaces of `sandbox`.
+    fn new(target: JoinTarget<'a>, sandbox: thread::UnshareFlags) -> SandboxEntry<'a> {
+        SandboxEntry {
+            target,
+            sandbox,
+            opened: [const { None }; NAMESPACE_FILES.len()],
+        }
+    }
+
+    /// Enters those of the sandbox's namespaces `namespaces` names.
+    ///
+    /// The first entry that falls back to the procfs opens every namespace of
+    /// the sandbox's, before entering any, so a later entry still finds those
+    /// it did not enter, by the procfs that indexed the holder.
+    fn enter(&mut self, namespaces: thread::UnshareFlags) -> Result<(), Errno> {
+        if self.opened.iter().all(Option::is_none) {
+            match thread::move_into_thread_name_spaces(
+                self.target.holder,
+                thread::ThreadNameSpaceType::from_bits_retain(namespaces.bits()),
+            ) {
+                Err(Errno::INVAL) => self.open()?,
+                joined => return joined,
+            }
+        }
+        for ((namespace, _), opened) in NAMESPACE_FILES.iter().zip(&self.opened) {
+            if let (true, Some(opened)) = (namespaces.contains(*namespace), opened) {
+                thread::move_into_link_name_space(opened.as_fd(), None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens every namespace of the sandbox's through `/proc/<pid>/ns`, held
+    /// to the holder's pidfd.
+    ///
+    /// The pidfd is asked once every open is done, failed or not: an exited
+    /// holder's entries name nothing to enter, or by then another process's,
+    /// and either way the sandbox has ended.
+    fn open(&mut self) -> Result<(), Errno> {
+        let opened = self.open_each();
+        if super::has_exited(self.target.holder) {
+            return Err(Errno::SRCH);
+        }
+        opened
+    }
+
+    /// Opens each namespace of the sandbox's under the holder's pid, stopping
+    /// at the first that fails.
+    fn open_each(&mut self) -> Result<(), Errno> {
+        for ((namespace, name), slot) in NAMESPACE_FILES.iter().zip(&mut self.opened) {
+            if self.sandbox.contains(*namespace) {
+                let mut path = StackPath::new();
+                path.push(b"/proc/");
+                path.push_decimal(self.target.pid);
+                path.push(b"/ns/");
+                path.push(name.to_bytes());
+                *slot = Some(fs::open(
+                    path.as_cstr(),
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Wires the command's standard streams and executes the command.
@@ -2525,7 +2626,7 @@ fn sweep_fds(context: &Context<'_>) -> Result<(), Errno> {
         context.stderr_fd,
         context.terminal_channel_fd,
         context.listener_channel_fd,
-        context.join_fd,
+        context.join.map(|join| join.holder),
         // A joining launch's command joins the cgroup after the sweep.
         context.cgroup_procs_fd.filter(|_| context.joins()),
     ]
@@ -3734,6 +3835,11 @@ fn report_held(fd: BorrowedFd<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use rustix::pipe::PipeFlags;
+    use rustix::thread::UnshareFlags;
+
     use super::*;
     use crate::scratch::Scratch;
 
@@ -4020,5 +4126,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Enters `target`'s namespaces of `namespaces` through `/proc/<pid>/ns`,
+    /// the route a kernel that joins nothing through a pidfd takes, in a forked
+    /// child, and answers its exit code: `0` where its host name is then
+    /// `holder`, `1` where the entries did not open, `2` where they were not
+    /// entered, `3` where the namespace entered was another's, and `4` where
+    /// the holder had exited.
+    fn enter_through_procfs(target: JoinTarget<'_>, namespaces: UnshareFlags) -> Option<i32> {
+        // SAFETY: the child makes raw syscalls only, through rustix, and ends
+        // in `exit_group`.
+        match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
+            sys::PidfdFork::Child => {
+                let mut entry = SandboxEntry::new(target, namespaces);
+                match entry.open() {
+                    Ok(()) => {}
+                    Err(Errno::SRCH) => sys::exit_group(4),
+                    Err(_) => sys::exit_group(1),
+                }
+                if entry.enter(namespaces).is_err() {
+                    sys::exit_group(2)
+                }
+                let name = rustix::system::uname();
+                sys::exit_group(if name.nodename().to_bytes() == b"holder" {
+                    0
+                } else {
+                    3
+                })
+            }
+            sys::PidfdFork::ParentOf(joiner) => joiner.reap().expect("the joiner is reaped"),
+        }
+    }
+
+    #[test]
+    fn a_sandbox_is_entered_through_its_holders_procfs_entries() {
+        // A holder in a user and UTS namespace of its own, named `holder`,
+        // which signals once it is there and holds until its pipe closes.
+        let (uid_line, gid_line) = crate::idmap::single_identity_lines();
+        let (ready, ready_end) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        let (hold_end, hold) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        // SAFETY: the holder makes raw syscalls only, through rustix and the
+        // shared map sequence, and ends in `exit_group`.
+        let holder = match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
+            sys::PidfdFork::Child => {
+                let duty = MapDuty::Write {
+                    paths: MapPaths::SELF,
+                    uid_line: &uid_line,
+                    gid_line: &gid_line,
+                };
+                let keep = [ready_end.as_raw_fd(), hold_end.as_raw_fd()];
+                if enter_mapped_namespace(&keep, UnshareFlags::NEWUTS, duty, None).is_err()
+                    || rustix::system::sethostname(b"holder").is_err()
+                    || rustix::io::write(&ready_end, b"R").is_err()
+                {
+                    sys::exit_group(1)
+                }
+                let mut byte = [0u8; 1];
+                let _ = rustix::io::read(&hold_end, &mut byte);
+                sys::exit_group(0)
+            }
+            sys::PidfdFork::ParentOf(holder) => holder,
+        };
+        drop((ready_end, hold_end));
+        let mut byte = [0u8; 1];
+        if rustix::io::read(&ready, &mut byte) != Ok(1) {
+            let _ = holder.reap();
+            ferroday_cage_testkit::require::USERNS
+                .skip("a forked child could not enter a user namespace of its own");
+            return;
+        }
+        let target = JoinTarget {
+            holder: holder.pidfd(),
+            pid: holder.pid().as_raw_nonzero().get() as u32,
+        };
+        let namespaces = UnshareFlags::NEWUSER | UnshareFlags::NEWUTS;
+
+        assert_eq!(
+            enter_through_procfs(target, namespaces),
+            Some(0),
+            "1: the entries did not open; 2: they were not entered; 3: the namespace \
+             entered was not the holder's; 4: the holder was taken for exited",
+        );
+
+        // Exited and not yet collected, the holder still has its user
+        // namespace's entry, and no other; the sandbox has ended all the same.
+        drop(hold);
+        assert!(
+            super::super::exits_within(holder.pidfd(), Duration::from_secs(10)),
+            "the holder exits once its pipe closes"
+        );
+        assert_eq!(enter_through_procfs(target, namespaces), Some(4));
+        assert_eq!(holder.reap(), Ok(Some(0)));
     }
 }

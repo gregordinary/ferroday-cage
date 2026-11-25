@@ -154,10 +154,12 @@ caller
 
 The join stage enters the sandbox with one `setns`, through the pidfd the
 handle holds. That is the init's, or the launch stage's without a PID
-namespace. The stage forks the further command into the sandbox and supervises
-it from outside, as a launch stage does without a PID namespace. The command
-then enters a nested user and mount namespace of its own, copied from the
-sandbox's setup, and applies the hardening. It is a Landlock domain and a
+namespace. A kernel before Linux 5.8 joins nothing through a pidfd, and the
+stage then opens that process's namespaces through `/proc/<pid>/ns` and enters
+each in turn. The stage forks the further command into the sandbox and
+supervises it from outside, as a launch stage does without a PID namespace. The
+command then enters a nested user and mount namespace of its own, copied from
+the sandbox's setup, and applies the hardening. It is a Landlock domain and a
 seccomp filter of its own, with the launch's rules.
 
 The commands share the sandbox. Its root and every mount the setup made are

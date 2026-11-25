@@ -1526,12 +1526,12 @@ pub(crate) struct Launched {
     pub(crate) stdout: Option<OwnedFd>,
     /// Read end of the command's captured standard error, when observing.
     pub(crate) stderr: Option<OwnedFd>,
-    /// A pidfd of the launch stage, for the handle to reap after the status
-    /// arrives. `None` with a PID namespace, where the launch stage is reaped
-    /// at spawn time and the init is not the caller's child process. A pidfd
-    /// rather than a raw pid so the deferred reap targets exactly this process
-    /// and cannot alias a pid a concurrent reaper freed and the OS recycled.
-    pub(crate) reap: Option<OwnedFd>,
+    /// The launch stage, for the handle to reap after the status arrives.
+    /// `None` with a PID namespace, where the launch stage is reaped at spawn
+    /// time and the init is not the caller's child process. Reaped through its
+    /// pidfd so the deferred reap targets exactly this process and cannot alias
+    /// a pid a concurrent reaper freed and the OS recycled.
+    pub(crate) reap: Option<Forked>,
     /// The caller's terminal, where the launch lent the sandbox its
     /// foreground, for the handle to hand back.
     pub(crate) foreground: Option<Foreground>,
@@ -1591,16 +1591,22 @@ impl Forked {
         reap_via_pidfd(self.pidfd.as_fd())
     }
 
-    /// The process's pidfd, to poll for its exit.
-    #[cfg(test)]
+    /// The process's pidfd, to poll for its exit or to signal it.
     pub(crate) fn pidfd(&self) -> BorrowedFd<'_> {
         self.pidfd.as_fd()
     }
+}
 
-    /// The pidfd, for a holder that reaps the process later.
-    fn into_pidfd(self) -> OwnedFd {
-        self.pidfd
-    }
+/// The running sandbox a further command's launch joins.
+#[derive(Clone, Copy)]
+pub(crate) struct JoinTarget<'a> {
+    /// A pidfd of the process holding the sandbox's namespaces: its init, or
+    /// without a PID namespace the launch stage that supervises its first
+    /// command from outside.
+    pub(crate) holder: BorrowedFd<'a>,
+    /// The holder's pid in the caller's PID namespace, which names its
+    /// namespaces under `/proc` for a kernel that joins none through a pidfd.
+    pub(crate) pid: u32,
 }
 
 /// The caller's ends of a freshly forked launch: the launch stage and every
@@ -1872,17 +1878,17 @@ pub(crate) const STDERR_FILENO: RawFd = 2;
 /// The caller's terminal is lent to the sandbox here, as [`Foreground`]
 /// decides, and the decision travels to the init in the context.
 ///
-/// `join` is a pidfd of the process that holds a running sandbox's namespaces,
-/// where the launch is a further command joining that sandbox: the launch
-/// stage joins them rather than creating its own, and no map gate is made,
-/// since the namespace it joins is mapped already.
+/// `join` names the process that holds a running sandbox's namespaces, where
+/// the launch is a further command joining that sandbox: the launch stage
+/// joins them rather than creating its own, and no map gate is made, since the
+/// namespace it joins is mapped already.
 fn fork_launch(
     plan: &LaunchPlan,
     observe: bool,
     gated: bool,
     terminal: Option<&Terminal>,
     cgroup_procs: Option<BorrowedFd<'_>>,
-    join: Option<BorrowedFd<'_>>,
+    join: Option<JoinTarget<'_>>,
 ) -> Result<ParentSide, Error> {
     refuse_directory_streams(plan, observe, terminal.is_some())?;
     let foreground = Foreground::lend(plan, observe, terminal.is_some())?;
@@ -2027,7 +2033,7 @@ fn fork_launch(
                 take_foreground: foreground.is_some(),
                 hidden: &hidden,
                 cgroup_procs_fd: cgroup_procs,
-                join_fd: join,
+                join,
             };
             child::stage_a(&context)
         }
@@ -2208,13 +2214,13 @@ fn establish_identity_map(plan: &LaunchPlan, parent: &ParentSide) -> Result<(), 
 /// best-effort in case the application reaps child processes of its own.
 /// Otherwise, without a PID namespace or in a launch joining a running
 /// sandbox, the launch stage stays outside as the command's parent and is
-/// reaped by the handle once the status arrives, so its pidfd is returned.
-fn reap_after(inside: bool, stage: Forked) -> Option<OwnedFd> {
+/// reaped by the handle once the status arrives, so it is returned.
+fn reap_after(inside: bool, stage: Forked) -> Option<Forked> {
     if inside {
         let _ = stage.reap();
         None
     } else {
-        Some(stage.into_pidfd())
+        Some(stage)
     }
 }
 
@@ -2306,16 +2312,16 @@ fn abort_launch(stage: &Forked, supervisor: &OwnedFd) {
 /// and one whose init's pidfd did not arrive has an end this side cannot wait
 /// for, and the targets of either are left where they are.
 ///
-/// `join` is a pidfd of the process holding a running sandbox's namespaces,
-/// where the launch is a further command joining it; see [`fork_launch`]. The
-/// launch stage then supervises the command from outside, as it does without a
-/// PID namespace, and the handle anchors on the command.
+/// `join` names the process holding a running sandbox's namespaces, where the
+/// launch is a further command joining it; see [`fork_launch`]. The launch
+/// stage then supervises the command from outside, as it does without a PID
+/// namespace, and the handle anchors on the command.
 pub(crate) fn spawn(
     plan: &LaunchPlan,
     observe: bool,
     terminal: Option<&Terminal>,
     cgroup_procs: Option<BorrowedFd<'_>>,
-    join: Option<BorrowedFd<'_>>,
+    join: Option<JoinTarget<'_>>,
     progress: &mut dyn FnMut(Progress),
     created: &mut Vec<CreatedTarget>,
 ) -> Result<(Launched, Option<OwnedFd>), Error> {

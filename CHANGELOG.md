@@ -245,7 +245,8 @@ consumer upgrading can skip it.
   a working directory, the standard streams, and `stop_with_caller`, and
   return a `Running` of its own, with the caller's end of a pseudoterminal for
   `exec_terminal`. The command joins the sandbox's namespaces with one `setns`
-  through the pidfd the handle holds, at the new `SetupStep::JoinSandbox`, and
+  through the pidfd the handle holds, or below Linux 5.8 through that process's
+  `/proc/<pid>/ns` entries, at the new `SetupStep::JoinSandbox`, and
   enters a nested user and mount namespace of its own, copied from the
   sandbox's setup, under the launch's identity, limits and hardening. Its
   handle ends that command alone, and runs further commands in the same
