@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::report::{FlowAdmission, FlowRefusal};
 use super::server_name::Host;
-use super::{dns, prefix};
+use super::{dns, own, prefix};
 
 /// A transport the stack carries the guest's traffic over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -534,6 +534,9 @@ pub(super) struct Policy {
     pub(super) allow: Vec<DestinationRule>,
     /// The rules that refuse, in the order given.
     pub(super) deny: Vec<DestinationRule>,
+    /// The host's own networks, read when the stack attaches, which a name
+    /// rule admits no address on; see [`own`](super::own).
+    pub(super) own: Vec<(IpAddr, u8)>,
 }
 
 /// The private ranges a name rule does not admit an address in: RFC 1918's
@@ -675,7 +678,10 @@ impl Policy {
             let rule = rule.clone();
             let refusal = if transport == Transport::Udp {
                 FlowRefusal::NameOverUdp { rule }
-            } else if is_private(address) {
+            } else if is_private(address)
+                || own::holds(&self.own, address)
+                || embedded.is_some_and(|embedded| own::holds(&self.own, embedded))
+            {
                 FlowRefusal::PrivateBehindName { rule }
             } else {
                 return (Ok(FlowAdmission::Allowed { rule }), Some(name));
@@ -997,6 +1003,7 @@ mod tests {
 
     fn rules(allow: &[&str], deny: &[&str]) -> Policy {
         Policy {
+            own: Vec::new(),
             allow: allow.iter().map(|text| rule(text)).collect(),
             deny: deny.iter().map(|text| rule(text)).collect(),
         }
@@ -1140,6 +1147,37 @@ mod tests {
                 Some("www.example.net".to_string())
             )
         );
+    }
+
+    #[test]
+    fn a_name_rule_admits_no_address_on_the_host_s_own_networks() {
+        // A LAN numbered from global addresses, and the host's own public
+        // address, read when the stack attached.
+        let mut policy = rules(&["example.com"], &[]);
+        policy.own = vec![
+            ("2001:db8:1:2::".parse().unwrap(), 64),
+            ("203.0.113.0".parse().unwrap(), 24),
+        ];
+        for own in ["2001:db8:1:2::77", "203.0.113.9", "64:ff9b::203.0.113.9"] {
+            assert_eq!(
+                policy
+                    .decide_named(Transport::Tcp, own, 443, &["example.com"])
+                    .0,
+                Err(FlowRefusal::PrivateBehindName {
+                    rule: rule("example.com")
+                }),
+                "{own}"
+            );
+        }
+        for elsewhere in ["2001:db8:1:3::77", "203.0.114.9"] {
+            assert!(
+                policy
+                    .decide_named(Transport::Tcp, elsewhere, 443, &["example.com"])
+                    .0
+                    .is_ok(),
+                "{elsewhere}"
+            );
+        }
     }
 
     #[test]

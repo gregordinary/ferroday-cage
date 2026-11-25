@@ -119,6 +119,7 @@ pub(crate) mod fuzzing {
     }
 }
 mod nameserver;
+mod own;
 mod pins;
 mod policy;
 mod prefix;
@@ -477,7 +478,10 @@ impl NetStack {
         let (stop, polled) = pump::Stop::new().map_err(|source| NetStackError::Spawn { source })?;
         let running = Arc::new(AtomicBool::new(true));
         let running_pump = Arc::clone(&running);
-        let plan = self.plan.clone();
+        let mut plan = self.plan.clone();
+        // The host's own networks too, which a name rule admits no address on,
+        // as they stand now.
+        plan.policy.own = own::networks();
         // The host's resolver is read now, on the caller's thread, so the
         // pump does no file I/O and a stack attached later reads the host's
         // configuration as it stands then.
@@ -1261,6 +1265,7 @@ impl NetStackBuilder {
                 policy: policy::Policy {
                     allow: self.allow,
                     deny: self.deny,
+                    own: Vec::new(),
                 },
             },
         })

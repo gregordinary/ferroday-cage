@@ -463,6 +463,12 @@ consumer upgrading can skip it.
   from the next connection's. It keyed them by the connection's socket handle,
   which smoltcp reuses once a socket is removed, so a connection reaped with
   queries in flight handed their answers, and its count of them, to the next.
+- An allow name rule admits no address on the host's own networks, as they
+  stand when the stack attaches: each network its routing table reaches
+  without a gateway, and the network of each of its global IPv6 addresses. It
+  refused the private ranges alone, so a name resolved to a LAN numbered from
+  global addresses, or to the host's own public address, where a service bound
+  to every address answers, was carried.
 
 ### Internal
 

@@ -463,10 +463,13 @@ pub enum FlowRefusal {
     /// learned the address some other way, or wrote it as a literal.
     NotResolved,
     /// An allow name rule matches a name the stack's nameserver resolved to
-    /// the destination, whose address is in a private range: `10.0.0.0/8`,
-    /// `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` or `fc00::/7`. A
-    /// name rule admits no such address, since a name anyone can register can
-    /// be resolved to the host's own network. An address rule admits one.
+    /// the destination, whose address is in a private range, `10.0.0.0/8`,
+    /// `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` or `fc00::/7`, or on
+    /// one of the host's own networks as it stood when the stack attached: one
+    /// its routing table reaches directly, or the network of one of its
+    /// global IPv6 addresses. A name rule admits no such address, since a
+    /// name anyone can register can be resolved to the host's own network. An
+    /// address rule admits one.
     #[non_exhaustive]
     PrivateBehindName {
         /// The first allow name rule, in the order given, that matches the
@@ -553,7 +556,8 @@ impl fmt::Display for FlowRefusal {
             ),
             FlowRefusal::PrivateBehindName { rule } => write!(
                 f,
-                "the allow rule {rule} admits the name but no private address behind it"
+                "the allow rule {rule} admits the name but no address behind it on a private \
+                 range or the host's own network"
             ),
             FlowRefusal::NameOverUdp { rule } => {
                 write!(f, "the allow rule {rule} admits the name over TCP alone")
