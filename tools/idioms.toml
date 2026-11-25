@@ -109,6 +109,13 @@ NUL, and the shapes that are not a name; a hand-rolled split decides those \
 again, and two splits that decide them differently admit different paths."""
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/provision/fetch.rs"
+count = 1
+why = """\
+Not a path: where a mirror URL's authority ends, which `mirror_url` takes no \
+slash from, so a mirror at the filesystem's root, `file:///`, keeps it."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/src/path.rs"
 count = 1
 why = "The answer."
@@ -412,11 +419,6 @@ answer = """\
 a composed suffix may or may not begin with one, so the join owns both. A \
 doubled or missing separator addresses no archive, and a join decided at each \
 site is a separator decided at each site."""
-
-[[idiom.site]]
-path = "crates/ferroday-cage/src/provision/fetch.rs"
-count = 1
-why = "The answer."
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/provision/debian/deb.rs"

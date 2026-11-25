@@ -763,12 +763,23 @@ pub(crate) fn compose_mirrors(
 /// or may not begin with one, so the join owns both: `http://mirror/debian/`
 /// and `http://mirror/debian` address the same archive, and a doubled or
 /// missing separator addresses neither.
+///
+/// One slash is taken from the mirror's end, and only from its path, past the
+/// authority `//` opens: a mirror at the filesystem's root, `file:///`, joins
+/// to `file:///debian`, where taking every slash would leave `file:` and a
+/// path read as the authority.
 pub(crate) fn mirror_url(mirror: &str, suffix: &str) -> String {
-    format!(
-        "{}/{}",
-        mirror.trim_end_matches('/'),
-        suffix.trim_start_matches('/'),
-    )
+    let path = mirror.find("://").map_or(0, |scheme| {
+        let authority = scheme + "://".len();
+        mirror[authority..]
+            .find('/')
+            .map_or(mirror.len(), |slash| authority + slash)
+    });
+    let base = match mirror.strip_suffix('/') {
+        Some(stripped) if stripped.len() >= path => stripped,
+        _ => mirror,
+    };
+    format!("{base}/{}", suffix.trim_start_matches('/'))
 }
 
 /// Decodes the percent escapes in `text`, or `None` where one is malformed: a
@@ -976,6 +987,23 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mirror_and_a_suffix_join_on_one_slash() {
+        for (mirror, joined) in [
+            ("http://mirror/debian", "http://mirror/debian/dists"),
+            ("http://mirror/debian/", "http://mirror/debian/dists"),
+            ("http://mirror/", "http://mirror/dists"),
+            ("http://mirror", "http://mirror/dists"),
+            // A mirror at the filesystem's root keeps it.
+            ("file:///", "file:///dists"),
+            ("file:///srv/mirror/", "file:///srv/mirror/dists"),
+        ] {
+            for suffix in ["dists", "/dists"] {
+                assert_eq!(mirror_url(mirror, suffix), joined, "{mirror} {suffix}");
+            }
+        }
+    }
 
     /// A boxed transport runs the boxed transport's own methods, its
     /// overridden batch included, rather than the trait's default bodies.

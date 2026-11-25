@@ -469,6 +469,9 @@ consumer upgrading can skip it.
   refused the private ranges alone, so a name resolved to a LAN numbered from
   global addresses, or to the host's own public address, where a service bound
   to every address answers, was carried.
+- A mirror at the filesystem's root, `file:///`, is joined to a path as
+  `file:///debian/...`. Every trailing slash was taken from a mirror, which
+  left `file:` and the path read as an authority.
 
 ### Internal
 
