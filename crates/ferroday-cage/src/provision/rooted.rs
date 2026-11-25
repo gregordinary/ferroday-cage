@@ -991,10 +991,13 @@ pub(crate) fn merged_lookup(
     relative: &Path,
     link: AncestorLink,
 ) -> io::Result<Merged> {
+    // An ancestor naming the tree's top, the empty path, `.` or a bare `/`, is
+    // every layer's own directory rather than an entry one holds, and is what
+    // `components` refuses.
     let ancestors: Vec<&Path> = relative
         .ancestors()
         .skip(1)
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .filter(|ancestor| components(ancestor).is_ok())
         .collect();
     for (at, layer) in layers.iter().enumerate() {
         match layer.stat(relative)? {
@@ -1114,6 +1117,34 @@ mod tests {
         assert!(matches!(
             merged_lookup(&layers, Path::new("lib/y"), AncestorLink::PassesDown).unwrap(),
             Merged::Absent
+        ));
+    }
+
+    #[test]
+    fn a_path_from_the_trees_top_is_looked_up_through_the_layers_beneath() {
+        // A path spelled from the tree's top, as a root's files name
+        // themselves, walks the same ancestors as its relative spelling: the
+        // top itself is every layer's directory, and no entry to look at.
+        let base_dir = Scratch::new("merged-top-base");
+        let upper_dir = Scratch::new("merged-top-upper");
+        let base = Rooted::open(&base_dir).unwrap();
+        let upper = Rooted::open(&upper_dir).unwrap();
+        base.write("etc/passwd", b"root:x:0:0::/root:/bin/sh\n")
+            .unwrap();
+        let layers = [&upper, &base];
+
+        for spelled in ["/etc/passwd", "./etc/passwd", "etc/passwd"] {
+            assert!(
+                matches!(
+                    merged_lookup(&layers, Path::new(spelled), AncestorLink::PassesDown),
+                    Ok(Merged::Entry { layer: 1 })
+                ),
+                "{spelled}"
+            );
+        }
+        assert!(matches!(
+            merged_lookup(&layers, Path::new("/etc/shadow"), AncestorLink::Hides),
+            Ok(Merged::Absent)
         ));
     }
 

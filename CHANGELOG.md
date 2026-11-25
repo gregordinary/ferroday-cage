@@ -940,6 +940,11 @@ consumer upgrading can skip it.
 - The launch resolves a mount target refusing a magic link by name, as every
   other scoped lookup in the crate does. `RESOLVE_IN_ROOT` refuses one too on
   every kernel so far.
+- The merged-view lookup that layered builds and the launch's placeholder
+  checks share walks the directories above a path spelled from the tree's top,
+  such as `/etc/passwd`, as it walks them for `etc/passwd`. It asked the upper
+  about `/` itself, and failed with `EINVAL`. No current caller spells a path
+  that way.
 
 ## [0.6.0] - 2026-11-13
 
