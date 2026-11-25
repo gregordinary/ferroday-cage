@@ -12,21 +12,24 @@
 //! the mechanism both formats share: reading the files from a tree that may be
 //! an overlay's upper, and rewriting the days a run wrote.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(any(feature = "debian", feature = "alpine"))]
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::rooted::{AncestorLink, Merged, Rooted, merged_lookup};
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
 /// The shadow file, and the copy of its previous version the account tools
 /// leave beside it on every change.
 pub(super) const SHADOW: [&str; 2] = ["etc/shadow", "etc/shadow-"];
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
 /// The seconds in the unit `/etc/shadow` counts in, a day.
 pub(super) const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 /// The file a root names its users in, and the one it names its groups in.
-#[cfg(feature = "alpine")]
 pub(super) const ACCOUNTS: [&str; 2] = ["etc/passwd", "etc/group"];
 
 /// The most of an accounts file a host-side step reads: a [`SHADOW`] file, or
@@ -37,6 +40,7 @@ pub(super) const ACCOUNTS: [&str; 2] = ["etc/passwd", "etc/group"];
 /// writing to it, and this is what such a file meets.
 pub(super) const MAX_SHADOW: u64 = 16 * 1024 * 1024;
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
 /// Each account's last-change day, by account name, as a [`SHADOW`] file
 /// records it.
 pub(super) type Dates = HashMap<Vec<u8>, Vec<u8>>;
@@ -92,6 +96,7 @@ fn read_accounts(
     ))
 }
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
 /// Each account's last-change day as `/etc/shadow` records it before the
 /// scripts run, in the file [`read_accounts`] reads: the tree's, or where the
 /// tree holds none and hides none, the one beneath it in a layered build. No
@@ -126,7 +131,6 @@ pub(super) fn account_dates(tree: &Rooted, beneath: Option<&Rooted>) -> Result<D
 /// The first line naming an account is the one that counts, as `getpwnam(3)`
 /// and `getgrnam(3)` read the files, and a line whose third field is not a
 /// number names no id. No file is no accounts.
-#[cfg(feature = "alpine")]
 pub(super) fn ids(
     tree: &Rooted,
     beneath: Option<&Rooted>,
@@ -150,6 +154,7 @@ pub(super) fn ids(
     Ok(ids)
 }
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
 /// The last-change field `/etc/shadow` records for a change at `epoch`: the
 /// day it falls on, counted from 1970.
 ///
@@ -164,6 +169,7 @@ pub(super) fn last_change_day(epoch: i64) -> String {
     }
 }
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
 /// Rewrites to `day` every last-change field the run wrote that `rewrites`
 /// accepts, in `/etc/shadow` and in the previous version beside it.
 ///
@@ -201,6 +207,7 @@ pub(super) fn redate(
     Ok(())
 }
 
+#[cfg(any(feature = "debian", feature = "alpine"))]
 /// `contents` with every last-change field the run wrote and `rewrites` accepts
 /// replaced by `day`, or `None` where there is none to replace.
 ///
@@ -237,7 +244,7 @@ fn redated(
     changed.then(|| lines.join(&b'\n'))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "debian", feature = "alpine")))]
 mod tests {
     use std::path::Path;
 

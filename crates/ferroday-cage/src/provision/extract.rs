@@ -54,13 +54,15 @@ use rustix::io::Errno;
 use crate::path::{self, LeadingSlash, Refused};
 
 use super::ProvisionError;
+use super::accounts;
 #[cfg(any(feature = "debian", feature = "alpine"))]
 use super::compress::read_fully;
 use super::containment::{self, Made, Reached};
 use super::copyin::{Owed, Translation, reown};
 use super::identity::Ownership;
-use super::tar::{Entry, TarReader};
-use super::xattr::{self, Acl};
+use super::rooted::Rooted;
+use super::tar::{AclRecords, Entry, TarReader};
+use super::xattr::{self, Acl, AclText};
 
 /// How every path an extraction writes through is resolved: inside the root,
 /// with an absolute link re-anchored there, as the root filesystem resolves it
@@ -114,12 +116,12 @@ pub(crate) enum Placement {
 struct DirMeta {
     mode: u32,
     mtime: Option<i64>,
-    /// The access control list the entry records, in the archive's form.
-    acl_access: Option<Vec<u8>>,
-    /// The default list the entry records, in the archive's form. Applied once
-    /// every entry is written, as the mode is, so no entry the extraction
+    /// The access control list the entry records, in the archive's forms.
+    acl_access: AclRecords,
+    /// The default list the entry records, in the archive's forms. Applied
+    /// once every entry is written, as the mode is, so no entry the extraction
     /// creates beneath the directory inherits it.
-    acl_default: Option<Vec<u8>>,
+    acl_default: AclRecords,
 }
 
 impl DirMeta {
@@ -128,8 +130,8 @@ impl DirMeta {
         DirMeta {
             mode,
             mtime,
-            acl_access: None,
-            acl_default: None,
+            acl_access: AclRecords::default(),
+            acl_default: AclRecords::default(),
         }
     }
 
@@ -153,16 +155,41 @@ impl DirMeta {
 /// kernel reads them as the host's. Each is read through the map first. The
 /// map is the one [`Extraction::owned_through`] names, the single-identity map
 /// unless one is named, under which only root inside has a host id.
+///
+/// A list recorded only as text may name its users and groups by name
+/// ([`AclText`]). A name means what the root's own `/etc/passwd` and
+/// `/etc/group` say it means, not what the host's do, so it is looked up there
+/// ([`accounts::ids`]), as the root stands when the list is applied: the merged
+/// view over the base, in a layered build. An archive that carries the
+/// accounts files after an entry whose list names an account they define
+/// leaves that list nothing to answer it, and it is given its narrowing.
 struct ListIds<'a> {
     ownership: &'a Ownership,
     resolved: OnceCell<Option<Translation>>,
+    /// The extraction root, which a list's names are looked up in.
+    root: &'a Path,
+    /// The base the root is an overlay upper over, where it is one.
+    lower: Option<&'a Path>,
+}
+
+/// What an entry's records give one of its lists, read and resolved.
+enum Stated {
+    /// Neither form states a list.
+    Nothing,
+    /// A list, its named entries in the root's ids.
+    List(Acl),
+    /// A list naming someone the root has no id for, which only its
+    /// narrowing can be given.
+    Unanswered(Acl),
 }
 
 impl ListIds<'_> {
-    fn new(ownership: &Ownership) -> ListIds<'_> {
+    fn new<'a>(ownership: &'a Ownership, root: &'a Path, lower: Option<&'a Path>) -> ListIds<'a> {
         ListIds {
             ownership,
             resolved: OnceCell::new(),
+            root,
+            lower,
         }
     }
 
@@ -175,7 +202,75 @@ impl ListIds<'_> {
             .as_ref()?;
         acl.mapped(|id| ids.host_uid(id), |id| ids.host_gid(id))
     }
+
+    /// The list `records` state for the entry at `path`.
+    ///
+    /// The attribute's own value wins where both forms are present: it holds
+    /// the ids its writer read, where the text may hold names for a database
+    /// that is not the root's. GNU tar reads the two the other way round, and
+    /// applies only the text. The text is read only where the value is absent,
+    /// so text that would not read beside a value is no reason to refuse the
+    /// entry.
+    ///
+    /// A list the kernel would not store, in either form, refuses the entry,
+    /// since nothing about the entry's access could then be relied on.
+    fn stated(&self, records: &AclRecords, path: &Path) -> Result<Stated, ProvisionError> {
+        let refused = |reason: &str| ProvisionError::EntryRefused {
+            path: path.to_path_buf(),
+            reason: format!(
+                "the access control list it records is not one the kernel stores: {reason}"
+            ),
+        };
+        if let Some(value) = &records.value {
+            return match Acl::parse(value) {
+                Ok(Some(acl)) => Ok(Stated::List(acl)),
+                Ok(None) => Ok(Stated::Nothing),
+                Err(flaw) => Err(refused(flaw.reason())),
+            };
+        }
+        let Some(text) = &records.text else {
+            return Ok(Stated::Nothing);
+        };
+        let text = AclText::parse(text).map_err(refused)?;
+        let resolved = if text.names_anyone() {
+            let (users, groups) = self.accounts()?;
+            text.resolve(
+                |name| users.get(name).copied(),
+                |name| groups.get(name).copied(),
+            )
+        } else {
+            text.resolve(|_| None, |_| None)
+        };
+        match resolved {
+            Ok(Some(acl)) => Ok(Stated::List(acl)),
+            Ok(None) => Ok(Stated::Unanswered(text.narrowed())),
+            Err(flaw) => Err(refused(flaw.reason())),
+        }
+    }
+
+    /// The id each name in the root's `/etc/passwd`, and each in its
+    /// `/etc/group`, is given there, as the root stands now.
+    fn accounts(&self) -> Result<(AccountIds, AccountIds), ProvisionError> {
+        let reading = |op: &'static str, path: &Path| {
+            let path = path.to_path_buf();
+            move |err: io::Error| ProvisionError::io(op, &path, err)
+        };
+        let tree = Rooted::open(self.root).map_err(reading("opening", self.root))?;
+        let beneath = self
+            .lower
+            .map(|lower| Rooted::open(lower).map_err(reading("opening", lower)))
+            .transpose()?;
+        let [passwd, group] = accounts::ACCOUNTS;
+        let ids = |file: &str| {
+            accounts::ids(&tree, beneath.as_ref(), file)
+                .map_err(|failure| ProvisionError::io(failure.op, &failure.path, failure.source))
+        };
+        Ok((ids(passwd)?, ids(group)?))
+    }
 }
+
+/// The id each name an accounts file names is given there.
+type AccountIds = HashMap<Vec<u8>, u32>;
 
 /// The tree entries are written into: the extraction root, and the base it is
 /// an overlay upper over, where it is one.
@@ -228,6 +323,11 @@ pub(crate) struct Extraction {
     /// The identity map the root is owned through, which that ownership is
     /// given through. See [`owned_through`](Self::owned_through).
     ownership: Ownership,
+    /// The extraction root's path, where a list's names are looked up
+    /// ([`ListIds`]).
+    root: PathBuf,
+    /// The base's path, where there is one.
+    lower: Option<PathBuf>,
 }
 
 impl Extraction {
@@ -242,6 +342,8 @@ impl Extraction {
             under: None,
             owed: RefCell::new(Vec::new()),
             ownership: Ownership::default(),
+            root: root.to_path_buf(),
+            lower: None,
         })
     }
 
@@ -287,6 +389,7 @@ impl Extraction {
     pub(crate) fn over(mut self, lower: Option<&Path>) -> Result<Extraction, ProvisionError> {
         if let Some(lower) = lower {
             self.lower_fd = Some(open_root(lower)?);
+            self.lower = Some(lower.to_path_buf());
         }
         Ok(self)
     }
@@ -359,7 +462,7 @@ impl Extraction {
         archive: &mut TarReader<R>,
         on_entry: &mut OnEntry<'_>,
     ) -> Result<(), ProvisionError> {
-        let lists = ListIds::new(&self.ownership);
+        let lists = ListIds::new(&self.ownership, &self.root, self.lower.as_deref());
         let tree = Tree {
             root: self.root_fd.as_fd(),
             lower: self.lower_fd.as_ref().map(AsFd::as_fd),
@@ -466,7 +569,7 @@ impl Extraction {
     /// `root` names the extraction root in an error, and is where that child
     /// opens it.
     pub(crate) fn finalize(self, root: &Path) -> Result<(), ProvisionError> {
-        let lists = ListIds::new(&self.ownership);
+        let lists = ListIds::new(&self.ownership, &self.root, self.lower.as_deref());
         apply_dir_meta(self.root_fd.as_fd(), self.dir_meta, &lists)?;
         if let Some(meta) = self.root_meta {
             apply_meta_fd(self.root_fd.as_fd(), &meta, &lists, root)?;
@@ -876,7 +979,7 @@ fn extract_file<R: Read>(
     apply_lists(
         file.as_fd(),
         entry.mode,
-        entry.acl_access.as_deref(),
+        &entry.acl_access,
         None,
         tree.lists,
         &bytes_to_path(&entry.path),
@@ -1061,7 +1164,7 @@ fn extract_fifo(
     apply_lists(
         pipe.as_fd(),
         entry.mode,
-        entry.acl_access.as_deref(),
+        &entry.acl_access,
         None,
         tree.lists,
         &bytes_to_path(&entry.path),
@@ -1182,8 +1285,8 @@ fn apply_meta_fd(
     apply_lists(
         fd,
         meta.mode,
-        meta.acl_access.as_deref(),
-        meta.acl_default.as_deref(),
+        &meta.acl_access,
+        Some(&meta.acl_default),
         lists,
         path,
     )?;
@@ -1197,72 +1300,66 @@ fn apply_meta_fd(
 /// records, its `mode` already applied: `access`, the entry's own list, and
 /// `default`, a directory's default list.
 ///
-/// Each list's named ids are read across the map first ([`ListIds`]). A list
-/// naming an id the map has no host id for cannot be given as it stands, and
-/// neither can one the filesystem holds no lists for. The access list is then
-/// given as its narrowing ([`Acl::narrowed`]), which is a mode: where a list
-/// has a mask, the mode's group bits are the mask, and the mode alone would
-/// give the owning group what the mask allows rather than what the list gave
-/// it. A default list is given as its narrowing where the map is what stands
-/// in the way, so what the directory's new entries inherit is no more open
-/// than the archive recorded; a filesystem without lists holds no default at
-/// all.
-///
-/// A list the kernel would not store ([`xattr::AclFlaw`]) refuses the entry
-/// before anything is set, since nothing about the entry's access could then be
-/// relied on. A value holding no entry is no list, as the kernel takes it.
+/// Each list is read from the form [`ListIds::stated`] chooses, and its named
+/// ids are read across the map ([`ListIds`]). A list naming an id the map has
+/// no host id for cannot be given as it stands, nor can one naming a user or
+/// group the root has no id for, and neither can one the filesystem holds no
+/// lists for. The access list is then given as its narrowing
+/// ([`Acl::narrowed`]), which is a mode: where a list has a mask, the mode's
+/// group bits are the mask, and the mode alone would give the owning group
+/// what the mask allows rather than what the list gave it. A default list is
+/// given as its narrowing where the map or the root's names are what stand in
+/// the way, so what the directory's new entries inherit is no more open than
+/// the archive recorded; a filesystem without lists holds no default at all.
 fn apply_lists(
     fd: BorrowedFd<'_>,
     mode: u32,
-    access: Option<&[u8]>,
-    default: Option<&[u8]>,
+    access: &AclRecords,
+    default: Option<&AclRecords>,
     lists: &ListIds<'_>,
     path: &Path,
 ) -> Result<(), ProvisionError> {
     let setting =
         |errno: Errno| ProvisionError::io("setting the access control list of", path, errno.into());
-    let parse = |value: &[u8]| {
-        Acl::parse(value).map_err(|flaw| ProvisionError::EntryRefused {
-            path: path.to_path_buf(),
-            reason: format!(
-                "the access control list it records is not one the kernel stores: {}",
-                flaw.reason()
-            ),
-        })
+    let narrow = |narrowed: &Acl| {
+        rustix::fs::fchmod(fd, Mode::from_raw_mode(narrowed.mode_of(mode))).map_err(setting)
     };
-    if let Some(value) = access
-        && let Some(acl) = parse(value)?
-    {
-        let given = match lists.on_host(&acl) {
-            Some(on_host) => {
-                match rustix::fs::fsetxattr(
-                    fd,
-                    xattr::ACCESS_ACL,
-                    &on_host.encode(),
-                    XattrFlags::empty(),
-                ) {
-                    Ok(()) => true,
-                    Err(Errno::NOTSUP) => false,
-                    Err(errno) => return Err(setting(errno)),
+    match lists.stated(access, path)? {
+        Stated::Nothing => {}
+        Stated::List(acl) => {
+            let given = match lists.on_host(&acl) {
+                Some(on_host) => {
+                    match rustix::fs::fsetxattr(
+                        fd,
+                        xattr::ACCESS_ACL,
+                        &on_host.encode(),
+                        XattrFlags::empty(),
+                    ) {
+                        Ok(()) => true,
+                        Err(Errno::NOTSUP) => false,
+                        Err(errno) => return Err(setting(errno)),
+                    }
                 }
+                None => false,
+            };
+            if !given {
+                narrow(&acl.narrowed())?;
             }
-            None => false,
-        };
-        if !given {
-            let narrowed = acl.narrowed().mode_of(mode);
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(narrowed)).map_err(setting)?;
         }
+        Stated::Unanswered(narrowed) => narrow(&narrowed)?,
     }
-    if let Some(value) = default
-        && let Some(acl) = parse(value)?
-    {
-        let list = lists.on_host(&acl).unwrap_or_else(|| acl.narrowed());
-        match rustix::fs::fsetxattr(fd, xattr::DEFAULT_ACL, &list.encode(), XattrFlags::empty()) {
-            Ok(()) | Err(Errno::NOTSUP) => {}
-            Err(errno) => return Err(setting(errno)),
-        }
+    let Some(default) = default else {
+        return Ok(());
+    };
+    let list = match lists.stated(default, path)? {
+        Stated::Nothing => return Ok(()),
+        Stated::List(acl) => lists.on_host(&acl).unwrap_or_else(|| acl.narrowed()),
+        Stated::Unanswered(narrowed) => narrowed,
+    };
+    match rustix::fs::fsetxattr(fd, xattr::DEFAULT_ACL, &list.encode(), XattrFlags::empty()) {
+        Ok(()) | Err(Errno::NOTSUP) => Ok(()),
+        Err(errno) => Err(setting(errno)),
     }
-    Ok(())
 }
 
 /// Timestamps that set the modification time and leave the access time
@@ -1391,7 +1488,7 @@ pub(crate) fn overlay_tree(
     let source_fd = open_root(source)?;
     let owed = RefCell::new(Vec::new());
     let ownership = over.map_or_else(Ownership::default, |(_, ownership)| ownership.clone());
-    let lists = ListIds::new(&ownership);
+    let lists = ListIds::new(&ownership, root, over.map(|(lower, _)| lower));
     let tree = Tree {
         root: root_fd.as_fd(),
         lower: lower_fd.as_ref().map(AsFd::as_fd),
@@ -2263,6 +2360,123 @@ mod list_tests {
             }
             other => panic!("expected the entry refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_list_recorded_only_as_text_is_applied_with_the_roots_own_names() {
+        // GNU tar's `--acls` records a list as text alone, naming each user
+        // the writing host could name. A name is the root's to answer, from
+        // the accounts the archive has already laid down; one it cannot
+        // answer leaves the list to its narrowing.
+        let root = Scratch::for_test("extract", "text-lists");
+        if !xattr::holds_acls(&root) {
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
+            return;
+        }
+        let caller = rustix::process::geteuid().as_raw();
+        let text = |named: &str| {
+            format!("user::rw-\nuser:{named}:rw-\ngroup::---\nmask::rw-\nother::---\n").into_bytes()
+        };
+        let mut tar = Tar::new();
+        tar.dir("etc", 0o755)
+            .file("etc/passwd", 0o644, b"admin:x:0:0::/root:/bin/sh\n")
+            .file("etc/group", 0o644, b"admin:x:0:\n");
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("0")));
+        tar.file("by-id", 0o660, b"x");
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("admin")));
+        tar.file("by-name", 0o660, b"x");
+        pax(
+            &mut tar,
+            &pax_record(b"SCHILY.acl.access", &text("stranger")),
+        );
+        tar.file("unanswered", 0o4660, b"x");
+        extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect("the archive extracts");
+
+        for name in ["by-id", "by-name"] {
+            assert_eq!(
+                xattr::get(&root.join(name), "system.posix_acl_access"),
+                Some(masked(caller)),
+                "{name}",
+            );
+        }
+        assert_eq!(
+            xattr::get(&root.join("unanswered"), "system.posix_acl_access"),
+            None
+        );
+        assert_eq!(
+            mode_of(&root.join("unanswered")),
+            0o4600,
+            "the owning group was given its own entry rather than the mask",
+        );
+    }
+
+    #[test]
+    fn a_lists_value_is_applied_over_its_text_and_text_beside_one_is_not_read() {
+        let root = Scratch::for_test("extract", "value-over-text");
+        if !xattr::holds_acls(&root) {
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
+            return;
+        }
+        let caller = rustix::process::geteuid().as_raw();
+        let mut tar = Tar::new();
+        // The text names someone the map has no id for; the value names root
+        // inside, which is the caller.
+        pax(
+            &mut tar,
+            &[
+                pax_record(
+                    b"SCHILY.acl.access",
+                    b"user::rw-\nuser:4242:rw-\ngroup::---\nmask::rw-\nother::---\n",
+                ),
+                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
+            ]
+            .concat(),
+        );
+        tar.file("disagreeing", 0o660, b"x");
+        pax(
+            &mut tar,
+            &[
+                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
+                pax_record(b"SCHILY.acl.access", b"not a list"),
+            ]
+            .concat(),
+        );
+        tar.file("unreadable-text", 0o660, b"x");
+        extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect("the archive extracts");
+        for name in ["disagreeing", "unreadable-text"] {
+            assert_eq!(
+                xattr::get(&root.join(name), "system.posix_acl_access"),
+                Some(masked(caller)),
+                "{name}",
+            );
+        }
+
+        // Alone, text that is not a list refuses its entry as a value does.
+        let mut tar = Tar::new();
+        pax(
+            &mut tar,
+            &pax_record(b"SCHILY.acl.access", b"user::rw-,group::r--"),
+        );
+        tar.file("file", 0o640, b"x");
+        let err = extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &Scratch::for_test("extract", "malformed-text"),
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect_err("a list missing an entry is refused");
+        assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
     }
 }
 

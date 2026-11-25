@@ -100,19 +100,42 @@ pub(crate) struct Entry {
     /// any vendor keyword, and this is `None`.
     #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
     pub checksum_sha1: Option<[u8; 20]>,
-    /// The POSIX access control list a `SCHILY.xattr.system.posix_acl_access`
-    /// record states for this entry, as the attribute's own value: the kernel's
-    /// binary form, its named ids as the archive's writer read them.
+    /// What the entry's records state about its POSIX access control list.
     ///
-    /// An [`Export`](super::Export) writes one for every entry that carries a
-    /// list. It is read for the extractor, which gives the entry the list
-    /// rather than the mode alone: where a list has a mask, the mode's group
-    /// bits are the mask, and the mode alone would give the owning group what
-    /// the mask allows.
-    pub acl_access: Option<Vec<u8>>,
-    /// The default list a `SCHILY.xattr.system.posix_acl_default` record states
-    /// for a directory, in the same form, read for the same reason.
-    pub acl_default: Option<Vec<u8>>,
+    /// Read for the extractor, which gives the entry the list rather than the
+    /// mode alone: where a list has a mask, the mode's group bits are the mask,
+    /// and the mode alone would give the owning group what the mask allows.
+    pub acl_access: AclRecords,
+    /// What they state about a directory's default list, read for the same
+    /// reason.
+    pub acl_default: AclRecords,
+}
+
+/// What an entry's pax records state about one of its access control lists,
+/// in either of the two forms an archive carries one in, or both.
+///
+/// An [`Export`](super::Export) writes both for every entry that carries a
+/// list, as GNU tar does with `--acls --xattrs`; `--acls` alone writes the
+/// text. Which one an entry is given is the extractor's to decide.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct AclRecords {
+    /// The attribute's own value, from a `SCHILY.xattr.system.posix_acl_access`
+    /// or `..._default` record: the kernel's binary form, its named ids as the
+    /// archive's writer read them.
+    pub value: Option<Vec<u8>>,
+    /// The list's text, from a `SCHILY.acl.access` or `SCHILY.acl.default`
+    /// record: the form `getfacl` prints, users and groups by name or by id.
+    pub text: Option<Vec<u8>>,
+}
+
+impl AclRecords {
+    /// `other` over `self`, each form taken from `other` where it states one.
+    fn overlaid(&self, other: &AclRecords) -> AclRecords {
+        AclRecords {
+            value: other.value.clone().or_else(|| self.value.clone()),
+            text: other.text.clone().or_else(|| self.text.clone()),
+        }
+    }
 }
 
 /// Whether entries of type `typeflag` carry a data stream.
@@ -136,8 +159,8 @@ struct PaxRecords {
     uname: Option<Vec<u8>>,
     gname: Option<Vec<u8>>,
     checksum_sha1: Option<[u8; 20]>,
-    acl_access: Option<Vec<u8>>,
-    acl_default: Option<Vec<u8>>,
+    acl_access: AclRecords,
+    acl_default: AclRecords,
     /// Whether any `GNU.sparse.*` record was present, which makes the entry a
     /// GNU sparse member in one of the pax formats.
     gnu_sparse: bool,
@@ -161,11 +184,8 @@ impl PaxRecords {
             uname: other.uname.clone().or_else(|| self.uname.clone()),
             gname: other.gname.clone().or_else(|| self.gname.clone()),
             checksum_sha1: other.checksum_sha1.or(self.checksum_sha1),
-            acl_access: other.acl_access.clone().or_else(|| self.acl_access.clone()),
-            acl_default: other
-                .acl_default
-                .clone()
-                .or_else(|| self.acl_default.clone()),
+            acl_access: self.acl_access.overlaid(&other.acl_access),
+            acl_default: self.acl_default.overlaid(&other.acl_default),
             gnu_sparse: other.gnu_sparse || self.gnu_sparse,
         }
     }
@@ -828,8 +848,8 @@ fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
         mtime,
         // Stated by a pax record only; a ustar header has no field for it.
         checksum_sha1: None,
-        acl_access: None,
-        acl_default: None,
+        acl_access: AclRecords::default(),
+        acl_default: AclRecords::default(),
     })
 }
 
@@ -1023,15 +1043,19 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
             // presence is recorded: the member is refused rather than
             // reassembled, so the map's values are never read.
             _ if key.starts_with(b"GNU.sparse.") => records.gnu_sparse = true,
+            // The same two lists as text, the form GNU tar's `--acls` writes and
+            // applies, and star's before it.
+            b"SCHILY.acl.access" => records.acl_access.text = Some(value.to_vec()),
+            b"SCHILY.acl.default" => records.acl_default.text = Some(value.to_vec()),
             // An extended attribute, its name spelled as GNU tar spells it in a
             // keyword. Only the two access control lists are read; every other
             // attribute is one the extractor does not apply.
             _ if key.starts_with(XATTR_KEYWORD) => {
                 let name = xattr_name(&key[XATTR_KEYWORD.len()..]);
                 if name == b"system.posix_acl_access" {
-                    records.acl_access = Some(value.to_vec());
+                    records.acl_access.value = Some(value.to_vec());
                 } else if name == b"system.posix_acl_default" {
-                    records.acl_default = Some(value.to_vec());
+                    records.acl_default.value = Some(value.to_vec());
                 }
             }
             _ => {}
@@ -1307,14 +1331,25 @@ mod tests {
                 b"\x02\0\0\0default",
             ),
             (b"SCHILY.xattr.user.comment", b"ignored"),
+            (b"SCHILY.acl.access", b"user::rw-"),
+            (b"SCHILY.acl.default", b"user::rwx"),
         ] {
             data.extend_from_slice(&pax_record(key, value));
         }
         let records = parse_pax(&data).unwrap();
-        assert_eq!(records.acl_access.as_deref(), Some(&b"\x02\0\0\0list"[..]));
         assert_eq!(
-            records.acl_default.as_deref(),
-            Some(&b"\x02\0\0\0default"[..])
+            records.acl_access,
+            AclRecords {
+                value: Some(b"\x02\0\0\0list".to_vec()),
+                text: Some(b"user::rw-".to_vec()),
+            }
+        );
+        assert_eq!(
+            records.acl_default,
+            AclRecords {
+                value: Some(b"\x02\0\0\0default".to_vec()),
+                text: Some(b"user::rwx".to_vec()),
+            }
         );
     }
 

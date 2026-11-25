@@ -766,27 +766,37 @@ filesystem:
 - **Device nodes and sockets are skipped.** They cannot be created without
   privilege, and the sandbox assembles its own minimal `/dev` at launch.
   FIFOs are extracted. Of the extended attributes an archive records, only
-  the POSIX access control lists an `Export` writes are applied, as below.
+  the POSIX access control lists are applied, as below.
 - A later entry for the same path replaces the earlier one, matching tar's
   behavior. Sparse members fail with `ProvisionError::EntryUnsupported`,
   whichever GNU format wrote them. That is the old `S` type, and the pax
   formats 0.0, 0.1 and 1.0, whose headers claim a regular file. Multi-volume
   members fail the same way.
 
-An archive records an access control list as
-`SCHILY.xattr.system.posix_acl_access`, and a directory's default list as
-`SCHILY.xattr.system.posix_acl_default`. A list is applied after the entry's
-mode, and a directory's once its contents are written. Its named users and
-groups are the ids the tree means, as an export reads them inside the map. Each
-is read through the map to the host's id. The single-identity map holds only
-root inside, which is the calling user. A list the kernel would not store
-refuses its entry with `ProvisionError::EntryRefused`.
+An archive records an access control list in either of two forms, or both. One
+is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in
+`SCHILY.xattr.system.posix_acl_default` for a directory's default list. The
+other is the list's text, in `SCHILY.acl.access` and `SCHILY.acl.default`, as
+GNU `tar --acls` writes it. Where both are present, the value is applied and the
+text is not read. GNU `tar` reads them the other way round.
+
+A list is applied after the entry's mode, and a directory's once its contents
+are written. Its named users and groups are the ids the tree means, as an export
+reads them inside the map. Each is read through the map to the host's id. The
+single-identity map holds only root inside, which is the calling user.
+
+The text may name users and groups by name, as GNU `tar` does for every one the
+writing host could name. A name means what the root's own `/etc/passwd` and
+`/etc/group` give it, as the root stands when the list is applied, not what the
+host's do. A list the kernel would not store, in either form, refuses its entry
+with `ProvisionError::EntryRefused`.
 
 A list naming an id the map has no host id for is given as its narrowing. So is
-a list the destination's filesystem cannot hold. The owning group then keeps
-what the list gave it, rather than the mask the mode's group bits show. No
-other extended attribute is applied. A capability needs a privilege the
-extraction does not hold.
+a list naming a user or group the root has no account for, and a list the
+destination's filesystem cannot hold. The owning group then keeps what the list
+gave it, rather than the mask the mode's group bits show. No other extended
+attribute is applied. A capability needs a privilege the extraction does not
+hold.
 
 Extraction imposes no size or entry-count quota. Where the archive comes from an
 untrusted source, bound disk usage externally.

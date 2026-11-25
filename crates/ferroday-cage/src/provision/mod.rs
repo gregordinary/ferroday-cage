@@ -46,7 +46,9 @@ use rustix::io::Errno;
 use crate::failure::path_io_error;
 use crate::mechanism::frame;
 
-#[cfg(any(feature = "debian", feature = "alpine"))]
+// Read by every layer that extracts an archive: an access control list
+// recorded as text names its users and groups by the root's own accounts.
+#[cfg(feature = "tarball")]
 mod accounts;
 #[cfg(any(feature = "debian", feature = "alpine"))]
 mod available;

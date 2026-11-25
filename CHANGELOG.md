@@ -34,6 +34,10 @@ consumer upgrading can skip it.
 - An `Export` writes each access control list also as a `SCHILY.acl.access` or
   `SCHILY.acl.default` record, its users and groups by id. GNU `tar --acls`
   applies only that form, so it extracted an export without its lists.
+- Extraction applies an access control list an archive records only as a
+  `SCHILY.acl.*` record, as GNU `tar --acls` writes one, naming users and groups
+  by the root's own `/etc/passwd` and `/etc/group`. Where an entry records both
+  forms, the attribute's value is applied and the text is not read.
 - Extraction refuses an entry whose access control list the kernel would not
   store with `ProvisionError::EntryRefused`, naming what is wrong with it, rather
   than failing to set it with an I/O error. A list naming one user or group twice,

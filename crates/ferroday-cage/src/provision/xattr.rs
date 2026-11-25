@@ -470,6 +470,267 @@ impl Acl {
     }
 }
 
+#[cfg(feature = "tarball")]
+/// An access control list in the text form a `SCHILY.acl.access` or
+/// `SCHILY.acl.default` pax record holds, read, with its names not yet looked
+/// up.
+///
+/// The form is the one `getfacl` prints and libacl reads, which GNU tar writes
+/// with a name for every user and group the writing host could name, and star
+/// and bsdtar extend with a fourth field holding the id beside the name. It is
+/// read as libacl reads it, except where libacl is loose: an id is decimal
+/// digits and nothing else, where libacl takes a sign or a hexadecimal one and
+/// wraps one past the range, and the fourth field is read, where libacl
+/// refuses it.
+///
+/// - Entries are separated by commas or line ends, with whitespace allowed
+///   around them and refused inside one.
+/// - A `#` starts a comment that runs to the end of its line, as `getfacl`'s
+///   `#effective:` comments do.
+/// - A tag is `user`, `group`, `mask` or `other`, or its first letter.
+/// - Permissions are one or more of `r`, `w`, `x` and `-`, in any order, each
+///   letter at most once.
+/// - Entries come in any order; the list puts them in its own.
+///
+/// What a name means is the root's that the list lands in, which is not the
+/// host's that wrote it, so [`resolve`](Self::resolve) asks the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AclText {
+    entries: Vec<TextEntry>,
+}
+
+#[cfg(feature = "tarball")]
+/// One entry of an [`AclText`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextEntry {
+    tag: u16,
+    perm: u16,
+    who: Who,
+}
+
+#[cfg(feature = "tarball")]
+/// Whom an [`AclText`] entry is for, as the text names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Who {
+    /// The owner, the owning group, the mask, or everyone else.
+    Nobody,
+    /// A user or group named by its id.
+    Id(u32),
+    /// A user or group named by its name, with the id its writer recorded
+    /// beside it, where it recorded one.
+    Name { name: Vec<u8>, id: Option<u32> },
+}
+
+#[cfg(feature = "tarball")]
+impl AclText {
+    /// Reads a list's text, or says why it is none.
+    ///
+    /// Whatever the entries name, the text must hold exactly one owner, one
+    /// owning group and one entry for everyone else, at most one mask, and a
+    /// mask wherever it names a user or group, as a list does
+    /// ([`AclFlaw::Shape`]); whether it names anyone twice waits for its names
+    /// ([`resolve`](Self::resolve)).
+    pub(super) fn parse(text: &[u8]) -> Result<AclText, &'static str> {
+        let mut entries = Vec::new();
+        for line in text.split(|byte| *byte == b'\n') {
+            let line = line
+                .iter()
+                .position(|byte| *byte == b'#')
+                .map_or(line, |comment| &line[..comment]);
+            for entry in line.split(|byte| *byte == b',') {
+                let entry = entry.trim_ascii();
+                if entry.is_empty() {
+                    continue;
+                }
+                if entry.iter().any(u8::is_ascii_whitespace) {
+                    return Err("an entry of its list holds whitespace");
+                }
+                entries.push(text_entry(entry)?);
+            }
+        }
+        let count = |tag: u16| entries.iter().filter(|entry| entry.tag == tag).count();
+        let named = count(ACL_USER) + count(ACL_GROUP);
+        let masks = count(ACL_MASK);
+        if count(ACL_USER_OBJ) != 1
+            || count(ACL_GROUP_OBJ) != 1
+            || count(ACL_OTHER) != 1
+            || masks > 1
+            || (named > 0 && masks == 0)
+        {
+            return Err(AclFlaw::Shape.reason());
+        }
+        Ok(AclText { entries })
+    }
+
+    /// Whether any entry names a user or group by name, which only the root
+    /// the list lands in can answer.
+    pub(super) fn names_anyone(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry.who, Who::Name { .. }))
+    }
+
+    /// The list, each name read through `user` or `group`: the id the root
+    /// the list lands in gives that name.
+    ///
+    /// A name the root answers takes the root's id over one its writer
+    /// recorded beside it, which is star's reading of the two. A name the root
+    /// does not answer takes the recorded id, and where there is none the
+    /// list cannot be given as it stands: `Ok(None)`, and its
+    /// [`narrowing`](Self::narrowed) is what can. An error is a list the
+    /// answers make invalid, one naming the same id twice.
+    pub(super) fn resolve(
+        &self,
+        user: impl Fn(&[u8]) -> Option<u32>,
+        group: impl Fn(&[u8]) -> Option<u32>,
+    ) -> Result<Option<Acl>, AclFlaw> {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let id = match &entry.who {
+                Who::Nobody => ACL_UNDEFINED_ID,
+                Who::Id(id) => *id,
+                Who::Name { name, id } => {
+                    let answer = if entry.tag == ACL_USER {
+                        user(name)
+                    } else {
+                        group(name)
+                    };
+                    match answer.or(*id) {
+                        Some(id) => id,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            entries.push(AclEntry {
+                tag: entry.tag,
+                perm: entry.perm,
+                id,
+            });
+        }
+        entries.sort_by_key(|entry| rank(entry.tag));
+        canonical(entries).map(|entries| Some(Acl { entries }))
+    }
+
+    /// The list's [`narrowing`](Acl::narrowed), which needs no name: it keeps
+    /// only the entries that name no one.
+    pub(super) fn narrowed(&self) -> Acl {
+        let mut entries: Vec<AclEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.who == Who::Nobody)
+            .map(|entry| AclEntry {
+                tag: entry.tag,
+                perm: entry.perm,
+                id: ACL_UNDEFINED_ID,
+            })
+            .collect();
+        entries.sort_by_key(|entry| rank(entry.tag));
+        Acl { entries }.narrowed()
+    }
+}
+
+#[cfg(feature = "tarball")]
+/// One entry of a list's text: a tag, a qualifier, permissions, and the
+/// fourth field star and bsdtar add, the id beside a name.
+fn text_entry(entry: &[u8]) -> Result<TextEntry, &'static str> {
+    let fields: Vec<&[u8]> = entry.split(|byte| *byte == b':').collect();
+    let (tag, qualifier, perm, id) = match fields[..] {
+        [tag, qualifier, perm] => (tag, qualifier, perm, None),
+        [tag, qualifier, perm, id] => (tag, qualifier, perm, Some(id)),
+        _ => return Err("an entry of its list is not a tag, a qualifier and permissions"),
+    };
+    let perm = text_perm(perm).ok_or("an entry of its list grants permissions it cannot spell")?;
+    let id = id
+        .map(|id| text_id(id).ok_or("an entry of its list records an id that is not one"))
+        .transpose()?;
+    let (tag, who) = match tag {
+        b"user" | b"u" => named(qualifier, id, ACL_USER_OBJ, ACL_USER)?,
+        b"group" | b"g" => named(qualifier, id, ACL_GROUP_OBJ, ACL_GROUP)?,
+        b"mask" | b"m" => (ACL_MASK, nobody(qualifier, id)?),
+        b"other" | b"o" => (ACL_OTHER, nobody(qualifier, id)?),
+        _ => return Err("an entry of its list has a tag no list holds"),
+    };
+    Ok(TextEntry { tag, perm, who })
+}
+
+#[cfg(feature = "tarball")]
+/// A `user` or `group` entry's tag and whom it is for: `object` where the
+/// qualifier is empty, `named` where it holds an id or a name.
+///
+/// A qualifier of digits is an id, as libacl reads one, and an id recorded
+/// beside it must be the same one.
+fn named(
+    qualifier: &[u8],
+    id: Option<u32>,
+    object: u16,
+    named: u16,
+) -> Result<(u16, Who), &'static str> {
+    if qualifier.is_empty() {
+        return match id {
+            None => Ok((object, Who::Nobody)),
+            Some(_) => Err("an entry of its list for the owner or the owning group records an id"),
+        };
+    }
+    if super::number::is_digits(qualifier) {
+        let qualified =
+            text_id(qualifier).ok_or("an entry of its list names an id that is not one")?;
+        return match id {
+            Some(id) if id != qualified => {
+                Err("an entry of its list names one id and records another")
+            }
+            _ => Ok((named, Who::Id(qualified))),
+        };
+    }
+    Ok((
+        named,
+        Who::Name {
+            name: qualifier.to_vec(),
+            id,
+        },
+    ))
+}
+
+#[cfg(feature = "tarball")]
+/// A `mask` or `other` entry, which names no one.
+fn nobody(qualifier: &[u8], id: Option<u32>) -> Result<Who, &'static str> {
+    if qualifier.is_empty() && id.is_none() {
+        Ok(Who::Nobody)
+    } else {
+        Err("an entry of its list for the mask or everyone else names someone")
+    }
+}
+
+#[cfg(feature = "tarball")]
+/// An id a list's text spells: decimal digits, and not the id that stands for
+/// no one.
+fn text_id(text: &[u8]) -> Option<u32> {
+    super::number::digits::<u32>(text).filter(|id| *id != ACL_UNDEFINED_ID)
+}
+
+#[cfg(feature = "tarball")]
+/// The permission bits a list's text spells, `None` where it spells none or
+/// names one twice.
+fn text_perm(text: &[u8]) -> Option<u16> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut perm = 0;
+    for byte in text {
+        let bit = match byte {
+            b'r' => 0o4,
+            b'w' => 0o2,
+            b'x' => 0o1,
+            b'-' => 0,
+            _ => return None,
+        };
+        if perm & bit != 0 {
+            return None;
+        }
+        perm |= bit;
+    }
+    Some(perm)
+}
+
 /// What a file capability comes to once its root is read through a
 /// translation.
 #[derive(Debug, PartialEq, Eq)]
@@ -743,6 +1004,129 @@ mod tests {
             text,
             b"user::rw-\nuser:0:r--\nuser:4242:r-x\ngroup::r--\ngroup:4243:rw-\nmask::rwx\nother::---\n",
         );
+        let read = AclText::parse(&text).expect("the text reads back");
+        assert_eq!(read.resolve(|_| None, |_| None), Ok(Some(acl)));
+    }
+
+    #[cfg(feature = "tarball")]
+    #[test]
+    fn a_lists_text_names_are_the_roots_to_answer() {
+        // As GNU tar writes it, naming each user the writing host could name.
+        let text = AclText::parse(
+            b"user::rw-\nuser:root:r--\nuser:4242:r-x\ngroup::r--\ngroup:wheel:rw-\nmask::rwx\nother::---\n",
+        )
+        .expect("the text reads");
+        assert!(text.names_anyone());
+        let users = |name: &[u8]| (name == b"root").then_some(0);
+        let groups = |name: &[u8]| (name == b"wheel").then_some(10);
+        assert_eq!(
+            text.resolve(users, groups),
+            Ok(Some(list(&[
+                (ACL_USER_OBJ, 6, NONE),
+                (ACL_USER, 4, 0),
+                (ACL_USER, 5, 4242),
+                (ACL_GROUP_OBJ, 4, NONE),
+                (ACL_GROUP, 6, 10),
+                (ACL_MASK, 7, NONE),
+                (ACL_OTHER, 0, NONE),
+            ]))),
+        );
+        // A name the root does not answer leaves the list uncarriable, and its
+        // narrowing is what the owner, the group and everyone else keep.
+        assert_eq!(text.resolve(users, |_| None), Ok(None));
+        assert_eq!(
+            text.narrowed(),
+            list(&[
+                (ACL_USER_OBJ, 6, NONE),
+                (ACL_GROUP_OBJ, 4, NONE),
+                (ACL_OTHER, 0, NONE)
+            ]),
+        );
+        // star's fourth field answers where the root does not, and gives way
+        // where it does.
+        let starred =
+            AclText::parse(b"u::rw-,u:lisa:rw-:502,g::r--,m::rw-,o::---").expect("the text reads");
+        assert_eq!(
+            starred.resolve(|_| None, |_| None),
+            Ok(Some(list(&[
+                (ACL_USER_OBJ, 6, NONE),
+                (ACL_USER, 6, 502),
+                (ACL_GROUP_OBJ, 4, NONE),
+                (ACL_MASK, 6, NONE),
+                (ACL_OTHER, 0, NONE),
+            ]))),
+        );
+        assert!(matches!(
+            starred.resolve(|_| Some(1000), |_| None),
+            Ok(Some(acl)) if acl.entries[1].id == 1000,
+        ));
+        // Two names the root reads as one id are one user named twice.
+        let twice = AclText::parse(b"u::rw-,u:a:r--,u:b:r--,g::r--,m::r--,o::---").unwrap();
+        assert_eq!(
+            twice.resolve(|_| Some(7), |_| None),
+            Err(AclFlaw::Duplicate)
+        );
+    }
+
+    #[cfg(feature = "tarball")]
+    #[test]
+    fn a_lists_text_is_read_as_libacl_reads_it_where_libacl_is_strict() {
+        // Each read below is one libacl's `acl_from_text` accepts.
+        for text in [
+            &b"u::rw-,g::r--,o::---"[..],
+            b"u::wr-,g::r--,o::---",
+            b"u::rw,g::r,o::-",
+            b"u::rw-,g::r--,o::---,",
+            b"u::rw-\ng::r--\no::---",
+            b"u::rw-, g::r--, o::---",
+            b"o::---,g::r--,u::rw-",
+            b"u::rw-,u:4242:r-- #effective:r--\ng::r--,m::r--,o::---",
+        ] {
+            assert!(
+                AclText::parse(text).is_ok(),
+                "{}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        // Each refused below is refused by libacl too.
+        for text in [
+            &b"u::rw-,g::r--,o::"[..],
+            b"u:: rw-,g::r--,o::---",
+            b"U::rw-,G::r--,O::---",
+            b"u::rwX,g::r--,o::---",
+            b"u::rw-,g::r--,o::---,d:u::rwx",
+            b"u::rw-,u:4242:r--,g::r--,o::---",
+            b"u::rw-,g::r--",
+            b"",
+        ] {
+            assert!(
+                AclText::parse(text).is_err(),
+                "{}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        // A comment runs to the end of its line, as libacl's does, taking the
+        // entries after it on that line with it: these are an owner and a
+        // named user alone, with no group or everyone-else entry.
+        assert!(AclText::parse(b"u::rw-,u:4242:r-- #effective:r--,g::r--,m::r--,o::---").is_err());
+        // Where libacl is loose, this is not. A run of digits past the range,
+        // or spelling the id that stands for no one, is refused rather than
+        // wrapped; a sign or a hexadecimal prefix makes a name, not an id, so
+        // only a root with an account of that name gives it one.
+        for id in ["4294967296", "4294967295"] {
+            let text = format!("u::rw-,u:{id}:r--,g::r--,m::r--,o::---");
+            assert!(AclText::parse(text.as_bytes()).is_err(), "{id}");
+        }
+        for name in ["-1", "0x10", "+5"] {
+            let text = format!("u::rw-,u:{name}:r--,g::r--,m::r--,o::---");
+            let read = AclText::parse(text.as_bytes()).expect("a name reads");
+            assert_eq!(read.resolve(|_| None, |_| None), Ok(None), "{name}");
+        }
+        // A name's recorded id must be an id, and a numeric qualifier's must
+        // be the same one.
+        assert!(AclText::parse(b"u::rw-,u:lisa:rw-:x,g::r--,m::rw-,o::---").is_err());
+        assert!(AclText::parse(b"u::rw-,u:5:rw-:6,g::r--,m::rw-,o::---").is_err());
+        assert!(AclText::parse(b"u::rw-,u:5:rw-:5,g::r--,m::rw-,o::---").is_ok());
     }
 
     #[test]
