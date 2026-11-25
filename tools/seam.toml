@@ -514,7 +514,7 @@ why = "A scratch directory that removes itself."
 
 [[reach]]
 item = "scratch::Scratch::for_test"
-tests = 78
+tests = 80
 cost = "test"
 why = "As above."
 

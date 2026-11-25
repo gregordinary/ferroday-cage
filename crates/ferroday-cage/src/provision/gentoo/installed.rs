@@ -673,6 +673,9 @@ fn read_entry(
                     "{dir:?} states a {file} of {length} bytes, past the {bound} a package \
                      states one in"
                 ),
+                Unreadable::Malformed { file, expected } => {
+                    format!("{dir:?} states a {file} that is not {expected}")
+                }
             },
         )
     })?;
@@ -730,6 +733,9 @@ impl InstalledPackage {
                     "states a {file} in its metadata of {length} bytes, past the {bound} a \
                      package states one in"
                 ),
+                Unreadable::Malformed { file, expected } => {
+                    format!("states a {file} in its metadata that is not {expected}")
+                }
             },
         )
     }
@@ -765,6 +771,14 @@ enum Unreadable {
         length: usize,
         /// The most it may be.
         bound: usize,
+    },
+    /// A slot that is not a slot and sub-slot the package manager
+    /// specification allows, or a flag list holding a word that is not a flag.
+    Malformed {
+        /// The file that states it.
+        file: &'static str,
+        /// What it should have been, as a noun phrase.
+        expected: &'static str,
     },
 }
 
@@ -845,6 +859,23 @@ fn read_package<E>(
         if let Some(refused) = overlong(file, flags, MAX_FLAGS_BYTES) {
             return Err(refused);
         }
+    }
+    // Both are named to a caller, as what an installed package is, so each is
+    // held to the alphabet the specification gives it, which holds no control
+    // character, as an index record's are: a newline in a `SLOT` would forge a
+    // line of a listing that prints it.
+    let (slot_name, subslot) = slot_parts(&slot);
+    if !atom::is_name(slot_name) || !atom::is_name(subslot) {
+        return Err(refuse(Unreadable::Malformed {
+            file: SLOT_FILE,
+            expected: "a slot and a sub-slot",
+        }));
+    }
+    if !use_flags.split_ascii_whitespace().all(atom::is_flag) {
+        return Err(refuse(Unreadable::Malformed {
+            file: USE_FILE,
+            expected: "a list of USE flags",
+        }));
     }
     let package = InstalledPackage {
         name,
@@ -1143,6 +1174,42 @@ mod tests {
             );
             assert!(err.to_string().contains(refusal), "{file}: {err}");
         }
+    }
+
+    #[test]
+    fn an_entry_whose_slot_or_flags_are_not_names_is_refused() {
+        // A listing prints both, so a newline in a slot would forge a line of
+        // it, and an escape would drive the terminal it is printed to.
+        for (file, text, refusal) in [
+            (
+                SLOT_FILE,
+                "0\nsys-apps/forged-9.9",
+                "is not a slot and a sub-slot",
+            ),
+            (SLOT_FILE, "0/", "is not a slot and a sub-slot"),
+            (SLOT_FILE, "\u{1b}[31m", "is not a slot and a sub-slot"),
+            ("USE", "amd64 \u{1b}[2J", "is not a list of USE flags"),
+        ] {
+            let dir = Scratch::for_test("gentoo-installed", "unnamed");
+            entry(&dir, "sys-apps", "openrc-0.62", Some("0"), "amd64");
+            std::fs::write(
+                dir.join(DB_DIR).join("sys-apps/openrc-0.62").join(file),
+                text,
+            )
+            .expect("the file is written");
+            let err = installed(&*dir).expect_err("the entry is refused");
+            assert!(err.to_string().contains(refusal), "{file} {text:?}: {err}");
+        }
+        // A slot and a sub-slot, and flags, as portage writes them, read.
+        let dir = Scratch::for_test("gentoo-installed", "named");
+        entry(
+            &dir,
+            "dev-libs",
+            "openssl-3.5.1",
+            Some("0/3"),
+            "abi_x86_64 amd64 asm",
+        );
+        installed(&*dir).expect("the entry reads");
     }
 
     #[test]

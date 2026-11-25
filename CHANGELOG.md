@@ -427,6 +427,11 @@ consumer upgrading can skip it.
   `--forward-loopback` with a profile that sets `network = "none"`. The stack
   attached to a sandbox denied the network gave it one, carrying every
   connection no rule refused, while `--print-resolved` said `network = "none"`.
+- The Gentoo layer refuses, as unreadable, a root's package database entry
+  whose `SLOT` is not a slot and sub-slot the package manager specification
+  allows, or whose `USE` holds a word that is no flag. Both reached a caller
+  unchecked, through `InstalledPackage::slot` and `use_flags`, and a `SLOT`
+  holding a newline forged a line of `fcage`'s package listing.
 
 ### Internal
 

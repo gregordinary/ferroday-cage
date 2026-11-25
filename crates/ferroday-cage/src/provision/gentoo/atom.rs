@@ -598,7 +598,7 @@ pub(super) fn is_package(text: &str) -> bool {
 /// The specification gives the two one rule: letters, digits, `+`, `_`, `.` and
 /// `-`, with no name beginning with `-`, `.` or `+`. The first-character rule is
 /// what keeps a category from being `.`, `..`, or a hidden entry.
-fn is_name(text: &str) -> bool {
+pub(super) fn is_name(text: &str) -> bool {
     let Some(first) = text.bytes().next() else {
         return false;
     };
