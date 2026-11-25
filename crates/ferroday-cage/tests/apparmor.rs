@@ -99,14 +99,21 @@ fn a_mount_the_confining_profile_refuses_names_the_profile() {
     let (step, named) = refused
         .split_once(' ')
         .unwrap_or_else(|| panic!("a refusal names its step: {refused}"));
-    assert_eq!(
-        named,
-        format!("{profile} enforce"),
-        "the refusal names the profile the launch ran under, at {step}",
+    let (label, mode) = named
+        .rsplit_once(' ')
+        .unwrap_or_else(|| panic!("a refusal names a mode: {named}"));
+    // The label is the profile, or a stack holding it where the process that
+    // ran the probe was confined already, as a CI runner's job can be: the
+    // kernel joins a stack's names with `//&`, and the refusal names the label
+    // as the kernel writes it.
+    assert!(
+        label.split("//&").any(|name| name == profile),
+        "the refusal names the profile the launch ran under, at {step}: {label}",
     );
+    assert_eq!(mode, "enforce", "at {step}");
     let message = reported("message");
     assert!(
-        message.contains(&format!("the AppArmor profile {profile:?} in enforce mode")),
+        message.contains(&format!("the AppArmor profile {label:?} in enforce mode")),
         "{message}"
     );
     assert!(
