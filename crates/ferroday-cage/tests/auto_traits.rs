@@ -289,7 +289,7 @@ mod netstack {
     const _: () = assert_send_sync::<netstack::ParseDestinationRuleError>();
     const _: () = assert_send_sync::<netstack::Transport>();
     const _: () = assert_send_sync::<netstack::NetStackReport>();
-    const _: () = assert_send_sync::<netstack::NetStackReports>();
+    const _: () = assert_send_sync::<netstack::Reports<netstack::NetStackReport>>();
     const _: () = assert_send_sync::<netstack::FlowAdmission>();
     const _: () = assert_send_sync::<netstack::FlowRefusal>();
 }

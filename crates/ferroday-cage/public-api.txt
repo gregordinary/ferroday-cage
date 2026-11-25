@@ -2972,7 +2972,7 @@ impl ferroday_cage::NetStackHandle
 pub fn ferroday_cage::NetStackHandle::is_running(&self) -> bool
 pub fn ferroday_cage::NetStackHandle::published(&self) -> &[core::net::socket_addr::SocketAddr]
 pub fn ferroday_cage::NetStackHandle::stop(self) -> core::result::Result<(), ferroday_cage::NetStackError>
-pub fn ferroday_cage::NetStackHandle::take_reports(&mut self) -> core::option::Option<ferroday_cage::NetStackReports>
+pub fn ferroday_cage::NetStackHandle::take_reports(&mut self) -> core::option::Option<ferroday_cage::Reports<ferroday_cage::NetStackReport>>
 impl core::ops::drop::Drop for ferroday_cage::NetStackHandle
 pub fn ferroday_cage::NetStackHandle::drop(&mut self)
 impl !core::marker::Freeze for ferroday_cage::NetStackHandle
@@ -2982,19 +2982,6 @@ impl core::marker::Unpin for ferroday_cage::NetStackHandle
 impl core::marker::UnsafeUnpin for ferroday_cage::NetStackHandle
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackHandle
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackHandle
-pub struct ferroday_cage::NetStackReports
-impl ferroday_cage::NetStackReports
-pub fn ferroday_cage::NetStackReports::dropped(&self) -> u64
-pub fn ferroday_cage::NetStackReports::recv(&self) -> core::result::Result<ferroday_cage::NetStackReport, std::sync::mpsc::RecvError>
-pub fn ferroday_cage::NetStackReports::recv_timeout(&self, core::time::Duration) -> core::result::Result<ferroday_cage::NetStackReport, std::sync::mpsc::RecvTimeoutError>
-pub fn ferroday_cage::NetStackReports::try_recv(&self) -> core::result::Result<ferroday_cage::NetStackReport, std::sync::mpsc::TryRecvError>
-impl !core::marker::Freeze for ferroday_cage::NetStackReports
-impl core::marker::Send for ferroday_cage::NetStackReports
-impl core::marker::Sync for ferroday_cage::NetStackReports
-impl core::marker::Unpin for ferroday_cage::NetStackReports
-impl core::marker::UnsafeUnpin for ferroday_cage::NetStackReports
-impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackReports
-impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackReports
 #[non_exhaustive] pub struct ferroday_cage::Output
 pub ferroday_cage::Output::status: ferroday_cage::ExitStatus
 pub ferroday_cage::Output::stderr: alloc::vec::Vec<u8>
@@ -3185,6 +3172,21 @@ impl core::marker::Unpin for ferroday_cage::ReadOnly
 impl core::marker::UnsafeUnpin for ferroday_cage::ReadOnly
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::ReadOnly
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ReadOnly
+pub struct ferroday_cage::Reports<T>
+impl<T> ferroday_cage::Reports<T>
+pub fn ferroday_cage::Reports<T>::dropped(&self) -> u64
+pub fn ferroday_cage::Reports<T>::recv(&self) -> core::result::Result<T, std::sync::mpsc::RecvError>
+pub fn ferroday_cage::Reports<T>::recv_timeout(&self, core::time::Duration) -> core::result::Result<T, std::sync::mpsc::RecvTimeoutError>
+pub fn ferroday_cage::Reports<T>::try_recv(&self) -> core::result::Result<T, std::sync::mpsc::TryRecvError>
+impl<T> core::fmt::Debug for ferroday_cage::Reports<T>
+pub fn ferroday_cage::Reports<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T> !core::marker::Freeze for ferroday_cage::Reports<T>
+impl<T> core::marker::Send for ferroday_cage::Reports<T> where T: core::marker::Send
+impl<T> core::marker::Sync for ferroday_cage::Reports<T> where T: core::marker::Send
+impl<T> core::marker::Unpin for ferroday_cage::Reports<T>
+impl<T> core::marker::UnsafeUnpin for ferroday_cage::Reports<T>
+impl<T> core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Reports<T>
+impl<T> core::panic::unwind_safe::UnwindSafe for ferroday_cage::Reports<T>
 #[non_exhaustive] pub struct ferroday_cage::ResolvedInputs
 pub ferroday_cage::ResolvedInputs::cgroup: core::option::Option<ferroday_cage::ResolvedCgroup>
 pub ferroday_cage::ResolvedInputs::env: alloc::vec::Vec<(std::ffi::os_str::OsString, std::ffi::os_str::OsString)>

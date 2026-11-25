@@ -625,7 +625,7 @@ report name a package and its version bare.
 | Which server do a TCP flow's first bytes ask for, and what does the stack answer first bytes it refuses with? | `netstack::server_name::read`, `server_name::answer` |
 | Which names did the stack's nameserver resolve to an address? | `netstack::pins::Pins`, which the nameserver fills from `netstack::dns::answer_addresses` |
 | Read a destination rule, or write one back | `DestinationRule`'s `FromStr` and `Display`, which the builder, the stack's profile format and `fcage` share |
-| Hand the caller a decision the network stack took, without the pump waiting on a reader | `netstack::report::Reporter`, whose `offer` never waits, and which the caller reads as `NetStackReports`, and for a refused UDP flow `netstack::udp::UdpTables::refuse`, which reports it once. `fcage`'s own lines have the CLI's `Reports`, a crate apart |
+| Hand the caller a report, without its source waiting on a reader | `reports::Reporter`, whose `offer` never waits, and which the caller reads as `Reports`. The network stack's is `netstack::report::Reporter`, and a refused UDP flow is reported once through `netstack::udp::UdpTables::refuse`. `fcage`'s own lines have the CLI's `Reports`, a crate apart |
 | A prefix length's mask, whether a network holds an address, and the IPv4 address NAT64's well-known prefix embeds | `netstack::prefix` |
 | Which IPv4 address of the host's own does a test reach a server on through the network stack? | the testkit's `require::routable_v4` |
 | Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `blocked`, `no_records`, `truncated` |

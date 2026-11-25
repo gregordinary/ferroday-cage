@@ -571,7 +571,7 @@ refused the AAAA question for example.net from 10.0.2.15:53140: no allow rule ad
 ```
 
 [`take_reports`][`NetStackHandle::take_reports`] hands over the receiving end, a
-[`NetStackReports`], which a thread of the caller's reads:
+[`Reports`], which a thread of the caller's reads:
 
 ```rust,no_run
 # use ferroday_cage::{Cage, NetStack};
@@ -607,7 +607,7 @@ the guest connected, and is reported a second time, refused.
 
 The pump never waits on the reader. Its queue holds 1024 reports, and a report
 it has no room for is dropped and counted, which
-[`dropped`][`NetStackReports::dropped`] answers. A caller that never takes the
+[`dropped`][`Reports::dropped`] answers. A caller that never takes the
 reports pays for the queue and nothing more. Dropping the receiving end stops
 the stack making them. The reports end once the stack has stopped and
 every queued report has been read, so a thread reading them ends after `stop`.
@@ -966,8 +966,8 @@ outside the sandbox and is not filtered.
 [`NetStackHandle::is_running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.is_running
 [`NetStackHandle::take_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.take_reports
 [`NetStackReport`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.NetStackReport.html
-[`NetStackReports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackReports.html
-[`NetStackReports::dropped`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackReports.html#method.dropped
+[`Reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Reports.html
+[`Reports::dropped`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Reports.html#method.dropped
 [`FlowAdmission`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.FlowAdmission.html
 [`FlowRefusal`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.FlowRefusal.html
 [`pasta`]: https://passt.top/

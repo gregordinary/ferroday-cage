@@ -306,6 +306,8 @@ mod path;
 mod poll;
 pub mod provision;
 pub mod relay;
+#[cfg(feature = "netstack")]
+mod reports;
 mod resolved;
 #[cfg(feature = "hardening")]
 mod restrict;
@@ -339,9 +341,11 @@ pub use mechanism::SockFilter;
 #[cfg(feature = "netstack")]
 pub use netstack::{
     DestinationRule, FlowAdmission, FlowRefusal, NetStack, NetStackBuilder, NetStackError,
-    NetStackHandle, NetStackReport, NetStackReports, ParseDestinationRuleError, Transport,
+    NetStackHandle, NetStackReport, ParseDestinationRuleError, Transport,
 };
 pub use observer::{Capped, Excerpt, Observer, Output, Progress};
+#[cfg(feature = "netstack")]
+pub use reports::Reports;
 pub use resolved::{
     ResolvedCgroup, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedLandlockFs,
     ResolvedLandlockNet, ResolvedMount, ResolvedNetworkFilter, ResolvedRlimit, ResolvedRoot,

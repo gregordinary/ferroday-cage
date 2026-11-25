@@ -1,41 +1,20 @@
 //! The stack's reports: each decision it takes about a flow the guest opens or
-//! a question it asks the stack's nameserver, delivered to the caller without
-//! the pump waiting on a reader.
+//! a question it asks the stack's nameserver.
 //!
-//! The pump offers each report through its [`Reporter`] to a queue of
-//! [`QUEUED_REPORTS`], and a caller reads them from the queue's other end, a
-//! [`NetStackReports`]. A report the queue has no room for is dropped and
-//! counted, so a reader that falls behind, or never reads, costs reports and
-//! never a flow: the pump serves every flow of the sandbox on one thread, and a
-//! wait on a reader would stall them all.
-//!
-//! `fcage` hands its own lines to standard error the same way, through its
-//! `output::Reports`. The two do not share code, since the CLI's queue is the
-//! CLI's and this one is part of the library's API.
+//! The pump offers each one through its [`Reporter`], and the caller reads them
+//! from a [`Reports`](crate::Reports) queue, which never makes the pump wait on
+//! its reader (see [`crate::reports`]).
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{
-    Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
-};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use smoltcp::wire::IpEndpoint;
 
 use super::dns;
 use super::policy::{DestinationRule, Transport};
 
-/// The most reports an attachment's queue holds for its reader before a further
-/// one is dropped.
-///
-/// Each slot holds a pointer to its report, since the queue allocates every
-/// slot when it is made: an attachment whose caller never reads its reports
-/// holds those 1024 reports at most, and the empty queue costs a few kilobytes.
-pub(super) const QUEUED_REPORTS: usize = 1024;
-
-/// A decision the network stack took, as [`NetStackReports`] delivers it.
+/// A decision the network stack took, as
+/// [`NetStackHandle::take_reports`](super::NetStackHandle::take_reports) delivers it.
 ///
 /// The stack decides each flow the guest opens toward the host: each TCP
 /// connection attempt, and each UDP flow, the datagrams between one port of the
@@ -585,127 +564,8 @@ impl fmt::Display for FlowRefusal {
     }
 }
 
-/// The receiving end of one attachment's reports, from
-/// [`NetStackHandle::take_reports`](super::NetStackHandle::take_reports).
-///
-/// The stack never waits on its reader. Its queue holds 1024 reports, and a
-/// report it has no room for is dropped and counted, which
-/// [`dropped`](Self::dropped) answers. A reader that keeps up therefore loses
-/// nothing, and one that falls behind, or never reads, loses reports and
-/// nothing else: every flow is carried or refused as it would have been.
-///
-/// The reports end once the stack has stopped and every report queued before
-/// it stopped has been read: [`recv`](Self::recv) then answers [`RecvError`].
-/// So a thread that reads them in a loop ends after
-/// [`stop`](super::NetStackHandle::stop), or after the handle is dropped,
-/// having read everything.
-///
-/// One reader reads at a time: a second thread's call waits for the first's to
-/// return.
-#[derive(Debug)]
-pub struct NetStackReports {
-    /// The queue's receiving end. The queue's own receiver can serve only one
-    /// thread, and the lock is what lets this be shared.
-    queue: Mutex<Receiver<Box<NetStackReport>>>,
-    /// How many reports the queue had no room for.
-    dropped: Arc<AtomicU64>,
-}
-
-impl NetStackReports {
-    /// Waits for the next report.
-    ///
-    /// Answers [`RecvError`] once the stack has stopped and every report has
-    /// been read.
-    pub fn recv(&self) -> Result<NetStackReport, RecvError> {
-        self.queue().recv().map(|report| *report)
-    }
-
-    /// Takes the next report, if one is waiting.
-    ///
-    /// Answers [`TryRecvError::Empty`] where none is, and
-    /// [`TryRecvError::Disconnected`] once the stack has stopped and every
-    /// report has been read.
-    pub fn try_recv(&self) -> Result<NetStackReport, TryRecvError> {
-        self.queue().try_recv().map(|report| *report)
-    }
-
-    /// Waits for the next report, for at most `timeout`.
-    ///
-    /// Answers [`RecvTimeoutError::Timeout`] where none arrived in that time,
-    /// and [`RecvTimeoutError::Disconnected`] once the stack has stopped and
-    /// every report has been read.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<NetStackReport, RecvTimeoutError> {
-        self.queue().recv_timeout(timeout).map(|report| *report)
-    }
-
-    /// How many reports the stack has dropped so far because the queue was
-    /// full.
-    ///
-    /// The count is final once [`recv`](Self::recv) has answered
-    /// [`RecvError`], since the stack has stopped by then.
-    pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
-    }
-
-    /// The queue, which nothing that can panic ever holds.
-    fn queue(&self) -> MutexGuard<'_, Receiver<Box<NetStackReport>>> {
-        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Where the pump offers its reports: the sending end of the queue a
-/// [`NetStackReports`] reads.
-pub(super) struct Reporter {
-    /// The queue, or `None` once its receiving end is gone, after which the
-    /// pump makes no report at all.
-    queue: Option<SyncSender<Box<NetStackReport>>>,
-    /// How many reports the queue had no room for, which the receiving end
-    /// reads.
-    dropped: Arc<AtomicU64>,
-}
-
-impl Reporter {
-    /// A reporter, and the receiving end of its queue, which holds
-    /// [`QUEUED_REPORTS`].
-    pub(super) fn new() -> (Reporter, NetStackReports) {
-        Reporter::holding(QUEUED_REPORTS)
-    }
-
-    /// A reporter whose queue holds `capacity` reports, and the queue's
-    /// receiving end.
-    fn holding(capacity: usize) -> (Reporter, NetStackReports) {
-        let (queue, received) = std::sync::mpsc::sync_channel(capacity);
-        let dropped = Arc::new(AtomicU64::new(0));
-        (
-            Reporter {
-                queue: Some(queue),
-                dropped: Arc::clone(&dropped),
-            },
-            NetStackReports {
-                queue: Mutex::new(received),
-                dropped,
-            },
-        )
-    }
-
-    /// Offers the report `report` makes to the queue, or drops it and counts
-    /// it where the queue is full. Never waits.
-    ///
-    /// The report is made only where its receiving end is still there to read
-    /// it.
-    pub(super) fn offer(&mut self, report: impl FnOnce() -> NetStackReport) {
-        let Some(queue) = &self.queue else {
-            return;
-        };
-        match queue.try_send(Box::new(report())) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => self.queue = None,
-        }
-    }
-}
+/// Where the pump offers its reports.
+pub(super) type Reporter = crate::reports::Reporter<NetStackReport>;
 
 #[cfg(test)]
 mod tests {
@@ -717,16 +577,6 @@ mod tests {
 
     fn endpoint(a: u8, b: u8, c: u8, d: u8, port: u16) -> IpEndpoint {
         IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::new(a, b, c, d)), port)
-    }
-
-    fn refusal(index: u16) -> NetStackReport {
-        NetStackReport::refused(
-            Transport::Tcp,
-            endpoint(10, 0, 2, 15, 40000 + index),
-            endpoint(198, 51, 100, 7, 443),
-            None,
-            FlowRefusal::NotAllowed,
-        )
     }
 
     #[test]
@@ -883,52 +733,5 @@ mod tests {
             assert!(!clause.ends_with('.'), "{clause}");
             assert!(!clause.contains('\n'), "{clause}");
         }
-    }
-
-    #[test]
-    fn a_full_queue_drops_and_counts_and_never_waits() {
-        let (mut reporter, reports) = Reporter::holding(4);
-        for index in 0..10 {
-            reporter.offer(|| refusal(index));
-        }
-        assert_eq!(reports.dropped(), 6);
-        // The four the queue held are the first four, in order.
-        for index in 0..4 {
-            assert_eq!(reports.try_recv(), Ok(refusal(index)));
-        }
-        assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
-        // Room again, so the next is queued.
-        reporter.offer(|| refusal(10));
-        assert_eq!(reports.try_recv(), Ok(refusal(10)));
-        assert_eq!(reports.dropped(), 6);
-    }
-
-    #[test]
-    fn the_reports_end_once_the_stack_has_stopped_and_they_are_read() {
-        let (mut reporter, reports) = Reporter::holding(4);
-        reporter.offer(|| refusal(0));
-        drop(reporter);
-        assert_eq!(reports.recv(), Ok(refusal(0)));
-        assert_eq!(reports.recv(), Err(RecvError));
-        assert_eq!(
-            reports.recv_timeout(Duration::from_millis(10)),
-            Err(RecvTimeoutError::Disconnected)
-        );
-        assert_eq!(reports.try_recv(), Err(TryRecvError::Disconnected));
-    }
-
-    #[test]
-    fn nothing_is_made_once_the_receiving_end_is_gone() {
-        let (mut reporter, reports) = Reporter::holding(4);
-        drop(reports);
-        // The first offer finds the receiving end gone; neither it nor any
-        // later offer is counted, and no later report is made at all.
-        reporter.offer(|| refusal(0));
-        let mut made = false;
-        reporter.offer(|| {
-            made = true;
-            refusal(1)
-        });
-        assert!(!made);
     }
 }

@@ -979,7 +979,7 @@ mod tests {
     }
 
     /// Every report queued so far.
-    fn reported(reports: &super::super::NetStackReports) -> Vec<NetStackReport> {
+    fn reported(reports: &crate::reports::Reports<NetStackReport>) -> Vec<NetStackReport> {
         std::iter::from_fn(|| reports.try_recv().ok()).collect()
     }
 

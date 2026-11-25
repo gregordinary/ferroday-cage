@@ -1679,8 +1679,9 @@ mod tests {
     use std::net::{Ipv6Addr as StdIpv6Addr, SocketAddr as StdSocketAddr, TcpListener, UdpSocket};
 
     use super::super::policy::Hold;
-    use super::super::{GUEST_MAC, NetStackReports, Publication, PumpExit, listen};
+    use super::super::{GUEST_MAC, Publication, PumpExit, listen};
     use super::sniff::classify;
+    use crate::reports::Reports;
 
     /// The guest's own IPv4 address under the default plan.
     const GUEST: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -1873,7 +1874,7 @@ mod tests {
         tap: OwnedFd,
         plan: Plan,
         listeners: Vec<Listener>,
-    ) -> (Engine, NetStackReports) {
+    ) -> (Engine, Reports<NetStackReport>) {
         let (reporter, reports) = Reporter::new();
         match Engine::new(tap, plan, listeners, None, reporter) {
             Ok(engine) => (engine, reports),
@@ -3032,7 +3033,7 @@ mod tests {
     // -- Reports -------------------------------------------------------------
 
     /// Every report the engine has queued so far.
-    fn reported(reports: &NetStackReports) -> Vec<NetStackReport> {
+    fn reported(reports: &Reports<NetStackReport>) -> Vec<NetStackReport> {
         std::iter::from_fn(|| reports.try_recv().ok()).collect()
     }
 
@@ -3248,7 +3249,7 @@ mod tests {
         tap: OwnedFd,
         plan: Plan,
         upstream: StdSocketAddr,
-    ) -> (Engine, NetStackReports) {
+    ) -> (Engine, Reports<NetStackReport>) {
         let (reporter, reports) = Reporter::new();
         match Engine::new(tap, plan, Vec::new(), Some(upstream), reporter) {
             Ok(engine) => (engine, reports),

@@ -89,10 +89,11 @@ use std::thread::JoinHandle;
 
 use smoltcp::wire::{IpAddress, IpEndpoint};
 
+use crate::reports::Reports;
 use crate::running::Pending;
 
 pub use policy::{DestinationRule, ParseDestinationRuleError, Transport};
-pub use report::{FlowAdmission, FlowRefusal, NetStackReport, NetStackReports};
+pub use report::{FlowAdmission, FlowRefusal, NetStackReport};
 
 mod device;
 mod dns;
@@ -613,7 +614,7 @@ pub struct NetStackHandle {
     /// order.
     published: Vec<SocketAddr>,
     /// The receiving end of the pump's reports, until the caller takes it.
-    reports: Option<NetStackReports>,
+    reports: Option<Reports<NetStackReport>>,
 }
 
 impl NetStackHandle {
@@ -664,7 +665,7 @@ impl NetStackHandle {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn take_reports(&mut self) -> Option<NetStackReports> {
+    pub fn take_reports(&mut self) -> Option<Reports<NetStackReport>> {
         self.reports.take()
     }
 

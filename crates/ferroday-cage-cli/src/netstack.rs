@@ -23,7 +23,7 @@
 use std::io;
 use std::thread::JoinHandle;
 
-use ferroday_cage::NetStackReports;
+use ferroday_cage::{NetStackReport, Reports};
 
 use crate::output::Reporter;
 
@@ -59,7 +59,7 @@ impl StackReports {
     /// Starts handing the reports `shown` selects from `reports` to
     /// `reporter`.
     pub(crate) fn start(
-        reports: NetStackReports,
+        reports: Reports<NetStackReport>,
         shown: Shown,
         reporter: Reporter,
     ) -> io::Result<StackReports> {
@@ -80,7 +80,7 @@ impl StackReports {
 /// Hands each report `shown` selects to `reporter`, as a line of `fcage`'s,
 /// until the stack has stopped, and then how many reports the stack dropped,
 /// where it dropped any.
-fn hand_on(reports: &NetStackReports, shown: Shown, reporter: &Reporter) {
+fn hand_on(reports: &Reports<NetStackReport>, shown: Shown, reporter: &Reporter) {
     while let Ok(report) = reports.recv() {
         if shown == Shown::Every || report.is_refusal() {
             reporter.report(format_args!("fcage: the network stack {report}"));

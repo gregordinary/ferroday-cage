@@ -204,8 +204,8 @@ consumer upgrading can skip it.
   is refused. Other first bytes are carried as they stand.
 - The native network stack reports each flow of the guest's it carries or
   refuses, and each question its nameserver relays, refuses, or answers with no
-  records. `NetStackHandle::take_reports` hands over the new `NetStackReports`,
-  the receiving end of a queue of 1024 reports that the stack never waits on: a
+  records. `NetStackHandle::take_reports` hands over the new `Reports`, the
+  receiving end of a queue of 1024 reports that the stack never waits on: a
   report it has no room for is dropped and counted. A flow's `NetStackReport`
   names the transport, the guest's end, the destination and the name the
   nameserver resolved to it, and a question's names the guest's end, the name
