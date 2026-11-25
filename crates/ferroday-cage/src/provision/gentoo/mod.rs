@@ -86,6 +86,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1664,6 +1665,7 @@ impl Gentoo {
             &format!("releases/{}/autobuilds/{}", self.architecture, stage3.path),
             cache::Entry {
                 path: &tarball,
+                dir: None,
                 size: Some(stage3.size),
             },
             to,
@@ -1860,24 +1862,27 @@ impl Gentoo {
         // the root's packages were built for, which the wave settles as it
         // goes, so it is verified as it is merged, and one that does not
         // verify there is removed and fetched again. Nothing is announced,
-        // since this layer has no download event. `is_file` follows a symbolic
-        // link at the entry, which is harmless: the merge opens the entry
-        // through `cache::open_entry`, which refuses a link, and verifies what
-        // it reads through that descriptor.
-        let mut cached: Vec<PathBuf> = Vec::with_capacity(plan.packages.len());
+        // since this layer has no download event. Each entry's directory is
+        // held as the chain's creation resolved it, without following a link,
+        // and the entry is downloaded into it and read from it, refusing a
+        // link at the entry itself, so a link put on the chain since leads
+        // nowhere this run writes or reads.
+        let mut cached: Vec<(PathBuf, OwnedFd)> = Vec::with_capacity(plan.packages.len());
         for planned in &plan.packages {
             let path = cache_entry(cache.path(), &directory, planned);
-            if let Some(parent) = path.parent() {
-                cache::create_within(cache.path(), parent)?;
-            }
-            cached.push(path);
+            let dir = cache::create_within(cache.path(), crate::path::parent_of(&path))?;
+            cached.push((path, dir));
         }
-        let missing: Vec<(&PlannedPackage, &Path)> = plan
+        let missing: Vec<(&PlannedPackage, &Path, &OwnedFd)> = plan
             .packages
             .iter()
             .zip(&cached)
-            .filter(|(_, path)| !path.is_file())
-            .map(|(planned, path)| (planned, path.as_path()))
+            .filter(|(_, (path, dir))| {
+                path.file_name().is_none_or(|name| {
+                    rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).is_err()
+                })
+            })
+            .map(|(planned, (path, dir))| (planned, path.as_path(), dir))
             .collect();
 
         // Fetched several at a time first, each from the first mirror, which is
@@ -1889,15 +1894,15 @@ impl Gentoo {
         if let Some(mirror) = self.mirrors.first() {
             let jobs: Vec<cache::Job<'_>> = missing
                 .iter()
-                .map(|(planned, path)| cache::Job {
+                .map(|(planned, path, dir)| cache::Job {
                     url: mirror_url(mirror, &format!("{directory}/{}", planned.path)),
-                    entry: package_entry(path, planned),
+                    entry: package_entry(path, dir.as_fd(), planned),
                 })
                 .collect();
             let keyring = &self.keyring;
             let targets = &targets;
             cache::prefetch(self.fetcher.as_mut(), &jobs, to, |job, file| {
-                let (planned, path) = missing[job];
+                let (planned, path, _) = missing[job];
                 gpkg::Package::read(file, path, planned, targets, keyring).map(drop)
             })
             .map_err(|failure| failure.into_provision(ProvisionError::from))?;
@@ -1913,9 +1918,10 @@ impl Gentoo {
         // targets is refused before anything is merged.
         if self.plan.is_some() {
             let mut arriving = Vec::with_capacity(plan.packages.len());
-            for (planned, cached) in plan.packages.iter().zip(&cached) {
+            for (planned, (cached, dir)) in plan.packages.iter().zip(&cached) {
                 stop_if_cancelled(to)?;
-                let package = self.package(&directory, planned, cached, &targets, to)?;
+                let entry = package_entry(cached, dir.as_fd(), planned);
+                let package = self.package(&directory, planned, entry, &targets, to)?;
                 if targets.is_empty() {
                     targets.insert(package.chost().to_string());
                 }
@@ -1943,9 +1949,10 @@ impl Gentoo {
         // `last` is `counter` plus a non-empty plan's length, so the first
         // ordinal does not overflow either.
         let ordinals = counter + 1..=last;
-        for ((planned, cached), ordinal) in plan.packages.iter().zip(&cached).zip(ordinals) {
+        for ((planned, (cached, dir)), ordinal) in plan.packages.iter().zip(&cached).zip(ordinals) {
             stop_if_cancelled(to)?;
-            let package = self.package(&directory, planned, cached, &targets, to)?;
+            let entry = package_entry(cached, dir.as_fd(), planned);
+            let package = self.package(&directory, planned, entry, &targets, to)?;
             to.progress(GentooEvent::Merging {
                 package: &planned.name,
                 version: &planned.version,
@@ -1971,23 +1978,24 @@ impl Gentoo {
     }
 
     /// The verified container `planned` names: the one the cache holds at
-    /// `cached`, or the one the mirrors publish under `directory`, downloaded
+    /// `entry`, or the one the mirrors publish under `directory`, downloaded
     /// into the cache there. It is held to `targets`, the `CHOST`s the root's
     /// own packages were built for.
     fn package(
         &mut self,
         directory: &str,
         planned: &PlannedPackage,
-        cached: &Path,
+        entry: cache::Entry<'_>,
         targets: &BTreeSet<String>,
         to: Reporting<'_>,
     ) -> Result<gpkg::Package, ProvisionError> {
         let keyring = &self.keyring;
+        let cached = entry.path;
         cached_or_fetched(
             self.fetcher.as_mut(),
             &self.mirrors,
             &format!("{directory}/{}", planned.path),
-            package_entry(cached, planned),
+            entry,
             to,
             |file, _| gpkg::Package::read(file, cached, planned, targets, keyring),
         )
@@ -2004,9 +2012,14 @@ impl Gentoo {
 /// a hostile or damaged index buys whatever that ceiling is, once per package.
 /// Nothing signs the index, so this layer keeps a ceiling of its own and the
 /// smaller of the two wins.
-fn package_entry<'a>(path: &'a Path, planned: &PlannedPackage) -> cache::Entry<'a> {
+fn package_entry<'a>(
+    path: &'a Path,
+    dir: std::os::fd::BorrowedFd<'a>,
+    planned: &PlannedPackage,
+) -> cache::Entry<'a> {
     cache::Entry {
         path,
+        dir: Some(dir),
         size: Some(planned.size.min(MAX_PACKAGE_BYTES)),
     }
 }
@@ -2059,14 +2072,14 @@ fn cached_or_fetched<T>(
 ) -> Result<T, ProvisionError> {
     // Anything at the name that is not a regular file, a link or a pipe, is not
     // the archive's file either, and the download publishes over it by renaming.
-    if let Ok(file) = cache::open_own_entry(entry.path) {
+    if let Ok(file) = entry.open_own() {
         // Verifying is a long read of a complete file in a cache that outlives
         // the run, so stopping ahead of it costs nothing.
         stop_if_cancelled(to)?;
         if let Ok(verified) = verify(file, to) {
             return Ok(verified);
         }
-        let _ = std::fs::remove_file(entry.path);
+        let _ = entry.remove();
     }
     cache::download(
         fetcher,

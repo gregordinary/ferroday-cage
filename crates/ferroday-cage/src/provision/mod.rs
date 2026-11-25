@@ -1761,10 +1761,16 @@ pub(crate) fn now_epoch() -> Option<i64> {
 /// [`sweep`]: Self::sweep
 #[cfg(feature = "tarball")]
 pub(crate) struct Staged {
-    /// The staging file's name.
+    /// The directory the staging file and its destination are in, resolved
+    /// once: the staging file is made, published and removed relative to it,
+    /// so a link put on the directory's path meanwhile redirects none of them.
+    dir: std::os::fd::OwnedFd,
+    /// The staging file's name in `dir`.
+    staging: OsString,
+    /// The destination's name in `dir`, which the rename publishes it at.
+    dest: OsString,
+    /// The staging file's path, which names it in a failure.
     path: PathBuf,
-    /// The destination the rename publishes it at.
-    dest: PathBuf,
     /// Whether the rename happened, after which the name is no longer this
     /// value's to remove.
     published: bool,
@@ -1808,21 +1814,35 @@ impl Staged {
     /// moment before the lock may have taken it, and a name it removed is
     /// given up for a fresh one.
     pub(crate) fn beside(dest: &Path) -> io::Result<(Staged, fs::File)> {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = rustix::fs::open(
+            crate::path::parent_of(dest),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        Staged::beside_in(dir, dest)
+    }
 
-        let dir = crate::path::parent_of(dest);
+    /// [`beside`](Self::beside), in `dir`, a directory the caller holds,
+    /// which `dest`'s path names: for a destination whose directory the caller
+    /// resolved without following a link, which a resolution of the path here
+    /// would follow.
+    pub(crate) fn beside_in(
+        dir: std::os::fd::OwnedFd,
+        dest: &Path,
+    ) -> io::Result<(Staged, fs::File)> {
+        use rustix::fs::AtFlags;
+
         let name = dest.file_name().unwrap_or(dest.as_os_str());
         for _ in 0..STAGE_ATTEMPTS {
             let mut staging = OsString::from(".");
             staging.push(name);
             staging.push(format!(".{}{PARTIAL}", crate::host::unique_hex()));
-            let path = dir.join(staging);
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(STAGED_MODE)
-                .open(&path)?;
+            let file = fs::File::from(rustix::fs::openat(
+                &dir,
+                &staging,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                Mode::from_raw_mode(STAGED_MODE),
+            )?);
             let held = match try_lock(&file) {
                 Ok(Locked::Held | Locked::Unsupported) => {
                     rustix::io::fcntl_dupfd_cloexec(&file, 0).map_err(io::Error::from)
@@ -1831,18 +1851,21 @@ impl Staged {
                 Ok(Locked::Elsewhere) => continue,
                 Err(err) => Err(err),
             };
-            let held =
-                match held.and_then(|held| still_named(&path, &held).map(|named| (held, named))) {
-                    Ok((held, true)) => held,
-                    Ok((_, false)) => continue,
-                    Err(err) => {
-                        let _ = fs::remove_file(&path);
-                        return Err(err);
-                    }
-                };
+            let named =
+                held.and_then(|held| still_named(&dir, &staging, &held).map(|named| (held, named)));
+            let held = match named {
+                Ok((held, true)) => held,
+                Ok((_, false)) => continue,
+                Err(err) => {
+                    let _ = rustix::fs::unlinkat(&dir, &staging, AtFlags::empty());
+                    return Err(err);
+                }
+            };
             let staged = Staged {
-                path,
-                dest: dest.to_path_buf(),
+                path: crate::path::parent_of(dest).join(&staging),
+                dir,
+                staging,
+                dest: name.to_os_string(),
                 published: false,
                 _held: held,
             };
@@ -1867,10 +1890,6 @@ impl Staged {
     /// is, and what the sweep was for, the run, goes on.
     #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
     pub(crate) fn sweep(dir: &Path) {
-        use std::os::fd::AsFd as _;
-
-        use rustix::fs::{AtFlags, FileType};
-
         let Ok(handle) = rustix::fs::open(
             dir,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -1878,7 +1897,32 @@ impl Staged {
         ) else {
             return;
         };
-        let Ok(entries) = rustix::fs::Dir::read_from(&handle) else {
+        Staged::sweep_handle(&handle);
+    }
+
+    /// [`sweep`](Self::sweep), of the directory `dir` holds.
+    #[cfg(feature = "gentoo")]
+    pub(crate) fn sweep_in(dir: std::os::fd::BorrowedFd<'_>) {
+        let Ok(handle) = rustix::fs::openat(
+            dir,
+            c".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return;
+        };
+        Staged::sweep_handle(&handle);
+    }
+
+    /// [`sweep`](Self::sweep), of the directory `handle` holds open for
+    /// reading.
+    #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+    fn sweep_handle(handle: &std::os::fd::OwnedFd) {
+        use std::os::fd::AsFd as _;
+
+        use rustix::fs::{AtFlags, FileType};
+
+        let Ok(entries) = rustix::fs::Dir::read_from(handle) else {
             return;
         };
         let names: Vec<std::ffi::CString> = entries
@@ -1887,7 +1931,7 @@ impl Staged {
             .filter(|name| is_staging_name(name.to_bytes()))
             .collect();
         for name in names {
-            let Ok(typed) = rustix::fs::statat(&handle, &name, AtFlags::SYMLINK_NOFOLLOW) else {
+            let Ok(typed) = rustix::fs::statat(handle, &name, AtFlags::SYMLINK_NOFOLLOW) else {
                 continue;
             };
             if FileType::from_raw_mode(typed.st_mode) != FileType::RegularFile {
@@ -1901,9 +1945,9 @@ impl Staged {
             if !matches!(try_lock(&file), Ok(Locked::Held)) {
                 continue;
             }
-            let still = rustix::fs::statat(&handle, &name, AtFlags::SYMLINK_NOFOLLOW);
+            let still = rustix::fs::statat(handle, &name, AtFlags::SYMLINK_NOFOLLOW);
             if still.is_ok_and(|now| now.st_dev == typed.st_dev && now.st_ino == typed.st_ino) {
-                let _ = rustix::fs::unlinkat(&handle, &name, AtFlags::empty());
+                let _ = rustix::fs::unlinkat(handle, &name, AtFlags::empty());
             }
         }
     }
@@ -1920,7 +1964,7 @@ impl Staged {
     /// the destination as it was, and the staging file goes when the value is
     /// dropped.
     pub(crate) fn publish(mut self) -> io::Result<()> {
-        fs::rename(&self.path, &self.dest)?;
+        rustix::fs::renameat(&self.dir, &self.staging, &self.dir, &self.dest)?;
         self.published = true;
         Ok(())
     }
@@ -1932,7 +1976,7 @@ impl Drop for Staged {
         if !self.published {
             // Best effort, as a drop must be. The name is unique to this call,
             // so what is removed is this call's own file and nothing else.
-            let _ = fs::remove_file(&self.path);
+            let _ = rustix::fs::unlinkat(&self.dir, &self.staging, rustix::fs::AtFlags::empty());
         }
     }
 }
@@ -1967,11 +2011,15 @@ fn try_lock(file: &impl std::os::fd::AsFd) -> io::Result<Locked> {
     }
 }
 
-/// Whether `path` still names the file `held` is a descriptor of.
+/// Whether `name` in `dir` still names the file `held` is a descriptor of.
 #[cfg(feature = "tarball")]
-fn still_named(path: &Path, held: &std::os::fd::OwnedFd) -> io::Result<bool> {
+fn still_named(
+    dir: &std::os::fd::OwnedFd,
+    name: &OsString,
+    held: &std::os::fd::OwnedFd,
+) -> io::Result<bool> {
     let held = rustix::fs::fstat(held)?;
-    match rustix::fs::lstat(path) {
+    match rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
         Ok(named) => Ok(named.st_dev == held.st_dev && named.st_ino == held.st_ino),
         Err(Errno::NOENT) => Ok(false),
         Err(errno) => Err(errno.into()),

@@ -446,17 +446,14 @@ why = "The answer."
 
 [[idiom]]
 name = "a staging file created by hand"
+# The answer creates its file relative to the directory it holds, with
+# `openat`, which this does not match, so it records no site of its own.
 pattern = '\.create_new\(true\)'
 answer = """\
 `provision::Staged`, which creates the staging file exclusively under a name \
 unique to the call, removes it on any failure, and publishes it by a rename. \
 A staging file made by hand has each of those to get right again, along with \
 checking what it holds before the rename publishes it."""
-
-[[idiom.site]]
-path = "crates/ferroday-cage/src/provision/mod.rs"
-count = 1
-why = "The answer."
 
 [[idiom]]
 name = "the host's temporary directory"

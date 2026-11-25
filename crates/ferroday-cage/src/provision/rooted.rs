@@ -111,13 +111,20 @@ impl Rooted {
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        Ok(Rooted {
+        Ok(Rooted::held(fd, root))
+    }
+
+    /// Treats the directory `fd` holds as a contained tree, which `root`
+    /// names in a failure: for a directory the caller resolved itself, without
+    /// following a link a resolution of `root` would follow.
+    pub(crate) fn held(fd: OwnedFd, root: &Path) -> Rooted {
+        Rooted {
             fd,
             #[cfg(feature = "tarball")]
             lower: None,
             ownership: Ownership::default(),
             root: root.to_path_buf(),
-        })
+        }
     }
 
     /// Treats the tree as an overlay upper over `lower`, where one is given.

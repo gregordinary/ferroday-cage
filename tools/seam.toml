@@ -95,7 +95,7 @@ why = "The one rule for a name that becomes a single path component: a signing k
 
 [[reach]]
 item = "path::parent_of"
-code = 3
+code = 5
 cost = "copy"
 why = "The directory a cache entry and a layer's upper are named in."
 
@@ -132,16 +132,28 @@ why = "Publication beside a destination, which `ensure` and the export use too: 
 
 [[reach]]
 item = "provision::Staged::beside"
-code = 4
+code = 3
 tests = 2
 cost = "share"
 why = "As above."
 
 [[reach]]
+item = "provision::Staged::beside_in"
+code = 1
+cost = "share"
+why = "As above, in a cache directory the caller holds."
+
+[[reach]]
 item = "provision::Staged::sweep"
-code = 3
+code = 2
 cost = "share"
 why = "As above: the staging a crashed run left behind."
+
+[[reach]]
+item = "provision::Staged::sweep_in"
+code = 1
+cost = "share"
+why = "As above, in a cache directory the caller holds."
 
 [[reach]]
 item = "provision::accounts::ACCOUNTS"
@@ -408,6 +420,12 @@ cost = "share"
 why = "As above."
 
 [[reach]]
+item = "provision::rooted::Rooted::held"
+code = 1
+cost = "share"
+why = "As above, for a cache directory the caller holds."
+
+[[reach]]
 item = "provision::rooted::Rooted::read_merged"
 code = 1
 cost = "share"
@@ -520,7 +538,7 @@ why = "As above."
 
 [[reach]]
 item = "scratch::Scratch::new"
-tests = 73
+tests = 74
 cost = "test"
 why = "As above."
 
@@ -628,7 +646,7 @@ code = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/mod.rs"
-code = 35
+code = 37
 tests = 4
 
 [[gate]]

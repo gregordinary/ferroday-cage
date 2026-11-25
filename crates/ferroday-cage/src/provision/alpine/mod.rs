@@ -1975,6 +1975,7 @@ fn acquire(
             name: &planned.name,
             entry: cache::Entry {
                 path,
+                dir: None,
                 size: planned.size,
             },
             mirrors,

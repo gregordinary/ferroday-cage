@@ -252,14 +252,20 @@ const DIR_MODE: u32 = 0o755;
 /// reached through a link. Nothing below it is, so a link at a directory of
 /// the chain fails the call, rather than being followed out of the cache by
 /// the download into it and the read back out of it. The chain is resolved
-/// from a descriptor of the cache, with every link refused.
+/// from a descriptor of the cache, with every link refused, and `dir` is
+/// returned as that resolution found it, an `O_PATH` descriptor for an
+/// [`Entry::dir`]: a link a co-tenant of a shared cache puts on the chain once
+/// it is made then redirects nothing the entry's download and read do there.
 ///
 /// # Errors
 ///
 /// Returns [`ProvisionError::Io`] naming `dir`: for a link in the chain,
 /// `ELOOP`, and for a `dir` that is not below `cache`, `EINVAL`.
 #[cfg(feature = "gentoo")]
-pub(crate) fn create_within(cache: &Path, dir: &Path) -> Result<(), ProvisionError> {
+pub(crate) fn create_within(
+    cache: &Path,
+    dir: &Path,
+) -> Result<std::os::fd::OwnedFd, ProvisionError> {
     use std::os::fd::AsFd as _;
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -286,15 +292,15 @@ pub(crate) fn create_within(cache: &Path, dir: &Path) -> Result<(), ProvisionErr
         Mode::empty(),
     )
     .map_err(fail)?;
-    super::containment::create_dirs(
+    let held = super::containment::create_dirs(
         root.as_fd(),
         &components,
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
         &mut |made| rustix::fs::fchmod(made.dir, Mode::from_raw_mode(DIR_MODE)),
     )
     .map_err(fail)?;
-    Staged::sweep(dir);
-    Ok(())
+    Staged::sweep_in(held.as_fd());
+    Ok(held)
 }
 
 /// Opens the cache entry at `path` for reading.
@@ -341,9 +347,14 @@ pub(crate) fn open_entry(path: &Path) -> io::Result<File> {
 /// What [`open_entry`] answers, and [`io::ErrorKind::PermissionDenied`] for an
 /// entry another user could write.
 pub(crate) fn open_own_entry(path: &Path) -> io::Result<File> {
+    own_only(open_entry(path)?, path)
+}
+
+/// `file`, the entry at `path` just opened, where no user but the calling one,
+/// or root, could rewrite it; see [`open_own_entry`].
+fn own_only(file: File, path: &Path) -> io::Result<File> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let file = open_entry(path)?;
     let meta = file.metadata()?;
     let owner = meta.uid();
     let own = owner == rustix::process::geteuid().as_raw() || owner == 0;
@@ -358,6 +369,49 @@ pub(crate) fn open_own_entry(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+impl Entry<'_> {
+    /// Opens the entry as [`open_own_entry`] does, in the directory it holds
+    /// where it holds one.
+    #[cfg(feature = "gentoo")]
+    pub(crate) fn open_own(&self) -> io::Result<File> {
+        match self.dir {
+            None => open_own_entry(self.path),
+            Some(dir) => {
+                let Some(name) = self.path.file_name() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} names no cache entry", self.path.display()),
+                    ));
+                };
+                let dir = rustix::io::fcntl_dupfd_cloexec(dir, 0)?;
+                let file = Rooted::held(dir, crate::path::parent_of(self.path)).reader(name)?;
+                own_only(file, self.path)
+            }
+        }
+    }
+
+    /// The staging file a download of the entry fills, beside it, in the
+    /// directory it holds where it holds one.
+    fn stage(&self) -> io::Result<(Staged, File)> {
+        match self.dir {
+            None => Staged::beside(self.path),
+            Some(dir) => Staged::beside_in(rustix::io::fcntl_dupfd_cloexec(dir, 0)?, self.path),
+        }
+    }
+
+    /// Removes what the entry's name holds, in the directory it holds where it
+    /// holds one, without following a link there.
+    #[cfg(feature = "gentoo")]
+    pub(crate) fn remove(&self) -> io::Result<()> {
+        match (self.dir, self.path.file_name()) {
+            (Some(dir), Some(name)) => {
+                rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty()).map_err(Into::into)
+            }
+            _ => fs::remove_file(self.path),
+        }
+    }
 }
 
 /// Writes `bytes` to the cache entry at `path` as a run publishes one, at a
@@ -379,6 +433,12 @@ pub(crate) fn seed(path: &Path, bytes: impl AsRef<[u8]>) {
 pub(crate) struct Entry<'a> {
     /// The entry's path in the cache.
     pub(crate) path: &'a Path,
+    /// The directory the entry is in, where the caller holds it: one it
+    /// resolved without following a link, as [`create_within`] does, so the
+    /// entry is staged, published and read there rather than wherever its
+    /// path leads once a link is put on it. `None` where the path is resolved
+    /// at each step.
+    pub(crate) dir: Option<std::os::fd::BorrowedFd<'a>>,
     /// The size a verified source stated for the body, or the layer's own
     /// ceiling for it; `None` where nothing bounds it but the transport.
     ///
@@ -641,7 +701,8 @@ fn fetch<T, E, W: Watch + ?Sized>(
     watch: &mut W,
     verify: impl FnOnce(File, &mut W) -> Result<T, E>,
 ) -> Result<T, Failure<E>> {
-    let (staged, mut file) = Staged::beside(entry.path)
+    let (staged, mut file) = entry
+        .stage()
         .map_err(|err| Failure::Io(ProvisionError::io("staging a download of", entry.path, err)))?;
 
     let (fetched, stopped, written) = {
@@ -759,7 +820,7 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
         let mut staged: Vec<(Staged, File)> = Vec::with_capacity(batch.len());
         for job in batch {
             watch.fetching(&job.url);
-            staged.push(Staged::beside(job.entry.path).map_err(|err| {
+            staged.push(job.entry.stage().map_err(|err| {
                 Failure::Io(ProvisionError::io(
                     "staging a download of",
                     job.entry.path,
@@ -1052,6 +1113,7 @@ mod tests {
         let path = dir.join("package");
         let entry = Entry {
             path: &path,
+            dir: None,
             size: None,
         };
 
@@ -1121,6 +1183,7 @@ mod tests {
             |mirror| format!("{mirror}/package"),
             Entry {
                 path: &path,
+                dir: None,
                 size: Some(16),
             },
             &mut Watching::patient(),
@@ -1148,6 +1211,7 @@ mod tests {
             |mirror| format!("{mirror}/package"),
             Entry {
                 path: &path,
+                dir: None,
                 size: Some(body.len() as u64),
             },
             &mut Watching::patient(),
@@ -1178,6 +1242,7 @@ mod tests {
             |mirror| format!("{mirror}/package"),
             Entry {
                 path: &path,
+                dir: None,
                 size: None,
             },
             &mut watch,
@@ -1272,6 +1337,7 @@ mod tests {
             |mirror| format!("{mirror}/package"),
             Entry {
                 path: &path,
+                dir: None,
                 size: None,
             },
             &mut Watching::patient(),
@@ -1301,7 +1367,11 @@ mod tests {
             .iter()
             .map(|path| Job {
                 url: "http://first.example/package".to_string(),
-                entry: Entry { path, size: None },
+                entry: Entry {
+                    path,
+                    dir: None,
+                    size: None,
+                },
             })
             .collect();
         let mut fetcher = serving(&body);
@@ -1334,7 +1404,11 @@ mod tests {
             .zip(&paths)
             .map(|(name, path)| Job {
                 url: format!("http://mirror.example/{name}"),
-                entry: Entry { path, size: None },
+                entry: Entry {
+                    path,
+                    dir: None,
+                    size: None,
+                },
             })
             .collect();
         let mut watch = Watching::patient();
@@ -1370,7 +1444,11 @@ mod tests {
             .into_iter()
             .map(|path| Job {
                 url: "http://mirror.example/package".to_string(),
-                entry: Entry { path, size: None },
+                entry: Entry {
+                    path,
+                    dir: None,
+                    size: None,
+                },
             })
             .collect();
         let mut fetcher = serving(b"a body");
@@ -1401,6 +1479,7 @@ mod tests {
             url: "http://mirror.example/package".to_string(),
             entry: Entry {
                 path: &path,
+                dir: None,
                 size: None,
             },
         }];
@@ -1619,5 +1698,61 @@ mod tests {
 
         // A directory that is not below the cache is not one to create there.
         assert!(create_within(&cache, &outside.join("x")).is_err());
+    }
+
+    #[cfg(feature = "gentoo")]
+    #[test]
+    fn a_link_put_on_the_chain_once_it_is_made_redirects_nothing() {
+        // A co-tenant of a shared cache can swap a directory of the chain for
+        // a link after the chain is made. The entry's download and read go
+        // through the directory the chain's creation held, so the link leads
+        // nowhere either of them goes.
+        use std::os::fd::AsFd as _;
+
+        let dir = Scratch::new("cache-held");
+        let (cache, outside) = (dir.join("cache"), dir.join("outside"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let chain = cache.join("binhost/app-misc");
+        let held = create_within(&cache, &chain.join("hello")).expect("the chain is created");
+        std::fs::rename(&chain, cache.join("binhost/moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &chain).unwrap();
+
+        let path = chain.join("hello/hello-1.gpkg.tar");
+        let entry = Entry {
+            path: &path,
+            dir: Some(held.as_fd()),
+            size: None,
+        };
+        let published = download(
+            &mut serving(b"the recorded bytes"),
+            &mirrors(),
+            |mirror| format!("{mirror}/package"),
+            entry,
+            &mut Watching::patient(),
+            holding(b"the recorded bytes"),
+            unserved,
+        )
+        .expect("the download is published");
+        assert_eq!(published, b"the recorded bytes");
+        assert!(
+            ferroday_cage_testkit::scratch::entries(&outside).is_empty(),
+            "the download followed the link"
+        );
+        let moved = cache.join("binhost/moved/hello/hello-1.gpkg.tar");
+        assert_eq!(fs::read(&moved).unwrap(), b"the recorded bytes");
+
+        // An entry the link's target holds is not the one read.
+        std::fs::create_dir(outside.join("hello")).unwrap();
+        seed(&outside.join("hello/hello-1.gpkg.tar"), b"planted");
+        let mut read = Vec::new();
+        entry
+            .open_own()
+            .expect("the held entry is opened")
+            .read_to_end(&mut read)
+            .unwrap();
+        assert_eq!(read, b"the recorded bytes");
+        entry.remove().expect("the held entry is removed");
+        assert!(!moved.exists());
+        assert!(outside.join("hello/hello-1.gpkg.tar").exists());
     }
 }

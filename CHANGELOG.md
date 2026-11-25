@@ -476,6 +476,11 @@ consumer upgrading can skip it.
   does. It took every Unicode space, so a continuation line holding a no-break
   space ended the stanza, splitting it into two halves apt reads as one, and a
   value lost a no-break space at its end.
+- The Gentoo provisioner downloads each binary package into, and reads it back
+  from, the cache directory it resolved when it made the binhost's chain there.
+  It went by path at each later step, so a directory of the chain that another
+  user of a shared cache replaced with a link carried the download, and the
+  read, wherever the link led. What was read was still verified.
 
 ### Internal
 

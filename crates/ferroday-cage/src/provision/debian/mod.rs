@@ -2398,6 +2398,7 @@ fn acquire_debs(
             name: &package.name,
             entry: cache::Entry {
                 path,
+                dir: None,
                 size: package.size,
             },
             mirrors: &repositories[package.origin].mirrors,
