@@ -1066,50 +1066,74 @@ impl<'a> Candidates<'a> {
     /// passed over like an excluded one, so the group is left to a later
     /// alternative, or to [`resolve_group`] to refuse as the pin's.
     fn target(&mut self, package: &'a Package, release: &str, excluded: &HashSet<&str>) {
+        // Depth first, each switched version's groups walked before the next
+        // group of the version that switched it, since what a switch changes
+        // decides whether a later group is met. On a stack of its own rather
+        // than the call stack: a chain of switches is as long as an index
+        // makes it.
+        let groups = |package: &'a Package| -> Vec<&'a Dependency> {
+            package
+                .pre_depends
+                .iter()
+                .chain(package.depends.iter())
+                .collect()
+        };
         self.targeted.insert(package.name.clone(), package.clone());
-        let groups: Vec<&Dependency> = package
-            .pre_depends
-            .iter()
-            .chain(package.depends.iter())
-            .collect();
-        for group in groups {
-            let met = group.iter().any(|atom| {
-                self.base_supplies(atom)
-                    || self.of(&atom.name).is_some_and(|candidate| {
-                        answers_by_name(atom, candidate) && self.installable(candidate, excluded)
-                    })
-                    || first_available_provider(self, atom, excluded).is_some_and(|provider| {
-                        self.of(&provider)
-                            .is_some_and(|candidate| self.installable(candidate, excluded))
-                    })
-            });
-            if met {
+        let mut stack = vec![groups(package).into_iter()];
+        while let Some(walking) = stack.last_mut() {
+            let Some(group) = walking.next() else {
+                stack.pop();
                 continue;
-            }
-            for atom in group {
-                let Some(constraint) = atom.constraint.as_ref() else {
-                    break;
-                };
-                if excluded.contains(atom.name.as_str()) {
-                    continue;
-                }
-                let Ok(Some(version)) = self.index.in_release(&atom.name, release) else {
-                    continue;
-                };
-                if !constraint.satisfied_by(&version.version)
-                    || !atom.qualifier.admits(version.multi_arch_allowed)
-                {
-                    continue;
-                }
-                let switched = self.targeted.get(&atom.name).is_some_and(|held| {
-                    held.origin == version.origin && held.version == version.version
-                });
-                if !switched {
-                    self.target(version, release, excluded);
-                }
-                break;
+            };
+            if let Some(version) = self.switch_for(group, release, excluded) {
+                self.targeted.insert(version.name.clone(), version.clone());
+                stack.push(groups(version).into_iter());
             }
         }
+    }
+
+    /// The version of `release` that [`target`](Self::target) switches to for
+    /// `group`, where the group is not met as things stand and a version the
+    /// release offers meets it; `None` otherwise, and where that version is
+    /// the one already switched to.
+    fn switch_for(
+        &self,
+        group: &Dependency,
+        release: &str,
+        excluded: &HashSet<&str>,
+    ) -> Option<&'a Package> {
+        let met = group.iter().any(|atom| {
+            self.base_supplies(atom)
+                || self.of(&atom.name).is_some_and(|candidate| {
+                    answers_by_name(atom, candidate) && self.installable(candidate, excluded)
+                })
+                || first_available_provider(self, atom, excluded).is_some_and(|provider| {
+                    self.of(&provider)
+                        .is_some_and(|candidate| self.installable(candidate, excluded))
+                })
+        });
+        if met {
+            return None;
+        }
+        for atom in group {
+            let constraint = atom.constraint.as_ref()?;
+            if excluded.contains(atom.name.as_str()) {
+                continue;
+            }
+            let Ok(Some(version)) = self.index.in_release(&atom.name, release) else {
+                continue;
+            };
+            if !constraint.satisfied_by(&version.version)
+                || !atom.qualifier.admits(version.multi_arch_allowed)
+            {
+                continue;
+            }
+            let switched = self.targeted.get(&atom.name).is_some_and(|held| {
+                held.origin == version.origin && held.version == version.version
+            });
+            return (!switched).then_some(version);
+        }
+        None
     }
 
     /// Whether every dependency group of `package` has an answer as things
@@ -3303,6 +3327,34 @@ mod tests {
                 ("linux-image-7.2-amd64".into(), "7.2".into(), 1),
                 ("linux-image-amd64".into(), "7.2".into(), 1),
             ],
+        );
+    }
+
+    #[test]
+    fn a_chain_of_switches_as_long_as_an_index_makes_it_is_walked() {
+        // Each version experimental offers needs the next one's, which only
+        // experimental carries: a chain of switches a link per package, longer
+        // than a thread's stack holds a call per link for.
+        const LINKS: usize = 20_000;
+        let name = |at: usize| format!("link{at}");
+        let mut primary = String::new();
+        let mut experimental = String::new();
+        for at in 0..LINKS {
+            primary.push_str(&stanza_at(&name(at), "1.0", "", ""));
+            let next = if at + 1 < LINKS {
+                format!("{} (>= 2.0)", name(at + 1))
+            } else {
+                String::new()
+            };
+            experimental.push_str(&stanza_at(&name(at), "2.0", &next, ""));
+        }
+        let index = ranked(&primary, "", &experimental);
+        let selected = resolve(&index, &[], &["link0/experimental".into()], &[]).into_packages();
+        assert_eq!(selected.len(), LINKS);
+        assert!(
+            selected
+                .iter()
+                .all(|package| package.version == "2.0" && package.origin == 2)
         );
     }
 

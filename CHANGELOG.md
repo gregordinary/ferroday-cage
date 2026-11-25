@@ -497,6 +497,10 @@ consumer upgrading can skip it.
   The signature segment is covered by no digest, so a package served with
   another signature recorded another size, and two bootstraps of one plan
   could differ.
+- The Debian resolver walks the versions a `name/release` entry switches to on a
+  stack of its own. It made a call per switch, so a chain of versioned
+  dependencies only the named release carries, as long as an index made it,
+  overflowed the thread's stack.
 
 ### Internal
 
