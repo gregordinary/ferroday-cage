@@ -463,6 +463,20 @@ impl<R: Read> TarReader<R> {
                         entry.link_target = longlink;
                     }
                     if let Some(size) = pax.size {
+                        // A type that carries no data, stated to carry some.
+                        // GNU tar skips the bytes the record counts, and other
+                        // readers read them as the next header, so the same
+                        // bytes are one archive to one reader and another to
+                        // the next: a member hidden from GNU tar, extracted by
+                        // every reader that ignores the record. The type's
+                        // header `size` is no such statement, since every
+                        // reader ignores it.
+                        if size != 0 && !has_data(entry.typeflag) {
+                            return Err(self.malformed(
+                                header_offset,
+                                "a pax record declares data for an entry whose type carries none",
+                            ));
+                        }
                         entry.size = size;
                     }
                     if let Some(mtime) = pax.mtime {
@@ -1894,6 +1908,36 @@ mod tests {
             "{err:?}",
         );
         assert!(err.to_string().contains("record is empty"), "{err}");
+    }
+
+    #[test]
+    fn a_pax_size_on_an_entry_without_data_is_refused() {
+        // GNU tar skips the bytes the record counts, and bsdtar and Python
+        // read them as the next header, finding the member `hidden` that GNU
+        // tar never sees. Read either way, it is two archives.
+        for typeflag in *b"123456" {
+            let mut archive = pax_block(b'x', &pax_record(b"size", b"1024"));
+            let mut entry = sized_header(b"entry", 0, typeflag);
+            entry[157..163].copy_from_slice(b"target");
+            checksum(&mut entry);
+            archive.extend_from_slice(&entry);
+            archive.extend_from_slice(&sized_header(b"hidden", 512, b'0'));
+            archive.extend_from_slice(&[b'h'; 512]);
+            archive.resize(archive.len() + 1024, 0);
+            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+            let err = entry_paths(&archive).expect_err("the entry contradicts itself");
+            assert!(
+                err.to_string()
+                    .contains("declares data for an entry whose type carries none"),
+                "{}: {err}",
+                typeflag as char
+            );
+        }
+        // A pax size of zero states what the type does, and reads.
+        let mut archive = pax_block(b'x', &pax_record(b"size", b"0"));
+        archive.extend_from_slice(&sized_header(b"dir/", 0, b'5'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        assert_eq!(entry_paths(&archive).expect("it reads"), [b"dir/".to_vec()]);
     }
 
     #[test]

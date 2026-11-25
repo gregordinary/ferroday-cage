@@ -363,6 +363,11 @@ consumer upgrading can skip it.
   the release from below only where the release states a `Valid-Until`, which
   Debian's stable suite does not, so any earlier release the key signed passes,
   as it does from a live mirror.
+- Extraction refuses an archive whose pax `size` record declares data for an
+  entry of a type that carries none: a hard or symbolic link, a device, a
+  directory or a named pipe. It read the bytes the record counted as the next
+  header, where GNU `tar` skips them, so a member GNU `tar` never sees was
+  extracted.
 
 ### Internal
 

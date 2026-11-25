@@ -780,7 +780,10 @@ filesystem:
   other than `comment`. A global header also fails where it follows another
   with no entry between them, or separates an entry from its metadata. So
   do a Solaris `X` extended header, an empty pax `path`, `linkpath`,
-  `uname` or `gname` record, and an entry whose name is empty.
+  `uname` or `gname` record, and an entry whose name is empty. A pax `size`
+  record declaring data for a link, a device, a directory or a named pipe
+  fails too, since GNU `tar` skips the bytes it counts and other readers read
+  them as the next member.
 
 An archive records an access control list in either of two forms, or both. One
 is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in
