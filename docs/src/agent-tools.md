@@ -147,6 +147,12 @@ session whose commits could not be taken in is kept, and the example names it.
   the tree.
 - The files and the hooks directory the configuration names inside the tree.
 
+A held path keeps its name: the directories above it in the tree are held in
+place, so the command can rename none of them, while it writes inside them as
+before. After the command, the example checks that each held path, and each
+directory above one, is still the entry it was. Where one is not, it takes
+nothing in and names the path.
+
 `--protected` prints them, with the gitdir mounts, and exits. A runtime's own
 editing tool runs outside the sandbox, so it refuses the same paths. A
 submodule that keeps its gitdir inside the tree, where a command could have

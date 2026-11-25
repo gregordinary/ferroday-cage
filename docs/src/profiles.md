@@ -180,7 +180,8 @@ profile. The `kind` selects which fields the entry carries:
   reads empty, and neither can be written. A `target` with nothing at it hides
   nothing.
 - `kind = "read-only"` makes `target` read-only where it stands, mounts beneath
-  it included. The `target` must exist.
+  it included, and holds its name: the directories above it, up to the nearest
+  mount, cannot be renamed or removed. The `target` must exist.
 
 Every kind shares one array so that their relative order is expressible. It
 matters whenever a mount covers a path an earlier one established: declaring a

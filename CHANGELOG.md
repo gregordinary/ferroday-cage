@@ -43,6 +43,17 @@ consumer upgrading can skip it.
   command line and the example's profile hold the whole `.git` read-only. A
   posture copied from the example's earlier one holds the whole gitdir rather
   than its hooks and configuration.
+- A path made read-only with `read_only`, or a profile's `kind = "read-only"`
+  mount, now keeps its name. The command could rename a directory above the
+  path, which carried the read-only bind away with it, and put an entry of its
+  own at the path, which the host then read: a submodule's `.git` file in a
+  working tree, which the caller's git obeys. Once the mount profile is in
+  place, each directory between the path and the nearest mount above it is
+  bound onto itself, so renaming or removing one fails with `EBUSY`, and
+  writes inside it are allowed as before. A failure there is the new
+  `SetupStep::HoldReadOnlyName`. The `agent-tools` example also checks, after
+  the command, that every path it holds and every directory above one is the
+  entry it was, and takes nothing in otherwise.
 
 ### Added
 

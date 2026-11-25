@@ -1194,10 +1194,13 @@ pub(crate) enum MountAction {
         contents: Vec<u8>,
     },
     /// Bind the tree at a path onto itself, read-only, with every mount
-    /// beneath it.
+    /// beneath it, and hold its name once the profile is in place.
     ReadOnly {
         /// Rootfs-relative path to make read-only.
         target: CString,
+        /// The rootfs-relative directory the path's name is in, empty where
+        /// that is the root: where the walk that holds the name starts.
+        parent: CString,
     },
 }
 
@@ -1286,7 +1289,7 @@ impl MountAction {
             | MountAction::Devpts { target, .. }
             | MountAction::Hide { target }
             | MountAction::File { target, .. } => Some((target, Arrival::Fresh)),
-            MountAction::Bind { target, .. } | MountAction::ReadOnly { target } => {
+            MountAction::Bind { target, .. } | MountAction::ReadOnly { target, .. } => {
                 Some((target, Arrival::Tree))
             }
             MountAction::Raw { target, flags, .. } => {
@@ -2757,6 +2760,7 @@ fn refused_only_by_a_security_module(step: SetupStep) -> bool {
             | SetupStep::PlaceFile
             | SetupStep::ReadOnlyPath
             | SetupStep::ReadOnlyEmptyRoot
+            | SetupStep::HoldReadOnlyName
             | SetupStep::PivotRoot
             | SetupStep::DetachOldRoot
     )

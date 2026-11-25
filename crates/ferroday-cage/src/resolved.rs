@@ -1035,7 +1035,7 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
         MountAction::Hide { target } => ResolvedMount::Hide {
             target: sandbox_path(target),
         },
-        MountAction::ReadOnly { target } => ResolvedMount::ReadOnly {
+        MountAction::ReadOnly { target, .. } => ResolvedMount::ReadOnly {
             target: sandbox_path(target),
         },
         // The build composes the contents as text, so nothing is lost here.

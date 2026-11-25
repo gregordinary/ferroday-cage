@@ -69,7 +69,10 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 
 use rustix::event::{PollFd, PollFlags};
-use rustix::fs::{self, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags};
+use rustix::fs::{
+    self, AtFlags, Mode, OFlags, RawDir, ResolveFlags, StatVfsMountFlags, StatxAttributes,
+    StatxFlags,
+};
 use rustix::io::Errno;
 use rustix::ioctl;
 use rustix::mount::{self, MountFlags, MountPropagationFlags, UnmountFlags};
@@ -1717,6 +1720,15 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
             .map_err(|errno| (SetupStep::ReadOnlyEmptyRoot, errno, 0))?;
     }
 
+    // Then the name of every path made read-only, now that each mount a hold
+    // clones carries the flags it ends with.
+    for (index, op) in plan.ops.iter().enumerate() {
+        if let MountAction::ReadOnly { parent, .. } = &op.action {
+            hold_name(newroot.as_fd(), parent)
+                .map_err(|(step, errno)| (step, errno, index as u32 + 1))?;
+        }
+    }
+
     process::fchdir(&newroot).map_err(|errno| (SetupStep::EnterRootfs, errno, 0))?;
 
     // The pivot-into-self idiom: with new_root and put_old both `.`, the old
@@ -2670,7 +2682,7 @@ fn execute_op(
     let done = match &op.action {
         MountAction::Hide { target } => return hide(root, target),
         MountAction::File { target, contents } => return place_file(root, target, contents),
-        MountAction::ReadOnly { target } => {
+        MountAction::ReadOnly { target, .. } => {
             let target = open_in_root(root, target, OFlags::PATH)
                 .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
             read_only_in_place(target.as_fd())
@@ -2865,6 +2877,80 @@ const OWN_FILE_MODE: u32 = 0o644;
 fn read_only_in_place(target: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
     let tree = clone_tree(target).map_err(|errno| (SetupStep::ReadOnlyPath, errno))?;
     attach_tree(tree, target, true, SetupStep::ReadOnlyPath)
+}
+
+/// The most directories [`hold_name`] binds for one path: more than a path the
+/// kernel resolves can hold, so reaching it means the walk never met a root.
+const MAX_HELD_DIRECTORIES: usize = 4096;
+
+/// Holds the name of a path made read-only: every directory between the
+/// nearest mount above the path and the path itself is bound onto itself, a
+/// mount point of its own, so renaming or removing one fails with `EBUSY`.
+///
+/// The read-only bind refuses a write, and a rename or removal of the path
+/// itself, which is its mount point. The kernel asks only of the entry renamed
+/// whether a mount stands on it, though, so renaming a directory above the
+/// path would carry the bind away with it and leave the name free for a new
+/// entry, which whatever reads the tree by name later reads instead: the
+/// caller's own git, reading a working tree after the command.
+///
+/// `parent` is the directory the name is in, root-relative and empty where
+/// that is the root, resolved inside the root as the target was. The walk
+/// climbs from it through `..` and stops at the first mount root, which its
+/// own mount cannot rename, or at the sandbox's root. A kernel that does not
+/// say whether a directory is a mount root (before Linux 5.8) has every
+/// directory up to the sandbox's root held instead: one that is already a
+/// mount root gains a mount stacked on it, and nothing is lost.
+///
+/// Each hold is a clone of the directory's tree with every mount beneath it,
+/// so the read-only bind and each hold below stay in view, and runs after the
+/// empty root and every hidden directory are made read-only, so a hold cloned
+/// from one of them is as read-only as it.
+fn hold_name(root: BorrowedFd<'_>, parent: &CStr) -> Result<(), (SetupStep, Errno)> {
+    if parent.is_empty() {
+        return Ok(());
+    }
+    let held = |errno| (SetupStep::HoldReadOnlyName, errno);
+    let opened = |errno| (SetupStep::OpenMountTarget, errno);
+    let top = fs::fstat(root).map_err(held)?;
+    let mut dir = open_in_root(root, parent, OFlags::PATH | OFlags::DIRECTORY).map_err(opened)?;
+    for _ in 0..MAX_HELD_DIRECTORIES {
+        let at = fs::fstat(&dir).map_err(held)?;
+        if (at.st_dev, at.st_ino) == (top.st_dev, top.st_ino)
+            || is_mount_root(dir.as_fd()).map_err(held)? == Some(true)
+        {
+            return Ok(());
+        }
+        let tree = clone_tree(dir.as_fd()).map_err(held)?;
+        attach(tree.as_fd(), dir.as_fd()).map_err(held)?;
+        dir = fs::openat(
+            &dir,
+            c"..",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(opened)?;
+    }
+    Err(held(Errno::LOOP))
+}
+
+/// Whether the directory `dir` names is the root of a mount, or `None` where
+/// the kernel does not say: before Linux 5.8, which added the attribute, or
+/// where `statx` itself is refused.
+fn is_mount_root(dir: BorrowedFd<'_>) -> Result<Option<bool>, Errno> {
+    match fs::statx(dir, c"", AtFlags::EMPTY_PATH, StatxFlags::empty()) {
+        Ok(stat)
+            if stat
+                .stx_attributes_mask
+                .contains(StatxAttributes::MOUNT_ROOT) =>
+        {
+            Ok(Some(
+                stat.stx_attributes.contains(StatxAttributes::MOUNT_ROOT),
+            ))
+        }
+        Ok(_) | Err(Errno::NOSYS) => Ok(None),
+        Err(errno) => Err(errno),
+    }
 }
 
 /// Clones the tree `at` names, every mount beneath it included, detached.

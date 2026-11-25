@@ -975,20 +975,32 @@ impl Hide {
 }
 
 /// A path inside the sandbox made read-only where it stands: the tree at the
-/// path is bound onto itself, read-only, with every mount beneath it.
+/// path is bound onto itself, read-only, with every mount beneath it, and its
+/// name is held.
 ///
 /// Added with [`CageBuilder::read_only`], or as a `[[mount]]` table with
 /// `kind = "read-only"` in a profile. It takes its place in the mount
 /// sequence, after the mount that brought the path, and works on every kind
-/// of root. It protects a path inside a writable bind, such as a working
-/// tree's `.git`, without naming the host path the bind came from, so it
-/// holds wherever the tree is bound from.
+/// of root. It protects a path inside a writable bind, such as a submodule's
+/// `.git` file in a working tree, without naming the host path the bind came
+/// from, so it holds wherever the tree is bound from.
+///
+/// The command cannot write the path, nor rename or remove it, which is a
+/// mount point. Renaming a directory above it would carry the bind away and
+/// leave the name free for a new entry, which whatever reads the tree by name
+/// afterwards would read instead. So once the profile is in place, every
+/// directory between the path and the nearest mount above it is bound onto
+/// itself as well, and renaming or removing one fails with `EBUSY` while
+/// writes inside it are as allowed as before. A failure there is
+/// [`SetupStep::HoldReadOnlyName`](crate::SetupStep::HoldReadOnlyName).
 ///
 /// The path must exist when the sequence reaches it, or the launch fails at
 /// [`SetupStep::OpenMountTarget`](crate::SetupStep::OpenMountTarget): a path
 /// left writable because it was missing is one the command could create. A
-/// symbolic link at the path is followed inside the root, as every mount
-/// target is.
+/// symbolic link at the path, or in a directory above it, is followed inside
+/// the root, as every mount target's is. What is held is where the link
+/// leads: the link itself is an entry the command can replace, so a name
+/// reached through one holds only as long as the link does.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -2255,8 +2267,9 @@ impl CageBuilder {
     ///
     /// The tree at the path is bound onto itself read-only, mounts beneath it
     /// included, so a path inside a writable bind is protected without naming
-    /// the host path the bind came from. See [`ReadOnly`]. The path must exist
-    /// when the sequence reaches it.
+    /// the host path the bind came from. The directories above it, up to the
+    /// nearest mount, are held in place, so the name stays the path's. See
+    /// [`ReadOnly`]. The path must exist when the sequence reaches it.
     pub fn read_only(mut self, path: impl AsRef<Path>) -> Self {
         self.mounts.push(Mount::ReadOnly(ReadOnly::new(path)));
         self
@@ -3934,7 +3947,7 @@ fn left_read_only(later: &[MountOp], target: &CStr) -> bool {
                 (flags & mechanism::MS_REMOUNT != 0)
                     .then_some(flags & MountFlags::RDONLY.bits() != 0)
             }
-            MountAction::ReadOnly { target: at } if covers(at, target) => Some(true),
+            MountAction::ReadOnly { target: at, .. } if covers(at, target) => Some(true),
             _ => None,
         })
         .unwrap_or(false)
@@ -5040,15 +5053,21 @@ impl Lowering {
         Ok(())
     }
 
-    /// A path made read-only where it stands. It creates nothing: a path that
-    /// is missing when the launch reaches it fails the launch.
+    /// A path made read-only where it stands, its name held from the directory
+    /// it is in. It creates nothing: a path that is missing when the launch
+    /// reaches it fails the launch.
     fn push_read_only(&mut self, read_only: &ReadOnly) -> Result<(), Error> {
+        let components = sandbox_path_components(&read_only.target)?;
+        let (_, parents) = components
+            .split_last()
+            .expect("a mount target names at least one component");
         self.push(
             MountOp {
                 dirs: Vec::new(),
                 create_file: None,
                 action: MountAction::ReadOnly {
-                    target: sandbox_target(&read_only.target)?,
+                    target: rel_cstring(&components)?,
+                    parent: rel_cstring(parents)?,
                 },
             },
             format!("{:?} made read-only", read_only.target),

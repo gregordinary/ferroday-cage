@@ -467,6 +467,17 @@ unmounting too: the command cannot detach an inherited mount to reveal what is
 beneath it. What the command remains free to do is mount things of its own; those
 mounts are its own, unlocked, and private to its mount namespace.
 
+A mount protects what it covers, and its name only as far as the directories
+above it hold still. Renaming or removing a mount point fails with `EBUSY`, but
+the kernel asks that only of the entry renamed. Renaming a directory above it
+carries the mount away and frees the name for a new entry. So a path made
+read-only where it stands, inside a writable bind, has its name held too. Once
+the profile is in place, each directory between the path and the nearest mount
+above it is bound onto itself. Renaming or removing one of them then fails with
+`EBUSY`, and what is inside it stays as writable as it was. A tree whose
+directories are held cannot be removed whole, so an `rm -rf` of one fails at
+its last step.
+
 ### The root is `nosuid`
 
 The root mount carries `nosuid`, so a set-user-ID or set-group-ID binary in the

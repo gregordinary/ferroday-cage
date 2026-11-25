@@ -51,7 +51,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Output};
 use std::time::Duration;
@@ -183,8 +183,22 @@ pub(crate) struct Session {
     revealed: Vec<PathBuf>,
     /// The `.git` entries the tree held before the command, relative to it.
     entries: BTreeSet<PathBuf>,
+    /// Each held path in the tree and each directory above it there, on the
+    /// host, with the entry it named before the command; see
+    /// [`Session::check_held`].
+    held: Vec<(PathBuf, Option<Identity>)>,
     /// Whether a repository the command creates is reported.
     report: bool,
+}
+
+/// What an entry is, as its filesystem and inode number say, whatever its name.
+type Identity = (u64, u64);
+
+/// The entry at `path`, not following a link there, or `None` where nothing is.
+fn identity(path: &Path) -> Option<Identity> {
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 impl Session {
@@ -254,6 +268,7 @@ impl Session {
             read_only: Vec::new(),
             revealed: Vec::new(),
             entries: BTreeSet::new(),
+            held: Vec::new(),
             report,
         };
         match session.set_up(gitdir, common, fresh) {
@@ -361,6 +376,52 @@ impl Session {
         }
         self.read_only.sort();
         self.read_only.dedup();
+        self.held = self.held_identities();
+        Ok(())
+    }
+
+    /// Each held path in the tree and each directory above it there, with the
+    /// entry it names now.
+    fn held_identities(&self) -> Vec<(PathBuf, Option<Identity>)> {
+        let mut paths = BTreeSet::new();
+        for path in self.protected() {
+            let Ok(within) = path.strip_prefix(&self.tree) else {
+                continue;
+            };
+            for above in within.ancestors() {
+                if !above.as_os_str().is_empty() {
+                    paths.insert(self.tree.join(above));
+                }
+            }
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                let before = identity(&path);
+                (path, before)
+            })
+            .collect()
+    }
+
+    /// Refuses a tree in which a held path, or a directory above one, is no
+    /// longer the entry it was before the command.
+    ///
+    /// The sandbox holds them all: a held path is a read-only mount point, and
+    /// each directory above it is bound onto itself, so the command can rename
+    /// or remove none of them. This is the second line, which names what moved
+    /// if that ever fails, rather than taking in commits from a tree whose git
+    /// may now obey another configuration.
+    fn check_held(&self) -> Result<(), String> {
+        for (path, before) in &self.held {
+            if identity(path) != *before {
+                return Err(format!(
+                    "{} is not the entry it was before the command, so nothing the command \
+                     did is taken in; check what the tree's git obeys there before running \
+                     git in it",
+                    path.display()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -820,6 +881,7 @@ impl Session {
     }
 
     fn settle(&self) -> Result<(), String> {
+        self.check_held()?;
         if self.mode != Mode::ReadOnly {
             // A submodule's commits first, so a superproject commit naming one
             // finds it in the caller's repository.

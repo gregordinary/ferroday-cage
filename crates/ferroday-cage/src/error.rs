@@ -219,6 +219,10 @@ wire_enum! {
         /// Place a read-only file of the launch's own over its target; see
         /// [`CageBuilder::nameservers`](crate::CageBuilder::nameservers).
         PlaceFile = 68 => "placing a file of the sandbox's own",
+        /// Hold the name of a path made read-only, binding each directory
+        /// between it and the nearest mount above it onto itself; see
+        /// [`ReadOnly`](crate::ReadOnly).
+        HoldReadOnlyName = 69 => "holding the name of a read-only path",
     }
 }
 

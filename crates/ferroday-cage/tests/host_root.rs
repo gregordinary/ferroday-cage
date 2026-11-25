@@ -323,6 +323,75 @@ fn a_read_only_path_refuses_writes_inside_a_writable_bind() {
     );
 }
 
+#[test]
+fn a_read_only_path_keeps_its_name_while_the_directories_above_it_stay_writable() {
+    if !common::require::userns() {
+        return;
+    }
+    let work = common::scratch_dir("host-root-read-only-name");
+    std::fs::create_dir_all(work.join("lib/sub")).unwrap();
+    std::fs::write(
+        work.join("lib/sub/.git"),
+        b"gitdir: ../../.git/modules/sub\n",
+    )
+    .unwrap();
+    let place = work.to_str().expect("a UTF-8 scratch path");
+    for builder in [Cage::builder().host_rootfs(), common::host_userland()] {
+        let (ok, printed) = run(
+            builder
+                .bind(&work, &work)
+                .read_only(work.join("lib/sub/.git")),
+            &format!(
+                "cd {place}; \
+                 mv lib/sub lib/sub.held || echo sub held; \
+                 mv lib lib.held || echo lib held; \
+                 rmdir lib/sub || echo sub kept; \
+                 echo planted > lib/sub/.git || echo name refused; \
+                 touch lib/sub/inside lib/beside && echo contents written"
+            ),
+        );
+        assert!(ok, "{printed}");
+        for said in [
+            "sub held",
+            "lib held",
+            "sub kept",
+            "name refused",
+            "contents written",
+        ] {
+            assert!(printed.contains(said), "{said}: {printed}");
+        }
+        assert_eq!(
+            std::fs::read(work.join("lib/sub/.git")).unwrap(),
+            b"gitdir: ../../.git/modules/sub\n"
+        );
+        assert!(work.join("lib/sub/inside").is_file());
+        assert!(!work.join("lib.held").exists() && !work.join("lib/sub.held").exists());
+    }
+}
+
+#[test]
+fn holding_a_read_only_path_s_name_leaves_a_read_only_root_read_only() {
+    if !common::require::userns() {
+        return;
+    }
+    // The empty root is made read-only once the profile is in place. The
+    // directories above `/held/path/work`, made in it for the bind, are held
+    // after that, so they stay as read-only as the root they are in.
+    let work = common::scratch_dir("host-root-read-only-held-root");
+    let (ok, printed) = run(
+        common::host_userland()
+            .bind(&work, "/held/path/work")
+            .read_only("/held/path/work"),
+        "touch /held/written || echo root refused; \
+         touch /held/path/written || echo path refused; \
+         touch /held/path/work/written || echo work refused",
+    );
+    assert!(ok, "{printed}");
+    for said in ["root refused", "path refused", "work refused"] {
+        assert!(printed.contains(said), "{said}: {printed}");
+    }
+}
+
 /// Set inside the sandbox to make [`probe_unix_connect`] connect rather than
 /// return: the socket paths to connect to, joined as a `PATH` is.
 #[cfg(feature = "hardening")]

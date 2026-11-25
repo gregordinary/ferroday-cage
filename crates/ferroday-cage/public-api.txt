@@ -2435,6 +2435,7 @@ pub ferroday_cage::SetupStep::Exec = 21
 pub ferroday_cage::SetupStep::ForkCommand = 28
 pub ferroday_cage::SetupStep::ForkInit = 23
 pub ferroday_cage::SetupStep::HidePath = 65
+pub ferroday_cage::SetupStep::HoldReadOnlyName = 69
 pub ferroday_cage::SetupStep::InstallNetworkFilter = 58
 pub ferroday_cage::SetupStep::InstallSeccomp = 36
 pub ferroday_cage::SetupStep::JoinCgroup = 67

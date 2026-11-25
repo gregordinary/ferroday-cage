@@ -1418,8 +1418,11 @@ mod tests {
             &["config", "user.email", "tester@example.invalid"],
         );
         let gitfile = std::fs::read(tree.join("sub/.git")).unwrap();
+        // Renaming the submodule's directory would carry the held gitfile
+        // away and free its name for one the command wrote.
         let script = "set -e
              if echo 'gitdir: /tmp' > sub/.git 2>/dev/null; then exit 3; fi
+             if mv sub sub.held 2>/dev/null; then exit 4; fi
              cd sub && echo change > inner && git add inner && git commit -q -m inner-change
              cd .. && git add sub && git commit -q -m bump";
         let code = run_script(&tree, "private", &[], script).expect("the run settles");
