@@ -2346,13 +2346,21 @@ fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigErro
 /// compiled from it with each refusal turned into a notification, and what its
 /// listener answers each one by: the program as compiled, `answers`.
 ///
-/// Refuses a program whose refusals no rewrite reaches (one returning a
-/// computed value), and a policy that refuses the `sendmsg` the command stage
+/// Refuses a program the kernel's verifier refuses, whose answers the listener
+/// could not give; a program whose refusals no rewrite reaches (one returning
+/// a computed value); and a policy that refuses the `sendmsg` the command stage
 /// hands the listener over with whatever its arguments, which would hold the
 /// stage in a notification nobody could answer. A rule refusing it for some
 /// arguments only passes here, and the command stage makes the same check
 /// against its own call before it installs the filter.
 fn reporting(answers: Vec<SockFilter>) -> Result<(Vec<SockFilter>, ReportedFilter), ConfigError> {
+    if !seccomp::eval::accepted(&answers) {
+        return Err(ConfigError::SeccompInvalid {
+            reason: "seccomp reports are on, and the kernel's verifier refuses the precompiled \
+                     program, so its answers cannot be read"
+                .to_string(),
+        });
+    }
     let arch = audit_arch(host_target_arch()?);
     let notifying = seccomp::notifying(&answers).ok_or(ConfigError::SeccompReportsUnrewritable)?;
     if !hands_over_ever(&notifying, arch) {
@@ -4047,6 +4055,27 @@ mod tests {
         assert!(matches!(
             lowered(Some(SeccompPolicy::Program(computed))),
             Err(ConfigError::SeccompReportsUnrewritable)
+        ));
+        // A program the kernel would refuse, though the call it is asked
+        // about returns before reaching what the kernel refuses: a jump
+        // past its end on the branch not taken.
+        let past_the_end = vec![
+            SockFilter {
+                code: bpf::JMP_JEQ_K,
+                jt: 0,
+                jf: 7,
+                k: 0,
+            },
+            SockFilter {
+                code: bpf::RET_K,
+                jt: 0,
+                jf: 0,
+                k: ret_value(SeccompAction::Allow),
+            },
+        ];
+        assert!(matches!(
+            lowered(Some(SeccompPolicy::Program(past_the_end))),
+            Err(ConfigError::SeccompInvalid { reason }) if reason.contains("verifier")
         ));
         // Allowing sendmsg admits them.
         let mut with_sendmsg = core.to_vec();

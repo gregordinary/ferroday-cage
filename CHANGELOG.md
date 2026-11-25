@@ -607,6 +607,12 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- A seccomp policy whose refusals are reported, given as a precompiled program
+  the kernel's verifier refuses, is refused at build with
+  `ConfigError::SeccompInvalid`. Such a program was refused as one that lets
+  no listener be handed over, or built and then failed at launch where the
+  call the build asked about returned before reaching what the verifier
+  refuses.
 - `DestinationRule`'s `FromStr` refuses text whose third or fourth byte falls
   inside a character that is not ASCII, such as `tcé`, where it panicked. That
   reached `fcage --netstack-allow` and `--netstack-deny`, and a trusted

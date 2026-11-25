@@ -618,6 +618,7 @@ report name a package and its version bare.
 | Does a seccomp policy let no call of a syscall run, whatever its arguments? | `SeccompPolicy::never_runs` |
 | Write a classic-BPF seccomp program by hand, or install one | `mechanism::seccomp`: its `bpf` opcodes and offsets, its audit architectures, and `seccomp::install` |
 | Run a seccomp program over a syscall in a unit test | `mechanism::seccomp::eval` |
+| Would the kernel's verifier take this seccomp program? | `mechanism::seccomp::eval::accepted`, which `eval::answer` asks before it runs one |
 | Does a launch install the network filter, and what does the filter refuse? | `mechanism::seccomp::installs_network_filter` and `seccomp::NETWORK_FILTER_REFUSALS`, which the launch and the provenance record both read |
 | What does a launch refuse its sandbox where the sandbox keeps the caller's session keyring? | `mechanism::seccomp::KEYRING_FILTER`, which the launch stage installs where the kernel refuses its keyring join |
 | Does a kernel at a Landlock ABI enforce this right or this scope? | `hardening::fs_enforced`, `hardening::net_enforced`, `hardening::scope_enforced`, which `host::landlock_enforces_fs`, `host::landlock_enforces_net` and `host::landlock_enforces_scope` ask of the running kernel |

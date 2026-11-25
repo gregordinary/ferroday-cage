@@ -935,10 +935,10 @@ fn install_listening_in_probe() -> i32 {
 ///
 /// Every instruction the kernel's seccomp verifier accepts is interpreted, so a
 /// caller's precompiled program is run as faithfully as the crate's own. A
-/// program the verifier would refuse answers `None`: an instruction outside its
-/// set, a load beyond `seccomp_data` or off a word boundary, a scratch word
-/// out of range, a jump past the end. Post-fork safe: nothing here allocates,
-/// locks, or panics.
+/// program the verifier would refuse answers `None` for every call, whichever
+/// path the call takes through it, since the verifier reads the whole program
+/// before it runs any of it. [`accepted`] states what it refuses. Post-fork
+/// safe: nothing here allocates, locks, or panics.
 #[cfg(any(feature = "hardening", test))]
 pub(crate) mod eval {
     use super::SockFilter;
@@ -946,6 +946,112 @@ pub(crate) mod eval {
 
     /// The size of `seccomp_data`, which `BPF_LEN` loads.
     const DATA_LEN: u32 = 64;
+
+    /// `BPF_MAXINSNS`: the most instructions a program the kernel takes holds.
+    const MAX_INSNS: usize = 4096;
+
+    /// `BPF_MEMWORDS`: the scratch words a program has.
+    const MEM_WORDS: u32 = 16;
+
+    /// Whether the kernel's verifier accepts `program` as a seccomp filter,
+    /// read as the kernel reads it, the whole program before any of it runs.
+    ///
+    /// The verifier refuses a program that is empty or longer than
+    /// `BPF_MAXINSNS`, that holds an instruction outside the set seccomp
+    /// takes, a load beyond `seccomp_data` or off a word boundary, a scratch
+    /// word out of range, a division by a constant zero or a shift by a
+    /// constant of 32 or more, or that does not end in a return. A jump must
+    /// land inside the program on both its branches, whether or not a call
+    /// ever takes them. A scratch word must be stored on every path to an
+    /// instruction that loads it: the kernel tracks which words each
+    /// instruction is reached with, joining the words at each jump's targets,
+    /// as this does.
+    pub(crate) fn accepted(program: &[SockFilter]) -> bool {
+        let len = program.len();
+        if len == 0 || len > MAX_INSNS {
+            return false;
+        }
+        // The scratch words stored on every path that reaches each
+        // instruction, one bit a word: every word, until a jump to it says
+        // otherwise. `stored` is what the instruction at hand is reached with.
+        let mut reached = [u16::MAX; MAX_INSNS];
+        let mut stored: u16 = 0;
+        for (at, insn) in program.iter().enumerate() {
+            stored &= reached.get(at).copied().unwrap_or(0);
+            let k = insn.k;
+            let fits = match insn.code {
+                bpf::LD_W_ABS => k % 4 == 0 && k < DATA_LEN,
+                more::LD_W_LEN
+                | more::LDX_W_LEN
+                | more::LD_IMM
+                | more::LDX_IMM
+                | more::TAX
+                | more::TXA
+                | more::ALU_NEG
+                | bpf::RET_K
+                | bpf::RET_A => true,
+                more::LD_MEM | more::LDX_MEM => k < MEM_WORDS && stored & (1 << k) != 0,
+                more::ST | more::STX => {
+                    stored |= 1u16.checked_shl(k).unwrap_or(0);
+                    k < MEM_WORDS
+                }
+                // `ALU | op | source`, an opcode of one byte.
+                code if code < 0x100 && code & 0x07 == more::ALU => {
+                    let constant = code & more::X == 0;
+                    match code & 0xf0 {
+                        more::ADD | more::SUB | more::MUL | more::OR | more::AND | more::XOR => {
+                            true
+                        }
+                        more::DIV => !constant || k != 0,
+                        more::LSH | more::RSH => !constant || k < 32,
+                        _ => false,
+                    }
+                }
+                bpf::JMP_JA => {
+                    let landed = usize::try_from(k)
+                        .is_ok_and(|skip| land(&mut reached, len, at, skip, stored));
+                    stored = u16::MAX;
+                    landed
+                }
+                // `JMP | test | source`.
+                code if code < 0x100 && code & 0x07 == more::JMP => {
+                    let tested =
+                        matches!(code & 0xf0, more::JEQ | more::JGT | more::JGE | more::JSET);
+                    let landed = land(&mut reached, len, at, usize::from(insn.jt), stored)
+                        && land(&mut reached, len, at, usize::from(insn.jf), stored);
+                    stored = u16::MAX;
+                    tested && landed
+                }
+                _ => false,
+            };
+            if !fits {
+                return false;
+            }
+        }
+        program
+            .last()
+            .is_some_and(|last| matches!(last.code, bpf::RET_K | bpf::RET_A))
+    }
+
+    /// Records that the instruction `skip` past the one at `at`, in a program
+    /// of `len` instructions, is reached with the scratch words `stored`, and
+    /// answers whether it lies inside the program.
+    fn land(
+        reached: &mut [u16; MAX_INSNS],
+        len: usize,
+        at: usize,
+        skip: usize,
+        stored: u16,
+    ) -> bool {
+        let target = at.saturating_add(1).saturating_add(skip);
+        match reached.get_mut(target) {
+            Some(words) if target < len => {
+                *words &= stored;
+                true
+            }
+            _ => false,
+        }
+    }
 
     /// The `seccomp_data` a filter is run over: the syscall number, the audit
     /// architecture, the address the call was made from, and the six
@@ -996,13 +1102,16 @@ pub(crate) mod eval {
 
     /// Runs `program` over `call` as the kernel does, returning the
     /// `SECCOMP_RET_*` value it answers, or `None` for a program the kernel's
-    /// verifier would refuse.
+    /// verifier would refuse, which [`accepted`] decides.
     ///
     /// Division by a zero index register ends the program with 0, as the
     /// kernel's does, and a shift by the index register takes its low five
     /// bits. Every jump goes forward, so the run ends within the program's
     /// length.
     pub(crate) fn answer(program: &[SockFilter], call: &Call) -> Option<u32> {
+        if !accepted(program) {
+            return None;
+        }
         let data = call.data();
         let mut accumulator = 0u32;
         let mut index = 0u32;
@@ -1598,6 +1707,70 @@ mod tests {
         ] {
             assert_eq!(answered(&refused), None, "{refused:?}");
         }
+    }
+
+    #[test]
+    fn the_evaluator_refuses_what_the_verifier_refuses_off_the_calls_path() {
+        use bpf::more::{ALU, DIV, LD_IMM, LD_MEM, LSH, ST};
+        let ret_a = stmt(bpf::RET_A, 0);
+        let allow = stmt(bpf::RET_K, RET_ALLOW);
+        // CALL's syscall number is 5, so a test for 5 takes the first branch
+        // and the second is never run.
+        let on_five = |rest: u8| jump(bpf::JMP_JEQ_K, 5, 0, rest);
+        for refused in [
+            // The branch the call does not take jumps past the end.
+            vec![stmt(bpf::LD_W_ABS, 0), jump(bpf::JMP_JEQ_K, 5, 0, 9), allow],
+            // An instruction outside the set, a division by a constant zero
+            // and a shift past the width, none of them run.
+            vec![
+                stmt(bpf::LD_W_ABS, 0),
+                on_five(1),
+                allow,
+                stmt(0x28, 0),
+                allow,
+            ],
+            vec![
+                stmt(bpf::LD_W_ABS, 0),
+                on_five(1),
+                allow,
+                stmt(ALU | DIV, 0),
+                allow,
+            ],
+            vec![
+                stmt(bpf::LD_W_ABS, 0),
+                on_five(1),
+                allow,
+                stmt(ALU | LSH, 32),
+                allow,
+            ],
+            // A scratch word stored on the path the call takes and not on the
+            // other, then loaded where the two meet.
+            vec![
+                stmt(bpf::LD_W_ABS, 0),
+                on_five(1),
+                stmt(ST, 3),
+                stmt(LD_MEM, 3),
+                ret_a,
+            ],
+            // A last instruction that is not a return, after the return the
+            // call reaches.
+            vec![stmt(bpf::LD_W_ABS, 0), on_five(1), allow, stmt(LD_IMM, 1)],
+            // One instruction more than the kernel takes.
+            std::iter::repeat_n(allow, 4097).collect(),
+        ] {
+            assert_eq!(answered(&refused), None, "{refused:?}");
+        }
+        // A word stored on every path to its load is the kernel's to take.
+        let stored_on_both = [
+            stmt(bpf::LD_W_ABS, 0),
+            stmt(ST, 3),
+            on_five(1),
+            stmt(ST, 3),
+            stmt(LD_MEM, 3),
+            ret_a,
+        ];
+        assert_eq!(answered(&stored_on_both), Some(5));
+        assert_eq!(answered(&[allow; 4096]), Some(RET_ALLOW));
     }
 
     #[cfg(feature = "hardening")]
