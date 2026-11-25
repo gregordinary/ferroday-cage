@@ -367,8 +367,8 @@ the export had established that it could produce anything.
 The staging file is created afresh, so the destination's inode is replaced
 rather than rewritten. A hard link to the previous archive keeps it, and a
 symlink at the destination is replaced rather than followed. The new file's
-permissions are `0o666` less the process umask, as an ordinary shell redirection
-produces.
+permissions are `0o644`, which the process umask can only narrow, so no user but
+its owner can write it.
 
 A destination *inside* the tree being exported is refused with
 `ProvisionError::ExportDestInside`. The walk would reach the file it is being

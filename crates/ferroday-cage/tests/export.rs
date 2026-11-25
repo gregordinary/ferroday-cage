@@ -402,6 +402,12 @@ fn a_failed_export_leaves_the_previous_archive_at_the_destination() {
         .expect("the first export succeeds");
     let published = std::fs::read(&archive).unwrap();
     assert!(!published.is_empty());
+    // Created at `0o644`, which the umask can only narrow: no user but its
+    // owner can write the archive, whatever the umask allows.
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&archive).unwrap().permissions(),
+    );
+    assert_eq!(mode & 0o7777 & !0o644, 0, "the archive is at {mode:o}");
 
     // A source that is not there is the ordinary typo, and it fails only after
     // the destination has been opened. Opening the destination directly would

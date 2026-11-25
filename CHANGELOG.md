@@ -894,6 +894,9 @@ consumer upgrading can skip it.
   on a loaded host outlasted, and then bound onto a name about to be removed.
   The guide says that on overlays sharing an upper the target's lock is not seen
   by the teardown, and that the other sandbox keeps its bind regardless.
+- `Export::write_to_path`'s documentation, and the guide's, give the archive's
+  mode as `0o644`, which the umask can only narrow. Both said `0o666` less the
+  umask, as a shell redirection makes a file.
 
 ### Internal
 

@@ -341,8 +341,9 @@ impl<'a> Export<'a> {
     /// The staging file is created afresh, so `path`'s own inode is replaced
     /// rather than rewritten: a hard link to the previous archive keeps it, and
     /// a symlink at `path` is replaced by the archive rather than followed. Its
-    /// permissions are the ones an ordinary shell redirection produces, `0o666`
-    /// less the process umask, and `path`'s previous mode does not carry over.
+    /// permissions are `0o644`, which the process umask can only narrow, so no
+    /// user but its owner can write it, and `path`'s previous mode does not
+    /// carry over.
     ///
     /// [`write_to`](Self::write_to) remains the call for a sink that is not a
     /// file — a pipe, a socket, a buffer in memory, a compressor.
