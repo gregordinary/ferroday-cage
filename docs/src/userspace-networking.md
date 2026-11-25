@@ -262,11 +262,16 @@ Multicast, broadcast, unspecified, loopback, and link-local destinations are
 always refused. Refusing loopback keeps the sandbox away from services bound to
 the host's `127.0.0.1`.
 
-Link-local covers the cloud metadata services at `169.254.169.254`. AWS also
-serves its instance services over IPv6, from `fd00:ec2::/32`. That block holds
-the metadata service at `fd00:ec2::254`, the DNS resolver, and the time service.
-It is a unique local block the host routes like any other, so the stack refuses
-it by name. A metadata service at any other routable address is reachable.
+Link-local covers the cloud metadata services at `169.254.169.254`. Clouds also
+serve them over IPv6, at unique local addresses the host routes like any other,
+so the stack refuses them by name:
+
+- AWS's `fd00:ec2::/32`, which holds the metadata service at `fd00:ec2::254`,
+  the DNS resolver, and the time service.
+- Google Cloud's metadata server at `fd20:ce::254`.
+- Oracle Cloud's metadata service at `fd00:c1::a9fe:a9fe`.
+
+A metadata service at any other routable address is reachable.
 
 Only TCP and UDP from the guest's own address are carried. A segment or datagram
 from any other source is dropped, since no reply to it could be delivered.
@@ -360,7 +365,7 @@ not change while a sandbox runs.
 Some of the stack's behaviour sits outside the rules:
 
 - The refusals above stand under every rule. No rule admits loopback,
-  link-local, multicast, AWS's IPv6 instance services, or the guest's own
+  link-local, multicast, a cloud's IPv6 instance services, or the guest's own
   subnet.
 - The gateway's [loopback mapping](#what-answers-and-what-checks-reachability)
   and the [published ports](#publishing-a-port) are grants of their own, and a

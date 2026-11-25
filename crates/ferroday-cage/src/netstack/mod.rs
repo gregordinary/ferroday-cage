@@ -18,9 +18,9 @@
 //! peers on the host's own networks, and a host service bound to a wildcard
 //! address, through the host's own addresses. Multicast, broadcast, loopback,
 //! and link-local destinations are refused, and link-local covers the IPv4
-//! cloud metadata services. AWS's IPv6 instance services, `fd00:ec2::/32` with
-//! the metadata service at `fd00:ec2::254`, are refused too, under any
-//! configuration. A caller bounds the rest with destination rules, by address
+//! cloud metadata services. The clouds' IPv6 instance services, AWS's
+//! `fd00:ec2::/32` and Google Cloud's and Oracle Cloud's metadata servers, are
+//! refused too, under any configuration. A caller bounds the rest with destination rules, by address
 //! or by name: [`allow`](NetStackBuilder::allow) names what the guest may
 //! reach, and [`deny`](NetStackBuilder::deny) what it may not. One exception is
 //! deliberate: [`host_loopback`](NetStackBuilder::host_loopback) and
@@ -327,7 +327,7 @@ impl NetStack {
     ///
     /// This is the forwarding decision every attachment makes, asked of one
     /// destination. It answers `false` for a destination the stack refuses
-    /// under any configuration: loopback, link-local, multicast, AWS's IPv6
+    /// under any configuration: loopback, link-local, multicast, a cloud's IPv6
     /// instance services, the guest's own subnet, and a protocol the
     /// configuration turns off. It answers `false` too for one the
     /// configuration's [`allow`](NetStackBuilder::allow) and

@@ -1956,13 +1956,14 @@ impl core::marker::UnsafeUnpin for ferroday_cage::FlowAdmission
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::FlowAdmission
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::FlowAdmission
 #[non_exhaustive] pub enum ferroday_cage::FlowRefusal
-pub ferroday_cage::FlowRefusal::AwsInstanceServices
 pub ferroday_cage::FlowRefusal::Broadcast
 #[non_exhaustive] pub ferroday_cage::FlowRefusal::Denied
 pub ferroday_cage::FlowRefusal::Denied::rule: ferroday_cage::DestinationRule
 pub ferroday_cage::FlowRefusal::EmbeddedIpv4
 pub ferroday_cage::FlowRefusal::GatewayUnmapped
 pub ferroday_cage::FlowRefusal::GuestNetwork
+#[non_exhaustive] pub ferroday_cage::FlowRefusal::InstanceServices
+pub ferroday_cage::FlowRefusal::InstanceServices::cloud: &'static str
 pub ferroday_cage::FlowRefusal::LinkLocal
 pub ferroday_cage::FlowRefusal::Loopback
 pub ferroday_cage::FlowRefusal::Multicast

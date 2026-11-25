@@ -263,6 +263,12 @@ consumer upgrading can skip it.
 - `CageBuilder::get_resolv_conf` answers whether the managed `resolv.conf` is
   wanted under the host's own root as under any other, since `nameservers`
   places one there. The host's own file is still not bound there.
+- **Breaking.** The network stack refuses Google Cloud's IPv6 metadata server,
+  `fd20:ce::254`, and Oracle Cloud's, `fd00:c1::a9fe:a9fe`, as it refuses AWS's
+  IPv6 instance services, since each answers the instance with its own cloud
+  credentials. `FlowRefusal::AwsInstanceServices` becomes
+  `FlowRefusal::InstanceServices`, whose `cloud` names whose services they
+  are.
 
 ### Fixed
 

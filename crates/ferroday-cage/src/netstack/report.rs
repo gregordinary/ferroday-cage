@@ -434,9 +434,16 @@ pub enum FlowRefusal {
     /// the deprecated compatible `::a.b.c.d`, which the stack refuses so an
     /// IPv4 refusal cannot be spelled in the other family.
     EmbeddedIpv4,
-    /// AWS's IPv6 instance services, `fd00:ec2::/32`, the metadata service at
-    /// `fd00:ec2::254` among them.
-    AwsInstanceServices,
+    /// A cloud's IPv6 instance services, where a metadata service answers the
+    /// instance that asks with the instance's own credentials: AWS's block,
+    /// `fd00:ec2::/32`, Google Cloud's metadata server, `fd20:ce::254`, and
+    /// Oracle Cloud's, `fd00:c1::a9fe:a9fe`.
+    #[non_exhaustive]
+    InstanceServices {
+        /// The cloud whose services they are, as its own documentation names
+        /// it.
+        cloud: &'static str,
+    },
     /// An address of the guest's own network, other than the gateway and the
     /// stack's nameserver on port 53.
     GuestNetwork,
@@ -529,8 +536,8 @@ impl fmt::Display for FlowRefusal {
             FlowRefusal::EmbeddedIpv4 => {
                 f.write_str("an IPv6 address embedding an IPv4 one is always refused")
             }
-            FlowRefusal::AwsInstanceServices => {
-                f.write_str("AWS's IPv6 instance services are always refused")
+            FlowRefusal::InstanceServices { cloud } => {
+                write!(f, "{cloud}'s IPv6 instance services are always refused")
             }
             FlowRefusal::GuestNetwork => f.write_str("the sandbox's own network is always refused"),
             FlowRefusal::GatewayUnmapped => {
@@ -838,7 +845,7 @@ mod tests {
             FlowRefusal::Broadcast,
             FlowRefusal::Unspecified,
             FlowRefusal::EmbeddedIpv4,
-            FlowRefusal::AwsInstanceServices,
+            FlowRefusal::InstanceServices { cloud: "AWS" },
             FlowRefusal::GuestNetwork,
             FlowRefusal::GatewayUnmapped,
             FlowRefusal::ProtocolDisabled,

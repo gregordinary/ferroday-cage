@@ -901,8 +901,9 @@ fn report_refusal(reports: &mut Reporter, flow: &mut TcpFlow) {
 ///   in both families. Refusing loopback specifically shields host services
 ///   bound to `127.0.0.1` or `::1`. Link-local covers the IPv4 cloud metadata
 ///   services at `169.254.169.254`.
-/// - AWS's IPv6 instance services, `fd00:ec2::/32`, the metadata service at
-///   `fd00:ec2::254` among them; see [`is_aws_instance_service`].
+/// - The clouds' IPv6 instance services, AWS's `fd00:ec2::/32` and the
+///   metadata servers of Google Cloud and Oracle Cloud; see
+///   [`INSTANCE_SERVICES`].
 /// - The whole IPv4 `0.0.0.0/8` "this network" block and the IPv6 addresses that
 ///   embed an IPv4 one — the mapped `::ffff:a.b.c.d` and the deprecated
 ///   compatible `::a.b.c.d` alike — so an IPv4 refusal cannot be re-expressed in
@@ -1002,8 +1003,8 @@ pub(super) fn host_target(
                 && let Some(refusal) = refusal_v4(embedded, plan.v4.as_ref())
             {
                 Some(refusal)
-            } else if is_aws_instance_service(addr) {
-                Some(FlowRefusal::AwsInstanceServices)
+            } else if let Some(cloud) = instance_services(addr) {
+                Some(FlowRefusal::InstanceServices { cloud })
             } else if prefix::contains(IpAddr::V6(v6.gateway), v6.prefix_len, address) {
                 Some(FlowRefusal::GuestNetwork)
             } else {
@@ -1099,20 +1100,52 @@ fn refusal_v4(addr: std::net::Ipv4Addr, v4: Option<&PlanV4>) -> Option<FlowRefus
     }
 }
 
-/// Whether `addr` is in `fd00:ec2::/32`, the block AWS serves its IPv6 instance
-/// services from: the metadata service at `fd00:ec2::254`, the DNS resolver at
-/// `fd00:ec2::253`, and the time service at `fd00:ec2::123`.
+/// The IPv6 addresses clouds serve an instance's own services at: each block,
+/// its prefix length, and the cloud, as a [`FlowRefusal::InstanceServices`]
+/// names it.
 ///
 /// Their IPv4 counterparts sit in `169.254.0.0/16` and are refused as
 /// link-local. These are unique local addresses instead, which the host routes
 /// like any other, so nothing about the address marks them as the host's own.
-/// The metadata service answers anything on the instance that asks, with the
-/// instance role's credentials among what it serves, so reaching it from the
-/// guest would hand the guest the host's cloud identity. The whole block is
-/// refused, the resolver and the time service with it, as their IPv4
-/// counterparts are.
-fn is_aws_instance_service(addr: std::net::Ipv6Addr) -> bool {
-    matches!(addr.segments(), [0xfd00, 0x0ec2, ..])
+/// A metadata service answers anything on the instance that asks, with the
+/// instance's credentials among what it serves, so reaching one from the guest
+/// would hand the guest the host's cloud identity.
+///
+/// - AWS reserves `fd00:ec2::/32` for them: the metadata service at
+///   `fd00:ec2::254`, the DNS resolver at `fd00:ec2::253`, and the time
+///   service at `fd00:ec2::123`. The whole block is refused, the resolver and
+///   the time service with it, as their IPv4 counterparts are.
+/// - Google Cloud serves the metadata server at `fd20:ce::254` to an instance
+///   with only IPv6. Its internal networks take their ranges from `fd20::/20`,
+///   so the address alone is refused.
+/// - Oracle Cloud serves the metadata service at `fd00:c1::a9fe:a9fe`, which
+///   cloud-init's Oracle datasource reads. A network of its customers' may take
+///   its range from anywhere in `fd00::/8`, so the address alone is refused.
+const INSTANCE_SERVICES: [(std::net::Ipv6Addr, u8, &str); 3] = [
+    (
+        std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0),
+        32,
+        "AWS",
+    ),
+    (
+        std::net::Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254),
+        128,
+        "Google Cloud",
+    ),
+    (
+        std::net::Ipv6Addr::new(0xfd00, 0x00c1, 0, 0, 0, 0, 0xa9fe, 0xa9fe),
+        128,
+        "Oracle Cloud",
+    ),
+];
+
+/// The cloud whose instance services `addr` is among, of
+/// [`INSTANCE_SERVICES`].
+fn instance_services(addr: std::net::Ipv6Addr) -> Option<&'static str> {
+    INSTANCE_SERVICES
+        .iter()
+        .find(|(block, length, _)| prefix::contains(IpAddr::V6(*block), *length, IpAddr::V6(addr)))
+        .map(|(_, _, cloud)| *cloud)
 }
 
 /// Eight bytes of kernel entropy for the interface's seed.
@@ -1207,23 +1240,30 @@ mod tests {
 
     #[test]
     fn the_cloud_metadata_services_are_refused() {
-        // The IPv4 service is link-local; AWS's IPv6 block is a unique local
-        // one the host routes, so it is refused by name.
+        // The IPv4 service is link-local; the clouds' IPv6 services are at
+        // unique local addresses the host routes, so they are refused by name.
         let plan = plan(false);
+        let services = |cloud| FlowRefusal::InstanceServices { cloud };
         for (dst, why) in [
             (v4(169, 254, 169, 254, 80), FlowRefusal::LinkLocal),
-            (v6("fd00:ec2::254", 80), FlowRefusal::AwsInstanceServices),
-            (v6("fd00:ec2::253", 53), FlowRefusal::AwsInstanceServices),
-            (
-                v6("fd00:ec2:ffff::1", 443),
-                FlowRefusal::AwsInstanceServices,
-            ),
+            (v6("fd00:ec2::254", 80), services("AWS")),
+            (v6("fd00:ec2::253", 53), services("AWS")),
+            (v6("fd00:ec2:ffff::1", 443), services("AWS")),
+            (v6("fd20:ce::254", 80), services("Google Cloud")),
+            (v6("fd00:c1::a9fe:a9fe", 80), services("Oracle Cloud")),
         ] {
             assert_eq!(refusal(Transport::Tcp, dst, &plan), Some(why), "{dst}");
         }
-        // The block is exactly a /32: its neighbours are ordinary unique local
-        // destinations.
-        for dst in [v6("fd00:ec3::254", 80), v6("fd00:ec1:ffff::1", 80)] {
+        // AWS's block is exactly a /32, and the others are an address each:
+        // their neighbours are ordinary unique local destinations, which a
+        // cloud's customers number their own networks from.
+        for dst in [
+            v6("fd00:ec3::254", 80),
+            v6("fd00:ec1:ffff::1", 80),
+            v6("fd20:ce::253", 80),
+            v6("fd20:ce:1::254", 80),
+            v6("fd00:c1::a9fe:a9ff", 80),
+        ] {
             assert_eq!(
                 target(Transport::Tcp, dst, &plan),
                 Some(SocketAddr::from((IpAddr::from(dst.addr), dst.port))),
