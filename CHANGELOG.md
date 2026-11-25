@@ -1125,6 +1125,10 @@ consumer upgrading can skip it.
   ferrotape reader that names the archive a failure belongs to. Its own header
   and pax parsing are gone. The `tar_archive` fuzz target is retired: the
   reader it drove is ferrotape's, which fuzzes it.
+- `tools/idioms.toml` records a tar header's layout, a `ustar` magic literal or
+  a slice at a header field's offset, with ferrotape as the answer, so a tar
+  header read or written by hand outside the test fixtures' writer fails
+  `tools/check-idioms.py`.
 
 ## [0.6.0] - 2026-11-13
 

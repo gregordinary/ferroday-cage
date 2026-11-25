@@ -684,3 +684,28 @@ count = 2
 why = """\
 The answer: the opcode's definition, and its one use in \
 `raise_interface`."""
+
+[[idiom]]
+name = "a tar header's layout"
+# A ustar magic literal, or a slice taken at the offset where one of a header's
+# fields begins: the name and link name, the mode, ids, size, time and checksum,
+# the typeflag, the magic and version, the owner names, the device numbers and
+# the prefix.
+pattern = '''b"ustar|\[(?:100|108|116|124|136|148|156|157|257|263|265|297|329|337|345)\.\.'''
+answer = """\
+ferrotape: its `Reader` reads a header, and its `Header` and `Writer` write \
+one. Every rule about which archives are read, and how a header is encoded \
+so that every reader reads it back alike, is decided there and measured \
+against the reference readers; a header parsed or encoded here is a second \
+reader or writer, which drifts from the first in exactly the cases those \
+rules exist for."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage-testkit/src/tar.rs"
+count = 19
+why = """\
+The fixtures' writer, deliberately byte-level: a test builds with it what no \
+well-behaved writer produces (an absolute path, a `..` component, a header \
+whose size its body does not match, an unknown typeflag), which ferrotape's \
+`Header` refuses to write, and a sparse member in GNU's old form, which \
+ferrotape's `Header` does not write. It writes headers and never reads one."""
