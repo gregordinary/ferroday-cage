@@ -4,8 +4,8 @@
 //! ferroday-cage library: fresh namespaces, the given root filesystem
 //! presented at `/` with the default mount profile assembled over it, and
 //! the calling user mapped to root inside. Almost every flag maps onto a call
-//! on the library's builder, and `--profile` loads a TOML sandbox
-//! specification through the library's `serde` feature; the binary contains
+//! on the library's builder, and `--profile` loads a sandbox specification,
+//! TOML or JSON, through the library's `serde` feature; the binary contains
 //! no sandboxing logic of its own. `--restrict` selects the library's
 //! restriction fallback instead: Landlock and seccomp confinement of a
 //! plain process, for hosts without unprivileged user namespaces.
@@ -45,6 +45,7 @@
 
 mod events;
 mod forward;
+mod listing;
 mod netstack;
 mod output;
 mod seccomp;
@@ -63,8 +64,7 @@ use ferroday_cage::provision::alpine::{Alpine, KeySet as AlpineKeySet};
 use ferroday_cage::provision::debian::{Debian, Priority, Repository};
 use ferroday_cage::provision::gentoo::Gentoo;
 use ferroday_cage::provision::{
-    ChangeKind, ChangeSet, EntryKind, Interrupt, Protected, Provision, ProvisionError, Provisioned,
-    Tarball,
+    ChangeSet, Interrupt, Protected, Provision, ProvisionError, Provisioned, Tarball,
 };
 use ferroday_cage::relay::{Escalation, RelayError};
 use ferroday_cage::{
@@ -1415,13 +1415,14 @@ const FLAGS: &[Flag] = &[
         section: Section::Profiles,
         placeholder: "FILE",
         help: &[
-            "Load a TOML sandbox profile; flags given alongside",
-            "override its settings, binds and variables extend it,",
-            "and any [hardening] table it carries takes effect. A",
-            "profile is trusted like a script: it can bind any host",
-            "path, issue raw mounts, share the host network, and",
-            "share the host PID namespace. Load only a profile you",
-            "trust, or use --restricted-profile",
+            "Load a sandbox profile: TOML, or JSON in the same",
+            "schema where its first character is '{'. Flags given",
+            "alongside override its settings, binds and variables",
+            "extend it, and any [hardening] table it carries takes",
+            "effect. A profile is trusted like a script: it can",
+            "bind any host path, issue raw mounts, share the host",
+            "network, and share the host PID namespace. Load only",
+            "a profile you trust, or use --restricted-profile",
         ],
         take: Take::One(|options, _flag, value| {
             let path = PathBuf::from(value);
@@ -1435,7 +1436,7 @@ const FLAGS: &[Flag] = &[
         section: Section::Profiles,
         placeholder: "FILE",
         help: &[
-            "Load a TOML profile from an untrusted source: like",
+            "Load a profile from an untrusted source: like",
             "--profile, but the operations that map host resources",
             "into the sandbox, write to the host, or share a host",
             "namespace are refused, and so is the hardening the",
@@ -2830,6 +2831,18 @@ const FLAGS: &[Flag] = &[
         take: Take::Bare(|options| options.print_resolved = true),
         ..Flag::DEFAULTS
     },
+    Flag {
+        long: "--json",
+        section: Section::Help,
+        help: &[
+            "Print the listing of --host-report, --print-resolved,",
+            "--changes or --apply-changes as one JSON document, on",
+            "a line of its own, in place of its text",
+        ],
+        restriction: true,
+        take: Take::Bare(|options| options.json = true),
+        ..Flag::DEFAULTS
+    },
 ];
 
 /// What `--help` prints above the option sections.
@@ -2946,7 +2959,10 @@ enum Invocation {
     /// can still be trusted to do, and until when.
     GentooKeyring,
     /// Print what this host offers a sandbox.
-    HostReport,
+    HostReport {
+        /// Whether the report is printed as JSON rather than TOML.
+        json: bool,
+    },
     /// Write a provisioned rootfs to a tar archive, under the identity map it
     /// was written under.
     Export {
@@ -2962,6 +2978,8 @@ enum Invocation {
     Changes {
         /// The overlay whose upper and lowers are read.
         overlay: Overlay,
+        /// Whether the listing is printed as JSON rather than as text.
+        json: bool,
     },
     /// Write what a run wrote through an overlay into a tree.
     ApplyChanges {
@@ -2976,6 +2994,9 @@ enum Invocation {
         only: Vec<PathBuf>,
         /// The reference time, where one was given.
         since: Option<std::time::SystemTime>,
+        /// Whether what the apply wrote or refused is printed as JSON rather
+        /// than as text.
+        json: bool,
     },
     Help,
     Version,
@@ -3114,6 +3135,8 @@ struct Options {
     /// `--print-resolved`: print what the build resolves to rather than
     /// launching.
     print_resolved: bool,
+    /// `--json`: print the resolved inputs as JSON rather than TOML.
+    json: bool,
     /// `--events`: where the run says what it has to say, as events.
     events: Option<PathBuf>,
     netstack: bool,
@@ -3518,21 +3541,22 @@ fn main() -> ExitCode {
         }) => gentoo_packages(&architecture, &binhost, mirror.as_deref(), &fallbacks),
         Ok(Invocation::GentooInstalled { root }) => gentoo_installed(&root),
         Ok(Invocation::GentooKeyring) => gentoo_keyring_horizon(),
-        Ok(Invocation::HostReport) => host_report(),
+        Ok(Invocation::HostReport { json }) => host_report(json),
         Ok(Invocation::Export {
             source,
             dest,
             map,
             clamp_mtime,
         }) => export_rootfs(&source, dest.as_deref(), map, clamp_mtime),
-        Ok(Invocation::Changes { overlay }) => list_changes(&overlay),
+        Ok(Invocation::Changes { overlay, json }) => list_changes(&overlay, json),
         Ok(Invocation::ApplyChanges {
             overlay,
             to,
             protected,
             only,
             since,
-        }) => apply_changes(&overlay, &to, protected, only, since),
+            json,
+        }) => apply_changes(&overlay, &to, protected, only, since, json),
         Err(message) => usage_error(format_args!("{message}")),
     }
 }
@@ -3669,6 +3693,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         caps: None,
         restrict: false,
         print_resolved: false,
+        json: false,
         events: None,
         netstack: false,
         netstack_cidr: None,
@@ -3733,6 +3758,17 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     // silently ignored.
     if options.kill_after_given && options.timeout.is_none() {
         return Err("--kill-after requires --timeout".to_string());
+    }
+
+    // A launch prints no listing but the resolved inputs, so `--json` has
+    // nothing else to change. What a launch says of its own as JSON is the
+    // event stream's.
+    if options.json && !options.print_resolved {
+        return Err(
+            "--json requires --print-resolved, the one listing a launch prints; --events \
+             writes what a launch says as JSON"
+                .to_string(),
+        );
     }
 
     // A terminal is all three of the command's standard streams, so a stated
@@ -4277,17 +4313,25 @@ fn parse_gentoo_keyring(args: Vec<OsString>) -> Result<Invocation, String> {
 
 /// Parses a `--host-report` command line, excluding the program name.
 ///
-/// The report asks the host and nothing else, so it takes no settings.
+/// The report asks the host and nothing else, so it takes no settings, only
+/// how it is printed.
 fn parse_host_report(args: Vec<OsString>) -> Result<Invocation, String> {
     if let Some(answer) = help_or_version(&args) {
         return Ok(answer);
     }
+    let mut json = false;
     for arg in args {
-        if arg != "--host-report" {
-            return Err(mode_conflict(&arg, "--host-report", &["--host-report"]));
+        if arg == "--json" {
+            json = true;
+        } else if arg != "--host-report" {
+            return Err(mode_conflict(
+                &arg,
+                "--host-report",
+                &["--host-report", "--json"],
+            ));
         }
     }
-    Ok(Invocation::HostReport)
+    Ok(Invocation::HostReport { json })
 }
 
 /// Parses a `--gentoo-packages` command line, excluding the program name.
@@ -4439,6 +4483,7 @@ fn parse_changes(args: Vec<OsString>) -> Result<Invocation, String> {
     }
     let mut overlay = Overlay::new();
     let mut upper = false;
+    let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if let Some(value) = mode_value("--changes", &arg, &mut args)? {
@@ -4446,11 +4491,13 @@ fn parse_changes(args: Vec<OsString>) -> Result<Invocation, String> {
             upper = true;
         } else if let Some(value) = mode_value("--overlay-lower", &arg, &mut args)? {
             overlay = overlay.lower(tree_value("--overlay-lower", value)?);
+        } else if arg == "--json" {
+            json = true;
         } else {
             return Err(mode_conflict(
                 &arg,
                 "--changes",
-                &["--changes", "--overlay-lower"],
+                &["--changes", "--overlay-lower", "--json"],
             ));
         }
     }
@@ -4465,7 +4512,7 @@ fn parse_changes(args: Vec<OsString>) -> Result<Invocation, String> {
                 .to_string(),
         );
     }
-    Ok(Invocation::Changes { overlay })
+    Ok(Invocation::Changes { overlay, json })
 }
 
 /// Parses an `--apply-changes` invocation.
@@ -4480,6 +4527,7 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut protected = Vec::new();
     let mut only = Vec::new();
     let mut since = None;
+    let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if let Some(value) = mode_value("--apply-changes", &arg, &mut args)? {
@@ -4500,6 +4548,8 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
             protected.push(Protected::name(value));
         } else if arg == "--no-protection" {
             defaults = false;
+        } else if arg == "--json" {
+            json = true;
         } else if let Some(value) = mode_value("--only", &arg, &mut args)? {
             only.push(relative_value("--only", value)?);
         } else if let Some(value) = mode_value("--since", &arg, &mut args)? {
@@ -4530,6 +4580,7 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
                     "--no-protection",
                     "--only",
                     "--since",
+                    "--json",
                 ],
             ));
         }
@@ -4556,6 +4607,7 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
         protected,
         only,
         since,
+        json,
     })
 }
 
@@ -5697,21 +5749,24 @@ fn stop_with_caller(flag: Option<bool>, profile: Option<bool>) -> bool {
     flag.or(profile).unwrap_or(true)
 }
 
-/// A `toml` error rendered as the body of one `fcage:` diagnostic.
+/// A profile's parser's error, TOML's or JSON's, rendered as the body of one
+/// `fcage:` diagnostic.
 ///
-/// The crate's `Display` ends with a newline of its own, and every diagnostic
-/// here goes out as a line of its own, so formatting one verbatim leaves a blank
-/// line behind the message. Only trailing whitespace is dropped: a parse
-/// diagnostic keeps its span, its caret, and the line breaks between them, and
-/// a single-line refusal -- an `unknown field`, or one of the restricted
-/// policy's -- becomes the one line it reads as.
+/// The `toml` crate's `Display` ends with a newline of its own, and every
+/// diagnostic here goes out as a line of its own, so formatting one verbatim
+/// leaves a blank line behind the message. Only trailing whitespace is dropped:
+/// a parse diagnostic keeps its span, its caret, and the line breaks between
+/// them, and a single-line refusal -- an `unknown field`, or one of the
+/// restricted policy's -- becomes the one line it reads as.
 ///
-/// A parse diagnostic quotes the line it failed on, and a profile is not
-/// always its caller's own writing: a raw escape sequence in one would reach
-/// the terminal and drive it. Every control character but the line breaks
-/// between the diagnostic's own lines is written as the escape `{:?}` gives
-/// it, as the library renders a string an untrusted source supplied.
-fn toml_diagnostic(error: &impl std::fmt::Display) -> String {
+/// A parse diagnostic quotes the line it failed on, a refusal quotes the key
+/// it refuses, and a profile is not always its caller's own writing: a raw
+/// escape sequence in one would reach the terminal and drive it. JSON spells a
+/// control character in a key as an escape, which the parser decodes into the
+/// character itself. Every control character but the line breaks between the
+/// diagnostic's own lines is written as the escape `{:?}` gives it, as the
+/// library renders a string an untrusted source supplied.
+fn profile_diagnostic(error: &impl std::fmt::Display) -> String {
     let mut rendered = String::new();
     for character in error.to_string().trim_end().chars() {
         if character.is_control() && character != '\n' {
@@ -5738,10 +5793,49 @@ struct Profile {
     /// The network stack its `[netstack]` table configures, which a
     /// `--netstack` run attaches.
     stack: Option<NetStackBuilder>,
+    /// What it was written in, which decides what a diagnostic calls that
+    /// table.
+    format: ProfileFormat,
+}
+
+/// The text format a profile is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileFormat {
+    Toml,
+    Json,
+}
+
+impl ProfileFormat {
+    /// The format of `text`: JSON where its first byte past JSON's whitespace
+    /// is `{`, which no TOML document can begin with, and TOML otherwise.
+    fn of(text: &str) -> ProfileFormat {
+        let first = text
+            .bytes()
+            .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+        if first == Some(b'{') {
+            ProfileFormat::Json
+        } else {
+            ProfileFormat::Toml
+        }
+    }
+
+    /// What a diagnostic calls the network stack's settings in this format.
+    const fn netstack(self) -> &'static str {
+        match self {
+            ProfileFormat::Toml => "[netstack] table",
+            ProfileFormat::Json => "\"netstack\" member",
+        }
+    }
 }
 
 /// Loads a profile: the sandbox it describes, and the network stack its
 /// `[netstack]` table configures, where it has one.
+///
+/// A profile is TOML, or JSON in the same schema, which [`ProfileFormat::of`]
+/// tells apart. A JSON document is read into TOML's data model, so everything
+/// after the parse reads both formats alike, and a JSON profile can say only
+/// what a TOML one can: a key stated twice, a `null`, and an integer past
+/// `i64` are refused, as TOML refuses them.
 ///
 /// With `restricted`, the profile is deserialized under the library's
 /// [`RestrictedProfile`] policy, which refuses the operations that map host
@@ -5756,27 +5850,40 @@ fn load_profile(path: &Path, restricted: bool) -> Result<Profile, String> {
             ErrorChain::new(&err)
         )
     })?;
-    let mut table: toml::Table = text.parse().map_err(|err| {
-        format!(
-            "cannot parse profile {}: {}",
-            path.display(),
-            toml_diagnostic(&err)
-        )
-    })?;
+    let format = ProfileFormat::of(&text);
+    let parsed = match format {
+        ProfileFormat::Toml => text.parse::<toml::Table>().map_err(|err| {
+            format!(
+                "cannot parse profile {}: {}",
+                path.display(),
+                profile_diagnostic(&err)
+            )
+        }),
+        ProfileFormat::Json => serde_json::from_str::<toml::Table>(&text).map_err(|err| {
+            format!(
+                "cannot parse profile {} as JSON: {}",
+                path.display(),
+                profile_diagnostic(&err)
+            )
+        }),
+    };
+    let mut table = parsed?;
     let stack = match table.remove(NETSTACK_TABLE) {
         None => None,
         Some(_) if restricted => {
             return Err(format!(
                 "cannot load profile {}: a restricted profile cannot configure the network \
-                 stack, so its [{NETSTACK_TABLE}] table is refused",
-                path.display()
+                 stack, so its {} is refused",
+                path.display(),
+                format.netstack(),
             ));
         }
         Some(value) => Some(value.try_into::<NetStackBuilder>().map_err(|err| {
             format!(
-                "cannot load profile {}: in its [{NETSTACK_TABLE}] table: {}",
+                "cannot load profile {}: in its {}: {}",
                 path.display(),
-                toml_diagnostic(&err)
+                format.netstack(),
+                profile_diagnostic(&err)
             )
         })?),
     };
@@ -5785,7 +5892,7 @@ fn load_profile(path: &Path, restricted: bool) -> Result<Profile, String> {
             format!(
                 "cannot load profile {}: {}",
                 path.display(),
-                toml_diagnostic(&err)
+                profile_diagnostic(&err)
             )
         })?;
         profile.into_builder()
@@ -5794,11 +5901,15 @@ fn load_profile(path: &Path, restricted: bool) -> Result<Profile, String> {
             format!(
                 "cannot load profile {}: {}",
                 path.display(),
-                toml_diagnostic(&err)
+                profile_diagnostic(&err)
             )
         })?
     };
-    Ok(Profile { builder, stack })
+    Ok(Profile {
+        builder,
+        stack,
+        format,
+    })
 }
 
 /// Deletes the provisioned rootfs or the overlay upper at `dest`, under the
@@ -5830,86 +5941,41 @@ fn remove_tree(dest: &Path, map: IdentityMap, removal: Removal) -> ExitCode {
     }
 }
 
-/// Writes a provisioned rootfs to a tar archive, to a file or to standard
-/// output.
-///
-/// A named destination appears complete or not at all: the library stages the
-/// archive beside it and renames, so a run that fails part-way leaves whatever
-/// archive was already there. Standard output has no such staging, and a
-/// pipeline that consumes a partial stream is the caller's to arrange.
-///
-/// The terminal refusal is here rather than in the parser, so that parsing a
-/// command line stays a function of the command line: whether standard output
-/// is a terminal is a property of how `fcage` was invoked, not of what was
-/// typed, and a parser that consulted it would answer differently under a test
-/// harness than at a prompt. It is still the usage error it looks like, exit
-/// code and all.
-///
-/// Both paths are checked before the walk begins, for the reason a launch
-/// checks its rootfs before building anything: without it a typo surfaces from
-/// wherever the walk happened to meet it, described in the walk's own
-/// vocabulary ("while opening an entry in the exported tree"), which names the
-/// step rather than the mistake.
-/// Prints what a run wrote through `overlay`, one change a line.
-fn list_changes(overlay: &Overlay) -> ExitCode {
+/// Prints what a run wrote through `overlay`: one change a line, or with
+/// `json` one document, [`listing::ChangeListing`].
+fn list_changes(overlay: &Overlay, json: bool) -> ExitCode {
     let changes = match ChangeSet::read(overlay) {
         Ok(changes) => changes,
         Err(error) => return fail(error),
     };
+    if json {
+        return output::print_json(
+            "the change listing",
+            &listing::ChangeListing::of(changes.changes()),
+        );
+    }
     output::print_stdout("the change listing", |out| {
         for change in changes.changes() {
-            writeln!(out, "{}", change_line(change))?;
+            writeln!(out, "{}", listing::change_line(change))?;
         }
         Ok(())
     })
 }
 
-/// One line of a change listing: a letter for the kind, the path quoted, and
-/// what a modified entry differs in, or the types a replaced one changed
-/// between.
-fn change_line(change: &ferroday_cage::provision::Change) -> String {
-    let kind_name = |kind: Option<EntryKind>| match kind {
-        Some(EntryKind::File) => "file",
-        Some(EntryKind::Directory) => "directory",
-        Some(EntryKind::Symlink) => "link",
-        _ => "other",
-    };
-    let mut line = match change.kind() {
-        ChangeKind::Added => format!("A {:?}", change.path()),
-        ChangeKind::Removed => format!("D {:?}", change.path()),
-        ChangeKind::Replaced => format!(
-            "T {:?} {} {}",
-            change.path(),
-            kind_name(change.before()),
-            kind_name(change.now()),
-        ),
-        _ => {
-            let differs: Vec<&str> = [
-                (change.content_differs(), "content"),
-                (change.mode_differs(), "mode"),
-                (change.owner_differs(), "owner"),
-                (change.attributes_differ(), "attributes"),
-            ]
-            .into_iter()
-            .filter_map(|(differs, name)| differs.then_some(name))
-            .collect();
-            format!("M {:?} {}", change.path(), differs.join(","))
-        }
-    };
-    if !change.is_readable() {
-        line.push_str(" unreadable");
-    }
-    line
-}
-
-/// Writes what a run wrote through `overlay` into `to`, printing each path
-/// written on standard output, and on a refusal each refused path with why.
+/// Writes what a run wrote through `overlay` into `to`.
+///
+/// As text, each path written is printed on standard output, each path passed
+/// over is said on standard error, and on a refusal each refused path is said
+/// there with why. With `json`, all of it is one document on standard output,
+/// [`listing::ApplyListing`], printed for a refusal too, and standard error
+/// carries only the failure.
 fn apply_changes(
     overlay: &Overlay,
     to: &Path,
     protected: Vec<Protected>,
     only: Vec<PathBuf>,
     since: Option<std::time::SystemTime>,
+    json: bool,
 ) -> ExitCode {
     let changes = match ChangeSet::read(overlay) {
         Ok(changes) => changes,
@@ -5923,6 +5989,10 @@ fn apply_changes(
         apply = apply.since(since);
     }
     match apply.run() {
+        Ok(report) if json => output::print_json(
+            "the applied listing",
+            &listing::ApplyListing::applied(&report),
+        ),
         Ok(report) => {
             for skipped in report.skipped() {
                 if output::say(format_args!(
@@ -5943,12 +6013,20 @@ fn apply_changes(
         Err(ProvisionError::ApplyRefused {
             target, refusals, ..
         }) => {
-            for refusal in &refusals {
-                output::report(format_args!(
-                    "fcage: refused {:?}: {}",
-                    refusal.path(),
-                    refusal.reason()
-                ));
+            if json {
+                let printed = output::print_json(
+                    "the refused listing",
+                    &listing::ApplyListing::refused(&refusals),
+                );
+                // A reader gone, or a document that could not be written,
+                // is the outcome already said.
+                if printed != ExitCode::SUCCESS {
+                    return printed;
+                }
+            } else {
+                for refusal in &refusals {
+                    output::report(format_args!("{}", listing::refusal_line(refusal)));
+                }
             }
             fail(format_args!(
                 "nothing was written to {}: {} of the changes are refused",
@@ -5960,6 +6038,26 @@ fn apply_changes(
     }
 }
 
+/// Writes a provisioned rootfs to a tar archive, to a file or to standard
+/// output.
+///
+/// A named destination appears complete or not at all: the library stages the
+/// archive beside it and renames, so a run that fails part-way leaves whatever
+/// archive was already there. Standard output has no such staging, and a
+/// pipeline that consumes a partial stream is the caller's to arrange.
+///
+/// The terminal refusal is here rather than in the parser, so that parsing a
+/// command line stays a function of the command line: whether standard output
+/// is a terminal is a property of how `fcage` was invoked, not of what was
+/// typed, and a parser that consulted it would answer differently under a test
+/// harness than at a prompt. It is still the usage error it looks like, exit
+/// code and all.
+///
+/// Both paths are checked before the walk begins, for the reason a launch
+/// checks its rootfs before building anything: without it a typo surfaces from
+/// wherever the walk happened to meet it, described in the walk's own
+/// vocabulary ("while opening an entry in the exported tree"), which names the
+/// step rather than the mistake.
 fn export_rootfs(
     source: &Path,
     dest: Option<&Path>,
@@ -6102,6 +6200,7 @@ fn run(options: Options) -> ExitCode {
     }
 
     let print_resolved = options.print_resolved;
+    let json = options.json;
     let launch = match Launch::prepare(options) {
         Ok(launch) => launch,
         Err(code) => return code,
@@ -6116,7 +6215,7 @@ fn run(options: Options) -> ExitCode {
             stack: launch.stack_settings.as_ref(),
         };
         let added = around.table();
-        return print_resolved_inputs(launch.builder, added);
+        return print_resolved_inputs(launch.builder, added, json);
     }
     if let Some(provisioner) = provisioner.as_mut() {
         let rootfs = rootfs.as_deref().expect("checked at parse time");
@@ -6162,11 +6261,13 @@ impl Launch {
         let Profile {
             mut builder,
             stack: profile_stack,
+            format: profile_format,
         } = match &options.profile {
             Some(path) => load_profile(path, options.profile_restricted).map_err(fail)?,
             None => Profile {
                 builder: Cage::builder(),
                 stack: None,
+                format: ProfileFormat::Toml,
             },
         };
 
@@ -6190,8 +6291,9 @@ impl Launch {
         } else {
             if profile_stack.is_some() {
                 output::say(format_args!(
-                    "fcage: the profile's [{NETSTACK_TABLE}] table is not used: no --netstack \
-                     attaches the stack it configures"
+                    "fcage: the profile's {} is not used: no --netstack attaches the stack it \
+                     configures",
+                    profile_format.netstack(),
                 ))
                 .map_err(|output::ReaderGone| Failure::ReaderGone.report())?;
             }
@@ -6491,11 +6593,23 @@ impl Launcher for RestrictionBuilder {
 
 /// Builds a launch and prints the inputs it resolves to, as TOML, without
 /// starting it: `--print-resolved`.
-fn print_resolved_inputs<B: Launcher>(builder: B, around: toml::Table) -> ExitCode {
+///
+/// With `json`, the same document is printed as JSON: the inputs' tables are
+/// rendered through TOML's, so its keys are the TOML document's, and `around`
+/// is its `fcage` member.
+fn print_resolved_inputs<B: Launcher>(builder: B, around: toml::Table, json: bool) -> ExitCode {
     let built = match builder.build() {
         Ok(built) => built,
         Err(error) => return fail(error),
     };
+    if json {
+        let mut document = match toml::Table::try_from(B::resolved_inputs(&built)) {
+            Ok(document) => document,
+            Err(err) => return fail(format!("cannot render the resolved inputs: {err}")),
+        };
+        document.insert("fcage".to_string(), around.into());
+        return output::print_json("the resolved inputs", &document);
+    }
     let mut fcage = toml::Table::new();
     fcage.insert("fcage".to_string(), around.into());
     let rendered = toml::to_string(&B::resolved_inputs(&built))
@@ -6561,13 +6675,14 @@ impl Around<'_> {
     }
 }
 
-/// Prints what this host offers a sandbox, as TOML: `--host-report`.
+/// Prints what this host offers a sandbox, as TOML, or with `json` the same
+/// document as JSON: `--host-report`.
 ///
 /// Each facility is a table of its own, so a reader asks for the one it needs
 /// and a facility added later adds a table. A facility a launch can be refused
 /// carries `available`, and a `reason` where it is not; the reason is the
 /// library's own description of the blocker.
-fn host_report() -> ExitCode {
+fn host_report(json: bool) -> ExitCode {
     use ferroday_cage::host;
     let facility = |reason: Option<String>| {
         let mut table = toml::Table::new();
@@ -6636,6 +6751,9 @@ fn host_report() -> ExitCode {
         }
     }
     report.insert("confinement".to_string(), confinement.into());
+    if json {
+        return output::print_json("the host report", &report);
+    }
     let text = match toml::to_string(&report) {
         Ok(text) => text,
         Err(err) => return fail(format!("cannot render the host report: {err}")),
@@ -7166,7 +7284,7 @@ fn run_restricted(mut options: Options) -> ExitCode {
             forwards: &[],
             stack: None,
         };
-        return print_resolved_inputs(builder, around.table());
+        return print_resolved_inputs(builder, around.table(), options.json);
     }
 
     if options.terminal {
@@ -9089,10 +9207,10 @@ mod tests {
     }
 
     #[test]
-    fn the_host_report_takes_nothing_and_print_resolved_rides_a_launch() {
+    fn the_host_report_takes_only_json_and_print_resolved_rides_a_launch() {
         assert!(matches!(
             parse_args(&["--host-report"]).expect("the report parses"),
-            Invocation::HostReport,
+            Invocation::HostReport { json: false },
         ));
         // A launch flag alongside the report is a usage error rather than a
         // setting with no effect.
@@ -9101,7 +9219,7 @@ mod tests {
 
         // --print-resolved is a launch's, plain or restricted.
         let options = run_options(&["--print-resolved", "--host-rootfs", "/bin/true"]);
-        assert!(options.print_resolved);
+        assert!(options.print_resolved && !options.json);
         let options = run_options(&[
             "--restrict",
             "--landlock-ro",
@@ -9110,6 +9228,56 @@ mod tests {
             "/bin/true",
         ]);
         assert!(options.print_resolved && options.restrict);
+    }
+
+    #[test]
+    fn json_is_taken_by_every_listing_and_refused_by_a_launch_that_lists_nothing() {
+        // Before or after the flag that selects the mode, since the pre-scan
+        // walks past a bare flag as it walks past any other.
+        for args in [["--host-report", "--json"], ["--json", "--host-report"]] {
+            assert!(matches!(
+                parse_args(&args).expect("the report parses"),
+                Invocation::HostReport { json: true },
+            ));
+        }
+        assert!(matches!(
+            parse_args(&[
+                "--changes",
+                "/roots/u",
+                "--overlay-lower",
+                "/roots/l",
+                "--json"
+            ])
+            .expect("the listing parses"),
+            Invocation::Changes { json: true, .. },
+        ));
+        assert!(matches!(
+            parse_args(&[
+                "--json",
+                "--apply-changes",
+                "/roots/u",
+                "--overlay-lower",
+                "/roots/l",
+                "--to",
+                "/roots/l",
+            ])
+            .expect("the apply parses"),
+            Invocation::ApplyChanges { json: true, .. },
+        ));
+        let options = run_options(&["--print-resolved", "--json", "--host-rootfs", "/bin/true"]);
+        assert!(options.print_resolved && options.json);
+
+        // A launch that prints no listing has nothing for it to change, and
+        // the refusal names what does write JSON.
+        let error = parse_error(&["--json", "--host-rootfs", "/bin/true"]);
+        assert!(
+            error.contains("--json requires --print-resolved"),
+            "{error}"
+        );
+        assert!(error.contains("--events"), "{error}");
+        // A mode that prints no listing does not take it.
+        let error = parse_error(&["--remove-rootfs", "/roots/a", "--json"]);
+        assert!(error.contains("--json"), "{error}");
     }
 
     #[test]
@@ -9619,6 +9787,181 @@ mod tests {
                 assert!(error.contains("\\u{1b}]52"), "{error:?}");
             }
         }
+        // JSON spells the sequence as escapes, which the parser decodes into
+        // the characters, and both a parse failure and a refusal quote a key.
+        for document in [
+            r#"{"rootfs": "/tmp", "bogus\u001b]52;c;aGk=\u0007": 1}"#,
+            r#"{"rootfs": "/tmp", "x\u001b]52;c;aGk=\u0007": 1, "x\u001b]52;c;aGk=\u0007": 2}"#,
+        ] {
+            std::fs::write(&profile, document).expect("the profile is written");
+            for restricted in [true, false] {
+                let Err(error) = load_profile(&profile, restricted) else {
+                    panic!("{document:?} loaded");
+                };
+                assert!(!error.contains(['\u{1b}', '\u{7}']), "{error:?}");
+                assert!(error.contains("\\u{1b}]52"), "{error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_profile_s_first_byte_tells_json_from_toml() {
+        for (text, format) in [
+            ("{}", ProfileFormat::Json),
+            (" \t\r\n{\"rootfs\": \"/tmp\"}", ProfileFormat::Json),
+            ("rootfs = \"/tmp\"\n", ProfileFormat::Toml),
+            ("# {\"rootfs\": \"/tmp\"}\n", ProfileFormat::Toml),
+            // TOML's comment and a vertical tab are not JSON's whitespace, so
+            // what follows them is not read as JSON.
+            ("\u{b}{}", ProfileFormat::Toml),
+            ("", ProfileFormat::Toml),
+        ] {
+            assert_eq!(ProfileFormat::of(text), format, "{text:?}");
+        }
+    }
+
+    /// The profiles the library's examples ship, beside this crate.
+    fn example_profiles() -> Vec<PathBuf> {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ferroday-cage/examples");
+        let mut profiles = Vec::new();
+        for dir in [examples.clone(), examples.join("orchestrator-profiles")] {
+            for entry in std::fs::read_dir(&dir).expect("the examples are readable") {
+                let path = entry.expect("an example").path();
+                if path.extension() == Some(OsStr::new("toml")) {
+                    profiles.push(path);
+                }
+            }
+        }
+        profiles.sort();
+        profiles
+    }
+
+    #[test]
+    fn every_example_profile_loads_alike_as_toml_and_as_json() {
+        // The JSON is the TOML document's own data, written by a serializer
+        // that knows nothing of profiles, so this holds the two readers to one
+        // schema rather than to two lists of keys kept in step.
+        let profiles = example_profiles();
+        assert!(profiles.len() >= 4, "the examples are found: {profiles:?}");
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-json-examples");
+        for toml_profile in profiles {
+            let text = std::fs::read_to_string(&toml_profile).expect("the example is readable");
+            let table: toml::Table = text.parse().expect("the example is TOML");
+            let json_profile = dir.join("profile.json");
+            std::fs::write(
+                &json_profile,
+                serde_json::to_string_pretty(&table).expect("the example is JSON"),
+            )
+            .expect("the profile is written");
+            for restricted in [false, true] {
+                let (as_toml, as_json) = (
+                    load_profile(&toml_profile, restricted),
+                    load_profile(&json_profile, restricted),
+                );
+                match (as_toml, as_json) {
+                    (Ok(as_toml), Ok(as_json)) => {
+                        assert_eq!(
+                            format!("{:?}", as_toml.builder),
+                            format!("{:?}", as_json.builder),
+                            "{}",
+                            toml_profile.display(),
+                        );
+                        assert_eq!(
+                            format!("{:?}", as_toml.stack),
+                            format!("{:?}", as_json.stack),
+                            "{}",
+                            toml_profile.display(),
+                        );
+                    }
+                    // A restricted load refuses a trusted example's keys
+                    // alike, naming the same key.
+                    (Err(as_toml), Err(as_json)) => {
+                        assert!(restricted, "{}: {as_toml}", toml_profile.display());
+                        let refusal = |error: &str| {
+                            error
+                                .split_once(": ")
+                                .map(|(_, refusal)| refusal.to_string())
+                        };
+                        assert_eq!(
+                            refusal(&as_toml),
+                            refusal(&as_json).map(|refusal| refusal
+                                .replace("\"netstack\" member", "[netstack] table")),
+                            "{}",
+                            toml_profile.display(),
+                        );
+                    }
+                    (as_toml, as_json) => panic!(
+                        "{} loads one way only: {:?} {:?}",
+                        toml_profile.display(),
+                        as_toml.err(),
+                        as_json.err(),
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_json_profile_says_only_what_a_toml_one_can() {
+        // A key stated twice, a null, and an integer past i64 each have no
+        // TOML spelling, and are refused rather than read one way or another.
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-json-profile-refusals");
+        let profile = dir.join("profile.json");
+        for (document, refused) in [
+            (
+                r#"{"rootfs": "/tmp", "rootfs": "/srv"}"#,
+                "duplicate key: `rootfs`",
+            ),
+            (
+                r#"{"rootfs": "/tmp", "netstack": {"mtu": 1400, "mtu": 1500}}"#,
+                "duplicate key: `mtu`",
+            ),
+            (r#"{"rootfs": null}"#, "null"),
+            (
+                r#"{"rootfs": "/tmp", "rlimit": {"open-files": 18446744073709551615}}"#,
+                "too large",
+            ),
+            (r#"{"rootfs": "/tmp",}"#, "trailing comma"),
+        ] {
+            std::fs::write(&profile, document).expect("the profile is written");
+            let Err(error) = load_profile(&profile, false) else {
+                panic!("{document} loaded");
+            };
+            assert!(error.contains("as JSON"), "{error}");
+            assert!(error.contains(refused), "{document}: {error}");
+        }
+
+        // The stack's settings are named as JSON names them.
+        std::fs::write(
+            &profile,
+            r#"{"rootfs": "/tmp", "netstack": {"gateway": "10.0.2.1"}}"#,
+        )
+        .expect("the profile is written");
+        let Err(error) = load_profile(&profile, false) else {
+            panic!("an unknown stack setting loaded");
+        };
+        assert!(error.contains("in its \"netstack\" member"), "{error}");
+        assert!(error.contains("gateway"), "{error}");
+        std::fs::write(&profile, r#"{"rootfs": "/tmp", "netstack": {}}"#)
+            .expect("the profile is written");
+        let Err(error) = load_profile(&profile, true) else {
+            panic!("--restricted-profile accepted a stack");
+        };
+        assert!(error.contains("\"netstack\" member is refused"), "{error}");
+
+        // And a JSON profile reaches the launch as its TOML twin does.
+        std::fs::write(
+            &profile,
+            r#"{"rootfs": "/tmp", "command": "/bin/sh", "args": ["-c", "exit 3"],
+                "netstack": {"allow": ["example.com:443"]}}"#,
+        )
+        .expect("the profile is written");
+        let profile = profile.to_str().expect("a UTF-8 scratch path");
+        let launch = Launch::prepare(*run_options(&["--profile", profile, "--netstack"]))
+            .unwrap_or_else(|_| panic!("the JSON profile composes"));
+        assert_eq!(launch.builder.get_command(), Some(Path::new("/bin/sh")));
+        assert_eq!(launch.builder.get_args(), ["-c", "exit 3"]);
+        assert!(launch.stack.is_some());
     }
 
     #[test]
@@ -11984,6 +12327,7 @@ mod tests {
     fn given(flag: &Flag) -> Vec<&'static str> {
         let value: &[&'static str] = match flag.long {
             "--kill-after" => return vec!["--timeout", "1", "--kill-after", "1"],
+            "--json" => return vec!["--print-resolved", "--json"],
             // A relaxation needs the curated roster it relaxes.
             "--seccomp-relax" => return vec!["--seccomp", "curated", "--seccomp-relax", "ptrace"],
             "--debian-base-priority" => &["required"],
@@ -12090,6 +12434,7 @@ mod tests {
             let seen = match flag.long {
                 "--terminal" => options.terminal,
                 "--print-resolved" => options.print_resolved,
+                "--json" => options.json,
                 "--events" => options.events.is_some(),
                 "--timeout" => options.timeout.is_some(),
                 "--kill-after" => options.kill_after == Duration::from_secs(1),

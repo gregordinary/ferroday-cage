@@ -85,7 +85,7 @@ confines a command with Landlock and seccomp alone, which need no user
 namespace.
 
 `fcage --host-report` asks every such probe at once and prints the answers as
-TOML, a table for each facility. A facility a launch can be refused says whether
+TOML, a table for each facility. `--json` prints the same document as JSON. A facility a launch can be refused says whether
 it is `available`, and gives the probe's `reason` where it is not. The report
 also gives the Landlock ABI, this process's cgroup, and the security module's
 confinement. `seccomp-listener` says whether a launch whose seccomp filter's

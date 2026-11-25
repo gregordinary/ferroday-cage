@@ -99,6 +99,194 @@ fn apply_changes_refuses_a_protected_path_and_writes_the_rest_without_it() {
     assert!(!lower.join(".envrc").exists());
 }
 
+/// The one document `fcage` printed, which is a line of its own.
+fn document(out: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8(out.stdout.clone()).expect("the document is UTF-8");
+    let line = stdout
+        .strip_suffix('\n')
+        .expect("the document ends its line");
+    assert!(!line.contains('\n'), "one line: {stdout}");
+    serde_json::from_str(line).expect("the document is JSON")
+}
+
+#[test]
+fn changes_prints_one_document_with_json() {
+    let dir = common::scratch_dir("fcage-changes-json");
+    if layers(&dir).is_none() {
+        return;
+    }
+    let out = fcage(&[
+        "--changes".as_ref(),
+        dir.join("upper").as_os_str(),
+        "--overlay-lower".as_ref(),
+        dir.join("lower").as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        document(&out),
+        serde_json::json!({"changes": [
+            {"kind": "added", "path": ".envrc", "now": "file", "size": 11, "readable": true},
+            {"kind": "removed", "path": "gone", "before": "file", "readable": true},
+            {"kind": "modified", "path": "keep", "before": "file", "now": "file", "size": 6,
+             "differs": ["content"], "readable": true},
+            {"kind": "added", "path": "new", "now": "file", "size": 6, "readable": true},
+        ]})
+    );
+}
+
+#[test]
+fn a_path_that_is_not_utf_8_is_listed_as_its_bytes() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = common::scratch_dir("fcage-changes-json-bytes");
+    let (lower, upper) = (dir.join("lower"), dir.join("upper"));
+    std::fs::create_dir(&lower).unwrap();
+    std::fs::create_dir(&upper).unwrap();
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9");
+    std::fs::write(upper.join(name), "x").unwrap();
+    let out = fcage(&[
+        "--changes".as_ref(),
+        upper.as_os_str(),
+        "--overlay-lower".as_ref(),
+        lower.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    // Base64 of the four bytes, which a reader takes back exactly.
+    assert_eq!(
+        document(&out)["changes"][0]["path"],
+        serde_json::json!({"base64": "Y2Fm6Q=="})
+    );
+    // The text quotes it, escaped.
+    let text = fcage(&[
+        "--changes".as_ref(),
+        upper.as_os_str(),
+        "--overlay-lower".as_ref(),
+        lower.as_os_str(),
+    ]);
+    assert_eq!(String::from_utf8_lossy(&text.stdout), "A \"caf\\xE9\"\n");
+}
+
+#[test]
+fn a_change_the_reader_cannot_read_is_marked_in_both_forms() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if rustix::process::geteuid().is_root() {
+        common::require::premise_unmet(
+            "root reads a file of mode 000, so nothing is unreadable to it",
+        );
+        return;
+    }
+    let dir = common::scratch_dir("fcage-changes-unreadable");
+    let (lower, upper) = (dir.join("lower"), dir.join("upper"));
+    std::fs::create_dir(&lower).unwrap();
+    std::fs::create_dir(&upper).unwrap();
+    std::fs::write(lower.join("f"), "same\n").unwrap();
+    std::fs::write(upper.join("f"), "same\n").unwrap();
+    std::fs::set_permissions(upper.join("f"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let list = |json: bool| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "--changes".as_ref(),
+            upper.as_os_str(),
+            "--overlay-lower".as_ref(),
+            lower.as_os_str(),
+        ];
+        if json {
+            args.push("--json".as_ref());
+        }
+        fcage(&args)
+    };
+    let (text, json) = (list(false), list(true));
+    std::fs::set_permissions(upper.join("f"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(text.status.success(), "{text:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout),
+        "M \"f\" content,mode unreadable\n"
+    );
+    assert!(json.status.success(), "{json:?}");
+    assert_eq!(
+        document(&json),
+        serde_json::json!({"changes": [
+            {"kind": "modified", "path": "f", "before": "file", "now": "file", "size": 5,
+             "differs": ["content", "mode"], "readable": false},
+        ]})
+    );
+}
+
+#[test]
+fn apply_changes_prints_what_it_refused_or_wrote_as_one_document() {
+    let dir = common::scratch_dir("fcage-apply-changes-json");
+    if layers(&dir).is_none() {
+        return;
+    }
+    let (lower, upper) = (dir.join("lower"), dir.join("upper"));
+    // A named pipe the run made, which an apply passes over.
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        upper.join("pipe"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .expect("the named pipe is made");
+    let apply = |extra: &[&str]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "--apply-changes".as_ref(),
+            upper.as_os_str(),
+            "--overlay-lower".as_ref(),
+            lower.as_os_str(),
+            "--to".as_ref(),
+            lower.as_os_str(),
+            "--json".as_ref(),
+        ];
+        args.extend(extra.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+        fcage(&args)
+    };
+
+    // A refusal is still a failure, and standard error says so once; the
+    // refusals themselves are the document's.
+    let refused = apply(&[]);
+    assert_eq!(refused.status.code(), Some(125), "{refused:?}");
+    assert_eq!(
+        document(&refused),
+        serde_json::json!({
+            "applied": [],
+            "skipped": [],
+            "refused": [{
+                "path": ".envrc",
+                "reason": "protected",
+                "protected-name": ".envrc",
+                "text": "fcage: refused \".envrc\": it touches the name \".envrc\" at any depth",
+            }],
+        })
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("nothing was written"), "{stderr}");
+    assert!(!lower.join("new").exists(), "nothing is written");
+
+    // What the text says on standard error of a path passed over is the
+    // document's too.
+    let applied = apply(&[
+        "--only", "keep", "--only", "gone", "--only", "new", "--only", "pipe",
+    ]);
+    assert!(applied.status.success(), "{applied:?}");
+    assert!(applied.stderr.is_empty(), "{applied:?}");
+    assert_eq!(
+        document(&applied),
+        serde_json::json!({
+            "applied": ["gone", "keep", "new"],
+            "skipped": ["pipe"],
+            "refused": [],
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(lower.join("keep")).unwrap(),
+        "upper\n"
+    );
+}
+
 #[test]
 fn the_change_modes_take_their_own_flags_alone() {
     let out = fcage(&[

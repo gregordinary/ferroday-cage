@@ -72,7 +72,8 @@ fcage --remove-overlay-upper ./run-42 --identity-map single
 
 `fcage --host-report` prints what the host offers a sandbox, as TOML, and
 `--print-resolved` prints the inputs a launch's flags and profile resolve to,
-without starting it.
+without starting it. Given `--json`, each of these listings, and `--changes` and
+`--apply-changes`, prints one JSON document instead.
 
 For a program driving `fcage`, `--events PATH` writes what `fcage` says of its own to `PATH`
 as events, one JSON object per line. Standard error is left to the command. The command's
@@ -151,6 +152,9 @@ With a profile file, the sandbox specification is configuration rather than a co
 ```sh
 fcage --profile ./build.toml -- /usr/bin/make
 ```
+
+A profile is TOML, or JSON in the same schema where its first character is `{`. A program
+passes one through a descriptor, as `--profile /dev/fd/3`.
 
 `--restricted-profile` is the path for a profile from a source you do not control. It
 refuses the keys that map host resources in, write to the host, or share a host namespace,

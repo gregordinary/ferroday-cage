@@ -255,6 +255,22 @@ pub fn print_stdout(
     ExitCode::from(stdout_status(subject, written))
 }
 
+/// Writes a listing as one JSON document on a line of its own, what `--json`
+/// prints, and returns the exit code its write earned, as [`print_stdout`]
+/// does.
+///
+/// A document that cannot be written as JSON, which only a map with keys
+/// other than strings is, fails the invocation, naming `subject`.
+pub fn print_json(subject: &str, document: &impl serde::Serialize) -> ExitCode {
+    match serde_json::to_vec(document) {
+        Ok(mut line) => {
+            line.push(b'\n');
+            print_stdout(subject, |out| out.write_all(&line))
+        }
+        Err(error) => crate::fail(format!("cannot render {subject} as JSON: {error}")),
+    }
+}
+
 /// What output on standard output exits with, given how its writes ended.
 ///
 /// Separate from [`print_stdout`] because that one owns the process's own

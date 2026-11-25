@@ -120,6 +120,22 @@ consumer upgrading can skip it.
   event standard error would have carried as a line has that line as `text`.
   Bytes that are not UTF-8 are written as `{"base64": ...}`. A program passes
   a pipe as `/dev/fd/N`, and a file is appended to (`ferroday-cage-cli`).
+- `fcage --profile` and `--restricted-profile` read a profile written in JSON
+  as well as TOML, in the same schema, and take one whose first character past
+  whitespace is `{` as JSON. A program passes one through a descriptor as
+  `/dev/fd/N`. A JSON profile holds only what a TOML one can: a key stated
+  twice, a `null` and an integer beyond TOML's are refused
+  (`ferroday-cage-cli`).
+- `fcage --json` prints a listing as one JSON document on a line of its own.
+  `--host-report` and `--print-resolved` print their TOML document as JSON,
+  with the same keys. `--changes` prints each change with its kind, its path,
+  the entry's type before and after, its size, what a modified entry differs
+  in, and whether it was read whole. `--apply-changes` prints the paths it
+  wrote and those it passed over, or, where it is refused, each refusing
+  change with its reason, the protected path or name it touches, and the line
+  the text says it in, and still exits 125. A path that is not UTF-8 is
+  written as `{"base64": ...}`. A launch takes `--json` only beside
+  `--print-resolved` (`ferroday-cage-cli`).
 - What a run wrote through an overlay can be read as a list of changes:
   `provision::ChangeSet::read` walks an `Overlay`'s upper against its lowers
   and lists each `Change` by path, added, modified, removed or replaced

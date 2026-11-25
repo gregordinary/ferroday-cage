@@ -1023,7 +1023,10 @@ keeps whiteouts, opaque markers, holes, shared inodes, modes and times. Copy an
 upper no sandbox is writing.
 
 On the command line, `--changes` prints a change set, one change a line, and
-`--apply-changes` writes one into a tree:
+`--apply-changes` writes one into a tree. With `--json`, each prints one JSON
+document instead. The listing gives each change's parts as members. The apply
+gives the paths it wrote or passed over, or each change that refused it and
+why. A path that is not UTF-8 is written as `{"base64": "..."}`.
 
 ```sh
 fcage --changes ./run-42 --overlay-lower ~/project

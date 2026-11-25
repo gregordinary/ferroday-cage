@@ -3,8 +3,8 @@
 With the library's `serde` feature, the sandbox specification — the builder
 itself — serializes and deserializes. A profile is a sandbox described in a
 file: a versionable, reviewable artifact that any consumer can load, in any
-serde format. The `fcage` binary loads TOML profiles with `--profile`; a
-program does the same in three lines:
+serde format. The `fcage` binary loads TOML and JSON profiles with
+`--profile`; a program does the same in three lines:
 
 ```rust,no_run
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -566,6 +566,12 @@ fcage --profile build.toml -- /bin/sh -c 'ls /build'
 # The profile with the network cut off:
 fcage --profile build.toml --isolate-net
 ```
+
+A profile whose first character past whitespace is `{` is JSON, in the same
+schema, and any other is TOML. A program can pass one through a descriptor, as
+`--profile /dev/fd/3`. A JSON profile holds only what a TOML one can: a key
+stated twice, a `null`, and an integer past TOML's range are refused. Its
+`[netstack]` table is a `netstack` member.
 
 `--profile` trusts the file like a script: it can bind any host path, issue
 raw mounts, share the host network, and share the host PID namespace. Load only
