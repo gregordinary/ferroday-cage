@@ -38,7 +38,7 @@ use super::copyin::Translation;
 use super::identity::compose_child_map;
 use super::tar::{
     BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
-    pax_record, ustar_block, xattr_keyword,
+    pax_header_block, pax_record, ustar_block, xattr_keyword,
 };
 use super::xattr::{ACCESS_ACL, Acl, AclFlaw, DEFAULT_ACL};
 use super::{Delegate, ProvisionError};
@@ -1103,13 +1103,7 @@ impl<'f, W: Write> TarWriter<'f, W> {
 
     /// Writes the header of a pax extended-header entry (typeflag `x`).
     fn write_pax_header(&mut self, path: &[u8], mtime: i64, size: usize) -> io::Result<()> {
-        // The name is cosmetic — the reader keys on the typeflag — but a
-        // path-derived one keeps `tar tvf` legible.
-        let mut name = b"PaxHeaders/".to_vec();
-        name.extend_from_slice(path);
-        let name = &name[..name.len().min(MAX_USTAR_NAME)];
-        let block = ustar_block(name, &[], 0o644, 0, 0, size as u64, mtime, b'x', &[])?;
-        self.out.write_all(&block)
+        self.out.write_all(&pax_header_block(path, mtime, size)?)
     }
 }
 

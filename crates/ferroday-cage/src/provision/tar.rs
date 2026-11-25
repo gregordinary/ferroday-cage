@@ -1254,6 +1254,22 @@ pub(crate) fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The header of a pax extended-header entry (typeflag `x`) carrying `size`
+/// bytes of [records](pax_record) for the entry at `path`, which follows it.
+///
+/// The header's own name is cosmetic, since a reader keys on the typeflag, and
+/// a path-derived one keeps `tar tvf` legible.
+pub(crate) fn pax_header_block(
+    path: &[u8],
+    mtime: i64,
+    size: usize,
+) -> io::Result<[u8; BLOCK as usize]> {
+    let mut name = b"PaxHeaders/".to_vec();
+    name.extend_from_slice(path);
+    let name = &name[..name.len().min(MAX_USTAR_NAME)];
+    ustar_block(name, &[], 0o644, 0, 0, size as u64, mtime, b'x', &[])
+}
+
 /// Writes the zero padding after `size` bytes of data, up to the next block.
 pub(crate) fn pad(out: &mut impl Write, size: u64) -> io::Result<()> {
     let rem = (size % BLOCK) as usize;

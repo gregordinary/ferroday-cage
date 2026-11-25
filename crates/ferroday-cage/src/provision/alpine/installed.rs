@@ -789,11 +789,16 @@ impl Database {
     /// kilobytes of shell script left uncompressed, and what it saves is a
     /// compressor this crate would otherwise carry only for this file.
     ///
+    /// A name longer than a ustar header's name field, which a package whose
+    /// name and version run past forty-odd bytes has, is carried in a pax
+    /// `path` record ahead of its header, the field holding a truncated form.
+    /// `apk` reads the record, and the name is the whole of how it finds the
+    /// script.
+    ///
     /// A [carried](Self::carrying) base's archive is appended whole, so its
     /// terminator ends the file and its members are carried byte for byte. That
     /// is why this database's own members are written first: the base's archive
-    /// is not this layer's to re-encode, and a script name can be longer than a
-    /// header field it would then have to be re-encoded into.
+    /// is not this layer's to re-encode.
     pub(super) fn scripts(&self) -> io::Result<Vec<u8>> {
         let mut order: Vec<&Record> = self.records.iter().collect();
         order.sort_by(|a, b| a.name.cmp(&b.name));
@@ -801,24 +806,16 @@ impl Database {
         for record in order {
             for (kind, body) in &record.scripts {
                 let name = script_name(record, *kind);
-                // A name past the header field is refused rather than written
-                // truncated: `apk` looks a script up by exactly this name, so a
-                // truncated one is a script the finished root has and cannot
-                // run. Nothing Alpine publishes comes near the limit — the
-                // longest name in `main` is a package that carries no script at
-                // all — and a refusal names the package if one ever does.
+                let mtime = record.build_time.unwrap_or(0) as i64;
                 if name.len() > tar::MAX_USTAR_NAME {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "the name apk looks {}'s {} script up by is {} bytes, past the {} a \
-                             tar header holds",
-                            record.name,
-                            kind.name(),
-                            name.len(),
-                            tar::MAX_USTAR_NAME,
-                        ),
-                    ));
+                    let records = tar::pax_record(b"path", name.as_bytes());
+                    out.write_all(&tar::pax_header_block(
+                        name.as_bytes(),
+                        mtime,
+                        records.len(),
+                    )?)?;
+                    out.write_all(&records)?;
+                    tar::pad(&mut out, records.len() as u64)?;
                 }
                 out.write_all(&tar::ustar_block(
                     name.as_bytes(),
@@ -827,7 +824,7 @@ impl Database {
                     0,
                     0,
                     body.len() as u64,
-                    record.build_time.unwrap_or(0) as i64,
+                    mtime,
                     b'0',
                     &[],
                 )?)?;
@@ -1196,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn a_script_name_past_the_header_field_is_refused_rather_than_truncated() {
+    fn a_script_name_past_the_header_field_is_carried_whole() {
         // `apk` looks a script up by exactly the name it is archived under, so a
         // truncated one is a script the finished root holds and cannot run.
         let long = "a".repeat(60);
@@ -1205,10 +1202,19 @@ mod tests {
             record(&info(&long, "1.0.0-r0", ""))
                 .with_scripts(vec![(ScriptKind::PostInstall, b"#!/bin/sh\n".to_vec())]),
         );
-        let Err(err) = database.scripts() else {
-            panic!("the name is past the field");
-        };
-        assert!(err.to_string().contains(&long), "{err}");
+        let archive = database.scripts().expect("the archive is written");
+        let mut reader = crate::provision::tar::TarReader::in_memory(&archive[..]);
+        let entry = reader
+            .next_entry()
+            .expect("the archive parses")
+            .expect("the script is there");
+        let name = format!("{long}-1.0.0-r0.X1{}.post-install", "0".repeat(40));
+        assert!(name.len() > crate::provision::tar::MAX_USTAR_NAME);
+        assert_eq!(entry.path, name.as_bytes());
+        let mut body = vec![0; 16];
+        let read = reader.read_data(&mut body).expect("the body reads");
+        assert_eq!(&body[..read], b"#!/bin/sh\n");
+        assert!(reader.next_entry().expect("the archive parses").is_none());
     }
 
     #[test]

@@ -530,6 +530,10 @@ consumer upgrading can skip it.
   chosen alternative carried no ordering, so it could merge after the package
   that needs it, which the order of merge ordinals, and what a wave that fails
   part way leaves behind, then showed.
+- The Alpine provisioner archives a package script whose name is longer than a
+  tar header's name field under a pax `path` record, which `apk` reads. It
+  refused the bootstrap instead, so a package whose name and version ran past
+  about 44 bytes could not be installed with its scripts.
 
 ### Internal
 

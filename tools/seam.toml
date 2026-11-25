@@ -463,9 +463,10 @@ why = "A tar member, as the reader `Tarball` uses reads it."
 
 [[reach]]
 item = "provision::tar::MAX_USTAR_NAME"
-code = 2
+code = 1
+tests = 1
 cost = "share"
-why = "The longest name a ustar header holds, for `scripts.tar`."
+why = "The longest name a ustar header holds, past which `scripts.tar` carries a pax `path` record."
 
 [[reach]]
 item = "provision::tar::TarReader"
@@ -476,7 +477,7 @@ why = "The tar reader `Tarball` uses: a `.deb`'s members, an apk's segments, a b
 [[reach]]
 item = "provision::tar::TarReader::in_memory"
 code = 1
-tests = 3
+tests = 4
 cost = "share"
 why = "As above, over bytes already read."
 
@@ -495,9 +496,21 @@ why = "A reader failure carried through a `Read`, for tar within tar."
 
 [[reach]]
 item = "provision::tar::pad"
+code = 2
+cost = "share"
+why = "The padding after a member's data, and after a pax header's records, for `scripts.tar`."
+
+[[reach]]
+item = "provision::tar::pax_header_block"
 code = 1
 cost = "share"
-why = "The padding after a member's data, for `scripts.tar`."
+why = "The header of a pax record block, for a long `scripts.tar` name."
+
+[[reach]]
+item = "provision::tar::pax_record"
+code = 1
+cost = "share"
+why = "The pax `path` record a long `scripts.tar` name is carried in."
 
 [[reach]]
 item = "provision::tar::read_failure"
