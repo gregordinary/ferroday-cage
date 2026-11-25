@@ -327,28 +327,24 @@ fn mount_by_fd_path(layers: &OverlayLayers<'_>) -> Result<OwnedFd, Errno> {
     )?;
     fs::mkdirat(&scratch, OVERLAY_MOUNT_POINT, Mode::from_raw_mode(0o700))?;
     attach_over_root(scratch.as_fd())?;
-    let clone = fs::openat(
-        &scratch,
-        OVERLAY_MOUNT_POINT,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .and_then(|at| {
-        mount::mount(
-            c"overlay",
-            fd_path(&at).as_cstr(),
-            c"overlay",
-            MountFlags::NOSUID,
-            options.as_cstr(),
-        )
-    })
-    .and_then(|()| {
-        mount::open_tree(
-            &scratch,
-            OVERLAY_MOUNT_POINT,
-            mount::OpenTreeFlags::OPEN_TREE_CLONE | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC,
-        )
-    });
+    let clone =
+        crate::provision::containment::open_child_dir(&scratch, OVERLAY_MOUNT_POINT, OFlags::PATH)
+            .and_then(|at| {
+                mount::mount(
+                    c"overlay",
+                    fd_path(&at).as_cstr(),
+                    c"overlay",
+                    MountFlags::NOSUID,
+                    options.as_cstr(),
+                )
+            })
+            .and_then(|()| {
+                mount::open_tree(
+                    &scratch,
+                    OVERLAY_MOUNT_POINT,
+                    mount::OpenTreeFlags::OPEN_TREE_CLONE | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC,
+                )
+            });
     let detached = mount::unmount(fd_path(&scratch).as_cstr(), UnmountFlags::DETACH);
     let clone = clone?;
     detached?;

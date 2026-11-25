@@ -732,7 +732,7 @@ impl Walk<'_> {
                 // symlink between the stat above and this open is refused here
                 // rather than descended through. Opened before the frame, so
                 // the attributes it announces are the directory's own.
-                let child = openat_nofollow(dir, &leaf, OFlags::DIRECTORY, &entry)?;
+                let child = open_dir_below(dir, &leaf, &entry)?;
                 let attributes = self.attributes(Holder::Fd(child.as_fd()), kind, &meta, &entry)?;
                 self.emit_named(stream, COPY_DIR, &name, &meta, attributes.mode, &entry)?;
                 let restore = self.prefix.len();
@@ -1244,24 +1244,17 @@ fn open_typed_file(
     })
 }
 
-/// Opens `name` under `dir`, following no symbolic link at it.
-///
-/// `extra` carries `O_DIRECTORY` where a directory is what was typed, so an
-/// entry that has since become something else is refused by the kernel rather
-/// than read as whatever it now is.
-fn openat_nofollow(
+/// Opens the directory `name` under `dir` for reading, following no symbolic
+/// link at it ([`containment::open_child_dir`]): an entry typed a directory
+/// that has since become something else is refused by the kernel rather than
+/// read as whatever it now is. `subject` names it in a failure.
+fn open_dir_below(
     dir: BorrowedFd<'_>,
     name: &CStr,
-    extra: OFlags,
     subject: &Path,
 ) -> Result<OwnedFd, ProvisionError> {
-    fs::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | extra,
-        fs::Mode::empty(),
-    )
-    .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))
+    containment::open_child_dir(dir, name, OFlags::RDONLY)
+        .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))
 }
 
 /// Every entry name `dir` holds, `.` and `..` left out.
@@ -1276,7 +1269,7 @@ pub(super) fn read_names(
     // A `Dir` consumes its descriptor's offset, so it is handed one of its own,
     // `.` opened relative to the walk's: the caller goes on resolving every
     // entry against the descriptor it already holds.
-    let handle = openat_nofollow(dir, c".", OFlags::DIRECTORY, subject)?;
+    let handle = open_dir_below(dir, c".", subject)?;
     let mut names = Vec::new();
     for entry in fs::Dir::new(handle)
         .map_err(|errno| ProvisionError::io("reading", subject, errno.into()))?
@@ -1399,18 +1392,13 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("outside/secret"), dir.join("source/as-file")).unwrap();
 
         let source = open_source(&dir.join("source")).expect("the source opens");
-        for (name, extra) in [
-            (c"as-dir", OFlags::DIRECTORY),
-            (c"as-file", OFlags::empty()),
-        ] {
-            assert!(
-                openat_nofollow(source.as_fd(), name, extra, &dir).is_err(),
-                "{name:?} was opened through a symlink",
-            );
-        }
+        assert!(
+            open_dir_below(source.as_fd(), c"as-dir", &dir).is_err(),
+            "a directory was opened through a symlink",
+        );
         // What is not a symlink still opens, so the refusal is the link's doing.
-        openat_nofollow(source.as_fd(), c"own", OFlags::empty(), &dir)
-            .expect("an ordinary file opens");
+        let scratch = open_source(dir.path()).expect("the scratch directory opens");
+        open_dir_below(scratch.as_fd(), c"outside", &dir).expect("an ordinary directory opens");
 
         // And the listing comes from the descriptor: a source directory
         // replaced by a symlink after it was opened is not what gets listed.

@@ -486,6 +486,7 @@ report name a package and its version bare.
 | What directory is a path's final component named in, as a path an `open` takes? | `path::parent_of` |
 | Resolve a path the kernel keeps inside a tree, retrying a raced walk | `mechanism::resolve::openat2` |
 | Open a directory inside a tree being provisioned | `provision::containment::open_dir`, or `containment::open_dir_path` after a fork |
+| Open the directory one name of a held directory holds, never through a link | `provision::containment::open_child_dir`, after a fork as well |
 | Create the missing directories of a chain inside a tree | `provision::containment::create_dirs` |
 | Replace whatever holds a name in a tree with a new entry, an empty directory included | `provision::containment::replacing`, over `containment::remove_at`, and `containment::link_replacing` for a hard link, to which a name already holding its target is done |
 | Write into an overlay upper where the mounted overlay would place it | `provision::containment::copy_up`, which the extractor and `Rooted::over` take over a base |
@@ -542,7 +543,7 @@ report name a package and its version bare.
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
 | Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
-| Write a tar header block, or one pax extended-header record | `provision::tar::ustar_block`, `tar::pax_record` |
+| Write a tar header block, one pax extended-header record, or the header of a block of them | `provision::tar::ustar_block`, `tar::pax_record`, `tar::pax_header_block` |
 | Which compression does a stream begin with, and what does it decode to? | `provision::compress::decoder`, or `compress::Codec::of` for a document already in memory, and `compress::lzma` for a stream its container names as LZMA, which carries no magic |
 | Decompress a document held in memory, bounded, telling a stream the decoder refuses from one that decodes past the bound | `provision::compress::inflate` |
 | Fill a buffer from a reader, short only at the end of its input | `provision::compress::read_fully` |

@@ -288,12 +288,7 @@ pub(crate) fn delete_tree(parent: BorrowedFd<'_>, leaf: &CStr) -> Result<(), Err
     // EPERM is only a guess at "directory": an immutable file is refused the
     // same way. Where the open proves it was not one, the first refusal is the
     // honest diagnostic, not the ENOTDIR that disproved the guess.
-    let start = match fs::openat(
-        parent,
-        leaf,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    let start = match crate::provision::containment::open_child_dir(parent, leaf, OFlags::RDONLY) {
         Ok(start) => start,
         Err(Errno::NOENT) => return Ok(()),
         Err(Errno::NOTDIR) => return Err(refused),
@@ -334,14 +329,10 @@ pub(crate) fn delete_tree(parent: BorrowedFd<'_>, leaf: &CStr) -> Result<(), Err
                         // parent's next pass removes it outright and no
                         // directory is visited twice.
                         Err(Errno::NOTEMPTY | Errno::EXIST) => {
-                            let child = fs::openat(
+                            let child = crate::provision::containment::open_child_dir(
                                 &current,
                                 name,
-                                OFlags::RDONLY
-                                    | OFlags::DIRECTORY
-                                    | OFlags::NOFOLLOW
-                                    | OFlags::CLOEXEC,
-                                Mode::empty(),
+                                OFlags::RDONLY,
                             )?;
                             current = child;
                             continue 'walk;

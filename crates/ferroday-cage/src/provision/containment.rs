@@ -288,12 +288,20 @@ fn make_dir(parent: BorrowedFd<'_>, leaf: &CStr) -> Result<OwnedFd, Errno> {
     open_child_dir(parent, leaf, OFlags::RDONLY)
 }
 
-/// Opens the directory `leaf` of `parent` itself, never through a link.
+/// Opens the directory `leaf` of `parent` itself, never through a link, for
+/// `access`: `O_RDONLY` to act on the directory or list it, `O_PATH` to
+/// resolve from it.
 ///
 /// One component from a descriptor the caller already holds inside the tree,
 /// so there is nothing for a resolve flag to contain: `O_NOFOLLOW` keeps the
-/// open on the entry that is there.
-fn open_child_dir(parent: BorrowedFd<'_>, leaf: &CStr, access: OFlags) -> Result<OwnedFd, Errno> {
+/// open on the entry that is there, and `O_DIRECTORY` refuses anything else
+/// that took the name. Given a `&CStr`, it allocates nothing, so a post-fork
+/// child calls it.
+pub(crate) fn open_child_dir(
+    parent: impl AsFd,
+    leaf: impl rustix::path::Arg,
+    access: OFlags,
+) -> Result<OwnedFd, Errno> {
     rustix::fs::openat(
         parent,
         leaf,

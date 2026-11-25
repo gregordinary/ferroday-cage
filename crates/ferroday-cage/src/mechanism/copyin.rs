@@ -752,13 +752,8 @@ fn enter_dir(
     name: &CStr,
 ) -> Result<(OwnedFd, bool), (CopyStep, Errno)> {
     let open = || {
-        fs::openat(
-            current,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| (CopyStep::OpenDir, errno))
+        crate::provision::containment::open_child_dir(current, name, OFlags::RDONLY)
+            .map_err(|errno| (CopyStep::OpenDir, errno))
     };
     let create = || {
         fs::mkdirat(current, name, Mode::from_bits_truncate(0o700))

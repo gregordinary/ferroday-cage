@@ -592,13 +592,9 @@ impl<'a> Walker<'a> {
             .map_err(|e| on_entry((ExportStep::Stat, e)))?;
         match FileType::from_raw_mode(stat.st_mode) {
             FileType::Directory => {
-                let child = fs::openat(
-                    dir,
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|e| on_entry((ExportStep::Open, e)))?;
+                let child =
+                    crate::provision::containment::open_child_dir(dir, name, OFlags::RDONLY)
+                        .map_err(|e| on_entry((ExportStep::Open, e)))?;
                 // Emit the directory (with its xattrs) before descending; the
                 // 64 KiB xattr buffers are freed on return, so they never
                 // overlap the recursion's stack.

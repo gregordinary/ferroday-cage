@@ -2489,12 +2489,7 @@ fn join_anonymous_session_keyring() -> Result<(), Errno> {
 fn create_mount_dir(dir: BorrowedFd<'_>, leaf: &CStr, mode: Mode) -> Result<(), Errno> {
     match fs::mkdirat(dir, leaf, mode) {
         Ok(()) => {
-            let created = fs::openat(
-                dir,
-                leaf,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?;
+            let created = crate::provision::containment::open_child_dir(dir, leaf, OFlags::RDONLY)?;
             fs::fchmod(&created, mode)
         }
         Err(Errno::EXIST) => Ok(()),

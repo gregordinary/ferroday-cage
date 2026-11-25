@@ -4818,13 +4818,9 @@ fn create_layer_dir(
         // would follow a link put there to the file it names.
         Ok(()) => {
             created.record(path.clone());
-            let made = rustix::fs::openat(
-                &dirfd,
-                &at.name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|errno| overlay_unusable(layer, &path, errno))?;
+            let made =
+                crate::provision::containment::open_child_dir(&dirfd, &at.name, OFlags::RDONLY)
+                    .map_err(|errno| overlay_unusable(layer, &path, errno))?;
             rustix::fs::fchmod(&made, Mode::from_raw_mode(OVERLAY_DIR_MODE))
                 .map_err(|errno| overlay_unusable(layer, &path, errno))?;
         }

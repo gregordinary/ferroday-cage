@@ -954,13 +954,8 @@ fn make_replacement_dir(
         |errno: Errno| ProvisionError::io("creating", bytes_to_path(entry_path), errno.into());
     rustix::fs::mkdirat(parent, leaf, Mode::from_raw_mode(0o700)).map_err(creating)?;
     if tree.lower.is_some() {
-        let dir = rustix::fs::openat(
-            parent,
-            leaf,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(creating)?;
+        let dir = crate::provision::containment::open_child_dir(parent, leaf, OFlags::RDONLY)
+            .map_err(creating)?;
         containment::mark_opaque(dir.as_fd()).map_err(creating)?;
     }
     Ok(())
@@ -990,13 +985,9 @@ fn refuse_superseding_a_base_directory(
     match rustix::fs::statat(&parent.dir, leaf, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) if FileType::from_raw_mode(stat.st_mode) != FileType::Directory => return Ok(()),
         Ok(_) => {
-            let own = rustix::fs::openat(
-                &parent.dir,
-                leaf,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(inspecting)?;
+            let own =
+                crate::provision::containment::open_child_dir(&parent.dir, leaf, OFlags::RDONLY)
+                    .map_err(inspecting)?;
             if containment::is_opaque(own.as_fd()).map_err(inspecting)? {
                 return Ok(());
             }
@@ -1763,11 +1754,10 @@ fn overlay_dir(
                 overlay_symlink(tree, &target, &components, dir_meta)?;
             }
             FileType::Directory => {
-                let dir = rustix::fs::openat(
+                let dir = crate::provision::containment::open_child_dir(
                     &level.dir,
                     &leaf,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
+                    OFlags::RDONLY,
                 )
                 .map_err(|errno| {
                     ProvisionError::io("reading the overlay directory", &entry, errno.into())

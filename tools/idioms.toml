@@ -445,6 +445,21 @@ count = 1
 why = "The answer."
 
 [[idiom]]
+name = "a held directory's child opened by hand"
+# The flags in the order every caller spelled them, which is what a hand-written
+# open of this shape copies.
+pattern = 'DIRECTORY \| OFlags::NOFOLLOW'
+answer = """\
+`provision::containment::open_child_dir`, which opens one name of a directory \
+the caller holds, never through a link and only as a directory, and allocates \
+nothing given a `&CStr`, so a post-fork child calls it too."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/provision/containment.rs"
+count = 1
+why = "The answer."
+
+[[idiom]]
 name = "a staging file created by hand"
 # The answer creates its file relative to the directory it holds, with
 # `openat`, which this does not match, so it records no site of its own.
