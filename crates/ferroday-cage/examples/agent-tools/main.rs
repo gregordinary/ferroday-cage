@@ -1458,7 +1458,12 @@ mod tests {
         );
 
         let config = parse_run(&["--relax", "unshare", "--relax=clone", "bwrap"]);
-        assert_eq!(config.relax, [libc::SYS_unshare, libc::SYS_clone]);
+        // `libc`'s syscall numbers are a C `long`, 32 bits on some targets, and
+        // a relaxation is kept as an `i64`: the conversion is a widening there
+        // and the identity elsewhere, so `allow` rather than `expect`.
+        #[allow(clippy::useless_conversion)]
+        let relaxed = [i64::from(libc::SYS_unshare), i64::from(libc::SYS_clone)];
+        assert_eq!(config.relax, relaxed);
 
         let config = parse_run(&[
             "--empty-root",

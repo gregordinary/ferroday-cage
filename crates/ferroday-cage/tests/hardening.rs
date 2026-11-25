@@ -774,10 +774,15 @@ fn keeping_a_capability_retains_only_it() {
 // Seccomp reports: each call the filter refuses, answered by the caller.
 // ---------------------------------------------------------------------------
 
+// The helpers below serve the report tests alone, which run on 64-bit targets,
+// so each is built only there.
+
 /// Collects the command's standard output.
+#[cfg(target_pointer_width = "64")]
 #[derive(Default)]
 struct Collected(Vec<u8>);
 
+#[cfg(target_pointer_width = "64")]
 impl ferroday_cage::Observer for Collected {
     fn stdout(&mut self, chunk: &[u8]) {
         self.0.extend_from_slice(chunk);
@@ -787,6 +792,7 @@ impl ferroday_cage::Observer for Collected {
 /// Every report a stream holds, read to its end, which comes once no process
 /// the filter governs is left; a stream that has not ended within ten seconds
 /// fails the test.
+#[cfg(target_pointer_width = "64")]
 fn drained(
     reports: ferroday_cage::Reports<ferroday_cage::SeccompReport>,
 ) -> Vec<ferroday_cage::SeccompReport> {
@@ -803,6 +809,7 @@ fn drained(
 }
 
 /// The syscall a report names, and the errno it answered.
+#[cfg(target_pointer_width = "64")]
 fn named(report: &ferroday_cage::SeccompReport) -> (Option<&'static str>, u16) {
     match report {
         ferroday_cage::SeccompReport::Denied { name, errno, .. } => (*name, *errno),
@@ -811,6 +818,7 @@ fn named(report: &ferroday_cage::SeccompReport) -> (Option<&'static str>, u16) {
 }
 
 /// How a test launches its sandbox: spawned, or held at the gate and released.
+#[cfg(target_pointer_width = "64")]
 #[derive(Debug, Clone, Copy)]
 enum Launch {
     Spawned,
@@ -820,6 +828,7 @@ enum Launch {
 /// Runs `script` under the fixture's busybox with `policy`, its refusals
 /// reported where `reports` says so, and returns its standard output and the
 /// reports read to their end.
+#[cfg(target_pointer_width = "64")]
 fn reported_run(
     rootfs: &Path,
     script: &str,
