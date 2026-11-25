@@ -1921,6 +1921,42 @@ fn an_exported_access_control_list_is_applied_where_the_archive_is_extracted() {
     );
 }
 
+/// Read through a map that does not hold a user an access control list names,
+/// the list names the id that stands for no one in that user's place, which no
+/// extraction could set. The export refuses the entry rather than record it.
+#[test]
+fn an_export_refuses_a_list_naming_a_user_the_map_does_not_hold() {
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("acl-unmapped");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let secret = root.join("secret");
+    std::fs::write(&secret, b"for one user\n").unwrap();
+    // Any user but the caller is one the single map has no id for.
+    let other = rustix::process::geteuid().as_raw().wrapping_add(4242);
+    let list = xattr::acl(&[
+        (0x01, 6, xattr::NO_ID),
+        (0x02, 6, other),
+        (0x04, 0, xattr::NO_ID),
+        (0x10, 6, xattr::NO_ID),
+        (0x20, 0, xattr::NO_ID),
+    ]);
+    if !xattr::set(&secret, xattr::ACCESS_ACL, &list) {
+        common::require::FILESYSTEM.skip("this filesystem holds no POSIX access control lists");
+        return;
+    }
+
+    match provision::export_tar(&root, &mut Vec::new(), IdentityMap::Single) {
+        Err(provision::ProvisionError::EntryRefused { path, reason, .. }) => {
+            assert_eq!(path, secret);
+            assert!(reason.contains("another map"), "{reason}");
+        }
+        other => panic!("expected the entry refused, got {other:?}"),
+    }
+}
+
 /// A pax keyword ends at its first `=`, so an attribute whose name holds one is
 /// spelled as GNU tar spells it, `%3D`, with `%` itself as `%25`, and GNU tar
 /// reads it back whole.

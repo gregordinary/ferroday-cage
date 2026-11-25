@@ -27,6 +27,10 @@ consumer upgrading can skip it.
 
 ### Fixed
 
+- An `Export` refuses an entry whose POSIX access control list names a user or
+  group the identity map does not hold, with `ProvisionError::EntryRefused`. The
+  kernel reports such an entry with the id that stands for no one, not the
+  overflow id, so the export recorded a list no extraction could apply.
 - Extraction refuses an entry whose access control list the kernel would not
   store with `ProvisionError::EntryRefused`, naming what is wrong with it, rather
   than failing to set it with an I/O error. A list naming one user or group twice,

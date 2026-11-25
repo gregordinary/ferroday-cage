@@ -38,7 +38,7 @@ use super::tar::{
     BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
     pax_record, ustar_block, xattr_keyword,
 };
-use super::xattr::{ACCESS_ACL, Acl, DEFAULT_ACL};
+use super::xattr::{ACCESS_ACL, Acl, AclFlaw, DEFAULT_ACL};
 use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
 use crate::mechanism::{
@@ -86,15 +86,19 @@ use crate::{IdMapper, IdentityMap};
 /// the walk inspected, before the walk opens it, fails the export too.
 ///
 /// Every entry is read through the map, and the kernel reports an owner the
-/// map does not hold, and an id an access control list names that it does not
-/// hold, as its overflow id: 65534 unless the host sets another. Where the map
-/// holds no inside id 65534, as the single-identity map holds root alone, that
-/// id can only be one the map does not hold, so the export refuses the entry
-/// with [`ProvisionError::EntryRefused`], naming it: the tree was built under
-/// another map. Where the map holds it, as the subordinate map does, it is an
-/// id the tree may mean, and an entry the map does not hold is recorded as
-/// owned by it, indistinguishably. Naming the map the tree was built under is
-/// what keeps an archive from holding such an entry.
+/// map does not hold as its overflow id: 65534 unless the host sets another.
+/// Where the map holds no inside id 65534, as the single-identity map holds
+/// root alone, that id can only be one the map does not hold, so the export
+/// refuses the entry with [`ProvisionError::EntryRefused`], naming it: the tree
+/// was built under another map. Where the map holds it, as the subordinate map
+/// does, it is an id the tree may mean, and an entry the map does not hold is
+/// recorded as owned by it, indistinguishably. Naming the map the tree was
+/// built under is what keeps an archive from holding such an entry.
+///
+/// An id an access control list names that the map does not hold is reported
+/// otherwise: the list's entry holds the id that stands for no one, which no
+/// list the kernel stores holds. An entry whose list names one is refused the
+/// same way under any map.
 ///
 /// A file is archived at its length, a sparse file's holes as the zeros they
 /// read as, and the export holds the archive to no ceiling. A tree untrusted
@@ -523,7 +527,7 @@ fn drive<W: Write>(
     let failed = |e: EncodeError, tar: &TarWriter<'_, _>, meta: &Meta| match e {
         EncodeError::Read(e) => read_err(e),
         EncodeError::Write(e) => write_err(e),
-        EncodeError::Unmapped(reason) => ProvisionError::EntryRefused {
+        EncodeError::Refused(reason) => ProvisionError::EntryRefused {
             path: tar.host_path(rootfs, &meta.name),
             reason,
         },
@@ -742,19 +746,27 @@ impl<'f, W: Write> TarWriter<'f, W> {
         }
     }
 
-    /// Refuses an entry that reads as owned by, or whose access control list
-    /// names, an id of `overflow`.
+    /// Refuses an entry that reads as owned by an id of `overflow`.
     fn overflow(mut self, overflow: Overflow) -> TarWriter<'f, W> {
         self.overflow = overflow;
         self
     }
 
     /// Refuses `meta` where it holds an id the map the export reads through
-    /// does not hold, which [`Overflow`] says how to tell.
+    /// does not hold, which [`Overflow`] says how to tell for an owner, or an
+    /// access control list no extraction could apply.
+    ///
+    /// The kernel reports an id a list names that the map does not hold
+    /// differently from an owner: the entry, with the id that stands for no
+    /// one in place of its own ([`AclFlaw::UnmappedId`]). No list the kernel
+    /// stores holds that id, so such a list is refused wherever it appears,
+    /// whatever the map holds. A list read through the kernel cannot be flawed
+    /// in any other way, and one that somehow were is refused too: the archive
+    /// would record a list no extraction could apply.
     fn check_mapped(&self, meta: &Meta) -> Result<(), EncodeError> {
         let Overflow { uid, gid } = self.overflow;
         if Some(meta.uid) == uid || Some(meta.gid) == gid {
-            return Err(EncodeError::Unmapped(format!(
+            return Err(EncodeError::Refused(format!(
                 "it reads as owned by {}:{}, and the identity map the export reads through \
                  holds neither the owner it has nor that id, which the kernel reports such an \
                  owner as: the tree was built under another map",
@@ -766,20 +778,23 @@ impl<'f, W: Write> TarWriter<'f, W> {
             {
                 continue;
             }
-            let names_overflow = Acl::parse(value).ok().flatten().is_some_and(|acl| {
-                acl.mapped(
-                    |id| (Some(id) != uid).then_some(id),
-                    |id| (Some(id) != gid).then_some(id),
-                )
-                .is_none()
-            });
-            if names_overflow {
-                return Err(EncodeError::Unmapped(format!(
-                    "its {} names an id the identity map the export reads through holds \
-                     neither as itself nor as the id the kernel reports it as: the tree was \
-                     built under another map",
-                    String::from_utf8_lossy(name),
-                )));
+            match Acl::parse(value) {
+                Ok(_) => {}
+                Err(AclFlaw::UnmappedId) => {
+                    return Err(EncodeError::Refused(format!(
+                        "its {} names an id the identity map the export reads through does not \
+                         hold, which the kernel reports as the id that stands for no one: the \
+                         tree was built under another map",
+                        String::from_utf8_lossy(name),
+                    )));
+                }
+                Err(flaw) => {
+                    return Err(EncodeError::Refused(format!(
+                        "its {} is not a list an extraction could apply: {}",
+                        String::from_utf8_lossy(name),
+                        flaw.reason(),
+                    )));
+                }
             }
         }
         Ok(())
@@ -1042,18 +1057,21 @@ enum EncodeError {
     Read(io::Error),
     /// The archive could not be written.
     Write(io::Error),
-    /// The entry holds an id the map does not hold, for the reason given.
-    Unmapped(String),
+    /// The entry cannot be recorded as the tree holds it, for the reason
+    /// given: an id the map does not hold, or an access control list no
+    /// extraction could apply.
+    Refused(String),
 }
 
 /// The ids an export refuses an entry for: the overflow uid and gid, each
 /// where the map the export reads through does not hold it.
 ///
-/// The kernel reports an owner a user namespace's map does not hold, and an id
-/// an access control list names that it does not hold, as the overflow id. A
-/// map that does not hold that id itself has no entry of its own that reads as
-/// it, so one that does is an entry outside the map. A map that holds it
-/// leaves the two indistinguishable, and `None` records nothing to refuse.
+/// The kernel reports an owner a user namespace's map does not hold as the
+/// overflow id. A map that does not hold that id itself has no entry of its
+/// own that reads as it, so one that does is an entry outside the map. A map
+/// that holds it leaves the two indistinguishable, and `None` records nothing
+/// to refuse. An id an access control list names is reported otherwise, and
+/// [`TarWriter::check_mapped`] tells it apart whatever the map holds.
 #[derive(Debug, Clone, Copy, Default)]
 struct Overflow {
     uid: Option<u32>,
@@ -1883,10 +1901,12 @@ mod tests {
             }
         }
 
-        // An access control list naming the id is refused the same way, and
-        // one naming only mapped ids is not.
+        // An access control list naming an id the map does not hold reads with
+        // the id that stands for no one in its place, which is refused under
+        // any map. The overflow id is not how a list reports one, so a list
+        // naming it is a list like any other.
+        use ferroday_cage_testkit::xattr::NO_ID;
         let acl = |named: u32| {
-            use ferroday_cage_testkit::xattr::NO_ID;
             ferroday_cage_testkit::xattr::acl(&[
                 (0x01, 6, NO_ID),
                 (0x04, 4, NO_ID),
@@ -1897,10 +1917,31 @@ mod tests {
         };
         let listed = |named| file((0, 0), &[(ACCESS_ACL.to_bytes(), acl(named))]);
         drive_frames_through(&listed(0), None, single).expect("a list naming root exports");
-        assert!(matches!(
-            drive_frames_through(&listed(65534), None, single),
-            Err(ProvisionError::EntryRefused { .. }),
-        ));
+        drive_frames_through(&listed(65534), None, single).expect("the overflow id is an id");
+        for overflow in [single, Overflow::default()] {
+            match drive_frames_through(&listed(NO_ID), None, overflow) {
+                Err(ProvisionError::EntryRefused { reason, .. }) => {
+                    assert!(reason.contains("another map"), "{reason}");
+                }
+                other => panic!("expected the list refused, got {other:?}"),
+            }
+        }
+        // A list no extraction could apply is refused for what is wrong with it.
+        let shuffled = ferroday_cage_testkit::xattr::acl(&[
+            (0x01, 6, NO_ID),
+            (0x20, 0, NO_ID),
+            (0x04, 4, NO_ID),
+        ]);
+        match drive_frames_through(
+            &file((0, 0), &[(ACCESS_ACL.to_bytes(), shuffled)]),
+            None,
+            single,
+        ) {
+            Err(ProvisionError::EntryRefused { reason, .. }) => {
+                assert!(reason.contains("out of order"), "{reason}");
+            }
+            other => panic!("expected the list refused, got {other:?}"),
+        }
 
         // Where the map holds the id, it is one the tree may mean; and an
         // excluded entry adds nothing to the archive to refuse.
