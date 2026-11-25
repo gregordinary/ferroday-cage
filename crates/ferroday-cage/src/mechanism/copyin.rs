@@ -204,6 +204,9 @@ pub(crate) enum CopyFailure {
         step: CopyStep,
         /// The raw OS error.
         errno: i32,
+        /// The path, from the destination root, of the entry the copy was
+        /// writing, or empty where it was writing none.
+        entry: Vec<u8>,
     },
     /// The identity map could not be applied by the delegate.
     Map(IdMapError),
@@ -243,18 +246,19 @@ impl CopyChild {
         } = self;
         drop(stream);
 
-        let read = match frame::read_record(gate.as_fd()) {
+        let read = match receive_outcome(gate.as_fd(), RecvFlags::empty()) {
             Ok(read) => read,
             Err(errno) => {
                 let _ = child.reap();
                 return Err(CopyFailure::Step {
                     step: CopyStep::Spawn,
                     errno: errno.raw_os_error(),
+                    entry: Vec::new(),
                 });
             }
         };
         let outcome = child.reap();
-        let Some(record) = read else {
+        let Some((record, entry)) = read else {
             // The child died without reporting, or reported something that is
             // not a record. Its exit status is all there is to go on either
             // way: a clean exit here would mean it finished the tree and lost
@@ -268,9 +272,10 @@ impl CopyChild {
             return Err(CopyFailure::Step {
                 step: CopyStep::Spawn,
                 errno: Errno::PIPE.raw_os_error(),
+                entry: Vec::new(),
             });
         };
-        decode_record(record)
+        decode_record(record, entry)
     }
 
     /// Kills and reaps the child, for a parent abandoning the copy part-way,
@@ -314,23 +319,38 @@ impl CopyChild {
 /// after a `COPY_END` frame, which a parent that is abandoning the copy never
 /// sent. It is reported as no outcome rather than treated as a case of its own.
 fn reported_outcome(gate: BorrowedFd<'_>) -> Option<CopyFailure> {
-    let mut record = [0u8; frame::RECORD_LEN];
     // `EAGAIN`: nothing is queued, so the child has reported nothing.
-    let (received, _) = frame::retry_on_intr!(rustix::net::recv(
-        gate,
-        &mut record[..],
-        RecvFlags::DONTWAIT
-    ))
-    .ok()?;
-    if received != record.len() {
-        return None;
-    }
-    decode_record(record).err()
+    let (record, entry) = receive_outcome(gate, RecvFlags::DONTWAIT).ok()??;
+    decode_record(record, entry).err()
+}
+
+/// The most bytes an outcome message takes: the record, and the path of the
+/// entry it names, which [`Trail`] bounds.
+const OUTCOME_MAX: usize = frame::RECORD_LEN + LINK_BUF;
+
+/// An outcome message as received: the record, and the path of the entry it
+/// names, empty where it names none.
+type Outcome = ([u8; frame::RECORD_LEN], Vec<u8>);
+
+/// Receives the child's outcome message, retrying `EINTR`: its record, and the
+/// path of the entry it names, empty where it names none.
+///
+/// The message is the record alone, as [`frame::read_record`] reads one,
+/// unless the copy failed on an entry, whose path follows it. One read is one
+/// message on a seqpacket, so `None` is a message shorter than a record, end of
+/// input included: what a child that exited without reporting leaves behind.
+fn receive_outcome(gate: BorrowedFd<'_>, flags: RecvFlags) -> Result<Option<Outcome>, Errno> {
+    let mut message = [0u8; OUTCOME_MAX];
+    let (received, _) = frame::retry_on_intr!(rustix::net::recv(gate, &mut message[..], flags))?;
+    let Some((record, entry)) = message[..received].split_first_chunk() else {
+        return Ok(None);
+    };
+    Ok(Some((*record, entry.to_vec())))
 }
 
 /// Reads the child's outcome record: the copy finished, or the step that
-/// failed and its errno.
-fn decode_record(record: [u8; frame::RECORD_LEN]) -> Result<(), CopyFailure> {
+/// failed and its errno, met on `entry` where that is not empty.
+fn decode_record(record: [u8; frame::RECORD_LEN], entry: Vec<u8>) -> Result<(), CopyFailure> {
     let (wire, errno) = frame::decode_record(record);
     if wire == frame::RECORD_DONE {
         return Ok(());
@@ -338,7 +358,7 @@ fn decode_record(record: [u8; frame::RECORD_LEN]) -> Result<(), CopyFailure> {
     let Some(step) = CopyStep::from_wire(wire) else {
         return Err(CopyFailure::Malformed);
     };
-    Err(CopyFailure::Step { step, errno })
+    Err(CopyFailure::Step { step, errno, entry })
 }
 
 /// Forks the copy child into `map` and returns the handle to stream a tree to.
@@ -350,6 +370,7 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
     let spawn_failure = |errno: Errno| CopyFailure::Step {
         step: CopyStep::Spawn,
         errno: errno.raw_os_error(),
+        entry: Vec::new(),
     };
 
     let (stream_read, stream_write) =
@@ -400,7 +421,7 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
                         // A success record before ready is not something a
                         // child sends; it is a malformed conversation.
                         Some(
-                            decode_record(record)
+                            decode_record(record, Vec::new())
                                 .err()
                                 .unwrap_or(CopyFailure::Malformed),
                         )
@@ -408,10 +429,12 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
                     Ok(super::Gated::ChildLost) => Some(CopyFailure::Step {
                         step: CopyStep::AwaitMap,
                         errno: Errno::PROTO.raw_os_error(),
+                        entry: Vec::new(),
                     }),
                     Err(super::GateFailure::Io(errno)) => Some(CopyFailure::Step {
                         step: CopyStep::AwaitMap,
                         errno: errno.raw_os_error(),
+                        entry: Vec::new(),
                     }),
                     Err(super::GateFailure::Map(err)) => Some(CopyFailure::Map(err)),
                 };
@@ -439,7 +462,7 @@ fn copy_child(
     map: &ChildMap<'_>,
 ) -> ! {
     let fail = |step: CopyStep, errno: Errno| -> ! {
-        report(gate, step.wire(), errno.raw_os_error());
+        report(gate, step.wire(), errno.raw_os_error(), &[]);
         sys::exit_group(1)
     };
 
@@ -469,12 +492,16 @@ fn copy_child(
         Err(errno) => fail(CopyStep::OpenRoot, errno),
     };
 
-    match consume(stream, root) {
+    let mut at = AtEntry::new();
+    match consume(stream, root, &mut at) {
         Ok(()) => {
-            report(gate, frame::RECORD_DONE, 0);
+            report(gate, frame::RECORD_DONE, 0, &[]);
             sys::exit_group(0)
         }
-        Err((step, errno)) => fail(step, errno),
+        Err((step, errno)) => {
+            report(gate, step.wire(), errno.raw_os_error(), at.path());
+            sys::exit_group(1)
+        }
     }
 }
 
@@ -491,7 +518,14 @@ fn copy_child(
 /// descriptor moves onto the stack as the walk descends, but an alias and a
 /// [`COPY_LINK`] anchor both resolve from the root, so one copy has to stay put
 /// for the whole tree. The [`Trail`] is the current directory's path from it.
-fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno)> {
+///
+/// `at` names the entry each frame acts on while it acts, so a failure is
+/// reported against it.
+fn consume(
+    stream: BorrowedFd<'_>,
+    root: OwnedFd,
+    at: &mut AtEntry,
+) -> Result<(), (CopyStep, Errno)> {
     let anchor_root =
         rustix::io::fcntl_dupfd_cloexec(&root, 0).map_err(|errno| (CopyStep::OpenRoot, errno))?;
     let mut stack: [Option<Level>; MAX_DEPTH] = [const { None }; MAX_DEPTH];
@@ -500,6 +534,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
     let mut trail = Trail::new();
 
     loop {
+        at.clear();
         let mut tag = [0u8; 1];
         match frame::read_full_or_eof(stream, &mut tag) {
             Ok(true) => {}
@@ -526,6 +561,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                     return Err((CopyStep::TooDeep, Errno::NAMETOOLONG));
                 }
                 let name = name.component()?;
+                at.set_in(&mut trail, name);
                 let (opened, created) = enter_dir(&anchor_root, &current, &mut trail, name)?;
                 stack[depth] = Some(Level {
                     parent: std::mem::replace(&mut current, opened),
@@ -544,6 +580,9 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 let level = stack[depth]
                     .take()
                     .ok_or((CopyStep::ReadFrame, Errno::INVAL))?;
+                if let Some(left) = trail.current() {
+                    at.set(left);
+                }
                 if level.created {
                     apply_meta(current.as_fd(), &level.meta)?;
                     apply_xattrs(stream, Some(current.as_fd()))?;
@@ -559,6 +598,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 read_full(stream, &mut size)?;
                 let size = u64::from_le_bytes(size);
                 let name = name.component()?;
+                at.set_in(&mut trail, name);
                 // O_EXCL, replacing what holds the name, rather than O_TRUNC:
                 // an existing entry may be a symlink, and truncating through
                 // one would write outside the tree.
@@ -587,6 +627,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 let mut terminated = [0u8; LINK_BUF + 1];
                 let target = cstr_in(&mut terminated, &raw[..len])?;
                 let name = name.component()?;
+                at.set_in(&mut trail, name);
                 containment::replacing(&current, name, || fs::symlinkat(target, &current, name))
                     .map_err(|errno| (CopyStep::Symlink, errno))?;
                 // A symlink carries ownership and a modification time but no
@@ -607,6 +648,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
             COPY_FIFO => {
                 let (name, meta) = read_named(stream)?;
                 let name = name.component()?;
+                at.set_in(&mut trail, name);
                 // Created 0600 and widened below, for the reason a directory
                 // is: the copy owns the window between creation and the final
                 // mode, and a permissive one should not exist inside it.
@@ -635,6 +677,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                 raw[len] = 0;
                 contained_path(&raw[..=len])?;
                 let name = name.component()?;
+                at.set_in(&mut trail, name);
                 // The link shares the anchor's inode, so it carries the
                 // ownership, mode, and modification time already applied to
                 // it — there is nothing further to set, which is the whole
@@ -654,6 +697,7 @@ fn consume(stream: BorrowedFd<'_>, root: OwnedFd) -> Result<(), (CopyStep, Errno
                     dev: u64::from_le_bytes(fields[8..16].try_into().expect("slice length is 8")),
                     ino: u64::from_le_bytes(fields[16..24].try_into().expect("slice length is 8")),
                 };
+                at.set(&raw[..len]);
                 own_at(&anchor_root, &mut raw[..=len], &owner)?;
             }
             _ => return Err((CopyStep::ReadFrame, Errno::INVAL)),
@@ -932,6 +976,13 @@ impl Trail {
         self.len = Some(end);
     }
 
+    /// The current directory's path from the root, without its separator:
+    /// empty for the root itself, and `None` once the trail was lost.
+    fn current(&self) -> Option<&[u8]> {
+        let len = self.len?;
+        Some(&self.buf[..len.saturating_sub(1)])
+    }
+
     /// `name` in the current directory, as a terminated path from the root.
     fn with(&mut self, name: &CStr) -> Result<&CStr, Errno> {
         let len = self.len.ok_or(Errno::NAMETOOLONG)?;
@@ -1183,9 +1234,65 @@ fn cstr_in<'b>(buf: &'b mut [u8], bytes: &[u8]) -> Result<&'b CStr, (CopyStep, E
     CStr::from_bytes_with_nul(&buf[..=bytes.len()]).map_err(|_| (CopyStep::BadName, Errno::INVAL))
 }
 
-/// Writes the outcome record to the gate, best effort.
-fn report(gate: BorrowedFd<'_>, wire: u32, errno: i32) {
-    let _ = rustix::io::write(gate, &frame::encode_record(wire, errno));
+/// Writes the outcome message to the gate, best effort: the record, and
+/// `entry`, the path of the entry the copy failed on, where there is one.
+///
+/// One write, so the seqpacket carries it as one message, and the record alone
+/// where `entry` is empty, which is the message every gate reader reads.
+fn report(gate: BorrowedFd<'_>, wire: u32, errno: i32, entry: &[u8]) {
+    let entry = &entry[..entry.len().min(LINK_BUF)];
+    let mut message = [0u8; OUTCOME_MAX];
+    message[..frame::RECORD_LEN].copy_from_slice(&frame::encode_record(wire, errno));
+    message[frame::RECORD_LEN..frame::RECORD_LEN + entry.len()].copy_from_slice(entry);
+    let _ = rustix::io::write(gate, &message[..frame::RECORD_LEN + entry.len()]);
+}
+
+/// The path, from the destination root, of the entry the frame being acted on
+/// names, which a failure is reported against.
+///
+/// Held in a fixed buffer, as the [`Trail`] it is copied from is, since the
+/// child cannot allocate one; empty between frames and for a frame that names
+/// no entry.
+struct AtEntry {
+    buf: [u8; LINK_BUF],
+    len: usize,
+}
+
+impl AtEntry {
+    fn new() -> AtEntry {
+        AtEntry {
+            buf: [0; LINK_BUF],
+            len: 0,
+        }
+    }
+
+    /// Names no entry.
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Names the entry at `path`, or none where it does not fit.
+    fn set(&mut self, path: &[u8]) {
+        self.len = 0;
+        if let Some(held) = self.buf.get_mut(..path.len()) {
+            held.copy_from_slice(path);
+            self.len = path.len();
+        }
+    }
+
+    /// Names `name` in the directory `trail` leads to, or none where the trail
+    /// was lost.
+    fn set_in(&mut self, trail: &mut Trail, name: &CStr) {
+        match trail.with(name) {
+            Ok(path) => self.set(path.to_bytes()),
+            Err(_) => self.clear(),
+        }
+    }
+
+    /// The path named, empty where none is.
+    fn path(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
 }
 
 #[cfg(test)]
@@ -1220,9 +1327,9 @@ mod tests {
     #[test]
     fn an_outcome_record_naming_no_step_is_malformed() {
         let record = |wire: u32| frame::encode_record(wire, 0);
-        assert!(decode_record(record(frame::RECORD_DONE)).is_ok());
+        assert!(decode_record(record(frame::RECORD_DONE), Vec::new()).is_ok());
         assert!(matches!(
-            decode_record(record(CopyStep::ALL.len() as u32)),
+            decode_record(record(CopyStep::ALL.len() as u32), Vec::new()),
             Err(CopyFailure::Malformed),
         ));
     }
@@ -1759,7 +1866,36 @@ mod tests {
             Mode::empty(),
         )
         .expect("the destination opens");
-        consume(read.as_fd(), root)
+        consume(read.as_fd(), root, &mut AtEntry::new())
+    }
+
+    /// A failure names the entry the frame was acting on, by its path from the
+    /// root.
+    #[test]
+    fn a_failure_names_the_entry_it_was_met_on() {
+        let dir = Scratch::new("copyin-blame");
+        std::fs::create_dir_all(dir.join("etc/passwd/held")).unwrap();
+        let mut frames = dir_frame(b"etc", 0o755);
+        frames.extend(file_frame(b"passwd", 0o644, b"root:x:0:0::/root:/bin/sh\n"));
+        frames.extend_from_slice(&LEAVE);
+        frames.push(COPY_END);
+
+        let (read, write) = rustix::pipe::pipe().expect("a pipe");
+        rustix::io::write(&write, &frames).expect("the frames fit the pipe buffer");
+        drop(write);
+        let root = fs::open(
+            dir.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("the destination opens");
+        let mut at = AtEntry::new();
+        let failed = consume(read.as_fd(), root, &mut at);
+        assert!(
+            matches!(failed, Err((CopyStep::Create, _))),
+            "a non-empty directory holds the name: {failed:?}"
+        );
+        assert_eq!(at.path(), b"etc/passwd");
     }
 
     /// Runs `frames` through the consuming walk against a fresh destination.

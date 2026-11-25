@@ -608,7 +608,7 @@ fn drive<W: Write>(
                 return Ok(());
             }
             FRAME_ERROR => {
-                let (step, errno) = read_error(&mut reader).map_err(read_err)?;
+                let (step, errno, name) = read_error(&mut reader).map_err(read_err)?;
                 let Some(step) = ExportStep::from_wire(step) else {
                     // The child is this same build, so a step it does not
                     // carry means the stream is malformed rather than newer.
@@ -617,9 +617,12 @@ fn drive<W: Write>(
                         format!("unexpected export failure step {step}"),
                     )));
                 };
+                // The entry it was met on, in the directory the stream has
+                // reached, or that directory itself where it names none.
+                let name = if name.is_empty() { &b"."[..] } else { &name };
                 return Err(ProvisionError::io(
                     step.describe(),
-                    rootfs,
+                    tar.host_path(rootfs, name),
                     io::Error::from_raw_os_error(errno),
                 ));
             }
@@ -1330,11 +1333,13 @@ fn read_symlink(reader: &mut impl Read) -> io::Result<Meta> {
     })
 }
 
-/// Reads an error frame: a step discriminant and an errno.
-fn read_error(reader: &mut impl Read) -> io::Result<(u32, i32)> {
+/// Reads an error frame: a step discriminant, an errno, and the name of the
+/// entry it was met on, empty where it was met on the current directory.
+fn read_error(reader: &mut impl Read) -> io::Result<(u32, i32, Vec<u8>)> {
     let step = read_u32(reader)?;
     let errno = read_i32(reader)?;
-    Ok((step, errno))
+    let name = read_bytes_u16(reader)?;
+    Ok((step, errno, name))
 }
 
 #[cfg(test)]
@@ -1983,6 +1988,48 @@ mod tests {
             .read_to_end(&mut answered)
             .expect("the replies read back");
         (outcome, answered)
+    }
+
+    #[test]
+    fn a_failure_the_child_reports_names_the_entry_it_was_met_on() {
+        let denied = rustix::io::Errno::ACCESS.raw_os_error();
+        let error = |name: &[u8]| {
+            let mut frame = vec![FRAME_ERROR];
+            frame.extend_from_slice(&crate::mechanism::frame::encode_record(
+                ExportStep::Open.wire(),
+                denied,
+            ));
+            frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            frame.extend_from_slice(name);
+            frame
+        };
+        let mut entered = vec![FRAME_DIR];
+        entered.extend_from_slice(&3u16.to_le_bytes());
+        entered.extend_from_slice(b"etc");
+        entered.extend_from_slice(&0o40_755u32.to_le_bytes());
+        entered.extend_from_slice(&[0; 8]);
+        entered.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        entered.extend_from_slice(&0u16.to_le_bytes());
+        let path_of = |frames: &[u8]| match drive_frames(frames, None) {
+            Err(ProvisionError::Io { path, source, .. }) => {
+                assert_eq!(source.raw_os_error(), Some(denied));
+                path
+            }
+            other => panic!("the export fails on the child's word: {other:?}"),
+        };
+
+        // An entry of the root.
+        assert_eq!(path_of(&error(b"secret")), Path::new("/srv/rootfs/secret"));
+        // An entry of a directory the stream entered, or that directory itself
+        // where none is named.
+        assert_eq!(
+            path_of(&[entered.clone(), error(b"shadow")].concat()),
+            Path::new("/srv/rootfs/etc/shadow")
+        );
+        assert_eq!(
+            path_of(&[entered, error(b"")].concat()),
+            Path::new("/srv/rootfs/etc")
+        );
     }
 
     #[test]

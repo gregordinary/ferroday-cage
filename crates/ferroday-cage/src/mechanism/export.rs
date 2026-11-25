@@ -41,7 +41,9 @@
 //! - [`FRAME_SYMLINK`]: a symbolic link. Its metadata and link target follow.
 //! - [`FRAME_END`]: the walk finished cleanly.
 //! - [`FRAME_ERROR`]: a syscall failed; a step discriminant and errno follow,
-//!   and the child exits.
+//!   then the name of the entry it failed on in the current directory, as a
+//!   `u16`-prefixed string, empty where it failed on the current directory
+//!   itself, and the child exits.
 //!
 //! Character and block devices, FIFOs, and sockets are skipped: a deployed OS
 //! image carries none that a runtime does not provide, and the tar reader on
@@ -62,6 +64,7 @@
 //! discarded, which nothing the archive was written to could bound: a sparse
 //! file of terabytes, linked a thousand times, cost its writer nothing.
 
+use std::cell::Cell;
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -343,7 +346,7 @@ fn export_child(
 ) -> ! {
     let stream = ends.stream;
     let fail = |step: ExportStep, errno: Errno| -> ! {
-        emit_error(stream, step, errno);
+        emit_error(stream, step, errno, &[]);
         sys::exit_group(1)
     };
 
@@ -379,17 +382,17 @@ fn export_child(
         Err(errno) => fail(ExportStep::Open, errno),
     };
 
-    let walker = Walker {
-        stream,
-        replies: ends.replies,
-        filtered: ends.filtered,
-    };
+    let walker = Walker::new(stream, ends.replies, ends.filtered);
     match walker.walk_root(root.as_fd(), arena) {
         Ok(()) => {
             emit_tag(stream, FRAME_END);
             sys::exit_group(0)
         }
-        Err((step, errno)) => fail(step, errno),
+        Err((step, errno)) => {
+            let (name, len) = walker.blamed();
+            emit_error(stream, step, errno, &name[..len]);
+            sys::exit_group(1)
+        }
     }
 }
 
@@ -434,9 +437,40 @@ struct Walker<'a> {
     replies: BorrowedFd<'a>,
     /// Whether the export is filtered, so every entry is asked of.
     filtered: bool,
+    /// The name, in the directory the parent holds as current, of the entry a
+    /// failure was met on, and its length: set by [`blame`](Self::blame) where
+    /// one was, and empty where the walk failed on that directory itself.
+    blamed: Cell<([u8; NAME_MAX], usize)>,
 }
 
-impl Walker<'_> {
+impl<'a> Walker<'a> {
+    /// A walk streaming to `stream` and reading the parent's replies from
+    /// `replies`, asking of every entry where `filtered`.
+    fn new(stream: BorrowedFd<'a>, replies: BorrowedFd<'a>, filtered: bool) -> Walker<'a> {
+        Walker {
+            stream,
+            replies,
+            filtered,
+            blamed: Cell::new(([0; NAME_MAX], 0)),
+        }
+    }
+
+    /// Records that the failure about to be returned was met on `name`, an
+    /// entry of the directory the parent holds as current, and hands it back.
+    fn blame(&self, name: &CStr, failure: (ExportStep, Errno)) -> (ExportStep, Errno) {
+        let name = name.to_bytes();
+        let mut held = [0; NAME_MAX];
+        let len = name.len().min(NAME_MAX);
+        held[..len].copy_from_slice(&name[..len]);
+        self.blamed.set((held, len));
+        failure
+    }
+
+    /// The name [`blame`](Self::blame) recorded, empty where none was.
+    fn blamed(&self) -> ([u8; NAME_MAX], usize) {
+        self.blamed.get()
+    }
+
     /// Walks the export root, emitting it as a `.` directory entry — the
     /// rootfs's own mode, ownership, mtime, and xattrs — then its contents,
     /// then a leave.
@@ -542,6 +576,10 @@ impl Walker<'_> {
     /// read. A named pipe put in its place between the two would otherwise hold
     /// the walk forever on a blocking open, and a different file would be read
     /// under the first one's metadata.
+    ///
+    /// A failure on the entry itself is [blamed](Self::blame) on its name. One
+    /// met inside a directory it descends into is that directory's walk's,
+    /// which the parent holds as current by then, and is left as it is.
     fn visit_entry(
         &self,
         dir: BorrowedFd<'_>,
@@ -549,8 +587,9 @@ impl Walker<'_> {
         depth: u32,
         arena: Arena<'_>,
     ) -> Result<(), (ExportStep, Errno)> {
-        let stat =
-            fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| (ExportStep::Stat, e))?;
+        let on_entry = |failure| self.blame(name, failure);
+        let stat = fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| on_entry((ExportStep::Stat, e)))?;
         match FileType::from_raw_mode(stat.st_mode) {
             FileType::Directory => {
                 let child = fs::openat(
@@ -559,11 +598,12 @@ impl Walker<'_> {
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),
                 )
-                .map_err(|e| (ExportStep::Open, e))?;
+                .map_err(|e| on_entry((ExportStep::Open, e)))?;
                 // Emit the directory (with its xattrs) before descending; the
                 // 64 KiB xattr buffers are freed on return, so they never
                 // overlap the recursion's stack.
-                self.emit_meta(FRAME_DIR, name, &stat, Some(child.as_fd()))?;
+                self.emit_meta(FRAME_DIR, name, &stat, Some(child.as_fd()))
+                    .map_err(on_entry)?;
                 if !self.filtered || self.sent()? {
                     self.walk_dir(child.as_fd(), depth + 1, arena)?;
                 }
@@ -572,20 +612,22 @@ impl Walker<'_> {
             FileType::RegularFile => {
                 let file = containment::open_typed_file(dir, name, &stat, OFlags::RDONLY).map_err(
                     |e| match e {
-                        Errno::STALE => (ExportStep::Changed, e),
-                        e => (ExportStep::Open, e),
+                        Errno::STALE => on_entry((ExportStep::Changed, e)),
+                        e => on_entry((ExportStep::Open, e)),
                     },
                 )?;
-                self.emit_meta(FRAME_FILE, name, &stat, Some(file.as_fd()))?;
+                self.emit_meta(FRAME_FILE, name, &stat, Some(file.as_fd()))
+                    .map_err(on_entry)?;
                 // Widened as `emit_meta` widens it; see there.
                 #[allow(clippy::useless_conversion)]
                 let nlink = u64::from(stat.st_nlink);
-                if asks_for_file(self.filtered, nlink) && !self.sent()? {
+                if asks_for_file(self.filtered, nlink) && !self.sent().map_err(on_entry)? {
                     return Ok(());
                 }
                 self.stream_data(file.as_fd(), stat.st_size as u64)
+                    .map_err(on_entry)
             }
-            FileType::Symlink => self.emit_symlink(dir, name, &stat),
+            FileType::Symlink => self.emit_symlink(dir, name, &stat).map_err(on_entry),
             _ => Ok(()),
         }
     }
@@ -801,22 +843,26 @@ fn emit_tag_checked(stream: BorrowedFd<'_>, tag: u8) -> Result<(), (ExportStep, 
 /// its own copy of the child's write end — a fork copies the whole
 /// descriptor table — so even a dead child's end-of-file can be held off
 /// indefinitely. The child is already dead by the time this runs, so whatever it
-/// wrote is queued in full: an error frame is nine bytes, well under `PIPE_BUF`,
-/// and a pipe write that small is atomic.
+/// wrote is queued in full: an error frame is one write of at most
+/// [`ERROR_FRAME_MAX`] bytes, well under `PIPE_BUF`, and a pipe write that
+/// small is atomic.
 ///
-/// Only an error frame is read back. A child past the gate is walking rather
-/// than reporting, and this runs only for one that never got there.
+/// Only an error frame is read back, and one naming no entry, since a child
+/// that has not reached the gate has not reached the tree either. A child past
+/// the gate is walking rather than reporting, and this runs only for one that
+/// never got there.
 fn early_report(stream: BorrowedFd<'_>) -> Option<StartError> {
     // The descriptor belongs to a `start_export` that is on its way to
     // returning an error, so it is dropped rather than restored to blocking.
     fs::fcntl_setfl(stream, OFlags::NONBLOCK).ok()?;
-    let mut error = [0u8; 1 + frame::RECORD_LEN];
+    let mut error = [0u8; 1 + frame::RECORD_LEN + 2];
     let read = frame::retry_on_intr!(rustix::io::read(stream, &mut error)).ok()?;
-    let [tag, record @ ..] = error;
-    if read != error.len() || tag != FRAME_ERROR {
+    let [tag, rest @ ..] = error;
+    let (record, unnamed) = rest.split_at(frame::RECORD_LEN);
+    if read != error.len() || tag != FRAME_ERROR || unnamed != [0, 0] {
         return None;
     }
-    let (wire, errno) = frame::decode_record(record);
+    let (wire, errno) = frame::decode_record(record.try_into().ok()?);
     Some(StartError::Reported {
         step: ExportStep::from_wire(wire)?,
         errno: Errno::from_raw_os_error(errno),
@@ -829,13 +875,25 @@ fn emit_tag(stream: BorrowedFd<'_>, tag: u8) {
     let _ = frame::write_full(stream, &[tag]);
 }
 
-/// Emits an error frame: the tag, then the outcome record naming the step and
-/// the errno.
-fn emit_error(stream: BorrowedFd<'_>, step: ExportStep, errno: Errno) {
-    let mut error = [0u8; 1 + frame::RECORD_LEN];
+/// The most bytes an error frame takes: the tag, the outcome record, and a
+/// name of [`NAME_MAX`] behind its two length bytes.
+const ERROR_FRAME_MAX: usize = 1 + frame::RECORD_LEN + 2 + NAME_MAX;
+
+/// Emits an error frame: the tag, the outcome record naming the step and the
+/// errno, and `name`, the entry it was met on, empty where none was.
+///
+/// One write, of at most [`ERROR_FRAME_MAX`] bytes, which is under `PIPE_BUF`,
+/// so the frame arrives whole or not at all.
+fn emit_error(stream: BorrowedFd<'_>, step: ExportStep, errno: Errno, name: &[u8]) {
+    let name = &name[..name.len().min(NAME_MAX)];
+    let mut error = [0u8; ERROR_FRAME_MAX];
     error[0] = FRAME_ERROR;
-    error[1..].copy_from_slice(&frame::encode_record(step.wire(), errno.raw_os_error()));
-    let _ = frame::write_full(stream, &error);
+    error[1..=frame::RECORD_LEN]
+        .copy_from_slice(&frame::encode_record(step.wire(), errno.raw_os_error()));
+    let at = 1 + frame::RECORD_LEN;
+    error[at..at + 2].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    error[at + 2..at + 2 + name.len()].copy_from_slice(name);
+    let _ = frame::write_full(stream, &error[..at + 2 + name.len()]);
 }
 
 /// Sends a signal to the export child, used to tear it down when the parent
@@ -906,11 +964,7 @@ mod tests {
             let stream = stream_into(&dir);
             let (read, write) = rustix::pipe::pipe().unwrap();
             frame::write_full(write.as_fd(), replies).unwrap();
-            let walker = Walker {
-                stream: stream.as_fd(),
-                replies: read.as_fd(),
-                filtered: true,
-            };
+            let walker = Walker::new(stream.as_fd(), read.as_fd(), true);
             let (mut names, mut order) = (vec![0u8; 4096], vec![0u32; 16]);
             let arena = Arena {
                 names: &mut names,
@@ -962,13 +1016,9 @@ mod tests {
             )
             .unwrap();
             let (replies, _) = rustix::pipe::pipe().unwrap();
-            Walker {
-                stream: stream.as_fd(),
-                replies: replies.as_fd(),
-                filtered: false,
-            }
-            .stream_data(file.as_fd(), declared)
-            .expect("the data streams");
+            Walker::new(stream.as_fd(), replies.as_fd(), false)
+                .stream_data(file.as_fd(), declared)
+                .expect("the data streams");
             let mut expected = data.to_vec();
             expected.push(status);
             assert_eq!(written(&dir), expected, "declared {declared}");
@@ -994,11 +1044,7 @@ mod tests {
         .unwrap();
         let stream = stream_into(&dir);
         let (replies, _) = rustix::pipe::pipe().unwrap();
-        let walker = Walker {
-            stream: stream.as_fd(),
-            replies: replies.as_fd(),
-            filtered: false,
-        };
+        let walker = Walker::new(stream.as_fd(), replies.as_fd(), false);
 
         let (mut names, mut order) = (vec![0u8; 4096], vec![0u32; 4]);
         let arena = Arena {
@@ -1045,6 +1091,53 @@ mod tests {
             seen.is_sorted(),
             "the entries are not in name order: {seen:?}"
         );
+    }
+
+    /// A failure on an entry names it, and one met inside a directory the
+    /// walk descended into names nothing more: the parent holds that directory
+    /// as current by then. The error frame carries the name.
+    #[test]
+    fn a_failure_names_the_entry_it_was_met_on() {
+        let dir = Scratch::new("export-blame");
+        std::fs::create_dir_all(dir.join("tree/crowded")).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join("tree/crowded").join(name), b"x").unwrap();
+        }
+        let tree = fs::open(
+            dir.join("tree"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let stream = stream_into(&dir);
+        let (replies, _) = rustix::pipe::pipe().unwrap();
+        let visit = |name: &CStr, order: usize| {
+            let walker = Walker::new(stream.as_fd(), replies.as_fd(), false);
+            let (mut names, mut order) = (vec![0u8; 4096], vec![0u32; order]);
+            let arena = Arena {
+                names: &mut names,
+                order: &mut order,
+            };
+            let failed = walker.visit_entry(tree.as_fd(), name, 0, arena);
+            let (blamed, len) = walker.blamed();
+            (failed, blamed[..len].to_vec())
+        };
+
+        let (failed, blamed) = visit(c"absent", 16);
+        assert_eq!(failed, Err((ExportStep::Stat, Errno::NOENT)));
+        assert_eq!(blamed, b"absent");
+        let (failed, blamed) = visit(c"crowded", 2);
+        assert_eq!(failed, Err((ExportStep::Crowded, Errno::NOBUFS)));
+        assert_eq!(blamed, b"", "the directory's own walk failed");
+
+        // The frame: the tag, the record, and the name behind its length.
+        let stream = stream_into(&dir);
+        emit_error(stream.as_fd(), ExportStep::Stat, Errno::NOENT, b"absent");
+        let frame = written(&dir);
+        let at = 1 + frame::RECORD_LEN;
+        assert_eq!(frame[0], FRAME_ERROR);
+        assert_eq!(&frame[at..at + 2], &6u16.to_le_bytes());
+        assert_eq!(&frame[at + 2..], b"absent");
     }
 
     /// The export child closes every descriptor it inherited but its own two.

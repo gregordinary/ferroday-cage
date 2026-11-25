@@ -601,9 +601,12 @@ fn failure(err: CopyFailure, rootfs: &Path) -> ProvisionError {
             path: rootfs.to_path_buf(),
             reason: ErrorChain::new(&err).to_string(),
         },
-        CopyFailure::Step { step, errno } => ProvisionError::Io {
+        CopyFailure::Step { step, errno, entry } => ProvisionError::Io {
             op: step.describe(),
-            path: rootfs.to_path_buf(),
+            path: match entry.is_empty() {
+                true => rootfs.to_path_buf(),
+                false => rootfs.join(std::ffi::OsStr::from_bytes(&entry)),
+            },
             source: io::Error::from_raw_os_error(errno),
         },
         CopyFailure::Malformed => ProvisionError::Io {

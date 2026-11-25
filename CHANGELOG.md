@@ -537,6 +537,9 @@ consumer upgrading can skip it.
 - A Debian `Release` that lists one index twice in a digest section, with two
   digests at one size, leaves the index out, as it does one listed at two
   sizes. The later line silently replaced the earlier.
+- A failure the export or copy-in process meets on an entry names that entry's
+  path in `ProvisionError::Io`, or the directory it was reading where it failed
+  on the directory itself. Both named only the tree's root.
 
 ### Internal
 

@@ -1401,7 +1401,7 @@ fn a_copy_the_child_refuses_reports_the_childs_own_step() {
             ..
         }) => {
             assert_eq!(op, "creating a file");
-            assert_eq!(path, rootfs);
+            assert_eq!(path, rootfs.join("a-file"), "the entry it was met on");
             assert_eq!(
                 cause.raw_os_error(),
                 Some(rustix::io::Errno::NOTEMPTY.raw_os_error()),
