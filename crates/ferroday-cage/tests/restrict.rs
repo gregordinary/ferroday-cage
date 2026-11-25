@@ -98,8 +98,8 @@ fn a_restriction_grant_follows_a_host_link() {
         return;
     }
     // A restriction's grants are host paths, resolved as the host resolves
-    // them: a grant naming a link covers what the link points at, as a grant on
-    // a merged-/usr host's `/lib` covers `/usr/lib`.
+    // them when it is built: a grant naming a link covers what the link points
+    // at, as a grant on a merged-/usr host's `/lib` covers `/usr/lib`.
     let tree = scratch("restrict-link");
     std::fs::create_dir(tree.join("real")).unwrap();
     std::fs::write(tree.join("real/file"), "through the link\n").unwrap();
@@ -554,22 +554,61 @@ fn landlock_grants_a_single_file_and_a_device_node() {
 }
 
 #[test]
-fn a_landlock_rule_that_fails_names_its_grant() {
-    if !common::landlock() {
-        return;
-    }
-    // Nothing checks a grant's path at build, so a missing one fails the launch.
-    // The failure names the grant rather than only the step that refused it.
+fn a_grant_on_nothing_is_refused_at_build() {
+    // A grant is resolved once, at build, so a path with nothing at it has
+    // nothing for a launch to grant.
     let result = grant_system_trees(Restriction::builder())
         .command("/bin/true")
         .landlock_fs(
             FsAccess::READ | FsAccess::WRITE,
             "/ferroday-cage/no/such/grant",
         )
-        .build()
-        .expect("a valid restriction configuration")
-        .run();
+        .build();
     match result {
+        Err(Error::Config(ferroday_cage::ConfigError::LandlockGrantUnresolved {
+            path,
+            source,
+            ..
+        })) => {
+            assert_eq!(path, Path::new("/ferroday-cage/no/such/grant"));
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+        }
+        other => panic!("a grant on nothing: {other:?}"),
+    }
+}
+
+#[test]
+fn a_link_an_earlier_run_planted_on_a_grant_fails_the_next_launch() {
+    if !common::landlock() {
+        return;
+    }
+    // One restriction launched twice. The first run may write the tree, so it
+    // replaces a granted directory with a link to one it was not granted. The
+    // second launch grants what the build resolved, follows no link to reach
+    // it, and fails at the grant, naming it, rather than carrying the grant to
+    // whatever the link names.
+    let tree = scratch("restrict-planted-link");
+    let outside = scratch("restrict-planted-link-outside");
+    std::fs::create_dir(tree.join("cache")).unwrap();
+    let cache = tree.join("cache");
+    let restriction = grant_system_trees(Restriction::builder())
+        .command("/bin/sh")
+        .args([
+            "-c",
+            &format!(
+                "[ -L {cache} ] || {{ rmdir {cache} && ln -s {outside} {cache}; }}",
+                cache = cache.display(),
+                outside = outside.display(),
+            ),
+        ])
+        .landlock_fs(FsAccess::READ | FsAccess::WRITE, &tree)
+        .landlock_fs(FsAccess::READ | FsAccess::WRITE, &cache)
+        .build()
+        .expect("a valid restriction configuration");
+    let first = restriction.run().expect("the first launch runs");
+    assert!(first.success(), "the first run plants its link");
+    assert!(cache.symlink_metadata().unwrap().file_type().is_symlink());
+    match restriction.run() {
         Err(Error::Setup {
             step: SetupStep::LandlockAddRule,
             detail,
@@ -578,11 +617,11 @@ fn a_landlock_rule_that_fails_names_its_grant() {
         }) => {
             assert_eq!(
                 detail.as_deref(),
-                Some("rw on /ferroday-cage/no/such/grant")
+                Some(format!("rw on {}", cache.display()).as_str())
             );
-            assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+            assert_eq!(source.raw_os_error(), Some(libc::ELOOP), "{source}");
         }
-        other => panic!("expected a Landlock rule failure, got {other:?}"),
+        other => panic!("the planted link was followed: {other:?}"),
     }
 }
 

@@ -2189,7 +2189,6 @@ impl Request {
             landlock_labels,
             // A sandbox's grants refuse a link on their way, and the
             // restriction's build, whose paths are the host's, lets them follow.
-            grants_follow_links: false,
             seccomp,
             keep_caps,
             // Whether the identity switch needs securebits is decided by

@@ -72,6 +72,15 @@ consumer upgrading can skip it.
   the consumer's own cgroup limits as well as the profile's wherever no parent
   was named, and a `cpu-weight` above the kernel's default of 100, which took
   processor time from the sandbox's siblings beneath the consumer's parent.
+- A `Restriction` resolves each Landlock grant's path once, at build, and
+  every launch grants the canonical path it resolved to without following a
+  link. A launch followed the path's links again, so one restriction launched
+  twice let its first run put a link where it could write and carry its next
+  run's write grant to whatever the link named: its own cgroup's files, which
+  its cgroup check had judged unreachable, or the caller's home directory. A
+  link met at launch now fails it at the grant, and a grant on a path that
+  does not resolve is refused at build with the new
+  `ConfigError::LandlockGrantUnresolved`.
 
 ### Added
 

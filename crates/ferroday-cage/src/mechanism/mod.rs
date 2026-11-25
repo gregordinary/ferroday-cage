@@ -869,15 +869,16 @@ pub struct SockFilter {
 // instruction of every filter.
 const _: () = assert!(size_of::<SockFilter>() == 8);
 
-/// One frozen Landlock grant: an absolute sandbox path and the kernel
+/// One frozen Landlock grant: an absolute path and the kernel
 /// `LANDLOCK_ACCESS_FS_*` bitmask allowed beneath it. The command stage masks
-/// the access to the running kernel's ABI and opens the path after the pivot,
-/// through symbolic links only where
-/// [`HardeningPlan::grants_follow_links`] says so.
+/// the access to the running kernel's ABI and opens the path, a sandbox's
+/// after the pivot, without following a symbolic link.
 #[cfg(feature = "hardening")]
 #[derive(Debug, Clone)]
 pub(crate) struct LandlockRule {
-    /// The grant's target, an absolute path resolved inside the pivoted root.
+    /// The grant's target: a sandbox's absolute path, resolved inside the
+    /// pivoted root, or a restriction's canonical host path, which the build
+    /// froze.
     pub(crate) path: CString,
     /// The unmasked `LANDLOCK_ACCESS_FS_*` rights allowed beneath the path.
     pub(crate) access: u64,
@@ -931,14 +932,6 @@ pub(crate) struct HardeningPlan {
     /// [`landlock_net`](Self::landlock_net)'s, in the order the command stage
     /// adds them. Never touched by the sandbox stages.
     pub(crate) landlock_labels: Vec<String>,
-    /// Whether a filesystem grant's path is resolved through symbolic links.
-    ///
-    /// False for a sandbox, whose root may hold links a package or an earlier
-    /// run planted: a link on the way to a grant's target would carry the grant
-    /// to wherever it points, so a path crossing one fails the rule instead.
-    /// True for a restriction, whose paths are the caller's host paths, where
-    /// a link such as a merged-`/usr` host's `/lib` is how the host is laid out.
-    pub(crate) grants_follow_links: bool,
     /// The compiled seccomp program, installed verbatim when present.
     pub(crate) seccomp: Option<Vec<SockFilter>>,
     /// The capability bits to retain across the drop; `None` leaves the

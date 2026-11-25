@@ -631,11 +631,14 @@ impl RestrictionBuilder {
     /// device node as well as a directory; there it allows only the rights that
     /// act on a file, since there are no entries to list, create, or remove.
     ///
-    /// The path is resolved as the host resolves it, through symbolic links, so
-    /// a grant on a merged-`/usr` host's `/lib` covers `/usr/lib`. A grant
-    /// therefore covers whatever a link on its path points at when the command
-    /// starts, including a link an earlier run left in a directory it could
-    /// write.
+    /// The path is resolved at [`build`](Self::build) as the host resolves it,
+    /// through symbolic links, so a grant on a merged-`/usr` host's `/lib`
+    /// covers `/usr/lib`, and the canonical path it resolves to is what every
+    /// launch grants. A launch opens that path without following a link, so a
+    /// link put on it since, by an earlier run that could write a directory on
+    /// the way, fails the launch at the grant rather than carrying the grant
+    /// to whatever it names. A path that does not resolve at build is refused
+    /// with [`ConfigError::LandlockGrantUnresolved`](crate::ConfigError::LandlockGrantUnresolved).
     ///
     /// Landlock does not govern a file's metadata, as
     /// [`CageBuilder::landlock_fs`](crate::CageBuilder::landlock_fs) states:
@@ -861,6 +864,7 @@ impl RestrictionBuilder {
         let mut hardening = self.hardening.lower(false)?;
         let abi = crate::mechanism::probe_landlock_abi();
         settle_landlock(&mut hardening, self.scopes_named, abi)?;
+        freeze_grants(&mut hardening, |path| std::fs::canonicalize(path))?;
         if self.cgroup.parent.is_some() || !self.cgroup.limits().is_empty() {
             let mounts = std::fs::read_to_string("/proc/self/mountinfo")
                 .ok()
@@ -869,17 +873,8 @@ impl RestrictionBuilder {
                         .map(|mount| mount.mount_point)
                         .collect::<Vec<_>>()
                 });
-            ensure_cgroup_held(
-                &hardening,
-                self.hardening.seccomp(),
-                mounts.as_deref(),
-                |grant| std::fs::canonicalize(grant).unwrap_or_else(|_| grant.to_path_buf()),
-            )?;
+            ensure_cgroup_held(&hardening, self.hardening.seccomp(), mounts.as_deref())?;
         }
-        // The grants are host paths, resolved as the host resolves them: a
-        // merged-`/usr` host's `/lib` is a link, and refusing links would refuse
-        // the very grants that make a host command runnable.
-        hardening.grants_follow_links = true;
         // Always drop to the empty capability set. A restriction runs on the
         // host with no user namespace, so a privileged caller (root, or one
         // holding file capabilities) would otherwise carry its full permitted
@@ -979,23 +974,51 @@ fn settle_landlock(
     }
 }
 
+/// Freezes each Landlock grant's path to the canonical path `resolve` reads it
+/// as, which every launch then opens without following a link.
+///
+/// A grant names a host path, and a host is laid out with links: a
+/// merged-`/usr` host's `/lib` is one. They are followed here, once, in the
+/// caller's process, so what the build judges of a grant, as
+/// [`ensure_cgroup_held`] does, is what each launch grants. Followed again at
+/// launch, a link put on the path since would carry the grant elsewhere: an
+/// earlier run of the same restriction that could write a directory on the way
+/// could make its next run's write grant reach its own cgroup, or the caller's
+/// home directory. A path that does not resolve has nothing to freeze, and is
+/// refused.
+fn freeze_grants(
+    hardening: &mut HardeningPlan,
+    resolve: impl Fn(&Path) -> std::io::Result<std::path::PathBuf>,
+) -> Result<(), ConfigError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    for rule in &mut hardening.landlock {
+        let path = Path::new(OsStr::from_bytes(rule.path.to_bytes()));
+        let canonical = resolve(path).map_err(|source| ConfigError::LandlockGrantUnresolved {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        rule.path = spec::cstring(canonical.as_os_str())?;
+    }
+    Ok(())
+}
+
 /// Refuses a restriction with a cgroup whose command could lift the cgroup's
 /// limits or leave the cgroup, naming the [`CgroupReach`] it would have.
 ///
 /// The command could write the cgroup's files unless its Landlock domain
 /// governs file writes and grants none at, above, or beneath a mount of the
 /// cgroup v2 hierarchy, and could start a process in another cgroup unless its
-/// seccomp policy lets no call of `clone3` run. A grant is judged both as
-/// named and as resolved through links, as the launch resolves it.
+/// seccomp policy lets no call of `clone3` run. Each grant is judged by the
+/// canonical path [`freeze_grants`] froze, which is the path every launch
+/// opens.
 ///
 /// `mounts` is where this process's mount table mounts the hierarchy, or
-/// `None` where the table cannot be read, and `resolve` reads a grant's path
-/// through its links.
+/// `None` where the table cannot be read.
 fn ensure_cgroup_held(
     hardening: &HardeningPlan,
     seccomp: Option<&SeccompPolicy>,
     mounts: Option<&[std::path::PathBuf]>,
-    resolve: impl Fn(&Path) -> std::path::PathBuf,
 ) -> Result<(), ConfigError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1013,12 +1036,7 @@ fn ensure_cgroup_held(
             continue;
         }
         let grant = Path::new(OsStr::from_bytes(rule.path.to_bytes()));
-        let resolved = resolve(grant);
-        let reaches = |mount: &Path| {
-            [grant, resolved.as_path()]
-                .iter()
-                .any(|path| path.starts_with(mount) || mount.starts_with(path))
-        };
+        let reaches = |mount: &Path| grant.starts_with(mount) || mount.starts_with(grant);
         if let Some(mount) = mounts.iter().find(|mount| reaches(mount)) {
             return refused(CgroupReach::WriteGranted {
                 grant: grant.to_path_buf(),
@@ -1355,9 +1373,31 @@ mod tests {
     }
 
     #[test]
-    fn a_restriction_lets_its_grants_follow_the_hosts_links() {
-        let restriction = restricted_true().build().unwrap();
-        assert!(restriction.plan.hardening.grants_follow_links);
+    fn a_restriction_freezes_its_grants_where_the_host_s_links_lead() {
+        // The links are followed once, at build, and a launch opens what they
+        // led to, following none.
+        let scratch = crate::scratch::Scratch::new("frozen-grant");
+        std::fs::create_dir(scratch.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", scratch.join("link")).unwrap();
+        let restriction = restricted_true()
+            .landlock_fs(FsAccess::READ, scratch.join("link"))
+            .build()
+            .unwrap();
+        let canonical = std::fs::canonicalize(scratch.join("real")).unwrap();
+        assert_eq!(
+            restriction.plan.hardening.landlock[0].path.as_bytes(),
+            std::os::unix::ffi::OsStrExt::as_bytes(canonical.as_os_str())
+        );
+        // A path with nothing at it has nothing to freeze.
+        match restricted_true()
+            .landlock_fs(FsAccess::READ, scratch.join("missing"))
+            .build()
+        {
+            Err(Error::Config(ConfigError::LandlockGrantUnresolved { path, .. })) => {
+                assert_eq!(path, scratch.join("missing"));
+            }
+            other => panic!("a grant on nothing: {other:?}"),
+        }
     }
 
     #[test]
@@ -1476,19 +1516,15 @@ mod tests {
 
     /// The reach `builder`'s Landlock grants and seccomp policy leave a
     /// command to a cgroup beneath `/sys/fs/cgroup`, with every grant's path
-    /// resolving as `resolve` reads it.
+    /// frozen as `resolve` reads it.
     fn reach(
         builder: RestrictionBuilder,
         resolve: impl Fn(&Path) -> std::path::PathBuf,
     ) -> Option<CgroupReach> {
-        let hardening = builder.hardening.lower(false).expect("a valid request");
+        let mut hardening = builder.hardening.lower(false).expect("a valid request");
+        freeze_grants(&mut hardening, |path| Ok(resolve(path))).expect("every grant resolves");
         let mounts = [std::path::PathBuf::from("/sys/fs/cgroup")];
-        match ensure_cgroup_held(
-            &hardening,
-            builder.hardening.seccomp(),
-            Some(&mounts),
-            resolve,
-        ) {
+        match ensure_cgroup_held(&hardening, builder.hardening.seccomp(), Some(&mounts)) {
             Ok(()) => None,
             Err(ConfigError::RestrictionCgroupReachable { reach }) => Some(reach),
             Err(err) => panic!("{err:?}"),
@@ -1603,7 +1639,7 @@ mod tests {
         assert_eq!(
             reach(linked, through_link),
             Some(CgroupReach::WriteGranted {
-                grant: "/home/user/cgroup".into(),
+                grant: "/sys/fs/cgroup/user.slice".into(),
                 mount: "/sys/fs/cgroup".into(),
             })
         );

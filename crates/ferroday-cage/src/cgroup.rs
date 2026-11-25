@@ -315,7 +315,8 @@ pub enum CgroupReach {
     /// files.
     #[non_exhaustive]
     WriteGranted {
-        /// The grant's path, as the restriction names it.
+        /// The grant's path, as the restriction's build resolved it, which is
+        /// the path its launches grant.
         grant: PathBuf,
         /// Where the cgroup v2 hierarchy is mounted.
         mount: PathBuf,

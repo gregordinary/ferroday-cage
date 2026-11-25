@@ -1747,6 +1747,9 @@ pub ferroday_cage::ConfigError::IdentityMapUnavailable::reason: alloc::string::S
 pub ferroday_cage::ConfigError::IdentityMapUnavailable::source: core::option::Option<ferroday_cage::IdMapError>
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockGrantEmpty
 pub ferroday_cage::ConfigError::LandlockGrantEmpty::grant: alloc::string::String
+#[non_exhaustive] pub ferroday_cage::ConfigError::LandlockGrantUnresolved
+pub ferroday_cage::ConfigError::LandlockGrantUnresolved::path: std::path::PathBuf
+pub ferroday_cage::ConfigError::LandlockGrantUnresolved::source: core::io::error::Error
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockPathInvalid
 pub ferroday_cage::ConfigError::LandlockPathInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::LandlockResolveUnixUnenforceable

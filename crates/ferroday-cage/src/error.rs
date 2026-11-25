@@ -962,6 +962,20 @@ rendered as text.
         /// What makes it no server.
         reason: &'static str,
     },
+    /// A restriction's Landlock grant names a host path that could not be
+    /// resolved.
+    ///
+    /// A restriction freezes each grant's canonical path at build and opens
+    /// it at launch without following a link, so that what it judged is what
+    /// every launch grants. A path that does not resolve has no canonical
+    /// form to freeze.
+    #[non_exhaustive]
+    LandlockGrantUnresolved {
+        /// The grant's path as it was given to the builder.
+        path: PathBuf,
+        /// The error encountered while resolving it.
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -1021,6 +1035,9 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::BindSourceUnusable { path, .. } => {
                 write!(f, "cannot use {path:?} as a bind-mount source")
+            }
+            ConfigError::LandlockGrantUnresolved { path, .. } => {
+                write!(f, "cannot resolve the Landlock grant path {path:?}")
             }
             ConfigError::MountTargetInvalid { path } => write!(
                 f,
@@ -1354,7 +1371,7 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {
     /// The failure underneath, for the refusals that have one: an OS failure
-    /// for the four that resolve a host path, and a configured identity-map
+    /// for the five that resolve a host path, and a configured identity-map
     /// delegate's own error.
     ///
     /// Every other variant is a request the builder refused on its own terms —
@@ -1365,7 +1382,8 @@ impl std::error::Error for ConfigError {
             ConfigError::RootfsUnusable { source, .. }
             | ConfigError::BindSourceUnusable { source, .. }
             | ConfigError::OverlayDirUnusable { source, .. }
-            | ConfigError::MountTargetMissing { source, .. } => Some(source),
+            | ConfigError::MountTargetMissing { source, .. }
+            | ConfigError::LandlockGrantUnresolved { source, .. } => Some(source),
             ConfigError::IdentityMapUnavailable {
                 source: Some(source),
                 ..

@@ -318,24 +318,22 @@ fn apply_landlock(plan: &HardeningPlan) -> Result<(), Failure> {
         if allowed == 0 {
             continue;
         }
-        // Post-pivot the sandbox root is `/`, so the grant's absolute path
-        // resolves within the sandbox. O_PATH opens the file or directory the
-        // rule is tied to. A sandbox's walk follows no link, the last component
-        // included: a planted `/var/lib/app -> /` would carry the grant to the
-        // whole sandbox view, so the walk answers ELOOP and the rule fails
-        // under its grant's name. A restriction resolves its host paths as the
-        // host does, through the links the host is laid out with.
-        let resolve = if plan.grants_follow_links {
-            ResolveFlags::empty()
-        } else {
-            ResolveFlags::NO_SYMLINKS
-        };
+        // Post-pivot the sandbox root is `/`, so a sandbox grant's absolute
+        // path resolves within the sandbox, and a restriction's is the
+        // canonical host path its build froze. O_PATH opens the file or
+        // directory the rule is tied to. The walk follows no link, the last
+        // component included. A planted `/var/lib/app -> /` would carry a
+        // sandbox's grant to the whole sandbox view, and a link an earlier run
+        // left in a directory a restriction let it write would carry the
+        // grant to whatever it names, the restriction's own cgroup included.
+        // The walk answers ELOOP instead, and the rule fails under its grant's
+        // name.
         let target = super::resolve::openat2(
             CWD,
             rule.path.as_c_str(),
             OFlags::PATH | OFlags::CLOEXEC,
             Mode::empty(),
-            resolve,
+            ResolveFlags::NO_SYMLINKS,
         )
         .map_err(failed)?;
         // The kernel refuses a rule on anything but a directory that allows a

@@ -28,9 +28,14 @@ and its libraries need read and execute grants alongside the data paths it
 works on. As in a sandbox, Landlock leaves a file's metadata ungoverned, as
 [Hardening](hardening.md#what-this-boundary-does-not-cover) sets out.
 
-A grant's path resolves as the host resolves it, through symbolic links. A grant
-on a merged-`/usr` host's `/lib` therefore covers `/usr/lib`. A sandbox refuses a
-link on a grant's path instead, because its root may not be trusted.
+A grant's path resolves as the host resolves it, through symbolic links, once,
+when the restriction is built. A grant on a merged-`/usr` host's `/lib`
+therefore covers `/usr/lib`. Each launch grants the path the build resolved,
+and follows no link to reach it: a link an earlier run put on the way, in a
+directory it could write, fails the launch rather than carrying the grant to
+whatever it names. A grant on a path that does not resolve is refused at build.
+A sandbox refuses a link on a grant's path at every launch, because its root
+may not be trusted.
 
 ```rust,no_run
 # use ferroday_cage::{FsAccess, Restriction};
@@ -220,8 +225,8 @@ both reaches:
 
 - Its Landlock domain governs file writes, which any filesystem grant gives
   it, and no grant carrying write access lies at, above, or beneath a mount of
-  the cgroup v2 hierarchy in the caller's mount table. A grant is judged
-  through its links, as the launch resolves it.
+  the cgroup v2 hierarchy in the caller's mount table. A grant is judged by the
+  path the build resolved it to, which is the path every launch grants.
 - Its seccomp policy lets no call of `clone3` run: it answers it with an
   errno, or kills the thread or the process that makes it. The curated policy
   answers it with `ENOSYS`, which the C library reads as a kernel without
