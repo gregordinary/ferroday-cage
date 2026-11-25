@@ -481,6 +481,13 @@ consumer upgrading can skip it.
   It went by path at each later step, so a directory of the chain that another
   user of a shared cache replaced with a link carried the download, and the
   read, wherever the link led. What was read was still verified.
+- A package body the batched download refuses ends the run. Every provisioner
+  that fetches packages several at a time left a refused body to the mirror
+  walk, which fetched it from the same mirror and refused it again.
+- The Gentoo provisioner leaves a cache entry in place when it does not verify
+  for the package asked for, and replaces it only with a download that does. It
+  removed the entry on any refusal, including one that names a valid build of
+  another record at the same path.
 
 ### Internal
 

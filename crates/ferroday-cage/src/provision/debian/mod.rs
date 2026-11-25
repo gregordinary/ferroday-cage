@@ -3491,8 +3491,9 @@ mod tests {
     fn bytes_the_batch_could_not_verify_are_not_published() {
         // The rename is what decides a package is in the cache, and it happens
         // only over bytes whose digest matched. A mirror that serves the wrong
-        // body through the batch therefore leaves nothing behind, and the walk
-        // refuses it for the same reason.
+        // body through the batch therefore leaves nothing behind, and the run
+        // ends there: the walk would ask the same mirror first and refuse the
+        // same body.
         let scratch = Scratch::new("acquire-batch-wrong");
         let package = wanted("one", b"the package the index named");
         let bodies = vec![(
@@ -3513,7 +3514,7 @@ mod tests {
             .map(|entry| entry.file_name())
             .collect();
         assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
-        assert_eq!(asked.len(), 2, "the batch asked, then the walk did");
+        assert_eq!(asked.len(), 1, "the batch asked, and the walk did not");
     }
 
     #[test]

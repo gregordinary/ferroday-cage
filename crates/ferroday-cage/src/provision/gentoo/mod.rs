@@ -450,7 +450,7 @@ pub enum GentooError {
     /// The chain held as far as the document; what a mirror served is not what
     /// the document vouched for. The bytes are not extracted. A download that
     /// does not match is never published into the cache, and a cached file that
-    /// does not match is removed and downloaded again.
+    /// does not match is downloaded again.
     #[non_exhaustive]
     Digest {
         /// What the digest was taken over: the tarball, or the member.
@@ -1861,7 +1861,7 @@ impl Gentoo {
         // Here the check is the merge's: a container is held to the targets
         // the root's packages were built for, which the wave settles as it
         // goes, so it is verified as it is merged, and one that does not
-        // verify there is removed and fetched again. Nothing is announced,
+        // verify there is fetched again. Nothing is announced,
         // since this layer has no download event. Each entry's directory is
         // held as the chain's creation resolved it, without following a link,
         // and the entry is downloaded into it and read from it, refusing a
@@ -1886,8 +1886,9 @@ impl Gentoo {
             .collect();
 
         // Fetched several at a time first, each from the first mirror, which is
-        // the one the walk would ask first too; what the batch does not deliver
-        // the merge below fetches. A container the batch publishes has passed
+        // the one the walk would ask first too; what does not arrive the merge
+        // below fetches, and a container the check refuses ends the run, as the
+        // walk would once it fetched it again. A container the batch publishes has passed
         // the check a merge holds it to, and the merge reads it again through a
         // descriptor of its own, which is what keeps the batch's descriptors to
         // one batch's worth.
@@ -2053,11 +2054,14 @@ fn cache_entry(cache: &Path, directory: &str, planned: &PlannedPackage) -> PathB
 /// The one rule both of this layer's caches keep. A cache entry is bytes on a
 /// disk this crate does not own, so it is verified on the read rather than
 /// trusted for having been verified once. One that does not verify is not the
-/// archive's file, whatever it is: a body a crash cut short, something put
-/// there by hand. It is a download waiting to happen rather than a refusal, so
-/// it is removed and the mirror walk fetches the entry again, through
-/// [`cache::download`] and the same `verify`. A fresh download that does not
-/// verify is a refusal, and is never published.
+/// archive's file, or not the one asked for: a body a crash cut short,
+/// something put there by hand, or a build another record names. It is a
+/// download waiting to happen rather than a refusal, so the mirror walk fetches
+/// the entry again, through [`cache::download`] and the same `verify`, and
+/// publishes what verifies by renaming it over the entry. The entry is left
+/// where nothing verifies: what is refused for one record may be another's
+/// valid build. A fresh download that does not verify is a refusal, and is
+/// never published.
 ///
 /// `suffix` is the entry's path below a mirror. `verify` reads the file from its
 /// start and hands back what the caller goes on with, the descriptor it read
@@ -2079,7 +2083,6 @@ fn cached_or_fetched<T>(
         if let Ok(verified) = verify(file, to) {
             return Ok(verified);
         }
-        let _ = entry.remove();
     }
     cache::download(
         fetcher,
@@ -4545,6 +4548,41 @@ mod tests {
         assert!(
             root.join("var/db/pkg/sys-libs/zlib-1.3.2/CONTENTS")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn a_cached_build_the_record_does_not_describe_is_left_in_the_cache() {
+        // The entry is a valid build, and the plan's record describes another
+        // at its path. The download that follows is refused for the same
+        // reason, and the entry is left as it was: what one record refuses may
+        // be the build another names.
+        let scratch = Scratch::for_test("gentoo", "package-cache-kept");
+        let key = fixture::signing_key("releng <releng@test.invalid>");
+        let cache = scratch.join("cache");
+        let served = container(&key, gpkg::fixture::Built::ordinary());
+        let mut gentoo = installing(&key, BINHOST, served.clone(), &cache);
+        let plan = gentoo
+            .plan
+            .as_mut()
+            .expect("the provisioner installs a plan");
+        let entry = cache_entry(&cache, &index::directory(ARCH, BINHOST), &plan.packages[0]);
+        std::fs::create_dir_all(entry.parent().expect("a parent")).unwrap();
+        cache::seed(&entry, &served);
+        plan.packages[0].slot = "9".to_string();
+
+        let root = supplied_root(&scratch, "root");
+        let err = gentoo
+            .install_wave(&root, None, &mut Silent)
+            .expect_err("the record describes another build");
+        assert!(
+            ErrorChain::new(&err).to_string().contains("the slot"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&entry).unwrap(),
+            served,
+            "the cached build is kept"
         );
     }
 

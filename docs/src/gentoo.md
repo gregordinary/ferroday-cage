@@ -887,10 +887,10 @@ binhosts.
 A cached entry is verified on the read, not trusted for having been verified
 once. What sits at a cache path is bytes on a disk this crate does not own. A
 cache hit and a fresh download therefore go through the same check. An entry
-that does not verify is not the archive's file, whatever it is. It is removed,
-and the run downloads it again. A fresh download is checked before it is renamed
-into the cache, so one that does not verify fails the run without ever being
-published.
+that does not verify is not the file asked for, whatever it is, and the run
+downloads it again. A fresh download is checked before it is renamed over the
+entry, so one that does not verify fails the run without ever being published,
+and leaves the entry as it was.
 
 What is verified is what is extracted. The tarball is extracted through the
 descriptor its digest was taken through, and a container's image through the

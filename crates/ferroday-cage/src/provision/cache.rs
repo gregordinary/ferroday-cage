@@ -400,18 +400,6 @@ impl Entry<'_> {
             Some(dir) => Staged::beside_in(rustix::io::fcntl_dupfd_cloexec(dir, 0)?, self.path),
         }
     }
-
-    /// Removes what the entry's name holds, in the directory it holds where it
-    /// holds one, without following a link there.
-    #[cfg(feature = "gentoo")]
-    pub(crate) fn remove(&self) -> io::Result<()> {
-        match (self.dir, self.path.file_name()) {
-            (Some(dir), Some(name)) => {
-                rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty()).map_err(Into::into)
-            }
-            _ => fs::remove_file(self.path),
-        }
-    }
 }
 
 /// Writes `bytes` to the cache entry at `path` as a run publishes one, at a
@@ -776,12 +764,18 @@ pub(crate) struct Job<'a> {
 /// [`Fetch::fetch_all`], publishing each body `verify` accepts.
 ///
 /// Answers, per job and in order, what `verify` made of it, or `None` where the
-/// job did not arrive or did not verify. Neither fails the call: this is an
-/// optimization over [`download`] and nothing more, and a job it does not
-/// deliver is the walk's, which has every mirror rather than the first. What is
-/// published is exactly what the walk would have published, a body that arrived
-/// complete within its size and that `verify` accepted; `verify` is handed it
-/// rewound, with the job's index.
+/// job did not arrive. That does not fail the call: this is an optimization
+/// over [`download`] and nothing more, and a job it does not deliver is the
+/// walk's, which has every mirror rather than the first. What is published is
+/// exactly what the walk would have published, a body that arrived complete
+/// within its size and that `verify` accepted; `verify` is handed it rewound,
+/// with the job's index.
+///
+/// A body that arrived and that `verify` refuses ends the call, once the rest
+/// of its batch is checked and what verified is published. The walk would ask
+/// the same mirror for it first, and a refusal is not a failure it advances
+/// past, so leaving the job to the walk would only download the body again to
+/// refuse it again.
 ///
 /// A host operation on the cache that fails ends the call instead: creating a
 /// job's staging file, writing it, reading it back, or publishing it. Each is
@@ -802,7 +796,8 @@ pub(crate) struct Job<'a> {
 /// # Errors
 ///
 /// Returns [`Failure::Cancelled`] where the run was cancelled before a batch.
-/// Returns [`Failure::Io`] where a job's staging file refused a write, once the
+/// Returns [`Failure::Refused`] with the first refusal of the batch a body was
+/// refused in. Returns [`Failure::Io`] where a job's staging file refused a write, once the
 /// batch it was in has finished, and nothing of that batch is published; and
 /// where a job's staging file could not be created, read back, or published, as
 /// it fails.
@@ -874,6 +869,7 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
         // A job that did not arrive, or that its check refuses, drops its
         // staging file here, unpublished.
         let first = verified.len();
+        let mut refusal = None;
         for ((at, (staged, mut file)), arrived) in staged.into_iter().enumerate().zip(arrived) {
             if !arrived {
                 verified.push(None);
@@ -886,9 +882,13 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
                     err,
                 ))
             })?;
-            let Ok(checked) = verify(first + at, file) else {
-                verified.push(None);
-                continue;
+            let checked = match verify(first + at, file) {
+                Ok(checked) => checked,
+                Err(err) => {
+                    refusal.get_or_insert(err);
+                    verified.push(None);
+                    continue;
+                }
             };
             staged.publish().map_err(|err| {
                 Failure::Io(ProvisionError::io(
@@ -898,6 +898,9 @@ pub(crate) fn prefetch<T, E, W: Watch + ?Sized>(
                 ))
             })?;
             verified.push(Some(checked));
+        }
+        if let Some(refusal) = refusal {
+            return Err(Failure::Refused(refusal));
         }
     }
     Ok(verified)
@@ -948,9 +951,9 @@ pub(crate) struct Package<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`Failure`] for the first package no mirror served or whose
-/// download `check` refused, for a cancellation, and for a host failure on the
-/// cache.
+/// Returns [`Failure`] for a package whose download `check` refused, for the
+/// first package no mirror served, for a cancellation, and for a host failure
+/// on the cache.
 #[cfg(any(feature = "debian", feature = "alpine"))]
 pub(crate) fn acquire<T, E, W: Watch + ?Sized>(
     fetcher: &mut dyn Fetch,
@@ -1391,15 +1394,19 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_publishes_what_arrived_and_verified_and_leaves_the_rest() {
-        // A job that does not arrive, or arrives and is refused, is left for the
-        // walk; nothing about it is published, and nothing of it is left staged.
+    fn a_batch_publishes_what_verified_and_ends_at_a_refusal() {
+        // A job that does not arrive is left for the walk. One that arrives and
+        // is refused ends the call once its batch is checked: the walk would
+        // fetch the same body from the same mirror and refuse it again. Nothing
+        // of either is published or left staged, and no later batch is fetched.
         let dir = Scratch::new("cache-batch");
-        let paths: Vec<PathBuf> = ["good", "refused", "missing"]
-            .iter()
-            .map(|name| dir.join(name))
+        let names: Vec<String> = ["good", "refused", "missing"]
+            .into_iter()
+            .map(str::to_string)
+            .chain((3..=BATCH).map(|at| format!("later-{at}")))
             .collect();
-        let jobs: Vec<Job<'_>> = ["good", "refused", "missing"]
+        let paths: Vec<PathBuf> = names.iter().map(|name| dir.join(name)).collect();
+        let jobs: Vec<Job<'_>> = names
             .iter()
             .zip(&paths)
             .map(|(name, path)| Job {
@@ -1411,25 +1418,56 @@ mod tests {
                 },
             })
             .collect();
-        let mut watch = Watching::patient();
+        let check = |at: usize, mut file: File| {
+            let mut held = String::new();
+            file.read_to_string(&mut held)
+                .map_err(|err| err.to_string())?;
+            if names[at] == "refused" {
+                return Err("refused".to_string());
+            }
+            Ok((at, held))
+        };
+
+        // Without the refused job, what did not arrive is left for the walk.
+        let unrefused = [&jobs[0], &jobs[2]].map(|job| Job {
+            url: job.url.clone(),
+            entry: job.entry,
+        });
         let verified = prefetch(
             &mut serving(b"a body"),
-            &jobs,
-            &mut watch,
-            |at, mut file| {
-                let mut held = String::new();
-                file.read_to_string(&mut held)
-                    .map_err(|err| err.to_string())?;
-                if at == 1 {
-                    return Err("refused".to_string());
-                }
-                Ok((at, held))
-            },
+            &unrefused,
+            &mut Watching::patient(),
+            |at, file| check([0, 2][at], file),
         )
-        .unwrap_or_else(|_| panic!("nothing cancelled the batch"));
-        assert_eq!(verified, [Some((0, "a body".to_string())), None, None],);
+        .unwrap_or_else(|_| panic!("nothing ended the batch"));
+        assert_eq!(verified, [Some((0, "a body".to_string())), None]);
         assert_eq!(ferroday_cage_testkit::scratch::entries(&dir), ["good"]);
-        assert_eq!(watch.fetched.len(), 3, "every job was announced");
+        fs::remove_file(&paths[0]).unwrap();
+
+        let mut fetcher = serving(b"a body");
+        let mut watch = Watching::patient();
+        let refused = prefetch(&mut fetcher, &jobs, &mut watch, check);
+        assert!(
+            matches!(&refused, Err(Failure::Refused(reason)) if reason == "refused"),
+            "{refused:?}"
+        );
+        let mut expected: Vec<&str> = names[..BATCH]
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !["refused", "missing"].contains(name))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            ferroday_cage_testkit::scratch::entries(&dir),
+            expected,
+            "what verified in the batch is published"
+        );
+        assert_eq!(
+            fetcher.asked().len(),
+            BATCH,
+            "the later batch was not fetched"
+        );
+        assert_eq!(watch.fetched.len(), BATCH);
     }
 
     #[test]
@@ -1751,8 +1789,5 @@ mod tests {
             .read_to_end(&mut read)
             .unwrap();
         assert_eq!(read, b"the recorded bytes");
-        entry.remove().expect("the held entry is removed");
-        assert!(!moved.exists());
-        assert!(outside.join("hello/hello-1.gpkg.tar").exists());
     }
 }
