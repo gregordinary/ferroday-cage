@@ -861,9 +861,17 @@ impl Cage {
     /// own.
     ///
     /// The init reports itself held as a command does at the gate, so a
-    /// [`NetStack`](crate::NetStack) attaches to the sandbox as to a pending
+    /// userspace network stack attaches to the sandbox as to a pending
     /// launch's, and [`proceed`](Pending::proceed) returns the sandbox's
     /// handle.
+    // The sentence links a feature-gated item, so it is gated on the feature:
+    // present in the canonical all-features build, absent, link and all, from
+    // a build without it.
+    #[cfg_attr(
+        feature = "netstack",
+        doc = "",
+        doc = "The native one, [`NetStack`](crate::NetStack), attaches the same way."
+    )]
     pub fn start_pending(&self) -> Result<Pending<'static>, Error> {
         Pending::launch(&self.started()?, None)
     }
