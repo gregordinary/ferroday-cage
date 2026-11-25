@@ -3419,6 +3419,13 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// - a cgroup parent (`parent` in `[cgroup]`), a host directory each launch
 ///   creates a cgroup in and enables controllers on for every cgroup beneath
 ///   it.
+/// - the cgroup limits waived without a parent (`required = false` in
+///   `[cgroup]`), which waives the consumer's own limits too, where it adds
+///   them and names no parent.
+/// - a processor weight above the default (`cpu-weight` above 100 in
+///   `[cgroup]`). A weight is a share against the sandbox's siblings beneath
+///   the parent the consumer names, so one above the kernel's default takes
+///   their processor time.
 ///
 /// The hardening that a consumer's own trusted calls add to rather than
 /// replace, since the profile's part would then widen the consumer's
@@ -3438,7 +3445,7 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 /// rejects for every profile), an empty root, a hidden path or one made
 /// read-only, the command, its arguments, environment, and working directory,
 /// path lookup, the hostname, the stream dispositions, the tie to the caller's
-/// lifetime, the resource limits and the cgroup limits, the identity map, the
+/// lifetime, the resource limits and the cgroup limits that only narrow, the identity map, the
 /// run-as and presented identities, the base environment, and the managed
 /// `resolv.conf` turned off. So is the hardening that only removes: a seccomp policy, a
 /// full capability drop (`drop-caps`), the Landlock scopes, and the unix-socket
@@ -3688,12 +3695,29 @@ impl CageBuilder {
         // in, and whose `cgroup.subtree_control` it enables controllers on,
         // which every sibling beneath the parent then has. Reserve it for a
         // trusted profile; the limits alone constrain only the sandbox, and
-        // without a parent `build` refuses them. `required = false` changes
-        // only that refusal: the limits are then the profile's own to waive,
-        // and the record reports them unapplied.
+        // without a parent `build` refuses them.
         if cgroup.parent.is_some() {
             return Err(ConfigError::ProfileOperationForbidden {
                 operation: "a cgroup parent",
+            });
+        }
+        // The limits are the profile's own to narrow, but two settings reach
+        // past its sandbox once the consumer names a parent, or adds limits of
+        // its own. A weight is a share against the sandbox's siblings, so one
+        // above the kernel's default takes their processor time. And
+        // `required = false` waives every limit a launch without a parent
+        // cannot apply, the consumer's own as much as the profile's.
+        if cgroup.required == Some(false) {
+            return Err(ConfigError::ProfileOperationForbidden {
+                operation: "the cgroup limits waived without a parent (required = false)",
+            });
+        }
+        if cgroup
+            .cpu_weight
+            .is_some_and(|weight| weight > crate::cgroup::DEFAULT_CPU_WEIGHT)
+        {
+            return Err(ConfigError::ProfileOperationForbidden {
+                operation: "a processor weight above the default (cpu-weight above 100)",
             });
         }
         // The hardening request holds two parts a consumer's own calls add to
@@ -9405,6 +9429,14 @@ target = "/work/.git/hooks"
             "[cgroup]\nparent = \"/sys/fs/cgroup/delegated\"\n",
             "a cgroup parent",
         ),
+        (
+            "[cgroup]\nrequired = false\npids-max = 64\n",
+            "the cgroup limits waived without a parent (required = false)",
+        ),
+        (
+            "[cgroup]\ncpu-weight = 101\n",
+            "a processor weight above the default (cpu-weight above 100)",
+        ),
         #[cfg(feature = "hardening")]
         (
             "[[hardening.landlock-fs]]\npath = \"/\"\naccess = \"rwx\"\n",
@@ -9476,7 +9508,7 @@ uid = [{ inside = 0, outside = 100000, count = 65536 }]
 gid = [{ inside = 0, outside = 100000, count = 65536 }]
 
 [cgroup]
-required = false
+required = true
 memory-max = 536870912
 memory-swap-max = 0
 pids-max = 64

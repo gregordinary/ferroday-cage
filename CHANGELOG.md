@@ -68,6 +68,10 @@ consumer upgrading can skip it.
   profile's `stop-with-caller = false` let the command it confines outlive
   `fcage`, so a `timeout 60 fcage --restricted-profile ...` or a `^C` bounded
   nothing.
+- `RestrictedProfile` refuses `required = false` in `[cgroup]`, which waived
+  the consumer's own cgroup limits as well as the profile's wherever no parent
+  was named, and a `cpu-weight` above the kernel's default of 100, which took
+  processor time from the sandbox's siblings beneath the consumer's parent.
 
 ### Added
 

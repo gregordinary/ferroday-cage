@@ -330,6 +330,11 @@ the resolved inputs report them as not applied. The [hardening
 chapter](hardening.md#limits-on-the-whole-tree) shows the pairing with an
 `[rlimit]` table as the floor.
 
+`RestrictedProfile` refuses `required = false` too, since it waives the
+consumer's own limits as well as the profile's, and a `cpu-weight` above the
+kernel's default of 100. A weight is a share against the sandbox's siblings
+beneath the parent, so a higher one takes their processor time.
+
 ## Hardening in a profile
 
 With the `hardening` feature, a profile carries the sandbox's Landlock,

@@ -88,6 +88,12 @@ pub enum CgroupLimit {
     CpuWeight(u16),
 }
 
+/// The `cpu.weight` the kernel gives a cgroup nothing set one for: a weight
+/// above it takes processor time from the siblings, and one at or below it
+/// only gives way to them. The restricted profile policy is what reads it.
+#[cfg(feature = "serde")]
+pub(crate) const DEFAULT_CPU_WEIGHT: u16 = 100;
+
 impl CgroupLimit {
     /// A [`CpuMax`](Self::CpuMax) limit of `quota_micros` in each period of
     /// `period_micros`.
