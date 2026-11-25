@@ -746,6 +746,33 @@ impl TcpFlow {
             )
     }
 
+    /// Ends the flow where `socket`, its guest-facing socket, is bound to no
+    /// guest endpoint or to another than the flow's, as an interface poll
+    /// can leave it. Returns whether it ended it.
+    ///
+    /// The socket listens until a SYN reaches it, and takes one from any
+    /// source port. One that listens after the poll that processed the
+    /// flow's SYN has lost the attempt it was opened for: the interface
+    /// dropped the SYN, or the guest reset the attempt, which smoltcp answers
+    /// by listening again. Left listening, it would take the next SYN to the
+    /// destination from any port, carried under this flow's decision and
+    /// reported by this flow's port. The flow ends instead, its host side
+    /// with it. A closed socket has ended its connection and is passed over.
+    pub(super) fn end_if_unbound(&mut self, socket: &mut tcp::Socket) -> bool {
+        if self.dead
+            || socket.state() == tcp::State::Closed
+            || socket.remote_endpoint() == Some(self.guest)
+        {
+            return false;
+        }
+        socket.abort();
+        if let Some(host) = self.host.take() {
+            reset_on_close(&host);
+        }
+        self.dead = true;
+        true
+    }
+
     /// Aborts the flow if it has run out of time, by the nearest of the
     /// deadlines [`due`](Self::due) names. Returns whether it did, since the
     /// guest's reset then waits on the socket's next dispatch.

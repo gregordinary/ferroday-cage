@@ -783,6 +783,16 @@ consumer upgrading can skip it.
   later datagram was decided again, against every rule and every name pinned at
   its address, and once a name a deny rule matches was pinned there, the flow
   was reported refused while the stack went on carrying it.
+- The network stack serves each TCP connection attempt on the flow it decided
+  and reported for that attempt. A flow listened for its SYN on the
+  destination and took one from any port of the guest's, and a flow whose
+  attempt the guest reset, as its kernel does for a socket closed while
+  connecting, listened again. The next attempt to that destination could land
+  there, carried under the earlier attempt's decision, a refused one's
+  included, and named by the earlier port in the flow's reports. A flow whose
+  attempt is reset or dropped now ends at once, its host connection with it.
+  A connection to the stack's nameserver is likewise served by the session
+  opened for it, whose question reports name its own port.
 - A mirror at the filesystem's root, `file:///`, is joined to a path as
   `file:///debian/...`. Every trailing slash was taken from a mirror, which
   left `file:` and the path read as an authority.

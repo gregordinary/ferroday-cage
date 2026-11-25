@@ -335,11 +335,7 @@ impl Nameserver {
         server: IpEndpoint,
         now: Instant,
     ) -> bool {
-        if self
-            .sessions
-            .iter()
-            .any(|session| session.guest == guest && session.server == server && !session.dead)
-        {
+        if self.has_session(guest, server) {
             return true;
         }
         if self.sessions.iter().filter(|session| !session.dead).count() >= MAX_SESSIONS {
@@ -365,6 +361,50 @@ impl Nameserver {
             dead: false,
         });
         true
+    }
+
+    /// Whether a live session serves `guest`'s connection to `server`, which a
+    /// retransmitted SYN of the connection reaches.
+    pub(super) fn has_session(&self, guest: IpEndpoint, server: IpEndpoint) -> bool {
+        self.sessions
+            .iter()
+            .any(|session| session.guest == guest && session.server == server && !session.dead)
+    }
+
+    /// Ends each session whose socket an interface poll left bound to no
+    /// guest endpoint, or to another than the session's, as a flow is ended
+    /// ([`TcpFlow::end_if_unbound`](super::tcp::TcpFlow::end_if_unbound)):
+    /// listening again after the guest reset its connection, it would take the
+    /// next connection to the nameserver from any port, whose queries its
+    /// reports would name by the session's.
+    pub(super) fn end_unbound(&mut self, sockets: &mut SocketSet<'static>) {
+        for session in &mut self.sessions {
+            let socket = sockets.get_mut::<tcp::Socket>(session.handle);
+            if !session.dead
+                && socket.state() != tcp::State::Closed
+                && socket.remote_endpoint() != Some(session.guest)
+            {
+                socket.abort();
+                session.dead = true;
+            }
+        }
+    }
+
+    /// Each live session's guest endpoint, and the endpoint its socket is
+    /// bound to, if any.
+    #[cfg(test)]
+    pub(super) fn session_ends(
+        &self,
+        sockets: &SocketSet<'static>,
+    ) -> Vec<(IpEndpoint, Option<IpEndpoint>)> {
+        self.sessions
+            .iter()
+            .filter(|session| !session.dead)
+            .map(|session| {
+                let socket = sockets.get::<tcp::Socket>(session.handle);
+                (session.guest, socket.remote_endpoint())
+            })
+            .collect()
     }
 
     /// Relays `query`, already read as one and asking about `name`, from

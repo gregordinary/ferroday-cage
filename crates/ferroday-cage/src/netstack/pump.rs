@@ -437,17 +437,44 @@ impl Engine {
 
             // Let the interface process what arrived, then alternate
             // servicing and interface polls until nothing moves.
-            self.iface
-                .poll(self.now(), &mut self.device, &mut self.sockets);
+            self.poll_interface();
             for _ in 0..SERVICE_ROUNDS {
                 if !self.service() {
                     break;
                 }
-                self.iface
-                    .poll(self.now(), &mut self.device, &mut self.sockets);
+                self.poll_interface();
             }
 
             self.reap(std::time::Instant::now());
+        }
+    }
+
+    /// Has the interface process the frames queued for it and send what is
+    /// due, then ends each flow, and each of the nameserver's sessions, the
+    /// poll left with a socket bound to no guest endpoint, or to another than
+    /// its own ([`TcpFlow::end_if_unbound`], [`Nameserver::end_unbound`]).
+    fn poll_interface(&mut self) {
+        self.iface
+            .poll(self.now(), &mut self.device, &mut self.sockets);
+        for flow in &mut self.flows {
+            let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
+            flow.end_if_unbound(socket);
+        }
+        if let Some(nameserver) = &mut self.nameserver {
+            nameserver.end_unbound(&mut self.sockets);
+        }
+    }
+
+    /// Readies the interface for a new listening socket, of a flow or of a
+    /// nameserver session: polls it over the frames queued, where any are.
+    ///
+    /// A reset among them can return a socket to listening, which the poll
+    /// ends, so the SYN the new socket listens for, queued after them, meets
+    /// no listener on its destination but that one. With nothing queued, the
+    /// last poll left none listening.
+    fn settle_before_listening(&mut self) {
+        if self.device.has_queued() {
+            self.poll_interface();
         }
     }
 
@@ -608,15 +635,24 @@ impl Engine {
     /// a refused attempt is answered with a reset, which the guest does not
     /// retry.
     ///
+    /// A listening socket takes a SYN from any source port, so a flow's, or a
+    /// nameserver session's, is made only once the frames queued ahead of
+    /// this one are processed ([`settle_before_listening`]). No other socket
+    /// listens on the destination when the SYN arrives, so the flow serves
+    /// the attempt it was decided and reported for.
+    ///
     /// The classifier does not verify checksums, so the host connect is
-    /// initiated on a segment the interface has not yet validated. A guest
-    /// emitting bad-checksum SYNs to a policy-permitted target thus starts
-    /// real outbound connects it never completes. The exposure is bounded:
-    /// the destination is still policy-checked by [`host_target`] (no reach
-    /// past policy), the flow count by [`MAX_FLOWS`], and each unfinished flow
-    /// by the establish deadline.
+    /// initiated on a segment the interface has not yet validated. A sandboxed
+    /// command holds no capability over the sandbox's network namespace, so
+    /// every frame on the tap is one the guest's kernel built, and a segment
+    /// with a bad checksum cannot come from it. The bounds stand as defence in
+    /// depth: the destination is still policy-checked by [`host_target`] (no
+    /// reach past policy), the flow count is bounded by [`MAX_FLOWS`], and a
+    /// flow whose SYN the interface drops ends at the poll that dropped it,
+    /// its host connect with it.
     ///
     /// [`MAX_FLOWS`]: tcp::MAX_FLOWS
+    /// [`settle_before_listening`]: Self::settle_before_listening
     fn admit_tcp(&mut self, src: IpEndpoint, dst: IpEndpoint) {
         // A retransmitted attempt already has its flow; the interface
         // routes it to the existing socket.
@@ -630,6 +666,13 @@ impl Engine {
         // A connection to the nameserver is served here rather than forwarded,
         // against a budget of its own.
         if self.plan.serves(dst) {
+            if self
+                .nameserver
+                .as_ref()
+                .is_some_and(|nameserver| !nameserver.has_session(src, dst))
+            {
+                self.settle_before_listening();
+            }
             if let Some(nameserver) = &mut self.nameserver {
                 nameserver.open_session(&mut self.sockets, src, dst, std::time::Instant::now());
             }
@@ -656,6 +699,7 @@ impl Engine {
                 return;
             }
         };
+        self.settle_before_listening();
         let mut socket = tcp::guest_facing_socket();
         if socket.listen(dst).is_err() {
             return;
@@ -859,8 +903,7 @@ impl Engine {
             aborted |= nameserver.enforce_deadlines(&mut self.sockets, now);
         }
         if aborted {
-            self.iface
-                .poll(self.now(), &mut self.device, &mut self.sockets);
+            self.poll_interface();
         }
         let mut index = 0;
         while index < self.flows.len() {
@@ -2035,9 +2078,7 @@ mod tests {
         let mut queued = engine.device.take_buffer();
         queued.extend_from_slice(frame);
         engine.device.enqueue(queued);
-        engine
-            .iface
-            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.poll_interface();
         engine.service();
     }
 
@@ -2548,9 +2589,7 @@ mod tests {
             );
             engine.flows[0].events = PollFlags::IN;
             engine.service();
-            engine
-                .iface
-                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            engine.poll_interface();
             std::thread::sleep(Duration::from_millis(10));
         }
         let _peer = writer.join().expect("the writer completes");
@@ -2559,9 +2598,7 @@ mod tests {
         // the flow can move nothing more.
         engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
         engine.service();
-        engine
-            .iface
-            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.poll_interface();
         engine.flows[0].events = PollFlags::empty();
         engine.service();
         let now = std::time::Instant::now();
@@ -2627,9 +2664,7 @@ mod tests {
             );
             engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
             engine.service();
-            engine
-                .iface
-                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            engine.poll_interface();
         }
         assert!(
             engine
@@ -2828,9 +2863,7 @@ mod tests {
                 host_side,
                 std::time::Instant::now(),
             ));
-            engine
-                .iface
-                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            engine.poll_interface();
             let sent = sent_to_guest(guest);
             let syn = sent
                 .iter()
@@ -2890,9 +2923,7 @@ mod tests {
                 .expect("the peer finishes");
             engine.flows[0].events = PollFlags::IN | PollFlags::RDHUP;
             engine.service();
-            engine
-                .iface
-                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            engine.poll_interface();
             let sent = sent_to_guest(guest);
             let fin = sent
                 .iter()
@@ -3006,9 +3037,7 @@ mod tests {
         // which is ten seconds.
         engine.reap(std::time::Instant::now());
         advance_clock(&mut engine, Duration::from_secs(30));
-        engine
-            .iface
-            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.poll_interface();
         engine.service();
         engine.reap(std::time::Instant::now());
 
@@ -3126,6 +3155,101 @@ mod tests {
                     FlowRefusal::LinkLocal,
                 ),
             ]
+        );
+    }
+
+    /// Hands `frame` to the engine as ingestion does, classified and then
+    /// queued, without the interface poll that follows a batch.
+    fn queue(engine: &mut Engine, frame: &[u8]) {
+        assert!(
+            engine.consider(classify(frame)),
+            "the stack withheld the guest's frame"
+        );
+        let mut queued = engine.device.take_buffer();
+        queued.extend_from_slice(frame);
+        engine.device.enqueue(queued);
+    }
+
+    #[test]
+    fn a_connection_attempt_is_served_by_the_flow_opened_for_it() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, guest) = tap_pair();
+        let (mut engine, reports) = reporting_engine(tap, mapping(port), Vec::new());
+        guest_sends(&mut engine, &resolve_gateway());
+        let destination = to(GATEWAY, port);
+
+        // An attempt the stack has answered, which the guest resets, as its
+        // kernel does where the connecting socket closed meanwhile. smoltcp
+        // answers the reset by listening again. Another port's attempt to the
+        // same destination arrives in the same batch as the reset.
+        guest_sends(&mut engine, &syn_from(30_000, destination));
+        assert!(sent_to_guest(&guest).iter().any(|segment| segment.syn));
+        let reset = tcp_v4(
+            (GUEST, 30_000),
+            (GATEWAY, port),
+            TcpControl::Rst,
+            GUEST_ISN + 1,
+            None,
+            &[],
+        );
+        queue(&mut engine, &reset);
+        queue(&mut engine, &syn_from(30_001, destination));
+        engine.poll_interface();
+
+        // The reset attempt's flow has ended, and the other attempt is served
+        // by the flow opened, and reported, for it.
+        let live: Vec<&TcpFlow> = engine.flows.iter().filter(|flow| !flow.dead).collect();
+        assert_eq!(live.len(), 1, "one flow serves the one attempt left");
+        assert_eq!(live[0].guest, from_guest(30_001));
+        let socket = engine.sockets.get::<tcp_socket::Socket>(live[0].handle);
+        assert_eq!(socket.remote_endpoint(), Some(from_guest(30_001)));
+        assert_eq!(socket.state(), tcp_socket::State::SynReceived);
+        assert_eq!(
+            reported(&reports),
+            [30_000, 30_001].map(|guest_port| NetStackReport::admitted(
+                Transport::Tcp,
+                from_guest(guest_port),
+                destination,
+                None,
+                FlowAdmission::HostLoopback,
+            ))
+        );
+        engine.reap(std::time::Instant::now());
+        assert_eq!(engine.flows.len(), 1);
+    }
+
+    #[test]
+    fn a_connection_to_the_nameserver_is_served_by_the_session_opened_for_it() {
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a host socket binds");
+        let address = upstream.local_addr().expect("an address");
+        let (tap, guest) = tap_pair();
+        let (mut engine, _reports) = naming_engine(tap, NetStack::default().plan, address);
+        guest_sends(&mut engine, &resolve_gateway());
+        let server = to(NAMESERVER, nameserver::PORT);
+
+        // As with a flow: a connection the guest resets once answered, and
+        // another port's in the same batch as the reset.
+        guest_sends(&mut engine, &syn_from(30_000, server));
+        assert!(sent_to_guest(&guest).iter().any(|segment| segment.syn));
+        let reset = tcp_v4(
+            (GUEST, 30_000),
+            (NAMESERVER, nameserver::PORT),
+            TcpControl::Rst,
+            GUEST_ISN + 1,
+            None,
+            &[],
+        );
+        queue(&mut engine, &reset);
+        queue(&mut engine, &syn_from(30_001, server));
+        engine.poll_interface();
+
+        let Some(nameserver) = &engine.nameserver else {
+            panic!("the stack serves a nameserver");
+        };
+        assert_eq!(
+            nameserver.session_ends(&engine.sockets),
+            [(from_guest(30_001), Some(from_guest(30_001)))]
         );
     }
 
@@ -3462,9 +3586,7 @@ mod tests {
         let frame = query_frame(5354, &refused);
         assert!(engine.consider(classify(&frame)));
         deliver(&mut engine, &frame);
-        engine
-            .iface
-            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.poll_interface();
         let answers = datagrams_to_guest(&guest);
         assert_eq!(answers.len(), 1, "{answers:?}");
         assert_eq!(answers[0][..2], [0x01, 0x01]);
@@ -3473,9 +3595,7 @@ mod tests {
         let https = dns_query(0x0102, "named.example", 65);
         let frame = query_frame(5355, &https);
         deliver(&mut engine, &frame);
-        engine
-            .iface
-            .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+        engine.poll_interface();
         let answers = datagrams_to_guest(&guest);
         assert_eq!(answers.len(), 1, "{answers:?}");
         assert_eq!(answers[0][3] & 0x0f, 0, "NOERROR");
@@ -3645,9 +3765,7 @@ mod tests {
         /// What the stack has since sent the guest, with the stack's next
         /// sequence number advanced past it.
         fn guest_receives(&mut self, engine: &mut Engine, guest: &OwnedFd) -> Vec<Sent> {
-            engine
-                .iface
-                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            engine.poll_interface();
             let sent = sent_to_guest(guest);
             for segment in &sent {
                 let length = u32::try_from(segment.data.len()).expect("a segment's payload fits");

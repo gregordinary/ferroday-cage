@@ -83,6 +83,11 @@ impl TapDevice {
         self.queue.push_back(frame);
     }
 
+    /// Whether frames wait for the interface's receive path.
+    pub(super) fn has_queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     /// The size every read buffer needs: the MTU plus the Ethernet header.
     pub(super) fn frame_capacity(&self) -> usize {
         self.mtu + ETHERNET_HEADER
