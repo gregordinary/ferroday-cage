@@ -4638,10 +4638,14 @@ mod tests {
     fn a_layered_entry_point_without_a_base_is_refused_where_it_is_called() {
         let scratch = Scratch::new("alpine-no-base");
         let mirror = published(&scratch, &[("musl-1.2.5-r23.apk", fixtures::MUSL)]);
+        // Extract-only, so a host other than x86_64 does not refuse the staging
+        // at the foreign-architecture preflight before it reaches the missing
+        // base.
         let mut alpine = Alpine::builder("v3.23")
             .architecture("x86_64")
             .mirror(&mirror)
             .include(["musl"])
+            .extract_only(true)
             .build()
             .expect("the bootstrap configures");
         let err = alpine.resolve_layer().expect_err("no base layer was set");

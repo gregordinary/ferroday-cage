@@ -3709,10 +3709,14 @@ mod tests {
             .collect(),
             &asked,
         );
+        // Extract-only, so a host other than amd64 does not refuse a run at the
+        // foreign-architecture preflight, which a full bootstrap meets before
+        // anything is fetched. Nothing here runs a package's programs.
         let debian = Debian::builder("trixie")
             .architecture("amd64")
             .mirror("https://mirror.example/debian")
             .trust_unsigned(true)
+            .extract_only(true)
             .fetcher(fetcher)
             .build()
             .expect("the builder validates");
