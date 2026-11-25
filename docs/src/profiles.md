@@ -410,6 +410,11 @@ allow = ["read", "write", "execve"]   # only these allowed, the rest fail EPERM
 [hardening.seccomp]
 curated = true
 deny = ["sethostname"]
+
+# ...or the curated roster less what a command needs:
+[hardening.seccomp]
+curated = true
+relax = ["unshare", "clone"]          # the roster's entries for these left out
 ```
 
 A syscall may be narrowed by its arguments through an `allow-rule` or
@@ -534,9 +539,11 @@ it:
   `--seccomp-reports` and `--no-seccomp-reports`, and the seccomp flags that
   set a posture replace its scopes, unix-socket restriction, capability
   posture, reports, or seccomp policy.
-  `--seccomp-errno` joins the policy that stands instead, the flags' or else the
-  profile's. The seccomp flags mirror the profile's seccomp table.
-  `--seccomp-allow` and `--seccomp-deny` take comma-separated syscall names.
+  `--seccomp-errno` and `--seccomp-relax` join the policy that stands instead,
+  the flags' or else the profile's, and `--seccomp-relax` needs it to be the
+  curated roster. The seccomp flags mirror the profile's seccomp table.
+  `--seccomp-allow`, `--seccomp-deny` and `--seccomp-relax` take
+  comma-separated syscall names.
   `--seccomp-allow-rule` and `--seccomp-deny-rule` take a syscall name with
   conditions in the `len`, `op`, `value` and `mask` of the table's `arg`
   entries, and the argument's `index` written `arg=`, as in `--seccomp-allow-rule

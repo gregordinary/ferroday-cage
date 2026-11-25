@@ -808,6 +808,10 @@ name = "errno_for"
 flags = ["--seccomp-errno"]
 
 [[builder.setting]]
+name = "relax"
+flags = ["--seccomp-relax"]
+
+[[builder.setting]]
 name = "default_action"
 kind = "library"
 why = "`fcage` builds each policy with its posture's own actions: an allowlist refuses what it does not name, and a denylist what it names, each with `EPERM`. A flag naming an action, such as killing the command instead, would have to come first."

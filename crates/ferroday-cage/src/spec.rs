@@ -9271,6 +9271,7 @@ value = 21
         r#"
 [hardening.seccomp]
 curated = true
+relax = ["ptrace"]
 deny = ["sethostname"]
 
 [[hardening.seccomp.deny-rule]]
@@ -9325,7 +9326,7 @@ target = "/work/.git/hooks"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 108] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 109] = [
         "args",
         "base-env",
         "cgroup",
@@ -9375,6 +9376,7 @@ target = "/work/.git/hooks"
         "hardening.seccomp.deny-rule[].syscall",
         "hardening.seccomp.errno",
         "hardening.seccomp.errno.clone3",
+        "hardening.seccomp.relax",
         "host-rootfs",
         "hostname",
         "identity-map",

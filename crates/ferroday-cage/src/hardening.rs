@@ -1201,13 +1201,17 @@ pub struct SeccompRules {
     /// compiled with rather than this holding a copy of it: a profile then
     /// records the roster by name, and a later release's additions reach it.
     curated: bool,
+    /// The syscalls whose entries the roster's rules leave out.
+    relaxed: BTreeSet<i64>,
 }
 
 impl SeccompRules {
     /// The curated denylist: dangerous and rarely-legitimate syscalls fail with
     /// `EPERM`, and everything else is allowed. A convenience posture, not a
     /// boundary claim. Its exact roster is documented and grows only
-    /// additively.
+    /// additively. That promise is the roster's: a caller who
+    /// [relaxes](Self::relax) an entry takes it out of the caller's own policy,
+    /// and the roster keeps it.
     ///
     /// The roster covers mounting, creating or entering a namespace, kernel
     /// modules, the keyring, tracing, setting the time, and similar
@@ -1258,6 +1262,7 @@ impl SeccompRules {
                 .collect(),
             errnos: BTreeMap::new(),
             curated: false,
+            relaxed: BTreeSet::new(),
         }
     }
 
@@ -1273,6 +1278,7 @@ impl SeccompRules {
                 .collect(),
             errnos: BTreeMap::new(),
             curated: false,
+            relaxed: BTreeSet::new(),
         }
     }
 
@@ -1329,6 +1335,39 @@ impl SeccompRules {
     /// a name or a number into that range.
     pub fn errno_for(mut self, syscall: i64, errno: u16) -> SeccompRules {
         self.errnos.insert(syscall, errno);
+        self
+    }
+
+    /// Leaves the [curated roster](Self::curated)'s entries for `syscall` out,
+    /// so a call of it runs, unless a rule or an errno of the caller's own
+    /// refuses it.
+    ///
+    /// This is how a policy widens past the roster for a command that needs
+    /// something it refuses: a browser or a container runtime that builds a
+    /// sandbox of its own needs `unshare` and `clone` to create namespaces, a
+    /// debugger needs `ptrace`. Every entry the roster holds for the syscall
+    /// goes, its conditions on arguments with it: relaxing `ioctl` admits
+    /// `TIOCSTI`, and relaxing `clone3` admits it in place of the `ENOSYS`
+    /// that sends the C library to `clone`, which then creates namespaces too,
+    /// since `clone3` takes its flags where no filter reads them. A
+    /// [report](crate::SeccompReport) of a refusal names the syscall to relax.
+    ///
+    /// ```
+    /// use ferroday_cage::{SeccompPolicy, SeccompRules};
+    ///
+    /// // The roster, less the entries that refuse a namespace of its own.
+    /// let rules = SeccompRules::curated()
+    ///     .relax(libc::SYS_unshare)
+    ///     .relax(libc::SYS_clone);
+    /// # let _ = SeccompPolicy::Rules(rules);
+    /// ```
+    ///
+    /// The build refuses, with
+    /// [`ConfigError::SeccompInvalid`](crate::ConfigError::SeccompInvalid), a
+    /// relaxation of rules that do not start from the roster, and one of a
+    /// syscall the roster holds no entry for, which would relax nothing.
+    pub fn relax(mut self, syscall: i64) -> SeccompRules {
+        self.relaxed.insert(syscall);
         self
     }
 
@@ -1420,16 +1459,45 @@ impl SeccompRules {
             return (self.rules.clone(), self.errnos.clone());
         }
         let mut errnos = curated_errnos();
+        errnos.retain(|syscall, _| !self.relaxed.contains(syscall));
         errnos.extend(&self.errnos);
-        let rules = curated_denylist()
-            .into_iter()
-            .map(SyscallRule::unconditional)
-            .chain(curated_ioctl_rules())
-            .chain(curated_namespace_rules())
-            .filter(|rule| !self.errnos.contains_key(&rule.syscall))
+        let rules = curated_rules()
+            .filter(|rule| {
+                !self.errnos.contains_key(&rule.syscall) && !self.relaxed.contains(&rule.syscall)
+            })
             .chain(self.rules.iter().cloned())
             .collect();
         (rules, errnos)
+    }
+
+    /// Refuses a relaxation that relaxes nothing: one of rules that do not
+    /// start from the roster, or of a syscall the roster holds no entry for.
+    fn check_relaxed(&self) -> Result<(), ConfigError> {
+        let Some(&first) = self.relaxed.first() else {
+            return Ok(());
+        };
+        if !self.curated {
+            return Err(ConfigError::SeccompInvalid {
+                reason: format!(
+                    "syscall number {first} is relaxed, and only the curated roster's \
+                     entries can be: these rules do not start from it"
+                ),
+            });
+        }
+        let errnos = curated_errnos();
+        let held: BTreeSet<i64> = curated_rules()
+            .map(|rule| rule.syscall)
+            .chain(errnos.keys().copied())
+            .collect();
+        match self.relaxed.iter().find(|syscall| !held.contains(syscall)) {
+            Some(unheld) => Err(ConfigError::SeccompInvalid {
+                reason: format!(
+                    "syscall number {unheld} is relaxed, and the curated roster holds no \
+                     entry for it"
+                ),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Whether no call of `syscall` runs, whatever its arguments.
@@ -1457,6 +1525,7 @@ impl SeccompRules {
     #[cfg(feature = "serde")]
     fn is_plain_curated(&self) -> bool {
         self.curated
+            && self.relaxed.is_empty()
             && self.rules.is_empty()
             && self.errnos.is_empty()
             && self.default_action == SeccompAction::Allow
@@ -1632,6 +1701,17 @@ const TIOCSTI: u64 = 0x5412;
 /// `TIOCL_PASTESEL` subcommands paste a console selection into the input queue
 /// and so reach the same place `TIOCSTI` does.
 const TIOCLINUX: u64 = 0x541C;
+
+/// Every rule of the curated roster's: the syscalls it refuses outright, and
+/// the `ioctl` requests and namespace flags it refuses by argument. Its errno
+/// answers are [`curated_errnos`].
+fn curated_rules() -> impl Iterator<Item = SyscallRule> {
+    curated_denylist()
+        .into_iter()
+        .map(SyscallRule::unconditional)
+        .chain(curated_ioctl_rules())
+        .chain(curated_namespace_rules())
+}
 
 /// The curated denylist's argument-conditioned entries: the two `ioctl`
 /// requests that write to a terminal's input queue.
@@ -2243,6 +2323,7 @@ fn grant_path_cstring(path: &Path) -> Result<CString, ConfigError> {
 fn compile_seccomp(policy: &SeccompPolicy) -> Result<Vec<SockFilter>, ConfigError> {
     let program = match policy {
         SeccompPolicy::Rules(rules) => {
+            rules.check_relaxed()?;
             let (listed, errnos) = rules.lowered();
             compile_filter(rules.default_action, rules.listed_action, &listed, &errnos)?
         }
@@ -2811,7 +2892,8 @@ pub(crate) mod serde_request {
     /// syscall names to errno names. The allow and deny sides are mutually
     /// exclusive; a table must set one side, and `errno` alone counts as the
     /// deny side, since what it does is refuse. `curated = true` is a deny side
-    /// of its own, the curated roster, which the table's deny side extends.
+    /// of its own, the curated roster, which the table's deny side extends and
+    /// `relax` takes entries out of.
     ///
     /// `curated` and `errno` precede the two rule arrays so the serialized
     /// table is valid TOML in field order, as [`HardeningProfile`] keeps its
@@ -2821,6 +2903,10 @@ pub(crate) mod serde_request {
     struct SeccompLists {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         curated: bool,
+        /// The syscalls whose curated entries are left out; see
+        /// [`SeccompRules::relax`].
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        relax: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         allow: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -3101,6 +3187,16 @@ pub(crate) mod serde_request {
             for (syscall, errno) in &self.errno {
                 rules = rules.errno_for(resolve_syscall(syscall)?, resolve_errno(errno)?);
             }
+            if !self.relax.is_empty() && !self.curated {
+                return Err(
+                    "relax takes entries out of the curated roster, which this table \
+                            does not start from (curated = true)"
+                        .to_string(),
+                );
+            }
+            for syscall in &self.relax {
+                rules = rules.relax(resolve_syscall(syscall)?);
+            }
             Ok(rules)
         }
 
@@ -3122,6 +3218,18 @@ pub(crate) mod serde_request {
                 .iter()
                 .map(|(&syscall, &errno)| Ok((name_syscall(syscall)?, name_errno(errno)?)))
                 .collect::<Result<BTreeMap<_, _>, String>>()?;
+            if !rules.relaxed.is_empty() && !rules.curated {
+                return Err(
+                    "relaxed syscalls are the curated roster's, and these rules do not \
+                     start from it"
+                        .to_string(),
+                );
+            }
+            let relax = rules
+                .relaxed
+                .iter()
+                .map(|&syscall| name_syscall(syscall))
+                .collect::<Result<Vec<_>, String>>()?;
             // A table that answers syscalls with an errno and lists none reads
             // back as a denylist, so that one shape is representable, and so
             // does the curated roster with no listing of the caller's.
@@ -3132,6 +3240,7 @@ pub(crate) mod serde_request {
             {
                 return Ok(SeccompLists {
                     curated: rules.curated,
+                    relax,
                     errno,
                     ..SeccompLists::default()
                 });
@@ -3159,6 +3268,7 @@ pub(crate) mod serde_request {
             match (rules.default_action, rules.listed_action) {
                 (SeccompAction::Allow, SeccompAction::Errno(EPERM)) => Ok(SeccompLists {
                     curated: rules.curated,
+                    relax,
                     deny: bare,
                     deny_rule: rule_profiles,
                     errno,
@@ -3948,6 +4058,55 @@ mod tests {
             .is_ok()
         );
         assert!(lowered(Some(SeccompPolicy::Rules(SeccompRules::curated()))).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_relaxed_entry_runs_and_the_rest_of_the_roster_still_refuses() {
+        let new_user = libc::CLONE_NEWUSER as u64;
+        let tiocsti = 0x5412;
+        let relaxed = SeccompRules::curated()
+            .relax(libc::SYS_ptrace)
+            .relax(libc::SYS_unshare)
+            .relax(libc::SYS_clone3);
+        let program = compile_seccomp(&SeccompPolicy::Rules(relaxed)).unwrap();
+        let answer = |syscall: i64, args: &[u64]| eval::run(&program, &host_call(syscall, args));
+        let eperm = ret_value(SeccompAction::Errno(EPERM));
+        let allow = ret_value(SeccompAction::Allow);
+        assert_eq!(answer(libc::SYS_ptrace, &[]), allow);
+        // Every entry for the syscall goes, its conditions with it.
+        assert_eq!(answer(libc::SYS_unshare, &[new_user]), allow);
+        // An errno answer of the roster's is an entry too.
+        assert_eq!(answer(libc::SYS_clone3, &[]), allow);
+        // What is not relaxed is refused as before.
+        assert_eq!(answer(libc::SYS_clone, &[new_user]), eperm);
+        assert_eq!(answer(libc::SYS_mount, &[]), eperm);
+        assert_eq!(answer(libc::SYS_ioctl, &[0, tiocsti]), eperm);
+        // The caller's own rule still refuses a relaxed syscall.
+        let relisted = SeccompRules::curated()
+            .relax(libc::SYS_ptrace)
+            .rule(libc::SYS_ptrace, []);
+        let program = compile_seccomp(&SeccompPolicy::Rules(relisted)).unwrap();
+        assert_eq!(
+            eval::run(&program, &host_call(libc::SYS_ptrace, &[])),
+            eperm
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_relaxation_that_relaxes_nothing_is_refused() {
+        // Rules that do not start from the roster, and a syscall it holds no
+        // entry for.
+        for rules in [
+            SeccompRules::denying([libc::SYS_ptrace]).relax(libc::SYS_ptrace),
+            SeccompRules::curated().relax(libc::SYS_getpid),
+        ] {
+            assert!(matches!(
+                compile_seccomp(&SeccompPolicy::Rules(rules)),
+                Err(ConfigError::SeccompInvalid { .. })
+            ));
+        }
     }
 
     #[test]
@@ -4807,6 +4966,35 @@ errno = { clone3 = "enosys" }
         );
         let reread: CageBuilder = toml::from_str(&written).expect("it reads back");
         assert_eq!(toml::to_string(&reread).unwrap(), written);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_relaxed_roster_reads_and_writes_by_name() {
+        use crate::{SeccompPolicy, SeccompRules};
+
+        let (policy, written) =
+            seccomp_round_trip("{ curated = true, relax = [\"unshare\", \"ptrace\"] }");
+        assert_eq!(
+            format!("{policy:?}"),
+            format!(
+                "{:?}",
+                SeccompPolicy::Rules(
+                    SeccompRules::curated()
+                        .relax(libc::SYS_ptrace)
+                        .relax(libc::SYS_unshare)
+                )
+            )
+        );
+        assert!(written.contains("curated = true"), "{written}");
+        assert!(written.contains("relax = ["), "{written}");
+        let reread: CageBuilder = toml::from_str(&written).expect("it reads back");
+        assert_eq!(toml::to_string(&reread).unwrap(), written);
+        // A relaxation is the roster's, so a table without it is refused.
+        let profile = "rootfs = \"/r\"\ncommand = \"/c\"\n[hardening.seccomp]\n\
+                       deny = [\"ptrace\"]\nrelax = [\"ptrace\"]\n";
+        let err = toml::from_str::<CageBuilder>(profile).unwrap_err();
+        assert!(err.to_string().contains("curated roster"), "{err}");
     }
 
     #[test]

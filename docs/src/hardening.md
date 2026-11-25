@@ -245,7 +245,12 @@ syscalls warrant denial. It is a convenience posture, not a boundary claim.
 
 The curated roster is a deny-list like any other, so a caller's rules extend
 it. An errno the caller gives for a syscall the roster lists answers that
-syscall in place of the roster's entry.
+syscall in place of the roster's entry. [`SeccompRules::relax`] leaves the
+roster's entries for a syscall out altogether, so a command that needs what the
+roster refuses runs with the rest of the roster in force: `unshare` and `clone`
+for a program that builds a sandbox of its own, `ptrace` for a debugger. The
+roster's promise to grow only additively is the roster's, and a relaxation is
+the caller's own policy.
 
 ```rust,no_run
 # use ferroday_cage::{Cage, SeccompPolicy, SeccompRules};
@@ -373,7 +378,8 @@ without the reports. [`Running::take_seccomp_reports`] hands the reports over,
 each a [`SeccompReport`] naming the syscall, its six arguments as raw values,
 the thread that made it and the program the thread runs, and the errno. A
 harness that reads them can name what stopped a command and offer to rerun it
-with the policy widened.
+with the policy widened: [`SeccompRules::relax`] takes the syscall a report
+names out of the curated roster.
 
 ```rust,no_run
 # use ferroday_cage::{Cage, SeccompPolicy, SeccompRules};
@@ -846,7 +852,8 @@ filter syscalls by name.
 terms of a profile's `arg` entries, `len`, `op`, `value` and `mask`, except that
 the flag names the argument `arg=` where the profile's entry names it `index`:
 `--seccomp-allow-rule 'ioctl arg=1 len=dword op=eq value=0x5413'`. `--seccomp-errno clone3=ENOSYS`
-answers one syscall with an errno of its own, and `--seccomp-reports` writes
+answers one syscall with an errno of its own, `--seccomp-relax ptrace` leaves
+the curated roster's entries for a syscall out, and `--seccomp-reports` writes
 each call the filter refuses on standard error. `--drop-caps` and `--keep-caps`
 control capabilities, and `--deny-net` selects the denied network.
 
@@ -862,6 +869,7 @@ with no sandbox around it.
 [`seccomp`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.seccomp
 [`SeccompPolicy`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.SeccompPolicy.html
 [`SeccompRules`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html
+[`SeccompRules::relax`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.relax
 [`seccomp_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.seccomp_reports
 [`Running::take_seccomp_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.take_seccomp_reports
 [`SeccompReport`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.SeccompReport.html

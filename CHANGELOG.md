@@ -125,6 +125,13 @@ consumer upgrading can skip it.
   `Error::SeccompListenerHeld`. The resolved inputs record
   `seccomp-reports`. `fcage --seccomp-reports` writes each refusal on standard
   error, and `--no-seccomp-reports` overrides a profile.
+- `SeccompRules::relax` leaves the curated roster's entries for a syscall
+  out, its argument conditions and errno answers with them, so a command that
+  needs what the roster refuses runs with the rest of it in force. A profile's
+  `[hardening.seccomp]` table spells it `relax = [...]` beside `curated =
+  true`, and `fcage --seccomp-relax` joins the curated policy the flags or a
+  profile set. A relaxation of rules that do not start from the roster, or of
+  a syscall it holds no entry for, is refused at build.
 - `fcage --host-report` prints what the host offers a sandbox, as TOML: user
   namespaces, the Landlock ABI, seccomp, a procfs of the sandbox's own, range
   maps, this process's cgroup, and a security module's confinement, each a

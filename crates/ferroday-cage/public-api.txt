@@ -3461,6 +3461,7 @@ pub fn ferroday_cage::SeccompRules::denying<I: core::iter::traits::collect::Into
 pub fn ferroday_cage::SeccompRules::errno(&str) -> core::option::Option<u16>
 pub fn ferroday_cage::SeccompRules::errno_for(self, i64, u16) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::listed_action(self, ferroday_cage::SeccompAction) -> ferroday_cage::SeccompRules
+pub fn ferroday_cage::SeccompRules::relax(self, i64) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::rule<I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::SeccompArg>>(self, i64, I) -> ferroday_cage::SeccompRules
 pub fn ferroday_cage::SeccompRules::syscall(&str) -> core::option::Option<i64>
 impl core::marker::Freeze for ferroday_cage::SeccompRules

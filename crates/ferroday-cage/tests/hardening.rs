@@ -607,6 +607,39 @@ fn curated_seccomp_denies_creating_a_namespace() {
 
 #[test]
 #[cfg(target_pointer_width = "64")]
+fn a_relaxed_roster_lets_a_command_create_namespaces_and_refuses_the_rest() {
+    let Some(rootfs) = rootfs() else {
+        return;
+    };
+    if !common::require::seccomp() {
+        return;
+    }
+    // The roster less its namespace entries, for a command that builds a
+    // sandbox of its own: the namespaces are created, and the mount the roster
+    // still refuses is refused.
+    let rules = SeccompRules::curated()
+        .relax(libc::SYS_unshare)
+        .relax(libc::SYS_clone);
+    let script = "unshare -U true 2>&1; echo user=$?; mkdir -p /mnt; \
+                  mount -t tmpfs none /mnt 2>&1; echo mount=$?";
+    let output = Cage::builder()
+        .rootfs(rootfs)
+        .command("/bin/busybox")
+        .args(["sh", "-c", script])
+        .seccomp(SeccompPolicy::Rules(rules))
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox launches");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("user=0") && stdout.contains("mount=1"),
+        "{stdout:?}"
+    );
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
 fn an_errno_no_failed_syscall_reports_is_refused_at_build() {
     // A build alone, so this needs neither the fixture nor seccomp in the
     // kernel. Zero would hand `getpid` a pid of 0 and tell a `clone3` caller it

@@ -2327,6 +2327,23 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--seccomp-relax",
+        section: Section::Hardening,
+        placeholder: "LIST",
+        help: &[
+            "Leave the curated roster's entries for these syscalls",
+            "out, so they run (comma-separated names, repeatable).",
+            "Joins the curated policy the flags or a profile set",
+        ],
+        restriction: true,
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            parse_seccomp_names(flag, &value, &mut options.seccomp_relax)?;
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--seccomp-reports",
         section: Section::Hardening,
         help: &[
@@ -2684,7 +2701,8 @@ seccomp flags are mutually constrained: an allow side (--seccomp-allow,
 --seccomp-allow-rule) cannot be mixed with a deny side (--seccomp-deny,
 --seccomp-deny-rule), and --seccomp curated is a deny side the deny flags
 extend. --seccomp-errno joins whichever policy stands, the flags' or else
-the profile's, and with neither denies only what it names. A profile's
+the profile's, and with neither denies only what it names. --seccomp-relax
+joins it the same way, and needs it to be the curated roster. A profile's
 [netstack] table configures the stack --netstack attaches, and is unused
 without it. --netstack-allow, --netstack-deny, --netstack-host-port, and
 --netstack-publish add to its lists, and the other --netstack-* flags
@@ -2899,6 +2917,9 @@ struct Options {
     /// until the launch: they join whichever policy stands, and with a profile
     /// that is not known until the profile is loaded.
     seccomp_errno: Vec<(i64, u16)>,
+    /// The `--seccomp-relax` syscalls, kept apart for the reason
+    /// [`seccomp_errno`](Self::seccomp_errno) is.
+    seccomp_relax: Vec<i64>,
     caps: Option<CapsChoice>,
     restrict: bool,
     /// `--print-resolved`: print what the build resolves to rather than
@@ -3443,6 +3464,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         seccomp_allow_rules: Vec::new(),
         seccomp_deny_rules: Vec::new(),
         seccomp_errno: Vec::new(),
+        seccomp_relax: Vec::new(),
         caps: None,
         restrict: false,
         print_resolved: false,
@@ -3539,6 +3561,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             && options.landlock_net.is_empty()
             && options.seccomp.is_none()
             && options.seccomp_errno.is_empty()
+            && options.seccomp_relax.is_empty()
         {
             return Err(
                 "--restrict requires at least one grant: a --landlock-ro, --landlock-rw, \
@@ -5156,37 +5179,72 @@ fn assemble_seccomp(
     Ok(Some(SeccompPolicy::Rules(policy)))
 }
 
+/// What the seccomp flags add to whichever policy stands, rather than
+/// replacing it: `--seccomp-errno`'s answers and `--seccomp-relax`'s
+/// relaxations.
+#[derive(Debug, Default)]
+struct Joining {
+    /// The `--seccomp-errno` answers.
+    errnos: Vec<(i64, u16)>,
+    /// The syscalls `--seccomp-relax` takes out of the curated roster.
+    relaxed: Vec<i64>,
+}
+
+impl Joining {
+    /// Whether nothing joins.
+    fn is_empty(&self) -> bool {
+        self.errnos.is_empty() && self.relaxed.is_empty()
+    }
+}
+
 /// The seccomp policy a launch sets, or `None` to leave the one it has.
 ///
 /// `flags` is the policy the allow, deny and curated flags assembled, which
 /// replaces a profile's as every flag given beside a profile overrides it.
-/// `errnos` joins whichever policy then stands: the flags', or else the
+/// `joining` joins whichever policy then stands: the flags', or else the
 /// profile's, `beneath`. An errno beside a profile's allow-list therefore
-/// answers its syscall without discarding the list. With neither policy, the
-/// errnos make a deny side of their own, refusing only what they name. A
-/// precompiled program, which neither the flags nor a profile spell, cannot be
-/// extended by one.
+/// answers its syscall without discarding the list, and a relaxation beside a
+/// profile's curated roster relaxes it. With neither policy, the errnos make a
+/// deny side of their own, refusing only what they name; a relaxation needs a
+/// roster to relax. A precompiled program, which neither the flags nor a
+/// profile spell, cannot be extended by either.
 fn compose_seccomp(
     flags: Option<SeccompPolicy>,
-    errnos: Vec<(i64, u16)>,
+    joining: Joining,
     beneath: Option<&SeccompPolicy>,
 ) -> Result<Option<SeccompPolicy>, String> {
-    if errnos.is_empty() {
+    if joining.is_empty() {
         return Ok(flags);
     }
     let rules = match (flags, beneath) {
         (Some(SeccompPolicy::Rules(rules)), _) => rules,
         (None, Some(SeccompPolicy::Rules(rules))) => rules.clone(),
-        (None, None) => SeccompRules::denying([]),
+        (None, None) if joining.relaxed.is_empty() => SeccompRules::denying([]),
+        (None, None) => {
+            return Err(
+                "--seccomp-relax relaxes the curated roster: give --seccomp curated, \
+                        or a profile whose seccomp policy starts from it"
+                    .to_string(),
+            );
+        }
         _ => {
             return Err(
-                "--seccomp-errno cannot be added to a precompiled seccomp program".to_string(),
+                "--seccomp-errno and --seccomp-relax cannot be added to a precompiled seccomp \
+                 program"
+                    .to_string(),
             );
         }
     };
-    let rules = errnos.into_iter().fold(rules, |rules, (syscall, errno)| {
-        rules.errno_for(syscall, errno)
-    });
+    let rules = joining
+        .errnos
+        .into_iter()
+        .fold(rules, |rules, (syscall, errno)| {
+            rules.errno_for(syscall, errno)
+        });
+    let rules = joining
+        .relaxed
+        .into_iter()
+        .fold(rules, |rules, syscall| rules.relax(syscall));
     Ok(Some(SeccompPolicy::Rules(rules)))
 }
 
@@ -5696,7 +5754,10 @@ impl Launch {
         // only now. A conflict between the two is the usage error it is.
         let seccomp = compose_seccomp(
             options.seccomp,
-            options.seccomp_errno,
+            Joining {
+                errnos: options.seccomp_errno,
+                relaxed: options.seccomp_relax,
+            },
             builder.get_seccomp(),
         )
         .map_err(|message| usage_error(format_args!("{message}")))?;
@@ -6667,7 +6728,10 @@ fn restriction_builder(options: &mut Options) -> Result<RestrictionBuilder, Stri
     // none denies only what it names.
     let seccomp = compose_seccomp(
         options.seccomp.take(),
-        std::mem::take(&mut options.seccomp_errno),
+        Joining {
+            errnos: std::mem::take(&mut options.seccomp_errno),
+            relaxed: std::mem::take(&mut options.seccomp_relax),
+        },
         None,
     )?;
     let mut builder = Restriction::builder();
@@ -10568,7 +10632,10 @@ mod tests {
 
     #[test]
     fn a_seccomp_errno_joins_whichever_policy_stands() {
-        let errno = || vec![(sysno("clone3"), 38)];
+        let errno = || Joining {
+            errnos: vec![(sysno("clone3"), 38)],
+            ..Joining::default()
+        };
         let allow = || SeccompRules::allowing([sysno("read")]);
         let deny = || SeccompRules::denying([sysno("ptrace")]);
 
@@ -10615,10 +10682,44 @@ mod tests {
         // Without errnos, the flags' policy stands as it is, and with no flag
         // at all the profile's is left in place.
         assert!(
-            compose_seccomp(None, Vec::new(), Some(&profile))
+            compose_seccomp(None, Joining::default(), Some(&profile))
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_seccomp_relaxation_joins_the_curated_roster_that_stands() {
+        let relax = || Joining {
+            relaxed: vec![sysno("ptrace")],
+            ..Joining::default()
+        };
+        let relaxed = format!("{:?}", SeccompRules::curated().relax(sysno("ptrace")));
+        // The flags' roster, and a profile's.
+        let curated = SeccompPolicy::Rules(SeccompRules::curated());
+        assert_eq!(
+            rules_of(compose_seccomp(Some(curated.clone()), relax(), None).unwrap()),
+            relaxed
+        );
+        assert_eq!(
+            rules_of(compose_seccomp(None, relax(), Some(&curated)).unwrap()),
+            relaxed
+        );
+        // With no roster at all there is nothing to relax.
+        let err = compose_seccomp(None, relax(), None).unwrap_err();
+        assert!(err.contains("--seccomp curated"), "{err}");
+        // On the command line it parses as the other name lists do.
+        let options = parse_run(&[
+            "--rootfs",
+            "/r",
+            "--seccomp",
+            "curated",
+            "--seccomp-relax",
+            "ptrace,unshare",
+            "/bin/true",
+        ])
+        .expect("the flags parse");
+        assert_eq!(options.seccomp_relax, [sysno("ptrace"), sysno("unshare")]);
     }
 
     #[test]
@@ -11247,6 +11348,8 @@ mod tests {
     fn given(flag: &Flag) -> Vec<&'static str> {
         let value: &[&'static str] = match flag.long {
             "--kill-after" => return vec!["--timeout", "1", "--kill-after", "1"],
+            // A relaxation needs the curated roster it relaxes.
+            "--seccomp-relax" => return vec!["--seccomp", "curated", "--seccomp-relax", "ptrace"],
             "--debian-base-priority" => &["required"],
             "--debian-source-date-epoch"
             | "--alpine-source-date-epoch"
@@ -11353,6 +11456,9 @@ mod tests {
                 "--print-resolved" => options.print_resolved,
                 "--timeout" => options.timeout.is_some(),
                 "--kill-after" => options.kill_after == Duration::from_secs(1),
+                // Given beside the roster it needs, so held to that rather
+                // than to nothing.
+                "--seccomp-relax" => with != built(&["--seccomp", "curated"]).0,
                 _ if with != without => true,
                 long => {
                     let counterpart = match long.strip_prefix("--no-") {
