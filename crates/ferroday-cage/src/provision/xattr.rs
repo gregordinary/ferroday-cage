@@ -13,14 +13,19 @@
 //! calling user. [`Acl`] and [`capability_mapped`] are that restatement, each
 //! given the translation its caller holds.
 //!
-//! A list naming an id the translation has no answer for cannot be carried. It
-//! cannot be dropped either, without care. Where a list carries a mask, the
-//! group bits of the entry's mode are the mask, not the owning group's own
-//! entry, so an entry laid down with its mode and without its list gives the
-//! owning group whatever the mask allows: `group::---,mask::rw-` arrives as
-//! `g+rw`. [`Acl::narrowed`] is the answer both callers give: the list without
-//! its named entries, its owning group's entry cut back by the mask, which is
-//! what that group was allowed and no more.
+//! A list naming an id the translation has no answer for cannot be carried as
+//! it stands. [`Acl::mapped`] carries it without the entries that name such an
+//! id, which takes nothing from anyone the translation answers for.
+//!
+//! A list that cannot be carried at all, on a filesystem without lists or by a
+//! step that lays an entry down without its attributes, cannot be dropped
+//! either, without care. Where a list carries a mask, the group bits of the
+//! entry's mode are the mask, not the owning group's own entry, so an entry
+//! laid down with its mode and without its list gives the owning group
+//! whatever the mask allows: `group::---,mask::rw-` arrives as `g+rw`.
+//! [`Acl::narrowed`] is the answer there: the list without its named entries,
+//! its owning group's entry cut back by the mask, which is what that group was
+//! allowed and no more.
 
 use std::ffi::CStr;
 use std::os::fd::BorrowedFd;
@@ -405,24 +410,38 @@ impl Acl {
         text
     }
 
-    /// The list with each named entry's id read through `uid` or `gid`, or
-    /// `None` where either has no answer for one, or the answers make no list:
-    /// two ids read as one.
+    /// The list with each named entry's id read through `uid` or `gid`, and
+    /// each entry they have no answer for left out, or `None` where the
+    /// answers make no list: two ids read as one.
+    ///
+    /// Leaving an entry out takes nothing from anyone the translation answers
+    /// for: each keeps what the list gave them, the mask's bound included. An
+    /// entry's denial counts only for whom it names, so narrowing the whole
+    /// list ([`narrowed`](Self::narrowed)) instead would leave each named user
+    /// and group to the owning group's or everyone else's entry, which can
+    /// grant them more than the list did.
     pub(super) fn mapped(
         &self,
         uid: impl Fn(u32) -> Option<u32>,
         gid: impl Fn(u32) -> Option<u32>,
-    ) -> Option<Acl> {
+    ) -> Option<Mapped> {
         let mut entries = Vec::with_capacity(self.entries.len());
+        let mut left_out = false;
         for entry in &self.entries {
             let id = match entry.tag {
-                ACL_USER => uid(entry.id)?,
-                ACL_GROUP => gid(entry.id)?,
-                _ => entry.id,
+                ACL_USER => uid(entry.id),
+                ACL_GROUP => gid(entry.id),
+                _ => Some(entry.id),
             };
-            entries.push(AclEntry { id, ..*entry });
+            match id {
+                Some(id) => entries.push(AclEntry { id, ..*entry }),
+                None => left_out = true,
+            }
         }
-        canonical(entries).ok().map(|entries| Acl { entries })
+        canonical(entries).ok().map(|entries| Mapped {
+            list: Acl { entries },
+            left_out,
+        })
     }
 
     /// The list without its named entries and its mask, the owning group's
@@ -468,6 +487,15 @@ impl Acl {
         let other = perm(ACL_OTHER).unwrap_or(mode & 0o7);
         (mode & !0o777) | (user << 6) | (group << 3) | other
     }
+}
+
+/// A list read across a translation ([`Acl::mapped`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Mapped {
+    /// The list, without the entries the translation has no answer for.
+    pub(super) list: Acl,
+    /// Whether any entry was left out.
+    pub(super) left_out: bool,
 }
 
 #[cfg(feature = "tarball")]
@@ -583,15 +611,16 @@ impl AclText {
     ///
     /// A name the root answers takes the root's id over one its writer
     /// recorded beside it, which is star's reading of the two. A name the root
-    /// does not answer takes the recorded id, and where there is none the
-    /// list cannot be given as it stands: `Ok(None)`, and its
-    /// [`narrowing`](Self::narrowed) is what can. An error is a list the
-    /// answers make invalid, one naming the same id twice.
+    /// does not answer takes the recorded id, and an entry with neither is
+    /// left out: it names no one the root has an account for, and leaving it
+    /// out takes nothing from anyone who has one, as [`Acl::mapped`] leaves out
+    /// an id. GNU tar applies no list at all where a name does not resolve. An
+    /// error is a list the answers make invalid, one naming the same id twice.
     pub(super) fn resolve(
         &self,
         user: impl Fn(&[u8]) -> Option<u32>,
         group: impl Fn(&[u8]) -> Option<u32>,
-    ) -> Result<Option<Acl>, AclFlaw> {
+    ) -> Result<Acl, AclFlaw> {
         let mut entries = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
             let id = match &entry.who {
@@ -605,7 +634,7 @@ impl AclText {
                     };
                     match answer.or(*id) {
                         Some(id) => id,
-                        None => return Ok(None),
+                        None => continue,
                     }
                 }
             };
@@ -616,24 +645,7 @@ impl AclText {
             });
         }
         entries.sort_by_key(|entry| rank(entry.tag));
-        canonical(entries).map(|entries| Some(Acl { entries }))
-    }
-
-    /// The list's [`narrowing`](Acl::narrowed), which needs no name: it keeps
-    /// only the entries that name no one.
-    pub(super) fn narrowed(&self) -> Acl {
-        let mut entries: Vec<AclEntry> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.who == Who::Nobody)
-            .map(|entry| AclEntry {
-                tag: entry.tag,
-                perm: entry.perm,
-                id: ACL_UNDEFINED_ID,
-            })
-            .collect();
-        entries.sort_by_key(|entry| rank(entry.tag));
-        Acl { entries }.narrowed()
+        canonical(entries).map(|entries| Acl { entries })
     }
 }
 
@@ -988,8 +1000,9 @@ mod tests {
         let flipped = acl
             .mapped(|id| Some(2001 - id), Some)
             .expect("both ids map");
+        assert!(!flipped.left_out);
         assert_eq!(
-            flipped,
+            flipped.list,
             list(&[
                 (ACL_USER_OBJ, 6, NONE),
                 (ACL_USER, 4, 1000),
@@ -1021,7 +1034,7 @@ mod tests {
             b"user::rw-\nuser:0:r--\nuser:4242:r-x\ngroup::r--\ngroup:4243:rw-\nmask::rwx\nother::---\n",
         );
         let read = stated(&text);
-        assert_eq!(read.resolve(|_| None, |_| None), Ok(Some(acl)));
+        assert_eq!(read.resolve(|_| None, |_| None), Ok(acl));
     }
 
     #[cfg(feature = "tarball")]
@@ -1036,7 +1049,7 @@ mod tests {
         let groups = |name: &[u8]| (name == b"wheel").then_some(10);
         assert_eq!(
             text.resolve(users, groups),
-            Ok(Some(list(&[
+            Ok(list(&[
                 (ACL_USER_OBJ, 6, NONE),
                 (ACL_USER, 4, 0),
                 (ACL_USER, 5, 4242),
@@ -1044,35 +1057,37 @@ mod tests {
                 (ACL_GROUP, 6, 10),
                 (ACL_MASK, 7, NONE),
                 (ACL_OTHER, 0, NONE),
-            ]))),
+            ])),
         );
-        // A name the root does not answer leaves the list uncarriable, and its
-        // narrowing is what the owner, the group and everyone else keep.
-        assert_eq!(text.resolve(users, |_| None), Ok(None));
+        // A name the root does not answer is left out, and everyone else,
+        // the mask's bound included, keeps what the list gave them.
         assert_eq!(
-            text.narrowed(),
-            list(&[
+            text.resolve(users, |_| None),
+            Ok(list(&[
                 (ACL_USER_OBJ, 6, NONE),
+                (ACL_USER, 4, 0),
+                (ACL_USER, 5, 4242),
                 (ACL_GROUP_OBJ, 4, NONE),
-                (ACL_OTHER, 0, NONE)
-            ]),
+                (ACL_MASK, 7, NONE),
+                (ACL_OTHER, 0, NONE),
+            ])),
         );
         // star's fourth field answers where the root does not, and gives way
         // where it does.
         let starred = stated(b"u::rw-,u:lisa:rw-:502,g::r--,m::rw-,o::---");
         assert_eq!(
             starred.resolve(|_| None, |_| None),
-            Ok(Some(list(&[
+            Ok(list(&[
                 (ACL_USER_OBJ, 6, NONE),
                 (ACL_USER, 6, 502),
                 (ACL_GROUP_OBJ, 4, NONE),
                 (ACL_MASK, 6, NONE),
                 (ACL_OTHER, 0, NONE),
-            ]))),
+            ])),
         );
         assert!(matches!(
             starred.resolve(|_| Some(1000), |_| None),
-            Ok(Some(acl)) if acl.entries[1].id == 1000,
+            Ok(acl) if acl.entries[1].id == 1000,
         ));
         // Two names the root reads as one id are one user named twice.
         let twice = stated(b"u::rw-,u:a:r--,u:b:r--,g::r--,m::r--,o::---");
@@ -1143,7 +1158,17 @@ mod tests {
         for name in ["-1", "0x10", "+5"] {
             let text = format!("u::rw-,u:{name}:r--,g::r--,m::r--,o::---");
             let read = stated(text.as_bytes());
-            assert_eq!(read.resolve(|_| None, |_| None), Ok(None), "{name}");
+            assert!(read.names_anyone(), "{name}");
+            assert_eq!(
+                read.resolve(|_| None, |_| None),
+                Ok(list(&[
+                    (ACL_USER_OBJ, 6, NONE),
+                    (ACL_GROUP_OBJ, 4, NONE),
+                    (ACL_MASK, 4, NONE),
+                    (ACL_OTHER, 0, NONE),
+                ])),
+                "{name}",
+            );
         }
         // A name's recorded id must be an id, and a numeric qualifier's must
         // be the same one.
@@ -1167,8 +1192,9 @@ mod tests {
         ]);
         let inside = |id: u32| id.checked_sub(100_000);
         let mapped = acl.mapped(inside, inside).expect("every id maps");
+        assert!(!mapped.left_out);
         assert_eq!(
-            mapped,
+            mapped.list,
             list(&[
                 (ACL_USER_OBJ, 7, ACL_UNDEFINED_ID),
                 (ACL_USER, 5, 42),
@@ -1178,8 +1204,56 @@ mod tests {
                 (ACL_OTHER, 0, ACL_UNDEFINED_ID),
             ]),
         );
-        // One id without an answer is a list that cannot be restated.
-        assert_eq!(acl.mapped(inside, |_| None), None);
+        // An id without an answer is left out, and every other entry, the
+        // mask included, is carried as it was.
+        assert_eq!(
+            acl.mapped(inside, |_| None),
+            Some(Mapped {
+                list: list(&[
+                    (ACL_USER_OBJ, 7, ACL_UNDEFINED_ID),
+                    (ACL_USER, 5, 42),
+                    (ACL_GROUP_OBJ, 5, ACL_UNDEFINED_ID),
+                    (ACL_MASK, 5, ACL_UNDEFINED_ID),
+                    (ACL_OTHER, 0, ACL_UNDEFINED_ID),
+                ]),
+                left_out: true,
+            }),
+        );
+    }
+
+    #[test]
+    fn a_denial_for_someone_the_translation_answers_survives_an_entry_it_cannot() {
+        // `alice` is denied what everyone else has, beside a user the
+        // translation has no answer for. Narrowing the list would leave alice
+        // to `other::r--`; leaving the one entry out keeps her denial.
+        let acl = list(&[
+            (ACL_USER_OBJ, 6, ACL_UNDEFINED_ID),
+            (ACL_USER, 0, 1001),
+            (ACL_USER, 6, 1002),
+            (ACL_GROUP_OBJ, 4, ACL_UNDEFINED_ID),
+            (ACL_MASK, 6, ACL_UNDEFINED_ID),
+            (ACL_OTHER, 4, ACL_UNDEFINED_ID),
+        ]);
+        let mapped = acl
+            .mapped(|id| (id == 1001).then_some(1001), Some)
+            .expect("the answered ids make a list");
+        assert!(mapped.left_out);
+        assert_eq!(
+            mapped.list,
+            list(&[
+                (ACL_USER_OBJ, 6, ACL_UNDEFINED_ID),
+                (ACL_USER, 0, 1001),
+                (ACL_GROUP_OBJ, 4, ACL_UNDEFINED_ID),
+                (ACL_MASK, 6, ACL_UNDEFINED_ID),
+                (ACL_OTHER, 4, ACL_UNDEFINED_ID),
+            ]),
+        );
+        // The same holds for a name the root does not answer.
+        let text = stated(b"u::rw-,u:alice:---,u:ghost:rw-,g::r--,m::rw-,o::r--");
+        assert_eq!(
+            text.resolve(|name| (name == b"alice").then_some(1001), |_| None),
+            Ok(mapped.list),
+        );
     }
 
     #[test]

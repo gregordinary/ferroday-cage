@@ -32,7 +32,7 @@ use rustix::fs::{self, AtFlags, OFlags};
 
 use super::containment;
 use super::identity::{Ownership, compose_child_map};
-use super::xattr::{self, Acl, Holder, Named, Restated};
+use super::xattr::{self, Acl, Holder, Mapped, Named, Restated};
 use super::{Delegate, ProvisionError};
 use crate::IdentityMap;
 use crate::failure::ErrorChain;
@@ -113,12 +113,10 @@ everything it can create — a named pipe included — and names the rest.
 /// a security module's label among them, are left for the destination's host
 /// to assign, as an export leaves them out.
 ///
-/// An access control list that cannot be copied is not dropped as though it
-/// were never there. Where a list has a mask, the group bits of the entry's
-/// mode are the mask, so the mode alone would give the owning group what the
-/// mask allows. The entry is given the list's own narrowing instead: the owning
-/// group keeps what the list allowed it, and the named users and groups lose
-/// what they were given. A directory's default list is narrowed the same way.
+/// An access control list naming an id the map has no id inside the rootfs for
+/// is copied without the entries that name one, and named in the report.
+/// Everyone else it names keeps what it gave them, the mask's bound included,
+/// and nobody it does not name gains anything.
 ///
 /// # Example
 ///
@@ -338,8 +336,8 @@ pub enum AttributeSkip {
     /// or a group an access control list names, or the user a capability is
     /// rooted at.
     ///
-    /// An access control list left off for this reason is narrowed rather than
-    /// dropped; see [`CopyIn`].
+    /// An access control list reported for this reason is given without the
+    /// entries naming such an id; see [`CopyIn`].
     UnmappedId,
 }
 
@@ -921,9 +919,9 @@ struct Attributes {
 /// them carry. One the host assigned is left out unreported, as an export
 /// leaves it out ([`containment::host_assigned_xattr`]). Everything else is
 /// [`AttributeSkip::Unsettable`]. A list or a capability naming an id the map
-/// has no inside id for is [`AttributeSkip::UnmappedId`]; such an access list
-/// narrows the mode the entry is given instead, and such a default list is
-/// replaced by its narrowing, so nothing lands more open than the source.
+/// has no inside id for is [`AttributeSkip::UnmappedId`]. Such a list is given
+/// without the entries naming one ([`Acl::mapped`]), so nothing lands more open
+/// than the source. A capability is left off.
 fn judge(
     read: Named,
     kind: fs::FileType,
@@ -954,7 +952,19 @@ fn judge(
                 // list: carried as it was read, it sets none.
                 Ok(None) => Ok(value),
                 Ok(Some(acl)) => match acl.mapped(|id| ids.maps_uid(id), |id| ids.maps_gid(id)) {
-                    Some(mapped) => Ok(mapped.encode()),
+                    Some(Mapped {
+                        list,
+                        left_out: false,
+                    }) => Ok(list.encode()),
+                    Some(Mapped {
+                        list,
+                        left_out: true,
+                    }) => {
+                        attributes.carried.push((name.clone(), list.encode()));
+                        Err(AttributeSkip::UnmappedId)
+                    }
+                    // Answers that read two ids as one, which a map's never
+                    // do: no list the kernel would store, so its narrowing.
                     None => {
                         let narrowed = acl.narrowed();
                         if is(xattr::ACCESS_ACL) {
@@ -1649,6 +1659,14 @@ mod tests {
                 (0x20, 0, NONE),
             ])
         };
+        // `masked` without its named user, the mask still bounding the owning
+        // group.
+        let unnamed = ferroday_cage_testkit::xattr::acl(&[
+            (0x01, 6, NONE),
+            (0x04, 0, NONE),
+            (0x10, 6, NONE),
+            (0x20, 0, NONE),
+        ]);
         let read: Vec<(Vec<u8>, Vec<u8>)> = vec![
             (
                 b"security.selinux".to_vec(),
@@ -1670,18 +1688,18 @@ mod tests {
 
         // The user attribute as it stands, and the capability rooted at the
         // map's root inside. The host's own labels and the overlay's
-        // bookkeeping are left out unreported.
+        // bookkeeping are left out unreported. The access list names host uid
+        // 5, which the map has no inside id for: it is carried without that
+        // entry and reported, and the entry keeps its own mode.
         assert_eq!(
             attributes.carried,
             vec![
                 (b"security.capability".to_vec(), capability(3, Some(0))),
+                (b"system.posix_acl_access".to_vec(), unnamed.clone()),
                 (b"user.comment".to_vec(), b"kept".to_vec()),
             ],
         );
-        // The access list names host uid 5, which the map has no inside id
-        // for. It is reported, and the owning group keeps the `---` the list
-        // gave it rather than the mask the mode shows.
-        assert_eq!(attributes.mode, Some(0o4600));
+        assert_eq!(attributes.mode, None);
         let reasons: Vec<(&[u8], AttributeSkip)> = skipped
             .iter()
             .map(|(name, reason)| (name.as_slice(), *reason))
@@ -1716,10 +1734,10 @@ mod tests {
             ],
         );
 
-        // A default list the map cannot name is replaced by its narrowing, so
-        // what the directory's new entries inherit is no more open than it
-        // was; a capability rooted outside the map, or of a revision the
-        // kernel will not store, is left off.
+        // A default list naming an id the map cannot name is carried without
+        // that entry, so what the directory's new entries inherit is no more
+        // open than it was; a capability rooted outside the map, or of a
+        // revision the kernel will not store, is left off.
         let (attributes, skipped) = judge(
             vec![
                 (b"security.capability".to_vec(), capability(3, Some(7))),
@@ -1731,14 +1749,7 @@ mod tests {
         );
         assert_eq!(
             attributes.carried,
-            vec![(
-                b"system.posix_acl_default".to_vec(),
-                ferroday_cage_testkit::xattr::acl(&[
-                    (0x01, 6, NONE),
-                    (0x04, 0, NONE),
-                    (0x20, 0, NONE)
-                ]),
-            )],
+            vec![(b"system.posix_acl_default".to_vec(), unnamed)],
         );
         assert_eq!(
             skipped,

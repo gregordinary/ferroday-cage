@@ -1802,11 +1802,11 @@ fn a_copy_carries_user_attributes_and_access_control_lists() {
 }
 
 /// An access control list naming a user the map has no id for cannot be
-/// carried, and is named in the report. Its mask is what the mode's group bits
-/// show, so the entry is given the list's narrowing rather than the mode
-/// alone: the owning group keeps the nothing the list gave it.
+/// carried as it stands, and is named in the report. It is carried without
+/// that user's entry: the mask still bounds the owning group, which keeps the
+/// nothing the list gave it although the mode's group bits show the mask.
 #[test]
-fn a_copy_names_a_list_it_cannot_carry_and_narrows_the_entry_instead() {
+fn a_copy_names_a_list_naming_an_unmapped_id_and_carries_the_rest() {
     use std::os::unix::fs::PermissionsExt;
 
     if !common::require::userns() {
@@ -1858,15 +1858,22 @@ fn a_copy_names_a_list_it_cannot_carry_and_narrows_the_entry_instead() {
     );
 
     let copied = rootfs.join("secret");
-    assert_eq!(xattr::get(&copied, xattr::ACCESS_ACL), None);
+    assert_eq!(
+        xattr::get(&copied, xattr::ACCESS_ACL),
+        Some(xattr::acl(&[
+            (0x01, 6, xattr::NO_ID),
+            (0x04, 0, xattr::NO_ID),
+            (0x10, 6, xattr::NO_ID),
+            (0x20, 0, xattr::NO_ID),
+        ])),
+    );
     assert_eq!(
         std::fs::symlink_metadata(&copied)
             .unwrap()
             .permissions()
             .mode()
             & 0o777,
-        0o600,
-        "the owning group was given the mask rather than its own entry",
+        0o660,
     );
 }
 

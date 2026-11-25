@@ -162,7 +162,7 @@ impl DirMeta {
 /// ([`accounts::ids`]), as the root stands when the list is applied: the merged
 /// view over the base, in a layered build. An archive that carries the
 /// accounts files after an entry whose list names an account they define
-/// leaves that list nothing to answer it, and it is given its narrowing.
+/// leaves that name nothing to answer it, and its entry is left out.
 struct ListIds<'a> {
     ownership: &'a Ownership,
     resolved: OnceCell<Option<Translation>>,
@@ -176,11 +176,9 @@ struct ListIds<'a> {
 enum Stated {
     /// Neither form states a list.
     Nothing,
-    /// A list, its named entries in the root's ids.
+    /// A list, its named entries in the root's ids, without any naming someone
+    /// the root has no account for ([`AclText::resolve`]).
     List(Acl),
-    /// A list naming someone the root has no id for, which only its
-    /// narrowing can be given.
-    Unanswered(Acl),
 }
 
 impl ListIds<'_> {
@@ -193,14 +191,16 @@ impl ListIds<'_> {
         }
     }
 
-    /// The list `acl` with its named ids read across the map, or `None` where
-    /// one has no host id, or the map cannot be resolved at all.
+    /// The list `acl` with its named ids read across the map, without the
+    /// entries naming an id the map has no host id for ([`Acl::mapped`]), or
+    /// `None` where the map cannot be resolved at all.
     fn on_host(&self, acl: &Acl) -> Option<Acl> {
         let ids = self
             .resolved
             .get_or_init(|| Translation::of_ownership(self.ownership).ok())
             .as_ref()?;
         acl.mapped(|id| ids.host_uid(id), |id| ids.host_gid(id))
+            .map(|mapped| mapped.list)
     }
 
     /// The list `records` state for the entry at `path`.
@@ -243,11 +243,9 @@ impl ListIds<'_> {
         } else {
             text.resolve(|_| None, |_| None)
         };
-        match resolved {
-            Ok(Some(acl)) => Ok(Stated::List(acl)),
-            Ok(None) => Ok(Stated::Unanswered(text.narrowed())),
-            Err(flaw) => Err(refused(flaw.reason())),
-        }
+        resolved
+            .map(Stated::List)
+            .map_err(|flaw| refused(flaw.reason()))
     }
 
     /// The id each name in the root's `/etc/passwd`, and each in its
@@ -1303,16 +1301,18 @@ fn apply_meta_fd(
 /// `default`, a directory's default list.
 ///
 /// Each list is read from the form [`ListIds::stated`] chooses, and its named
-/// ids are read across the map ([`ListIds`]). A list naming an id the map has
-/// no host id for cannot be given as it stands, nor can one naming a user or
-/// group the root has no id for, and neither can one the filesystem holds no
-/// lists for. The access list is then given as its narrowing
-/// ([`Acl::narrowed`]), which is a mode: where a list has a mask, the mode's
-/// group bits are the mask, and the mode alone would give the owning group
-/// what the mask allows rather than what the list gave it. A default list is
-/// given as its narrowing where the map or the root's names are what stand in
-/// the way, so what the directory's new entries inherit is no more open than
-/// the archive recorded; a filesystem without lists holds no default at all.
+/// ids are read across the map ([`ListIds`]). An entry naming a user or group
+/// the root has no account for, or an id the map has no host id for, is left
+/// out, and everyone else keeps what the list gave them.
+///
+/// A list the filesystem holds no lists for cannot be given at all, nor can
+/// one whose map cannot be resolved. The access list is then given as its
+/// narrowing ([`Acl::narrowed`]), which is a mode: where a list has a mask,
+/// the mode's group bits are the mask, and the mode alone would give the
+/// owning group what the mask allows rather than what the list gave it. A
+/// default list is given as its narrowing where the map cannot be resolved, so
+/// what the directory's new entries inherit is no more open than the archive
+/// recorded; a filesystem without lists holds no default at all.
 fn apply_lists(
     fd: BorrowedFd<'_>,
     mode: u32,
@@ -1348,7 +1348,6 @@ fn apply_lists(
                 narrow(&acl.narrowed())?;
             }
         }
-        Stated::Unanswered(narrowed) => narrow(&narrowed)?,
     }
     let Some(default) = default else {
         return Ok(());
@@ -1356,7 +1355,6 @@ fn apply_lists(
     let list = match lists.stated(default, path)? {
         Stated::Nothing => return Ok(()),
         Stated::List(acl) => lists.on_host(&acl).unwrap_or_else(|| acl.narrowed()),
-        Stated::Unanswered(narrowed) => narrowed,
     };
     match rustix::fs::fsetxattr(fd, xattr::DEFAULT_ACL, &list.encode(), XattrFlags::empty()) {
         Ok(()) | Err(Errno::NOTSUP) => Ok(()),
@@ -2209,6 +2207,17 @@ mod list_tests {
 
     use ferroday_cage_testkit::xattr::{self, NO_ID as NONE, acl};
 
+    /// `user::rw-,group::---,mask::rw-,other::---`: [`masked`] with its named
+    /// user left out, the mask still bounding the owning group.
+    fn unnamed() -> Vec<u8> {
+        acl(&[
+            (0x01, 6, NONE),
+            (0x04, 0, NONE),
+            (0x10, 6, NONE),
+            (0x20, 0, NONE),
+        ])
+    }
+
     /// `user::rw-,user:<named>:rw-,group::---,mask::rw-,other::---`, whose
     /// mode shows the mask as the group's bits.
     fn masked(named: u32) -> Vec<u8> {
@@ -2248,12 +2257,12 @@ mod list_tests {
     }
 
     #[test]
-    fn an_access_control_list_the_archive_records_is_applied_or_narrowed() {
+    fn an_access_control_list_the_archive_records_is_applied_without_ids_the_map_lacks() {
         // Under the single-identity map root inside is the calling user, so a
-        // list naming root inside lands naming the caller, and a list naming
-        // anyone else cannot land at all. That one is narrowed rather than
-        // dropped: its mode's group bits are its mask, and the owning group's
-        // own entry is `---`.
+        // list naming root inside lands naming the caller, and an entry naming
+        // anyone else cannot land at all. That entry is left out, and the rest
+        // of its list lands as recorded: the mask still bounds the owning
+        // group's `---`, which the mode's group bits do not show.
         let root = Scratch::for_test("extract", "access-lists");
         if !xattr::holds_acls(&root) {
             ferroday_cage_testkit::require::FILESYSTEM
@@ -2271,7 +2280,7 @@ mod list_tests {
             &mut tar,
             &pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(4242)),
         );
-        tar.file("narrowed", 0o4660, b"for someone else\n");
+        tar.file("unmapped", 0o4660, b"for someone else\n");
         // A directory's default list waits for the deferred pass, so the file
         // extracted beneath it inherits none.
         pax(
@@ -2297,14 +2306,10 @@ mod list_tests {
         assert_eq!(mode_of(&root.join("shared")), 0o660);
 
         assert_eq!(
-            xattr::get(&root.join("narrowed"), "system.posix_acl_access"),
-            None
+            xattr::get(&root.join("unmapped"), "system.posix_acl_access"),
+            Some(unnamed()),
         );
-        assert_eq!(
-            mode_of(&root.join("narrowed")),
-            0o4600,
-            "the owning group was given the mask rather than its own entry",
-        );
+        assert_eq!(mode_of(&root.join("unmapped")), 0o4660);
 
         for name in ["system.posix_acl_access", "system.posix_acl_default"] {
             assert_eq!(
@@ -2368,8 +2373,8 @@ mod list_tests {
     fn a_list_recorded_only_as_text_is_applied_with_the_roots_own_names() {
         // GNU tar's `--acls` records a list as text alone, naming each user
         // the writing host could name. A name is the root's to answer, from
-        // the accounts the archive has already laid down; one it cannot
-        // answer leaves the list to its narrowing.
+        // the accounts the archive has already laid down; an entry naming one
+        // it cannot answer is left out, and the rest of the list lands.
         let root = Scratch::for_test("extract", "text-lists");
         if !xattr::holds_acls(&root) {
             ferroday_cage_testkit::require::FILESYSTEM
@@ -2409,13 +2414,9 @@ mod list_tests {
         }
         assert_eq!(
             xattr::get(&root.join("unanswered"), "system.posix_acl_access"),
-            None
+            Some(unnamed()),
         );
-        assert_eq!(
-            mode_of(&root.join("unanswered")),
-            0o4600,
-            "the owning group was given its own entry rather than the mask",
-        );
+        assert_eq!(mode_of(&root.join("unanswered")), 0o4660);
     }
 
     #[test]

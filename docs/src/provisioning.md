@@ -616,14 +616,13 @@ the tree's root. That is the most a user namespace's root can grant.
 What the tree's root cannot set is left off and named in the report. That covers
 a `trusted.` attribute, and a `security.` attribute other than a capability. It
 covers a `system.` attribute other than an access control list, and anything a
-symbolic link holds. It also covers a list or a capability naming an id the map
-has no id for.
+symbolic link holds. It also covers a capability naming an id the map has no id
+for.
 
-A list left off is not dropped as though it were never there. Where a list has
-a mask, the group bits of a mode are the mask. The mode alone would then give
-the owning group what the mask allows. The entry is given the list's narrowing
-instead. The owning group keeps what the list gave it, and the named entries
-lose what they had. A directory's default list is narrowed the same way.
+A list naming an id the map has no id for is named in the report too. It is
+copied without the entries that name such an id, and everyone else keeps what
+it gave them. The mask still bounds the owning group, although the mode's group
+bits show the mask.
 
 The attributes the host assigns are left for the destination's host to assign,
 as an export leaves them out.
@@ -803,12 +802,15 @@ writing host could name. A name means what the root's own `/etc/passwd` and
 host's do. A list the kernel would not store, in either form, refuses its entry
 with `ProvisionError::EntryRefused`.
 
-A list naming an id the map has no host id for is given as its narrowing. So is
-a list naming a user or group the root has no account for, and a list the
-destination's filesystem cannot hold. The owning group then keeps what the list
-gave it, rather than the mask the mode's group bits show. No other extended
-attribute is applied. A capability needs a privilege the extraction does not
-hold.
+An entry naming an id the map has no host id for is left out of its list. So is
+one naming a user or group the root has no account for, where GNU `tar` applies
+no list at all. The rest of the list is applied as recorded, so whoever it
+denies stays denied.
+
+A list the destination's filesystem cannot hold is given as its narrowing. The
+owning group then keeps what the list gave it, rather than the mask the mode's
+group bits show. No other extended attribute is applied. A capability needs a
+privilege the extraction does not hold.
 
 Extraction imposes no size or entry-count quota. Where the archive comes from an
 untrusted source, bound disk usage externally.

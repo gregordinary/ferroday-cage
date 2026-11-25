@@ -489,7 +489,7 @@ report name a package and its version bare.
 | Is this entry an overlay whiteout, or this directory opaque? | `provision::containment::is_whiteout`, `containment::is_opaque` |
 | What does an overlay's merged view show at a path, and which layer holds it? | `provision::rooted::merged_lookup`, with `AncestorLink` saying what a symbolic link at an ancestor does, and `Rooted::read_merged` for the file it shows |
 | Is this extended attribute the host's rather than the tree's? | `provision::containment::host_assigned_xattr` |
-| Read an entry's extended attributes, or restate an access control list or a file capability for the other side of an identity map | `provision::xattr::read_all`, `xattr::Acl` (`Acl::narrowed` where it cannot be restated), `xattr::capability_mapped` |
+| Read an entry's extended attributes, or restate an access control list or a file capability for the other side of an identity map | `provision::xattr::read_all`, `xattr::Acl::mapped`, which leaves out an entry the map cannot name (`Acl::narrowed` where no list can be given at all), `xattr::capability_mapped` |
 | Is this attribute value an access control list the kernel stores and libacl passes, and what is wrong with it if not? Read or write one as the text a `SCHILY.acl.*` record holds | `provision::xattr::Acl::parse`, its `xattr::AclFlaw`; `xattr::AclText`, `Acl::text` |
 | Which list does an archive entry's records give it, in the root's own ids and names? | `provision::extract::ListIds::stated`, over `tar::AclRecords` |
 | Open the regular file a walk just inspected, refusing whatever took its name | `provision::containment::open_typed_file` |

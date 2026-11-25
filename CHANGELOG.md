@@ -196,6 +196,12 @@ consumer upgrading can skip it.
   or `gname` record is empty. The reader took the empty value.
 - A tar archive is refused as malformed where an entry's name is empty. The
   reader passed the entry on with no name.
+- An access control list naming an id the identity map has no id for, or a
+  user or group the root has no account for, is applied by the tar extractor
+  and by `CopyIn` without the entries naming one, the rest as recorded. The
+  whole list was narrowed to its owner, owning group and everyone else, which
+  gave each user and group it named, a denied one included, their class's
+  access. `CopyIn` still reports such a list as `AttributeSkip::UnmappedId`.
 
 ### Internal
 
