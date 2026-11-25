@@ -227,13 +227,13 @@ impl DirMeta {
 /// map is the one [`Extraction::owned_through`] names, the single-identity map
 /// unless one is named, under which only root inside has a host id.
 ///
-/// A list recorded only as text may name its users and groups by name. A name
-/// means what the root's own `/etc/passwd` and `/etc/group` say it means, not
-/// what the host's do, so it is looked up there ([`accounts::ids`]), as the
-/// root stands when the list is applied: the merged view over the base, in a
-/// layered build. An archive that carries the accounts files after an entry
-/// whose list names an account they define leaves that name nothing to answer
-/// it, and its entry is left out.
+/// A list's text may name its users and groups by name. A name means what the
+/// root's own `/etc/passwd` and `/etc/group` say it means, not what the host's
+/// do, so it is looked up there ([`accounts::ids`]), as the root stands when
+/// the list is applied: the merged view over the base, in a layered build. An
+/// archive that carries the accounts files after an entry whose list names an
+/// account they define leaves that name nothing to answer it, and its entry is
+/// left out.
 struct ListIds<'a> {
     ownership: &'a Ownership,
     resolved: OnceCell<Option<Translation>>,
@@ -290,13 +290,16 @@ impl ListIds<'_> {
 
     /// The list `records` state for the entry at `path`.
     ///
-    /// The attribute's own value wins where both forms are present: it holds
-    /// the ids its writer read, where the text may hold names for a database
-    /// that is not the root's. GNU tar reads the two the other way round, and
-    /// applies only the text. The text is read only where the value is absent,
-    /// so text that would not read beside a value is no reason to refuse the
-    /// entry. A text alone is given without the entries naming someone the
-    /// root has no account for, where GNU tar gives no list at all.
+    /// The text is the form GNU tar and bsdtar apply, its names the root's own
+    /// accounts. An entry that carries both forms is given the list only where
+    /// they state the same one: where they differ, or where the text does not
+    /// read or names someone the root has no account for, one reader of the
+    /// archive gives the entry one list and another a different one, or none,
+    /// so the entry is refused. The attribute's value alone, which neither tar
+    /// applies, is given as it stands, so an archive written with only the
+    /// attributes keeps its lists. A text alone is given without the entries
+    /// naming someone the root has no account for, where GNU tar gives no list
+    /// at all.
     ///
     /// A list the kernel would not store, in either form, refuses the entry,
     /// since nothing about the entry's access could then be relied on.
@@ -305,17 +308,18 @@ impl ListIds<'_> {
             path: path.to_path_buf(),
             reason,
         };
-        if let Some(value) = &records.value {
-            return match file_acl::xattr::decode(value) {
-                Ok(Some(acl)) => Ok(Stated::List(acl)),
-                Ok(None) => Ok(Stated::Nothing),
-                Err(flaw) => Err(refused(format!(
+        let value = records
+            .value
+            .as_deref()
+            .map(file_acl::xattr::decode)
+            .transpose()
+            .map_err(|flaw| {
+                refused(format!(
                     "the access control list it records is not one the kernel stores: {flaw}"
-                ))),
-            };
-        }
+                ))
+            })?;
         let Some(text) = &records.text else {
-            return Ok(Stated::Nothing);
+            return Ok(value.flatten().map_or(Stated::Nothing, Stated::List));
         };
         let unreadable = |reason: &dyn std::fmt::Display| {
             refused(format!(
@@ -323,23 +327,41 @@ impl ListIds<'_> {
                  stores: {reason}"
             ))
         };
-        let Some(parsed) = text::parse(text).map_err(|flaw| unreadable(&flaw))? else {
-            return Ok(Stated::Nothing);
-        };
-        let accounts = if parsed.holds_names() {
-            self.accounts()?
-        } else {
-            Rc::new((AccountIds::new(), AccountIds::new()))
+        let parsed = text::parse(text).map_err(|flaw| unreadable(&flaw))?;
+        let accounts = match &parsed {
+            Some(parsed) if parsed.holds_names() => self.accounts()?,
+            _ => Rc::new((AccountIds::new(), AccountIds::new())),
         };
         let (users, groups) = &*accounts;
-        parsed
-            .resolve_partial(
-                |name| users.get(name).copied(),
-                |name| groups.get(name).copied(),
-                Prefer::Name,
-            )
-            .map(|partial| Stated::List(partial.list))
-            .map_err(|flaw| unreadable(&flaw))
+        let user = |name: &[u8]| users.get(name).copied();
+        let group = |name: &[u8]| groups.get(name).copied();
+        let Some(value) = value else {
+            return match parsed {
+                None => Ok(Stated::Nothing),
+                Some(parsed) => parsed
+                    .resolve_partial(user, group, Prefer::Name)
+                    .map(|partial| Stated::List(partial.list))
+                    .map_err(|flaw| unreadable(&flaw)),
+            };
+        };
+        let from_text = parsed
+            .map(|parsed| parsed.resolve(user, group, Prefer::Name))
+            .transpose()
+            .map_err(|flaw| match flaw {
+                text::ResolveError::Unresolved { .. } => refused(format!(
+                    "the text of the access control list it records beside the list's \
+                     attribute value names someone the root has no account for: {flaw}"
+                )),
+                _ => unreadable(&flaw),
+            })?;
+        if from_text != value {
+            return Err(refused(
+                "the access control list it records states one list as an attribute value and \
+                 another as text"
+                    .to_owned(),
+            ));
+        }
+        Ok(value.map_or(Stated::Nothing, Stated::List))
     }
 
     /// The id each name in the root's `/etc/passwd`, and each in its
@@ -2925,8 +2947,11 @@ mod list_tests {
     }
 
     #[test]
-    fn a_lists_value_is_applied_over_its_text_and_text_beside_one_is_not_read() {
-        let root = Scratch::for_test("extract", "value-over-text");
+    fn a_lists_two_forms_are_applied_where_they_state_one_list() {
+        // GNU tar's `--acls --xattrs` writes both forms, the text naming each
+        // user the writing host could name. The root's own accounts give the
+        // name the id the value holds, so the two agree.
+        let root = Scratch::for_test("extract", "agreeing-forms");
         if !xattr::holds_acls(&root) {
             ferroday_cage_testkit::require::FILESYSTEM
                 .skip("this filesystem holds no POSIX access control lists");
@@ -2934,29 +2959,20 @@ mod list_tests {
         }
         let caller = rustix::process::geteuid().as_raw();
         let mut tar = Tar::new();
-        // The text names someone the map has no id for; the value names root
-        // inside, which is the caller.
-        pax(
-            &mut tar,
-            &[
-                pax_record(
-                    b"SCHILY.acl.access",
-                    b"user::rw-\nuser:4242:rw-\ngroup::---\nmask::rw-\nother::---\n",
-                ),
-                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
-            ]
-            .concat(),
-        );
-        tar.file("disagreeing", 0o660, b"x");
-        pax(
-            &mut tar,
-            &[
-                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
-                pax_record(b"SCHILY.acl.access", b"not a list"),
-            ]
-            .concat(),
-        );
-        tar.file("unreadable-text", 0o660, b"x");
+        tar.dir("etc", 0o755)
+            .file("etc/passwd", 0o644, b"admin:x:0:0::/root:/bin/sh\n");
+        for (name, named) in [("by-name", "admin"), ("by-id", "0")] {
+            let text = format!("user::rw-\nuser:{named}:rw-\ngroup::---\nmask::rw-\nother::---\n");
+            pax(
+                &mut tar,
+                &[
+                    pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0)),
+                    pax_record(b"SCHILY.acl.access", text.as_bytes()),
+                ]
+                .concat(),
+            );
+            tar.file(name, 0o660, b"x");
+        }
         extract_archive(
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
@@ -2964,13 +2980,43 @@ mod list_tests {
             &mut || false,
         )
         .expect("the archive extracts");
-        for name in ["disagreeing", "unreadable-text"] {
+        for name in ["by-name", "by-id"] {
             assert_eq!(
                 xattr::get(&root.join(name), "system.posix_acl_access"),
                 Some(masked(caller)),
                 "{name}",
             );
         }
+    }
+
+    #[test]
+    fn a_lists_two_forms_that_do_not_state_one_list_refuse_their_entry() {
+        let value = pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked(0));
+        let both = |text: &[u8]| [value.clone(), pax_record(b"SCHILY.acl.access", text)].concat();
+        // GNU tar and bsdtar would give user 4242 the access the value gives
+        // root.
+        let reason = refusal(
+            "differing-forms",
+            &both(b"user::rw-\nuser:4242:rw-\ngroup::---\nmask::rw-\nother::---\n"),
+        );
+        assert!(reason.contains("another as text"), "{reason}");
+        // An empty text states no list, where the value states one.
+        let reason = refusal("empty-text-beside-a-value", &both(b""));
+        assert!(reason.contains("another as text"), "{reason}");
+        // Text that does not read, where GNU tar applies no list.
+        let reason = refusal("unreadable-text-beside-a-value", &both(b"not a list"));
+        assert!(
+            reason.contains("text of the access control list"),
+            "{reason}"
+        );
+        // Text naming someone the root has no account for, where GNU tar
+        // applies no list.
+        let reason = refusal(
+            "unanswered-text-beside-a-value",
+            &both(b"user::rw-\nuser:stranger:rw-\ngroup::---\nmask::rw-\nother::---\n"),
+        );
+        assert!(reason.contains("no account"), "{reason}");
+        assert!(reason.contains("stranger"), "{reason}");
     }
 
     #[test]

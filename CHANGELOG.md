@@ -675,6 +675,13 @@ consumer upgrading can skip it.
   earlier launch that renamed the directory it is in, is under a name the hide
   does not reach. A path with nothing at it when the sandbox is built still
   hides nothing.
+- **Breaking.** The tar extractor gives an entry the access control list its
+  `SCHILY.acl.access` or `SCHILY.acl.default` text states, the form GNU tar and
+  bsdtar apply, and refuses an entry recording both forms of a list unless they
+  state the same one: where they differ, where the text does not read, or where
+  it names a user or group the root has no account for. The attribute's value
+  was applied and the text beside it not read. A value alone is applied as
+  before.
 - A list's text is refused where libacl reads it otherwise or more loosely than
   its own rules: a qualifier spelling a number in another form than decimal
   digits, such as `010`, which libacl reads as 8, `0x10` or `-1`; a comment

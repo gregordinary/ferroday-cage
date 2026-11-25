@@ -430,9 +430,10 @@ whole.
 
 A POSIX access control list is written twice: as its attribute's record, and as
 the text a `SCHILY.acl.access` record holds, or `SCHILY.acl.default` for a
-directory's default list. The text names users and groups by id. GNU `tar
---acls` applies the text and passes the attribute's record over, so without it a
-list would not survive extraction by GNU `tar`.
+directory's default list. The text names users and groups by id, so the two
+state one list. GNU `tar --acls` and `bsdtar` apply the text and pass the
+attribute's record over, so without it a list would not survive extraction by
+either.
 
 Member names match `tar -C rootfs .`. The archive leads with a `./` directory
 entry for the root and every other member is `./`-prefixed (`./etc/`,
@@ -820,10 +821,15 @@ An archive records an access control list in either of two forms, or both. One
 is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in
 `SCHILY.xattr.system.posix_acl_default` for a directory's default list. The
 other is the list's text, in `SCHILY.acl.access` and `SCHILY.acl.default`, as
-GNU `tar --acls` writes it. Where both are present, the value is applied and the
-text is not read. GNU `tar` reads them the other way round. Text holding no
-entry states no list, as the empty `SCHILY.acl.default` GNU `tar` writes for a
-directory without a default list does.
+GNU `tar --acls` writes it. The text is the form GNU `tar` and `bsdtar`
+apply. Where both are present, the entry is refused with
+`ProvisionError::EntryRefused` unless they state the same list. That includes
+text that does not read, and text naming a user or group the root has no account
+for. Otherwise one reader of the archive would give the entry one list and
+another a different one, or none. The value alone is applied as it stands,
+though neither `tar` applies it, so an archive written with only the attributes
+keeps its lists. An empty text states no list, as the empty `SCHILY.acl.default`
+GNU `tar` writes for a directory without a default list does.
 
 A list is applied after the entry's mode, and a directory's once its contents
 are written. Its named users and groups are the ids the tree means, as an export
@@ -842,9 +848,9 @@ would not store, in either form, refuses its entry with
 `ProvisionError::EntryRefused`.
 
 An entry naming an id the map has no host id for is left out of its list. So is
-one naming a user or group the root has no account for, where GNU `tar` applies
-no list at all. The rest of the list is applied as recorded, so whoever it
-denies stays denied.
+one naming a user or group the root has no account for, in a text the entry
+records alone, where GNU `tar` applies no list at all. The rest of the list is
+applied as recorded, so whoever it denies stays denied.
 
 A list the destination's filesystem cannot hold is given as its narrowing. The
 owning group then keeps what the list gave it, rather than the mask the mode's

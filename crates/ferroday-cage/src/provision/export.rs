@@ -1064,8 +1064,10 @@ impl<'f, W: Write> TarWriter<'f, W> {
             pax.extend_from_slice(&pax_record(&xattr_keyword(name), value));
         }
         // Each access control list again in its text form, which is the one
-        // GNU tar applies: it passes over the attribute's value above. This
-        // crate's extractor reads the value where both are present.
+        // GNU tar and bsdtar apply: both pass over the attribute's value above.
+        // The text names each user and group by its id, so the two forms state
+        // one list, as this crate's extractor requires of an entry carrying
+        // both.
         for (attribute, keyword) in [
             (ACCESS_ACL, &b"SCHILY.acl.access"[..]),
             (DEFAULT_ACL, b"SCHILY.acl.default"),
