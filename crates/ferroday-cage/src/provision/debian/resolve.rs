@@ -895,9 +895,18 @@ impl Closure<'_> {
         for (at, name) in self.answered.clone().iter().enumerate() {
             self.resolve(THE_INSTALL_LIST, at, &vec![unversioned(name)]);
         }
+        // Resolving a group can unselect a package a clash names, one later in
+        // this list among them, and an unselected package's groups no longer
+        // need answering, so each name is asked of the selection as it comes.
         let names: Vec<String> = self.selected.keys().cloned().collect();
         for name in &names {
-            for (at, group) in relations(&self.selected[name]).iter().enumerate() {
+            let Some(groups) = self.selected.get(name).map(relations) else {
+                continue;
+            };
+            for (at, group) in groups.iter().enumerate() {
+                if !self.selected.contains_key(name) {
+                    break;
+                }
                 self.resolve(name, at, group);
             }
         }
@@ -1959,6 +1968,35 @@ mod tests {
         );
         let selected = resolve(&index(&text), &["aa".into()], &[], &[]).into_packages();
         assert_eq!(names(&selected), ["aa", "bb", "cc"]);
+    }
+
+    #[test]
+    fn a_name_unselected_while_the_selection_settles_is_passed_over() {
+        // Settling resolves each selected package's groups in turn. `bb`'s
+        // `xx` conflicts with `uu`, which `pp`'s alternative chose, so it
+        // unselects names that come after it in the selection: the walk
+        // must pass over them rather than look them up.
+        let text = format!(
+            "{}{}{}{}{}{}{}",
+            stanza("aa", "qq, pp", ""),
+            stanza("qq", "", ""),
+            stanza("pp", "cc | uu", ""),
+            stanza("cc", "", "Conflicts: qq"),
+            stanza("uu", "", ""),
+            stanza("bb", "xx", ""),
+            stanza("xx", "", "Conflicts: uu"),
+        );
+        let (selected, refusals) = resolve(&index(&text), &["aa".into(), "bb".into()], &[], &[]);
+        // Every choice of `pp`'s clashes with something the install list
+        // needs, so the clash the selection is left with is refused.
+        assert!(
+            refusals
+                .describe()
+                .contains("cc 1.0 states \"Conflicts: qq\""),
+            "resolved {:?}, refusing {}",
+            names(&selected),
+            refusals.describe()
+        );
     }
 
     #[test]

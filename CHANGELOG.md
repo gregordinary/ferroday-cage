@@ -354,6 +354,9 @@ consumer upgrading can skip it.
   written, a future dropped before the handle arrived left the sandbox running
   with nothing able to kill it, and its blocking task waiting on it. The
   chapter no longer says a handle cannot cross an await point.
+- The Debian resolver no longer panics where a package resolved while the
+  selection settles unselects one that comes after it in the selection, which
+  a conflict on a chosen alternative does.
 
 ### Internal
 
