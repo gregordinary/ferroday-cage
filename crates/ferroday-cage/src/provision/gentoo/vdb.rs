@@ -52,13 +52,25 @@
 //! can act on, which is the strongest argument for registering the entry
 //! properly.
 //!
-//! # `CONFIG_PROTECT` is not honoured
+//! Nor is `env-update`, which portage runs after a merge that changed
+//! `/etc/env.d`: `/etc/ld.so.conf` and `/etc/profile.env` are not regenerated,
+//! and `ldconfig` does not run, so a library in a directory only an `env.d`
+//! `LDPATH` names is not found by the dynamic linker until `env-update` runs.
+//!
+//! # `CONFIG_PROTECT` is not honoured, nor are collisions refused
 //!
 //! An existing file under `/etc` is overwritten rather than given portage's
 //! `._cfg0000_` treatment. The layer builds roots rather than upgrading live
 //! systems, and a root whose configuration depends on merge order is not
 //! reproducible.
+//!
+//! A file, link or pipe the root already holds at a path the image ships is
+//! replaced, where portage's default `protect-owned` refuses the merge when
+//! another package owns it. The entry that owned it keeps its `CONTENTS` line,
+//! so two entries claim the path. The merge reports each path it replaced, so
+//! a caller learns of it rather than finding it.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -69,7 +81,7 @@ use crate::path;
 use crate::provision::ProvisionError;
 use crate::provision::digest;
 use crate::provision::extract::{Cancelled, Extraction, Placement};
-use crate::provision::rooted::Rooted;
+use crate::provision::rooted::{AncestorLink, Merged, Rooted, merged_lookup};
 
 /// Where portage keeps the ordinal it stamped the last merge into a root with:
 /// one number for the whole root, beside the one each entry records in its
@@ -137,6 +149,9 @@ enum Laid {
 /// archive it will not unpack, [`ProvisionError::Cancelled`] among it where
 /// `cancelled` answers `true` part way through.
 ///
+/// Answers the paths the image replaced something other than a directory at,
+/// which the root already held, as the image names them.
+///
 /// The root comes three ways, its path, its base, and the tree held open, and
 /// the package two, its container's path and what was read from it, so the
 /// merge takes one argument more than the lint allows rather than a bundle
@@ -151,9 +166,13 @@ pub(super) fn merge(
     planned: &PlannedPackage,
     counter: u64,
     cancelled: &mut Cancelled<'_>,
-) -> Result<(), ProvisionError> {
+) -> Result<Vec<String>, ProvisionError> {
     let entry = entry_dir(planned);
-    let laid = extract_image(root, over, container, package, cancelled)?;
+    let lower = over
+        .map(|over| Rooted::open(over).map_err(|err| GentooError::io("opening", over, err)))
+        .transpose()?;
+    let layers: Vec<&Rooted> = std::iter::once(rooted).chain(lower.as_ref()).collect();
+    let (laid, replaced) = extract_image(root, over, &layers, container, package, cancelled)?;
     let contents = render_contents(root, rooted, &laid)?;
 
     // The metadata files first, then the three portage computes. Written after
@@ -200,7 +219,7 @@ pub(super) fn merge(
     rooted
         .write(ROOT_COUNTER, counter.to_string().as_bytes())
         .map_err(|err| GentooError::io("writing the merge counter", root, err))?;
-    Ok(())
+    Ok(replaced)
 }
 
 /// The database directory this package's entry belongs at.
@@ -228,16 +247,23 @@ fn entry_dir(planned: &PlannedPackage) -> String {
     format!("{DB_DIR}/{category}/{name}-{}", planned.version)
 }
 
-/// Extracts the container's image into the root, recording what it laid down.
+/// Extracts the container's image into the root, recording what it laid down
+/// and the paths it replaced something other than a directory at, which
+/// `layers`, the root's merged view, held before.
 fn extract_image(
     root: &Path,
     over: Option<&Path>,
+    layers: &[&Rooted],
     container: &Path,
     package: &Package,
     cancelled: &mut Cancelled<'_>,
-) -> Result<Vec<Laid>, ProvisionError> {
+) -> Result<(Vec<Laid>, Vec<String>), ProvisionError> {
     let mut image = package.image(container)?;
     let mut laid: Vec<Laid> = Vec::new();
+    // The image's own paths so far, so a path it ships twice is not reported
+    // as one the root held.
+    let mut named: HashSet<String> = HashSet::new();
+    let mut replaced = Vec::new();
     let mut extraction = Extraction::new(root)?
         .over(over)?
         .under(IMAGE_DIR.as_bytes());
@@ -265,6 +291,14 @@ fn extract_image(
                     format!("ships a path that {why}"),
                 ))
             })?;
+            if entry.typeflag != b'5'
+                && !named.contains(&path)
+                && holds_other_than_a_directory(layers, &path)
+                    .map_err(|err| GentooError::io("inspecting", root.join(&path), err))?
+            {
+                replaced.push(path.clone());
+            }
+            named.insert(path.clone());
             laid.push(match entry.typeflag {
                 b'5' => Laid::Directory(path),
                 b'2' => {
@@ -286,7 +320,19 @@ fn extract_image(
         cancelled,
     )?;
     extraction.finalize(root)?;
-    Ok(laid)
+    Ok((laid, replaced))
+}
+
+/// Whether the merged view of `layers` holds something other than a
+/// directory at `path`: what an image entry there replaces.
+fn holds_other_than_a_directory(layers: &[&Rooted], path: &str) -> std::io::Result<bool> {
+    let Merged::Entry { layer } = merged_lookup(layers, Path::new(path), AncestorLink::PassesDown)?
+    else {
+        return Ok(false);
+    };
+    Ok(layers[layer]
+        .stat(path)?
+        .is_some_and(|stat| !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir()))
 }
 
 /// `bytes` as text a `CONTENTS` line can hold, or why it cannot hold it.
@@ -388,18 +434,37 @@ mod tests {
     /// The same, for a container a test has bent.
     fn merged_container(tag: &str, counter: u64, built: Built) -> Scratch {
         let (dir, merged) = merging(tag, counter, built);
-        merged.expect("the package merges");
+        assert_eq!(
+            merged.expect("the package merges"),
+            Vec::<String>::new(),
+            "a fresh root holds nothing the image replaces"
+        );
         dir
     }
 
     /// Merges a container a test has bent, and reports what happened.
-    fn merging(tag: &str, counter: u64, built: Built) -> (Scratch, Result<(), ProvisionError>) {
+    fn merging(
+        tag: &str,
+        counter: u64,
+        built: Built,
+    ) -> (Scratch, Result<Vec<String>, ProvisionError>) {
+        merging_into(tag, counter, built, |_| {})
+    }
+
+    /// [`merging`], into a root `prepare` has put something in first.
+    fn merging_into(
+        tag: &str,
+        counter: u64,
+        built: Built,
+        prepare: impl FnOnce(&Path),
+    ) -> (Scratch, Result<Vec<String>, ProvisionError>) {
         let dir = Scratch::for_test("gentoo-vdb", tag);
         let key = fixture::signing_key("releng <releng@test.invalid>");
         let container = dir.join("package.gpkg.tar");
         built.write(&container, &key);
         let root = dir.join("root");
         std::fs::create_dir_all(&root).expect("the root is created");
+        prepare(&root);
         let rooted = Rooted::open(&root).expect("the root opens");
         let planned = planned_for(CPV, 1, &container);
         let package = Package::read(
@@ -447,6 +512,24 @@ mod tests {
         );
         // The wrapper directory itself is not a path in the root.
         assert!(!root.join("image").exists());
+    }
+
+    #[test]
+    fn what_the_root_held_at_a_path_the_image_ships_is_replaced_and_reported() {
+        // The library is another package's in the root, and the image ships it
+        // too; `usr/lib`, a directory both hold, is no replacement.
+        let (dir, merged) = merging_into("replaced", 1, Built::ordinary(), |root| {
+            std::fs::create_dir_all(root.join("usr/lib")).unwrap();
+            std::fs::write(root.join("usr/lib/libz.so.1.3.2"), b"another's").unwrap();
+        });
+        assert_eq!(
+            merged.expect("the package merges"),
+            ["usr/lib/libz.so.1.3.2"]
+        );
+        assert_eq!(
+            std::fs::read(dir.join("root/usr/lib/libz.so.1.3.2")).unwrap(),
+            b"ELF\n"
+        );
     }
 
     #[test]

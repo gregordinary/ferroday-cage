@@ -235,6 +235,10 @@ consumer upgrading can skip it.
   `fcage` releases them as soon as its terminal session ends, or fails to
   start, where it left them blocked with nothing reading them, so a `^C` or a
   `SIGTERM` while it wound down did nothing.
+- `GentooEvent::Replaced` reports a Gentoo merge that replaced files, links or
+  pipes the root already held, naming the paths. Portage refuses such a merge
+  by default where another package owns the path; this layer replaces it, and
+  now says so. `fcage` prints a line for it.
 
 ### Changed
 
@@ -279,6 +283,10 @@ consumer upgrading can skip it.
   its grace, the relayed standard streams, each `--forward-loopback`, and the
   network stack's settings, its rules and publications among them, which may
   listen beyond the loopback. It printed the sandbox's inputs alone.
+- The Gentoo guide states that `env-update` is not run after a merge, so a
+  library in a directory only an `/etc/env.d` `LDPATH` names is not found until
+  it is, and that a path another package's entry claims is replaced rather
+  than refused.
 
 ### Fixed
 

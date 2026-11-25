@@ -516,10 +516,25 @@ a sandbox over the finished root:
 | Regenerate the CA bundle | `update-ca-certificates` |
 | Rebuild the font cache | `fc-cache` |
 
+**`env-update` is not run.** Portage runs it after a merge that changed
+`/etc/env.d`. It regenerates `/etc/ld.so.conf` and `/etc/profile.env` from the
+fragments there, and runs `ldconfig`. Here neither file is regenerated and the
+linker cache is not rebuilt. A library in a directory that only an `env.d`
+`LDPATH` names, as LLVM's and GCC's are, is not found by the dynamic linker
+until `env-update` runs in a sandbox over the finished root.
+
 **`CONFIG_PROTECT` is not honored.** An existing file under `/etc` is
 overwritten rather than given portage's `._cfg0000_` treatment. The layer builds
 roots rather than upgrading live systems, and a root whose configuration depends
 on merge order is not reproducible.
+
+**Collisions are replaced, not refused.** Where the root already holds a file,
+a link or a pipe at a path the image ships, the merge replaces it, as a tar
+extraction does. Portage's default `protect-owned` refuses the merge when
+another package owns that path. The entry that owned it keeps its `CONTENTS`
+line, so two entries claim the path, and the file is the later package's. Each
+merge that replaced something is reported with `GentooEvent::Replaced`, which
+names the paths, and `fcage` prints a line for it.
 
 ### Coverage is a property of the archive
 

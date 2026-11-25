@@ -7156,6 +7156,19 @@ impl<W: std::io::Write> Progress<W> {
                 "fcage: {package}-{version} defines pkg_{} which this install does not run",
                 phases.join(", pkg_"),
             )),
+            GentooEvent::Replaced {
+                package,
+                version,
+                paths,
+                ..
+            } => self.line(format_args!(
+                "fcage: {package}-{version} replaced {} the root already held: {}",
+                match paths.len() {
+                    1 => "a path".to_string(),
+                    count => format!("{count} paths"),
+                },
+                paths.join(", "),
+            )),
             GentooEvent::DependencyCycle { packages, .. } => self.line(format_args!(
                 "fcage: a runtime dependency cycle among {} was broken to order the merge",
                 packages.join(", "),

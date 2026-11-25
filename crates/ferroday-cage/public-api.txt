@@ -906,6 +906,10 @@ pub ferroday_cage::provision::gentoo::GentooEvent::PhasesNotRun::version: &'a st
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Planned
 pub ferroday_cage::provision::gentoo::GentooEvent::Planned::bytes: u64
 pub ferroday_cage::provision::gentoo::GentooEvent::Planned::packages: usize
+#[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Replaced
+pub ferroday_cage::provision::gentoo::GentooEvent::Replaced::package: &'a str
+pub ferroday_cage::provision::gentoo::GentooEvent::Replaced::paths: &'a [alloc::string::String]
+pub ferroday_cage::provision::gentoo::GentooEvent::Replaced::version: &'a str
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Resolved
 pub ferroday_cage::provision::gentoo::GentooEvent::Resolved::stage3: &'a ferroday_cage::provision::gentoo::Stage3
 #[non_exhaustive] pub ferroday_cage::provision::gentoo::GentooEvent::Unsatisfiable

@@ -390,13 +390,13 @@ why = "The package cache's stale entries, which `Remove` reaches publicly."
 
 [[reach]]
 item = "provision::rooted::AncestorLink"
-code = 3
+code = 5
 cost = "share"
 why = "What a symbolic link above a path does in an overlay's merged view, for a Gentoo root's installed packages."
 
 [[reach]]
 item = "provision::rooted::Merged"
-code = 2
+code = 4
 cost = "share"
 why = "As above: what the merged view shows."
 
@@ -420,7 +420,7 @@ why = "As above: whether a name is an overlay whiteout."
 
 [[reach]]
 item = "provision::rooted::Rooted::open"
-code = 15
+code = 16
 tests = 4
 cost = "share"
 why = "As above."
@@ -439,7 +439,7 @@ why = "As above: a file as the merged view shows it."
 
 [[reach]]
 item = "provision::rooted::merged_lookup"
-code = 1
+code = 2
 cost = "share"
 why = "As for `Merged`."
 

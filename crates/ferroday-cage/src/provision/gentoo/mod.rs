@@ -1958,7 +1958,7 @@ impl Gentoo {
                 package: &planned.name,
                 version: &planned.version,
             });
-            vdb::merge(
+            let replaced = vdb::merge(
                 root,
                 over,
                 &rooted,
@@ -1968,6 +1968,13 @@ impl Gentoo {
                 ordinal,
                 &mut || to.cancelled(),
             )?;
+            if !replaced.is_empty() {
+                to.progress(GentooEvent::Replaced {
+                    package: &planned.name,
+                    version: &planned.version,
+                    paths: &replaced,
+                });
+            }
             let defined = package
                 .metadata_files()
                 .find(|(name, _)| *name == DEFINED_PHASES_FILE)
@@ -2322,6 +2329,24 @@ pub enum GentooEvent<'a> {
         /// The phases it defines that a binary install runs, without their
         /// `pkg_` prefix, in the order portage runs them.
         phases: &'a [&'a str],
+    },
+    /// A package was merged over paths the root already held something other
+    /// than a directory at, which its merge replaced.
+    ///
+    /// Portage's default `protect-owned` refuses a merge whose files another
+    /// package owns. This layer replaces them, as a tar extraction does, and
+    /// the entry that owned one keeps its `CONTENTS` line, so two entries claim
+    /// it. A plan that merges two packages shipping one file therefore builds a
+    /// root whose file is the later one's, and this names the paths.
+    #[non_exhaustive]
+    Replaced {
+        /// The package, as `category/name`.
+        package: &'a str,
+        /// The version merged.
+        version: &'a str,
+        /// The paths it replaced, relative to the root, as its image names
+        /// them, in the order it laid them down.
+        paths: &'a [String],
     },
 }
 
