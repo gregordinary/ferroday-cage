@@ -3024,20 +3024,7 @@ impl CageBuilder {
         // against the value that carries it rather than a candidate built
         // from it.
         let env = compose_env(base, &self.env)?;
-        let program_search = if command.searched {
-            // A `PATH` with no absolute entry leaves nothing to search. Refuse
-            // it here rather than fall through to an `execve` of the bare name,
-            // which the kernel would resolve against the sandbox's working
-            // directory — the relative resolution path lookup exists to avoid.
-            let path = effective_path(&self.env, base_env);
-            let candidates = search_candidates(&path, &command.path)?;
-            if candidates.is_empty() {
-                return Err(ConfigError::SearchPathUnusable { path }.into());
-            }
-            candidates
-        } else {
-            Vec::new()
-        };
+        let program_search = lookup_candidates(&command, &env)?;
         // The label a failed exec step reports. `ENOENT` from `execve` means
         // either "no such binary" or "no such ELF interpreter", so naming the
         // command — and, for a path lookup, every candidate that was tried —
@@ -5904,29 +5891,54 @@ pub(crate) fn is_command_name(command: &Path) -> bool {
     path::is_ordinary_component(command.as_os_str().as_bytes())
 }
 
-/// The `PATH` a path-lookup command is resolved against: the last `PATH` the
-/// caller set through [`CageBuilder::env`], or the deterministic
-/// [`BASE_PATH`] when none is set and the base environment is in force. It
-/// mirrors the value the command's own environment will carry, so lookup and
-/// the running command agree on `PATH`.
+/// The candidates a command is executed through: none for a command given as a
+/// path, and for a bare name one per absolute directory of the `PATH` its
+/// composed environment carries, in order.
 ///
-/// With the base environment opted out of and no `PATH` of the caller's own,
-/// the command will run with no `PATH` at all, so there is genuinely nothing
-/// to search. Returning empty here rather than the base is what makes
-/// [`CageBuilder::build`] report that, instead of resolving the command
-/// against a `PATH` the command will never see.
-fn effective_path(env: &[(OsString, OsString)], base_env: bool) -> OsString {
+/// The `PATH` searched is the one the command's own environment will carry, so
+/// lookup and the running command agree on it: the caller's last, or the base
+/// environment's, or none where the base is opted out of and the caller set
+/// none. A `PATH` with no absolute entry leaves nothing to search, and is
+/// refused with [`ConfigError::SearchPathUnusable`] rather than fall through to
+/// an `execve` of the bare name, which the kernel would resolve against the
+/// sandbox's working directory, the relative resolution path lookup exists to
+/// avoid.
+pub(crate) fn lookup_candidates(
+    command: &ValidCommand,
+    env: &[CString],
+) -> Result<Vec<CString>, Error> {
+    if !command.searched {
+        return Ok(Vec::new());
+    }
+    let path = env_pairs(env)
+        .into_iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value)
+        .unwrap_or_default();
+    let candidates = search_candidates(&path, &command.path)?;
+    if candidates.is_empty() {
+        return Err(ConfigError::SearchPathUnusable { path }.into());
+    }
+    Ok(candidates)
+}
+
+/// The variables of a composed environment, each `NAME=value` entry split at
+/// its first `=`, which no composed name contains; see [`compose_env`].
+pub(crate) fn env_pairs(env: &[CString]) -> Vec<(OsString, OsString)> {
     env.iter()
-        .rev()
-        .find(|(key, _)| key == "PATH")
-        .map(|(_, value)| value.clone())
-        .unwrap_or_else(|| {
-            if base_env {
-                OsString::from(BASE_PATH)
-            } else {
-                OsString::new()
-            }
+        .map(|entry| {
+            let bytes = entry.as_bytes();
+            let split = bytes
+                .iter()
+                .position(|&byte| byte == b'=')
+                .unwrap_or(bytes.len());
+            let (name, value) = bytes.split_at(split);
+            (
+                OsStr::from_bytes(name).to_os_string(),
+                OsStr::from_bytes(value.get(1..).unwrap_or_default()).to_os_string(),
+            )
         })
+        .collect()
 }
 
 /// The candidate absolute paths a bare `command` resolves to: one per absolute
