@@ -1659,10 +1659,11 @@ impl Gentoo {
         // be the one the signed document named would otherwise already have
         // written most of a root filesystem. The size the signed enumeration
         // recorded bounds what the download may spend.
+        let suffix = self.url(&stage3.path);
         let verified = cached_or_fetched(
             self.fetcher.as_mut(),
             &self.mirrors,
-            &format!("releases/{}/autobuilds/{}", self.architecture, stage3.path),
+            &suffix,
             cache::Entry {
                 path: &tarball,
                 dir: None,

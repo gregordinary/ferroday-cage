@@ -389,12 +389,10 @@ impl Plan {
         let mut plan = Plan {
             architecture: required(header.get("Architecture"), "Architecture", "the header")?,
             binhost: required(header.get("Binhost"), "Binhost", "the header")?,
-            // Signed because the field it reads is: an index states its
-            // `TIMESTAMP` as an unsigned number and a mirror may state one above
-            // `i64::MAX`, which `Preamble::generated` carries as the negative it
-            // became. The field is provenance and nothing rests on it, so a plan
-            // that recorded such a timestamp must read back as itself rather
-            // than refusing the whole document over a line no decision consults.
+            // Signed, as the index's own `generated` it records is. The field
+            // is provenance and nothing rests on it, so whatever value a plan
+            // states reads back as itself rather than refusing the whole
+            // document over a line no decision consults.
             index_timestamp: number::<i64>(
                 header.get("Index-Timestamp"),
                 "Index-Timestamp",
@@ -554,12 +552,10 @@ mod tests {
 
     #[test]
     fn an_index_timestamp_round_trips_whatever_the_index_stated() {
-        // The field is signed because what it carries is: an index states its
-        // `TIMESTAMP` as an unsigned number and a mirror may state one above
-        // `i64::MAX`, which the preamble carries as the negative it became.
+        // The field is signed, as the index's own `generated` it records is.
         // Nothing rests on the value -- it is provenance and the module says so
-        // -- which makes refusing the whole document over it exactly the wrong
-        // response.
+        // -- which makes refusing the whole document over any value it states
+        // exactly the wrong response.
         for stated in [Some(0), Some(-1), Some(i64::MIN), Some(i64::MAX), None] {
             let plan = Plan {
                 index_timestamp: stated,
