@@ -492,8 +492,8 @@ pub enum ProvisionError {
     /// An archive entry attempted to reach outside the extraction root.
     ///
     /// The entry's path or hardlink target is absolute, contains `..`, or
-    /// carries a NUL byte that would truncate it, or its path resolves through
-    /// a magic link or a symlink loop. A symbolic link in the tree resolves
+    /// carries a NUL byte that would truncate it, or its resolution was carried
+    /// out of the tree by a rename made while it ran. A symbolic link in the tree resolves
     /// inside the rootfs being extracted, as it does for the root itself, so it
     /// carries no entry outside: one naming a host path names the rootfs's own
     /// path of that name. Containment is enforced by the kernel during path
@@ -511,8 +511,9 @@ pub enum ProvisionError {
     /// An entry cannot be handled as it stands, for a reason that is not a
     /// containment failure.
     ///
-    /// A malformed archive — a path component that is not a directory, an empty
-    /// symlink target — a source tree past a limit the copy protocol can carry
+    /// A malformed archive — a path component that is not a directory, a path
+    /// through a loop of symbolic links, an empty symlink target — a source
+    /// tree past a limit the copy protocol can carry
     /// (its depth, an entry name, a link target), or a source id the
     /// destination's identity map has no place for.
     ///

@@ -513,6 +513,10 @@ consumer upgrading can skip it.
   skipped ones included, and every four mebibytes of an entry's data. It asked
   only before each entry it extracted, so one large entry, or a run of entries
   it skips, could not be cancelled until it was read through.
+- An archive entry whose path runs through a loop of symbolic links is refused
+  with `ProvisionError::EntryRefused`. It was reported as
+  `ProvisionError::EntryUnsafe`, an escape attempt, though a loop the archive
+  laid down inside the tree reaches nothing outside it.
 
 ### Internal
 

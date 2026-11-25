@@ -1069,21 +1069,24 @@ fn classify_existing_dir(
 
 /// Maps a parent-resolution failure onto the typed error surface.
 ///
-/// `EXDEV` and `ELOOP` are the kernel refusing a resolution: the first is a
-/// rename racing the walk out of the root, the second a magic link or a loop,
-/// and the errno does not distinguish those two. Both are containment
-/// failures. A link naming a place outside the tree is not one, since it
-/// resolves inside the root, and a link to nothing there is `ENOTDIR` from the
-/// creation that found its name taken. `ENOTDIR` is not either: an archive that
-/// ships `foo` as a file and `foo/bar` after it is an ordinary malformed
-/// archive, and calling that an escape attempt would tell a caller something
-/// untrue about their input.
+/// `EXDEV` is the kernel refusing a resolution that a rename racing the walk
+/// carried out of the root, a containment failure. A link naming a place
+/// outside the tree is not one, since it resolves inside the root, and a link
+/// to nothing there is `ENOTDIR` from the creation that found its name taken.
+/// `ELOOP` is not one either. `RESOLVE_NO_MAGICLINKS` answers it for a magic
+/// link, which only a mounted procfs holds and no tree being extracted into
+/// does, so what it reports here is a loop of symbolic links, or a chain longer
+/// than the kernel follows, that the archive laid down. That, and `ENOTDIR`,
+/// an archive that ships `foo` as a file and `foo/bar` after it, are ordinary
+/// malformed archives, and calling either an escape attempt would tell a
+/// caller something untrue about their input.
 fn resolve_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
     match errno {
         Errno::XDEV => entry_unsafe(entry_path, "the path resolves outside the extraction root"),
-        Errno::LOOP => entry_unsafe(
+        Errno::LOOP => entry_refused(
             entry_path,
-            "the path resolves through a symlink loop or a magic link",
+            "the path resolves through a loop of symbolic links, or through more of them than \
+             the kernel follows",
         ),
         Errno::NOTDIR => entry_refused(entry_path, "a parent component is not a directory"),
         errno => ProvisionError::io("resolving", bytes_to_path(entry_path), errno.into()),
@@ -2307,6 +2310,29 @@ mod mode_tests {
     use crate::scratch::Scratch;
     use ferroday_cage_testkit::tar::Tar;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    #[test]
+    fn a_path_through_a_loop_of_links_is_refused_rather_than_called_an_escape() {
+        // Two links naming each other are a malformed archive, laid down
+        // inside the root; nothing in them reaches outside it.
+        let root = Scratch::for_test("extract", "link-loop");
+        let mut tar = Tar::new();
+        tar.symlink("a", "b")
+            .symlink("b", "a")
+            .file("a/x", 0o644, b"x");
+        let err = extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+            &mut || false,
+        )
+        .expect_err("the path does not resolve");
+        assert!(
+            matches!(&err, crate::provision::ProvisionError::EntryRefused { reason, .. }
+                if reason.contains("loop")),
+            "{err}"
+        );
+    }
 
     #[test]
     fn a_named_pipe_takes_its_entrys_mode_even_one_its_owner_cannot_read() {
