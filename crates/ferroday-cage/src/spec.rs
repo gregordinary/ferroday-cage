@@ -1079,6 +1079,13 @@ impl Symlink {
 /// or, on the host's own root, at a target the host must already hold. A
 /// symbolic link at the path is followed inside the root, as every mount target
 /// is, and what it names is hidden.
+///
+/// A path inside a directory bound into the sandbox is the exception. Where
+/// the bind's source holds an entry at the path when the sandbox is built, a
+/// launch that finds nothing there fails with
+/// [`SetupStep::OpenMountTarget`](crate::SetupStep::OpenMountTarget), naming
+/// the hide: the entry was moved or removed since, and one moved is under a
+/// name the hide does not reach.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[cfg_attr(
@@ -3456,6 +3463,9 @@ impl CageBuilder {
                 lowering.push_resolv_conf()?;
             }
         }
+        // A hide inside a bound directory that holds an entry at its path now
+        // must find one at launch.
+        require_found_hides(&mut lowering.ops);
         // The host's own root is read-only and the launch creates nothing in
         // it, so every target outside a filesystem the sandbox mounts must
         // already be there.
@@ -5615,6 +5625,9 @@ impl Lowering {
                 create_file: None,
                 action: MountAction::Hide {
                     target: sandbox_target(&hide.target)?,
+                    // Settled once the whole profile is lowered; see
+                    // `require_found_hides`.
+                    required: false,
                 },
             },
             format!("hiding {:?}", hide.target),
@@ -5799,7 +5812,7 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
         let target = match &ops[at].action {
             MountAction::ReadOnly { .. } => continue,
             MountAction::Symlink { parent, leaf, .. } => join_target(parent, leaf),
-            MountAction::Hide { target }
+            MountAction::Hide { target, .. }
             | MountAction::Tmpfs { target, .. }
             | MountAction::Procfs { target }
             | MountAction::Devpts { target, .. }
@@ -5882,6 +5895,82 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Marks each hide the launch must find something at: one whose path lies
+/// beneath a directory bound into the sandbox, where the bind's source holds an
+/// entry at that path now.
+///
+/// A hide of nothing hides nothing, so one list of paths serves trees that hold
+/// different subsets of them. Inside a tree the caller binds in, though, the
+/// build can look, and an entry there that is gone at launch was moved or
+/// removed meanwhile: by a command an earlier launch of the same sandbox ran,
+/// renaming the directory it is in, for one, which leaves the entry under
+/// another name the hide does not reach. The launch fails there rather than
+/// hide nothing.
+///
+/// The path is looked up as the launch looks it up, from the source as a root,
+/// following a link at the leaf inside it, so a link that leads nowhere is no
+/// entry here either. A path made read-only between the bind and the hide shows
+/// the bind's own tree, and is looked through. Beneath anything else, a
+/// filesystem of the sandbox's own, an overlay, a raw mount or the root itself,
+/// a hide is left as it is.
+fn require_found_hides(ops: &mut [MountOp]) {
+    for at in 0..ops.len() {
+        let MountAction::Hide { target, .. } = &ops[at].action else {
+            continue;
+        };
+        let cover = ops[..at]
+            .iter()
+            .rev()
+            .filter(|earlier| !matches!(earlier.action, MountAction::ReadOnly { .. }))
+            .find(|earlier| {
+                earlier
+                    .action
+                    .arrival()
+                    .is_some_and(|(over, _)| covers(over, target))
+            });
+        let found = match cover.map(|earlier| &earlier.action) {
+            Some(MountAction::Bind {
+                source,
+                target: over,
+                ..
+            }) => {
+                let rest = &target.as_bytes()[over.as_bytes().len()..];
+                let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+                !rest.is_empty() && found_beneath(source, rest)
+            }
+            _ => false,
+        };
+        if let MountAction::Hide { required, .. } = &mut ops[at].action {
+            *required = found;
+        }
+    }
+}
+
+/// Whether `relative` names an entry inside the directory `source`, resolved
+/// as the launch resolves a path beneath a bind of it: with `RESOLVE_IN_ROOT`
+/// from the directory, following a link at the leaf. A lookup that fails for
+/// any reason finds nothing.
+fn found_beneath(source: &CStr, relative: &[u8]) -> bool {
+    let Ok(relative) = CString::new(relative) else {
+        return false;
+    };
+    let Ok(source) = rustix::fs::open(
+        source,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    mechanism::resolve::openat2(
+        std::os::fd::AsFd::as_fd(&source),
+        &relative,
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        rustix::fs::ResolveFlags::IN_ROOT | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .is_ok()
 }
 
 /// The root-relative path an entry `leaf` in the root-relative directory
@@ -7334,6 +7423,46 @@ mod tests {
                 target: PathBuf::from("/dev/pts"),
                 data: "newinstance,ptmxmode=0666,mode=0620".to_string(),
             },
+        );
+    }
+
+    #[test]
+    fn a_hide_inside_a_bound_directory_is_required_where_the_build_finds_it() {
+        let dir = Scratch::new("required-hides");
+        std::fs::create_dir(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config/secret"), b"").unwrap();
+        std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+        let cage = sh_in("/tmp")
+            .bind(dir.path(), "/work")
+            .read_only("/work/config")
+            .hide("/work/config/secret")
+            .hide("/work/absent")
+            .hide("/work/dangling")
+            .hide("/tmp/scratch")
+            .build()
+            .unwrap();
+        let required: Vec<(String, bool)> = cage
+            .plan
+            .ops
+            .iter()
+            .filter_map(|op| match &op.action {
+                MountAction::Hide { target, required } => {
+                    Some((target.to_string_lossy().into_owned(), *required))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            required,
+            [
+                // Present, looked up through the path made read-only above it.
+                ("work/config/secret".to_string(), true),
+                ("work/absent".to_string(), false),
+                // A link to nothing leads nowhere at launch either.
+                ("work/dangling".to_string(), false),
+                // In a tmpfs of the sandbox's own.
+                ("tmp/scratch".to_string(), false),
+            ],
         );
     }
 

@@ -1330,10 +1330,14 @@ pub(crate) enum MountAction {
     },
     /// Hide what is at a path: an empty tmpfs over a directory, made read-only
     /// once the profile is in place, or an empty read-only file over anything
-    /// else. A path with nothing at it hides nothing.
+    /// else. A path with nothing at it hides nothing, unless it is `required`.
     Hide {
         /// Rootfs-relative path to hide.
         target: CString,
+        /// Whether the launch fails where it finds nothing at the path: the
+        /// path lies inside a directory bound into the sandbox, which held an
+        /// entry there at build.
+        required: bool,
     },
     /// Place a read-only file of the launch's own, holding `contents`, over a
     /// file target: the `resolv.conf` naming a caller's nameservers.
@@ -1451,7 +1455,7 @@ impl MountAction {
             MountAction::Tmpfs { target, .. }
             | MountAction::Procfs { target }
             | MountAction::Devpts { target, .. }
-            | MountAction::Hide { target }
+            | MountAction::Hide { target, .. }
             | MountAction::File { target, .. } => Some((target, Arrival::Fresh)),
             MountAction::Bind { target, .. } | MountAction::ReadOnly { target, .. } => {
                 Some((target, Arrival::Tree))
@@ -1479,7 +1483,7 @@ impl MountAction {
             | MountAction::Devpts { target, .. }
             | MountAction::Bind { target, .. }
             | MountAction::Raw { target, .. }
-            | MountAction::Hide { target }
+            | MountAction::Hide { target, .. }
             | MountAction::File { target, .. }
             | MountAction::ReadOnly { target, .. }
             | MountAction::Overlay { target, .. } => target,

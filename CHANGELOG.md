@@ -553,6 +553,13 @@ consumer upgrading can skip it.
   hidden path. It mounted them with `mount(2)` through the target's
   `/proc/self/fd` path, which reached through the host's `/proc`.
   `host::procfs_blocker` mounts its procfs the same way.
+- A `hide` whose path lies inside a directory bound into the sandbox, where the
+  bound directory holds an entry when the sandbox is built, fails the launch
+  with `SetupStep::OpenMountTarget` where the launch finds nothing at the path,
+  rather than hiding nothing. An entry moved since, as by a command of an
+  earlier launch that renamed the directory it is in, is under a name the hide
+  does not reach. A path with nothing at it when the sandbox is built still
+  hides nothing.
 
 ### Fixed
 

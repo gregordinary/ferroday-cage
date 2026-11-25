@@ -1047,7 +1047,7 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
                 target: PathBuf::from(OsString::from_vec(content.as_bytes().to_vec())),
             }
         }
-        MountAction::Hide { target } => ResolvedMount::Hide {
+        MountAction::Hide { target, .. } => ResolvedMount::Hide {
             target: sandbox_path(target),
         },
         MountAction::ReadOnly { target, .. } => ResolvedMount::ReadOnly {

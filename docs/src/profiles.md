@@ -179,7 +179,8 @@ profile. The `kind` selects which fields the entry carries:
   link is not a mount, but it takes its place in the same order.
 - `kind = "hide"` leaves `target` empty: a directory holds nothing and a file
   reads empty, and neither can be written. A `target` with nothing at it hides
-  nothing.
+  nothing, except inside a directory bound into the sandbox that held an entry
+  there when the sandbox was built, where the launch fails instead.
 - `kind = "read-only"` makes `target` read-only where it stands, mounts beneath
   it included, and holds its name: the directories above it, up to the nearest
   mount, cannot be renamed or removed. The `target` must exist.

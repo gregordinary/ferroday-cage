@@ -3492,7 +3492,7 @@ fn perform(
     let open =
         |oflags| open_target(at, rest, oflags).map_err(|errno| (SetupStep::OpenMountTarget, errno));
     let (target, mount) = match action {
-        MountAction::Hide { .. } => match hide(root, at, rest)? {
+        MountAction::Hide { required, .. } => match hide(root, at, rest, *required)? {
             Some((target, mount)) => (target, mount),
             None => return Ok((Place::Nowhere, None)),
         },
@@ -3592,7 +3592,8 @@ fn mount_fresh(
 
 /// Hides what `rest` names beneath `at`: an empty tmpfs over a directory, and
 /// an empty read-only file of the launch's own over anything else. Nothing at
-/// the path hides nothing.
+/// the path hides nothing, unless the hide is `required`, which fails with the
+/// `ENOENT` the lookup answered.
 ///
 /// Returns the target and what it mounted there: a hidden directory's tmpfs,
 /// writable, so that a later op can still make a mount point in it, which the
@@ -3602,10 +3603,11 @@ fn hide<'a>(
     root: BorrowedFd<'_>,
     at: BorrowedFd<'a>,
     rest: &CStr,
+    required: bool,
 ) -> Result<Option<(Target<'a>, OwnedFd)>, (SetupStep, Errno)> {
     let target = match open_target(at, rest, OFlags::PATH) {
         Ok(target) => target,
-        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::NOENT) if !required => return Ok(None),
         Err(errno) => return Err((SetupStep::OpenMountTarget, errno)),
     };
     let failed = |errno| (SetupStep::HidePath, errno);
@@ -4616,6 +4618,7 @@ mod tests {
             }),
             op(MountAction::Hide {
                 target: c"work/secrets".into(),
+                required: false,
             }),
             op(MountAction::Bind {
                 source: c"/srv/tree".into(),
@@ -4682,9 +4685,11 @@ mod tests {
         let ops = [
             op(MountAction::Hide {
                 target: c"run".into(),
+                required: false,
             }),
             op(MountAction::Hide {
                 target: c"var/run".into(),
+                required: false,
             }),
         ];
         let slots = [held_slot(), held_slot()];
@@ -4829,6 +4834,7 @@ mod tests {
             }),
             op(MountAction::Hide {
                 target: c"work/.env".into(),
+                required: false,
             }),
             op(MountAction::ReadOnly {
                 target: c"work/.git".into(),
@@ -4897,9 +4903,11 @@ mod tests {
         let ops = [
             op(MountAction::Hide {
                 target: c"run".into(),
+                required: false,
             }),
             op(MountAction::Hide {
                 target: c"var/run".into(),
+                required: false,
             }),
             op(MountAction::Symlink {
                 parent: c"run".into(),

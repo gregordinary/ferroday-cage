@@ -671,6 +671,46 @@ fn a_failed_mount_op_names_the_mount() {
 }
 
 #[test]
+fn a_hide_inside_a_bind_that_finds_nothing_the_build_found_fails_the_launch() {
+    // The build saw the entry in the bound directory, and the launch does not:
+    // it was moved, here between the two, and the hide fails the launch rather
+    // than hide nothing while the entry sits under another name.
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let tree = common::scratch_dir("hide-required");
+    std::fs::create_dir(tree.join("config")).unwrap();
+    std::fs::write(tree.join("config/secret"), b"secret").unwrap();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .bind(&tree, "/work")
+        .hide("/work/config/secret")
+        .hide("/work/never-there")
+        .command("/bin/sh")
+        .args(["-c", "cat /work/config/secret"])
+        .build()
+        .expect("a valid sandbox configuration");
+
+    // Found, it is hidden, and the hide of what was never there hides nothing.
+    let output = cage.output().expect("the sandbox launches");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+
+    std::fs::rename(tree.join("config"), tree.join("moved")).unwrap();
+    match cage.run().unwrap_err() {
+        Error::Setup {
+            step,
+            detail: Some(detail),
+            ..
+        } => {
+            assert_eq!(step, SetupStep::OpenMountTarget);
+            assert!(detail.contains("/work/config/secret"), "{detail}");
+        }
+        other => panic!("expected a detailed Setup error, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_raw_mount_reaches_the_kernel_verbatim() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
