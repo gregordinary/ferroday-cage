@@ -2085,6 +2085,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::ListenRefusal
 #[non_exhaustive] pub enum ferroday_cage::Mount
 pub ferroday_cage::Mount::Bind(ferroday_cage::Bind)
 pub ferroday_cage::Mount::Hide(ferroday_cage::Hide)
+pub ferroday_cage::Mount::Overlay(ferroday_cage::OverlayMount)
 pub ferroday_cage::Mount::Raw(ferroday_cage::RawMount)
 pub ferroday_cage::Mount::ReadOnly(ferroday_cage::ReadOnly)
 pub ferroday_cage::Mount::Symlink(ferroday_cage::Symlink)
@@ -2308,6 +2309,11 @@ pub ferroday_cage::ResolvedMount::File::contents: alloc::string::String
 pub ferroday_cage::ResolvedMount::File::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Hide
 pub ferroday_cage::ResolvedMount::Hide::target: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::Overlay
+pub ferroday_cage::ResolvedMount::Overlay::lower: alloc::vec::Vec<std::path::PathBuf>
+pub ferroday_cage::ResolvedMount::Overlay::target: std::path::PathBuf
+pub ferroday_cage::ResolvedMount::Overlay::upper: std::path::PathBuf
+pub ferroday_cage::ResolvedMount::Overlay::work: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Procfs
 pub ferroday_cage::ResolvedMount::Procfs::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Raw
@@ -2487,6 +2493,7 @@ pub ferroday_cage::SetupStep::LandlockRestrictSelf = 35
 pub ferroday_cage::SetupStep::MountDevpts = 13
 pub ferroday_cage::SetupStep::MountEmptyRoot = 59
 pub ferroday_cage::SetupStep::MountHostRoot = 64
+pub ferroday_cage::SetupStep::MountOverlay = 73
 pub ferroday_cage::SetupStep::MountOverlayRoot = 43
 pub ferroday_cage::SetupStep::MountProc = 25
 pub ferroday_cage::SetupStep::MountRaw = 26
@@ -2665,6 +2672,7 @@ pub fn ferroday_cage::CageBuilder::mounts<I>(self, I) -> Self where I: core::ite
 pub fn ferroday_cage::CageBuilder::nameservers(self, impl core::iter::traits::collect::IntoIterator<Item = core::net::ip_addr::IpAddr>) -> Self
 pub fn ferroday_cage::CageBuilder::network(self, ferroday_cage::Network) -> Self
 pub fn ferroday_cage::CageBuilder::overlay(self, ferroday_cage::Overlay) -> Self
+pub fn ferroday_cage::CageBuilder::overlay_at(self, impl core::convert::AsRef<std::path::Path>, ferroday_cage::Overlay) -> Self
 pub fn ferroday_cage::CageBuilder::overlay_rootfs(self, impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::path_lookup(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::pid_namespace(self, bool) -> Self
@@ -3073,6 +3081,18 @@ impl core::marker::Unpin for ferroday_cage::Overlay
 impl core::marker::UnsafeUnpin for ferroday_cage::Overlay
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Overlay
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Overlay
+#[non_exhaustive] pub struct ferroday_cage::OverlayMount
+impl ferroday_cage::OverlayMount
+pub fn ferroday_cage::OverlayMount::get_overlay(&self) -> &ferroday_cage::Overlay
+pub fn ferroday_cage::OverlayMount::get_target(&self) -> &std::path::Path
+pub fn ferroday_cage::OverlayMount::new(impl core::convert::AsRef<std::path::Path>, ferroday_cage::Overlay) -> ferroday_cage::OverlayMount
+impl core::marker::Freeze for ferroday_cage::OverlayMount
+impl core::marker::Send for ferroday_cage::OverlayMount
+impl core::marker::Sync for ferroday_cage::OverlayMount
+impl core::marker::Unpin for ferroday_cage::OverlayMount
+impl core::marker::UnsafeUnpin for ferroday_cage::OverlayMount
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::OverlayMount
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::OverlayMount
 pub struct ferroday_cage::ParseCapabilityError
 impl ferroday_cage::ParseCapabilityError
 pub fn ferroday_cage::ParseCapabilityError::text(&self) -> &str

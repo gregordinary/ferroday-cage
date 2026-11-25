@@ -234,6 +234,9 @@ wire_enum! {
         /// Join a running sandbox's namespaces, for a further command run in
         /// it; see `Running::exec`.
         JoinSandbox = 72 => "joining the running sandbox's namespaces",
+        /// Mount an overlay at a path inside the sandbox; see
+        /// `CageBuilder::overlay_at`.
+        MountOverlay = 73 => "mounting an overlay",
     }
 }
 

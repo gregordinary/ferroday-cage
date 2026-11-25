@@ -10,7 +10,7 @@ mod common;
 
 use std::path::Path;
 
-use ferroday_cage::{Cage, Error, ExitStatus, SetupStep};
+use ferroday_cage::{Cage, Error, Exec, ExitStatus, Overlay, SetupStep};
 use rustix::io::Errno;
 
 /// Runs `/bin/sh -c <script>` in an overlay of `lower` with writes in `upper`.
@@ -406,4 +406,178 @@ fn a_layer_path_holding_an_option_separator_mounts_the_directory_named() {
         std::fs::read_to_string(upper.join("written")).unwrap(),
         "written\n"
     );
+}
+
+/// A tree for an overlay mounted at a path: a file to keep, one to edit, and
+/// one to delete, each holding `original`.
+fn overlay_tree(dir: &Path) -> std::path::PathBuf {
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for name in ["keep", "edit", "gone"] {
+        std::fs::write(tree.join(name), b"original\n").unwrap();
+    }
+    tree
+}
+
+/// Asserts that the run of the script [`OVERLAID_WRITES`] left `tree` as it
+/// was and recorded its writes in `upper`.
+fn assert_writes_landed_in_the_upper(tree: &Path, upper: &Path) {
+    for name in ["keep", "edit", "gone"] {
+        assert_eq!(
+            std::fs::read_to_string(tree.join(name)).unwrap(),
+            "original\n",
+            "the tree's {name} is untouched"
+        );
+    }
+    assert!(!tree.join("added").exists(), "nothing is added to the tree");
+    assert_eq!(
+        std::fs::read_to_string(upper.join("added")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(upper.join("edit")).unwrap(),
+        "changed\n"
+    );
+    assert!(common::overlay::is_whiteout(&upper.join("gone")));
+    assert!(
+        !upper.join("keep").exists(),
+        "a file only read is not copied up"
+    );
+}
+
+/// What a run writes through an overlay of [`overlay_tree`] mounted at the
+/// working directory.
+const OVERLAID_WRITES: &str = "test \"$(cat keep)\" = original && echo new > added \
+     && echo changed > edit && rm gone && test ! -e gone";
+
+#[test]
+fn an_overlay_at_a_path_takes_the_writes_to_its_tree() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("overlay-at-path");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let tree = overlay_tree(&dir);
+    let upper = dir.join("upper");
+    let status = Cage::builder()
+        .rootfs(rootfs)
+        .overlay_at("/work", Overlay::new().lower(&tree).upper(&upper))
+        .current_dir("/work")
+        .command("/bin/sh")
+        .args(["-c", OVERLAID_WRITES])
+        .build()
+        .expect("a valid overlay mount")
+        .run()
+        .expect("the sandbox launches");
+    assert!(status.success(), "the overlaid tree reads and writes");
+    assert_writes_landed_in_the_upper(&tree, &upper);
+    assert!(
+        !rootfs.join("work").join("added").exists(),
+        "nothing lands in the root's mount point"
+    );
+}
+
+/// The host's own root takes no overlay root, and an overlay at the working
+/// tree's own path is how its writes are kept apart from it.
+#[test]
+fn an_overlay_at_a_path_in_the_hosts_root() {
+    let dir = common::scratch_dir("overlay-at-path-host");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let tree = std::fs::canonicalize(overlay_tree(&dir)).unwrap();
+    let upper = dir.join("upper");
+    let status = Cage::builder()
+        .host_rootfs()
+        .overlay_at(&tree, Overlay::new().lower(&tree).upper(&upper))
+        .current_dir(&tree)
+        .command("/bin/sh")
+        .args(["-c", OVERLAID_WRITES])
+        .build()
+        .expect("a valid overlay mount")
+        .run()
+        .expect("the sandbox launches");
+    assert!(status.success(), "the overlaid tree reads and writes");
+    assert_writes_landed_in_the_upper(&tree, &upper);
+}
+
+/// A bind declared after the overlay lands inside it, read-only where it is
+/// asked to be, and the empty file made as its target in the upper goes once
+/// the sandbox is gone; the directory made above it stays, as a mount point
+/// directory does.
+#[test]
+fn a_bind_inside_an_overlay_mount_holds_and_its_target_goes() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("overlay-at-path-bind");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let tree = overlay_tree(&dir);
+    let upper = dir.join("upper");
+    let source = dir.join("source");
+    std::fs::write(&source, b"bound\n").unwrap();
+    let status = Cage::builder()
+        .rootfs(rootfs)
+        .overlay_at("/work", Overlay::new().lower(&tree).upper(&upper))
+        .bind_ro(&source, "/work/sub/file")
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "test \"$(cat /work/sub/file)\" = bound && ! (echo x > /work/sub/file) 2>/dev/null",
+        ])
+        .build()
+        .expect("a valid overlay mount")
+        .run()
+        .expect("the sandbox launches");
+    assert!(status.success(), "the bind reads and refuses a write");
+    assert!(
+        upper.join("sub").is_dir(),
+        "the mount point directory stays"
+    );
+    assert!(
+        !upper.join("sub/file").exists(),
+        "the file made as the bind's target goes with the sandbox"
+    );
+    assert!(!tree.join("sub").exists(), "nothing lands in the tree");
+    assert_eq!(std::fs::read(&source).unwrap(), b"bound\n");
+}
+
+/// A further command run in a started sandbox sees the overlay as the first
+/// command does, and writes into the same upper.
+#[test]
+fn a_further_command_writes_into_the_same_upper() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let dir = common::scratch_dir("overlay-at-path-exec");
+    if !common::require::overlay(&dir) {
+        return;
+    }
+    let tree = overlay_tree(&dir);
+    let upper = dir.join("upper");
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .overlay_at("/work", Overlay::new().lower(&tree).upper(&upper))
+        .build()
+        .expect("a valid overlay mount");
+    let mut sandbox = cage.start().expect("the sandbox starts");
+    for script in ["echo one > /work/from-exec", "echo two >> /work/from-exec"] {
+        let status = sandbox
+            .exec(&Exec::new("/bin/sh").args(["-c", script]))
+            .expect("the further command launches")
+            .wait()
+            .expect("the further command is collected");
+        assert!(status.success(), "{script}");
+    }
+    sandbox.terminate().expect("the sandbox is told to end");
+    sandbox.wait().expect("the sandbox ends");
+    assert_eq!(
+        std::fs::read_to_string(upper.join("from-exec")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert!(!tree.join("from-exec").exists());
 }

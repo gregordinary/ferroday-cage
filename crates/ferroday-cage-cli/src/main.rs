@@ -65,10 +65,10 @@ use ferroday_cage::relay::{Escalation, RelayError};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
     ExitStatus, FsAccess, Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount,
-    NetAccess, NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Overlay, Pending,
-    PresentedIdentity, RawMount, ReadOnly, ResolvedCgroup, ResolvedInputs, Resource,
-    RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg, SeccompArgLen,
-    SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
+    NetAccess, NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Overlay,
+    OverlayMount, Pending, PresentedIdentity, RawMount, ReadOnly, ResolvedCgroup, ResolvedInputs,
+    Resource, RestrictedProfile, Restriction, RestrictionBuilder, Running, SeccompArg,
+    SeccompArgLen, SeccompCompare, SeccompPolicy, SeccompRules, Stdio, Symlink,
 };
 use serde::Deserialize as _;
 
@@ -1450,6 +1450,29 @@ const FLAGS: &[Flag] = &[
             options
                 .mounts
                 .push(Mount::ReadOnly(ReadOnly::new(PathBuf::from(value))));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--overlay-tree",
+        section: Section::Profiles,
+        placeholder: "DIR UPPER",
+        help: &[
+            "Overlay host directory DIR at its own path, in its",
+            "place among the mounts: the command's writes there land",
+            "in UPPER, and DIR is left as it was (repeatable). A",
+            "profile's kind = \"overlay\" mount names another target,",
+            "stacked lowers, or a work directory",
+        ],
+        needs: "a directory and an upper",
+        take: Take::Two(|options, flag, value, second| {
+            let tree =
+                std::path::absolute(&value).map_err(|err| format!("{flag}: {value:?}: {err}"))?;
+            options.mounts.push(Mount::Overlay(OverlayMount::new(
+                &tree,
+                Overlay::new().lower(&tree).upper(PathBuf::from(second)),
+            )));
             Ok(())
         }),
         ..Flag::DEFAULTS
@@ -10121,6 +10144,38 @@ mod tests {
         };
         assert_eq!(hide.get_target(), Path::new("/srv/work/.env"));
         assert_eq!(read_only.get_target(), Path::new("/srv/work/.git/hooks"));
+
+        // An overlaid tree is mounted at its own path, absolute however it was
+        // named, and takes its place in the sequence too.
+        let options = run_options(&[
+            "--host-rootfs",
+            "--overlay-tree",
+            "/srv/work",
+            "/srv/upper",
+            "--overlay-tree",
+            "relative",
+            "/srv/upper-2",
+            "--read-only",
+            "/srv/work/.git/hooks",
+            "/bin/true",
+        ]);
+        let [
+            Mount::Overlay(tree),
+            Mount::Overlay(relative),
+            Mount::ReadOnly(_),
+        ] = &options.mounts[..]
+        else {
+            panic!("two overlays, then a read-only path: {:?}", options.mounts);
+        };
+        assert_eq!(tree.get_target(), Path::new("/srv/work"));
+        assert_eq!(tree.get_overlay().get_lowers(), [Path::new("/srv/work")]);
+        assert_eq!(
+            tree.get_overlay().get_upper(),
+            Some(Path::new("/srv/upper"))
+        );
+        let absolute = std::env::current_dir().unwrap().join("relative");
+        assert_eq!(relative.get_target(), absolute);
+        assert_eq!(relative.get_overlay().get_lowers(), [absolute]);
 
         for args in [
             ["--host-rootfs", "--rootfs", "/r", "/bin/true"].as_slice(),

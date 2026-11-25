@@ -5,7 +5,7 @@ use std::fmt;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1390,8 +1390,6 @@ fn guarded<T>(
 /// unmount the second's bind.
 #[derive(Default)]
 pub(crate) struct PlaceholderGuard {
-    /// The root's writable layer, which every path below is relative to.
-    root: PathBuf,
     /// The targets the launch created and the caller side can name.
     created: Vec<Placeholder>,
     /// The supervisor, whose exit frees them; `None` where no process of the
@@ -1402,7 +1400,10 @@ pub(crate) struct PlaceholderGuard {
 /// One target a launch created: where it is, which file it is, and whether
 /// creating it replaced an overlay whiteout that removing it puts back.
 struct Placeholder {
-    /// The path, relative to the guard's root.
+    /// The writable layer it was created in, which [`path`](Self::path) is
+    /// relative to.
+    layer: PathBuf,
+    /// The path, relative to its layer.
     path: PathBuf,
     /// The created file's inode number; see [`CreatedTarget`].
     ino: u64,
@@ -1443,16 +1444,20 @@ impl PlaceholderGuard {
             .iter()
             .filter_map(|target| {
                 let file = ops.get(target.op)?.create_file.as_ref()?;
-                let path = PathBuf::from(OsStr::from_bytes(file.to_bytes()));
-                managed.paths.contains(&path).then(|| Placeholder {
-                    whiteout: managed.whiteouts.contains(&path),
-                    path,
+                let file = Path::new(OsStr::from_bytes(file.to_bytes()));
+                let managed = managed
+                    .targets
+                    .iter()
+                    .find(|managed| managed.file == file)?;
+                Some(Placeholder {
+                    layer: managed.layer.clone(),
+                    path: managed.path.clone(),
+                    whiteout: managed.whiteout,
                     ino: target.ino,
                 })
             })
             .collect();
         PlaceholderGuard {
-            root: managed.root.clone(),
             created,
             supervisor,
         }
@@ -1469,13 +1474,25 @@ impl Drop for PlaceholderGuard {
         {
             return;
         }
-        // One descriptor for the root, which every path below is resolved
+        // One descriptor for each layer, which every path in it is resolved
         // against; nothing here walks the host's own tree.
-        let Ok(root) = Rooted::open(&self.root) else {
-            return;
-        };
+        let mut layers: Vec<(&Path, Option<Rooted>)> = Vec::new();
         for placeholder in &self.created {
-            remove_placeholder(&root, placeholder);
+            let at = match layers
+                .iter()
+                .position(|(layer, _)| *layer == placeholder.layer)
+            {
+                Some(at) => at,
+                None => {
+                    let layer = placeholder.layer.as_path();
+                    layers.push((layer, Rooted::open(layer).ok()));
+                    layers.len() - 1
+                }
+            };
+            let Some(root) = &layers[at].1 else {
+                continue;
+            };
+            remove_placeholder(root, placeholder);
             // A target created over an overlay whiteout replaced it; the
             // whiteout goes back once the target is gone. A name still
             // occupied, by a target that was not removed, refuses the
@@ -2077,7 +2094,7 @@ mod tests {
     use rustix::process::{Pid, PidfdFlags};
 
     use super::*;
-    use crate::mechanism::MountAction;
+    use crate::mechanism::{ManagedTarget, MountAction};
     use crate::observer::Progress;
     use crate::scratch::Scratch;
 
@@ -2098,9 +2115,12 @@ mod tests {
         std::fs::create_dir(dir.join("etc")).expect("the scratch tree is writable");
         let target = dir.join("etc/target");
         let managed = ManagedPlaceholders {
-            root: dir.path().to_path_buf(),
-            paths: vec![PathBuf::from("etc/target")],
-            whiteouts: Vec::new(),
+            targets: vec![ManagedTarget {
+                file: PathBuf::from("etc/target"),
+                layer: dir.path().to_path_buf(),
+                path: PathBuf::from("etc/target"),
+                whiteout: false,
+            }],
         };
         let ops = [MountOp {
             dirs: Vec::new(),

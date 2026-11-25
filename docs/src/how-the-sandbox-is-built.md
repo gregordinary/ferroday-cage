@@ -430,6 +430,44 @@ without naming the host path the bind came from. Its path must exist when the
 sequence reaches it: a path left writable because it was missing is one the
 command could create.
 
+[`overlay_at`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_at)
+mounts an overlay at a path, in a root of any kind. The command sees the lowers
+merged there, and its writes land in the upper, as in an overlay root. No
+overlay root can take the host's own root as a lower. An overlay at a working
+tree's own path keeps the tree as it was while the command writes:
+
+```rust,no_run
+use ferroday_cage::{Cage, Overlay};
+
+# fn main() -> ferroday_cage::Result<()> {
+let tree = "/home/user/project";
+let cage = Cage::builder()
+    .host_rootfs()
+    .overlay_at(
+        tree,
+        Overlay::new()
+            .lower(tree)
+            .upper("/home/user/.cache/runs/1/upper"),
+    )
+    .current_dir(tree)
+    .command("/usr/bin/make")
+    .build()?;
+# let _ = cage;
+# Ok(())
+# }
+```
+
+Its layers are checked as an overlay root's are, and the upper and its work
+directory are created the same way. No overlay a sandbox mounts writes into
+another's layers: two overlays writing one upper, or one writing into another's
+lower, are refused at build. A bind declared after the overlay lands inside it.
+Leave the lowers alone while a sandbox has them mounted. The kernel does not
+define what an overlay shows of a lower that changes beneath it.
+
+On the command line, `--overlay-tree DIR UPPER` overlays a directory at its own
+path. A profile's `kind = "overlay"` mount can name another target, stacked
+lowers, or a work directory.
+
 Last comes the managed `resolv.conf`. Where
 [`nameservers`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.nameservers)
 names some, it is a file of the sandbox's own, under every network. The file
@@ -610,9 +648,10 @@ Two targets are outside the rule, because neither is a file in the root: one
 created inside an earlier mount — under the `/tmp` tmpfs, or under a bind of
 the caller's own — belongs to that mount rather than to the root, and for an
 overlay root the created file lands in the upper, where the merged view's
-writes go, and is removed from there.
+writes go, and is removed from there. A target beneath an overlay mounted at a
+path lands in that overlay's upper, and is removed from there the same way.
 
-For an overlay root, whether a target is already there is what the merged view
+For an overlay, whether a target is already there is what the merged view
 shows. A whiteout or an opaque directory in a higher layer hides what a lower
 layer holds. A target created over a whiteout in the upper replaces it, and the
 whiteout is restored once the target is removed.

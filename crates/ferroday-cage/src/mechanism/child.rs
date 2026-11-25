@@ -91,8 +91,8 @@ use super::resolve;
 use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
-    IdentityPlan, LaunchPlan, MountAction, MountOp, RootPlan, STATUS_DUMPED, STATUS_EXITED,
-    STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
+    IdentityPlan, LaunchPlan, MountAction, MountOp, OverlayPlan, RootPlan, STATUS_DUMPED,
+    STATUS_EXITED, STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
 };
 use crate::error::SetupStep;
 
@@ -2927,6 +2927,11 @@ fn execute_op(
                 .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
             bind(source, target.as_fd(), *read_only)
         }
+        MountAction::Overlay { overlay, target } => {
+            let target = open_in_root(root, target, OFlags::PATH | OFlags::DIRECTORY)
+                .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+            mount_overlay_at(overlay, target.as_fd())
+        }
         MountAction::Raw {
             source,
             target,
@@ -3229,6 +3234,29 @@ fn bind(source: &CStr, target: BorrowedFd<'_>, read_only: bool) -> Result<(), (S
     let source = open_frozen(source, OFlags::empty()).map_err(failed)?;
     let tree = clone_tree(source.as_fd()).map_err(failed)?;
     attach_tree(tree, target, read_only, SetupStep::BindMount)
+}
+
+/// Mounts the overlay `overlay` onto the mount target `target` names, its
+/// layers opened as the overlay root's are, without following a link, and
+/// through [`mount_overlay`] as that root is mounted, `nosuid` included.
+fn mount_overlay_at(
+    overlay: &OverlayPlan,
+    target: BorrowedFd<'_>,
+) -> Result<(), (SetupStep, Errno)> {
+    let failed = |errno| (SetupStep::MountOverlay, errno);
+    let (base, stacked) = overlay
+        .lower
+        .split_first()
+        .ok_or((SetupStep::MountOverlay, Errno::INVAL))?;
+    let base = open_frozen(base, OFlags::DIRECTORY).map_err(failed)?;
+    let layers = OverlayLayers {
+        base: base.as_fd(),
+        stacked,
+        upper: &overlay.upper,
+        work: &overlay.work,
+    };
+    let mount = mount_overlay(&layers).map_err(failed)?;
+    attach_tree(mount, target, false, SetupStep::MountOverlay)
 }
 
 /// Attaches a detached clone, `tree`, onto the mount target `target` names,

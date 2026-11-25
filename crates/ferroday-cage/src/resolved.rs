@@ -717,6 +717,18 @@ pub enum ResolvedMount {
         /// What the file holds.
         contents: String,
     },
+    /// An overlay mounted at a path. See [`OverlayMount`](crate::OverlayMount).
+    #[non_exhaustive]
+    Overlay {
+        /// The mount point inside the sandbox.
+        target: PathBuf,
+        /// The lower layers, base first, as canonical host paths.
+        lower: Vec<PathBuf>,
+        /// The upper layer, where the sandbox's writes there land.
+        upper: PathBuf,
+        /// The work directory beside the upper.
+        work: PathBuf,
+    },
 }
 
 impl ResolvedMount {
@@ -733,7 +745,8 @@ impl ResolvedMount {
             | ResolvedMount::Raw { target, .. }
             | ResolvedMount::Hide { target }
             | ResolvedMount::ReadOnly { target }
-            | ResolvedMount::File { target, .. } => target,
+            | ResolvedMount::File { target, .. }
+            | ResolvedMount::Overlay { target, .. } => target,
             ResolvedMount::Symlink { path, .. } => path,
         }
     }
@@ -1046,6 +1059,12 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
         MountAction::File { target, contents } => ResolvedMount::File {
             target: sandbox_path(target),
             contents: String::from_utf8_lossy(contents).into_owned(),
+        },
+        MountAction::Overlay { overlay, target } => ResolvedMount::Overlay {
+            target: sandbox_path(target),
+            lower: overlay.lower_paths(),
+            upper: overlay.upper_path().to_path_buf(),
+            work: overlay.work_path().to_path_buf(),
         },
     }
 }
@@ -1390,6 +1409,7 @@ mod serde_tests {
             ResolvedMount::Hide { .. } => "mount hide",
             ResolvedMount::ReadOnly { .. } => "mount read-only",
             ResolvedMount::File { .. } => "mount file",
+            ResolvedMount::Overlay { .. } => "mount overlay",
         });
         [root, identity, hardening]
             .into_iter()

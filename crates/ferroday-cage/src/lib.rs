@@ -359,7 +359,8 @@ pub use running::{KillHandle, Pending, Running};
 #[cfg(feature = "serde")]
 pub use spec::RestrictedProfile;
 pub use spec::{
-    Bind, Cage, CageBuilder, Hide, Mount, Network, Overlay, RawMount, ReadOnly, Stdio, Symlink,
+    Bind, Cage, CageBuilder, Hide, Mount, Network, Overlay, OverlayMount, RawMount, ReadOnly,
+    Stdio, Symlink,
 };
 pub use status::{ExitStatus, ResourceUsage};
 pub use terminal::{Pty, Terminal};

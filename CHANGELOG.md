@@ -107,6 +107,18 @@ consumer upgrading can skip it.
 
 ### Added
 
+- An overlay can be mounted at a path inside a sandbox, in a root of any kind,
+  the host's own included: `CageBuilder::overlay_at` takes a target and an
+  `Overlay`, a `Mount::Overlay` holds an `OverlayMount`, and a profile spells
+  it as a `[[mount]]` table with `kind = "overlay"`, its `target` beside the
+  overlay's `lower`, `upper` and `work`. Its layers are checked and created as
+  an overlay root's are, and no overlay a sandbox mounts, its root's included,
+  writes into another's layers: `ConfigError::OverlayLayersOverlap` names the
+  two. A file made as a bind's target beneath it lands in its upper and is
+  removed once the sandbox is gone. The mount fails at the new
+  `SetupStep::MountOverlay`, and `ResolvedMount::Overlay` reports it. A
+  restricted profile refuses it. `fcage --overlay-tree DIR UPPER` overlays a
+  directory at its own path.
 - A further command can run in a sandbox that is running: `Running::exec`,
   `Running::exec_with` and `Running::exec_terminal` run an `Exec`, which
   states the command, its arguments, variables over the launch's environment,

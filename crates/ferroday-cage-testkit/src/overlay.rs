@@ -28,3 +28,19 @@ pub fn whiteout(path: &Path) -> bool {
         Err(errno) => panic!("making a whiteout at {}: {errno}", path.display()),
     }
 }
+
+/// Whether `path` holds an overlay whiteout, a character device numbered 0:0,
+/// without following a link: how a test reads what a run deleted out of an
+/// upper.
+///
+/// # Panics
+///
+/// Where nothing is at `path`, or it cannot be read.
+#[track_caller]
+pub fn is_whiteout(path: &Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = std::fs::symlink_metadata(path)
+        .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+    metadata.file_type().is_char_device() && metadata.rdev() == 0
+}

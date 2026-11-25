@@ -18,6 +18,7 @@
 pub use ferroday_cage_testkit::compress;
 pub use ferroday_cage_testkit::dns;
 pub use ferroday_cage_testkit::fd::{is_open, readable_by, with_standard_streams_closed};
+pub use ferroday_cage_testkit::overlay;
 pub use ferroday_cage_testkit::process::{
     controlling_terminal, cpu_ticks, finish_bounded, process_exists, process_parent, process_state,
     rerun, rerun_args, run_bounded, spawn_grouped, status_field, wait_gone,

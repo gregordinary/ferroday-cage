@@ -664,7 +664,7 @@ report name a package and its version bare.
 | What does a process's `stat` record say of it in a test: its processor time, its state, its parent, its controlling terminal? | `ferroday_cage_testkit::process::cpu_ticks`, `thread_ticks`, `process_state`, `process_parent`, `controlling_terminal` |
 | Read a field of the `status` record a command in a sandbox printed | `ferroday_cage_testkit::process::status_field` |
 | Encode a POSIX access control list, set or read an extended attribute, or ask whether a filesystem holds one, in a test | `ferroday_cage_testkit::xattr` |
-| Lay an overlay whiteout into an upper by hand in a test | `ferroday_cage_testkit::overlay::whiteout` |
+| Lay an overlay whiteout into an upper by hand in a test, or read one a run left | `ferroday_cage_testkit::overlay::whiteout`, `overlay::is_whiteout` |
 | Compress a document whole with gzip, xz, LZMA or zstd in a test | `ferroday_cage_testkit::compress`, or an explicit level where a test asserts the size |
 
 Two guards hold the table to the code, and each covers what the other cannot:

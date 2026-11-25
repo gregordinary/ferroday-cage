@@ -18,9 +18,9 @@ use crate::error::{ConfigError, Error, OverlayLayer};
 use crate::idmap::{self, IdMapper, Identity, IdentityMap, PresentedIdentity};
 use crate::limits::{Limit, Resource};
 use crate::mechanism::{
-    self, Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, MountAction,
-    MountDir, MountOp, NestedMap, NestedPlan, OverlayPlan, PresentPlan, RlimitPlan, RootPlan,
-    RunAsPlan, StdioPlan,
+    self, Arrival, Confinement, IdentityPlan, LaunchPlan, ManagedPlaceholders, ManagedTarget,
+    MountAction, MountDir, MountOp, NestedMap, NestedPlan, OverlayPlan, PresentPlan, RlimitPlan,
+    RootPlan, RunAsPlan, StdioPlan,
 };
 use crate::observer::{Observer, Output};
 use crate::path;
@@ -128,13 +128,16 @@ fn claims_resolv_conf(mount: &Mount) -> bool {
 
 /// Whether a mount of the caller's claims the root-relative file `file`, by
 /// the rule [`claims_resolv_conf`] states for `/etc/resolv.conf`: a mount at
-/// it, or a tree, a link or a path made read-only at a directory above it.
+/// it, or a tree, a link, a path made read-only or an overlay at a directory
+/// above it.
 fn claims_target(mount: &Mount, file: &CStr) -> bool {
     let arrival = match mount {
         // A link at the target or above it decides what the path names, as a
         // tree mounted there would. A path made read-only is a tree bound onto
         // itself.
         Mount::Bind(_) | Mount::Symlink(_) | Mount::ReadOnly(_) => Some(Arrival::Tree),
+        // The lowers' trees, merged.
+        Mount::Overlay(_) => Some(Arrival::Overlay),
         // A hidden directory is a tmpfs of the sandbox's own, as a fresh
         // filesystem mounted above the target is.
         Mount::Hide(_) => Some(Arrival::Fresh),
@@ -146,7 +149,7 @@ fn claims_target(mount: &Mount, file: &CStr) -> bool {
     let (Some(arrival), Ok(target)) = (arrival, target) else {
         return false;
     };
-    target.as_c_str() == file || (arrival == Arrival::Tree && covers(&target, file))
+    target.as_c_str() == file || (arrival != Arrival::Fresh && covers(&target, file))
 }
 
 /// The most nameservers a `resolv.conf` names that the C libraries read: glibc
@@ -1108,7 +1111,7 @@ impl ReadOnly {
 }
 
 /// One mount a consumer adds to a sandbox: a bind, a raw mount, a symbolic
-/// link, a hidden path, or a path made read-only.
+/// link, a hidden path, a path made read-only, or an overlay.
 ///
 /// The sandbox applies these in the order they are declared, after the
 /// managed mount profile. Holding every kind in one sequence is what makes
@@ -1117,7 +1120,8 @@ impl ReadOnly {
 ///
 /// Added with [`CageBuilder::bind`], [`CageBuilder::bind_ro`],
 /// [`CageBuilder::raw_mount`], [`CageBuilder::symlink`], [`CageBuilder::hide`],
-/// and [`CageBuilder::read_only`], whole with [`CageBuilder::mount`] and
+/// [`CageBuilder::read_only`], and [`CageBuilder::overlay_at`], whole with
+/// [`CageBuilder::mount`] and
 /// [`CageBuilder::mounts`], or as a `[[mount]]` table in a profile, and read
 /// back through [`CageBuilder::get_mounts`].
 #[derive(Debug, Clone)]
@@ -1138,6 +1142,8 @@ pub enum Mount {
     Hide(Hide),
     /// A path made read-only where it stands.
     ReadOnly(ReadOnly),
+    /// An overlay mounted at a path.
+    Overlay(OverlayMount),
 }
 
 impl Mount {
@@ -1154,6 +1160,7 @@ impl Mount {
             Mount::Symlink(symlink) => symlink.get_path(),
             Mount::Hide(hide) => hide.get_target(),
             Mount::ReadOnly(read_only) => read_only.get_target(),
+            Mount::Overlay(overlay) => overlay.get_target(),
         }
     }
 }
@@ -1319,6 +1326,139 @@ impl Overlay {
     /// library manages a hidden sibling of the upper.
     pub fn get_work(&self) -> Option<&Path> {
         self.work.as_deref()
+    }
+}
+
+/// An [`Overlay`] mounted at a path inside the sandbox, in a root of any kind.
+///
+/// The command sees the lowers merged at the target, and every write it makes
+/// there lands in the upper, as in an [overlay root](CageBuilder::overlay). It
+/// is how a sandbox on the [host's own root](CageBuilder::host_rootfs), which
+/// no overlay root can take as a lower, keeps the writes to one directory, a
+/// working tree, apart from the directory itself:
+///
+/// ```no_run
+/// use ferroday_cage::{Cage, Overlay};
+///
+/// # fn main() -> ferroday_cage::Result<()> {
+/// let tree = "/home/user/project";
+/// let cage = Cage::builder()
+///     .host_rootfs()
+///     .overlay_at(
+///         tree,
+///         Overlay::new()
+///             .lower(tree)
+///             .upper("/home/user/.cache/runs/1/upper"),
+///     )
+///     .current_dir(tree)
+///     .command("/usr/bin/make")
+///     .build()?;
+/// # let _ = cage;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Everything [`Overlay`] states holds here: where the upper lives, disjoint
+/// layers, the order of the lowers, the upper's filesystem. The layers of every
+/// overlay a sandbox mounts, its root among them, are disjoint from each
+/// other's writable layers as well, since two overlays writing one upper, or one
+/// writing into another's lower, show neither what was written.
+///
+/// A mount point the launch creates beneath the target, for a bind declared
+/// after it, is created in the upper. An empty file made for a file bind is
+/// removed again once the sandbox is gone, as in an overlay root; a directory is
+/// left, as a mount point directory is everywhere.
+///
+/// The lowers are the caller's to leave alone while a sandbox has them
+/// mounted: the kernel does not define what an overlay shows of a lower that
+/// changes beneath it.
+///
+/// Added with [`CageBuilder::overlay_at`], or as a `[[mount]]` table with
+/// `kind = "overlay"` in a profile, which names the target and the overlay's
+/// keys beside it:
+///
+/// ```toml
+/// [[mount]]
+/// kind = "overlay"
+/// target = "/home/user/project"
+/// lower = ["/home/user/project"]
+/// upper = "/home/user/.cache/runs/1/upper"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(from = "OverlayMountFields", into = "OverlayMountFields")
+)]
+pub struct OverlayMount {
+    target: PathBuf,
+    overlay: Overlay,
+}
+
+impl OverlayMount {
+    /// Returns `overlay` mounted at `target`, an absolute path inside the
+    /// sandbox.
+    ///
+    /// [`CageBuilder::overlay_at`] is the ordinary way to add one. This
+    /// constructor is for a consumer assembling a [`Mount`] sequence directly.
+    pub fn new(target: impl AsRef<Path>, overlay: Overlay) -> OverlayMount {
+        OverlayMount {
+            target: target.as_ref().to_path_buf(),
+            overlay,
+        }
+    }
+
+    /// The path inside the sandbox the overlay is mounted at.
+    pub fn get_target(&self) -> &Path {
+        &self.target
+    }
+
+    /// The overlay's layers.
+    pub fn get_overlay(&self) -> &Overlay {
+        &self.overlay
+    }
+}
+
+/// An [`OverlayMount`] as a profile spells it: the target and the overlay's own
+/// keys in one table, which `deny_unknown_fields` cannot hold to a flattened
+/// field.
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct OverlayMountFields {
+    target: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lower: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upper: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work: Option<PathBuf>,
+}
+
+#[cfg(feature = "serde")]
+impl From<OverlayMountFields> for OverlayMount {
+    fn from(fields: OverlayMountFields) -> OverlayMount {
+        OverlayMount {
+            target: fields.target,
+            overlay: Overlay {
+                lower: fields.lower,
+                upper: fields.upper,
+                work: fields.work,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<OverlayMount> for OverlayMountFields {
+    fn from(mount: OverlayMount) -> OverlayMountFields {
+        OverlayMountFields {
+            target: mount.target,
+            lower: mount.overlay.lower,
+            upper: mount.overlay.upper,
+            work: mount.overlay.work,
+        }
     }
 }
 
@@ -2367,6 +2507,23 @@ impl CageBuilder {
         self
     }
 
+    /// Mounts `overlay` at `target`, an absolute path inside the sandbox, in its
+    /// place in the mount sequence: the command sees the lowers merged there,
+    /// and its writes land in the upper.
+    ///
+    /// See [`OverlayMount`]. In a root of any kind, the
+    /// [host's own](Self::host_rootfs) included; the target must exist when the
+    /// sequence reaches it, and in the host's root, which the launch creates
+    /// nothing in, it must exist on the host. The host must support an
+    /// unprivileged overlay, which [`build`](Self::build) checks as it does for
+    /// an [overlay root](Self::overlay), and it creates the upper and its work
+    /// directory as that root's are created.
+    pub fn overlay_at(mut self, target: impl AsRef<Path>, overlay: Overlay) -> Self {
+        self.mounts
+            .push(Mount::Overlay(OverlayMount::new(target, overlay)));
+        self
+    }
+
     /// Adds a mount of any kind, applied in declaration order with the rest.
     ///
     /// The counterpart of [`get_mounts`](Self::get_mounts), for a caller that
@@ -2375,8 +2532,9 @@ impl CageBuilder {
     /// [`bind`](Self::bind) or [`bind_ro`](Self::bind_ro) its read-only flag
     /// names, a [`Mount::Raw`] is a [`raw_mount`](Self::raw_mount), a
     /// [`Mount::Symlink`] is a [`symlink`](Self::symlink), a [`Mount::Hide`] is
-    /// a [`hide`](Self::hide), and a [`Mount::ReadOnly`] is a
-    /// [`read_only`](Self::read_only).
+    /// a [`hide`](Self::hide), a [`Mount::ReadOnly`] is a
+    /// [`read_only`](Self::read_only), and a [`Mount::Overlay`] is an
+    /// [`overlay_at`](Self::overlay_at).
     pub fn mount(mut self, mount: Mount) -> Self {
         self.mounts.push(mount);
         self
@@ -2822,7 +2980,11 @@ impl CageBuilder {
     pub fn get_binds(&self) -> impl Iterator<Item = &Bind> {
         self.mounts.iter().filter_map(|mount| match mount {
             Mount::Bind(bind) => Some(bind),
-            Mount::Raw(_) | Mount::Symlink(_) | Mount::Hide(_) | Mount::ReadOnly(_) => None,
+            Mount::Raw(_)
+            | Mount::Symlink(_)
+            | Mount::Hide(_)
+            | Mount::ReadOnly(_)
+            | Mount::Overlay(_) => None,
         })
     }
 
@@ -2830,7 +2992,11 @@ impl CageBuilder {
     pub fn get_raw_mounts(&self) -> impl Iterator<Item = &RawMount> {
         self.mounts.iter().filter_map(|mount| match mount {
             Mount::Raw(raw) => Some(raw),
-            Mount::Bind(_) | Mount::Symlink(_) | Mount::Hide(_) | Mount::ReadOnly(_) => None,
+            Mount::Bind(_)
+            | Mount::Symlink(_)
+            | Mount::Hide(_)
+            | Mount::ReadOnly(_)
+            | Mount::Overlay(_) => None,
         })
     }
 
@@ -3221,6 +3387,7 @@ impl CageBuilder {
                 Mount::Symlink(symlink) => lowering.push_symlink(symlink)?,
                 Mount::Hide(hide) => lowering.push_hide(hide)?,
                 Mount::ReadOnly(read_only) => lowering.push_read_only(read_only)?,
+                Mount::Overlay(overlay) => lowering.push_overlay(overlay)?,
             }
         }
         // The managed `resolv.conf`, which `resolv_conf` above already
@@ -3354,48 +3521,68 @@ impl CageBuilder {
             hardening
         };
 
-        // The root, with every mount target the launch has to create in it as
-        // an empty file, as the host path it comes to rest at. A file the
-        // sandbox creates only to mount over is not part of the root, so the
-        // caller side takes it away once the sandbox is gone. Writes land in
-        // the root filesystem itself for a plain root and in the upper for an
-        // overlay root, whose pivoted root is the merged view. Both are
-        // canonical paths, so a root the caller named relatively does not leave
-        // a path that re-resolves against whatever directory the process
-        // happens to be in when the handle drops. An empty root is the
-        // sandbox's own: what the launch creates in it goes with it, and none
-        // of it has a host path.
-        let (root, managed_placeholders) = match &canonical {
-            None if self.host_rootfs => (RootPlan::HostReadOnly, ManagedPlaceholders::default()),
-            None => (RootPlan::Empty, ManagedPlaceholders::default()),
-            Some(canonical) => {
-                let base = cstring(canonical.as_os_str())?;
-                match &self.overlay {
-                    None => (
-                        RootPlan::Bind(base),
-                        created_file_targets(&lowering.ops, &RootLayers::Plain(canonical)),
-                    ),
-                    // An overlay root: `canonical` is the base lower the
-                    // overlay mounts over, any further lowers are resolved
-                    // beside it, and the caller's upper — with its work
-                    // directory — is prepared and frozen here, so the sandbox
-                    // stage only opens what the plan names. A host that
-                    // cannot establish an unprivileged overlay is refused now,
-                    // before any fork. This is the one step that creates
-                    // anything on the host, so it runs once every other part of
-                    // the configuration has been accepted: a build refused for
-                    // any other reason leaves no layer directory behind.
-                    Some(overlay) => {
-                        let overlay = build_overlay_plan(canonical, overlay)?;
-                        let lower = overlay.lower_paths();
-                        let layers = RootLayers::Overlay {
-                            upper: overlay.upper_path(),
-                            lower: &lower,
-                        };
-                        let placeholders = created_file_targets(&lowering.ops, &layers);
-                        (RootPlan::Overlay { base, overlay }, placeholders)
-                    }
-                }
+        // Every overlay the sandbox mounts, its root among them, resolved, held
+        // apart from each other, and its upper and work directory created. This
+        // is the one step that creates anything on the host, so it runs once
+        // every other part of the configuration has been accepted: a build
+        // refused for any other reason leaves no layer directory behind, and
+        // one refused here removes what it created. A host that cannot
+        // establish an unprivileged overlay is refused now, before any fork.
+        // An overlay root's `canonical` is the base lower the overlay mounts
+        // over, and any further lowers are resolved beside it.
+        let root_overlay = match (&canonical, &self.overlay) {
+            (Some(canonical), Some(overlay)) => Some(resolve_overlay(Some(canonical), overlay)?),
+            _ => None,
+        };
+        let overlays: Vec<&ResolvedOverlay> =
+            root_overlay.iter().chain(&lowering.overlays).collect();
+        check_overlays_apart(&overlays)?;
+        let mut created = CreatedDirs::default();
+        for overlay in &overlays {
+            create_overlay(overlay, &mut created)?;
+        }
+        created.keep();
+
+        // The root, with every mount target the launch has to create in a
+        // layer of the caller's as an empty file, as the host path it comes to
+        // rest at. A file the sandbox creates only to mount over is not part of
+        // the root, so the caller side takes it away once the sandbox is gone.
+        // Writes land in the root filesystem itself for a plain root, in the
+        // upper for an overlay root, whose pivoted root is the merged view, and
+        // in an overlay mount's upper beneath its target. Each is a canonical
+        // path, so a root the caller named relatively does not leave a path
+        // that re-resolves against whatever directory the process happens to
+        // be in when the handle drops. An empty root is the sandbox's own, and
+        // the host's is read-only: what the launch creates in either outside
+        // an overlay mount goes with the sandbox, and none of it has a host
+        // path.
+        let (root, managed_placeholders) = match (&canonical, root_overlay) {
+            (None, _) if self.host_rootfs => (
+                RootPlan::HostReadOnly,
+                created_file_targets(&lowering.ops, &RootLayers::Own),
+            ),
+            (None, _) => (
+                RootPlan::Empty,
+                created_file_targets(&lowering.ops, &RootLayers::Own),
+            ),
+            (Some(canonical), None) => (
+                RootPlan::Bind(cstring(canonical.as_os_str())?),
+                created_file_targets(&lowering.ops, &RootLayers::Plain(canonical)),
+            ),
+            (Some(canonical), Some(overlay)) => {
+                let lower = overlay.plan.lower_paths();
+                let layers = RootLayers::Overlay {
+                    upper: overlay.plan.upper_path(),
+                    lower: &lower,
+                };
+                let placeholders = created_file_targets(&lowering.ops, &layers);
+                (
+                    RootPlan::Overlay {
+                        base: cstring(canonical.as_os_str())?,
+                        overlay: overlay.plan,
+                    },
+                    placeholders,
+                )
             }
         };
 
@@ -3485,9 +3672,10 @@ fn identity_map_is_default(map: &IdentityMap) -> bool {
 ///   sandbox exits: a link at `/etc/ld.so.preload`, pointing at a path a
 ///   confined command can write, reaches every later sandbox on that tree.
 /// - host networking (`network = "host"`).
-/// - an overlay root (`[overlay]`). Its upper, with a work directory beside
-///   it, is created at whatever host path the profile names, where a rootfs
-///   must already exist.
+/// - an overlay root (`[overlay]`), and an overlay mounted at a path
+///   (`kind = "overlay"`). Each upper, with a work directory beside it, is
+///   created at whatever host path the profile names, where a rootfs must
+///   already exist, and each lower maps a host path in.
 /// - the host's own root (`host-rootfs`), which maps the host's whole tree in,
 ///   and a path the host's root hides taken back (`reveal`), which a
 ///   consumer's own [`host_rootfs`](CageBuilder::host_rootfs) after loading
@@ -3833,6 +4021,9 @@ fn restricted_mount_refusal(mount: &Mount) -> Option<&'static str> {
         // source, type, and data reach.
         Mount::Bind(_) => Some("a bind mount"),
         Mount::Raw(_) => Some("a raw mount"),
+        // Maps its lowers in, and creates its upper and work directory at
+        // whatever host path the profile names, as an overlay root does.
+        Mount::Overlay(_) => Some("an overlay mount"),
         // A link maps nothing in, but it is made in the setup stage, before
         // Landlock, the run-as switch, or any capability drop applies, and on a
         // plain rootfs it stays on the host after the sandbox exits. A profile
@@ -4617,26 +4808,48 @@ pub(crate) fn validate_workdir(path: &Path) -> Result<Option<CString>, Error> {
     Ok(Some(cstring(path.as_os_str())?))
 }
 
-/// Prepares an overlay root: resolves the lowers, creates the upper and its work
-/// directory, refuses a host that cannot mount an unprivileged overlay, and
-/// freezes every layer's path.
+/// An overlay's layers, resolved and checked, with nothing created on the host
+/// yet: [`create_overlay`] creates its upper and work directory once the whole
+/// configuration has been accepted.
+struct ResolvedOverlay {
+    /// The layers as the launch opens them.
+    plan: OverlayPlan,
+    /// Where the upper goes.
+    upper: LayerPath,
+    /// Where the work directory goes.
+    work: LayerPath,
+}
+
+impl ResolvedOverlay {
+    /// Every layer as the launch opens it, each named by its kind.
+    fn layers(&self) -> Vec<(OverlayLayer, PathBuf)> {
+        self.plan
+            .lower_paths()
+            .into_iter()
+            .map(|lower| (OverlayLayer::Lower, lower))
+            .chain([
+                (OverlayLayer::Upper, self.upper.path()),
+                (OverlayLayer::Work, self.work.path()),
+            ])
+            .collect()
+    }
+}
+
+/// Resolves an overlay's layers and checks them, creating nothing.
 ///
-/// `base` is the already-canonicalized root filesystem, which is the first
-/// lower. Every further lower is resolved beside it, and the upper and work
-/// directories are resolved to the absolute paths the sandbox stage opens. The
-/// work directory, which the overlay requires empty and on the upper's
-/// filesystem, is a hidden sibling of the upper unless the caller named one.
+/// `base` is an overlay root's already-canonicalized root filesystem, which is
+/// its first lower and keeps the rootfs's own reporting. An overlay mounted at a
+/// path has none, and its first lower is resolved with the rest. Every lower is
+/// resolved the same way, so a missing or non-directory layer is a typed
+/// configuration error here, and the upper and work directories are resolved to
+/// the absolute paths the sandbox stage opens. The work directory, which the
+/// overlay requires empty and on the upper's filesystem, is a hidden sibling of
+/// the upper unless the caller named one.
 ///
-/// Everything that can be refused without creating a directory is checked
-/// before one is created: the number of lowers, the lowers themselves, the
-/// presence of an upper, and whether every layer is disjoint from every other.
-/// The missing directories above the upper and the work
-/// directory are created next, and then the host's support for an unprivileged
-/// overlay is probed in the upper's parent, through
-/// [`overlay_blocker`](crate::host::overlay_blocker). A refusal after that
-/// removes the directories this call created, so a refused build leaves the host
-/// as it found it.
-fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Error> {
+/// Everything that can be refused without creating a directory is refused here:
+/// the number of lowers, the lowers themselves, the presence of an upper, and
+/// whether every layer is disjoint from every other.
+fn resolve_overlay(base: Option<&Path>, overlay: &Overlay) -> Result<ResolvedOverlay, Error> {
     let max = crate::mechanism::MAX_LOWERS;
     if overlay.lower.len() > max {
         return Err(ConfigError::OverlayTooManyLowers {
@@ -4646,11 +4859,16 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         .into());
     }
 
-    // The base is already canonical: it is the first lower, resolved as the
-    // rootfs. Resolve any further lowers the same way, so a missing or
-    // non-directory layer is a typed configuration error here.
-    let mut lowers = vec![base.to_path_buf()];
-    for lower in overlay.lower.iter().skip(1) {
+    let mut lowers = Vec::with_capacity(overlay.lower.len());
+    let named = match base {
+        Some(base) => {
+            lowers.push(base.to_path_buf());
+            overlay.lower.get(1..).unwrap_or_default()
+        }
+        None if overlay.lower.is_empty() => return Err(ConfigError::OverlayLowerMissing.into()),
+        None => &overlay.lower[..],
+    };
+    for lower in named {
         let resolved = std::fs::canonicalize(lower)
             .map_err(|err| overlay_unusable(OverlayLayer::Lower, lower, err))?;
         rustix::fs::open(
@@ -4691,9 +4909,65 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         upper: cstring(upper_path.as_os_str())?,
         work: cstring(work_path.as_os_str())?,
     };
+    Ok(ResolvedOverlay { plan, upper, work })
+}
 
-    let mut created = CreatedDirs::default();
-    for (layer, at) in [(OverlayLayer::Upper, &upper), (OverlayLayer::Work, &work)] {
+/// Refuses overlays that reach into each other: a writable layer of one, its
+/// upper or its work directory, that is a layer of another or lies beneath one,
+/// or holds one beneath it.
+///
+/// Two overlays writing one upper each see neither's writes as the kernel
+/// defines them, and one writing into another's lower changes that lower
+/// beneath a mounted overlay, which the kernel does not define either. Two
+/// overlays may share a lower, which neither writes. Each overlay's own layers
+/// are held apart by [`check_layers_disjoint`].
+fn check_overlays_apart(overlays: &[&ResolvedOverlay]) -> Result<(), ConfigError> {
+    let layers: Vec<Vec<(OverlayLayer, PathBuf)>> =
+        overlays.iter().map(|overlay| overlay.layers()).collect();
+    for (at, own) in layers.iter().enumerate() {
+        for (layer, path) in own {
+            if *layer == OverlayLayer::Lower {
+                continue;
+            }
+            for (other, path_other) in layers
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != at)
+                .flat_map(|(_, other)| other)
+            {
+                let (inner, outer) = if path.starts_with(path_other) {
+                    ((*layer, path), (*other, path_other))
+                } else if path_other.starts_with(path) {
+                    ((*other, path_other), (*layer, path))
+                } else {
+                    continue;
+                };
+                return Err(ConfigError::OverlayLayersOverlap {
+                    layer: inner.0,
+                    path: inner.1.clone(),
+                    within: outer.0,
+                    within_path: outer.1.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates a resolved overlay's upper and work directory, recording each
+/// directory it creates in `created`, and refuses a host that cannot mount an
+/// unprivileged overlay there.
+///
+/// The missing directories above the upper and the work directory are created
+/// first, and then the host's support for an unprivileged overlay is probed in
+/// the upper's parent, through
+/// [`overlay_blocker`](crate::host::overlay_blocker). The caller keeps
+/// `created` only once every overlay it builds has been created, so a refusal
+/// here or later removes what this created and a refused build leaves the host
+/// as it found it.
+fn create_overlay(overlay: &ResolvedOverlay, created: &mut CreatedDirs) -> Result<(), Error> {
+    let (upper, work) = (&overlay.upper, &overlay.work);
+    for (layer, at) in [(OverlayLayer::Upper, upper), (OverlayLayer::Work, work)] {
         created
             .create_all(&at.parent)
             .map_err(|err| overlay_unusable(layer, &at.parent, err))?;
@@ -4708,14 +4982,15 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         return Err(ConfigError::OverlayUnavailable { blocker }.into());
     }
 
-    create_layer_dir(OverlayLayer::Upper, &upper, &mut created)?;
-    create_layer_dir(OverlayLayer::Work, &work, &mut created)?;
+    create_layer_dir(OverlayLayer::Upper, upper, created)?;
+    create_layer_dir(OverlayLayer::Work, work, created)?;
 
     // The overlay moves files between the upper and the work directory, so the
     // kernel requires them on one filesystem. A caller that named its own work
     // directory can have put it elsewhere; comparing the two devices refuses
     // that here, with both named, rather than at the mount as a bare EXDEV
     // from a syscall the caller never issued.
+    let (upper_path, work_path) = (upper.path(), work.path());
     let device = |layer, path: &Path| {
         rustix::fs::stat(path)
             .map(|stat| stat.st_dev)
@@ -4728,9 +5003,7 @@ fn build_overlay_plan(base: &Path, overlay: &Overlay) -> Result<OverlayPlan, Err
         }
         .into());
     }
-
-    created.keep();
-    Ok(plan)
+    Ok(())
 }
 
 /// The overlay work directory the library manages beside `upper`: a hidden
@@ -5035,6 +5308,10 @@ fn overlay_unusable(layer: OverlayLayer, path: &Path, source: impl Into<std::io:
 struct Lowering {
     ops: Vec<MountOp>,
     labels: Vec<String>,
+    /// The overlays mounted at a path, resolved and not yet created, in the
+    /// order of their ops; the build creates each once the whole configuration
+    /// has been accepted.
+    overlays: Vec<ResolvedOverlay>,
 }
 
 impl Lowering {
@@ -5221,6 +5498,33 @@ impl Lowering {
             },
             label,
         );
+        Ok(())
+    }
+
+    /// An overlay mounted at a path, its layers resolved and checked here and
+    /// created by the build later. Its target is a directory, created where
+    /// missing as a directory bind's is.
+    fn push_overlay(&mut self, mount: &OverlayMount) -> Result<(), Error> {
+        let overlay = resolve_overlay(None, &mount.overlay)?;
+        let components = sandbox_path_components(&mount.target)?;
+        let label = format!(
+            "an overlay of {:?} at {:?}, writing into {:?}",
+            overlay.plan.lower_paths(),
+            mount.target,
+            overlay.plan.upper_path(),
+        );
+        self.push(
+            MountOp {
+                dirs: dir_chain(&components, DIR_MODE)?,
+                create_file: None,
+                action: MountAction::Overlay {
+                    overlay: overlay.plan.clone(),
+                    target: rel_cstring(&components)?,
+                },
+            },
+            label,
+        );
+        self.overlays.push(overlay);
         Ok(())
     }
 
@@ -5428,9 +5732,10 @@ impl Lowering {
 ///
 /// Each op's target is placed by the latest op before it whose arrival covers
 /// it, as the launch will find it. Inside a fresh filesystem of the sandbox's
-/// own, a hidden directory or the managed `/tmp` for instance, the directories
-/// and the file the target needs below that filesystem are created as on any
-/// root, and those above it are already there. Anywhere else the target is in
+/// own, a hidden directory or the managed `/tmp` for instance, or inside an
+/// overlay mounted at a path, whose upper is the caller's, the directories and
+/// the file the target needs below that mount are created as on any root, and
+/// those above it are already there. Anywhere else the target is in
 /// the host's tree, or in a tree a mount brought, which is the host's too, so
 /// nothing is created and the target must exist: it is looked up on the host,
 /// through a bind's source where a bind brought the tree, and refused with
@@ -5457,6 +5762,7 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
             | MountAction::Devpts { target, .. }
             | MountAction::Bind { target, .. }
             | MountAction::Raw { target, .. }
+            | MountAction::Overlay { target, .. }
             | MountAction::File { target, .. } => target.clone(),
         };
         let cover = ops[..at]
@@ -5472,7 +5778,10 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
                     .map(|(over, arrival)| (over.to_owned(), arrival, &earlier.action))
             });
         let host_path = match &cover {
-            Some((over, Arrival::Fresh, _)) => {
+            // A fresh filesystem is the sandbox's own, and what is created
+            // beneath an overlay lands in its upper, a directory of the
+            // caller's: neither is the host's tree.
+            Some((over, Arrival::Fresh | Arrival::Overlay, _)) => {
                 let beneath = |path: &CStr| path != over.as_c_str() && covers(over, path);
                 let op = &mut ops[at];
                 op.dirs
@@ -5546,6 +5855,10 @@ fn join_target(parent: &CStr, leaf: &CStr) -> CString {
 /// The host directories a sandbox's root is made of, as far as the mount
 /// targets the launch creates are concerned.
 enum RootLayers<'a> {
+    /// A root of the sandbox's own, empty, or the host's, read-only: what the
+    /// launch creates in it outside an overlay mount has no host path of the
+    /// caller's.
+    Own,
     /// A plain root filesystem: the launch's writes land in it, and an entry is
     /// present when the root filesystem holds one.
     Plain(&'a Path),
@@ -5559,6 +5872,51 @@ enum RootLayers<'a> {
     },
 }
 
+/// One tree a mount target the launch creates can land in: a plain root, or an
+/// overlay's layers, the root's or a mount's.
+struct TargetLayers {
+    /// The layer the launch's writes land in: the rootfs, or the upper.
+    writable: PathBuf,
+    /// One descriptor per layer, in the order the merged view consults them:
+    /// the upper, then the lowers from the last stacked down to the base. A
+    /// layer that cannot be opened at all is a lookup that reaches no verdict.
+    opened: Vec<Option<Rooted>>,
+    /// Whether the tree is an overlay's merged view, rather than one directory.
+    merged: bool,
+}
+
+impl TargetLayers {
+    /// A plain root filesystem.
+    fn plain(rootfs: &Path) -> TargetLayers {
+        TargetLayers {
+            writable: rootfs.to_path_buf(),
+            opened: vec![Rooted::open(rootfs).ok()],
+            merged: false,
+        }
+    }
+
+    /// An overlay of `lower`, base first, writing into `upper`.
+    fn overlay(upper: &Path, lower: &[PathBuf]) -> TargetLayers {
+        TargetLayers {
+            writable: upper.to_path_buf(),
+            opened: std::iter::once(upper)
+                .chain(lower.iter().rev().map(PathBuf::as_path))
+                .map(|layer| Rooted::open(layer).ok())
+                .collect(),
+            merged: true,
+        }
+    }
+
+    /// What the tree shows at `relative`.
+    fn presence(&self, relative: &Path) -> Presence {
+        if self.merged {
+            merged_presence(&self.opened, relative)
+        } else {
+            layer_presence(self.opened[0].as_ref(), relative)
+        }
+    }
+}
+
 /// The host paths of the mount targets `ops` has to create as empty files.
 ///
 /// A file bind needs its target to exist, so the launch creates one where the
@@ -5567,90 +5925,116 @@ enum RootLayers<'a> {
 /// contribution, not part of the root, so it is reported here for the caller
 /// side to remove once the sandbox is gone.
 ///
-/// Two targets are deliberately left out, because neither is a file in the root
-/// at a path this can name:
+/// The latest mount before a target that covers it decides where it lands. An
+/// overlay mounted at a path places it in that overlay's upper, at its path
+/// beneath the overlay's target, and the overlay's merged view decides whether
+/// it is present. Where no mount covers it, the root decides as below.
+///
+/// Two targets are deliberately left out, because neither is a file in a layer
+/// of the caller's at a path this can name:
 ///
 /// - one already present in the root, which the root ships and the launch
 ///   therefore does not create. Presence is any entry at the path, a symbolic
 ///   link included: the launch creates the target with `O_EXCL`, so an entry of
-///   any kind is one it leaves alone. For an overlay root, presence is what the
+///   any kind is one it leaves alone. For an overlay, presence is what the
 ///   merged view shows; see [`merged_presence`];
-/// - one under the target of an earlier op, which is created inside that mount
-///   — a tmpfs that vanishes with the namespace, or a caller's own bind source
-///   — rather than in the root directory on the host. A hide mounts nothing
-///   over a path with nothing at it, so a hidden path counts only where the
-///   root holds an entry there when this asks. A root that changes between
-///   the build and the launch can make that answer wrong either way, and
-///   neither way removes what the launch did not create: a target counted as
-///   covered is not removed, and one counted as the root's is removed only
-///   where the name still holds the file the launch reported creating.
+/// - one under the target of an earlier op other than an overlay, which is
+///   created inside that mount — a tmpfs that vanishes with the namespace, or a
+///   caller's own bind source — rather than in a layer on the host. A hide
+///   mounts nothing over a path with nothing at it, so a hidden path counts only
+///   where the tree it is in holds an entry there when this asks. A root that
+///   changes between the build and the launch can make that answer wrong either
+///   way, and neither way removes what the launch did not create: a target
+///   counted as covered is not removed, and one counted as a layer's is removed
+///   only where the name still holds the file the launch reported creating.
 ///
 /// Directories the launch creates are not placeholders: a mount point directory
 /// is part of what a launch contributes to a tree, created at the mode of the
 /// directory it stands for, and is left in place.
 fn created_file_targets(ops: &[MountOp], root: &RootLayers<'_>) -> ManagedPlaceholders {
-    // One descriptor per layer, in the order the merged view consults them:
-    // the upper, then the lowers from the last stacked down to the base. A
-    // layer that cannot be opened at all is a lookup that reaches no verdict.
-    let (writable, layers): (&Path, Vec<Option<Rooted>>) = match root {
-        RootLayers::Plain(rootfs) => (rootfs, vec![Rooted::open(rootfs).ok()]),
-        RootLayers::Overlay { upper, lower } => (
-            upper,
-            std::iter::once(*upper)
-                .chain(lower.iter().rev().map(PathBuf::as_path))
-                .map(|layer| Rooted::open(layer).ok())
-                .collect(),
-        ),
-    };
-    let overlay = matches!(root, RootLayers::Overlay { .. });
-
-    let presence = |path: &CStr| {
-        let relative = Path::new(OsStr::from_bytes(path.to_bytes()));
-        if overlay {
-            merged_presence(&layers, relative)
-        } else {
-            layer_presence(layers[0].as_ref(), relative)
-        }
+    let root = match root {
+        RootLayers::Own => None,
+        RootLayers::Plain(rootfs) => Some(TargetLayers::plain(rootfs)),
+        RootLayers::Overlay { upper, lower } => Some(TargetLayers::overlay(upper, lower)),
     };
 
-    let mut mounted: Vec<&CStr> = Vec::new();
-    let mut paths = Vec::new();
-    let mut whiteouts = Vec::new();
+    // Each mount that brings something to rest, in op order, with the index of
+    // its layers among `overlays` where it is an overlay.
+    let mut mounted: Vec<(&CStr, Option<usize>)> = Vec::new();
+    let mut overlays: Vec<TargetLayers> = Vec::new();
+    let mut targets = Vec::new();
     for op in ops {
-        if let Some(file) = &op.create_file {
-            let relative = Path::new(OsStr::from_bytes(file.to_bytes()));
-            if !mounted.iter().any(|mount| covers(mount, file)) {
-                match presence(file) {
-                    Presence::Absent => paths.push(relative.to_path_buf()),
-                    Presence::WhitedOut => {
-                        paths.push(relative.to_path_buf());
-                        whiteouts.push(relative.to_path_buf());
-                    }
-                    Presence::Present | Presence::Unknown => {}
-                }
+        if let Some(file) = &op.create_file
+            && let Some((layers, relative)) = land(root.as_ref(), &overlays, &mounted, file)
+        {
+            let whiteout = match layers.presence(&relative) {
+                Presence::Absent => Some(false),
+                Presence::WhitedOut => Some(true),
+                Presence::Present | Presence::Unknown => None,
+            };
+            if let Some(whiteout) = whiteout {
+                targets.push(ManagedTarget {
+                    file: PathBuf::from(OsStr::from_bytes(file.to_bytes())),
+                    layer: layers.writable.clone(),
+                    path: relative,
+                    whiteout,
+                });
             }
         }
         if let Some((target, _)) = op.action.arrival() {
-            // A hide in the root itself, of a path the root holds nothing at,
-            // brings nothing to rest. One beneath an earlier mount is covered
-            // by that mount whatever it brings.
+            // A hide of a path the tree it is in holds nothing at brings
+            // nothing to rest. One beneath a mount of the sandbox's own is
+            // covered by that mount whatever it brings.
             let hides_nothing = matches!(op.action, MountAction::Hide { .. })
-                && !mounted.iter().any(|mount| covers(mount, target))
-                && matches!(presence(target), Presence::Absent | Presence::WhitedOut);
-            if !hides_nothing {
-                mounted.push(target);
+                && land(root.as_ref(), &overlays, &mounted, target).is_some_and(
+                    |(layers, relative)| {
+                        matches!(
+                            layers.presence(&relative),
+                            Presence::Absent | Presence::WhitedOut
+                        )
+                    },
+                );
+            if hides_nothing {
+                continue;
             }
+            let overlay = match &op.action {
+                MountAction::Overlay { overlay, .. } => {
+                    overlays.push(TargetLayers::overlay(
+                        overlay.upper_path(),
+                        &overlay.lower_paths(),
+                    ));
+                    Some(overlays.len() - 1)
+                }
+                _ => None,
+            };
+            mounted.push((target, overlay));
         }
     }
-    ManagedPlaceholders {
-        root: if paths.is_empty() {
-            PathBuf::new()
-        } else {
-            writable.to_path_buf()
-        },
-        paths,
-        whiteouts,
-    }
+    ManagedPlaceholders { targets }
+}
+
+/// The tree the root-relative `path` lands in, as [`created_file_targets`]
+/// places a target, and its path within that tree: beneath the latest of
+/// `mounted` that covers it, or in `root` where none does. `None` inside a
+/// mount of the sandbox's own, or in a root of its own.
+///
+/// `mounted` holds each mount that brings something to rest, in op order,
+/// with the index of its layers among `overlays` where it is an overlay.
+fn land<'t>(
+    root: Option<&'t TargetLayers>,
+    overlays: &'t [TargetLayers],
+    mounted: &[(&CStr, Option<usize>)],
+    path: &CStr,
+) -> Option<(&'t TargetLayers, PathBuf)> {
+    let (layers, relative) = match mounted.iter().rev().find(|(over, _)| covers(over, path)) {
+        None => (root?, path.to_bytes()),
+        Some((over, Some(at))) => {
+            let rest = &path.to_bytes()[over.to_bytes().len()..];
+            (&overlays[*at], rest.strip_prefix(b"/").unwrap_or(rest))
+        }
+        Some((_, None)) => return None,
+    };
+    Some((layers, PathBuf::from(OsStr::from_bytes(relative))))
 }
 
 /// What a lookup in the root found at a mount target's path.
@@ -8436,10 +8820,10 @@ mod tests {
         let canonical = std::fs::canonicalize(&dir).unwrap();
         assert_eq!(
             (
-                created.plan.managed_placeholders.root.as_path(),
-                created.plan.managed_placeholders.paths.as_slice(),
+                created.plan.managed_placeholders.layer(),
+                created.plan.managed_placeholders.paths(),
             ),
-            (canonical.as_path(), &[PathBuf::from("etc/resolv.conf")][..]),
+            (canonical.clone(), vec![PathBuf::from("etc/resolv.conf")]),
             "a target the launch creates must be recorded for removal"
         );
 
@@ -8453,7 +8837,8 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            named_relatively.plan.managed_placeholders.root, canonical,
+            named_relatively.plan.managed_placeholders.layer(),
+            canonical,
             "a relatively named rootfs must still record an absolute root"
         );
 
@@ -8508,12 +8893,12 @@ mod tests {
         assert!(binds_resolv_conf(&cage));
         assert_eq!(
             (
-                cage.plan.managed_placeholders.root.as_path(),
-                cage.plan.managed_placeholders.paths.as_slice(),
+                cage.plan.managed_placeholders.layer(),
+                cage.plan.managed_placeholders.paths(),
             ),
             (
-                std::fs::canonicalize(&upper).unwrap().as_path(),
-                &[PathBuf::from("etc/resolv.conf")][..],
+                std::fs::canonicalize(&upper).unwrap(),
+                vec![PathBuf::from("etc/resolv.conf")],
             ),
             "an overlay root's placeholder belongs to the upper"
         );
@@ -8906,6 +9291,213 @@ mod tests {
         .expect("a sibling is disjoint");
     }
 
+    /// The build of `builder`, or `None` where the host cannot establish an
+    /// unprivileged overlay, which the build refuses and the test skips.
+    fn built_with_overlays(builder: CageBuilder) -> Option<Cage> {
+        match builder.build() {
+            Ok(cage) => Some(cage),
+            Err(Error::Config(ConfigError::OverlayUnavailable { blocker })) => {
+                ferroday_cage_testkit::require::OVERLAY.skip(format!(
+                    "an unprivileged overlay is unavailable here: {blocker}"
+                ));
+                None
+            }
+            Err(err) => panic!("the overlay sandbox builds: {err}"),
+        }
+    }
+
+    /// Two overlays writing one upper, or one writing into another's lower, are
+    /// refused, the root's overlay among them, before anything is created; two
+    /// sharing a lower are not.
+    #[test]
+    fn overlays_that_reach_into_each_other_are_refused_before_anything_is_created() {
+        let (scratch, base) = overlap_scratch("overlap-between-overlays");
+        let tree = scratch.join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let tree = std::fs::canonicalize(&tree).unwrap();
+        let root = std::fs::canonicalize(&*scratch).unwrap();
+        let refusal = |builder: CageBuilder| match builder.command("/bin/sh").build() {
+            Err(Error::Config(ConfigError::OverlayLayersOverlap {
+                layer,
+                path,
+                within,
+                within_path,
+            })) => (layer, path, within, within_path),
+            other => panic!("expected the overlays to be refused as overlapping: {other:?}"),
+        };
+
+        // A mount's upper beneath the root overlay's lower.
+        let into_root = root.join("base/etc/up");
+        assert_eq!(
+            refusal(
+                Cage::builder()
+                    .overlay_rootfs(&base, root.join("root-up"))
+                    .overlay_at("/work", Overlay::new().lower(&tree).upper(&into_root)),
+            ),
+            (
+                OverlayLayer::Upper,
+                into_root,
+                OverlayLayer::Lower,
+                base.clone()
+            ),
+        );
+        // Two mounts writing one upper.
+        let shared = root.join("up");
+        assert_eq!(
+            refusal(
+                Cage::builder()
+                    .rootfs(&base)
+                    .overlay_at("/a", Overlay::new().lower(&tree).upper(&shared))
+                    .overlay_at("/b", Overlay::new().lower(&tree).upper(&shared)),
+            ),
+            (
+                OverlayLayer::Upper,
+                shared.clone(),
+                OverlayLayer::Upper,
+                shared.clone()
+            ),
+        );
+        // A mount's upper beneath another mount's lower.
+        let into_tree = tree.join("up");
+        assert_eq!(
+            refusal(
+                Cage::builder()
+                    .rootfs(&base)
+                    .overlay_at("/a", Overlay::new().lower(&tree).upper(root.join("a-up")))
+                    .overlay_at("/b", Overlay::new().lower(&base).upper(&into_tree)),
+            ),
+            (
+                OverlayLayer::Upper,
+                into_tree,
+                OverlayLayer::Lower,
+                tree.clone()
+            ),
+        );
+        for created in ["root-up", ".root-up.work", "up", ".up.work", "a-up"] {
+            assert!(!root.join(created).exists(), "{created} is not created");
+        }
+        assert!(!tree.join("up").exists(), "nothing is created in the tree");
+
+        // Two mounts of one lower, each writing its own upper.
+        let Some(_) = built_with_overlays(
+            Cage::builder()
+                .rootfs(&base)
+                .overlay_at("/a", Overlay::new().lower(&tree).upper(root.join("a-up")))
+                .overlay_at("/b", Overlay::new().lower(&tree).upper(root.join("b-up")))
+                .command("/bin/sh"),
+        ) else {
+            return;
+        };
+        assert!(root.join("a-up").is_dir() && root.join("b-up").is_dir());
+    }
+
+    /// A file bind's target beneath an overlay mount is created in the
+    /// overlay's upper, and recorded there for removal, unless the overlay's
+    /// merged view already holds it or a mount of the sandbox's own beneath the
+    /// overlay takes it.
+    #[test]
+    fn a_target_beneath_an_overlay_mount_is_managed_in_its_upper() {
+        let scratch = Scratch::new("overlay-mount-placeholder");
+        let root = std::fs::canonicalize(&*scratch).unwrap();
+        std::fs::create_dir_all(root.join("base/work")).unwrap();
+        std::fs::create_dir_all(root.join("tree/shipped")).unwrap();
+        std::fs::write(root.join("tree/shipped/file"), b"shipped\n").unwrap();
+        let upper = root.join("upper");
+        let overlay = || Overlay::new().lower(root.join("tree")).upper(&upper);
+        let placeholders = |builder: CageBuilder| {
+            built_with_overlays(builder.command("/bin/sh"))
+                .map(|cage| cage.plan.managed_placeholders.clone())
+        };
+
+        let Some(managed) = placeholders(
+            Cage::builder()
+                .rootfs(root.join("base"))
+                .overlay_at("/work", overlay())
+                .bind_ro("/etc/hostname", "/work/sub/file"),
+        ) else {
+            return;
+        };
+        assert_eq!(
+            managed.targets,
+            [ManagedTarget {
+                file: PathBuf::from("work/sub/file"),
+                layer: upper.clone(),
+                path: PathBuf::from("sub/file"),
+                whiteout: false,
+            }],
+        );
+
+        // The host's own root creates nothing in the host's tree, and a target
+        // beneath an overlay mount there is created in the upper all the same.
+        let tree = root.join("tree");
+        let Some(managed) = placeholders(
+            Cage::builder()
+                .host_rootfs()
+                .overlay_at(&tree, overlay())
+                .bind_ro("/etc/hostname", tree.join("sub/file")),
+        ) else {
+            return;
+        };
+        assert_eq!(managed.paths(), [Path::new("sub/file")]);
+        assert_eq!(managed.layer(), upper);
+
+        // What the lower ships is not the launch's to create.
+        let managed = placeholders(
+            Cage::builder()
+                .rootfs(root.join("base"))
+                .overlay_at("/work", overlay())
+                .bind_ro("/etc/hostname", "/work/shipped/file"),
+        );
+        assert!(managed.is_some_and(|managed| managed.is_empty()));
+
+        // A tmpfs mounted beneath the overlay takes the target.
+        let managed = placeholders(
+            Cage::builder()
+                .rootfs(root.join("base"))
+                .overlay_at("/work", overlay())
+                .raw_mount(
+                    RawMount::new("/work/scratch")
+                        .fstype("tmpfs")
+                        .source("tmpfs"),
+                )
+                .bind_ro("/etc/hostname", "/work/scratch/file"),
+        );
+        assert!(managed.is_some_and(|managed| managed.is_empty()));
+    }
+
+    /// An overlay mounted in the host's own root needs its target there, as a
+    /// bind does: the launch creates nothing in the host's tree. The target
+    /// here is in the host's `/usr`, outside the managed `/tmp`, where a
+    /// target is created in the sandbox's own tmpfs.
+    #[test]
+    fn an_overlay_mount_in_the_hosts_root_needs_its_target() {
+        let scratch = Scratch::new("overlay-mount-host-target");
+        let root = std::fs::canonicalize(&*scratch).unwrap();
+        std::fs::create_dir(root.join("tree")).unwrap();
+        let missing = PathBuf::from(format!(
+            "/usr/share/ferroday-cage-missing-{}",
+            crate::host::unique_hex()
+        ));
+        let built = Cage::builder()
+            .host_rootfs()
+            .overlay_at(
+                &missing,
+                Overlay::new()
+                    .lower(root.join("tree"))
+                    .upper(root.join("up")),
+            )
+            .command("/bin/sh")
+            .build();
+        assert!(
+            matches!(
+                &built,
+                Err(Error::Config(ConfigError::MountTargetMissing { target, .. }))
+                    if *target == missing
+            ),
+            "{built:?}"
+        );
+    }
+
     /// A directory that does not exist yet resolves to the path it will have
     /// once its missing directories are created.
     #[test]
@@ -8963,8 +9555,8 @@ mod tests {
                 lower: &lower,
             },
         );
-        assert_eq!(placeholders.paths, [Path::new("etc/shipped")]);
-        assert_eq!(placeholders.whiteouts, [Path::new("etc/shipped")]);
+        assert_eq!(placeholders.paths(), [Path::new("etc/shipped")]);
+        assert_eq!(placeholders.whiteouts(), [Path::new("etc/shipped")]);
 
         // What the launch does: the target replaces the whiteout, and the
         // setup reports the file it created.
@@ -9015,8 +9607,8 @@ mod tests {
                 .command("/bin/sh")
                 .bind_ro(&source, "/etc/created"),
         );
-        assert_eq!(recorded.root, canonical);
-        assert_eq!(recorded.paths, [Path::new("etc/created")]);
+        assert_eq!(recorded.layer(), canonical);
+        assert_eq!(recorded.paths(), [Path::new("etc/created")]);
 
         // A target the rootfs ships is not the launch's to create or remove.
         let cage = Cage::builder()
@@ -9086,7 +9678,7 @@ mod tests {
 
         // Nothing at the hidden path: the hide mounts nothing, and the bind
         // creates its target in the root itself, which the root never held.
-        assert_eq!(hidden().paths, [Path::new("root/.config/git/config")]);
+        assert_eq!(hidden().paths(), [Path::new("root/.config/git/config")]);
 
         // A directory there: the hide's tmpfs takes the target, and the target
         // goes with the namespace.
@@ -9169,7 +9761,7 @@ mod tests {
                 .bind_ro(&source, "/absolute/entry"),
         );
         assert_eq!(
-            recorded.paths,
+            recorded.paths(),
             [Path::new("absolute/entry")],
             "a target behind a root-internal absolute symlink is the launch's to create"
         );
@@ -9355,6 +9947,13 @@ fstype = "tmpfs"
 flags = 6
 data = "mode=0777"
 
+[[mount]]
+kind = "overlay"
+target = "/work"
+lower = ["/srv/work"]
+upper = "/var/tmp/work-upper"
+work = "/var/tmp/work-work"
+
 [hardening]
 seccomp = "curated"
 keep-caps = ["net-bind-service"]
@@ -9453,7 +10052,7 @@ target = "/work/.git/hooks"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 109] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 112] = [
         "args",
         "base-env",
         "cgroup",
@@ -9525,10 +10124,13 @@ target = "/work/.git/hooks"
         "mount[].flags",
         "mount[].fstype",
         "mount[].kind",
+        "mount[].lower",
         "mount[].path",
         "mount[].read-only",
         "mount[].source",
         "mount[].target",
+        "mount[].upper",
+        "mount[].work",
         "nameservers",
         "network",
         "overlay",
@@ -9615,6 +10217,11 @@ target = "/work/.git/hooks"
             "[overlay]\nlower = [\"/srv/base\"]\nupper = \"/var/tmp/upper\"\n\
              work = \"/var/tmp/work\"\n",
             "an overlay root",
+        ),
+        (
+            "[[mount]]\nkind = \"overlay\"\ntarget = \"/work\"\nlower = [\"/srv/work\"]\n\
+             upper = \"/var/tmp/upper\"\nwork = \"/var/tmp/work\"\n",
+            "an overlay mount",
         ),
         ("host-rootfs = true\n", "the host's own root (host-rootfs)"),
         (

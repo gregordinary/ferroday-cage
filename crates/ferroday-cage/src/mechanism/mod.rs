@@ -491,7 +491,7 @@ pub(crate) struct PresentPlan {
 }
 
 /// The mount targets a launch has to create as empty files in the root, and the
-/// writable layer they are created in.
+/// writable layer each is created in.
 ///
 /// A file bind needs its target to exist before anything can be mounted onto it,
 /// so a root shipping none gets an empty file created. Left behind, that file is
@@ -501,16 +501,21 @@ pub(crate) struct PresentPlan {
 /// creates.
 ///
 /// Only the targets the caller side can name are listed: one under an earlier
-/// mount is created inside that mount rather than in the root, and one the root
-/// already ships — an entry of any kind at the path — is not the launch's to
-/// remove. The list is what a launch *may* create. Which of them it did is what
-/// the setup reports as it creates each one, as a [`CreatedTarget`]: a target
-/// another launch created first, on a root two sandboxes share, is found rather
-/// than created, and is not this launch's.
+/// mount is created inside that mount rather than in a layer of the caller's,
+/// and one the root already ships — an entry of any kind at the path — is not
+/// the launch's to remove. The list is what a launch *may* create. Which of them
+/// it did is what the setup reports as it creates each one, as a
+/// [`CreatedTarget`]: a target another launch created first, on a root two
+/// sandboxes share, is found rather than created, and is not this launch's.
 ///
-/// The paths are held root-relative, with the root named once, so the removal
+/// An overlay mounted at a path is the one earlier mount whose targets the
+/// caller side can name: what is created beneath it lands in its upper, a
+/// directory of the caller's, as what an overlay root's launch creates lands in
+/// the root's upper. Its targets are listed against that upper.
+///
+/// The paths are held layer-relative, with the layer named apart, so the removal
 /// can resolve them the way the sandbox stage resolves its mount targets:
-/// against a descriptor for the root, with `RESOLVE_IN_ROOT`. Joined into
+/// against a descriptor for the layer, with `RESOLVE_IN_ROOT`. Joined into
 /// absolute host paths instead, a rootfs-internal symbolic link — which an
 /// untrusted unpacked tree is entitled to contain — would resolve against the
 /// *host's* root on this side of the fork, and the removal could land outside
@@ -520,28 +525,73 @@ pub(crate) struct PresentPlan {
 /// each path is under its bind, where unlinking it is `EBUSY`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ManagedPlaceholders {
-    /// The root's writable layer — the rootfs itself, or an overlay's upper —
-    /// which is where the launch creates the targets below. Canonical, so a root
-    /// the caller named relatively does not re-resolve against whatever
-    /// directory the process happens to be in when the handle drops. Empty when
-    /// there are no placeholders.
-    pub(crate) root: PathBuf,
-    /// The targets, as paths relative to [`root`](Self::root).
-    pub(crate) paths: Vec<PathBuf>,
-    /// The targets among [`paths`](Self::paths) an overlay's upper held a
-    /// whiteout at before the launch, which the removal puts back.
+    /// The targets, in the order of the ops that create them.
+    pub(crate) targets: Vec<ManagedTarget>,
+}
+
+/// One mount target a launch may create in a writable layer of the caller's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedTarget {
+    /// The root-relative file the creating op's
+    /// [`create_file`](MountOp::create_file) names, by which a setup report
+    /// is matched to it.
+    pub(crate) file: PathBuf,
+    /// The writable layer the launch creates it in: the rootfs itself, an
+    /// overlay root's upper, or the upper of an overlay mounted at a path
+    /// above it. Canonical, so a layer the caller named relatively does not
+    /// re-resolve against whatever directory the process happens to be in when
+    /// the handle drops.
+    pub(crate) layer: PathBuf,
+    /// The target, relative to [`layer`](Self::layer).
+    pub(crate) path: PathBuf,
+    /// Whether the layer, an overlay's upper, held a whiteout at the path
+    /// before the launch, which the removal puts back.
     ///
     /// Creating the target over a whiteout replaces the whiteout, so removing
     /// the target alone would bring back the entry a lower layer holds there,
     /// which the upper had deleted.
-    pub(crate) whiteouts: Vec<PathBuf>,
+    pub(crate) whiteout: bool,
 }
 
+#[cfg(test)]
 impl ManagedPlaceholders {
     /// Whether the launch creates no mount target the caller side has to remove.
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.targets.is_empty()
+    }
+
+    /// The one layer every target lands in, or the empty path where there are
+    /// none.
+    ///
+    /// # Panics
+    ///
+    /// Where the targets land in more than one layer.
+    pub(crate) fn layer(&self) -> PathBuf {
+        let layer = self.targets.first().map(|target| target.layer.clone());
+        assert!(
+            self.targets
+                .iter()
+                .all(|target| Some(&target.layer) == layer.as_ref()),
+            "the targets land in one layer: {self:?}"
+        );
+        layer.unwrap_or_default()
+    }
+
+    /// The targets' paths within their layers.
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect()
+    }
+
+    /// The targets' paths where a whiteout stood before the launch.
+    pub(crate) fn whiteouts(&self) -> Vec<PathBuf> {
+        self.targets
+            .iter()
+            .filter(|target| target.whiteout)
+            .map(|target| target.path.clone())
+            .collect()
     }
 }
 
@@ -1226,6 +1276,15 @@ pub(crate) enum MountAction {
         /// that is the root: where the walk that holds the name starts.
         parent: CString,
     },
+    /// Mount an overlay of host layers onto a rootfs target, through
+    /// [`overlay::mount_overlay`] as the overlay root is mounted.
+    Overlay {
+        /// The layers, each a canonical host path the stage opens before the
+        /// pivot, without following a link.
+        overlay: OverlayPlan,
+        /// Rootfs-relative mount target.
+        target: CString,
+    },
 }
 
 /// What a [`MountAction`] brings to rest on its target.
@@ -1237,6 +1296,11 @@ pub(crate) enum Arrival {
     /// A tree that already stood elsewhere, bound or moved onto the target:
     /// what is written under it lands wherever that tree lives.
     Tree,
+    /// An overlay of trees that stand elsewhere: what is beneath the target is
+    /// theirs, as under a [`Tree`](Self::Tree), and what is written there,
+    /// a mount point the launch creates included, lands in the overlay's
+    /// upper, a directory of the caller's.
+    Overlay,
 }
 
 /// `MS_REMOUNT`. rustix keeps the flag to its own remount call, and a raw
@@ -1319,6 +1383,7 @@ impl MountAction {
             MountAction::Raw { target, flags, .. } => {
                 Arrival::of_raw(*flags).map(|arrival| (target.as_c_str(), arrival))
             }
+            MountAction::Overlay { target, .. } => Some((target, Arrival::Overlay)),
             MountAction::Symlink { .. } => None,
         }
     }
