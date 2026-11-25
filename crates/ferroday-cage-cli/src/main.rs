@@ -6936,10 +6936,12 @@ fn provision(rootfs: &Path, provisioner: &mut Selected) -> Result<Provisioned, E
 /// shell running a script stops the script when a command it waited for died
 /// of `SIGINT`, and goes on when the command merely exited 130. The hold has
 /// ended by the time this runs, so the signal does what it would have done
-/// without one. 130 is the shell's code for it, should the raise return.
+/// without one. The shell's code for it is what is returned, should the raise
+/// return.
 fn end_by_interrupt() -> ExitCode {
-    let _ = rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT);
-    ExitCode::from(130)
+    let interrupt = rustix::process::Signal::INT;
+    let _ = rustix::process::kill_process(rustix::process::getpid(), interrupt);
+    ExitCode::from(ExitStatus::signaled(interrupt.as_raw()).shell_code())
 }
 
 /// What a provisioning run reports as it goes: each userland's progress, and
