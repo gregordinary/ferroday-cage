@@ -23,13 +23,11 @@
 //! the command exits. Publishing a port, for a server inside the sandbox, is
 //! the guide's to show: a fetch has nothing listening.
 //!
-//! DNS is the caller's to arrange. The stack refuses loopback and link-local
-//! destinations, so a host running systemd-resolved — whose `127.0.0.53` stub is
-//! the only entry in `/etc/resolv.conf` — offers the sandbox no working
-//! resolver. This example binds the host's `resolv.conf` only when it names a
-//! nameserver the stack [forwards](ferroday_cage::NetStack::forwards) to, and
-//! otherwise leaves the sandbox to resolve nothing; fetching a literal IP
-//! address always works.
+//! The sandbox resolves through the stack's own nameserver, which asks the
+//! host's resolver, a loopback one such as systemd-resolved's stub included.
+//! The example names it in the sandbox's `resolv.conf` with
+//! [`nameservers`](ferroday_cage::CageBuilder::nameservers), from the addresses
+//! [`NetStack::nameservers`](ferroday_cage::NetStack::nameservers) returns.
 //!
 //! # Usage
 //!
@@ -68,9 +66,8 @@ Options:
                      from a service listening on the host's 127.0.0.1
   -h, --help         Print this help
 
-The URL is fetched with wget and written to standard output. Give a URL with a
-literal IP address to sidestep DNS, or ensure the host has a routable
-nameserver in /etc/resolv.conf.
+The URL is fetched with wget and written to standard output. Its name is
+resolved through the stack's nameserver, which asks the host's own resolver.
 ";
 
 /// The parsed command line.
@@ -164,17 +161,13 @@ fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
     }
     let stack = stack.build()?;
 
-    let mut builder = Cage::builder()
+    let cage = Cage::builder()
         .rootfs(&options.rootfs)
+        .nameservers(stack.nameservers())
         .command(WGET)
         .arg("-qO-")
-        .arg(&options.url);
-    // Give the sandbox the host's DNS only if the stack forwards to one of its
-    // nameservers.
-    if host_has_forwarded_nameserver(&stack) {
-        builder = builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf");
-    }
-    let cage = builder.build()?;
+        .arg(&options.url)
+        .build()?;
 
     // Hold the command at the gate, stand the network up in the sandbox's
     // namespace, then release the command so it sees the network from its
@@ -194,30 +187,6 @@ fn fetch(options: &Options) -> Result<ExitCode, FetchFailure> {
     }
 
     Ok(ExitCode::from(status.shell_code()))
-}
-
-/// Whether the host's `resolv.conf` names a nameserver reachable through the
-/// stack, by the stack's own [`forwards`](NetStack::forwards).
-fn host_has_forwarded_nameserver(stack: &NetStack) -> bool {
-    let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
-        return false;
-    };
-    contents.lines().any(|line| {
-        let Some(address) = line.trim().strip_prefix("nameserver") else {
-            return false;
-        };
-        // The keyword and its value are separated by whitespace, and glibc
-        // ignores a line that runs them together. Reading `nameserver8.8.8.8`
-        // as a nameserver would count a line the resolver does not as the
-        // reason this host is considered routable.
-        if !address.starts_with([' ', '\t']) {
-            return false;
-        }
-        address
-            .trim()
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| stack.forwards(std::net::SocketAddr::new(address, 53)))
-    })
 }
 
 /// Parses the command line, returning `None` when help was requested.

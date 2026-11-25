@@ -3,8 +3,9 @@
 //! Both crates' suites need the same things: the pinned Alpine minirootfs,
 //! scratch directories that clear themselves, the rule for skipping a test the
 //! host cannot run, a tar writer, `ar` and `.deb` writers, a hex encoder, a
-//! pseudoterminal to play the user at, and a few descriptor, process, sandbox
-//! and extended-attribute helpers.
+//! pseudoterminal to play the user at, a stand-in resolver for the network
+//! stack's nameserver to ask, and a few descriptor, process, sandbox and
+//! extended-attribute helpers.
 //! One copy of each is what keeps them agreeing: a skip that honors its
 //! `REQUIRE` variable in one suite honors it in every suite.
 //!
@@ -32,6 +33,7 @@
 #[cfg(feature = "compress")]
 pub mod compress;
 pub mod deb;
+pub mod dns;
 pub mod fd;
 pub mod fixture;
 #[cfg(feature = "hex")]

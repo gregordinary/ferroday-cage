@@ -1817,13 +1817,10 @@ const FLAGS: &[Flag] = &[
             "Attach the native userspace network stack: IPv4 and",
             "IPv6 for the isolated network, outbound and to any",
             "--netstack-publish port, carried over host sockets",
-            "with no external helper. Binds the host's resolv.conf",
-            "when it names a nameserver the stack forwards to,",
-            "unless --no-resolv-conf or --no-managed-mounts is",
-            "given or a mount of the run's own claims the file; a",
-            "host whose nameservers are all loopback or link-local",
-            "composes nothing, leaving the rootfs's own resolv.conf",
-            "in place",
+            "with no external helper. The sandbox's resolv.conf",
+            "names the stack's nameserver, unless --no-resolv-conf,",
+            "--no-managed-mounts or --nameserver is given or a",
+            "mount of the run's own claims the file",
         ],
         take: Take::Bare(|options| {
             options.netstack = true;
@@ -1980,7 +1977,8 @@ const FLAGS: &[Flag] = &[
         help: &[
             "Serve no DNS from the stack, which otherwise answers",
             "on port 53 of 10.0.2.3 and fd00::3 by asking the",
-            "host's resolver",
+            "host's resolver; the sandbox keeps its rootfs's own",
+            "resolv.conf",
         ],
         take: Take::Bare(|options| {
             options.netstack_no_nameserver = true;
@@ -2352,8 +2350,9 @@ const FLAGS: &[Flag] = &[
         long: "--no-resolv-conf",
         section: Section::Off,
         help: &[
-            "Do not bind the host resolv.conf: neither the bind",
-            "--share-net makes nor the one --netstack composes",
+            "Place no resolv.conf: neither the host's that",
+            "--share-net binds nor the one naming --netstack's",
+            "nameserver",
         ],
         take: Take::Bare(|options| {
             options.resolv_conf = Some(false);
@@ -5546,25 +5545,8 @@ impl Launch {
             None => {}
         }
 
-        // The native stack composes the sandbox's DNS from the host's own,
-        // where the stack forwards to one of its nameservers, unless the run
-        // opts out. --no-managed-mounts opts out as surely as --no-resolv-conf
-        // does: its promise is that the sandbox carries exactly the binds the
-        // command line names, and this would be one it does not.
-        //
-        // The builder is asked rather than the flags, so that a profile
-        // setting either toggle governs this composition exactly as the
-        // matching flag does. Both have already been applied above.
-        //
-        // The same getter folds in the caller's own claim on the target: a
-        // mount of theirs at `/etc/resolv.conf`, or a host tree of theirs over
-        // `/etc`, which this composition yields to exactly as the library's own
-        // bind for a host-network sandbox does.
-        if let Some(stack) = &stack
-            && builder.get_resolv_conf()
-        {
-            builder = compose_netstack_resolv_conf(builder, stack)
-                .map_err(|output::ReaderGone| ExitCode::from(output::broken_pipe()))?;
+        if let Some(stack) = &stack {
+            builder = name_the_stacks_nameserver(builder, stack);
         }
 
         settle_command(&builder).map_err(|error| Failure::Cage(error).report())?;
@@ -6033,83 +6015,29 @@ fn run_pending(
     settled_code(outcome, delivered)
 }
 
-/// Composes the sandbox's `resolv.conf` for a native-stack run: binds the
-/// host's `resolv.conf` read-only when it names a nameserver the stack forwards
-/// to, and otherwise composes nothing and says so.
+/// Names the native stack's nameserver in the sandbox's `resolv.conf`, so the
+/// sandbox resolves through the stack.
 ///
-/// Called only where [`CageBuilder::get_resolv_conf`] holds, which folds in
-/// both opt-outs and the caller's own claim on the target. A caller's mount at
-/// `/etc/resolv.conf` or over `/etc` replaces this bind as it replaces the
-/// library's own for a host-network sandbox.
-///
-/// A nameserver the stack refuses is unreachable from the sandbox, so binding a
-/// file that names only such ones would produce nothing but silent DNS
-/// failures. systemd-resolved's `127.0.0.53` stub is the common one, and a
-/// cloud host's link-local resolver another; [`NetStack::forwards`] is the
-/// stack's own answer for each.
-///
-/// Composing nothing leaves whatever `resolv.conf` the rootfs ships, which
-/// may name a routable resolver and resolve perfectly well. The warning
-/// therefore reports what was not composed; it does not predict that the
-/// sandbox has no DNS, which is not this function's to know.
-///
-/// The warning is written before the launch, so a reader of it that has gone
-/// stops the launch: [`output::ReaderGone`].
-fn compose_netstack_resolv_conf(
-    builder: CageBuilder,
-    stack: &NetStack,
-) -> Result<CageBuilder, output::ReaderGone> {
-    let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
-        // No host resolv.conf to compose from; leave the sandbox's as-is.
-        return Ok(builder);
-    };
-    if names_a_forwarded_nameserver(&contents, stack) {
-        return Ok(builder.bind_ro("/etc/resolv.conf", "/etc/resolv.conf"));
+/// Nothing is named where the run opts out of the managed `resolv.conf`, names
+/// nameservers of its own, or mounts something of its own at the file.
+/// `--no-managed-mounts` opts out as surely as `--no-resolv-conf` does: its
+/// promise is that the sandbox carries exactly the mounts the command line
+/// names, and this would be one it does not. The builder is asked rather than
+/// the flags, so a profile setting either toggle, or naming nameservers,
+/// governs this as the matching flag does; all of them are applied first. A
+/// stack whose nameserver is off names none, and the sandbox keeps the
+/// `resolv.conf` its root ships.
+fn name_the_stacks_nameserver(builder: CageBuilder, stack: &NetStack) -> CageBuilder {
+    if builder.get_nameservers().is_empty() && builder.get_resolv_conf() {
+        builder.nameservers(stack.nameservers())
+    } else {
+        builder
     }
-    // The remedies are named as flags rather than as goals. This is the default
-    // configuration on every systemd-resolved host, so it is the warning most
-    // users of --netstack ever see, and "point it at a routable nameserver" is
-    // not something anyone can type.
-    output::say(format_args!(
-        "fcage: the host's nameservers are all ones the network stack refuses, such as a \
-         loopback or link-local address, so no resolv.conf was composed; the sandbox \
-         resolves through whatever its rootfs ships"
-    ))?;
-    output::say(format_args!(
-        "Try '--ro-bind FILE /etc/resolv.conf' with a file naming a routable nameserver, \
-         which is taken in place of this composition; or '--netstack-host-loopback' with \
-         the gateway address, which reaches a host resolver only when that resolver \
-         listens on 127.0.0.1, not systemd-resolved's 127.0.0.53 stub; or \
-         '--no-resolv-conf' to leave the rootfs's own and silence this."
-    ))?;
-    Ok(builder)
 }
 
 /// The port a `resolv.conf` nameserver is queried on: `resolv.conf` names no
 /// port, and the resolver always asks 53.
 const DNS_PORT: u16 = 53;
-
-/// Whether a `resolv.conf` names at least one nameserver the network stack
-/// forwards DNS to.
-fn names_a_forwarded_nameserver(contents: &str, stack: &NetStack) -> bool {
-    contents.lines().any(|line| {
-        let line = line.trim();
-        let Some(address) = line.strip_prefix("nameserver") else {
-            return false;
-        };
-        // The keyword and its value are separated by whitespace, and glibc
-        // ignores a line that runs them together. Reading `nameserver8.8.8.8`
-        // as a nameserver would count a line the resolver does not as the
-        // reason this host is considered routable.
-        if !address.starts_with([' ', '\t']) {
-            return false;
-        }
-        match address.trim().parse::<std::net::IpAddr>() {
-            Ok(address) => stack.forwards(SocketAddr::new(address, DNS_PORT)),
-            Err(_) => false,
-        }
-    })
-}
 
 /// Builds and runs a restriction — the --restrict mode — mapping the outcome
 /// onto the exit status exactly as the sandbox path does.
@@ -10502,30 +10430,33 @@ mod tests {
     }
 
     #[test]
-    fn only_a_nameserver_the_stack_forwards_to_is_composed() {
+    fn netstack_names_the_stacks_nameserver_unless_the_run_says_otherwise() {
         let stack = NetStack::default();
-        let forwarded = |contents: &str| names_a_forwarded_nameserver(contents, &stack);
-        assert!(!forwarded("nameserver 127.0.0.53\noptions edns0\n"));
-        assert!(forwarded("nameserver 127.0.0.53\nnameserver 9.9.9.9\n"));
-        assert!(forwarded("nameserver 2606:4700:4700::1111\n"));
-        assert!(!forwarded("# only a comment\n"));
-        // A cloud host's own resolvers: AWS's link-local IPv4 one and its
-        // instance-service IPv6 one, both of which the stack refuses.
-        assert!(!forwarded("nameserver 169.254.169.253\n"));
-        assert!(!forwarded("nameserver fd00:ec2::253\n"));
-        // A resolver on the guest's own subnet is on-link to the guest, and the
-        // stack forwards nothing there.
-        assert!(!forwarded("nameserver 10.0.2.3\n"));
-        // The keyword and the address run together is not a nameserver line.
-        assert!(!forwarded("nameserver9.9.9.9\n"));
-        // A protocol the run turns off reaches nothing.
-        let ipv4_only = NetStack::builder()
-            .ipv6(false)
+        let named = |builder: CageBuilder| {
+            name_the_stacks_nameserver(builder, &stack)
+                .get_nameservers()
+                .to_vec()
+        };
+        let base = || Cage::builder().rootfs("/r").command("/bin/true");
+        assert_eq!(named(base()), stack.nameservers());
+        assert_eq!(
+            named(Cage::builder().host_rootfs().command("/bin/true")),
+            stack.nameservers(),
+            "the host's own root takes the file too",
+        );
+        assert!(named(base().resolv_conf(false)).is_empty());
+        assert!(named(base().managed_mounts(false)).is_empty());
+        assert!(named(base().bind_ro("/etc/hosts", "/etc/resolv.conf")).is_empty());
+        let own = [IpAddr::from([192, 0, 2, 53])];
+        assert_eq!(named(base().nameservers(own)), own, "the run's own stand");
+        let off = NetStack::builder()
+            .nameserver(false)
             .build()
-            .expect("a valid configuration");
-        assert!(!names_a_forwarded_nameserver(
-            "nameserver 2606:4700:4700::1111\n",
-            &ipv4_only
-        ));
+            .expect("a stack without a nameserver");
+        assert!(
+            name_the_stacks_nameserver(base(), &off)
+                .get_nameservers()
+                .is_empty()
+        );
     }
 }

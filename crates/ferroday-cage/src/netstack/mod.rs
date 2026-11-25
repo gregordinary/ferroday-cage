@@ -301,8 +301,8 @@ impl NetStack {
     /// [`host_loopback_port`](NetStackBuilder::host_loopback_port) admits.
     ///
     /// A caller composing the guest's configuration asks this rather than
-    /// restating the rules. `fcage --netstack` binds the host's `resolv.conf`
-    /// only where it names a nameserver the stack forwards to on port 53.
+    /// restating the rules: one that turns the stack's nameserver off, say, and
+    /// gives the guest a resolver of its own to reach through the stack.
     ///
     /// ```
     /// use ferroday_cage::NetStack;

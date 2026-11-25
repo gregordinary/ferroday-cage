@@ -355,25 +355,17 @@ pattern = 'strip_prefix\("nameserver"\)'
 answer = """\
 `netstack::nameserver::first_nameserver`, which the network stack's nameserver \
 reads the host's resolver with. It is crate-private, so a site in another \
-crate cannot reach it, and each such site says why it reads the file at all. \
-What the record buys is that a change to one arrives as a diff naming the \
-others: the rule they must agree on is glibc's, where the keyword and its value \
-are separated by whitespace and a line running them together is ignored."""
+crate cannot reach it, and one that reads the file needs a reason to here. A \
+consumer composing a sandbox's DNS names the stack's nameserver instead, \
+through `CageBuilder::nameservers`, and reads no `resolv.conf` at all. The rule \
+any reader keeps is glibc's: the keyword and its value are separated by \
+whitespace, and a line running them together is ignored."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/netstack/nameserver.rs"
 count = 1
 why = "The answer."
 
-[[idiom.site]]
-path = "crates/ferroday-cage-cli/src/main.rs"
-count = 1
-why = "Deciding whether `--netstack` composes a resolv.conf for the sandbox."
-
-[[idiom.site]]
-path = "crates/ferroday-cage/examples/fetch-sandbox.rs"
-count = 1
-why = "The same decision, for the same reason, in a consumer of the public API."
 
 [[idiom]]
 name = "a mirror-relative URL built by hand"

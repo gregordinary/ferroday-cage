@@ -58,6 +58,14 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking.** `fcage --netstack` names the stack's nameserver in the
+  sandbox's `resolv.conf`, through `CageBuilder::nameservers`, rather than
+  binding the host's. It does so under `--host-rootfs` too, where it composed
+  nothing, and on a host whose nameservers are all loopback or link-local, such
+  as systemd-resolved's stub, where it composed nothing and warned. A sandbox on
+  such a host now resolves. `--no-resolv-conf`, `--no-managed-mounts`,
+  `--nameserver` and a mount of the run's own at the file still decline it.
+- The `fetch-sandbox` example names the stack's nameserver in the same way.
 - `CageBuilder::get_resolv_conf` answers whether the managed `resolv.conf` is
   wanted under the host's own root as under any other, since `nameservers`
   places one there. The host's own file is still not bound there.

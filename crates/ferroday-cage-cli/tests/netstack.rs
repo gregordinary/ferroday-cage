@@ -1,5 +1,6 @@
 //! Integration tests for `fcage --netstack`: what the built binary refuses
-//! before a native network stack carries a sandbox's traffic.
+//! before a native network stack carries a sandbox's traffic, and the names a
+//! sandbox resolves through the stack's nameserver.
 //!
 //! The tests skip explicitly, on stderr, on a host that cannot create
 //! unprivileged user namespaces or offers no seccomp. Every run is bounded, so
@@ -66,4 +67,65 @@ fn a_network_grant_the_kernel_cannot_enforce_refuses_the_stack() {
         "the stack was not refused for the grant: {stderr}",
     );
     assert!(!output.status.success(), "{}", output.status);
+}
+
+/// Runs `fcage` with `args`, then `--netstack`, the stand-in resolver as the
+/// stack's upstream, and `getent hosts` for the name it knows, and returns
+/// whether it succeeded, what it printed, and what it said on stderr.
+fn resolve_known_name(args: &[&str], getent: &str) -> (bool, String, String) {
+    let resolver = common::dns::Resolver::new(1);
+    let upstream = resolver.address().to_string();
+    let mut command = Command::new(FCAGE);
+    command
+        .args(args)
+        .args(["--netstack", "--netstack-upstream", &upstream])
+        .args(["--", getent, "hosts", common::dns::KNOWN_NAME])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = common::run_bounded(&mut command, PATIENCE);
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// `--netstack` names the stack's nameserver in the sandbox's `resolv.conf`,
+/// so the sandbox resolves through the stack, here from a resolver on the
+/// host's loopback, which the sandbox's own traffic never reaches.
+#[test]
+fn netstack_resolves_through_the_stack_s_nameserver() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let rootfs = rootfs.to_str().expect("a UTF-8 fixture path");
+    let (ok, stdout, stderr) = resolve_known_name(&["--rootfs", rootfs], "/usr/bin/getent");
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("192.0.2.1"), "{stdout}\n{stderr}");
+}
+
+/// Under the host's own root the host's C library resolves, and the sandbox's
+/// `resolv.conf` is the host's, commonly a link into the hidden `/run`. The
+/// stack's nameserver is named where it leads.
+#[test]
+fn netstack_resolves_through_the_stack_s_nameserver_under_the_host_root() {
+    if !common::require::tun() {
+        return;
+    }
+    let getent = "/usr/bin/getent";
+    if !std::path::Path::new(getent).is_file() {
+        common::require::premise_unmet("the host has no /usr/bin/getent to resolve with");
+        return;
+    }
+    if std::fs::canonicalize("/etc/resolv.conf").is_err() {
+        common::require::premise_unmet("the host has no /etc/resolv.conf to read through");
+        return;
+    }
+    let (ok, stdout, stderr) = resolve_known_name(&["--host-rootfs"], getent);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("192.0.2.1"), "{stdout}\n{stderr}");
 }

@@ -10,6 +10,7 @@
 //! helper.
 #![allow(unused_imports, dead_code)]
 
+pub use ferroday_cage_testkit::dns;
 pub use ferroday_cage_testkit::process::{
     cpu_ticks, finish_bounded, process_state, rerun, run_bounded, spawn_grouped,
 };

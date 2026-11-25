@@ -492,25 +492,22 @@ host loopback.
 `fcage` report the port the kernel chose, on standard error, before the command
 starts.
 
-`--netstack` binds the host's `resolv.conf` into the sandbox when it names a
-nameserver the stack forwards to. A host whose resolvers are all loopback or
-link-local composes nothing and warns. The sandbox then keeps whatever
-`resolv.conf` its rootfs ships, which may name a routable resolver and work
-perfectly well. The warning reports what was not composed rather than
-predicting the run's DNS.
+`--netstack` names the stack's nameserver in the sandbox's `resolv.conf`,
+through [`nameservers`][`CageBuilder::nameservers`], under every root, the
+host's own included. `--nameserver ADDRESS` names other servers in its place.
 
-`--no-resolv-conf` opts out of the composition, and so does
-`--no-managed-mounts`, whose promise is that the sandbox carries exactly the
-binds the command line names. A profile setting either toggle governs it the
-same way. A mount of the caller's own onto `/etc/resolv.conf` replaces the
-composed one rather than sitting under it, whether `--bind`, `--ro-bind` or
-`--raw-mount` made it. So does a host directory bound over `/etc`. A run that
-supplies its own resolver configuration therefore need not also decline this
-one. These are the rules the library's own bind follows for a host-network
-sandbox, read from [`get_resolv_conf`][`CageBuilder::get_resolv_conf`]. A
-rootfs that ships no `/etc/resolv.conf` gets one created to mount onto and
-taken away again afterwards, as every file bind target does. The flag conflicts
-with `--share-net` and with `--restrict`.
+`--no-resolv-conf` opts out, and so does `--no-managed-mounts`, whose promise is
+that the sandbox carries exactly the mounts the command line names. A profile
+setting either toggle, or naming nameservers, governs it the same way. A mount
+of the caller's own onto `/etc/resolv.conf` replaces the file rather than
+sitting under it, whether `--bind`, `--ro-bind` or `--raw-mount` made it. So
+does a host directory bound over `/etc`. These are the rules every managed
+`resolv.conf` follows, read from
+[`get_resolv_conf`][`CageBuilder::get_resolv_conf`].
+
+With `--netstack-no-nameserver` nothing is named, and the sandbox keeps the
+`resolv.conf` its rootfs ships. The flag conflicts with `--share-net` and with
+`--restrict`.
 
 ### A worked example
 
