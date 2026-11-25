@@ -572,6 +572,10 @@ consumer upgrading can skip it.
   route outward, which the destination rules' tests reach, since the stack
   refuses loopback whatever the rules say. `FERRODAY_CAGE_REQUIRE_TUN` governs
   its skip.
+- Giving a copied entry its recorded owner holds the name to the recorded
+  identity through an `O_PATH` descriptor before anything else, so a socket or
+  a device at the name is owned, or left alone, rather than failing an open for
+  reading. No current caller reaches such an entry.
 
 ## [0.6.0] - 2026-11-13
 

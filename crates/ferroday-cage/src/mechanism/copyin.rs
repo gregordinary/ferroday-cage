@@ -104,7 +104,7 @@
 use std::ffi::CStr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
-use rustix::fs::{self, AtFlags, Mode, OFlags, ResolveFlags, Timestamps};
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, ResolveFlags, Timestamps};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, SocketFlags, SocketType};
 
@@ -870,54 +870,64 @@ struct OwnFrame {
 /// as it is. The entry the owner was stated for is gone, and giving its owner
 /// to whatever took the name would re-own an unrelated entry.
 ///
-/// The final component is never followed. A symbolic link is given its owner
-/// as the link it is, through a descriptor of the link. Anything else is opened
-/// without following and without waiting — a named pipe opens as readily as a
-/// file — and given its owner through that descriptor. Its mode is then put
-/// back as it was. A `chown` clears a file's setuid and setgid bits, and a
-/// setuid or setgid helper is the commonest file an owner is stated for. The
+/// The final component is never followed. The name is opened `O_PATH`, which
+/// opens anything without acting on it, and held to the recorded identity
+/// before anything else is done, so a socket, a device, or an overlay whiteout
+/// that took the name is left alone rather than opened. The entry is given its
+/// owner through that descriptor, as the thing it is: a symbolic link as the
+/// link, a pipe without waiting on it.
+///
+/// A `chown` clears a regular file's setuid and setgid bits, and a setuid or
+/// setgid helper is the commonest file an owner is stated for, so a regular
+/// file is opened again for reading, held to the identity once more, and its
+/// mode put back as it was through that descriptor. So is a directory: the
 /// kernel keeps a directory's set-group-ID bit, but a filesystem that cleared
-/// it would change what new entries beneath the directory inherit.
+/// it would change what new entries beneath the directory inherit. Nothing else
+/// loses a mode bit to a `chown`.
 fn own_at(root: &OwnedFd, path: &mut [u8], owner: &OwnFrame) -> Result<(), (CopyStep, Errno)> {
     let (dir, leaf) = parent_in_root(root, path, CopyStep::Own)?;
     let dir = dir.as_ref().map_or(root.as_fd(), AsFd::as_fd);
     let uid = Some(rustix::fs::Uid::from_raw(owner.uid));
     let gid = Some(rustix::fs::Gid::from_raw(owner.gid));
-    let opened = fs::openat(
+    let held = match fs::openat(
+        dir,
+        leaf,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(held) => held,
+        Err(Errno::NOENT | Errno::NOTDIR) => return Ok(()),
+        Err(errno) => return Err((CopyStep::Own, errno)),
+    };
+    let stat = fs::fstat(&held).map_err(|errno| (CopyStep::Own, errno))?;
+    if !is_entry(&stat, owner) {
+        return Ok(());
+    }
+    if !matches!(
+        FileType::from_raw_mode(stat.st_mode),
+        FileType::RegularFile | FileType::Directory
+    ) {
+        return fs::chownat(&held, c"", uid, gid, AtFlags::EMPTY_PATH)
+            .map_err(|errno| (CopyStep::Chown, errno));
+    }
+    let entry = match fs::openat(
         dir,
         leaf,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
-    );
-    match opened {
-        Ok(entry) => {
-            let stat = fs::fstat(&entry).map_err(|errno| (CopyStep::Own, errno))?;
-            if !is_entry(&stat, owner) {
-                return Ok(());
-            }
-            fs::fchown(&entry, uid, gid).map_err(|errno| (CopyStep::Chown, errno))?;
-            fs::fchmod(&entry, Mode::from_bits_truncate(stat.st_mode & 0o7777))
-                .map_err(|errno| (CopyStep::Metadata, errno))
-        }
-        // What `O_NOFOLLOW` answers for a symbolic link.
-        Err(Errno::LOOP) => {
-            let link = fs::openat(
-                dir,
-                leaf,
-                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|errno| (CopyStep::Own, errno))?;
-            let stat = fs::fstat(&link).map_err(|errno| (CopyStep::Own, errno))?;
-            if !is_entry(&stat, owner) {
-                return Ok(());
-            }
-            fs::chownat(&link, c"", uid, gid, AtFlags::EMPTY_PATH)
-                .map_err(|errno| (CopyStep::Chown, errno))
-        }
-        Err(Errno::NOENT | Errno::NOTDIR) => Ok(()),
-        Err(errno) => Err((CopyStep::Own, errno)),
+    ) {
+        Ok(entry) => entry,
+        // Gone, or replaced by something else, since it was held.
+        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::NXIO) => return Ok(()),
+        Err(errno) => return Err((CopyStep::Own, errno)),
+    };
+    let stat = fs::fstat(&entry).map_err(|errno| (CopyStep::Own, errno))?;
+    if !is_entry(&stat, owner) {
+        return Ok(());
     }
+    fs::fchown(&entry, uid, gid).map_err(|errno| (CopyStep::Chown, errno))?;
+    fs::fchmod(&entry, Mode::from_bits_truncate(stat.st_mode & 0o7777))
+        .map_err(|errno| (CopyStep::Metadata, errno))
 }
 
 /// Whether `stat` is the entry `owner` was recorded for.
@@ -1543,6 +1553,20 @@ mod tests {
             consume_frames_in(dir.path(), &frames),
             Err((CopyStep::Chown, Errno::PERM)),
         );
+    }
+
+    #[test]
+    fn an_owned_socket_is_owned_without_being_opened() {
+        // A socket refuses an open for reading, so an entry is held to its
+        // identity, and given its owner, through a descriptor that opens
+        // anything.
+        let dir = Scratch::new("copyin-own-socket");
+        let socket = dir.join("socket");
+        let _bound = std::os::unix::net::UnixListener::bind(&socket).expect("the socket binds");
+        let (uid, gid) = own_ids();
+        let mut frames = own_frame(b"socket", uid, gid, &socket);
+        frames.push(COPY_END);
+        assert_eq!(consume_frames_in(dir.path(), &frames), Ok(()));
     }
 
     #[test]
