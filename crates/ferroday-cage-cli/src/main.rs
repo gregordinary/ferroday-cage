@@ -3396,7 +3396,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         base_env: None,
         // `None` like every other toggle, so a profile's setting survives. The
         // default is applied where the profile is known rather than here: see
-        // `stop_with_caller_default`.
+        // `stop_with_caller`.
         stop_with_caller: None,
         landlock: Vec::new(),
         landlock_net: Vec::new(),
@@ -5232,7 +5232,8 @@ fn parse_seconds(name: &str, value: &OsStr) -> Result<Duration, String> {
 }
 
 /// Whether to set the caller tie, and to what: the flag where one was given,
-/// `fcage`'s own default where neither the command line nor a profile said.
+/// The tie to `fcage`'s lifetime a launch runs with: the command line's, else
+/// the one a profile `fcage` trusts states, else on.
 ///
 /// The tie is on by default here, unlike in the library: `fcage` waits for the
 /// command and exits with it, so a sandbox that outlived the process is never
@@ -5245,8 +5246,13 @@ fn parse_seconds(name: &str, value: &OsStr) -> Result<Duration, String> {
 /// a profile's `stop-with-caller = false` would be overridden by a value its
 /// author never wrote, leaving a documented profile key unreachable through
 /// `fcage`.
-fn stop_with_caller_default(flag: Option<bool>, profile_states_it: bool) -> Option<bool> {
-    flag.or((!profile_states_it).then_some(true))
+///
+/// A restricted profile is not among what answers: the caller passes `None`
+/// for it. How long the command it confines may outlive `fcage` is the
+/// caller's to decide, and a `timeout 60 fcage --restricted-profile` would
+/// otherwise bound nothing.
+fn stop_with_caller(flag: Option<bool>, profile: Option<bool>) -> bool {
+    flag.or(profile).unwrap_or(true)
 }
 
 /// A `toml` error rendered as the body of one `fcage:` diagnostic.
@@ -5287,15 +5293,6 @@ const NETSTACK_TABLE: &str = "netstack";
 struct Profile {
     /// The sandbox it describes.
     builder: CageBuilder,
-    /// Whether it states `stop-with-caller`.
-    ///
-    /// Everything else `fcage` reconciles against its own flags it asks of the
-    /// builder. Whether the tie was stated is the one answer the builder does
-    /// not hold: it holds the tie's value, which reads the same whether the
-    /// profile wrote `false` or said nothing, and only the first stops
-    /// `fcage`'s own default from applying, as [`stop_with_caller_default`]
-    /// describes.
-    states_stop_with_caller: bool,
     /// The network stack its `[netstack]` table configures, which a
     /// `--netstack` run attaches.
     stack: Option<NetStackBuilder>,
@@ -5324,7 +5321,6 @@ fn load_profile(path: &Path, restricted: bool) -> Result<Profile, String> {
             toml_diagnostic(&err)
         )
     })?;
-    let states_stop_with_caller = table.contains_key("stop-with-caller");
     let stack = match table.remove(NETSTACK_TABLE) {
         None => None,
         Some(_) if restricted => {
@@ -5360,11 +5356,7 @@ fn load_profile(path: &Path, restricted: bool) -> Result<Profile, String> {
             )
         })?
     };
-    Ok(Profile {
-        builder,
-        states_stop_with_caller,
-        stack,
-    })
+    Ok(Profile { builder, stack })
 }
 
 /// Deletes the provisioned rootfs or the overlay upper at `dest`, under the
@@ -5587,13 +5579,11 @@ impl Launch {
     fn prepare(options: Options) -> Result<Launch, ExitCode> {
         let Profile {
             mut builder,
-            states_stop_with_caller: profile_sets_stop_with_caller,
             stack: profile_stack,
         } = match &options.profile {
             Some(path) => load_profile(path, options.profile_restricted).map_err(fail)?,
             None => Profile {
                 builder: Cage::builder(),
-                states_stop_with_caller: false,
                 stack: None,
             },
         };
@@ -5765,11 +5755,10 @@ impl Launch {
         if let Some(managed) = options.managed_mounts {
             builder = builder.managed_mounts(managed);
         }
-        if let Some(tie) =
-            stop_with_caller_default(options.stop_with_caller, profile_sets_stop_with_caller)
-        {
-            builder = builder.stop_with_caller(tie);
-        }
+        let stated = builder
+            .get_stop_with_caller()
+            .filter(|_| !options.profile_restricted);
+        builder = builder.stop_with_caller(stop_with_caller(options.stop_with_caller, stated));
         for (path, access) in options.landlock {
             builder = builder.landlock_fs(access, path);
         }
@@ -6567,9 +6556,7 @@ fn restriction_builder(options: &mut Options) -> Result<RestrictionBuilder, Stri
     if let Some(required) = options.cgroup_required {
         builder = builder.cgroup_required(required);
     }
-    if let Some(tie) = stop_with_caller_default(options.stop_with_caller, false) {
-        builder = builder.stop_with_caller(tie);
-    }
+    builder = builder.stop_with_caller(stop_with_caller(options.stop_with_caller, None));
     for (path, access) in std::mem::take(&mut options.landlock) {
         builder = builder.landlock_fs(access, path);
     }
@@ -8441,10 +8428,7 @@ mod tests {
         // profile is known.
         let options = parse_run(&["--rootfs", "/srv/alpine", "/bin/true"]).expect("it parses");
         assert_eq!(options.stop_with_caller, None);
-        assert_eq!(
-            stop_with_caller_default(options.stop_with_caller, false),
-            Some(true)
-        );
+        assert!(stop_with_caller(options.stop_with_caller, None));
         let options = parse_run(&[
             "--rootfs",
             "/srv/alpine",
@@ -8453,10 +8437,7 @@ mod tests {
         ])
         .expect("it parses");
         assert_eq!(options.stop_with_caller, Some(false));
-        assert_eq!(
-            stop_with_caller_default(options.stop_with_caller, false),
-            Some(false),
-        );
+        assert!(!stop_with_caller(options.stop_with_caller, None));
     }
 
     #[test]
@@ -8510,13 +8491,13 @@ mod tests {
         // every run state the tie, so a profile's `stop-with-caller = false`
         // was overridden by a value its author never wrote and the documented
         // key could not be reached through fcage at all.
-        assert_eq!(stop_with_caller_default(None, true), None);
+        assert!(!stop_with_caller(None, Some(false)));
         // A flag still wins over the profile, in both directions.
-        assert_eq!(stop_with_caller_default(Some(false), true), Some(false));
-        assert_eq!(stop_with_caller_default(Some(true), true), Some(true));
+        assert!(!stop_with_caller(Some(false), Some(true)));
+        assert!(stop_with_caller(Some(true), Some(false)));
 
-        // And the profile is read for the key, which is what tells "the
-        // profile said so" from "nothing said".
+        // The builder holds whether the profile stated the tie, which is what
+        // tells "the profile said so" from "nothing said".
         let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-profile-tie");
         let stated = dir.join("stated.toml");
         std::fs::write(
@@ -8525,13 +8506,41 @@ mod tests {
         )
         .expect("the profile is written");
         let loaded = load_profile(&stated, false).expect("the profile loads");
-        assert!(loaded.states_stop_with_caller);
+        assert_eq!(loaded.builder.get_stop_with_caller(), Some(false));
 
         let silent = dir.join("silent.toml");
         std::fs::write(&silent, "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\n")
             .expect("the profile is written");
         let loaded = load_profile(&silent, false).expect("the profile loads");
-        assert!(!loaded.states_stop_with_caller);
+        assert_eq!(loaded.builder.get_stop_with_caller(), None);
+    }
+
+    #[test]
+    fn a_restricted_profile_cannot_untie_the_sandbox_from_fcage() {
+        // How long the command a restricted profile confines may outlive fcage
+        // is the caller's to decide: `timeout 60 fcage --restricted-profile`
+        // must bound the command, whatever the profile states.
+        let dir = ferroday_cage_testkit::scratch::scratch_dir("fcage-restricted-tie");
+        let profile = dir.join("untied.toml");
+        std::fs::write(
+            &profile,
+            "rootfs = \"/tmp\"\ncommand = \"/bin/true\"\nstop-with-caller = false\n",
+        )
+        .expect("the profile is written");
+        let profile = profile.to_str().expect("a UTF-8 scratch path");
+        let tie = |args: &[&str]| {
+            Launch::prepare(*run_options(args))
+                .unwrap_or_else(|_| panic!("{args:?} composes"))
+                .builder
+                .get_stop_with_caller()
+        };
+        assert_eq!(tie(&["--restricted-profile", profile]), Some(true));
+        // The caller can untie it, and a trusted profile can.
+        assert_eq!(
+            tie(&["--restricted-profile", profile, "--no-stop-with-caller"]),
+            Some(false)
+        );
+        assert_eq!(tie(&["--profile", profile]), Some(false));
     }
 
     #[test]

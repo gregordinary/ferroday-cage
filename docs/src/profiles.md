@@ -514,7 +514,9 @@ it:
   outlived the process is never what a shell or a supervisor meant, and the tie
   is on unless something says otherwise. A profile stating the key is that
   something, so `stop-with-caller = false` holds — the flag still overrides
-  either way.
+  either way. A profile loaded with `--restricted-profile` is not: how long the
+  command it confines may outlive `fcage` is the caller's to decide, so the tie
+  is on unless the command line turns it off.
 - Hardening flags compose with a profile's `[hardening]` table. `--landlock-ro`,
   `--landlock-rw`, `--landlock-unix`, `--landlock-bind`, and `--landlock-connect`
   add grants to it. `--landlock-scope`, `--landlock-resolve-unix` and

@@ -157,8 +157,9 @@ responds to its own signals is application policy. The defined behavior:
   of its terminal lends nothing either. The sandbox is then a background group
   of the terminal, orphaned once the launch stage exits, so its reads of it
   fail. A `^C` reaches the caller's job rather than the sandbox: `fcage`'s
-  stop-with-caller tie ends the sandbox with `fcage`, and a library caller
-  decides for itself. A capturing launch, such as `Cage::output`, never takes
+  stop-with-caller tie, on unless its command line or a profile it trusts
+  turns it off, ends the sandbox with `fcage`, and a library caller decides
+  for itself. A capturing launch, such as `Cage::output`, never takes
   the terminal from its caller.
 - **The foreground comes back to the caller.** The wait that collects the
   outcome gives it back, and so does dropping the handle. A sandbox still

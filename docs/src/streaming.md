@@ -288,8 +288,9 @@ terminal, so the far end of a pipeline reads it as before. The sandbox is a
 background group of the terminal, orphaned once the launch stage exits, so its
 reads of the terminal fail. An
 interrupt, or a `^Z`, reaches the caller's job and not the sandbox. `fcage`
-ends the sandbox with itself, and a library caller decides what an interrupt
-means for the sandboxes it launched.
+ends the sandbox with itself, unless its command line or a profile it trusts
+unties them, and a library caller decides what an interrupt means for the
+sandboxes it launched.
 
 Without a PID namespace the command is in the caller's own process group. The
 caller's shell then manages it as it does any job.

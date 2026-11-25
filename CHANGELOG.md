@@ -63,6 +63,11 @@ consumer upgrading can skip it.
   The host's own root also hides the host's `/proc`, `/dev` or `/tmp` wherever
   the managed profile mounts none of its own there, and `reveal` takes such a
   hide back.
+- `fcage --restricted-profile` keeps the sandbox tied to `fcage` whatever the
+  profile states, unless the command line turns the tie off. A restricted
+  profile's `stop-with-caller = false` let the command it confines outlive
+  `fcage`, so a `timeout 60 fcage --restricted-profile ...` or a `^C` bounded
+  nothing.
 
 ### Added
 
@@ -192,6 +197,10 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- **Breaking.** `CageBuilder::get_stop_with_caller` returns `Option<bool>`, the
+  tie as stated, `None` where nothing stated it. A profile rendered from a
+  builder no longer writes `stop-with-caller = false` for a tie nobody stated,
+  which `fcage` then held to as the profile's own.
 - **Breaking.** `NetStack::forwards` takes the new `Transport`, TCP or UDP,
   beside the destination, since a destination rule can carry one transport and
   not the other.

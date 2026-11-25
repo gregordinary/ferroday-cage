@@ -2606,7 +2606,7 @@ pub fn ferroday_cage::CageBuilder::get_run_as(&self) -> core::option::Option<&fe
 pub fn ferroday_cage::CageBuilder::get_stderr(&self) -> &ferroday_cage::Stdio
 pub fn ferroday_cage::CageBuilder::get_stdin(&self) -> &ferroday_cage::Stdio
 pub fn ferroday_cage::CageBuilder::get_stdout(&self) -> &ferroday_cage::Stdio
-pub fn ferroday_cage::CageBuilder::get_stop_with_caller(&self) -> bool
+pub fn ferroday_cage::CageBuilder::get_stop_with_caller(&self) -> core::option::Option<bool>
 pub fn ferroday_cage::CageBuilder::hide(self, impl core::convert::AsRef<std::path::Path>) -> Self
 pub fn ferroday_cage::CageBuilder::host_rootfs(self) -> Self
 pub fn ferroday_cage::CageBuilder::hostname(self, impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self

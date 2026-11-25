@@ -1413,7 +1413,11 @@ pub struct CageBuilder {
     // through a render-and-reload cycle.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     base_env: Option<bool>,
-    stop_with_caller: bool,
+    // `Option` for the same reason again, and because a consumer whose own
+    // default differs from the library's, as `fcage`'s does, applies it only
+    // where nothing stated the tie.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    stop_with_caller: Option<bool>,
     path_lookup: bool,
     // The identity fields sit between the scalars and the tables. The presented
     // identity is always a string and the run-as identity always a table, and
@@ -1545,7 +1549,7 @@ impl Default for CageBuilder {
             resolv_conf: None,
             nameservers: Vec::new(),
             base_env: None,
-            stop_with_caller: false,
+            stop_with_caller: None,
             path_lookup: false,
             present_as: None,
             identity_map: IdentityMap::Single,
@@ -2073,7 +2077,7 @@ impl CageBuilder {
     ///
     /// [`KillHandle`]: crate::KillHandle
     pub fn stop_with_caller(mut self, tie: bool) -> Self {
-        self.stop_with_caller = tie;
+        self.stop_with_caller = Some(tie);
         self
     }
 
@@ -2854,8 +2858,14 @@ impl CageBuilder {
         &self.stderr
     }
 
-    /// Whether the sandbox's lifetime is tied to the caller's.
-    pub fn get_stop_with_caller(&self) -> bool {
+    /// The tie to the caller's lifetime as stated: `Some` where
+    /// [`stop_with_caller`](Self::stop_with_caller) or a profile's
+    /// `stop-with-caller` set it, and `None` where nothing did, which a launch
+    /// reads as no tie.
+    ///
+    /// A consumer whose own default differs, as `fcage`'s does, applies it
+    /// where this is `None`.
+    pub fn get_stop_with_caller(&self) -> Option<bool> {
         self.stop_with_caller
     }
 
@@ -3327,7 +3337,7 @@ impl CageBuilder {
                 // The session follows standard input alone: it is the stream
                 // whose inheritance carries the caller's session with it.
                 own_session: !matches!(self.stdin, Stdio::Inherit),
-                stop_with_caller: self.stop_with_caller,
+                stop_with_caller: self.stop_with_caller.unwrap_or(false),
                 hostname,
                 configure_loopback,
                 network: self.network,
@@ -9595,7 +9605,7 @@ read-only = true
         assert_eq!(builder.mount_dev, Some(false));
         assert_eq!(builder.mount_tmp, Some(true));
         assert_eq!(builder.resolv_conf, Some(false));
-        assert!(builder.stop_with_caller);
+        assert_eq!(builder.stop_with_caller, Some(true));
         assert_eq!(builder.env.len(), 2);
         // Three mounts in one sequence, and the profile's declaration order is
         // preserved: the raw mount sits between the two binds.
@@ -9656,7 +9666,11 @@ read-only = true
         assert!(builder.get_managed_mounts() && builder.get_base_env());
         assert_eq!(builder.network, Network::Isolated);
         assert!(matches!(builder.stdin, Stdio::Inherit));
-        assert!(!builder.stop_with_caller);
+        assert_eq!(builder.stop_with_caller, None);
+        // And rendered, the unstated tie stays unstated, so a consumer whose
+        // own default differs still applies it to the reloaded profile.
+        let rendered = toml::to_string(&builder).unwrap();
+        assert!(!rendered.contains("stop-with-caller"), "{rendered}");
     }
 
     /// `get_resolv_conf` is a consumer-facing opt-out signal, not only an
