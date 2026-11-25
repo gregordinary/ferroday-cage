@@ -123,6 +123,52 @@ pub(super) fn account_dates(tree: &Rooted, beneath: Option<&Rooted>) -> Result<D
     Ok(dates)
 }
 
+/// What tells one version of the accounts file at `path`, as the root sees it
+/// ([`read_accounts`]), from another: the layer that holds it, and the file's
+/// device, inode, size and change time; `None` where the root holds none.
+///
+/// For a caller that keeps what it read of the file and asks again later
+/// whether that still stands. A write to the file changes its change time, and
+/// a file put in its place, or a layer that now holds or hides one, changes
+/// the rest. Two files of one size written within one tick of the file
+/// system's clock, the second at the inode the first freed, read as one.
+pub(super) fn version(
+    tree: &Rooted,
+    beneath: Option<&Rooted>,
+    path: &str,
+) -> Result<Option<Version>, Failure> {
+    let layers: Vec<&Rooted> = std::iter::once(tree).chain(beneath).collect();
+    let merged = merged_lookup(&layers, Path::new(path), AncestorLink::PassesDown)
+        .map_err(Failure::at("inspecting the accounts", tree, path))?;
+    let Merged::Entry { layer } = merged else {
+        return Ok(None);
+    };
+    let holder = layers[layer];
+    let stat = holder
+        .stat(path)
+        .map_err(Failure::at("inspecting the accounts", holder, path))?;
+    Ok(stat.map(|stat| Version {
+        layer,
+        identity: [
+            i128::from(stat.st_dev),
+            i128::from(stat.st_ino),
+            i128::from(stat.st_size),
+            i128::from(stat.st_ctime),
+            i128::from(stat.st_ctime_nsec),
+        ],
+    }))
+}
+
+/// One version of an accounts file; see [`version`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Version {
+    /// The layer that holds the file.
+    layer: usize,
+    /// Its device, inode, size, and change time in seconds and nanoseconds,
+    /// each widened to one type, since their own types differ by architecture.
+    identity: [i128; 5],
+}
+
 /// The id each name in the accounts file at `path` is given, as the root sees
 /// the file ([`read_accounts`]): the tree's, or where the tree holds none and
 /// hides none, the one beneath it in a layered build. `path` is one of

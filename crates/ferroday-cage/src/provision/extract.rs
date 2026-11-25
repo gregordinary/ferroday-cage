@@ -44,6 +44,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use rustix::fs::Timespec;
 use rustix::fs::{
@@ -227,7 +228,18 @@ struct ListIds<'a> {
     root: &'a Path,
     /// The base the root is an overlay upper over, where it is one.
     lower: Option<&'a Path>,
+    /// The accounts last read, and the versions of the two files they were
+    /// read from: an archive can carry many entries whose lists name
+    /// accounts, and each file can be sixteen mebibytes.
+    accounts: RefCell<Option<(Versions, Rc<Accounts>)>>,
 }
+
+/// The id each user name, and each group name, is given in a root.
+type Accounts = (AccountIds, AccountIds);
+
+/// The versions of a root's `/etc/passwd` and `/etc/group` that a reading of
+/// [`Accounts`] stands for.
+type Versions = [Option<accounts::Version>; 2];
 
 /// What an entry's records give one of its lists, read and resolved.
 enum Stated {
@@ -245,6 +257,7 @@ impl ListIds<'_> {
             resolved: OnceCell::new(),
             root,
             lower,
+            accounts: RefCell::new(None),
         }
     }
 
@@ -292,7 +305,8 @@ impl ListIds<'_> {
             return Ok(Stated::Nothing);
         };
         let resolved = if text.names_anyone() {
-            let (users, groups) = self.accounts()?;
+            let accounts = self.accounts()?;
+            let (users, groups) = &*accounts;
             text.resolve(
                 |name| users.get(name).copied(),
                 |name| groups.get(name).copied(),
@@ -307,7 +321,10 @@ impl ListIds<'_> {
 
     /// The id each name in the root's `/etc/passwd`, and each in its
     /// `/etc/group`, is given there, as the root stands now.
-    fn accounts(&self) -> Result<(AccountIds, AccountIds), ProvisionError> {
+    ///
+    /// Read again only where either file is not the version last read, which
+    /// an archive that carries the files changes when it writes them.
+    fn accounts(&self) -> Result<Rc<Accounts>, ProvisionError> {
         let reading = |op: &'static str, path: &Path| {
             let path = path.to_path_buf();
             move |err: io::Error| ProvisionError::io(op, &path, err)
@@ -317,12 +334,21 @@ impl ListIds<'_> {
             .lower
             .map(|lower| Rooted::open(lower).map_err(reading("opening", lower)))
             .transpose()?;
-        let [passwd, group] = accounts::ACCOUNTS;
-        let ids = |file: &str| {
-            accounts::ids(&tree, beneath.as_ref(), file)
-                .map_err(|failure| ProvisionError::io(failure.op, &failure.path, failure.source))
+        let failed = |failure: accounts::Failure| {
+            ProvisionError::io(failure.op, &failure.path, failure.source)
         };
-        Ok((ids(passwd)?, ids(group)?))
+        let [passwd, group] = accounts::ACCOUNTS;
+        let version = |file: &str| accounts::version(&tree, beneath.as_ref(), file).map_err(failed);
+        let versions = [version(passwd)?, version(group)?];
+        if let Some((read, accounts)) = &*self.accounts.borrow()
+            && *read == versions
+        {
+            return Ok(Rc::clone(accounts));
+        }
+        let ids = |file: &str| accounts::ids(&tree, beneath.as_ref(), file).map_err(failed);
+        let accounts = Rc::new((ids(passwd)?, ids(group)?));
+        *self.accounts.borrow_mut() = Some((versions, Rc::clone(&accounts)));
+        Ok(accounts)
     }
 }
 
@@ -2576,6 +2602,51 @@ mod list_tests {
                 (0x10, 6, NONE),
                 (0x20, 0, NONE),
             ])),
+        );
+    }
+
+    #[test]
+    fn accounts_an_archive_rewrites_answer_the_entries_after_them() {
+        // The accounts are read once and kept while the files stand as they
+        // were read. An archive that lays down a new `/etc/passwd` part way
+        // through has the entries after it answered from the new one.
+        let root = Scratch::for_test("extract", "text-lists-rewritten");
+        if !xattr::holds_acls(&root) {
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
+            return;
+        }
+        let caller = rustix::process::geteuid().as_raw();
+        let text = |named: &str| {
+            format!("user::rw-\nuser:{named}:rw-\ngroup::---\nmask::rw-\nother::---\n").into_bytes()
+        };
+        let mut tar = Tar::new();
+        tar.dir("etc", 0o755)
+            .file("etc/passwd", 0o644, b"admin:x:0:0::/root:/bin/sh\n")
+            .file("etc/group", 0o644, b"admin:x:0:\n");
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("late")));
+        tar.file("before", 0o660, b"x");
+        tar.file(
+            "etc/passwd",
+            0o644,
+            b"admin:x:0:0::/root:/bin/sh\nlate:x:0:0::/:/bin/sh\n",
+        );
+        pax(&mut tar, &pax_record(b"SCHILY.acl.access", &text("late")));
+        tar.file("after", 0o660, b"x");
+        extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect("the archive extracts");
+
+        assert_eq!(
+            xattr::get(&root.join("before"), "system.posix_acl_access"),
+            Some(unnamed()),
+        );
+        assert_eq!(
+            xattr::get(&root.join("after"), "system.posix_acl_access"),
+            Some(masked(caller)),
         );
     }
 

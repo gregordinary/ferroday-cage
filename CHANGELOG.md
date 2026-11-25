@@ -501,6 +501,10 @@ consumer upgrading can skip it.
   stack of its own. It made a call per switch, so a chain of versioned
   dependencies only the named release carries, as long as an index made it,
   overflowed the thread's stack.
+- Extraction reads a root's `/etc/passwd` and `/etc/group` once for the entries
+  whose access control lists name accounts, and again only when the archive
+  changes either file. It read and parsed both files for each such entry, so an
+  archive of many of them over sixteen-mebibyte account files took minutes.
 
 ### Internal
 
