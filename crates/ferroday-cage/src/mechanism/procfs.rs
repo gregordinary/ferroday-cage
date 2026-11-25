@@ -27,7 +27,7 @@ use rustix::io::Errno;
 use rustix::mount::{self, MountAttrFlags, MountPropagationFlags};
 use rustix::thread::UnshareFlags;
 
-use super::child::{MapDuty, MapPaths, attach, enter_mapped_namespace, fresh_mount};
+use super::child::{HOST_PROCFS, MapDuty, attach, enter_mapped_namespace, fresh_mount};
 use super::{FreshFs, sys};
 
 /// The outcome of the procfs probe.
@@ -100,7 +100,7 @@ fn probe_child(uid_line: &[u8], gid_line: &[u8]) -> i32 {
     // a process inside one, which `unshare` gives the next child alone. The
     // probe keeps no descriptor.
     let duty = MapDuty::Write {
-        paths: MapPaths::SELF,
+        procfs: HOST_PROCFS,
         uid_line,
         gid_line,
     };

@@ -130,6 +130,18 @@ consumer upgrading can skip it.
   mount, which `mount(2)` makes by path, is opened again by name from the
   nearest mount above it once it is made, and is covered as long as nothing
   renames that path in the same moment.
+- An identity map is written only through a procfs, into files opened beneath
+  it. The sandbox's init, writing a command's nested map under a range map,
+  writes through the descriptor of the procfs the mount profile made, which it
+  keeps from that mount, where it opened the procfs's path again once the
+  profile was in place. A process writing a root two sandboxes share could
+  rename that procfs's mount point and leave a directory of its own at the path,
+  whose map files then took the map's bytes and left the command without its
+  map. Every writer now refuses a directory that is not a procfs, with
+  `EMEDIUMTYPE`, and opens each map file beneath it without crossing a mount or
+  following a magic link: the init, the launch stage outside a sandbox without a
+  PID namespace, a command writing its own nested map, a further command joining
+  a sandbox, and every helper process that maps itself.
 
 ### Added
 

@@ -4226,12 +4226,8 @@ fn build_nested_plan(
         // procfs serves: a process writing its own map reaches it through
         // `self`, which every instance resolves for its reader.
         IdentityPlan::Single => {
-            let procfs_target =
+            let (_, procfs_target) =
                 visible_procfs(ops, false).ok_or_else(|| procfs_refusal(ops, false))?;
-            // The map files as the command names them after the pivot:
-            // absolute, under the profile's own procfs target.
-            let under_procfs =
-                |leaf: &str| cstring(sandbox_path(procfs_target).join(leaf).as_os_str());
             // The one extent names the sandbox's root, the writer's own id,
             // as the command is to see it: 0, or the presented identity.
             let (uid, gid) = present_as.map_or((0, 0), |presented| (presented.uid, presented.gid));
@@ -4244,9 +4240,9 @@ fn build_nested_plan(
             };
             (
                 NestedMap::SelfWritten {
-                    setgroups_path: under_procfs("self/setgroups")?,
-                    gid_map_path: under_procfs("self/gid_map")?,
-                    uid_map_path: under_procfs("self/uid_map")?,
+                    // The procfs as the command names it after the pivot:
+                    // absolute, at the profile's own procfs target.
+                    procfs: cstring(sandbox_path(procfs_target).as_os_str())?,
                 },
                 root(uid),
                 root(gid),
@@ -4258,17 +4254,14 @@ fn build_nested_plan(
             // instance: the delegate names the command's map files by the pid
             // its `fork` returned, an in-namespace pid a bound procfs from
             // outside does not index. See `procfs_op_target`.
-            let procfs_target = if pid_namespace {
-                Some(
-                    visible_procfs(ops, true)
-                        .ok_or_else(|| procfs_refusal(ops, true))?
-                        .to_owned(),
-                )
+            let procfs_op = if pid_namespace {
+                let (op, _) = visible_procfs(ops, true).ok_or_else(|| procfs_refusal(ops, true))?;
+                Some(op)
             } else {
                 None
             };
             (
-                NestedMap::Delegated { procfs_target },
+                NestedMap::Delegated { procfs_op },
                 idmap::reflect_inside(map.uid()),
                 idmap::reflect_inside(map.gid()),
             )
@@ -4282,8 +4275,9 @@ fn build_nested_plan(
     })
 }
 
-/// The rootfs-relative target of the procfs the sandbox ends up with, or `None`
-/// when the profile mounts none the nested map can be established through.
+/// The op that mounts the procfs the sandbox ends up with, and its
+/// rootfs-relative target, or `None` when the profile mounts none the nested
+/// map can be established through.
 ///
 /// The ops execute in order, so a later mount can hide an earlier one; the scan
 /// follows the same order and drops a procfs another mount comes to rest on top
@@ -4294,7 +4288,7 @@ fn build_nested_plan(
 /// tree it finds onto itself, a procfs within it included. Either can still
 /// make a procfs unusable, by leaving it read-only, and one that does drops it
 /// as a cover would.
-fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<&CStr> {
+fn visible_procfs(ops: &[MountOp], needs_fresh: bool) -> Option<(usize, &CStr)> {
     standing_procfs(ops, needs_fresh, Writable::Required)
 }
 
@@ -4313,7 +4307,7 @@ enum Writable {
 /// count, and the plain refusal otherwise.
 fn procfs_refusal(ops: &[MountOp], needs_fresh: bool) -> ConfigError {
     match standing_procfs(ops, needs_fresh, Writable::Ignored) {
-        Some(target) => ConfigError::NestedUsernsProcfsReadOnly {
+        Some((_, target)) => ConfigError::NestedUsernsProcfsReadOnly {
             target: sandbox_path(target),
         },
         None => ConfigError::NestedUsernsNeedsProcfs,
@@ -4321,9 +4315,13 @@ fn procfs_refusal(ops: &[MountOp], needs_fresh: bool) -> ConfigError {
 }
 
 /// The search behind [`visible_procfs`] and [`procfs_refusal`]: the last
-/// procfs candidate no later mount comes to rest on, with `writable` deciding
-/// whether a read-only one counts.
-fn standing_procfs(ops: &[MountOp], needs_fresh: bool, writable: Writable) -> Option<&CStr> {
+/// procfs candidate no later mount comes to rest on, and its op's index, with
+/// `writable` deciding whether a read-only one counts.
+fn standing_procfs(
+    ops: &[MountOp],
+    needs_fresh: bool,
+    writable: Writable,
+) -> Option<(usize, &CStr)> {
     // Walked backwards, because what is wanted is the *last* one still visible:
     // a candidate qualifies when nothing after it comes to rest on top of it.
     // Carrying only the most recent candidate forward instead would report no
@@ -4344,7 +4342,7 @@ fn standing_procfs(ops: &[MountOp], needs_fresh: bool, writable: Writable) -> Op
             .any(|(over, _)| covers(over, target));
         let read_only = writable == Writable::Required && left_read_only(later, target);
         if !covered && !read_only {
-            return Some(target);
+            return Some((at, target));
         }
     }
     None
@@ -7602,12 +7600,12 @@ mod tests {
             .build()
             .expect("the first procfs is still visible");
         let nested = cage.plan.nested.as_ref().expect("a container nests");
-        let crate::mechanism::NestedMap::SelfWritten { uid_map_path, .. } = &nested.map else {
+        let crate::mechanism::NestedMap::SelfWritten { procfs } = &nested.map else {
             panic!("this tier writes its own map: {:?}", nested.map);
         };
-        // Composed from the procfs that is still standing, not from the one
-        // the tmpfs came to rest on.
-        assert_eq!(uid_map_path.to_bytes(), b"/proc/self/uid_map");
+        // The procfs that is still standing, not the one the tmpfs came to
+        // rest on.
+        assert_eq!(procfs.to_bytes(), b"/proc");
     }
 
     #[test]
@@ -7894,9 +7892,7 @@ mod tests {
         let nested = cage.plan.nested.as_ref().expect("a container nests");
         assert!(matches!(
             nested.map,
-            crate::mechanism::NestedMap::Delegated {
-                procfs_target: None
-            },
+            crate::mechanism::NestedMap::Delegated { procfs_op: None },
         ));
     }
 

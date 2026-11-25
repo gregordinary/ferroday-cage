@@ -83,8 +83,8 @@ process creates a gate immediately before it forks the command, writes the map
 when the command signals that it has unshared, and releases it. No delegate of
 the caller's is involved, and the `IdMapper` seam below is not consulted.
 
-The map files are reached by path, so establishing the nested map generally
-requires a procfs, and a profile that mounts none is refused at `build` with
+The map files are reached through a procfs, so establishing the nested map
+generally requires one, and a profile that mounts none is refused at `build` with
 `ConfigError::NestedUsernsNeedsProcfs`. The managed profile mounts one by
 default, so this arises only for a profile that opts out of the managed mounts
 and supplies no procfs of its own. The map files are written, and named from

@@ -208,9 +208,14 @@ The map is established the same way the sandbox's own is. It is written in
 process under the single-identity map, and by a delegate under a [range
 map](identity-maps.md). The delegate here is the sandbox init rather than the
 caller, since only a process inside the sandbox's namespace is root of it. It is
-reached through a procfs, by path, which is why a sandbox that mounts none is
-refused at build time — except where the delegate is outside the sandbox and
-reads the host's own, which [Identity maps](identity-maps.md) sets out.
+reached through a procfs, which is why a sandbox that mounts none is refused at
+build time — except where the delegate is outside the sandbox and reads the
+host's own, which [Identity maps](identity-maps.md) sets out. The delegate
+writes through the procfs the profile mounted, by the descriptor the init kept
+of it; a command writing its own map opens the procfs by its path. Either way
+the launch refuses a directory that is not a procfs, and opens the map files
+beneath it without crossing a mount or following a magic link, so nothing put at
+the procfs's path takes the map's bytes in its place.
 
 The entry sits where it does because the kernel re-derives the whole credential
 for a new user namespace: securebits return to their defaults, the capability

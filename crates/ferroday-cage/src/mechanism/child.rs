@@ -317,14 +317,7 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // on the mount namespace this stage shares with it and would change what
     // the path resolves to, and before a join, which changes it the same way.
     let procfs = if context.supervised_outside() && delegates_nested_map(context) {
-        Some(
-            rustix::fs::open(
-                c"/proc",
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|errno| (SetupStep::OpenSandboxProcfs, errno, 0))?,
-        )
+        Some(open_procfs(HOST_PROCFS).map_err(|errno| (SetupStep::OpenSandboxProcfs, errno, 0))?)
     } else {
         None
     };
@@ -1464,8 +1457,11 @@ fn await_proceed(fd: BorrowedFd<'_>) -> Result<(), (SetupStep, Errno)> {
 pub(super) enum MapDuty<'a> {
     /// Write the single-identity map in process.
     Write {
-        /// Where the writing process's own map files are.
-        paths: MapPaths<'a>,
+        /// The procfs the writing process reaches its own map files through,
+        /// by `self`: the host's at [`HOST_PROCFS`], or, for the nested user
+        /// namespace a command enters after the root swap, wherever the mount
+        /// profile put one.
+        procfs: &'a CStr,
         /// The `uid_map` line.
         uid_line: &'a [u8],
         /// The `gid_map` line.
@@ -1476,31 +1472,9 @@ pub(super) enum MapDuty<'a> {
     Await,
 }
 
-/// Where a process finds the files that establish its own user namespace's
-/// identity map.
-///
-/// Named rather than hardcoded because the nested user namespace a command
-/// enters is mapped after the root swap, where the procfs is wherever the mount
-/// profile put it. Every other caller writes through the host's `/proc`, which
-/// [`SELF`](MapPaths::SELF) names.
-#[derive(Clone, Copy)]
-pub(super) struct MapPaths<'a> {
-    /// The `setgroups` file, written `deny` before the gid map.
-    pub(super) setgroups: &'a CStr,
-    /// The `gid_map` file.
-    pub(super) gid_map: &'a CStr,
-    /// The `uid_map` file.
-    pub(super) uid_map: &'a CStr,
-}
-
-impl MapPaths<'static> {
-    /// The writing process's own map files, through the procfs at `/proc`.
-    pub(super) const SELF: MapPaths<'static> = MapPaths {
-        setgroups: c"/proc/self/setgroups",
-        gid_map: c"/proc/self/gid_map",
-        uid_map: c"/proc/self/uid_map",
-    };
-}
+/// The host's procfs, where a process that has not swapped its root reaches
+/// its own map files.
+pub(super) const HOST_PROCFS: &CStr = c"/proc";
 
 /// A step of a child's entry into a user namespace of its own.
 ///
@@ -1606,15 +1580,17 @@ pub(super) fn establish_map(
 ) -> Result<(), MapFailure> {
     match duty {
         MapDuty::Write {
-            paths,
+            procfs,
             uid_line,
             gid_line,
         } => {
-            write_file(paths.setgroups, b"deny")
+            let procfs = open_procfs(procfs)
                 .map_err(|errno| MapFailure::Step(MapStep::DenySetgroups, errno))?;
-            write_file(paths.gid_map, gid_line)
+            write_in_procfs(procfs.as_fd(), c"self/setgroups", b"deny")
+                .map_err(|errno| MapFailure::Step(MapStep::DenySetgroups, errno))?;
+            write_in_procfs(procfs.as_fd(), c"self/gid_map", gid_line)
                 .map_err(|errno| MapFailure::Step(MapStep::WriteGidMap, errno))?;
-            write_file(paths.uid_map, uid_line)
+            write_in_procfs(procfs.as_fd(), c"self/uid_map", uid_line)
                 .map_err(|errno| MapFailure::Step(MapStep::WriteUidMap, errno))?;
         }
         MapDuty::Await => {
@@ -1651,7 +1627,7 @@ fn establish_identity_map(context: &Context<'_>) -> Result<(), Failure> {
         // Stage A has not swapped its root, so the host's `/proc` is the one
         // its own map files are under.
         MapDuty::Write {
-            paths: MapPaths::SELF,
+            procfs: HOST_PROCFS,
             uid_line: context.uid_line,
             gid_line: context.gid_line,
         }
@@ -1702,18 +1678,11 @@ fn enter_nested_namespace(context: &Context<'_>, gate: Option<OwnedFd>) -> Resul
         .map_err(|errno| (SetupStep::NestedUnshare, errno, 0))?;
 
     let duty = match &nested.map {
-        super::NestedMap::SelfWritten {
-            setgroups_path,
-            gid_map_path,
-            uid_map_path,
-        } => MapDuty::Write {
-            // The root was swapped before this stage ran, so the map files are
-            // named through the procfs the mount profile established.
-            paths: MapPaths {
-                setgroups: setgroups_path.as_c_str(),
-                gid_map: gid_map_path.as_c_str(),
-                uid_map: uid_map_path.as_c_str(),
-            },
+        super::NestedMap::SelfWritten { procfs } => MapDuty::Write {
+            // The root was swapped before this stage ran, or the stage joined a
+            // sandbox whose root is, so the map files are reached through the
+            // procfs the mount profile established.
+            procfs,
             uid_line: &nested.uid_lines,
             gid_line: &nested.gid_lines,
         },
@@ -1805,21 +1774,20 @@ fn delegates_nested_map(context: &Context<'_>) -> bool {
     )
 }
 
-/// The rootfs-relative procfs target a delegate inside the sandbox writes the
-/// command's map files through, or `None` where this stage is not that
-/// delegate.
+/// The mount op whose procfs a delegate inside the sandbox writes the command's
+/// map files through, or `None` where this stage is not that delegate.
 ///
 /// Only a delegated map inside a PID namespace has its delegate in here; a
 /// self-written map has no delegate at all, and a delegated map without a PID
 /// namespace is written by the launch stage, outside, through the host's own
-/// `/proc`. The build composes a target for that one case and for no other, so
-/// a `None` here is the same condition as the build having required no procfs.
-fn nested_procfs_target<'a>(context: &'a Context<'_>) -> Option<&'a CStr> {
+/// `/proc`. The build names an op for that one case and for no other, so a
+/// `None` here is the same condition as the build having required no procfs.
+fn nested_procfs_op(context: &Context<'_>) -> Option<usize> {
     if !context.plan.pid_namespace {
         return None;
     }
     match &context.plan.nested.as_ref()?.map {
-        super::NestedMap::Delegated { procfs_target } => procfs_target.as_deref(),
+        super::NestedMap::Delegated { procfs_op } => *procfs_op,
         super::NestedMap::SelfWritten { .. } => None,
     }
 }
@@ -1890,14 +1858,54 @@ fn delegate_nested_map(
 /// Writes one of another process's identity-map files, addressed relative to a
 /// descriptor for the procfs that indexes it.
 fn write_map_file(procfs: BorrowedFd<'_>, pid: u32, file: &[u8], data: &[u8]) -> Result<(), Errno> {
-    let path = map_file_path(pid, file);
-    let fd = fs::openat(
-        procfs,
-        path.as_cstr(),
-        OFlags::WRONLY | OFlags::CLOEXEC,
+    write_in_procfs(procfs, map_file_path(pid, file).as_cstr(), data)
+}
+
+/// Opens the procfs at `path`, refusing anything that is not one: what an
+/// identity map is written through.
+///
+/// A map file the kernel does not provide accepts the map's bytes as readily as
+/// a real one, and the map is then not in force: a directory of a root two
+/// sandboxes share, put where the procfs was mounted, holds whatever another
+/// process wrote there. The descriptor is checked to be a procfs, and every
+/// file is opened beneath it with [`write_in_procfs`]. `EMEDIUMTYPE` refuses
+/// another filesystem.
+pub(super) fn open_procfs(path: &CStr) -> Result<OwnedFd, Errno> {
+    let procfs = fs::open(
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    frame::write_whole(fd.as_fd(), data)
+    ensure_procfs(procfs.as_fd())?;
+    Ok(procfs)
+}
+
+/// Refuses, with `EMEDIUMTYPE`, a descriptor that is not of a procfs.
+fn ensure_procfs(procfs: BorrowedFd<'_>) -> Result<(), Errno> {
+    match fs::fstatfs(procfs)?.f_type == fs::PROC_SUPER_MAGIC {
+        true => Ok(()),
+        false => Err(Errno::MEDIUMTYPE),
+    }
+}
+
+/// Opens `path` beneath the procfs `procfs` names and writes `data` in a
+/// single `write`, on the terms [`frame::write_whole`] states for the
+/// identity-map files.
+///
+/// The open stays beneath the procfs (`RESOLVE_BENEATH`), crosses no mount
+/// (`RESOLVE_NO_XDEV`), so no file bound over a map file stands in for it, and
+/// follows no magic link (`RESOLVE_NO_MAGICLINKS`). An ordinary link is
+/// followed, since a process's own files are reached through `self`, which in
+/// a procfs is the kernel's link to the reader's own entry.
+fn write_in_procfs(procfs: BorrowedFd<'_>, path: &CStr, data: &[u8]) -> Result<(), Errno> {
+    let file = resolve::openat2(
+        procfs,
+        path,
+        OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
+    )?;
+    frame::write_whole(file.as_fd(), data)
 }
 
 /// The [`SetupStep`] a launch reports for a shared map step.
@@ -1919,11 +1927,11 @@ fn setup_step(step: MapStep) -> SetupStep {
 ///
 /// Returns a descriptor for the sandbox's procfs when this stage is the
 /// delegate for the command's nested identity map, and `None` otherwise. It is
-/// opened here, through the new-root descriptor and with the same
-/// `RESOLVE_IN_ROOT` discipline every mount target gets, because here is the
-/// last moment at which nothing else could be mounted over it: the command does
-/// not exist yet, and once it does it shares this mount namespace until it
-/// unshares one of its own.
+/// the descriptor of the procfs the mount profile made, which the setup keeps
+/// from the moment it is mounted, so nothing put at the procfs's path later,
+/// within the launch or by a process sharing the root, stands in for it. A
+/// procfs a raw mount made is opened again by name once it is mounted, as
+/// every raw mount the setup needs again is; see [`execute_op`].
 fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     let plan = context.plan;
 
@@ -2011,10 +2019,12 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     // mounted is kept, in the slot the caller allocated for it, while a later
     // step still resolves beneath it, and a hidden directory's tmpfs until
     // nothing more is made in it.
+    let procfs_op = nested_procfs_op(context);
     let profile = Profile {
         root: newroot.as_fd(),
         ops: &plan.ops,
         slots: context.mounts,
+        procfs: procfs_op,
     };
     for index in 0..plan.ops.len() {
         execute_op(&profile, index, context.report_fd)
@@ -2022,14 +2032,20 @@ fn setup_sandbox(context: &Context<'_>) -> Result<Option<OwnedFd>, Failure> {
     }
 
     // The procfs the command's nested identity map will be written through,
-    // opened only where this stage is the delegate for it. The mount profile
+    // taken only where this stage is the delegate for it. The mount profile
     // has just established it, and the build refused a profile that establishes
     // none for a configuration that reaches here.
-    let procfs = match nested_procfs_target(context) {
-        Some(target) => Some(
-            open_in_root(newroot.as_fd(), target, OFlags::RDONLY | OFlags::DIRECTORY)
-                .map_err(|errno| (SetupStep::OpenSandboxProcfs, errno, 0))?,
-        ),
+    let procfs = match procfs_op {
+        Some(op) => {
+            let procfs = context
+                .mounts
+                .get(op)
+                .and_then(|slot| slot.mount.take())
+                .ok_or((SetupStep::OpenSandboxProcfs, Errno::BADF, 0))?;
+            ensure_procfs(procfs.as_fd())
+                .map_err(|errno| (SetupStep::OpenSandboxProcfs, errno, 0))?;
+            Some(procfs)
+        }
         None => None,
     };
 
@@ -3121,6 +3137,9 @@ struct Profile<'a> {
     ops: &'a [MountOp],
     /// One slot per op, allocated by the caller.
     slots: &'a [MountSlot],
+    /// The op whose procfs the command's nested identity map is written
+    /// through, by a delegate inside the sandbox, which the setup keeps.
+    procfs: Option<usize>,
 }
 
 /// What the setup keeps of one op of the mount profile, in a slot the caller
@@ -3368,8 +3387,8 @@ fn is_directory(fd: BorrowedFd<'_>) -> Result<bool, Errno> {
 
 /// Executes the profile's `index`th op, and keeps what it mounted where the
 /// setup needs it again: where a later step resolves beneath it or stacks onto
-/// its root, and a hidden directory's tmpfs, to make it read-only once the
-/// profile is in place.
+/// its root, the procfs a delegate writes the nested map through, and a hidden
+/// directory's tmpfs, to make it read-only once the profile is in place.
 ///
 /// Every path the op names is resolved from its anchor (see [`Profile`]): its
 /// target, the directories made on the way to it, and the file a bind needs
@@ -3431,7 +3450,8 @@ fn execute_op(
             .held_at(index, place.as_fd())
             .map_err(|errno| (SetupStep::OpenMountTarget, errno))?,
     };
-    let kept = stacked.is_some() || anchors_later(profile.ops, index);
+    let kept =
+        stacked.is_some() || profile.procfs == Some(index) || anchors_later(profile.ops, index);
     if let MountAction::Raw { target, .. } = &op.action
         && kept
     {
@@ -4322,13 +4342,6 @@ fn bring_up_loopback() -> Result<(), Errno> {
     Ok(())
 }
 
-/// Opens `path` and writes `data` in a single `write`, on the terms
-/// [`frame::write_whole`] states for the identity-map files under `/proc`.
-pub(super) fn write_file(path: &CStr, data: &[u8]) -> Result<(), Errno> {
-    let fd = rustix::fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())?;
-    frame::write_whole(fd.as_fd(), data)
-}
-
 /// Writes the failure record: the step discriminant, the errno, and the detail
 /// index, all little-endian. Smaller than `PIPE_BUF`, the write is atomic. If it
 /// fails the caller is gone and there is no one to report to.
@@ -4595,7 +4608,11 @@ mod tests {
         let ops = [
             op(MountAction::Tmpfs {
                 target: c"work".into(),
-                fs: super::super::procfs::FRESH_PROCFS,
+                fs: FreshFs {
+                    fstype: c"tmpfs",
+                    params: &[],
+                    attributes: OWN_TMPFS_ATTRIBUTES,
+                },
             }),
             op(MountAction::Hide {
                 target: c"work/secrets".into(),
@@ -4623,6 +4640,7 @@ mod tests {
             root: root.as_fd(),
             ops: &ops,
             slots: &slots,
+            procfs: None,
         };
         let anchored = |before, path: &CStr| {
             let anchor = profile.anchor(before, path);
@@ -4677,6 +4695,7 @@ mod tests {
             root: root.as_fd(),
             ops: &ops,
             slots: &slots,
+            procfs: None,
         };
         let anchor = profile.anchor(2, c"run/x").expect("the hide covers it");
         // Beneath the first hide's target, from the second's mount.
@@ -4690,12 +4709,14 @@ mod tests {
     /// Forks a child that enters a user and a mount namespace of its own,
     /// executes the first of `ops` against `root`, waits while `between` runs
     /// in this process, then executes the rest and answers with `check`'s
-    /// code. `check` and the ops run under the post-fork discipline.
+    /// code. `procfs` names the op whose procfs a delegate would write through.
+    /// `check` and the ops run under the post-fork discipline.
     fn run_profile(
         root: &CStr,
         ops: &[MountOp],
+        procfs: Option<usize>,
         between: impl FnOnce(),
-        check: impl FnOnce() -> i32,
+        check: impl FnOnce(&[MountSlot]) -> i32,
     ) -> Option<i32> {
         let (uid_line, gid_line) = crate::idmap::single_identity_lines();
         let slots: Vec<MountSlot> = ops.iter().map(|_| MountSlot::default()).collect();
@@ -4713,7 +4734,7 @@ mod tests {
         match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
             sys::PidfdFork::Child => {
                 let duty = MapDuty::Write {
-                    paths: MapPaths::SELF,
+                    procfs: HOST_PROCFS,
                     uid_line: &uid_line,
                     gid_line: &gid_line,
                 };
@@ -4738,6 +4759,7 @@ mod tests {
                     root: root.as_fd(),
                     ops,
                     slots: &slots,
+                    procfs,
                 };
                 if execute_op(&profile, 0, null.as_fd()).is_err() {
                     sys::exit_group(102)
@@ -4753,7 +4775,7 @@ mod tests {
                         sys::exit_group(104)
                     }
                 }
-                sys::exit_group(check())
+                sys::exit_group(check(&slots))
             }
             sys::PidfdFork::ParentOf(child) => {
                 drop(child_end);
@@ -4820,13 +4842,14 @@ mod tests {
         let code = run_profile(
             &c_path(&root),
             &ops,
+            None,
             || {
                 std::fs::rename(root.join("work"), root.join("moved")).unwrap();
                 std::fs::create_dir_all(root.join("work/.git")).unwrap();
                 std::fs::write(root.join("work/.env"), b"decoy").unwrap();
                 std::fs::write(root.join("work/.git/config"), b"decoy").unwrap();
             },
-            || {
+            |_| {
                 let writable = |path: &CStr| {
                     fs::open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty()).map(drop)
                 };
@@ -4888,8 +4911,9 @@ mod tests {
         let code = run_profile(
             &c_path(&root),
             &ops,
+            None,
             || {},
-            || {
+            |_| {
                 let mut target = [0u8; 8];
                 match fs::readlinkat_raw(fs::CWD, marker.as_c_str(), &mut target[..]) {
                     Ok(len) if &target[..len] == b"made" => 0,
@@ -4902,6 +4926,68 @@ mod tests {
             Some(0),
             "1: the link was made in the tmpfs underneath; 100 and up: the child could not \
              set up",
+        );
+    }
+
+    #[test]
+    fn the_mount_a_delegate_writes_through_is_kept_from_its_own_step() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        // The delegate inside a PID namespace writes the command's map through
+        // the procfs the profile made, by the descriptor its step returned,
+        // not by its path, which a process sharing the root can put another
+        // directory at. A tmpfs stands in for it here, since a procfs needs a
+        // PID namespace of its own to mount, and nothing beneath it would keep
+        // it otherwise.
+        let dir = Scratch::new("kept-procfs");
+        let base = std::fs::canonicalize(dir.path()).expect("the scratch directory resolves");
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        let ops = [op(MountAction::Tmpfs {
+            target: c"proc".into(),
+            fs: FreshFs {
+                fstype: c"tmpfs",
+                params: &[],
+                attributes: OWN_TMPFS_ATTRIBUTES,
+            },
+        })];
+        let kept = |procfs| {
+            run_profile(
+                &c_path(&root),
+                &ops,
+                procfs,
+                || {},
+                |slots| {
+                    let Some(held) = slots.first().and_then(|slot| slot.mount.take()) else {
+                        return 1;
+                    };
+                    match fs::fstatfs(held.as_fd()) {
+                        // `TMPFS_MAGIC`, which rustix does not name.
+                        Ok(stat) if stat.f_type == 0x0102_1994 => 0,
+                        _ => 2,
+                    }
+                },
+            )
+        };
+        assert_eq!(kept(Some(0)), Some(0), "1: not kept; 2: not the tmpfs");
+        assert_eq!(kept(None), Some(1), "nothing else keeps it");
+    }
+
+    #[test]
+    fn a_map_is_written_only_through_a_procfs_and_beneath_it() {
+        // Anything else is refused before a byte is written.
+        assert_eq!(open_procfs(c"/").map(drop), Err(Errno::MEDIUMTYPE));
+        let procfs = open_procfs(HOST_PROCFS).expect("the host's procfs opens");
+        // `self` is a link of the procfs's own, and is followed; `root` beneath
+        // it is a magic link, refused by name.
+        assert_eq!(
+            write_in_procfs(procfs.as_fd(), c"self/root/tmp/x", b""),
+            Err(Errno::LOOP),
+        );
+        assert_eq!(
+            write_in_procfs(procfs.as_fd(), c"../tmp/x", b""),
+            Err(Errno::XDEV),
         );
     }
 
@@ -5014,7 +5100,7 @@ mod tests {
         }
         let (uid_line, gid_line) = crate::idmap::single_identity_lines();
         let duty = || MapDuty::Write {
-            paths: MapPaths::SELF,
+            procfs: HOST_PROCFS,
             uid_line: &uid_line,
             gid_line: &gid_line,
         };
@@ -5134,7 +5220,7 @@ mod tests {
         let holder = match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
             sys::PidfdFork::Child => sys::in_child(|| {
                 let duty = MapDuty::Write {
-                    paths: MapPaths::SELF,
+                    procfs: HOST_PROCFS,
                     uid_line: &uid_line,
                     gid_line: &gid_line,
                 };

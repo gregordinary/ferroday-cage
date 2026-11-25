@@ -214,29 +214,26 @@ pub(crate) enum NestedMap {
     /// The command writes its own map, under the kernel's unprivileged one-id
     /// exception: `setgroups` is denied first, which is what permits the write.
     ///
-    /// The files are reached by path, after the pivot, so they are named
-    /// through the procfs the mount profile establishes.
+    /// The files are reached after the pivot, through the procfs the mount
+    /// profile establishes, by `self`, which every procfs resolves for its
+    /// reader. A further command joining the sandbox reaches them the same way.
     SelfWritten {
-        /// `/proc/self/setgroups` as it is named inside the sandbox.
-        setgroups_path: CString,
-        /// `/proc/self/gid_map` as it is named inside the sandbox.
-        gid_map_path: CString,
-        /// `/proc/self/uid_map` as it is named inside the sandbox.
-        uid_map_path: CString,
+        /// The procfs's path inside the sandbox, absolute.
+        procfs: CString,
     },
     /// A delegate — the process that forked the command — writes the map while
     /// the command blocks at a gate. `setgroups` stays at `allow`, so the
     /// supplementary groups a run-as identity names still work.
     Delegated {
-        /// The procfs mount target, rootfs-relative, that a delegate inside the
-        /// sandbox opens during setup and writes the command's map files
-        /// through.
+        /// The mount op whose procfs a delegate inside the sandbox writes the
+        /// command's map files through, by the descriptor the setup keeps of
+        /// the mount that op made.
         ///
         /// `None` where the sandbox has no PID namespace: the delegate is then
         /// the launch stage, which is outside and opens the host's `/proc`
         /// before the pivot, so the profile's own procfs is never consulted and
         /// a profile that mounts none still works.
-        procfs_target: Option<CString>,
+        procfs_op: Option<usize>,
     },
 }
 
@@ -1794,7 +1791,7 @@ impl ChildMap<'_> {
             // A provisioning child runs on the caller's own mount view, so its
             // map files are under the host's `/proc`.
             ChildMap::SelfMap { uid_line, gid_line } => child::MapDuty::Write {
-                paths: child::MapPaths::SELF,
+                procfs: child::HOST_PROCFS,
                 uid_line,
                 gid_line,
             },

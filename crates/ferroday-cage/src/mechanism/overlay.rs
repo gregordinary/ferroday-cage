@@ -36,7 +36,7 @@ use rustix::mount::{self, MountFlags, MountPropagationFlags, UnmountFlags};
 use rustix::thread::UnshareFlags;
 
 use super::child::{
-    MapDuty, MapPaths, StackBuf, attach_over_root, empty_tmpfs, enter_mapped_namespace, fd_path,
+    HOST_PROCFS, MapDuty, StackBuf, attach_over_root, empty_tmpfs, enter_mapped_namespace, fd_path,
     open_frozen,
 };
 use super::sys;
@@ -102,7 +102,7 @@ fn probe_child(lower: &CStr, upper: &CStr, work: &CStr, uid_line: &[u8], gid_lin
     // Root inside is the caller outside, which is credential enough to mount an
     // overlay in the new namespace.
     let duty = MapDuty::Write {
-        paths: MapPaths::SELF,
+        procfs: HOST_PROCFS,
         uid_line,
         gid_line,
     };
@@ -427,7 +427,7 @@ mod tests {
             let (uid_line, gid_line) = crate::idmap::single_identity_lines();
             let probe = || {
                 let duty = MapDuty::Write {
-                    paths: MapPaths::SELF,
+                    procfs: HOST_PROCFS,
                     uid_line: &uid_line,
                     gid_line: &gid_line,
                 };
