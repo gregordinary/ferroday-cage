@@ -22,6 +22,7 @@ use std::path::Path;
 use super::super::ProvisionError;
 use super::super::compress;
 use super::super::extract::{Cancelled, Extraction, OnEntry};
+use super::super::number;
 use super::super::tar::{self, TarReader};
 
 /// The 8-byte `ar` global header.
@@ -215,7 +216,7 @@ fn seek_to_member<R: Read + Seek>(
             ));
         }
         let name = ar_name(&header[0..16]);
-        let size: u64 = ascii_field(&header[48..58]).parse().map_err(|_| {
+        let size: u64 = number::digits(ascii_field(&header[48..58])).ok_or_else(|| {
             refused(
                 path,
                 offset,
@@ -571,6 +572,21 @@ mod tests {
         archive.extend_from_slice(&header);
         let reason = member_of(&archive, Member::Data).unwrap_err();
         assert!(reason.contains("runs past its end"), "{reason}");
+    }
+
+    #[test]
+    fn a_member_size_with_a_sign_is_not_a_number() {
+        // A run of digits, as dpkg-deb reads a member size; Rust's parser would
+        // take the sign.
+        let mut archive = ferroday_cage_testkit::deb::ar(&[("debian-binary", b"2.0\n")]);
+        let mut header = [b' '; AR_HEADER];
+        header[.."data.tar".len()].copy_from_slice(b"data.tar");
+        header[48..50].copy_from_slice(b"+0");
+        header[58] = b'`';
+        header[59] = b'\n';
+        archive.extend_from_slice(&header);
+        let reason = member_of(&archive, Member::Data).unwrap_err();
+        assert!(reason.contains("is not a number"), "{reason}");
     }
 
     /// A single-entry uncompressed tar holding `./control`, the shape of a

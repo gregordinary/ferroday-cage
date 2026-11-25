@@ -885,6 +885,9 @@ fn read_package<E>(
         iuse,
         blockers,
         guards,
+        // Read as portage reads it, with Python's `int()`, which takes a sign
+        // where `number::digits` would not: a bookkeeping ordinal, written by
+        // portage, which this reads only to continue the sequence past it.
         counter: field(COUNTER_FILE)?.and_then(|text| text.parse().ok()),
         chost: field(CHOST_FILE)?.filter(|chost| !chost.is_empty()),
         container_md5: field(BINPKGMD5_FILE)?

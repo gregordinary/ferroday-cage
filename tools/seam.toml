@@ -366,19 +366,19 @@ why = "Portage's digit-run order, for Gentoo versions."
 
 [[reach]]
 item = "provision::number::digits"
-code = 17
+code = 24
 cost = "copy"
 why = "The decimal reader every format goes through."
 
 [[reach]]
 item = "provision::number::digits_in"
-code = 2
+code = 1
 cost = "move"
 why = "A run of digits inside an HTTP header."
 
 [[reach]]
 item = "provision::number::is_digits"
-code = 12
+code = 13
 cost = "copy"
 why = "As for `digits`."
 

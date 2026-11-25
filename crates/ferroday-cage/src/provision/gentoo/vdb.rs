@@ -405,7 +405,9 @@ fn render_contents(root: &Path, rooted: &Rooted, laid: &[Laid]) -> Result<String
 /// A layered build asks this of the base as well as of the upper, which is the
 /// merged view's answer.
 ///
-/// A value that does not parse is read as zero rather than refused, as portage
+/// The value is read as portage reads it, with Python's `int()`, which takes
+/// the whitespace around it and a sign, rather than through `number::digits`.
+/// One that does not parse is read as zero rather than refused, as portage
 /// reads one: it is a bookkeeping ordinal, and the entries' own still bound
 /// where the sequence continues. A file past [`MAX_COUNTER_BYTES`] is refused,
 /// since that is not a value at all.

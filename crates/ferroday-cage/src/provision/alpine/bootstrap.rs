@@ -71,6 +71,7 @@ use crate::provision::accounts;
 use crate::provision::copyin::{self, Owed, Owner};
 use crate::provision::identity::Ownership;
 use crate::provision::layer::{Forward, Rooting};
+use crate::provision::number;
 use crate::provision::rooted::Rooted;
 use crate::{IdMapper, IdentityMap};
 
@@ -348,7 +349,7 @@ fn date_accounts(tree: &Rooted, found: &accounts::Dates, epoch: i64) -> Result<(
 /// login, so neither is a date. A script that expires a password writes the
 /// zero, and dating it would withdraw the demand.
 fn is_day(field: &[u8]) -> bool {
-    field.iter().all(u8::is_ascii_digit) && field.iter().any(|&digit| digit != b'0')
+    number::is_digits(field) && field.iter().any(|&digit| digit != b'0')
 }
 
 /// Runs the `.trigger` script of every package whose watched paths the finished

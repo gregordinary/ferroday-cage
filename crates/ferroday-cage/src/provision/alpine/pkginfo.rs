@@ -42,6 +42,7 @@ use ferrata::dependency::Dependency;
 use super::index::NOARCH;
 use super::{AlpineError, DIALECT};
 use crate::provision::digest::Algorithm;
+use crate::provision::number;
 
 /// The separator between a key and its value: one space either side, which is
 /// what `abuild` writes and what `apk` splits on.
@@ -233,7 +234,7 @@ fn count<T: std::str::FromStr>(
 ) -> Result<Option<T>, AlpineError> {
     match fields.get(key).copied().filter(|value| !value.is_empty()) {
         None => Ok(None),
-        Some(value) => value.parse().map(Some).map_err(|_| {
+        Some(value) => number::digits(value).map(Some).ok_or_else(|| {
             AlpineError::container(
                 subject,
                 format!(".PKGINFO states {key} = {value:?}, which is not a count"),

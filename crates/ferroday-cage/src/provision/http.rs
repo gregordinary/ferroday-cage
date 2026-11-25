@@ -1089,7 +1089,9 @@ fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
             .split_once(']')
             .ok_or_else(|| bad("the bracketed host literal is unterminated"))?;
         let port = match after.strip_prefix(':') {
-            Some(port) => port.parse().map_err(|_| bad("the port is not a number"))?,
+            Some(port) => {
+                super::number::digits(port).ok_or_else(|| bad("the port is not a number"))?
+            }
             None if after.is_empty() => 80,
             None => return Err(bad("the bracketed host is followed by junk")),
         };
@@ -1101,7 +1103,7 @@ fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
         match authority.rsplit_once(':') {
             Some((host, port)) => (
                 host.to_string(),
-                port.parse().map_err(|_| bad("the port is not a number"))?,
+                super::number::digits(port).ok_or_else(|| bad("the port is not a number"))?,
             ),
             None => (authority.to_string(), 80),
         }
@@ -1184,7 +1186,7 @@ fn read_status<R: BufRead>(reader: &mut R) -> io::Result<Status> {
     let version = words.next().and_then(parse_version).ok_or_else(malformed)?;
     let code = words
         .next()
-        .and_then(|code| code.parse().ok())
+        .and_then(super::number::digits)
         .ok_or_else(malformed)?;
     Ok(Status { version, code })
 }
@@ -1285,7 +1287,7 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Headers> {
                 // body's extent unknown. Reading such a response to end of
                 // stream would turn a truncation into a short, successful body,
                 // so it is refused instead.
-                let length = super::number::digits_in(value, 10).ok_or_else(|| {
+                let length = super::number::digits::<u64>(value).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "malformed Content-Length")
                 })?;
                 if headers.content_length.is_some_and(|first| first != length) {

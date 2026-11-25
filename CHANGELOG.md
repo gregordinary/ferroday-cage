@@ -543,6 +543,12 @@ consumer upgrading can skip it.
 - The `agent-tools` example takes in what the command committed when serving
   the command, or waiting for it, fails after it started. It discarded a
   temporary session then, and the commits in it.
+- A `.deb`'s `ar` member size, a `.PKGINFO` count, a mirror URL's port, and an
+  HTTP status code are read as runs of digits, as the tools that write them
+  spell them. Each took a leading `+`, which Rust's integer parser accepts and
+  none of those formats does. A Gentoo container's `BUILD_TIME` is read as the
+  binhost index's reader reads it, so a value the two read differently is no
+  longer a mismatch between them.
 
 ### Internal
 

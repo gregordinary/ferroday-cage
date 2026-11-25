@@ -936,7 +936,7 @@ fn check_record(
             return Err(differs(what, &signed, stated));
         }
     }
-    let built = text("BUILD_TIME").parse::<i64>().unwrap_or(0);
+    let built = number::digits::<i64>(text("BUILD_TIME")).unwrap_or(0);
     if built != planned.build_time {
         return Err(differs(
             "the build time",
