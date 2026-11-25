@@ -294,10 +294,13 @@ Two further gates matter when the public API moves:
   how the userlands version with the library.
 
 A reader of input the library does not trust lands with a fuzz target in
-`fuzz/`. What a sandbox sends the network stack is such input. A target reaches
-its reader through the `fuzzing` module, which exists only where cargo-fuzz
-builds with `--cfg fuzzing`. CI builds every target and runs none. Run one for a while after
-changing the reader it drives, on the nightly the `fuzz` job pins:
+`fuzz/`. What a sandbox sends the network stack is such input, and so is an
+archive or an index a provisioner reads before anything verifies it. A target
+reaches its reader through the `fuzzing` module, which exists only where
+cargo-fuzz builds with `--cfg fuzzing`. CI builds every target on each push and
+runs none. The `Fuzzing` workflow runs each for fifteen minutes, weekly and by
+hand, and prints a failing input in its log. Run one for a while after changing
+the reader it drives, on the nightly the `fuzz` job pins:
 
 ```sh
 cd fuzz

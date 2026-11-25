@@ -2956,6 +2956,20 @@ impl GentooBuilder {
     }
 }
 
+/// Reads `text` as a runtime dependency class of an index record or a
+/// database entry, for a fuzz target: it may not panic, and a class it reads
+/// names no more atoms than its text has bytes.
+#[cfg(fuzzing)]
+pub(super) fn exercise_dependencies(text: &[u8]) {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return;
+    };
+    if let Ok(class) = index::read_class(text) {
+        let atoms: usize = class.iter().map(atom::Dependency::atoms).sum();
+        assert!(atoms <= text.len(), "{atoms} atoms from {text:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

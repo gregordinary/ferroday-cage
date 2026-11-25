@@ -288,6 +288,11 @@ consumer upgrading can skip it.
 
 ### Internal
 
+- Fuzz targets read a tar archive as an extraction does, an access control
+  list as an attribute's value and as a `SCHILY.acl.*` record's text, and a
+  Gentoo dependency class, each holding its reader to an invariant beyond not
+  panicking. A `Fuzzing` workflow runs every target for fifteen minutes, weekly
+  and by hand, and prints a failing input in its log.
 - `tools/check-seam.py` measures the userland side of `provision`: the three
   layers and the archive machinery only they use. It records each item that
   side reaches in the rest of the crate that is not public API (79, read from

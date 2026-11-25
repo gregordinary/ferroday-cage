@@ -290,6 +290,10 @@ mod netstack;
 pub mod fuzzing {
     #[cfg(feature = "netstack")]
     pub use crate::netstack::fuzzing::{client_hello, dns_query, http_head};
+    #[cfg(feature = "gentoo")]
+    pub use crate::provision::fuzzing::gentoo_dependencies;
+    #[cfg(feature = "tarball")]
+    pub use crate::provision::fuzzing::{acl, tar_archive};
 }
 mod observer;
 mod path;

@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ferroday-cage = { path = "../crates/ferroday-cage", features = ["netstack"] }
+ferroday-cage = { path = "../crates/ferroday-cage", features = ["netstack", "tarball", "gentoo"] }
 
 # A workspace of its own, so the fuzzing harness never joins the library's
 # build.
@@ -33,6 +33,27 @@ bench = false
 [[bin]]
 name = "http_head"
 path = "fuzz_targets/http_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_archive"
+path = "fuzz_targets/tar_archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acl"
+path = "fuzz_targets/acl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gentoo_dependencies"
+path = "fuzz_targets/gentoo_dependencies.rs"
 test = false
 doc = false
 bench = false

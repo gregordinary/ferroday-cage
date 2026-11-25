@@ -884,6 +884,24 @@ pub(super) fn capability_mapped(value: &[u8], uid: impl Fn(u32) -> Option<u32>) 
     }
 }
 
+/// Reads `bytes` as an access control list's attribute value and as the text a
+/// `SCHILY.acl.*` record holds, for a fuzz target: neither may panic, and a list
+/// the attribute's reader admits renders as text the text's reader reads back
+/// as a list.
+#[cfg(all(fuzzing, feature = "tarball"))]
+pub(super) fn exercise(bytes: &[u8]) {
+    if let Ok(Some(acl)) = Acl::parse(bytes) {
+        let text = acl.text();
+        assert!(
+            matches!(AclText::parse(&text), Ok(Some(_))),
+            "{} renders as {:?}, which reads as no list",
+            bytes.escape_ascii(),
+            String::from_utf8_lossy(&text)
+        );
+    }
+    let _ = AclText::parse(bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

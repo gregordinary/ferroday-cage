@@ -78,6 +78,30 @@ pub mod digest;
 // The plan document's syntax, which every userland layer's plan is written in
 // -- and, for Gentoo, the syntax its archive publishes its binary-package index
 // in as well.
+/// The provisioners' readers of input nothing has verified yet, for the fuzz
+/// targets alone.
+#[cfg(fuzzing)]
+pub(crate) mod fuzzing {
+    /// Reads `archive` as an extraction reads a tar archive, each entry whole.
+    #[cfg(feature = "tarball")]
+    pub fn tar_archive(archive: &[u8]) {
+        super::tar::exercise(archive);
+    }
+
+    /// Reads `bytes` as an access control list's attribute value and as a
+    /// `SCHILY.acl.*` record's text.
+    #[cfg(feature = "tarball")]
+    pub fn acl(bytes: &[u8]) {
+        super::xattr::exercise(bytes);
+    }
+
+    /// Reads `text` as a Gentoo runtime dependency class.
+    #[cfg(feature = "gentoo")]
+    pub fn gentoo_dependencies(text: &[u8]) {
+        super::gentoo::exercise_dependencies(text);
+    }
+}
+
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
 mod document;
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]

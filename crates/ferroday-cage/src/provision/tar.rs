@@ -1331,6 +1331,19 @@ fn octal(field: &mut [u8], value: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Reads `archive` as an extraction reads one, each entry's data whole within
+/// a bound, for a fuzz target: it may not panic, and it ends, since each entry
+/// consumes at least a header's block of the input.
+#[cfg(fuzzing)]
+pub(super) fn exercise(archive: &[u8]) {
+    let mut reader = TarReader::in_memory(archive);
+    while let Ok(Some(_)) = reader.next_entry() {
+        if reader.read_entry(1 << 20).is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

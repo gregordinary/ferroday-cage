@@ -1,0 +1,61 @@
+name: Fuzzing
+
+# Each fuzz target run for a bounded while, on a schedule of its own.
+#
+# CI builds every target on each push and runs none, since a run is not a pass
+# or fail a pull request can wait on. This runs them, weekly and by hand, each
+# under limits on its time, its memory, and the time one input may take. Each
+# run starts from an empty corpus, so it explores afresh rather than resuming.
+on:
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The nightly the CI's fuzz job builds with, for the reason it gives.
+  FUZZ_NIGHTLY: nightly-2026-07-09
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Each target reports on its own, so one finding does not hide another.
+      fail-fast: false
+      matrix:
+        target:
+          - dns_query
+          - client_hello
+          - http_head
+          - tar_archive
+          - acl
+          - gentoo_dependencies
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (pinned nightly) and cargo-fuzz
+        run: |
+          rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Run the target for fifteen minutes
+        working-directory: fuzz
+        run: >-
+          cargo "+$FUZZ_NIGHTLY" fuzz run "${{ matrix.target }}" --
+          -max_total_time=900 -rss_limit_mb=2048 -timeout=10
+      - name: Print the input that failed
+        # As base64 in the log, so a finding is reproduced from the run alone:
+        # decode it into a file and give the file to `cargo fuzz run`.
+        if: failure()
+        working-directory: fuzz
+        run: |
+          for input in artifacts/"${{ matrix.target }}"/*; do
+            [ -f "$input" ] || continue
+            echo "$input"
+            base64 -w0 "$input"
+            echo
+          done

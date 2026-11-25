@@ -582,6 +582,11 @@ item = "provision::gentoo::GentooError::io"
 tests = 1
 why = "As above."
 
+[[reverse]]
+item = "provision::gentoo::exercise_dependencies"
+code = 1
+why = "The provisioners' fuzzing module, which exists only under `--cfg fuzzing` and hands the fuzz targets the Gentoo dependency reader. A crate of the userlands' own would carry the target with it."
+
 # Userland feature gates outside the userland side: `cfg` predicates naming
 # `debian`, `alpine` or `gentoo`, one per predicate.
 
@@ -596,7 +601,7 @@ tests = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/lib.rs"
-code = 3
+code = 4
 tests = 1
 
 [[gate]]
@@ -623,7 +628,7 @@ code = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/mod.rs"
-code = 34
+code = 35
 tests = 4
 
 [[gate]]
