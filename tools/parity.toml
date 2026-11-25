@@ -756,6 +756,10 @@ why = "--no-protection replaces the default set with an empty one, which --prote
 name = "since"
 flags = ["--since"]
 
+[[builder.setting]]
+name = "links_leading_out"
+flags = ["--links-leading-out"]
+
 # No settings, and recorded so that gaining one is a difference rather than a
 # silence. A tarball is named and then provisioned from; `--provision-tar`
 # reaches both constructors, a path and a reader.

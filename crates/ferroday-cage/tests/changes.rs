@@ -222,7 +222,16 @@ fn a_run_applied_to_its_tree_leaves_the_tree_as_the_run_saw_it() {
     assert!(status.success());
 
     let changes = ChangeSet::read(&overlay).unwrap();
-    let report = changes.apply(&tree).run().expect("the changes apply");
+    // The run's link to `/etc/passwd` leads out of the tree, which an apply
+    // refuses unless told to write it.
+    let refused = changes.apply(&tree).check().unwrap();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].path(), Path::new("added-link"));
+    let report = changes
+        .apply(&tree)
+        .links_leading_out(true)
+        .run()
+        .expect("the changes apply");
     assert_eq!(report.skipped(), [Path::new("added-fifo")]);
     assert_eq!(report.applied().len(), changes.changes().len() - 1);
 

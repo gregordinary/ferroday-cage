@@ -240,7 +240,8 @@ consumer upgrading can skip it.
   the entry's type before and after, its size, what a modified entry differs
   in, and whether it was read whole. `--apply-changes` prints the paths it
   wrote and those it passed over, or, where it is refused, each refusing
-  change with its reason, the protected path or name it touches, and the line
+  change with its reason, the protected path or name it touches or the
+  target of a link leading out, and the line
   the text says it in, and still exits 125. A path that is not UTF-8 is
   written as `{"base64": ...}`. A launch takes `--json` only beside
   `--print-resolved` (`ferroday-cage-cli`).
@@ -267,8 +268,9 @@ consumer upgrading can skip it.
 - `fcage --changes UPPER --overlay-lower DIR` prints what a run wrote through
   an overlay, one change a line (`A`, `M` with what differs, `D`, `T`), and
   `fcage --apply-changes UPPER --overlay-lower DIR --to DIR` writes it into a
-  tree, with `--only`, `--protect`, `--protect-name`, `--no-protection` and
-  `--since`; a refused apply names each refused path and writes nothing
+  tree, with `--only`, `--protect`, `--protect-name`, `--no-protection`,
+  `--since` and `--links-leading-out`; a refused apply names each refused path
+  and writes nothing
   (`ferroday-cage-cli`).
 - An upper can be copied to a new one, so two sessions continue from one
   point: `ChangeSet::fork` copies the upper the changes were read from,
@@ -286,7 +288,10 @@ consumer upgrading can skip it.
   without writing; `run` refuses the whole apply with
   `ProvisionError::ApplyRefused` where a chosen change touches a protected
   path, or the target changed its path after the reference time, or lacks
-  its directory, or reaches it through a symbolic link. It stages every file
+  its directory, or reaches it through a symbolic link, or where it writes a
+  symbolic link leading out of the target, absolute or climbing above its top
+  (`ApplyRefusalReason::LinkLeadsOut`), which `links_leading_out` allows. It
+  stages every file
   and link before giving any its name, carries content with its holes, links,
   permission bits without the set-id bits, and `user.` attributes and access
   control lists, and reports what it wrote and the named pipes, sockets and

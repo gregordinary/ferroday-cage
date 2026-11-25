@@ -1125,6 +1125,7 @@ pub fn ferroday_cage::provision::gentoo::installed(impl core::convert::AsRef<std
 #[non_exhaustive] pub enum ferroday_cage::provision::ApplyRefusalReason
 pub ferroday_cage::provision::ApplyRefusalReason::Changed
 pub ferroday_cage::provision::ApplyRefusalReason::Link
+pub ferroday_cage::provision::ApplyRefusalReason::LinkLeadsOut(std::path::PathBuf)
 pub ferroday_cage::provision::ApplyRefusalReason::Missing
 pub ferroday_cage::provision::ApplyRefusalReason::Occupied
 pub ferroday_cage::provision::ApplyRefusalReason::OtherFilesystem
@@ -1367,6 +1368,7 @@ pub struct ferroday_cage::provision::Apply<'a>
 impl<'a> ferroday_cage::provision::Apply<'a>
 pub fn ferroday_cage::provision::Apply<'a>::check(&self) -> core::result::Result<alloc::vec::Vec<ferroday_cage::provision::ApplyRefusal>, ferroday_cage::provision::ProvisionError>
 pub fn ferroday_cage::provision::Apply<'a>::filter(self, impl core::ops::function::Fn(&ferroday_cage::provision::Change) -> bool + core::marker::Send + core::marker::Sync + 'a) -> ferroday_cage::provision::Apply<'a>
+pub fn ferroday_cage::provision::Apply<'a>::links_leading_out(self, bool) -> ferroday_cage::provision::Apply<'a>
 pub fn ferroday_cage::provision::Apply<'a>::protect(self, ferroday_cage::provision::Protected) -> ferroday_cage::provision::Apply<'a>
 pub fn ferroday_cage::provision::Apply<'a>::protected(self, impl core::iter::traits::collect::IntoIterator<Item = ferroday_cage::provision::Protected>) -> ferroday_cage::provision::Apply<'a>
 pub fn ferroday_cage::provision::Apply<'a>::run(self) -> core::result::Result<ferroday_cage::provision::ApplyReport, ferroday_cage::provision::ProvisionError>

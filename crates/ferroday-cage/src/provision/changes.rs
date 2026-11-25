@@ -203,6 +203,10 @@ pub struct Change {
     /// holds now: what an apply holds the upper to, so it writes what was
     /// read and not what a run went on to write.
     upper: Option<UpperEntry>,
+    /// The target of the symbolic link the merged view holds now, as the reader
+    /// read it: what an apply judges, and writes, while the upper still holds
+    /// the link it was read from.
+    link: Option<Vec<u8>>,
 }
 
 /// An upper entry as the reader found it.
@@ -301,6 +305,12 @@ impl Change {
     /// are not listed, or attributes not compared.
     pub fn is_readable(&self) -> bool {
         self.readable
+    }
+
+    /// The target of the symbolic link the merged view holds now, as the
+    /// reader read it, or `None` where it holds no link.
+    pub(super) fn link(&self) -> Option<&[u8]> {
+        self.link.as_deref()
     }
 }
 
@@ -481,6 +491,7 @@ impl Reader {
             differs: Differs::default(),
             readable: true,
             upper: Some(UpperEntry::of(&stat)),
+            link: None,
         };
 
         // A directory is opened before anything else is asked of it, so the
@@ -505,6 +516,9 @@ impl Reader {
             opened: dir.as_ref().map(AsFd::as_fd),
         };
         let attributes = held.attributes(&change.path, Layer::Upper)?;
+        if now == EntryKind::Symlink {
+            change.link = Some(link_target(&held, &change.path)?);
+        }
         let opaque = match &dir {
             Some(dir) => {
                 level.opaque
@@ -534,8 +548,8 @@ impl Reader {
                         same_bytes(&held, &theirs, &change.path, lower.layer)?.map(|same| !same)
                     }
                     EntryKind::Symlink => Some(
-                        link_target(&held, &change.path)?
-                            != link_target(&theirs, &lower.layer.join(&change.path))?,
+                        change.link.as_deref()
+                            != Some(&*link_target(&theirs, &lower.layer.join(&change.path))?),
                     ),
                     EntryKind::Directory | EntryKind::Other => Some(false),
                 };
@@ -588,6 +602,7 @@ impl Reader {
             differs: Differs::default(),
             readable: true,
             upper: None,
+            link: None,
         });
     }
 }

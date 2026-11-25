@@ -260,8 +260,8 @@ agent-tools --worktree ~/project --overlay ~/.cache/agent/1 --apply --skip .envr
 
 An apply protects the library's [default paths](provisioning.md#applying-a-change-set),
 and the held paths git obeys as well. It refuses a path the tree changed after
-the first command's overlay was made, and a refused apply writes nothing and
-exits 1. The command's commits still come back under `refs/agent/`, and the
+the first command's overlay was made, and a symbolic link the command made that
+leads out of the tree. A refused apply writes nothing and exits 1. The command's commits still come back under `refs/agent/`, and the
 branch does not move. Until an apply, the tree on the host is the one before
 the command. A branch moved to the command's commits would show it as undoing
 them.

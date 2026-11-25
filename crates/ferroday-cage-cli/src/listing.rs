@@ -189,7 +189,7 @@ pub struct Refused {
     /// The change's path, relative to the target's top.
     path: Bytes,
     /// Why: `protected`, `changed`, `occupied`, `missing`, `parent-missing`,
-    /// `link`, `other-filesystem` or `unreadable`.
+    /// `link`, `other-filesystem`, `unreadable` or `link-leads-out`.
     reason: &'static str,
     /// Where `reason` is `protected`, the protected path the change touches,
     /// relative to the target's top.
@@ -199,6 +199,9 @@ pub struct Refused {
     /// at any depth.
     #[serde(skip_serializing_if = "Option::is_none")]
     protected_name: Option<Bytes>,
+    /// Where `reason` is `link-leads-out`, the target the link holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_target: Option<Bytes>,
     /// The line the listing's text says it in.
     text: String,
 }
@@ -210,6 +213,7 @@ impl Refused {
             reason: "other",
             protected_path: None,
             protected_name: None,
+            link_target: None,
             text: refusal_line(refusal),
         };
         refused.reason = match refusal.reason() {
@@ -230,6 +234,10 @@ impl Refused {
             ApplyRefusalReason::Link => "link",
             ApplyRefusalReason::OtherFilesystem => "other-filesystem",
             ApplyRefusalReason::Unreadable => "unreadable",
+            ApplyRefusalReason::LinkLeadsOut(target) => {
+                refused.link_target = Some(path_bytes(target));
+                "link-leads-out"
+            }
             _ => "other",
         };
         refused

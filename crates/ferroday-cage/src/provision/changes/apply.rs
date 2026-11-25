@@ -21,7 +21,6 @@ use super::super::containment;
 use super::super::copyin::read_names;
 use super::super::xattr::{self, Holder};
 use super::{Change, ChangeKind, ChangeSet, EntryKind};
-use crate::mechanism::bounds::LINK_BUF;
 use crate::mechanism::delete_tree;
 
 /// A path an [`Apply`] refuses to change.
@@ -202,6 +201,37 @@ fn removes(kind: ChangeKind) -> bool {
     matches!(kind, ChangeKind::Removed | ChangeKind::Replaced)
 }
 
+/// Whether a symbolic link at `path`, from the target's top, whose target is
+/// `target`, leads out of the target, as [Links that lead
+/// out](Apply#links-that-lead-out) states: `target` is absolute, climbs above
+/// the top from the directory `path` lies in, or climbs after a name.
+///
+/// Read from the text alone, so the answer does not depend on what the target
+/// holds when it is asked. Every `..` before the first name climbs from a
+/// directory the apply reaches without following a link, and a link it holds
+/// along the way, the target's own or one this apply writes, is judged where
+/// it lies. The target is split here rather than by `path::tree_components`,
+/// which refuses the `..` this counts.
+fn leads_out(path: &Path, target: &[u8]) -> bool {
+    if target.first() == Some(&b'/') {
+        return true;
+    }
+    let mut depth = path.components().count().saturating_sub(1);
+    let mut named = false;
+    for component in target.split(|byte| *byte == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." if named => return true,
+            b".." => match depth.checked_sub(1) {
+                Some(above) => depth = above,
+                None => return true,
+            },
+            _ => named = true,
+        }
+    }
+    false
+}
+
 /// Writes chosen changes of a [`ChangeSet`] into a target directory, usually
 /// the lower the run started from.
 ///
@@ -247,7 +277,22 @@ fn removes(kind: ChangeKind) -> bool {
 ///   change, or a component of its path is a symbolic link in the target;
 /// - it lies on another filesystem than the target's top, where the apply
 ///   stages what it writes;
-/// - the reader could not read it whole ([`Change::is_readable`]).
+/// - the reader could not read it whole ([`Change::is_readable`]);
+/// - it writes a symbolic link that leads out of the target, unless
+///   [`links_leading_out`](Self::links_leading_out) allows one (below).
+///
+/// # Links that lead out
+///
+/// A link the run wrote is the run's, and the next tool that writes through it
+/// writes where it leads: a link at `.bashrc` naming `/home/user/.bashrc`, or
+/// one naming `../../.ssh/authorized_keys`, takes that write out of the tree.
+/// So a link is refused where its target is absolute, or where its target,
+/// read from the directory the link lies in, climbs above the target's top
+/// with `..`. A `..` that follows a name is refused too, wherever it would
+/// lead: the name may itself be a link, which the kernel follows before it
+/// climbs, so the text alone does not say where such a target ends. A link
+/// the target already holds, which a target may lead through, is the
+/// target's own.
 ///
 /// # The reference time
 ///
@@ -300,6 +345,7 @@ pub struct Apply<'a> {
     filter: Option<Box<ChangePredicate<'a>>>,
     protected: Vec<Protected>,
     since: Option<SystemTime>,
+    links_leading_out: bool,
 }
 
 /// What [`Apply::filter`] takes: a predicate over a change, `Send` and `Sync`
@@ -314,6 +360,7 @@ impl fmt::Debug for Apply<'_> {
             .field("filter", &self.filter.as_ref().map(|_| "<filter>"))
             .field("protected", &self.protected)
             .field("since", &self.since)
+            .field("links_leading_out", &self.links_leading_out)
             .finish_non_exhaustive()
     }
 }
@@ -328,6 +375,7 @@ impl ChangeSet {
             filter: None,
             protected: Protected::defaults(),
             since: None,
+            links_leading_out: false,
         }
     }
 }
@@ -356,6 +404,18 @@ impl<'a> Apply<'a> {
     /// entry the target changed at or after it is refused.
     pub fn since(mut self, since: SystemTime) -> Apply<'a> {
         self.since = Some(since);
+        self
+    }
+
+    /// Writes a symbolic link that leads out of the target where `allow`,
+    /// rather than refusing it with [`ApplyRefusalReason::LinkLeadsOut`]. See
+    /// [Links that lead out](Self#links-that-lead-out).
+    ///
+    /// For a tree whose links lead out by design, such as a root filesystem's
+    /// absolute links. Every such link the run wrote is then written, wherever
+    /// it leads, so [`check`](Self::check) the apply without it first.
+    pub fn links_leading_out(mut self, allow: bool) -> Apply<'a> {
+        self.links_leading_out = allow;
         self
     }
 
@@ -429,6 +489,7 @@ impl<'a> Apply<'a> {
             chosen,
             refusals: Vec::new(),
             protected: &self.protected,
+            links_leading_out: self.links_leading_out,
         };
         plan.check()?;
         Ok(plan)
@@ -528,6 +589,9 @@ pub enum ApplyRefusalReason {
     OtherFilesystem,
     /// The reader could not read the change whole.
     Unreadable,
+    /// The change writes a symbolic link to this target, which leads out of
+    /// the target directory. See [Links that lead out](Apply#links-that-lead-out).
+    LinkLeadsOut(PathBuf),
 }
 
 impl fmt::Display for ApplyRefusalReason {
@@ -551,6 +615,10 @@ impl fmt::Display for ApplyRefusalReason {
                 f.write_str("it lies on another filesystem than the target's top")
             }
             ApplyRefusalReason::Unreadable => f.write_str("the change could not be read whole"),
+            ApplyRefusalReason::LinkLeadsOut(target) => write!(
+                f,
+                "it is a symbolic link to {target:?}, which leads out of the target"
+            ),
         }
     }
 }
@@ -569,6 +637,8 @@ struct Plan<'p> {
     chosen: Vec<&'p Change>,
     refusals: Vec<ApplyRefusal>,
     protected: &'p [Protected],
+    /// Whether a symbolic link that leads out of the target is written.
+    links_leading_out: bool,
 }
 
 /// What staging wrote: the staging directory's name at the target's top, its
@@ -621,6 +691,14 @@ impl Plan<'_> {
             .find(|protected| protected.touched_by(change))
         {
             return Ok(Some(ApplyRefusalReason::Protected(protected.clone())));
+        }
+        if !self.links_leading_out
+            && let Some(target) = change.link()
+            && leads_out(change.path(), target)
+        {
+            return Ok(Some(ApplyRefusalReason::LinkLeadsOut(PathBuf::from(
+                OsStr::from_bytes(target),
+            ))));
         }
         let (parent, leaf) = split(change.path()).map_err(|errno| {
             ProvisionError::io(
@@ -777,17 +855,15 @@ impl Plan<'_> {
             let staged_name = CString::new(format!("{index}")).expect("a number holds no NUL");
             let target_io = |errno: Errno| ProvisionError::io("staging", &named, errno.into());
             match now {
+                // The target the reader read, which the plan judged. A link's
+                // target cannot change without a new inode, and the upper
+                // still holds the inode the reader read it from.
                 EntryKind::Symlink => {
-                    let mut buffer = [0u8; LINK_BUF];
-                    let read = fs::readlinkat_raw(&dir, &leaf, &mut buffer[..]).map_err(io)?;
-                    if read == buffer.len() {
-                        return Err(ProvisionError::EntryRefused {
-                            path: named,
-                            reason: "the symlink target is longer than the apply reads".to_string(),
-                        });
-                    }
-                    let target = OsStr::from_bytes(&buffer[..read]);
-                    fs::symlinkat(target, &staged.dir, &staged_name).map_err(target_io)?;
+                    let Some(target) = change.link() else {
+                        return Err(unchanged(&stat));
+                    };
+                    fs::symlinkat(OsStr::from_bytes(target), &staged.dir, &staged_name)
+                        .map_err(target_io)?;
                 }
                 _ => {
                     let source =
@@ -1530,6 +1606,65 @@ mod tests {
                 protected("app/.husky/pre-commit", Protected::name(".husky")),
                 protected("backend/mise.toml", Protected::name("mise.toml")),
             ]
+        );
+    }
+
+    /// A link the run wrote is refused where it leads out of the target, and
+    /// written as it is where the caller allows that.
+    #[test]
+    fn a_link_that_leads_out_of_the_target_is_refused_unless_allowed() {
+        let (_scratch, overlay, lower, upper) = layers("apply-links-out");
+        write(lower.join("a/b/f"), "lower\n");
+        std::fs::create_dir_all(upper.join("a/b")).unwrap();
+        let since = after_a_tick();
+        for (at, target) in [
+            ("bashrc", "/home/user/.bashrc"),
+            ("a/b/up", "../../../outside"),
+            ("a/b/top", "../../inside"),
+            ("a/b/after-name", "f/../../.."),
+            ("a/b/sibling", "f"),
+            ("a/b/dots", "./..//b/f"),
+        ] {
+            std::os::unix::fs::symlink(target, upper.join(at)).unwrap();
+        }
+        let changes = ChangeSet::read(&overlay).unwrap();
+        let refused: Vec<_> = changes
+            .apply(&lower)
+            .since(since)
+            .check()
+            .unwrap()
+            .into_iter()
+            .map(|refusal| (refusal.path().to_path_buf(), refusal.reason().clone()))
+            .collect();
+        let out = |at: &str, target: &str| {
+            (
+                PathBuf::from(at),
+                ApplyRefusalReason::LinkLeadsOut(PathBuf::from(target)),
+            )
+        };
+        assert_eq!(
+            refused,
+            [
+                out("a/b/after-name", "f/../../.."),
+                out("a/b/up", "../../../outside"),
+                out("bashrc", "/home/user/.bashrc"),
+            ]
+        );
+
+        let report = changes
+            .apply(&lower)
+            .since(since)
+            .links_leading_out(true)
+            .run()
+            .unwrap();
+        assert_eq!(report.applied().len(), 6);
+        assert_eq!(
+            std::fs::read_link(lower.join("bashrc")).unwrap(),
+            Path::new("/home/user/.bashrc")
+        );
+        assert_eq!(
+            std::fs::read_link(lower.join("a/b/dots")).unwrap(),
+            Path::new("./..//b/f")
         );
     }
 

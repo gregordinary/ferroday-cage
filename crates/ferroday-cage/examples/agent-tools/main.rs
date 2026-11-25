@@ -204,9 +204,10 @@ Reviewing what the command wrote:
                         are printed after each command
   --apply               Write the overlay's changes into the working tree, then
                         discard them; a change the tree also made since the
-                        overlay was created, or one to a path git or another
-                        tool acts on, refuses the whole apply. With no command,
-                        apply and exit
+                        overlay was created, one to a path git or another tool
+                        acts on, or a symbolic link leading out of the tree
+                        refuses the whole apply. With no command, apply and
+                        exit
   --skip PATH           Leave PATH, relative to the working tree, and what lies
                         beneath it out of --apply; its changes are discarded
                         with the rest (repeatable)

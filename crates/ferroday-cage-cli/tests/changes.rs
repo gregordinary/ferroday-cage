@@ -288,6 +288,54 @@ fn apply_changes_prints_what_it_refused_or_wrote_as_one_document() {
 }
 
 #[test]
+fn apply_changes_refuses_a_link_leading_out_unless_told_to_write_it() {
+    let dir = common::scratch_dir("fcage-apply-changes-links");
+    let (lower, upper) = (dir.join("lower"), dir.join("upper"));
+    std::fs::create_dir(&lower).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    std::fs::create_dir(&upper).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", upper.join("out")).unwrap();
+    let apply = |extra: &[&str]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "--apply-changes".as_ref(),
+            upper.as_os_str(),
+            "--overlay-lower".as_ref(),
+            lower.as_os_str(),
+            "--to".as_ref(),
+            lower.as_os_str(),
+            "--json".as_ref(),
+        ];
+        args.extend(extra.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+        fcage(&args)
+    };
+
+    let refused = apply(&[]);
+    assert_eq!(refused.status.code(), Some(125), "{refused:?}");
+    assert_eq!(
+        document(&refused),
+        serde_json::json!({
+            "applied": [],
+            "skipped": [],
+            "refused": [{
+                "path": "out",
+                "reason": "link-leads-out",
+                "link-target": "/etc/passwd",
+                "text": "fcage: refused \"out\": it is a symbolic link to \"/etc/passwd\", \
+                         which leads out of the target",
+            }],
+        })
+    );
+    assert!(std::fs::symlink_metadata(lower.join("out")).is_err());
+
+    let applied = apply(&["--links-leading-out"]);
+    assert!(applied.status.success(), "{applied:?}");
+    assert_eq!(
+        std::fs::read_link(lower.join("out")).unwrap(),
+        Path::new("/etc/passwd")
+    );
+}
+
+#[test]
 fn the_change_modes_take_their_own_flags_alone() {
     let out = fcage(&[
         "--changes".as_ref(),

@@ -130,6 +130,13 @@ the root, where `tree_components` refuses both, since a name a caller hands in \
 has no business holding them and a link's target routinely does."""
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/provision/changes/apply.rs"
+count = 1
+why = """A symbolic link's target, which an apply judges by where it leads: each `..` \
+is counted against the directories above the link, where `tree_components` \
+refuses one outright, and a leading `/` is the answer rather than a refusal."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/src/mechanism/copyin.rs"
 count = 2
 why = """\

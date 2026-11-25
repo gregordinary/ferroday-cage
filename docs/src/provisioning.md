@@ -1033,6 +1033,13 @@ the rest through. A change is refused for one of these reasons:
 - The target lacks the directory the change lies in, or reaches it through a
   symbolic link.
 - The change lies on another filesystem than the target's top.
+- It writes a symbolic link that leads out of the target. A link is the run's,
+  and the next tool to write through it writes where it leads, such as
+  `/home/user/.bashrc` or `../../.ssh/authorized_keys`. That is a link whose
+  target is absolute, or which climbs above the target's top with `..` from
+  the directory it lies in. A `..` after a name is refused too, since the name
+  may itself be a link. `links_leading_out` writes such links, for a tree whose
+  links lead out by design, and `--links-leading-out` on the command line.
 
 The change-time check matters because an overlay hides a lower's later edits
 from the run. Say the user edits a file the run has already copied up. The run

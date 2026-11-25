@@ -1335,11 +1335,11 @@ const FLAGS: &[Flag] = &[
             "Write what a run wrote through an overlay whose upper",
             "is UPPER, against the lowers --overlay-lower names,",
             "into the directory --to names, and exit. A change the",
-            "target also made after the upper was created, or one",
+            "target also made after the upper was created, one",
             "touching a protected path (.git, .envrc, git hook",
             "managers', mise's, editor, CI and shell startup files),",
-            "refuses the whole apply, naming each; nothing is",
-            "written then",
+            "or a symbolic link leading out of the target refuses",
+            "the whole apply, naming each; nothing is written then",
         ],
         mode: Mode::ApplyChanges,
         selects: true,
@@ -1413,6 +1413,18 @@ const FLAGS: &[Flag] = &[
         ],
         mode: Mode::ApplyChanges,
         take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--links-leading-out",
+        section: Section::Provisioning,
+        help: &[
+            "Let --apply-changes write a symbolic link that leads",
+            "out of the target, absolute or climbing above its top,",
+            "which it refuses otherwise",
+        ],
+        mode: Mode::ApplyChanges,
+        take: Take::Refused(Arity::Bare),
         ..Flag::DEFAULTS
     },
     Flag {
@@ -3049,6 +3061,9 @@ enum Invocation {
         only: Vec<PathBuf>,
         /// The reference time, where one was given.
         since: Option<std::time::SystemTime>,
+        /// Whether a symbolic link leading out of the tree is written rather
+        /// than refused.
+        links_leading_out: bool,
         /// Whether what the apply wrote or refused is printed as JSON rather
         /// than as text.
         json: bool,
@@ -3625,8 +3640,17 @@ fn main() -> ExitCode {
             protected,
             only,
             since,
+            links_leading_out,
             json,
-        }) => apply_changes(&overlay, &to, protected, only, since, json),
+        }) => apply_changes(
+            &overlay,
+            &to,
+            protected,
+            only,
+            since,
+            links_leading_out,
+            json,
+        ),
         Err(message) => usage_error(format_args!("{message}")),
     }
 }
@@ -4773,6 +4797,7 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
     let mut protected = Vec::new();
     let mut only = Vec::new();
     let mut since = None;
+    let mut links_leading_out = false;
     let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -4794,6 +4819,8 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
             protected.push(Protected::name(value));
         } else if arg == "--no-protection" {
             defaults = false;
+        } else if arg == "--links-leading-out" {
+            links_leading_out = true;
         } else if arg == "--json" {
             json = true;
         } else if let Some(value) = mode_value("--only", &arg, &mut args)? {
@@ -4826,6 +4853,7 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
                     "--no-protection",
                     "--only",
                     "--since",
+                    "--links-leading-out",
                     "--json",
                 ],
             ));
@@ -4853,6 +4881,7 @@ fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
         protected,
         only,
         since,
+        links_leading_out,
         json,
     })
 }
@@ -6229,6 +6258,7 @@ fn apply_changes(
     protected: Vec<Protected>,
     only: Vec<PathBuf>,
     since: Option<std::time::SystemTime>,
+    links_leading_out: bool,
     json: bool,
 ) -> ExitCode {
     let changes = match ChangeSet::read(overlay) {
@@ -6242,7 +6272,7 @@ fn apply_changes(
     if let Some(since) = since {
         apply = apply.since(since);
     }
-    match apply.run() {
+    match apply.links_leading_out(links_leading_out).run() {
         Ok(report) if json => output::print_json(
             "the applied listing",
             &listing::ApplyListing::applied(&report),
