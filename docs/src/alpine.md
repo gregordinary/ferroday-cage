@@ -474,6 +474,11 @@ that resolves to a directory, which a later directory entry passes through.
 `alpine-baselayout` ships `var/run` as a link to `../run`, so a package that
 ships `var/run/` lays its files in `run`.
 
+A package whose path holds a newline is refused with
+`ProvisionError::EntryRefused` before the entry is written. The installed
+database is read a line at a time, so what follows the newline would read back
+as fields of the record, or as a record of a package the root does not hold.
+
 ## Layered build roots
 
 `base_layer`, `resolve_layer` and `stage_layer` work as [the Debian layer's

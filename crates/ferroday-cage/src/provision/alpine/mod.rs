@@ -2383,6 +2383,12 @@ fn lay_package<R: std::io::Read>(
 /// tree. A directory over an earlier package's link is pushed onto `through`,
 /// with the package that laid the link, for [`lay_package`] to settle against
 /// the tree.
+///
+/// A path holding a newline is refused the same way. The database is read a
+/// line at a time, so such a path would be recorded as more lines than one,
+/// and what the archive spelled after the newline would be read back as fields
+/// of the record, or as a record of its own: a package the root does not hold,
+/// at a version the archive chose.
 fn record_entry(
     database: &mut Database,
     at: usize,
@@ -2391,6 +2397,12 @@ fn record_entry(
     through: &mut Vec<(Vec<u8>, String)>,
 ) -> Result<Placement, ProvisionError> {
     let path = components.join(&b'/');
+    if path.contains(&b'\n') {
+        return Err(ProvisionError::EntryRefused {
+            path: PathBuf::from(OsStr::from_bytes(&path)),
+            reason: "holds a newline, which the installed database cannot record".to_string(),
+        });
+    }
     // Root, which is what the extraction leaves every entry owned by. An entry
     // whose package states another owner is given it, and the record told so,
     // in the configure wave.
@@ -5667,6 +5679,27 @@ mod tests {
             };
             crate::failure::hostile::assert_escaped(&collision.to_string());
         }
+    }
+
+    #[test]
+    fn a_path_holding_a_newline_is_refused_before_it_is_recorded() {
+        // Recorded as it stands, the path would be read back as lines of its
+        // own: a record of a package the root does not hold.
+        let path = "usr/lib/x\n\nC:Q1forged=\nP:musl\nV:9999-r0\nF:usr";
+        let (scratch, laid) = lay(&[("one", "", one_file_archive(path, b"forged"))]);
+        let Err(err) = laid else {
+            panic!("the path cannot be recorded");
+        };
+        assert!(
+            matches!(&err, ProvisionError::EntryRefused { reason, .. } if reason.contains("newline")),
+            "{err}"
+        );
+        assert!(
+            !scratch.join("root/usr/lib").exists()
+                || ferroday_cage_testkit::scratch::entries(&scratch.join("root/usr/lib"))
+                    .is_empty(),
+            "nothing of the entry was written"
+        );
     }
 
     #[test]

@@ -488,6 +488,10 @@ consumer upgrading can skip it.
   for the package asked for, and replaces it only with a download that does. It
   removed the entry on any refusal, including one that names a valid build of
   another record at the same path.
+- The Alpine provisioner refuses a package whose path holds a newline. It
+  recorded the path in `lib/apk/db/installed` as it stood, so the archive's text
+  after the newline read back as fields of the record, or as a record of its
+  own for a package the root does not hold.
 
 ### Internal
 
