@@ -863,7 +863,7 @@ impl<'obs> Running<'obs> {
     /// [`SetupStep::JoinSandbox`](crate::SetupStep::JoinSandbox), where the
     /// caller runs under a seccomp policy that refuses `setns`, for one.
     pub fn exec(&self, exec: &Exec) -> Result<Running<'static>, Error> {
-        Running::join(self.joinable()?, exec, None)
+        Running::join(self.joinable()?, exec, None, None).map(|(running, _)| running)
     }
 
     /// Runs a further command in this handle's sandbox, capturing its output
@@ -876,7 +876,33 @@ impl<'obs> Running<'obs> {
         exec: &Exec,
         observer: &'o mut dyn Observer,
     ) -> Result<Running<'o>, Error> {
-        Running::join(self.joinable()?, exec, Some(observer))
+        Running::join(self.joinable()?, exec, Some(observer), None).map(|(running, _)| running)
+    }
+
+    /// Runs a further command in this handle's sandbox on a pseudoterminal of
+    /// its own, returning a handle to it and the caller's end of the terminal.
+    ///
+    /// Like [`exec`](Self::exec), with the terminal
+    /// [`Cage::spawn_terminal`](crate::Cage::spawn_terminal) gives a first
+    /// command: allocated from the `/dev/ptmx` the sandbox's mount profile
+    /// provides, so its replica is a node the command can name, and the
+    /// controlling terminal of a session the command leads. The further
+    /// command's [`Exec`] names no stream of its own, since all three are the
+    /// terminal.
+    ///
+    /// # Errors
+    ///
+    /// As [`exec`](Self::exec)'s, and
+    /// [`ConfigError::StreamAttachmentConflict`](crate::ConfigError::StreamAttachmentConflict)
+    /// where the exec names a stream of its own.
+    pub fn exec_terminal(
+        &self,
+        exec: &Exec,
+        terminal: &Terminal,
+    ) -> Result<(Running<'static>, Pty), Error> {
+        let (running, primary) = Running::join(self.joinable()?, exec, None, Some(terminal))?;
+        let primary = primary.ok_or_else(|| wait_syscall_error(Errno::PROTO))?;
+        Ok((running, Pty::new(primary)))
     }
 
     /// What a further command joins this handle's sandbox through.
@@ -909,13 +935,15 @@ impl<'obs> Running<'obs> {
         }))
     }
 
-    /// Launches `exec` into the sandbox `joinable` names and wraps its
-    /// channels.
+    /// Launches `exec` into the sandbox `joinable` names, on `terminal` where
+    /// it names one, and wraps its channels, returning the terminal's primary
+    /// beside them.
     fn join(
         joinable: Arc<Joinable>,
         exec: &Exec,
         mut observer: Option<&'obs mut dyn Observer>,
-    ) -> Result<Running<'obs>, Error> {
+        terminal: Option<&Terminal>,
+    ) -> Result<(Running<'obs>, Option<OwnedFd>), Error> {
         if mechanism::has_exited(joinable.holder.as_fd()) {
             return Err(Error::SandboxEnded);
         }
@@ -924,11 +952,14 @@ impl<'obs> Running<'obs> {
         if observe {
             check_capture_composes(&plan)?;
         }
+        if terminal.is_some() {
+            check_terminal_composes(&plan)?;
+        }
         let ready = Readiness::new()?;
         let spawned = mechanism::spawn(
             &plan,
             observe,
-            None,
+            terminal,
             joinable.cgroup.as_deref().map(Cgroup::procs),
             Some(joinable.holder.as_fd()),
             &mut |event| {
@@ -941,15 +972,15 @@ impl<'obs> Running<'obs> {
         );
         let (launched, primary) =
             spawned.map_err(|err| sandbox_ended(err, joinable.holder.as_fd()))?;
-        debug_assert!(primary.is_none(), "a launch with no terminal returns none");
-        Ok(Running::from_launched(
+        let running = Running::from_launched(
             launched,
             observer,
             PlaceholderGuard::default(),
             ready,
             None,
             Some(Sandbox::Joined(joinable)),
-        ))
+        );
+        Ok((running, primary))
     }
 
     /// Whether every channel has settled: the streams at end-of-file, the

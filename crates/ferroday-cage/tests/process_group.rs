@@ -19,7 +19,7 @@ mod common;
 use std::process::{Command, Stdio as HostStdio};
 use std::time::{Duration, Instant};
 
-use ferroday_cage::Cage;
+use ferroday_cage::{Cage, Exec, Stdio};
 use rustix::process::{Pid, WaitOptions};
 
 /// Which part this test binary plays, when it is run again: `shell` or
@@ -27,7 +27,9 @@ use rustix::process::{Pid, WaitOptions};
 const ROLE: &str = "FERRODAY_CAGE_TEST_GROUP_ROLE";
 
 /// What the caller launches and how it stands: `interrupt`, `suspend`,
-/// `suspend-subreaper`, `inner-job`, `pipeline`, or `pipe`.
+/// `suspend-subreaper`, `inner-job`, `pipeline`, `pipe`, or `exec`, where the
+/// command is a further command run in a sandbox the caller started off the
+/// terminal.
 const SCENARIO: &str = "FERRODAY_CAGE_TEST_GROUP_SCENARIO";
 
 /// The command every scenario runs: it signals its own process group, which
@@ -175,16 +177,41 @@ fn helper_caller() {
         .spawn()
         .expect("the sibling starts");
     // Tied to the caller, so a run that fails and ends the caller does not
-    // leave the sandbox behind.
-    let mut running = Cage::builder()
-        .rootfs(rootfs)
-        .command("/bin/sh")
-        .args(["-c", script(&scenario)])
-        .stop_with_caller(true)
-        .build()
-        .expect("a valid sandbox configuration")
-        .spawn()
-        .expect("the sandbox launches");
+    // leave the sandbox behind. In `exec` the sandbox's own command keeps it
+    // running off the terminal, and the scenario's command is a further one,
+    // on the caller's standard streams.
+    let sandbox = (scenario == "exec").then(|| {
+        Cage::builder()
+            .rootfs(rootfs)
+            .command("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .stop_with_caller(true)
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn()
+            .expect("the sandbox launches")
+    });
+    let mut running = match &sandbox {
+        Some(sandbox) => sandbox
+            .exec(
+                &Exec::new("/bin/sh")
+                    .args(["-c", script(&scenario)])
+                    .stop_with_caller(true),
+            )
+            .expect("the further command launches"),
+        None => Cage::builder()
+            .rootfs(rootfs)
+            .command("/bin/sh")
+            .args(["-c", script(&scenario)])
+            .stop_with_caller(true)
+            .build()
+            .expect("a valid sandbox configuration")
+            .spawn()
+            .expect("the sandbox launches"),
+    };
     // Whether the launch kept the terminal's foreground with the caller, read
     // once the command runs; the reader of a pipeline waits for the word.
     // One write, so the command's own output cannot land inside the line.
@@ -306,6 +333,24 @@ fn a_command_on_the_callers_terminal_signals_only_its_own_group() {
     // the foreground, and the caller has it back once the wait returns.
     assert_contained(&session(
         "interrupt",
+        &[
+            Step::Expect("ready"),
+            Step::Expect("caller-launched"),
+            Step::Type("\x03"),
+        ],
+    ));
+}
+
+#[test]
+fn a_further_command_on_the_callers_terminal_signals_only_its_own_group() {
+    if common::fixture_rootfs().is_none() {
+        return;
+    }
+    // As a first command on the caller's terminal: the further command takes a
+    // group of its own and the terminal's foreground, so what it sends its
+    // group misses the caller, and a `^C` reaches it.
+    assert_contained(&session(
+        "exec",
         &[
             Step::Expect("ready"),
             Step::Expect("caller-launched"),

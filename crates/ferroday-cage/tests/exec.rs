@@ -8,7 +8,9 @@ use common::Collect;
 
 use std::time::Duration;
 
-use ferroday_cage::{Cage, Error, Exec, IdentityMap, Running};
+use std::io::Read as _;
+
+use ferroday_cage::{Cage, ConfigError, Error, Exec, IdentityMap, Running, Stdio, Terminal};
 
 /// How long a test waits for an outcome it expects promptly.
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -315,9 +317,7 @@ fn a_further_command_states_its_own_command_line_and_inherits_the_rest() {
     // A relative command without lookup is refused as at build.
     assert!(matches!(
         sandbox.exec(&Exec::new("sh")),
-        Err(Error::Config(
-            ferroday_cage::ConfigError::CommandNotAbsolute { .. }
-        ))
+        Err(Error::Config(ConfigError::CommandNotAbsolute { .. }))
     ));
     sandbox.kill().expect("the kill is delivered");
     sandbox.wait().expect("the outcome is collected");
@@ -336,7 +336,7 @@ fn a_further_command_takes_a_process_group_of_its_own() {
             &Exec::new("/bin/sleep")
                 .arg("86399")
                 .stop_with_caller(true)
-                .stdout(ferroday_cage::Stdio::Null),
+                .stdout(Stdio::Null),
         )
         .expect("the further command launches");
     let ours = rustix::process::getpgrp().as_raw_nonzero().get();
@@ -352,6 +352,68 @@ fn a_further_command_takes_a_process_group_of_its_own() {
     assert_ne!(group, ours, "{stat}");
     further.kill().expect("the kill is delivered");
     common::outcome_within(&mut further, PATIENCE);
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+}
+
+#[test]
+fn a_further_command_on_a_terminal_leads_a_session_on_it() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // The first command runs on the test's own streams; the further command
+    // gets a terminal of its own, which is its controlling terminal, and leads
+    // the session that terminal belongs to.
+    let mut sandbox = running_sandbox(rootfs, true);
+    let (mut further, mut pty) = sandbox
+        .exec_terminal(
+            &Exec::new("/bin/sh").args([
+                "-c",
+                "for fd in 0 1 2; do [ -t $fd ] || exit 1; done; \
+                 stat=$(cut -d')' -f2- /proc/$$/stat); \
+                 echo pid=$$ sid=$(echo $stat | cut -d' ' -f4) \
+                 tty=$(echo $stat | cut -d' ' -f5)",
+            ]),
+            &Terminal::new(),
+        )
+        .expect("the further command launches on a terminal");
+    let mut written = Vec::new();
+    pty.read_to_end(&mut written)
+        .expect("the primary drains to end-of-file");
+    let written = String::from_utf8_lossy(&written).into_owned();
+    let status = common::outcome_within(&mut further, PATIENCE);
+    assert!(status.success(), "every stream is the terminal: {written}");
+    let field = |name: &str| {
+        written
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name} in {written:?}"))
+            .to_owned()
+    };
+    assert_eq!(field("pid="), field("sid="), "{written}");
+    assert_ne!(field("tty="), "0", "{written}");
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+}
+
+#[test]
+fn a_further_command_on_a_terminal_names_no_stream_of_its_own() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut sandbox = running_sandbox(rootfs, true);
+    let refused = sandbox.exec_terminal(
+        &Exec::new("/bin/true").stdout(Stdio::Null),
+        &Terminal::new(),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Config(ConfigError::StreamAttachmentConflict { .. }))
+        ),
+        "{:?}",
+        refused.err()
+    );
     sandbox.kill().expect("the kill is delivered");
     sandbox.wait().expect("the outcome is collected");
 }
@@ -389,7 +451,7 @@ fn a_range_map_reaches_a_further_command() {
 mod hardening {
     use super::*;
 
-    use ferroday_cage::{ConfigError, Restriction, SeccompPolicy, SeccompRules};
+    use ferroday_cage::{Restriction, SeccompPolicy, SeccompRules};
 
     #[test]
     fn a_further_command_is_refused_what_the_first_is() {
@@ -449,7 +511,10 @@ mod hardening {
             .take_seccomp_reports()
             .expect("the first command's reports are made");
         let mut further = sandbox
-            .exec(&Exec::new("/bin/sh").args(["-c", "mkdir -p /mnt; mount -t tmpfs none /mnt"]))
+            .exec(
+                &Exec::new("/bin/sh")
+                    .args(["-c", "mkdir -p /mnt; mount -t tmpfs none /mnt 2>/dev/null"]),
+            )
             .expect("the further command launches");
         let reports = further
             .take_seccomp_reports()

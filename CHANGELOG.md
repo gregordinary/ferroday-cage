@@ -107,18 +107,19 @@ consumer upgrading can skip it.
 
 ### Added
 
-- A further command can run in a sandbox that is running: `Running::exec` and
-  `Running::exec_with` run an `Exec`, which states the command, its arguments,
-  variables over the launch's environment, a working directory, the standard
-  streams, and `stop_with_caller`, and return a `Running` of its own. The
-  command joins the sandbox's namespaces with one `setns` through the pidfd the
-  handle holds, at the new `SetupStep::JoinSandbox`, and enters a nested user
-  and mount namespace of its own, copied from the sandbox's setup, under the
-  launch's identity, limits and hardening. Its handle signals that command
-  alone, and runs further commands in the same sandbox. A sandbox that has
-  ended answers `Error::SandboxEnded`, and a restriction's handle
-  `ConfigError::ExecIntoRestriction`. Library only: `fcage` runs one command
-  per invocation.
+- A further command can run in a sandbox that is running: `Running::exec`,
+  `Running::exec_with` and `Running::exec_terminal` run an `Exec`, which
+  states the command, its arguments, variables over the launch's environment,
+  a working directory, the standard streams, and `stop_with_caller`, and
+  return a `Running` of its own, with the caller's end of a pseudoterminal for
+  `exec_terminal`. The command joins the sandbox's namespaces with one `setns`
+  through the pidfd the handle holds, at the new `SetupStep::JoinSandbox`, and
+  enters a nested user and mount namespace of its own, copied from the
+  sandbox's setup, under the launch's identity, limits and hardening. Its
+  handle signals that command alone, and runs further commands in the same
+  sandbox. A sandbox that has ended answers `Error::SandboxEnded`, and a
+  restriction's handle `ConfigError::ExecIntoRestriction`. Library only:
+  `fcage` runs one command per invocation.
 - A sandbox or a restriction can report each call its seccomp filter refuses
   the command: `seccomp_reports(true)` on `CageBuilder` and
   `RestrictionBuilder`, `seccomp-reports` in a profile's `[hardening]` table.

@@ -3442,6 +3442,7 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::RestrictionBuilder
 pub struct ferroday_cage::Running<'obs>
 impl<'obs> ferroday_cage::Running<'obs>
 pub fn ferroday_cage::Running<'obs>::exec(&self, &ferroday_cage::Exec) -> core::result::Result<ferroday_cage::Running<'static>, ferroday_cage::Error>
+pub fn ferroday_cage::Running<'obs>::exec_terminal(&self, &ferroday_cage::Exec, &ferroday_cage::Terminal) -> core::result::Result<(ferroday_cage::Running<'static>, ferroday_cage::Pty), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::exec_with<'o>(&self, &ferroday_cage::Exec, &'o mut dyn ferroday_cage::Observer) -> core::result::Result<ferroday_cage::Running<'o>, ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::kill(&mut self) -> core::result::Result<(), ferroday_cage::Error>
 pub fn ferroday_cage::Running<'obs>::kill_handle(&self) -> core::result::Result<ferroday_cage::KillHandle, ferroday_cage::Error>
