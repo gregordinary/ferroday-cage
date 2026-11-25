@@ -117,6 +117,10 @@ consumer upgrading can skip it.
 - `fcage` writes each refusal the network stack reports on standard error under
   `--netstack-allow` or `--netstack-deny`, and every report under the new
   `--netstack-log`.
+- `NetStackBuilder` reads each of its settings back, through `get_ipv4`,
+  `get_ipv6`, `get_ipv4_cidr`, `get_ipv6_cidr`, `get_mtu`, `get_interface`,
+  `get_host_loopback`, `get_host_loopback_ports`, `get_publications`,
+  `get_nameserver`, `get_upstream`, `get_allow` and `get_deny`.
 
 ### Changed
 

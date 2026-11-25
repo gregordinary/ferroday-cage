@@ -1039,6 +1039,83 @@ impl NetStackBuilder {
         self
     }
 
+    /// Whether IPv4 is enabled; see [`ipv4`](Self::ipv4).
+    pub fn get_ipv4(&self) -> bool {
+        self.ipv4
+    }
+
+    /// Whether IPv6 is enabled; see [`ipv6`](Self::ipv6).
+    pub fn get_ipv6(&self) -> bool {
+        self.ipv6
+    }
+
+    /// The IPv4 network and its prefix length; see [`ipv4_cidr`](Self::ipv4_cidr).
+    pub fn get_ipv4_cidr(&self) -> (Ipv4Addr, u8) {
+        self.ipv4_cidr
+    }
+
+    /// The IPv6 network and its prefix length; see [`ipv6_cidr`](Self::ipv6_cidr).
+    pub fn get_ipv6_cidr(&self) -> (Ipv6Addr, u8) {
+        self.ipv6_cidr
+    }
+
+    /// The tap interface's MTU; see [`mtu`](Self::mtu).
+    pub fn get_mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// The tap interface's name; see [`interface`](Self::interface).
+    pub fn get_interface(&self) -> &str {
+        &self.interface
+    }
+
+    /// Whether every port of the gateway maps onto host loopback; see
+    /// [`host_loopback`](Self::host_loopback).
+    pub fn get_host_loopback(&self) -> bool {
+        self.host_loopback
+    }
+
+    /// The ports of the gateway mapped onto host loopback one at a time, in the
+    /// order they were named; see [`host_loopback_port`](Self::host_loopback_port).
+    pub fn get_host_loopback_ports(&self) -> &[u16] {
+        &self.host_loopback_ports
+    }
+
+    /// The published ports, each the host address listened on and the guest
+    /// port its connections are carried to, in the order they were published.
+    ///
+    /// [`NetStackHandle::published`] reports the address each listener is bound
+    /// to, in the same order, which is how a caller learns the port the kernel
+    /// chose for a publication on port 0.
+    pub fn get_publications(&self) -> impl Iterator<Item = (SocketAddr, u16)> + '_ {
+        self.publish
+            .iter()
+            .map(|publication| (publication.host, publication.guest_port))
+    }
+
+    /// Whether the stack serves the guest's DNS; see
+    /// [`nameserver`](Self::nameserver).
+    pub fn get_nameserver(&self) -> bool {
+        self.nameserver
+    }
+
+    /// The resolver the nameserver asks in place of the host's, where one is
+    /// named; see [`upstream`](Self::upstream).
+    pub fn get_upstream(&self) -> Option<SocketAddr> {
+        self.upstream
+    }
+
+    /// The allow rules, in the order they were given; see
+    /// [`allow`](Self::allow).
+    pub fn get_allow(&self) -> &[DestinationRule] {
+        &self.allow
+    }
+
+    /// The deny rules, in the order they were given; see [`deny`](Self::deny).
+    pub fn get_deny(&self) -> &[DestinationRule] {
+        &self.deny
+    }
+
     /// Validates the configuration and freezes it into a [`NetStack`].
     pub fn build(self) -> Result<NetStack, NetStackError> {
         if !self.ipv4 && !self.ipv6 {
@@ -2112,5 +2189,64 @@ mod tests {
             ],
             "the network stack's format keys moved",
         );
+    }
+
+    #[test]
+    fn each_getter_reads_back_its_setting() {
+        let defaults = NetStack::builder();
+        assert!(defaults.get_ipv4() && defaults.get_ipv6());
+        assert_eq!(defaults.get_ipv4_cidr(), (Ipv4Addr::new(10, 0, 2, 0), 24));
+        assert_eq!(
+            defaults.get_ipv6_cidr(),
+            (Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0), 64)
+        );
+        assert_eq!(defaults.get_mtu(), 1500);
+        assert_eq!(defaults.get_interface(), "tap0");
+        assert!(!defaults.get_host_loopback());
+        assert!(defaults.get_host_loopback_ports().is_empty());
+        assert_eq!(defaults.get_publications().count(), 0);
+        assert!(defaults.get_nameserver());
+        assert_eq!(defaults.get_upstream(), None);
+        assert!(defaults.get_allow().is_empty() && defaults.get_deny().is_empty());
+
+        let allow: DestinationRule = "example.com:443".parse().unwrap();
+        let deny: DestinationRule = "192.0.2.7".parse().unwrap();
+        let set = NetStack::builder()
+            .ipv4(false)
+            .ipv6(false)
+            .ipv4_cidr(Ipv4Addr::new(192, 168, 7, 0), 24)
+            .ipv6_cidr(Ipv6Addr::new(0xfd00, 7, 0, 0, 0, 0, 0, 0), 64)
+            .mtu(1400)
+            .interface("net0")
+            .host_loopback(true)
+            .host_loopback_port(5432)
+            .host_loopback_port(6379)
+            .publish("127.0.0.1:0".parse().unwrap(), 80)
+            .publish("[::1]:8443".parse().unwrap(), 443)
+            .nameserver(false)
+            .upstream("127.0.0.53:53".parse().unwrap())
+            .allow(allow.clone())
+            .deny(deny.clone());
+        assert!(!set.get_ipv4() && !set.get_ipv6());
+        assert_eq!(set.get_ipv4_cidr(), (Ipv4Addr::new(192, 168, 7, 0), 24));
+        assert_eq!(
+            set.get_ipv6_cidr(),
+            (Ipv6Addr::new(0xfd00, 7, 0, 0, 0, 0, 0, 0), 64)
+        );
+        assert_eq!(set.get_mtu(), 1400);
+        assert_eq!(set.get_interface(), "net0");
+        assert!(set.get_host_loopback());
+        assert_eq!(set.get_host_loopback_ports(), [5432, 6379]);
+        assert_eq!(
+            set.get_publications().collect::<Vec<_>>(),
+            [
+                ("127.0.0.1:0".parse().unwrap(), 80),
+                ("[::1]:8443".parse().unwrap(), 443),
+            ]
+        );
+        assert!(!set.get_nameserver());
+        assert_eq!(set.get_upstream(), Some("127.0.0.53:53".parse().unwrap()));
+        assert_eq!(set.get_allow(), [allow]);
+        assert_eq!(set.get_deny(), [deny]);
     }
 }

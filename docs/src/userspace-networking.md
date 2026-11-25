@@ -186,7 +186,10 @@ With the `serde` feature the builder is also the stack's profile format: it
 serializes and deserializes as the stack specification, for embedding in a
 consumer's own configuration. Keys are kebab-case, unknown keys are rejected,
 the CIDR fields read and write as `"address/len"` strings, and the `allow` and
-`deny` lists hold each rule as its text.
+`deny` lists hold each rule as its text. Each setting reads back through a
+getter named for it, such as [`get_allow`][`NetStackBuilder::get_allow`] for
+`allow`. A consumer can then inspect a specification it loaded before it
+builds the stack.
 
 ### The handle owns the stack
 
@@ -897,6 +900,7 @@ outside the sandbox and is not filtered.
 [`NetStackBuilder::upstream`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.upstream
 [`NetStackBuilder::allow`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.allow
 [`NetStackBuilder::deny`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.deny
+[`NetStackBuilder::get_allow`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.get_allow
 [`NetStackBuilder::build`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.build
 [`DestinationRule`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.DestinationRule.html
 [`NetStackError::RuleInvalid`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.NetStackError.html#variant.RuleInvalid

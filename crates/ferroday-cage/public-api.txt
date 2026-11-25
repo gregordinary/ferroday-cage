@@ -2888,6 +2888,19 @@ impl ferroday_cage::NetStackBuilder
 pub fn ferroday_cage::NetStackBuilder::allow(self, ferroday_cage::DestinationRule) -> Self
 pub fn ferroday_cage::NetStackBuilder::build(self) -> core::result::Result<ferroday_cage::NetStack, ferroday_cage::NetStackError>
 pub fn ferroday_cage::NetStackBuilder::deny(self, ferroday_cage::DestinationRule) -> Self
+pub fn ferroday_cage::NetStackBuilder::get_allow(&self) -> &[ferroday_cage::DestinationRule]
+pub fn ferroday_cage::NetStackBuilder::get_deny(&self) -> &[ferroday_cage::DestinationRule]
+pub fn ferroday_cage::NetStackBuilder::get_host_loopback(&self) -> bool
+pub fn ferroday_cage::NetStackBuilder::get_host_loopback_ports(&self) -> &[u16]
+pub fn ferroday_cage::NetStackBuilder::get_interface(&self) -> &str
+pub fn ferroday_cage::NetStackBuilder::get_ipv4(&self) -> bool
+pub fn ferroday_cage::NetStackBuilder::get_ipv4_cidr(&self) -> (core::net::ip_addr::Ipv4Addr, u8)
+pub fn ferroday_cage::NetStackBuilder::get_ipv6(&self) -> bool
+pub fn ferroday_cage::NetStackBuilder::get_ipv6_cidr(&self) -> (core::net::ip_addr::Ipv6Addr, u8)
+pub fn ferroday_cage::NetStackBuilder::get_mtu(&self) -> u16
+pub fn ferroday_cage::NetStackBuilder::get_nameserver(&self) -> bool
+pub fn ferroday_cage::NetStackBuilder::get_publications(&self) -> impl core::iter::traits::iterator::Iterator<Item = (core::net::socket_addr::SocketAddr, u16)> + '_
+pub fn ferroday_cage::NetStackBuilder::get_upstream(&self) -> core::option::Option<core::net::socket_addr::SocketAddr>
 pub fn ferroday_cage::NetStackBuilder::host_loopback(self, bool) -> Self
 pub fn ferroday_cage::NetStackBuilder::host_loopback_port(self, u16) -> Self
 pub fn ferroday_cage::NetStackBuilder::interface(self, impl core::convert::Into<alloc::string::String>) -> Self
