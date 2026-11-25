@@ -32,9 +32,12 @@ model](process-model.md) describes.
    blocked until then. The caller's ignored dispositions would otherwise
    survive into the command, and an inherited signal handler must never run
    inside these tightly constrained processes. The launch stage keeps every
-   signal but the faults blocked for as long as it lives. Each process it
-   forks sets its own mask: the command starts with none blocked, and the init
-   blocks only `SIGCHLD`, which it reads from a descriptor.
+   signal blocked until it supervises, and outside the sandbox it then ignores
+   every one but `SIGCHLD`. Each process it forks sets its own mask: the init
+   blocks only `SIGCHLD`, which it reads from a descriptor, and the command
+   keeps every signal blocked until its identity maps are written, is then made
+   not dumpable, and unblocks them before it executes, so a signal sent to it
+   meanwhile dumps none of the caller's memory.
 2. **Join the sandbox's cgroup**, where the launch has one from
    `cgroup_parent`. The caller created the cgroup and wrote its limits before
    the fork, and created a leaf beneath it. The launch stage moves itself into
@@ -157,7 +160,9 @@ model](process-model.md) describes.
     The command wires its standard
     streams per the configuration, applies the configured [resource
     limits](hardening.md#resource-limits), and enters a nested user namespace
-    (below). It then installs the [network filter](#the-network-filter) where
+    (below). With that map written, it makes itself not dumpable and unblocks
+    its signals, as step 1 says. It then installs the [network
+    filter](#the-network-filter) where
     the sandbox has its own network namespace, applies any hardening, and calls
     `execve`, resolved inside the new root. The hardening layer applies in two halves around the switch to the
     configured [run-as

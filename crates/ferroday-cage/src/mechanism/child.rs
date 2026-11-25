@@ -195,6 +195,15 @@ impl Context<'_> {
     fn supervised_outside(&self) -> bool {
         self.joins() || !self.plan.pid_namespace
     }
+
+    /// Whether the launch stage holds the namespaces a further command joins:
+    /// the stage of a container's first command without a PID namespace; see
+    /// [`withhold_stage`].
+    fn holds_sandbox(&self) -> bool {
+        matches!(self.plan.confinement, super::Confinement::Container)
+            && !self.joins()
+            && !self.plan.pid_namespace
+    }
 }
 
 /// A failed setup step: the step, the errno, and the 1-based index of the
@@ -227,16 +236,15 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
     // constraints. The fork left every signal blocked until here, so neither
     // can happen.
     //
-    // Every signal the outside supervisor ignores stays blocked. This process
-    // is in the caller's process group, and without a PID namespace it
-    // outlives the setup as the command's supervisor, which must not end
-    // because a signal was sent to that group. Blocked from the fork on, a
+    // Every signal stays blocked. This process is in the caller's process
+    // group, and where it supervises from outside it outlives the setup as the
+    // command's supervisor, which must not end because a signal was sent to
+    // that group, or by a process of the sandbox. Blocked from the fork on, a
     // signal that arrives waits until the supervisor ignores it, which
-    // discards it; see `ignore_outside_signals`. `SIGCHLD` stays blocked
-    // too, for good: the supervisor reads it from a descriptor, and one
-    // delivered at its default disposition before that would be discarded.
-    reset_signals(&SigSet::all().without(&SUPERVISOR_FAULTS))
-        .map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
+    // discards it; see `ignore_outside_signals`. `SIGCHLD` stays blocked too,
+    // for good: the supervisor reads it from a descriptor, and one delivered
+    // at its default disposition before that would be discarded.
+    reset_signals(&SigSet::all()).map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
 
     // Every standard number the caller left closed, held before anything here
     // creates a descriptor that would land on it. Nothing above created one,
@@ -371,7 +379,8 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                 // else, then the cgroup namespace the launch stage left it, and
                 // leaves the caller's process group as the init does for a
                 // first command, for the same reason, with every signal still
-                // blocked as the fork left it.
+                // blocked as the fork left it. The command keeps them blocked
+                // until its exec is near; see `withhold_image`.
                 if context.joins() {
                     if let Some(procs) = context.cgroup_procs_fd {
                         join_cgroup(procs)?;
@@ -383,7 +392,6 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                     }
                     take_process_group(context)?;
                 }
-                unblock_signals().map_err(|errno| (SetupStep::ResetSignals, errno, 0))?;
                 // The command keeps its own end of the gate and drops the
                 // delegate's side of the seam, which is not its to hold.
                 let gate = seam.map(|seam| {
@@ -444,6 +452,12 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
                 // The init supervises itself from inside the namespace;
                 // this stage's work is done.
                 sys::exit_group(0)
+            }
+            if !context.holds_sandbox()
+                && let Err(errno) = withhold_stage()
+            {
+                abandon_command(child);
+                return Err((SetupStep::SetNotDumpable, errno, 0));
             }
             let children = match watch_children() {
                 Ok(children) => children,
@@ -703,12 +717,9 @@ fn stage_init(context: &Context<'_>, launch_stage: Option<OwnedFd>) -> ! {
             sys::exit_group(127)
         }
         Ok(sys::Fork::Child) => {
-            if let Err(errno) = unblock_signals() {
-                report(context.report_fd, SetupStep::ResetSignals, errno, 0);
-                sys::exit_group(127)
-            }
-            // The command keeps its own end of the gate and drops the
-            // delegate's side of the seam, which is not its to hold.
+            // The command keeps every signal blocked until its exec is near;
+            // see `withhold_image`. It keeps its own end of the gate and drops
+            // the delegate's side of the seam, which is not its to hold.
             let gate = seam.map(|seam| {
                 drop(seam.procfs);
                 drop(seam.delegate);
@@ -1104,6 +1115,13 @@ fn exec_command(
     // any depth.
     if let Err((step, errno, detail)) = enter_nested_namespace(context, nested_gate) {
         report(context.report_fd, step, errno, detail);
+        sys::exit_group(127)
+    }
+
+    // Every identity map that needed this process dumpable is written, so it
+    // is made not dumpable, and only then are its signals unblocked.
+    if let Err((step, errno)) = withhold_image() {
+        report(context.report_fd, step, errno, 0);
         sys::exit_group(127)
     }
 
@@ -2114,24 +2132,6 @@ fn supervisor_hygiene(context: &Context<'_>, role: Role) {
     }
 }
 
-/// The signals that report the supervisor's own failure, which the outside
-/// supervisor leaves at their defaults and unblocked: the faults the kernel
-/// raises on an instruction it executes, which it delivers whatever the
-/// disposition, and `SIGABRT`.
-///
-/// `SIGKILL` and `SIGSTOP` take no disposition at all. Another process can
-/// therefore still end this one by sending it one of these, as it can with
-/// `SIGKILL`.
-const SUPERVISOR_FAULTS: [Signal; 7] = [
-    Signal::SEGV,
-    Signal::BUS,
-    Signal::ILL,
-    Signal::FPE,
-    Signal::TRAP,
-    Signal::SYS,
-    Signal::ABORT,
-];
-
 /// The signal mask every supervisor runs under: `SIGCHLD` alone.
 ///
 /// The supervisor reads `SIGCHLD` from a descriptor, which sees a signal only
@@ -2141,9 +2141,8 @@ const SUPERVISOR_FAULTS: [Signal; 7] = [
 /// itself, and the supervisor's wait would never see its status.
 const SUPERVISOR_MASK: SigSet = SigSet::of(&[Signal::CHILD]);
 
-/// Ignores every signal but `SIGCHLD` and [`SUPERVISOR_FAULTS`], then unblocks
-/// all but `SIGCHLD`: the outside supervisor's immunity, the one the init has
-/// as PID 1.
+/// Ignores every signal but `SIGCHLD`, then unblocks all but `SIGCHLD`: the
+/// outside supervisor's immunity, the one the init has as PID 1.
 ///
 /// The init is immune by construction. A namespace's PID 1 is never sent a
 /// signal it has left at the default, from inside the namespace or above it,
@@ -2159,9 +2158,21 @@ const SUPERVISOR_MASK: SigSet = SigSet::of(&[Signal::CHILD]);
 /// The library itself never signals this process to make it act. A termination
 /// request, a request to end the sandbox, and the caller's exit reach it over
 /// the control socket, and a kill goes to the command through the command's
-/// pidfd. Only the teardown of a
-/// launch being given up on ends it, with `SIGKILL`, which no disposition
-/// stops.
+/// pidfd. Only the teardown of a launch being given up on ends it, with
+/// `SIGKILL`, which no disposition stops.
+///
+/// The signals the kernel raises on a fault, `SIGSEGV`, `SIGBUS`, `SIGILL`,
+/// `SIGFPE`, `SIGTRAP` and `SIGSYS`, are ignored with the rest. Without a PID
+/// namespace the sandbox's processes run as this process's own user in its PID
+/// namespace, and each of those, sent by one of them, would end this copy of
+/// the caller's address space with a core dump, written where the dumping
+/// process's root and working directory say, which the pivot may have made
+/// the sandbox's. A fault this process raises itself is still delivered: the
+/// kernel resets an ignored or blocked fault's disposition to the default as
+/// it delivers it. `SIGABRT` comes from `abort`, which nothing here calls.
+/// `SIGKILL` and `SIGSTOP` take no disposition, so another process can still
+/// end this one, or stop it until a kill or a termination through the handle
+/// continues it.
 ///
 /// Ignored only here, after the command was forked, because an ignored
 /// disposition survives `execve` and the command must start with every one at
@@ -2170,11 +2181,7 @@ const SUPERVISOR_MASK: SigSet = SigSet::of(&[Signal::CHILD]);
 /// no moment at which one reaches this process at the default.
 fn ignore_outside_signals() -> Result<(), Errno> {
     for signal in every_signal() {
-        if signal == Signal::KILL
-            || signal == Signal::STOP
-            || signal == Signal::CHILD
-            || SUPERVISOR_FAULTS.contains(&signal)
-        {
+        if signal == Signal::KILL || signal == Signal::STOP || signal == Signal::CHILD {
             continue;
         }
         match sys::set_disposition(signal, Disposition::Ignore) {
@@ -2187,7 +2194,8 @@ fn ignore_outside_signals() -> Result<(), Errno> {
     replace_mask(&SUPERVISOR_MASK)
 }
 
-/// Empties the signal mask of the command, freshly forked.
+/// Empties the signal mask of the command, once [`withhold_image`] has made
+/// it not dumpable.
 ///
 /// [`sys::fork`] leaves every signal blocked in the child process. The
 /// dispositions it inherited are its parent process's, which
@@ -2196,6 +2204,59 @@ fn ignore_outside_signals() -> Result<(), Errno> {
 /// process ordinarily has.
 fn unblock_signals() -> Result<(), Errno> {
     replace_mask(&SigSet::empty())
+}
+
+/// Makes the command's process not dumpable, then unblocks its signals: the
+/// step between its last identity-map write and its hardening.
+///
+/// Until its `execve` the process is a copy of the caller's address space,
+/// whatever the caller held in it. Any process running as the same user that
+/// can name it may signal it, a process of the sandbox among them where it is
+/// in the sandbox's PID namespace, as a further command is, or shares the
+/// caller's. A signal whose default action dumps core, `SIGQUIT` or `SIGSEGV`
+/// for one, would have the kernel write that copy where the core pattern says:
+/// a file in the process's working directory or under its root, a container's
+/// own by then, or a handler that forwards it into the process's root.
+/// The process therefore keeps every signal blocked from its fork, and once it
+/// is not dumpable the kernel dumps nothing, so a signal that arrived
+/// meanwhile acts on its default as it is unblocked, and dumps nothing. The
+/// `execve` makes the process dumpable again, as the command's own image.
+///
+/// Not dumpable any earlier, because the kernel gives such a process's
+/// `/proc/<pid>` files to root of the caller's user namespace, and the
+/// command's identity-map files are among them: neither the command writing
+/// its own nested map nor the sandbox's root writing it could then write it.
+///
+/// What remains is a stop: `SIGSTOP` takes no mask, and a process of the
+/// sandbox can still hold the command short of its exec, and the launch
+/// waiting for it.
+fn withhold_image() -> Result<(), (SetupStep, Errno)> {
+    process::set_dumpable_behavior(process::DumpableBehavior::NotDumpable)
+        .map_err(|errno| (SetupStep::SetNotDumpable, errno))?;
+    unblock_signals().map_err(|errno| (SetupStep::ResetSignals, errno))
+}
+
+/// Makes a launch stage that supervises from outside, and holds nothing a
+/// further command joins, not dumpable, once its command is forked.
+///
+/// The stage is a copy of the caller's address space for as long as it
+/// supervises, and the command's processes can name it, as a further
+/// command's processes can without a PID namespace and a restriction's always
+/// can. [`ignore_outside_signals`] keeps a signal from making it dump; not
+/// dumpable, a fault of its own dumps nothing either, and no process without
+/// `CAP_SYS_PTRACE` reads it. Only after the fork, since the command inherits
+/// the state and its identity maps are still to be written.
+///
+/// The launch stage of a container's first command without a PID namespace,
+/// and the init of one with a PID namespace, stay dumpable: each holds the
+/// sandbox's namespaces, and the kernel lets a further command's launch stage
+/// join them through its pidfd, and a caller open them under `/proc/<pid>/ns`,
+/// only while it is. Neither is exposed by it. That launch stage ignores every
+/// signal that dumps, the init receives from inside its namespace no signal it
+/// has no handler for, and it has none, and a command, in a user namespace of
+/// its own below theirs, holds no capability over either to trace it.
+fn withhold_stage() -> Result<(), Errno> {
+    process::set_dumpable_behavior(process::DumpableBehavior::NotDumpable)
 }
 
 /// Replaces the signal mask of this process, every disposition of which is the
@@ -4173,6 +4234,92 @@ mod tests {
                      open one was touched; 3: a descriptor landed on a standard number",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_command_is_withheld_once_its_map_is_written_and_not_before() {
+        if !ferroday_cage_testkit::require::not_root(
+            "root owns its processes' /proc files dumpable or not",
+        ) {
+            return;
+        }
+        let (uid_line, gid_line) = crate::idmap::single_identity_lines();
+        let duty = || MapDuty::Write {
+            paths: MapPaths::SELF,
+            uid_line: &uid_line,
+            gid_line: &gid_line,
+        };
+
+        // As the command: its map written, then withheld with every signal
+        // blocked until then, and held there for the parent to look at.
+        let (ready, ready_end) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        let (hold_end, hold) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC).expect("a pipe");
+        // SAFETY: the child makes raw syscalls only, through rustix, `sys` and
+        // the shared map sequence, and ends in `exit_group`.
+        let child = match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
+            sys::PidfdFork::Child => {
+                let keep = [ready_end.as_raw_fd(), hold_end.as_raw_fd()];
+                if enter_mapped_namespace(&keep, UnshareFlags::empty(), duty(), None).is_err() {
+                    sys::exit_group(1)
+                }
+                // SAFETY: blocking signals runs nothing.
+                if unsafe { sys::sigprocmask(How::SetMask, Some(&SigSet::all())) }.is_err()
+                    || withhold_image().is_err()
+                    || rustix::io::write(&ready_end, b"R").is_err()
+                {
+                    sys::exit_group(2)
+                }
+                let mut byte = [0u8; 1];
+                let _ = rustix::io::read(&hold_end, &mut byte);
+                sys::exit_group(0)
+            }
+            sys::PidfdFork::ParentOf(child) => child,
+        };
+        drop((ready_end, hold_end));
+        let mut byte = [0u8; 1];
+        if rustix::io::read(&ready, &mut byte) != Ok(1) {
+            let _ = child.reap();
+            ferroday_cage_testkit::require::USERNS
+                .skip("a forked child could not enter a user namespace of its own");
+            return;
+        }
+        let pid = child.pid().as_raw_nonzero().get();
+        let owner = fs::stat(format!("/proc/{pid}/environ"))
+            .expect("the child's environment is there to stat")
+            .st_uid;
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("the status reads");
+        drop(hold);
+        assert_eq!(child.reap(), Ok(Some(0)));
+        assert_eq!(owner, 0, "the withheld command's /proc files are root's");
+        assert_eq!(
+            ferroday_cage_testkit::process::status_field(&status, "SigBlk"),
+            Some("0000000000000000"),
+            "the withheld command blocks no signal"
+        );
+
+        // Withheld first, the map can no longer be written: why the command
+        // waits for it.
+        // SAFETY: as above.
+        match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
+            sys::PidfdFork::Child => {
+                if withhold_image().is_err() {
+                    sys::exit_group(2)
+                }
+                match enter_mapped_namespace(&[], UnshareFlags::empty(), duty(), None) {
+                    Err(MapFailure::Step(MapStep::DenySetgroups, Errno::ACCESS)) => {
+                        sys::exit_group(0)
+                    }
+                    _ => sys::exit_group(1),
+                }
+            }
+            sys::PidfdFork::ParentOf(child) => assert_eq!(
+                child.reap(),
+                Ok(Some(0)),
+                "1: the map was written, or failed another way; 2: the process could not be \
+                 withheld"
+            ),
         }
     }
 

@@ -517,6 +517,36 @@ fn the_restrictions_supervisor_outlives_the_signals_sent_to_its_group() {
 }
 
 #[test]
+fn the_restrictions_supervisor_is_not_dumpable() {
+    if !common::require::seccomp() {
+        return;
+    }
+    if !common::require::not_root("root owns its processes' /proc files dumpable or not") {
+        return;
+    }
+    // The launch stage is a copy of the caller's address space, and the command
+    // runs beside it as the same user. Once the command is forked the stage is
+    // not dumpable, so its `/proc` files are root's, and the command reads
+    // nothing of it there.
+    let mut running = Restriction::builder()
+        .command("/bin/sh")
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 200 ]; do \
+             [ \"$(stat -c %u /proc/$PPID/environ)\" = 0 ] && exit 7; \
+             sleep 0.05; i=$((i+1)); done; exit 1",
+        ])
+        .seccomp(SeccompPolicy::Rules(SeccompRules::curated()))
+        .stdin(Stdio::Null)
+        .build()
+        .expect("a valid restriction configuration")
+        .spawn()
+        .expect("the restriction launches");
+    let status = common::outcome_within(&mut running, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(7));
+}
+
+#[test]
 fn landlock_grants_a_single_file_and_a_device_node() {
     if !common::landlock() {
         return;

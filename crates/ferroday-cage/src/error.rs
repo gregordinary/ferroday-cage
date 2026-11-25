@@ -237,6 +237,10 @@ wire_enum! {
         /// Mount an overlay at a path inside the sandbox; see
         /// `CageBuilder::overlay_at`.
         MountOverlay = 73 => "mounting an overlay",
+        /// Make a process of the launch not dumpable, which holds a copy of the
+        /// caller's address space: the command's before its exec, and a launch
+        /// stage that supervises from outside.
+        SetNotDumpable = 74 => "making a process of the launch not dumpable",
     }
 }
 

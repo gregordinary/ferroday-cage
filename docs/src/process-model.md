@@ -269,12 +269,23 @@ responds to its own signals is application policy. The defined behavior:
 - **The library's own processes outlive the signals sent to the caller's
   process group.** The init is immune to them as PID 1 of its namespace.
   Without a PID namespace, the launch stage stays in the caller's process group
-  as the command's parent. It ignores every signal but `SIGCHLD` and the
-  faults. A `^C`, a hangup, or a shell's `kill %1` that ends the caller leaves
-  it to collect the outcome and stop the sandbox as asked. `SIGKILL`, or a
-  fault's signal, sent to the group still ends it, and a command in a session
-  of its own then runs on.
+  as the command's parent. It ignores every signal but `SIGCHLD`, the faults'
+  included, which the kernel still delivers for a fault of its own. A `^C`, a
+  hangup, or a shell's `kill %1` that ends the caller leaves it to collect the
+  outcome and stop the sandbox as asked. `SIGKILL` sent to the group still ends
+  it, and a command in a session of its own then runs on.
   The command starts with every signal at its default.
+- **No process of the launch dumps the caller's memory.** Each process the
+  launch forks is a copy of the caller's address space until it executes,
+  and a process of the sandbox, running as the same user, can signal those it
+  can name. The command keeps every signal blocked from its fork until its
+  identity maps are written, and is not dumpable from then until its exec,
+  which makes it dumpable again as the command. No signal therefore makes it
+  dump that copy, though a stop still holds it short of its exec, and the
+  launch waits. A launch stage that supervises from outside ignores the
+  signals that dump, and one that holds nothing a further command joins, a
+  further command's own and a restriction's, is not dumpable once its command
+  is forked. The init receives none of them from inside its namespace.
 - **A signal delivered to the caller alone does not affect the sandbox.**
   An application that wants its `SIGTERM` to stop the sandbox calls
   [`terminate`]/[`kill`] from its handler path, per the recipe above.

@@ -2677,6 +2677,7 @@ pub ferroday_cage::SetupStep::SetGid = 41
 pub ferroday_cage::SetupStep::SetGroups = 40
 pub ferroday_cage::SetupStep::SetHostname = 5
 pub ferroday_cage::SetupStep::SetNoNewPrivs = 32
+pub ferroday_cage::SetupStep::SetNotDumpable = 74
 pub ferroday_cage::SetupStep::SetRlimit = 44
 pub ferroday_cage::SetupStep::SetSecurebits = 39
 pub ferroday_cage::SetupStep::SetUid = 42

@@ -2298,10 +2298,9 @@ impl CageBuilder {
     /// process the caller forks without executing holds a copy until it exits
     /// or executes; the sandbox runs on until then. Without a PID namespace
     /// the supervisor outside the sandbox is a member of the caller's process
-    /// group. It ignores every signal but `SIGCHLD` and those that report a
-    /// fault (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`, `SIGSYS`,
-    /// `SIGABRT`). One of those, or a `SIGKILL`, sent to the whole group ends it
-    /// as it ends the caller, and the command then runs on unsupervised.
+    /// group. It ignores every signal but `SIGCHLD`, so only a `SIGKILL` sent
+    /// to the whole group ends it as it ends the caller, and the command then
+    /// runs on unsupervised.
     ///
     /// With a [`cgroup_parent`](Self::cgroup_parent), dropping the last handle
     /// also ends every process of the cgroup's tree, as

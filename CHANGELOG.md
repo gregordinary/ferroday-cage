@@ -104,6 +104,20 @@ consumer upgrading can skip it.
   shared cache, the entry's owner, or a member of its group where its mode let
   one write, could change the bytes between the two passes. A download is now
   published at mode 0644, which the umask can only narrow.
+- No signal a process of a sandbox sends makes a process of its launch dump
+  the caller's memory. A command's process, a further command's included,
+  unblocked its signals as it was forked and stayed dumpable until its
+  `execve`, a copy of the caller's address space all the while, so a process
+  of the sandbox could send it `SIGQUIT` or `SIGSEGV` and have the kernel write
+  that copy where the core pattern says: into the sandbox's root or working
+  directory, or to a handler that forwards it there. The command now keeps
+  every signal blocked until its identity maps are written, is then made not
+  dumpable, at the new `SetupStep::SetNotDumpable`, and only then unblocks
+  them; its `execve` makes it dumpable again. A launch stage that supervises
+  from outside ignores the faults' signals and `SIGABRT` as it ignores the
+  rest, and one that holds nothing a further command joins, a further
+  command's and a restriction's, is not dumpable once its command is forked. A
+  process of the sandbox can still stop a command short of its exec.
 
 ### Added
 

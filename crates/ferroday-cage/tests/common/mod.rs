@@ -33,10 +33,11 @@ pub use ferroday_cage_testkit::tar::Tar;
 pub use ferroday_cage_testkit::xattr;
 
 /// The signals a process can be sent that end or stop it at their default
-/// dispositions, the faults and `SIGABRT` aside: what a process group receives
-/// from a terminal or a shell, and what a supervisor in that group must
-/// outlive.
-pub const GROUP_SIGNALS: [rustix::process::Signal; 17] = {
+/// dispositions, `SIGKILL` and `SIGSTOP` aside: what a process group receives
+/// from a terminal or a shell, and what a process sharing a supervisor's user
+/// can send it, the faults' signals and `SIGABRT` among them, all of which a
+/// supervisor outside the sandbox must outlive.
+pub const GROUP_SIGNALS: [rustix::process::Signal; 24] = {
     use rustix::process::Signal;
     [
         Signal::INT,
@@ -56,6 +57,13 @@ pub const GROUP_SIGNALS: [rustix::process::Signal; 17] = {
         Signal::XFSZ,
         Signal::IO,
         Signal::POWER,
+        Signal::SEGV,
+        Signal::BUS,
+        Signal::ILL,
+        Signal::FPE,
+        Signal::TRAP,
+        Signal::SYS,
+        Signal::ABORT,
     ]
 };
 

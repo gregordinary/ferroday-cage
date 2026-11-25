@@ -273,6 +273,30 @@ fn a_further_command_racing_the_sandboxs_end_is_refused_as_its_end() {
 }
 
 #[test]
+fn a_further_commands_launch_stage_is_not_dumpable_and_outlives_its_signals() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    // Without a PID namespace a further command can name the launch stage that
+    // supervises it, a copy of the caller's address space, and signal it as
+    // the same user. A signal that dumps core is ignored, and the stage is not
+    // dumpable once the command is forked: its `/proc` files are root's, which
+    // the sandbox's namespace maps to no id. The stage reports the outcome.
+    let sandbox = running_sandbox(rootfs, false);
+    let mut further = sandbox
+        .exec(&Exec::new("/bin/sh").args([
+            "-c",
+            "for signal in SEGV BUS ILL FPE TRAP SYS ABRT QUIT; do kill -$signal $PPID; done; \
+             i=0; while [ $i -lt 200 ]; do \
+             [ \"$(stat -c %u /proc/$PPID/environ)\" = 65534 ] && exit 7; \
+             sleep 0.05; i=$((i+1)); done; exit 1",
+        ]))
+        .expect("the further command launches");
+    let status = common::outcome_within(&mut further, PATIENCE);
+    assert_eq!(status.code(), Some(7), "{status:?}");
+}
+
+#[test]
 fn a_further_command_states_its_own_command_line_and_inherits_the_rest() {
     let Some(rootfs) = common::fixture_rootfs() else {
         return;
