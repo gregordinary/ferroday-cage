@@ -532,7 +532,7 @@ report name a package and its version bare.
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
 | Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode` |
-| Is this text a run of digits, and what number does it spell, without the leading `+` Rust's parsers take? How do two runs of digits compare? | `provision::number::is_digits`, `number::digits`, `number::digits_in` for HTTP's hexadecimal framing, `number::compare_digit_runs` |
+| Is this text a run of digits, and what number does it spell, without the leading `+` Rust's parsers take? How do two runs of digits compare? | `provision::number::is_digits`, `number::digits`, `number::digits_in` for HTTP's hexadecimal framing, `number::compare_digit_runs`. The network stack builds without the provisioners and asks of a port itself, `netstack::server_name::is_port` |
 | Spell bytes as lowercase hex, or read lowercase hex back | `provision::digest::hex`, `digest::unhex`; a percent escape, which either case spells, is `fetch::percent_decode`'s to read |
 | Read a field-and-stanza document one stanza at a time, in place, or carry a stanza on whole, or write a plan document and read its header, its number fields and its list fields | `provision::document::parse`, `Stanza::get`, `Stanza::get_each`, `Stanza::text`, `document::header`, `document::number`, `document::list` |
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
@@ -616,6 +616,8 @@ report name a package and its version bare.
 | Make a file of the launch's own, empty or holding given bytes, to mount over a target | `mechanism::child::own_file`, which a hidden file and a placed one share |
 | Does the network stack carry the guest's traffic over this transport to this destination, and if not, why not? | `NetStack::forwards`, over `netstack::pump::host_target`, which settles the refusals no rule lifts, naming which as a `FlowRefusal`, and then asks `netstack::policy::Policy::decide` of the address and the names pinned at it, which names the rule that decided |
 | Do the destination rules admit a question the stack's nameserver would relay? | `netstack::policy::Policy::decide_question` |
+| Are a TCP flow's first bytes held to the destination rules, and do the rules admit the server they ask for? | `netstack::policy::Policy::hold`, `Policy::decide_servers` |
+| Which server do a TCP flow's first bytes ask for, and what does the stack answer first bytes it refuses with? | `netstack::server_name::read`, `server_name::answer` |
 | Which names did the stack's nameserver resolve to an address? | `netstack::pins::Pins`, which the nameserver fills from `netstack::dns::answer_addresses` |
 | Read a destination rule, or write one back | `DestinationRule`'s `FromStr` and `Display`, which the builder, the stack's profile format and `fcage` share |
 | Hand the caller a decision the network stack took, without the pump waiting on a reader | `netstack::report::Reporter`, whose `offer` never waits, and which the caller reads as `NetStackReports`, and for a refused UDP flow `netstack::udp::UdpTables::refuse`, which reports it once. `fcage`'s own lines have the CLI's `Reports`, a crate apart |
@@ -623,7 +625,8 @@ report name a package and its version bare.
 | Which IPv4 address of the host's own does a test reach a server on through the network stack? | the testkit's `require::routable_v4` |
 | Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `blocked`, `no_records`, `truncated` |
 | Which addresses does an answer give the name its question asked about, through its aliases? | `netstack::dns::answer_addresses` |
-| What spelling is a DNS name compared and reported in? | `netstack::dns::Query::name`, over the module's one name walk |
+| What spelling is a DNS name compared and reported in? | `netstack::dns::Query::name`, over the module's one name walk, and `dns::host_name_text` for a name a TLS server name or an HTTP host writes |
+| What can a host name contain, as a destination rule, a TLS server name or an HTTP host writes one? | `netstack::dns::host_name_flaw` |
 | Which resolver does the host ask, as its `resolv.conf` names it? | `netstack::nameserver::host_upstream`, over `nameserver::first_nameserver` |
 | Declare what surrounds a layer's observer trait: a closure as an observer, a download's view of it, a run's, and the layer with a sink bound | `provision::observe::layer_observer!` |
 | Report a step over a wire, by number | `wire::wire_enum!` |

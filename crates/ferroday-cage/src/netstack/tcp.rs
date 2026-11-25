@@ -25,6 +25,14 @@
 //! not established both sides within [`ESTABLISH_DEADLINE`] is aborted, which
 //! bounds what a connection flood can pin.
 //!
+//! Under name rules a flow may be held at its first bytes ([`Hold`]): nothing
+//! the guest sends is forwarded until the server those bytes ask for, a TLS
+//! server name or an HTTP host, has been read and held to the rules, while the
+//! host connect proceeds and whatever the host sends reaches the guest. A flow
+//! refused there answers the guest in its own protocol, resets the host side,
+//! takes nothing more from the guest, and closes; see
+//! [`TcpFlow::read_first_bytes`].
+//!
 //! An established flow whose guest stops reading fills the transmit buffer, so
 //! no forwarding is possible until the guest reads again. Such a flow stays
 //! watched for the host erroring or hanging up. An error is terminal and aborts
@@ -54,6 +62,7 @@
 //! process-shared resource model is set out in `userspace-networking.md`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use std::os::fd::OwnedFd;
@@ -65,6 +74,10 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpEndpoint;
 
+use super::policy::{Hold, Policy};
+use super::pump::Refused;
+use super::report::FlowRefusal;
+use super::server_name::{self, Protocol, Reading};
 use crate::mechanism::netns::socket_for;
 
 /// The most TCP connections of the guest's own opening served at once. A
@@ -89,6 +102,23 @@ pub(super) const BUFFER_SIZE: usize = 64 * 1024;
 /// How long a flow may sit with either side unestablished before it is
 /// aborted.
 pub(super) const ESTABLISH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a guest has to finish first bytes it has begun, where the
+/// destination rules hold them: a TLS ClientHello or an HTTP request head. A
+/// flow still unfinished then is reset, and refused as
+/// [`FlowRefusal::ServerNameUnfinished`].
+///
+/// The clock starts at the guest's first byte, not at the connection: a client
+/// that connects and waits for the server to speak first sends nothing and is
+/// held to nothing. Ten seconds is far past what a client takes to write a
+/// ClientHello or a request head it has begun, and short beside the
+/// [`ESTABLISH_DEADLINE`] a flow that never finishes would otherwise hold its
+/// slot for.
+pub(super) const FIRST_BYTES_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a flow refused at its first bytes waits for the guest to take the
+/// answer and close its side before the flow is reset.
+const ANSWER_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Seconds between keep-alive probes on an idle established flow. Held well
 /// below [`IDLE_TIMEOUT`] so a live peer's answer to a probe resets the idle
@@ -225,6 +255,29 @@ pub(super) struct TcpFlow {
     /// The flow arrived through a published port, which decides the budget
     /// it counts against: [`MAX_PUBLISHED_FLOWS`] rather than [`MAX_FLOWS`].
     pub(super) published: bool,
+    /// What holds the guest's first bytes, where the destination rules hold
+    /// them; `None` once they are read and admitted, and for a flow the rules
+    /// do not hold. Nothing the guest sends is forwarded while it is held.
+    held: Option<Held>,
+    /// When the flow was refused at its first bytes. From then it takes
+    /// nothing more from the guest, and ends once the guest closes its side.
+    refused_at: Option<Instant>,
+    /// A refusal of the flow's first bytes the pump has yet to report.
+    pub(super) refusal: Option<Refused>,
+}
+
+/// What holds a flow's first bytes.
+struct Held {
+    /// What the destination rules hold them to.
+    hold: Hold,
+    /// The name the flow's reports name its destination by.
+    name: Option<Arc<str>>,
+    /// When the guest sent its first byte, which starts the
+    /// [`FIRST_BYTES_DEADLINE`].
+    began: Option<Instant>,
+    /// How many bytes the receive buffer held at the last read, so a pass
+    /// that brought nothing new reads nothing again.
+    read: usize,
 }
 
 impl TcpFlow {
@@ -303,7 +356,161 @@ impl TcpFlow {
             unacknowledged: 0,
             dead: false,
             published,
+            held: None,
+            refused_at: None,
+            refusal: None,
         }
+    }
+
+    /// Whether the flow's first bytes are held.
+    #[cfg(test)]
+    pub(super) fn is_held(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Holds the flow's first bytes to `hold`. `name` is the name the flow's
+    /// reports name its destination by.
+    pub(super) fn hold(&mut self, hold: Hold, name: Option<Arc<str>>) {
+        self.held = Some(Held {
+            hold,
+            name,
+            began: None,
+            read: 0,
+        });
+    }
+
+    /// Reads the guest's first bytes on a held flow, as far as they have
+    /// arrived, and settles the hold where they are enough to. Returns whether
+    /// it settled.
+    ///
+    /// Bytes that ask for a server the rules admit, or for none, or that are
+    /// neither TLS nor HTTP, release the hold, and the flow forwards them on.
+    /// Bytes that ask for a server the rules refuse, or that the stack does not
+    /// read, are answered in their own protocol, a TLS alert or an HTTP
+    /// response, by [`refuse_first_bytes`](Self::refuse_first_bytes). A guest
+    /// that ends its side of the flow with its bytes unfinished is reset.
+    ///
+    /// The bytes are read where they wait, in the receive buffer of the flow's
+    /// own socket. Nothing has been taken from it, and smoltcp fills a ring
+    /// from its start, so the stream's first bytes lie contiguous there up to
+    /// the buffer's size, past [`MAX_HEAD`](server_name::MAX_HEAD). A ring that
+    /// held them in two pieces regardless would read as unfinished, and hold
+    /// the flow to its deadline, never read as other bytes than the guest sent.
+    pub(super) fn read_first_bytes(
+        &mut self,
+        socket: &mut tcp::Socket,
+        policy: &Policy,
+        now: Instant,
+    ) -> bool {
+        let Some(held) = &mut self.held else {
+            return false;
+        };
+        if self.dead {
+            return false;
+        }
+        let queued = socket.recv_queue();
+        let finished = guest_finished(socket);
+        if queued == 0 {
+            // A guest that has sent nothing is held to no deadline, and one
+            // that has ended its side without sending has nothing to read.
+            if finished {
+                self.held = None;
+            }
+            return finished;
+        }
+        held.began.get_or_insert(now);
+        if queued == held.read && !finished {
+            return false;
+        }
+        held.read = queued;
+        let reading = match socket.peek(server_name::MAX_HEAD) {
+            Ok(bytes) => server_name::read(bytes),
+            Err(_) => return false,
+        };
+        let (protocol, refusal) = match reading {
+            Reading::Incomplete if finished => (None, FlowRefusal::ServerNameUnfinished),
+            Reading::Incomplete => return false,
+            Reading::Other => {
+                self.held = None;
+                return true;
+            }
+            Reading::Asks { protocol, hosts } => {
+                let destination = self.destination;
+                match policy.decide_servers(
+                    held.hold,
+                    destination.addr.into(),
+                    destination.port,
+                    &hosts,
+                ) {
+                    Ok(()) => {
+                        self.held = None;
+                        return true;
+                    }
+                    Err(refusal) => (Some(protocol), refusal),
+                }
+            }
+            Reading::Unreadable { protocol, reason } => {
+                (Some(protocol), FlowRefusal::ServerNameUnreadable { reason })
+            }
+        };
+        self.refuse_first_bytes(socket, protocol, refusal, now);
+        true
+    }
+
+    /// Refuses a held flow at its first bytes, for `refusal`, and records the
+    /// refusal for the pump to report.
+    ///
+    /// The host side has taken nothing of the guest's, and is reset. Where the
+    /// bytes began `protocol`, the guest is answered in it
+    /// ([`server_name::answer`]) and the guest's side is closed after the
+    /// answer: a refusal the client reads as the server's, where a reset alone
+    /// would read as a broken server. Bytes left unfinished have no answer in
+    /// their protocol, and the guest's side is reset.
+    fn refuse_first_bytes(
+        &mut self,
+        socket: &mut tcp::Socket,
+        protocol: Option<Protocol>,
+        refusal: FlowRefusal,
+        now: Instant,
+    ) {
+        let name = self.held.take().and_then(|held| held.name);
+        if let Some(host) = self.host.take() {
+            reset_on_close(&host);
+        }
+        match protocol {
+            Some(protocol) => {
+                // The answer is a few hundred bytes at most. Only a host that
+                // spoke first and filled the transmit buffer leaves it too
+                // little room, and the guest then has what fits before the
+                // close.
+                let _ = socket.send_slice(&server_name::answer(protocol, &refusal));
+                socket.close();
+                self.refused_at = Some(now);
+            }
+            None => {
+                socket.abort();
+                self.dead = true;
+            }
+        }
+        self.refusal = Some(Refused { refusal, name });
+    }
+
+    /// Moves a flow refused at its first bytes toward its end: whatever the
+    /// guest sends is taken and dropped, and the flow ends once the guest's
+    /// side has closed behind the answer. Returns whether anything moved.
+    fn wind_down(&mut self, socket: &mut tcp::Socket) -> bool {
+        let mut progress = false;
+        while let Ok(taken) = socket.recv(|bytes| (bytes.len(), bytes.len()))
+            && taken > 0
+        {
+            progress = true;
+        }
+        Self::leave_time_wait(socket);
+        if socket.state() == tcp::State::Closed {
+            self.dead = true;
+            progress = true;
+        }
+        progress
     }
 
     /// The host descriptor, for the pump's poll set. `None` once both
@@ -322,11 +529,37 @@ impl TcpFlow {
         if self.dead {
             return None;
         }
-        if !self.established(socket) {
-            return Some(self.deadline.saturating_duration_since(now));
+        self.due(socket)
+            .map(|due| due.saturating_duration_since(now))
+    }
+
+    /// When this flow's nearest deadline falls due, if it has one: the
+    /// [`ANSWER_DEADLINE`] of a flow refused at its first bytes, and otherwise
+    /// the nearer of the [`FIRST_BYTES_DEADLINE`] of first bytes begun and held,
+    /// and the establish deadline before both sides are up or the drain
+    /// deadline of a stall after.
+    fn due(&self, socket: &tcp::Socket) -> Option<Instant> {
+        if let Some(refused_at) = self.refused_at {
+            return Some(refused_at + ANSWER_DEADLINE);
         }
-        self.stalled_since
-            .map(|since| (since + DRAIN_DEADLINE).saturating_duration_since(now))
+        let flow = match self.established(socket) {
+            true => self.stalled_since.map(|since| since + DRAIN_DEADLINE),
+            false => Some(self.deadline),
+        };
+        match (flow, self.first_bytes_due()) {
+            (Some(flow), Some(first_bytes)) => Some(flow.min(first_bytes)),
+            (flow, first_bytes) => flow.or(first_bytes),
+        }
+    }
+
+    /// When the first bytes the guest has begun on a held flow fall due, at
+    /// the [`FIRST_BYTES_DEADLINE`]; `None` where it has begun none, and where
+    /// nothing holds them.
+    fn first_bytes_due(&self) -> Option<Instant> {
+        self.held
+            .as_ref()
+            .and_then(|held| held.began)
+            .map(|began| began + FIRST_BYTES_DEADLINE)
     }
 
     /// The poll interest of the host descriptor right now, judged against
@@ -343,9 +576,10 @@ impl TcpFlow {
         if !self.host_eof && socket.can_send() {
             interest |= PollFlags::IN;
         }
-        if !self.host_shutdown && socket.can_recv() {
+        if !self.host_shutdown && socket.can_recv() && self.held.is_none() {
             // Guest bytes are waiting because an earlier host send did not
-            // take them; wake when the host can.
+            // take them; wake when the host can. Bytes held for reading wait
+            // on the guest's next ones instead.
             interest |= PollFlags::OUT;
         }
         // Watch for the host closing or resetting even when the guest has
@@ -370,6 +604,9 @@ impl TcpFlow {
     pub(super) fn service(&mut self, socket: &mut tcp::Socket, now: Instant) -> bool {
         if self.dead {
             return false;
+        }
+        if self.refused_at.is_some() {
+            return self.wind_down(socket);
         }
         let mut progress = false;
 
@@ -509,25 +746,26 @@ impl TcpFlow {
             )
     }
 
-    /// Aborts the flow if it has run out of time: the establish deadline before
-    /// both sides are up, the drain deadline for a stall that never resolves.
-    /// Returns whether it did, since the guest's reset then waits on the
-    /// socket's next dispatch.
+    /// Aborts the flow if it has run out of time, by the nearest of the
+    /// deadlines [`due`](Self::due) names. Returns whether it did, since the
+    /// guest's reset then waits on the socket's next dispatch.
+    ///
+    /// First bytes begun and unfinished at their deadline are refused as
+    /// [`FlowRefusal::ServerNameUnfinished`], recorded for the pump to report.
     pub(super) fn enforce_deadline(&mut self, socket: &mut tcp::Socket, now: Instant) -> bool {
-        if self.dead {
+        if self.dead || self.due(socket).is_none_or(|due| now < due) {
             return false;
         }
-        let expired = if self.established(socket) {
-            self.stalled_since
-                .is_some_and(|since| now >= since + DRAIN_DEADLINE)
-        } else {
-            now >= self.deadline
-        };
-        if expired {
-            socket.abort();
-            self.dead = true;
+        if self.first_bytes_due().is_some_and(|due| now >= due) {
+            let name = self.held.take().and_then(|held| held.name);
+            self.refusal = Some(Refused {
+                refusal: FlowRefusal::ServerNameUnfinished,
+                name,
+            });
         }
-        expired
+        socket.abort();
+        self.dead = true;
+        true
     }
 
     /// Whether one side has finished sending and what it sent still waits on
@@ -547,16 +785,8 @@ impl TcpFlow {
         } else {
             !socket.can_send()
         };
-        let guest_finished = matches!(
-            socket.state(),
-            tcp::State::CloseWait
-                | tcp::State::LastAck
-                | tcp::State::Closing
-                | tcp::State::TimeWait
-                | tcp::State::Closed
-        );
         let toward_host = !self.host_shutdown && socket.can_recv();
-        (host_finished && toward_guest) || (guest_finished && toward_host)
+        (host_finished && toward_guest) || (guest_finished(socket) && toward_host)
     }
 
     /// Records whether the pass that just ran left the flow stalled, which is
@@ -600,6 +830,10 @@ impl TcpFlow {
     /// truncated, and the flow's end resets the host side instead; see the
     /// [`Drop`] implementation.
     fn guest_to_host(&mut self, socket: &mut tcp::Socket) -> bool {
+        // Held bytes wait to be read where they are.
+        if self.held.is_some() {
+            return false;
+        }
         // The descriptor is released only after both half-closes, at which
         // point `host_shutdown` is already set and this does nothing.
         let Some(host) = self.host.as_ref() else {
@@ -710,6 +944,19 @@ impl Drop for TcpFlow {
             reset_on_close(&host);
         }
     }
+}
+
+/// Whether the guest has finished sending on `socket`: its FIN or a reset has
+/// arrived, which leaves the socket in one of the states past it.
+fn guest_finished(socket: &tcp::Socket) -> bool {
+    matches!(
+        socket.state(),
+        tcp::State::CloseWait
+            | tcp::State::LastAck
+            | tcp::State::Closing
+            | tcp::State::TimeWait
+            | tcp::State::Closed
+    )
 }
 
 /// Makes the close of a host socket a reset rather than an end of stream, by a

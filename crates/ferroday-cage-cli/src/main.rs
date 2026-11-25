@@ -10380,19 +10380,33 @@ mod tests {
             assert!(err.starts_with(flag) && err.contains("port 0"), "{err}");
         }
         // A name rule composes a stack whose nameserver resolves its names,
-        // and one the library cannot use is refused where the stack is built.
-        let name_rule = [
+        // and one the library cannot use is refused where the stack is built:
+        // an allow name rule without the nameserver. A deny name rule there
+        // still refuses the servers flows name.
+        let name_rule = |kind: &str| {
+            run_options(&[
+                "--rootfs",
+                "/r",
+                "--netstack",
+                kind,
+                "example.com",
+                "--netstack-no-nameserver",
+                "/bin/true",
+            ])
+        };
+        netstack_from(&run_options(&[
             "--rootfs",
             "/r",
             "--netstack",
-            "--netstack-deny",
+            "--netstack-allow",
             "example.com",
-        ];
-        netstack_from(&run_options(&[&name_rule[..], &["/bin/true"]].concat()))
-            .expect("a name rule composes a stack");
-        let options =
-            run_options(&[&name_rule[..], &["--netstack-no-nameserver", "/bin/true"]].concat());
-        let err = netstack_from(&options).expect_err("a name rule without a nameserver");
+            "/bin/true",
+        ]))
+        .expect("a name rule composes a stack");
+        netstack_from(&name_rule("--netstack-deny"))
+            .expect("a deny name rule composes a stack without the nameserver");
+        let err = netstack_from(&name_rule("--netstack-allow"))
+            .expect_err("an allow name rule without a nameserver");
         assert!(err.to_string().contains("example.com"), "{err}");
         // And like every --netstack-* flag, each needs --netstack.
         let err = parse_error(&["--rootfs", "/r", "--netstack-allow", "192.0.2.0/24", "/x"]);

@@ -406,31 +406,95 @@ A flow is then held to the names pinned at its address:
 An address rule admits what a name rule leaves out. Under allow rules, the stack
 refuses a flow to an address it resolved no name to, unless an address rule
 admits it. Such an address is a literal, or one the guest learned from a
-resolver of its own. Under deny rules alone such a flow is carried, so a deny
-name rule holds only where the guest resolves through the stack.
+resolver of its own. Under deny rules alone such a flow is carried. A deny name
+rule then holds only where the guest resolves through the stack, or names the
+server in its first bytes ([server names](#server-names)).
 
 Under any name rule, the nameserver answers a question for a name's HTTPS or
 SVCB records with none. Those records carry the keys a client encrypts its
 server name with.
 
-A name rule is only as strong as the tie between a name and its addresses:
+[`build`][`NetStackBuilder::build`] refuses `*`, and a wildcard over the names
+under one label such as `*.com`, as an allow rule, since either admits nearly
+every name. It refuses an allow name rule where the nameserver is turned off,
+since nothing then resolves the names it admits by. Both refusals are
+[`NetStackError::RuleInvalid`]. A deny name rule builds without the nameserver,
+and refuses the servers flows name in their first bytes. Parsing refuses a name
+whose last label is a number, such as `2130706433` or `127.1`, since some
+resolvers read such a name as an address.
 
-- Several names share an address wherever a content network serves them. A flow
-  to an admitted name's address reaches whichever of its sites the guest asks
-  for.
+#### Server names
+
+Several names share an address wherever a content network serves them, and the
+name a client sends picks the site. Under name rules the stack therefore reads
+the server a TCP flow's first bytes ask for before it forwards anything the
+guest sent:
+
+- **TLS**: the server name of the ClientHello, read across as many records as it
+  spans.
+- **HTTP/1**: the `Host` header, and the host of an absolute or a `CONNECT`
+  target.
+- **Anything else** is carried as it stands. Its address was admitted when the
+  guest connected. SSH to a Git host is the common case.
+
+The server is held to the rules on the flow's port:
+
+- On a flow an allow name rule admitted, an allow name rule must admit the
+  server too. A client that names no server is admitted by the name it
+  resolved. That is a ClientHello without a server name, or a request without a
+  `Host`. An address as the host is admitted only where it is the flow's own
+  destination.
+- On any flow it reads, a deny name rule refuses the server it matches.
+- A flow an address rule admitted is held to the deny rules alone, since the
+  address is the grant.
+
+The stack holds the guest's bytes, not the connection. The host connect starts
+when the guest's does, and a server that speaks first is heard at once. A guest
+that has begun a ClientHello or a request must finish it within ten seconds, or
+the flow is reset. One that sends nothing is held to no deadline. First bytes
+not whole within the stream's first 16 KiB are refused.
+
+A refusal is answered in the flow's own protocol, and the flow is then closed:
+
+| | TLS | HTTP |
+|---|---|---|
+| The rules refuse the server | alert `unrecognized_name` | `403 Forbidden` |
+| The stack does not read the server | alert `decode_error` | `400 Bad Request` |
+
+The alert is sent in the clear, as a server's own is before any key is agreed.
+The HTTP response's body says why, in one line. Clients report the alert in
+their TLS library's words:
+
+- OpenSSL, under curl, Python and Node: `tlsv1 unrecognized name`.
+- GnuTLS, under git on Debian and Ubuntu: `The server name sent was not
+  recognized`.
+- Go: `tls: unrecognized name`.
+
+The stack refuses first bytes a server could read another server from than the
+stack would:
+
+- A ClientHello naming two servers.
+- A header folded onto a further line, or a carriage return that ends no line.
+- Two `Host` headers, or user information in a target.
+- HTTP/2 without TLS, whose host is in compressed headers.
+
+A name rule is only as strong as the tie between a name and the site a flow
+reaches:
+
+- Inside TLS the stack sees neither the HTTP host nor anything after the
+  ClientHello. A client can name an admitted server and ask it for another site,
+  which is called domain fronting. It reaches that site wherever the content
+  network still routes such a request. A name rule over a large content network
+  or cloud host is weaker than it reads.
+- Only the first request of a plain HTTP connection is read. A later one on the
+  same connection can name another host.
+- A client using Encrypted Client Hello with keys it learned elsewhere names its
+  provider's public server, which is refused unless a rule admits it.
 - The name a flow is held to is the one the guest asked for. The aliases its
   answer passes through are not held to the rules.
 - A guest can spell data into names below an admitted wildcard, and those
   questions reach that zone's own servers. Questions for every name the rules
   refuse stay in the stack.
-
-[`build`][`NetStackBuilder::build`] refuses `*`, and a wildcard over the names
-under one label such as `*.com`, as an allow rule, since either admits nearly
-every name. It refuses a name rule of either kind where the nameserver is turned
-off, since nothing then resolves its names. Both refusals are
-[`NetStackError::RuleInvalid`]. Parsing refuses a name whose last
-label is a number, such as `2130706433` or `127.1`, since some resolvers read
-such a name as an address.
 
 ### Reports
 
@@ -446,7 +510,8 @@ stack refused it:
 - A [`FlowRefusal`] says why the stack refused it: no allow rule admits it, or a
   named deny rule refuses it. A name rule's refusals say no name was resolved to
   the address. Otherwise they name the rule that leaves out a UDP flow or a
-  private address.
+  private address. A refusal at a flow's first bytes names the server they ask
+  for, or says why the stack does not read it.
   Otherwise it names the kind of destination the stack always refuses, or says
   the stack already carries all the flows it holds.
 
@@ -493,7 +558,8 @@ reader.join().expect("the reader finishes");
 A flow is reported once. A refused TCP attempt is answered with a reset, so the
 guest does not repeat it. A refused UDP flow is reported at its first datagram.
 It is reported again only after the guest has sent it nothing for two minutes,
-as an idle flow expires.
+as an idle flow expires. A TCP flow refused at its first bytes was carried when
+the guest connected, and is reported a second time, refused.
 
 The pump never waits on the reader. Its queue holds 1024 reports, and a report
 it has no room for is dropped and counted, which

@@ -240,22 +240,85 @@ fn skip_name(message: &[u8], start: usize) -> Option<usize> {
 /// where the name breaks one of the protocol's limits.
 fn name_text(message: &[u8], start: usize) -> Option<(String, usize)> {
     let mut text = String::new();
-    let end = walk_name(message, start, |label| {
-        if !text.is_empty() {
-            text.push('.');
-        }
-        for byte in label.iter().map(u8::to_ascii_lowercase) {
-            if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
-                text.push(char::from(byte));
-            } else {
-                let _ = write!(text, "\\{byte:03}");
-            }
-        }
-    })?;
+    let end = walk_name(message, start, |label| push_label(&mut text, label))?;
     if text.is_empty() {
         text.push('.');
     }
     Some((text, end))
+}
+
+/// Appends `label` to `text`, a name's text so far, in the spelling the
+/// [module](self) describes: after a dot where `text` already holds a label.
+fn push_label(text: &mut String, label: &[u8]) {
+    if !text.is_empty() {
+        text.push('.');
+    }
+    for byte in label.iter().map(u8::to_ascii_lowercase) {
+        if is_host_name_byte(byte) {
+            text.push(char::from(byte));
+        } else {
+            let _ = write!(text, "\\{byte:03}");
+        }
+    }
+}
+
+/// Whether `byte` may stand in a label of a host name, and in a name's text as
+/// itself: a letter, a digit, `-` or `_`.
+fn is_host_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+/// The longest label of a name (RFC 1035, section 2.3.4).
+const MAX_LABEL: usize = 63;
+
+/// The longest host name, without a trailing dot: the most a name of
+/// [`MAX_NAME`] bytes on the wire spells.
+const MAX_HOST_NAME: usize = MAX_NAME - 2;
+
+/// Why `name` is not a host name, or `None` where it is one: labels of
+/// letters, digits, `-` and `_` joined by dots, of at most 63 bytes each, and
+/// at most 253 bytes in all, without a trailing dot.
+///
+/// A host name is how a destination rule, a TLS server name and an HTTP host
+/// write a name. Its text in the [module's](self) spelling is the name in lower
+/// case, so a host name compares with a name the nameserver read as its text
+/// does. `name` that is empty is refused as holding an empty label.
+pub(super) fn host_name_flaw(name: &str) -> Option<&'static str> {
+    if name.len() > MAX_HOST_NAME {
+        return Some("the name is longer than 253 characters");
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Some("the name has an empty label");
+        }
+        if label.len() > MAX_LABEL {
+            return Some("a label of the name is longer than 63 characters");
+        }
+        if !label.bytes().all(is_host_name_byte) {
+            return Some("a name holds letters, digits, `-` and `_` between its dots");
+        }
+    }
+    None
+}
+
+/// The text of `host`, a name written out as a TLS server name or an HTTP host
+/// writes one, in the spelling the [module](self) describes, or `None` where
+/// `host` is not a host name ([`host_name_flaw`]). One trailing dot is dropped.
+///
+/// A byte the module's spelling would escape refuses the name rather than
+/// being escaped. A server may read such a byte, a NUL say, as the name's end,
+/// and take a different name from the bytes than the one the text compares.
+pub(super) fn host_name_text(host: &[u8]) -> Option<String> {
+    let host = std::str::from_utf8(host).ok()?;
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host_name_flaw(host).is_some() {
+        return None;
+    }
+    let mut text = String::with_capacity(host.len());
+    for label in host.split('.') {
+        push_label(&mut text, label.as_bytes());
+    }
+    Some(text)
 }
 
 /// Walks the name that starts at `start` in `message`, handing `label` each of
@@ -887,6 +950,48 @@ mod tests {
             text(&[&[b'a'; 63], &[b'a'; 63], &[b'a'; 63], &[b'a'; 63]]),
             None
         );
+    }
+
+    #[test]
+    fn a_host_name_is_written_in_the_same_spelling() {
+        assert_eq!(
+            host_name_text(b"WWW.Example.com").as_deref(),
+            Some("www.example.com")
+        );
+        assert_eq!(
+            host_name_text(b"_dmarc.a-b.9.").as_deref(),
+            Some("_dmarc.a-b.9"),
+            "one trailing dot is dropped"
+        );
+        // A byte the spelling would escape refuses the name, and so does each
+        // of the protocol's limits.
+        for host in [
+            &b"evil.example\x00.example.com"[..],
+            b"a b.example",
+            b"x\\046example.com",
+            b"*.example.com",
+            b"b\xc3\xbccher.example",
+            b"",
+            b".",
+            b"example.com..",
+            b".example.com",
+            b"example..com",
+        ] {
+            assert_eq!(host_name_text(host), None, "{:?}", host.escape_ascii());
+        }
+        let label = "a".repeat(MAX_LABEL);
+        assert!(host_name_text(format!("{label}.example").as_bytes()).is_some());
+        assert_eq!(
+            host_name_flaw(&format!("a{label}.example")),
+            Some("a label of the name is longer than 63 characters")
+        );
+        let name = vec!["a".repeat(61); 4].join(".") + ".example";
+        assert_eq!(name.len(), MAX_HOST_NAME + 2);
+        assert_eq!(
+            host_name_flaw(&name),
+            Some("the name is longer than 253 characters")
+        );
+        assert!(host_name_text(&name.as_bytes()[2..]).is_some());
     }
 
     #[test]

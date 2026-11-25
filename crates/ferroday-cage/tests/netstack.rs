@@ -740,6 +740,10 @@ fn refused_as(refusal: &FlowRefusal) -> String {
         FlowRefusal::Denied { rule, .. } => format!("denied by {rule}"),
         FlowRefusal::PrivateBehindName { rule, .. } => format!("private behind {rule}"),
         FlowRefusal::NameOverUdp { rule, .. } => format!("over udp under {rule}"),
+        FlowRefusal::ServerNameNotAllowed { name, .. } => format!("server {name} not allowed"),
+        FlowRefusal::ServerNameDenied { name, rule, .. } => {
+            format!("server {name} denied by {rule}")
+        }
         other => format!("refused as {other:?}"),
     }
 }
@@ -1956,4 +1960,311 @@ fn the_nameserver_gives_its_reason_and_withholds_service_bindings() {
             ("admitted.example".to_string(), "withheld".to_string()),
         ]
     );
+}
+
+// -- First bytes -------------------------------------------------------------
+//
+// Under name rules the stack reads the server a TCP flow's first bytes ask
+// for. These tests send them from the guest by hand, so what reaches the host,
+// and what the guest is answered with, can be compared byte for byte.
+
+/// A ClientHello naming `example.com`, as curl sent one.
+const HELLO: &[u8] = include_bytes!("fixtures/client-hello/curl-8.5-openssl-3.0.bin");
+
+/// A ClientHello naming `example.com`, as Node sent one: longer than one
+/// segment carries, so the guest's kernel sends it in two.
+const LONG_HELLO: &[u8] = include_bytes!("fixtures/client-hello/node-24.18.bin");
+
+/// The fatal `unrecognized_name` alert the stack answers a refused server name
+/// in TLS with, as `od` writes it.
+const ALERT: &str = "15 03 03 00 02 02 70";
+
+/// A host TCP listener on `address` that records what each of `connections`
+/// connections sends, until its peer finishes, resets, or falls silent for a
+/// second, and then closes it. Returns its port and a receiver that yields
+/// each connection's bytes in the order the connections end.
+fn recording_listener_on(address: Ipv4Addr, connections: usize) -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind((address, 0)).expect("a host listener binds");
+    let port = listener
+        .local_addr()
+        .expect("the listener has an address")
+        .port();
+    let (send, recv) = mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..connections {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("the read timeout is set");
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut buf) {
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..read]);
+            }
+            let _ = send.send(received);
+        }
+    });
+    (port, recv)
+}
+
+/// A shell command sending `bytes` to `port` of `address` with busybox `nc`
+/// and printing, on a line of its own, what came back as `od` writes it.
+fn exchange(address: Ipv4Addr, port: u16, bytes: &[u8]) -> String {
+    format!(
+        "printf '{}' | /usr/bin/nc -w 3 {address} {port} | od -An -v -tx1 | tr -s ' \\n' ' '; \
+         echo",
+        printf_bytes(bytes)
+    )
+}
+
+/// The bytes `line`, as `od` wrote them, as text.
+fn od_text(line: &str) -> String {
+    let bytes: Vec<u8> = line
+        .split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).expect("od writes hex"))
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Asserts that `line`, as `od` wrote it, is an HTTP response of `status`
+/// whose body ends in `why`.
+fn assert_answered(line: &str, status: &str, why: &str) {
+    let response = od_text(line);
+    assert!(
+        response.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+        "{response}"
+    );
+    assert!(response.trim_end().ends_with(why), "{response}");
+}
+
+#[test]
+fn a_server_name_the_rules_refuse_is_answered_in_its_protocol() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    if routable().is_none() {
+        return;
+    }
+    // The guest reaches an admitted name's address, and asks it for another
+    // site, as a content network's shared address would be asked. The host's
+    // own address is private, which a name rule never admits, so the address is
+    // one the host's connect never reaches: the guest's side of each flow is
+    // established against the stack, which refuses it before the host's side
+    // would matter.
+    let resolver = naming_resolver();
+    let stack = naming(&resolver, &["admitted.example"], &[]);
+    let requests = [
+        HELLO.to_vec(),
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+        b"GET http://example.com/ HTTP/1.1\r\nHost: admitted.example\r\n\r\n".to_vec(),
+        b"GET / HTTP/1.1\r\nHost: admitted.example\r\nHost: example.com\r\n\r\n".to_vec(),
+        b"GET / HTTP/1.1\r\nHost: admitted.example\r\n\r\n".to_vec(),
+    ];
+    let script = std::iter::once("getent hosts admitted.example > /dev/null".to_string())
+        .chain(
+            requests
+                .iter()
+                .map(|request| exchange(ADMITTED, 443, request)),
+        )
+        .collect::<Vec<_>>()
+        .join("; ");
+    let (printed, reports, _) = run_naming(Cage::builder().rootfs(rootfs), &stack, &script);
+    let lines: Vec<&str> = printed.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), requests.len(), "{printed}");
+
+    // A TLS alert, in the clear, and HTTP responses saying why. The admitted
+    // request waits on a server that never answers.
+    assert_eq!(lines[0], ALERT);
+    let not_allowed = "its first bytes ask for example.com, which no allow rule admits";
+    assert_answered(lines[1], "403 Forbidden", not_allowed);
+    assert_answered(lines[2], "403 Forbidden", not_allowed);
+    assert_answered(
+        lines[3],
+        "400 Bad Request",
+        "it carries more than one Host header",
+    );
+    assert_eq!(lines[4], "");
+
+    let flow = |decision: &str| {
+        (
+            Transport::Tcp,
+            SocketAddr::from((ADMITTED, 443)),
+            Some("admitted.example".to_string()),
+            decision.to_string(),
+        )
+    };
+    let carried = flow("allowed by admitted.example");
+    let refused = flow("server example.com not allowed");
+    let unread = flow(
+        "refused as ServerNameUnreadable { reason: \"it carries more than one Host header\" }",
+    );
+    assert_eq!(
+        flows(&reports),
+        [
+            carried.clone(),
+            refused.clone(),
+            carried.clone(),
+            refused.clone(),
+            carried.clone(),
+            refused,
+            carried.clone(),
+            unread,
+            carried,
+        ]
+    );
+}
+
+#[test]
+fn a_flow_an_address_rule_admits_is_held_to_the_deny_name_rules() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let Some(address) = routable() else {
+        return;
+    };
+    let stack = ruled(
+        NetStack::builder(),
+        &[address.to_string()],
+        &["other.example".to_string()],
+    );
+    let (port, received) = recording_listener_on(address, 3);
+    let carried = b"GET / HTTP/1.1\r\nHost: www.example.net\r\n\r\n";
+    let script = [
+        exchange(address, port, LONG_HELLO),
+        exchange(
+            address,
+            port,
+            b"GET / HTTP/1.1\r\nHost: other.example\r\n\r\n",
+        ),
+        exchange(address, port, carried),
+    ]
+    .join("; ");
+    let (_, printed, reports) = run_reporting(rootfs, &stack, &script);
+    let lines: Vec<&str> = printed.lines().map(str::trim).collect();
+    assert_eq!(lines.len(), 3, "{printed}");
+    assert_answered(
+        lines[1],
+        "403 Forbidden",
+        "its first bytes ask for other.example, which the deny rule other.example refuses",
+    );
+    // The ClientHello reaches the server whole, both its segments, and so
+    // does the admitted request; the refused one's connection carries nothing.
+    let seen: Vec<Vec<u8>> = (0..3)
+        .map(|_| {
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("each connection reached the host")
+        })
+        .collect();
+    assert_eq!(seen, [LONG_HELLO.to_vec(), Vec::new(), carried.to_vec()]);
+    let allowed = format!("allowed by {address}");
+    assert_eq!(
+        reports,
+        [
+            tcp((address, port), allowed.as_str()),
+            tcp((address, port), allowed.as_str()),
+            tcp(
+                (address, port),
+                "server other.example denied by other.example"
+            ),
+            tcp((address, port), allowed.as_str()),
+        ]
+    );
+}
+
+#[test]
+fn a_deny_name_rule_holds_the_server_name_without_the_nameserver() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let Some(address) = routable() else {
+        return;
+    };
+    // The guest resolves nothing through the stack, here or with the
+    // nameserver off; it connects to the address as a literal, which deny
+    // rules alone carry, and names the server in its first bytes.
+    for nameserver in [true, false] {
+        let stack = ruled(
+            NetStack::builder().nameserver(nameserver),
+            &[],
+            &["*.example.org".to_string(), "example.com".to_string()],
+        );
+        let (port, received) = recording_listener_on(address, 2);
+        let script = [
+            exchange(address, port, HELLO),
+            exchange(
+                address,
+                port,
+                b"GET / HTTP/1.1\r\nHost: www.example.net\r\n\r\n",
+            ),
+        ]
+        .join("; ");
+        let (_, printed, reports) = run_reporting(rootfs, &stack, &script);
+        let lines: Vec<&str> = printed.lines().map(str::trim).collect();
+        assert_eq!(lines.first().copied(), Some(ALERT), "{printed}");
+        let mut seen: Vec<Vec<u8>> = (0..2)
+            .map(|_| {
+                received
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("each connection reached the host")
+            })
+            .collect();
+        seen.retain(|bytes| !bytes.is_empty());
+        assert_eq!(
+            seen,
+            [b"GET / HTTP/1.1\r\nHost: www.example.net\r\n\r\n".to_vec()],
+            "nameserver {nameserver}"
+        );
+        assert_eq!(
+            reports,
+            [
+                tcp((address, port), "carried as Default"),
+                tcp((address, port), "server example.com denied by example.com"),
+                tcp((address, port), "carried as Default"),
+            ],
+            "nameserver {nameserver}"
+        );
+    }
+}
+
+#[test]
+fn a_server_that_speaks_first_is_heard_before_the_guest_sends() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let Some(address) = routable() else {
+        return;
+    };
+    let stack = ruled(NetStack::builder(), &[], &["other.example".to_string()]);
+    let (port, received) = banner_listener_on(address, b"220 ready\r\n");
+    // The guest says nothing until a second after it has connected, by which
+    // time the server's banner has arrived through the held flow; and then
+    // something of no server name's, which the stack carries as it stands.
+    let script = format!("(sleep 1; echo QUIT) | /usr/bin/nc -w 3 {address} {port}");
+    let (_, printed, reports) = run_reporting(rootfs, &stack, &script);
+    assert!(printed.starts_with("220 ready"), "{printed}");
+    assert_eq!(
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the connection reached the host"),
+        b"QUIT\n"
+    );
+    assert_eq!(reports, [tcp((address, port), "carried as Default")]);
 }

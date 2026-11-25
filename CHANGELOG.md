@@ -71,8 +71,8 @@ consumer upgrading can skip it.
   ports are outside the rules. An IPv4 rule covers the address's NAT64
   spelling too. A rule parses from text and writes back with `Display`, and a
   malformed one is refused with the new `ParseDestinationRuleError`. `build`
-  refuses an allow rule over every name or every name under one label, and a
-  name rule where the nameserver is turned off, with the new
+  refuses an allow rule over every name or every name under one label, and an
+  allow name rule where the nameserver is turned off, with the new
   `NetStackError::RuleInvalid`. The stack's profile format gains the `allow`
   and `deny` keys, and `fcage` the `--netstack-allow RULE` and
   `--netstack-deny RULE` flags.
@@ -88,6 +88,19 @@ consumer upgrading can skip it.
   is refused. A deny name rule refuses a flow to a pinned address of its name
   over either transport. Under any name rule, a question for a name's HTTPS or
   SVCB records is answered with none.
+- Under name rules, the native network stack reads the server a TCP flow's
+  first bytes ask for, the server name of a TLS ClientHello or the host of an
+  HTTP/1 request, and forwards nothing the guest sends until it has. On a flow
+  an allow name rule admits, an allow name rule must admit that server too, and
+  on any flow it reads, a deny name rule refuses the server it matches, the
+  nameserver turned off or not. A refusal is answered with a TLS alert, or an
+  HTTP `403 Forbidden` or `400 Bad Request`, before the flow is closed, and
+  reported with the new `FlowRefusal::ServerNameNotAllowed`,
+  `FlowRefusal::ServerNameDenied`, `FlowRefusal::ServerNameUnfinished` or
+  `FlowRefusal::ServerNameUnreadable`. First bytes not whole within ten seconds
+  of their first byte, or within 16 KiB, are refused, and so are bytes a server
+  could read another server from, two `Host` headers among them. Other first
+  bytes are carried as they stand.
 - The native network stack reports each flow of the guest's it carries or
   refuses, and each question its nameserver relays, refuses, or answers with no
   records. `NetStackHandle::take_reports` hands over the new `NetStackReports`,

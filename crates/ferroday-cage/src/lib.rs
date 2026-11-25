@@ -289,7 +289,7 @@ mod netstack;
 #[doc(hidden)]
 pub mod fuzzing {
     #[cfg(feature = "netstack")]
-    pub use crate::netstack::fuzzing::dns_query;
+    pub use crate::netstack::fuzzing::{client_hello, dns_query, http_head};
 }
 mod observer;
 mod path;

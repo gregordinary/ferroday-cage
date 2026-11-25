@@ -46,6 +46,11 @@ pub(super) const QUEUED_REPORTS: usize = 1024;
 /// datagrams have stopped for as long as the stack keeps an idle flow, two
 /// minutes.
 ///
+/// Under name rules the stack also reads the server a carried TCP flow's first
+/// bytes ask for, a TLS server name or an HTTP host, and holds it to the rules.
+/// A flow refused there is reported a second time, refused, after the report
+/// that carried it.
+///
 /// A flow's report names its destination's name where the stack's nameserver
 /// resolved one to the destination's address: the name a name rule matched,
 /// where one decided, and otherwise the name most recently resolved to it.
@@ -354,7 +359,10 @@ pub enum FlowAdmission {
     /// resolved to it.
     #[non_exhaustive]
     Allowed {
-        /// The first allow rule, in the order given, that matches.
+        /// The allow rule that admits the destination: the first address rule,
+        /// in the order given, that matches its address, or where none does,
+        /// the first name rule that matches a name resolved to it. A question
+        /// is admitted by the first name rule that matches its name.
         rule: DestinationRule,
     },
     /// The destination is the gateway, on a port
@@ -380,11 +388,20 @@ impl fmt::Display for FlowAdmission {
 /// Why the stack refuses a flow, carried by [`NetStackReport::FlowRefused`].
 ///
 /// The caller's rules refuse with [`NotAllowed`](Self::NotAllowed),
-/// [`Denied`](Self::Denied), and the three refusals of a flow its name rules
-/// leave out. Most of the rest are the destinations the stack refuses under any
-/// configuration, which no rule admits, and an address under NAT64's well-known
-/// prefix, `64:ff9b::/96`, that the stack refuses for the IPv4 address it
-/// embeds is refused for that address's reason.
+/// [`Denied`](Self::Denied), the three refusals of a flow its name rules leave
+/// out, and the four of a TCP flow's first bytes. Most of the rest are the
+/// destinations the stack refuses under any configuration, which no rule
+/// admits, and an address under NAT64's well-known prefix, `64:ff9b::/96`, that
+/// the stack refuses for the IPv4 address it embeds is refused for that
+/// address's reason.
+///
+/// A TCP flow's first bytes are read under name rules, for the server they ask
+/// for: the server name of a TLS ClientHello, or the host of an HTTP/1
+/// request, its `Host` header or an absolute target's. The stack forwards
+/// nothing the guest sends until it has read them, and answers a refusal there
+/// in the flow's own protocol before it closes the flow: a TLS alert,
+/// `unrecognized_name` or `decode_error`, or an HTTP `403 Forbidden` or
+/// `400 Bad Request` whose body says why.
 ///
 /// A question the stack's nameserver refuses is refused by the same rules,
 /// read for its name, and [`NetStackReport::QuestionRefused`] carries why:
@@ -458,6 +475,40 @@ pub enum FlowRefusal {
         /// name.
         rule: DestinationRule,
     },
+    /// The first bytes of a TCP flow an allow name rule admitted ask for a
+    /// server no allow name rule admits on the flow's port: another site at an
+    /// address it shares with the admitted one, say. An address the first
+    /// bytes ask for, other than the flow's own destination, is refused this
+    /// way too.
+    #[non_exhaustive]
+    ServerNameNotAllowed {
+        /// The server, a name in the spelling the
+        /// [question reports](NetStackReport::QuestionRelayed) use, or an
+        /// address.
+        name: String,
+    },
+    /// A deny name rule matches the server a TCP flow's first bytes ask for.
+    #[non_exhaustive]
+    ServerNameDenied {
+        /// The server, in the spelling the
+        /// [question reports](NetStackReport::QuestionRelayed) use.
+        name: String,
+        /// The first deny rule, in the order given, that matches it.
+        rule: DestinationRule,
+    },
+    /// A TCP flow's first bytes began a TLS ClientHello or an HTTP request and
+    /// did not finish it within ten seconds, or the guest ended its side of
+    /// the flow first. A guest that sends nothing is not held to the deadline.
+    ServerNameUnfinished,
+    /// A TCP flow's first bytes began a TLS ClientHello or an HTTP request the
+    /// stack does not read a server from: one that names several, one not
+    /// whole within the stream's first 16 KiB, or one a server could read
+    /// another server from than the stack would.
+    #[non_exhaustive]
+    ServerNameUnreadable {
+        /// What the stack does not read, as a clause.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for FlowRefusal {
@@ -500,6 +551,25 @@ impl fmt::Display for FlowRefusal {
             FlowRefusal::NameOverUdp { rule } => {
                 write!(f, "the allow rule {rule} admits the name over TCP alone")
             }
+            FlowRefusal::ServerNameNotAllowed { name } => {
+                write!(
+                    f,
+                    "its first bytes ask for {name}, which no allow rule admits"
+                )
+            }
+            FlowRefusal::ServerNameDenied { name, rule } => write!(
+                f,
+                "its first bytes ask for {name}, which the deny rule {rule} refuses"
+            ),
+            FlowRefusal::ServerNameUnfinished => f.write_str(
+                "its first bytes began a TLS handshake or an HTTP request and did not finish it \
+                 within 10 seconds",
+            ),
+            FlowRefusal::ServerNameUnreadable { reason } => write!(
+                f,
+                "its first bytes began a TLS handshake or an HTTP request the stack does not \
+                 read: {reason}"
+            ),
         }
     }
 }
@@ -779,6 +849,17 @@ mod tests {
             },
             FlowRefusal::NameOverUdp {
                 rule: "example.com".parse().unwrap(),
+            },
+            FlowRefusal::ServerNameNotAllowed {
+                name: "other.example".to_string(),
+            },
+            FlowRefusal::ServerNameDenied {
+                name: "other.example".to_string(),
+                rule: "*.example".parse().unwrap(),
+            },
+            FlowRefusal::ServerNameUnfinished,
+            FlowRefusal::ServerNameUnreadable {
+                reason: "it carries more than one Host header",
             },
         ];
         let clauses = admissions

@@ -1968,6 +1968,14 @@ pub ferroday_cage::FlowRefusal::NotResolved
 #[non_exhaustive] pub ferroday_cage::FlowRefusal::PrivateBehindName
 pub ferroday_cage::FlowRefusal::PrivateBehindName::rule: ferroday_cage::DestinationRule
 pub ferroday_cage::FlowRefusal::ProtocolDisabled
+#[non_exhaustive] pub ferroday_cage::FlowRefusal::ServerNameDenied
+pub ferroday_cage::FlowRefusal::ServerNameDenied::name: alloc::string::String
+pub ferroday_cage::FlowRefusal::ServerNameDenied::rule: ferroday_cage::DestinationRule
+#[non_exhaustive] pub ferroday_cage::FlowRefusal::ServerNameNotAllowed
+pub ferroday_cage::FlowRefusal::ServerNameNotAllowed::name: alloc::string::String
+pub ferroday_cage::FlowRefusal::ServerNameUnfinished
+#[non_exhaustive] pub ferroday_cage::FlowRefusal::ServerNameUnreadable
+pub ferroday_cage::FlowRefusal::ServerNameUnreadable::reason: &'static str
 pub ferroday_cage::FlowRefusal::TooManyFlows
 pub ferroday_cage::FlowRefusal::Unspecified
 impl core::fmt::Display for ferroday_cage::FlowRefusal

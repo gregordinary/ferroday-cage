@@ -32,13 +32,14 @@ without a bound rather than a panic."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/netstack/tcp.rs"
-count = 3
+count = 4
 why = """\
-A TCP flow's own deadlines: `ESTABLISH_DEADLINE` (30 seconds) and \
-`DRAIN_DEADLINE` (the stack's idle timeout, minutes) added to a reading of \
-the monotonic clock. Both are constants of the stack's own rather than a \
-caller's number, and no duration that short can carry the clock past what it \
-expresses."""
+A TCP flow's own deadlines: `ESTABLISH_DEADLINE` (30 seconds), \
+`DRAIN_DEADLINE` (the stack's idle timeout, minutes), and \
+`FIRST_BYTES_DEADLINE` and `ANSWER_DEADLINE` (10 seconds each) added to a \
+reading of the monotonic clock. Each is a constant of the stack's own rather \
+than a caller's number, and no duration that short can carry the clock past \
+what it expresses."""
 
 [[idiom.site]]
 path = "crates/ferroday-cage/src/netstack/nameserver.rs"

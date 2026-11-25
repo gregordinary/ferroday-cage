@@ -4,16 +4,18 @@
 //! [`DestinationRule`] is the one grammar the builder, the stack's profile
 //! format and `fcage` share. [`Policy`] holds a configuration's allow and deny
 //! rules and decides by them: a flow, after the refusals no rule overrides
-//! ([`host_target`](super::pump::host_target)), and a question the stack's
-//! nameserver would relay.
+//! ([`host_target`](super::pump::host_target)), a question the stack's
+//! nameserver would relay, and the server a TCP flow's first bytes ask for
+//! ([`server_name`](super::server_name)).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use super::prefix;
 use super::report::{FlowAdmission, FlowRefusal};
+use super::server_name::Host;
+use super::{dns, prefix};
 
 /// A transport the stack carries the guest's traffic over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -320,13 +322,6 @@ fn parse_network(text: &str) -> Option<Result<Target, &'static str>> {
     }))
 }
 
-/// The longest name a rule can hold: 253 characters without a trailing dot,
-/// the most a DNS name of 255 bytes on the wire spells.
-const MAX_NAME: usize = 253;
-
-/// The longest label of a name.
-const MAX_LABEL: usize = 63;
-
 /// Parses a name, or a wildcard over the names below one, lowering its case
 /// and dropping one trailing dot.
 fn parse_name(text: &str) -> Result<Target, &'static str> {
@@ -349,32 +344,18 @@ fn parse_name(text: &str) -> Result<Target, &'static str> {
     })
 }
 
-/// Checks a lowered name with no trailing dot: within the length limits,
-/// labels of letters, digits, `-` and `_`, and a last label that is not a
-/// number.
+/// Checks a lowered name with no trailing dot: a host name
+/// ([`dns::host_name_flaw`]) without a wildcard in it, whose last label is not
+/// a number.
 fn validate_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("it names no destination");
     }
-    if name.len() > MAX_NAME {
-        return Err("the name is longer than 253 characters");
+    if name.contains('*') {
+        return Err("a wildcard is a whole first label, as in `*.example.com`");
     }
-    for label in name.split('.') {
-        if label.is_empty() {
-            return Err("the name has an empty label");
-        }
-        if label.len() > MAX_LABEL {
-            return Err("a label of the name is longer than 63 characters");
-        }
-        if label.contains('*') {
-            return Err("a wildcard is a whole first label, as in `*.example.com`");
-        }
-        if !label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        {
-            return Err("a name holds letters, digits, `-` and `_` between its dots");
-        }
+    if let Some(flaw) = dns::host_name_flaw(name) {
+        return Err(flaw);
     }
     let last = name.rsplit('.').next().unwrap_or(name);
     if is_number(last) {
@@ -525,6 +506,20 @@ impl fmt::Display for ParseDestinationRuleError {
 
 impl std::error::Error for ParseDestinationRuleError {}
 
+/// What the destination rules hold a TCP flow's first bytes to: the server a
+/// TLS ClientHello or an HTTP request asks for
+/// ([`server_name`](super::server_name)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Hold {
+    /// The flow was admitted by a name the stack resolved to its address, so
+    /// an allow name rule must admit the server too, and no deny rule refuse
+    /// it.
+    AllowRules,
+    /// The flow was admitted by an address rule or by default, so a deny name
+    /// rule alone refuses the server.
+    DenyRules,
+}
+
 /// A configuration's allow and deny rules, which decide each destination the
 /// stack would otherwise carry.
 #[derive(Debug, Clone, Default)]
@@ -608,10 +603,13 @@ impl Policy {
     /// A deny rule that matches refuses, whatever else matches, and the first
     /// that matches is the one named. A deny name rule matches a flow to any of
     /// `names` over either transport, unless `tcp:` qualifies it. Otherwise a
-    /// policy with any allow rule admits what an allow rule matches, naming the
-    /// first, and refuses the rest, and one without admits everything by
-    /// default. The destinations no rule can admit are the caller's to refuse
-    /// first.
+    /// policy with any allow rule admits what an allow rule matches and refuses
+    /// the rest, and one without admits everything by default. The allow rule
+    /// named is the first address rule that matches, and only where none does,
+    /// the first name rule: an address rule is the exact grant, and a flow it
+    /// admits is not held to the server its first bytes ask for
+    /// ([`hold`](Self::hold)). The destinations no rule can admit are the
+    /// caller's to refuse first.
     ///
     /// An allow name rule admits a TCP flow to an address one of `names` it
     /// matches was resolved to, and two flows it would otherwise admit are
@@ -654,13 +652,13 @@ impl Policy {
         if self.allow.is_empty() {
             return (Ok(FlowAdmission::Default), None);
         }
+        if let Some(rule) = self.allow.iter().find(|rule| by_address(rule)) {
+            return (Ok(FlowAdmission::Allowed { rule: rule.clone() }), None);
+        }
         // A name rule that matches and does not admit is remembered, and its
-        // reason given where no later rule admits the flow.
+        // reason given where no later name rule admits the flow.
         let mut withheld = None;
         for rule in &self.allow {
-            if by_address(rule) {
-                return (Ok(FlowAdmission::Allowed { rule: rule.clone() }), None);
-            }
             let Some(name) = rule
                 .covers(Transport::Tcp, port)
                 .then(|| by_name(rule))
@@ -687,6 +685,69 @@ impl Policy {
             true => (Err(FlowRefusal::NotResolved), None),
             false => (Err(FlowRefusal::NotAllowed), None),
         }
+    }
+
+    /// What the rules hold the first bytes of a TCP flow to `port` to, which
+    /// `admission` admitted, or `None` where nothing those bytes could ask for
+    /// would refuse the flow.
+    ///
+    /// On an address many sites share, the name the client sends picks the
+    /// site. A flow an allow name rule admitted reached its address through a
+    /// name the guest resolved, so the name it sends is held to the allow rules
+    /// as that one was. A flow admitted otherwise is held where a deny name rule
+    /// covers its port. The gateway's loopback mapping is outside the rules.
+    pub(super) fn hold(&self, admission: &FlowAdmission, port: u16) -> Option<Hold> {
+        match admission {
+            FlowAdmission::Allowed { rule } if rule.is_name() => Some(Hold::AllowRules),
+            FlowAdmission::HostLoopback => None,
+            FlowAdmission::Default | FlowAdmission::Allowed { .. } => self
+                .deny
+                .iter()
+                .any(|rule| rule.is_name() && rule.covers(Transport::Tcp, port))
+                .then_some(Hold::DenyRules),
+        }
+    }
+
+    /// What the rules decide of `hosts`, the servers the first bytes of a TCP
+    /// flow to `destination` on `port` ask for, which `hold` holds them to.
+    ///
+    /// A deny name rule covering the port that matches a name refuses the
+    /// flow. Under [`Hold::AllowRules`] an allow name rule covering the port
+    /// must also match each name. An address names no site but itself, so
+    /// under [`Hold::AllowRules`] it is the flow's own destination or the flow
+    /// is refused, and under [`Hold::DenyRules`] it is passed over. First bytes
+    /// that ask for no server are decided at the flow's attempt alone.
+    pub(super) fn decide_servers(
+        &self,
+        hold: Hold,
+        destination: IpAddr,
+        port: u16,
+        hosts: &[Host],
+    ) -> Result<(), FlowRefusal> {
+        for host in hosts {
+            let name = match host {
+                Host::Name(name) => name,
+                Host::Address(address) if hold == Hold::AllowRules && *address != destination => {
+                    return Err(FlowRefusal::ServerNameNotAllowed {
+                        name: address.to_string(),
+                    });
+                }
+                Host::Address(_) => continue,
+            };
+            let matches = |rule: &&DestinationRule| {
+                rule.covers(Transport::Tcp, port) && rule.matches_name(name)
+            };
+            if let Some(rule) = self.deny.iter().find(matches) {
+                return Err(FlowRefusal::ServerNameDenied {
+                    name: name.clone(),
+                    rule: rule.clone(),
+                });
+            }
+            if hold == Hold::AllowRules && !self.allow.iter().any(|rule| matches(&rule)) {
+                return Err(FlowRefusal::ServerNameNotAllowed { name: name.clone() });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -870,14 +931,14 @@ mod tests {
             assert_eq!(refusal(text), reason, "{text:?}");
         }
         // A label and a name at their limits, and one byte past each.
-        let label = "a".repeat(MAX_LABEL);
+        let label = "a".repeat(63);
         rule(&format!("{label}.example"));
         assert_eq!(
             refusal(&format!("a{label}.example")),
             "a label of the name is longer than 63 characters",
         );
         let name = vec!["a".repeat(61); 4].join(".") + ".example";
-        assert_eq!(name.len(), MAX_NAME + 2);
+        assert_eq!(name.len(), 253 + 2);
         assert_eq!(refusal(&name), "the name is longer than 253 characters");
         rule(&name[2..]);
         // A last label that only starts like a number is a name.
@@ -1384,6 +1445,123 @@ mod tests {
                 rule: rule("192.0.2.0/24")
             })
         );
+    }
+
+    #[test]
+    fn an_address_rule_admits_ahead_of_a_name_rule_given_before_it() {
+        // The address rule is the exact grant, so it is named whatever the
+        // order, and the flow is held to nothing but the deny rules.
+        let policy = rules(&["example.com", "198.51.100.0/24"], &[]);
+        let (admission, name) =
+            policy.decide_named(Transport::Tcp, "198.51.100.7", 443, &["example.com"]);
+        assert_eq!(
+            admission,
+            Ok(FlowAdmission::Allowed {
+                rule: rule("198.51.100.0/24")
+            })
+        );
+        assert_eq!(name, None);
+        assert_eq!(policy.hold(&admission.unwrap(), 443), None);
+    }
+
+    #[test]
+    fn a_flow_is_held_to_the_rules_its_admission_leaves_open() {
+        let allowed = |text: &str| FlowAdmission::Allowed { rule: rule(text) };
+        let policy = rules(&["example.com", "192.0.2.0/24"], &["tcp:*.bad.example:443"]);
+        // Admitted by a name: an allow rule must admit the server too.
+        assert_eq!(
+            policy.hold(&allowed("example.com"), 80),
+            Some(Hold::AllowRules)
+        );
+        // Admitted by an address, or by default: held where a deny name rule
+        // covers the port, and nowhere else.
+        assert_eq!(
+            policy.hold(&allowed("192.0.2.0/24"), 443),
+            Some(Hold::DenyRules)
+        );
+        assert_eq!(policy.hold(&allowed("192.0.2.0/24"), 80), None);
+        let deny_alone = rules(&[], &["*.bad.example"]);
+        assert_eq!(
+            deny_alone.hold(&FlowAdmission::Default, 22),
+            Some(Hold::DenyRules)
+        );
+        assert_eq!(Policy::default().hold(&FlowAdmission::Default, 443), None);
+        // The gateway's mapping is outside the rules.
+        assert_eq!(deny_alone.hold(&FlowAdmission::HostLoopback, 22), None);
+    }
+
+    fn hosts(hosts: &[&str]) -> Vec<Host> {
+        hosts
+            .iter()
+            .map(|host| match host.parse() {
+                Ok(address) => Host::Address(address),
+                Err(_) => Host::Name(host.to_string()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_server_first_bytes_ask_for_is_held_to_the_name_rules() {
+        let policy = rules(
+            &["example.com:443", "*.cdn.example", "192.0.2.0/24"],
+            &["tcp:mail.cdn.example:25", "bad.cdn.example"],
+        );
+        let destination = ip("198.51.100.7");
+        let decide = |hold, port, servers: &[&str]| {
+            policy.decide_servers(hold, destination, port, &hosts(servers))
+        };
+        // Under the allow rules: a server an allow name rule admits on the
+        // port, or none at all.
+        for (port, servers) in [
+            (443, &["example.com"][..]),
+            (443, &["img.cdn.example"]),
+            (80, &["img.cdn.example"]),
+            (443, &[]),
+            (443, &["198.51.100.7"]),
+        ] {
+            assert_eq!(
+                decide(Hold::AllowRules, port, servers),
+                Ok(()),
+                "{servers:?} on {port}"
+            );
+        }
+        for (port, servers, name) in [
+            (80, &["example.com"][..], "example.com"),
+            (443, &["other.example"], "other.example"),
+            (443, &["example.com", "other.example"], "other.example"),
+            (443, &["192.0.2.7"], "192.0.2.7"),
+        ] {
+            assert_eq!(
+                decide(Hold::AllowRules, port, servers),
+                Err(FlowRefusal::ServerNameNotAllowed {
+                    name: name.to_string()
+                }),
+                "{servers:?} on {port}"
+            );
+        }
+        // A deny name rule on its ports, under either hold.
+        for hold in [Hold::AllowRules, Hold::DenyRules] {
+            assert_eq!(
+                decide(hold, 443, &["bad.cdn.example"]),
+                Err(FlowRefusal::ServerNameDenied {
+                    name: "bad.cdn.example".to_string(),
+                    rule: rule("bad.cdn.example")
+                })
+            );
+            assert_eq!(
+                decide(hold, 25, &["mail.cdn.example"]),
+                Err(FlowRefusal::ServerNameDenied {
+                    name: "mail.cdn.example".to_string(),
+                    rule: rule("tcp:mail.cdn.example:25")
+                })
+            );
+        }
+        assert_eq!(decide(Hold::AllowRules, 443, &["mail.cdn.example"]), Ok(()));
+        // Under the deny rules alone, anything else passes, an address
+        // included.
+        for servers in [&["other.example"][..], &["192.0.2.7"], &[]] {
+            assert_eq!(decide(Hold::DenyRules, 443, servers), Ok(()), "{servers:?}");
+        }
     }
 
     #[test]

@@ -52,7 +52,9 @@
 //! resolver is commonly on its loopback, which the guest itself cannot reach;
 //! see [`NetStackBuilder::nameserver`]. The destination rules decide each
 //! question before it is relayed, and the addresses each answer gives are what
-//! a name rule admits a flow by.
+//! a name rule admits a flow by. Under name rules the stack also reads the
+//! server a TCP flow's first bytes ask for, a TLS server name or an HTTP host,
+//! and holds it to the rules before it forwards anything the guest sent.
 //!
 //! Only TCP and UDP are forwarded, and only from the guest's own address: a
 //! segment or datagram from any other source is dropped, since nothing sent
@@ -103,6 +105,18 @@ pub(crate) mod fuzzing {
     pub fn dns_query(message: &[u8]) {
         super::dns::exercise(message);
     }
+
+    /// Reads a ClientHello's body as the stack reads a TCP flow's first bytes,
+    /// in one record and in records of the size `input`'s first byte gives.
+    pub fn client_hello(input: &[u8]) {
+        super::server_name::exercise_client_hello(input);
+    }
+
+    /// Reads `bytes` as the stack reads a TCP flow's first bytes, as a request
+    /// head where they begin one.
+    pub fn http_head(bytes: &[u8]) {
+        super::server_name::exercise_http_head(bytes);
+    }
 }
 mod nameserver;
 mod pins;
@@ -110,6 +124,7 @@ mod policy;
 mod prefix;
 mod pump;
 mod report;
+mod server_name;
 mod sniff;
 mod tap;
 mod tcp;
@@ -901,8 +916,10 @@ impl NetStackBuilder {
     ///
     /// Off, host 3 is an address of the guest's subnet like any other, refused
     /// as the rest of it is, and the guest resolves through whatever its
-    /// `resolv.conf` names that the stack forwards to. A name rule then has no
-    /// names to match, so [`build`](Self::build) refuses one.
+    /// `resolv.conf` names that the stack forwards to. An allow name rule then
+    /// has no addresses to admit, so [`build`](Self::build) refuses one. A deny
+    /// name rule still refuses the server a TCP flow's first bytes ask for; see
+    /// [`deny`](Self::deny).
     pub fn nameserver(mut self, enabled: bool) -> Self {
         self.nameserver = enabled;
         self
@@ -948,6 +965,20 @@ impl NetStackBuilder {
     /// nameserver answers a question for a name's HTTPS or SVCB records with
     /// none.
     ///
+    /// Many sites share an address on a content network, and the name a client
+    /// sends picks the site. So a TCP flow an allow name rule admits forwards
+    /// nothing the guest sends until the stack has read the server its first
+    /// bytes ask for: the server name of a TLS ClientHello, or the host of an
+    /// HTTP/1 request. An allow name rule must admit that server on the flow's
+    /// port too. A flow an address rule admits is not held to the allow rules
+    /// this way, since the address is the grant. A refusal there is answered in
+    /// the flow's own protocol, a TLS alert or an HTTP `403`, before the flow
+    /// is closed. First bytes that are neither TLS nor HTTP are carried as they
+    /// stand, and so is a ClientHello or a request naming no server. Inside TLS
+    /// the stack sees nothing after the ClientHello, the HTTP host included, so
+    /// a client that names an admitted server and asks it for another site
+    /// reaches that site wherever the content network routes such a request.
+    ///
     /// The rules decide the destinations the stack would otherwise carry.
     /// Those it refuses under any configuration, loopback and link-local among
     /// them, stay refused, and no rule admits them. The gateway's
@@ -960,8 +991,8 @@ impl NetStackBuilder {
     ///
     /// [`build`](Self::build) refuses `*`, and a wildcard over the names under
     /// one label such as `*.com`, as an allow rule, since either admits nearly
-    /// every name. It refuses a name rule, allow or deny, where the nameserver
-    /// is turned off, with [`NetStackError::RuleInvalid`].
+    /// every name. It refuses an allow name rule where the nameserver is turned
+    /// off, with [`NetStackError::RuleInvalid`].
     ///
     /// ```
     /// use ferroday_cage::{NetStack, Transport};
@@ -993,10 +1024,13 @@ impl NetStackBuilder {
     /// A deny name rule without ports has the nameserver answer a question for
     /// a name it matches with NXDOMAIN. With ports or without, it refuses a
     /// flow on its ports to an address the nameserver resolved such a name to,
-    /// over either transport unless `tcp:` qualifies it. Under deny rules alone
-    /// a flow to an address the guest learned other than through the
-    /// nameserver is carried, so a name deny holds only where the guest
-    /// resolves through the stack.
+    /// over either transport unless `tcp:` qualifies it, and a TCP flow on its
+    /// ports whose first bytes ask for such a name as their server, as
+    /// [`allow`](Self::allow) describes. Under deny rules alone a flow to an
+    /// address the guest learned other than through the nameserver is carried,
+    /// so a name deny holds only where the guest resolves through the stack or
+    /// names the server in its first bytes. It holds there with the nameserver
+    /// turned off too.
     ///
     /// What the rules decide, and what they leave to grants of their own, is
     /// as [`allow`](Self::allow) describes.
@@ -1126,16 +1160,12 @@ impl NetStackBuilder {
             }
         }
         if !self.nameserver
-            && let Some(rule) = self
-                .allow
-                .iter()
-                .chain(&self.deny)
-                .find(|rule| rule.is_name())
+            && let Some(rule) = self.allow.iter().find(|rule| rule.is_name())
         {
             return Err(NetStackError::RuleInvalid {
                 rule: rule.clone(),
-                reason: "the stack's nameserver is turned off, and a name rule matches only the \
-                         names it resolves",
+                reason: "the stack's nameserver is turned off, and an allow name rule admits only \
+                         the addresses it resolves names to",
             });
         }
         Ok(NetStack {
@@ -1714,14 +1744,6 @@ mod tests {
                 "example.com",
                 "turned off",
             ),
-            (
-                NetStack::builder()
-                    .nameserver(false)
-                    .allow(rule("192.0.2.0/24"))
-                    .deny(rule("*.example.com")),
-                "*.example.com",
-                "turned off",
-            ),
         ] {
             let err = builder.build().expect_err(refused);
             match &err {
@@ -1732,17 +1754,23 @@ mod tests {
             assert!(err.to_string().contains(refused), "{err}");
         }
         // A name rule the nameserver resolves for builds, a deny over every
-        // name among them.
+        // name among them, and a deny name rule builds without the
+        // nameserver, since the server a flow's first bytes ask for gives it
+        // names to match.
         for builder in [
             NetStack::builder().allow(rule("example.com")),
             NetStack::builder()
                 .allow(rule("192.0.2.0/24"))
                 .deny(rule("*.example.com")),
             NetStack::builder().deny(rule("*")).deny(rule("*.com")),
+            NetStack::builder()
+                .nameserver(false)
+                .allow(rule("192.0.2.0/24"))
+                .deny(rule("*.example.com")),
         ] {
             builder
                 .build()
-                .expect("a name rule the nameserver resolves for");
+                .expect("a name rule something gives names to match");
         }
     }
 

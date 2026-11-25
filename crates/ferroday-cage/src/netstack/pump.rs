@@ -19,7 +19,10 @@
 //! where ingestion decides it, a refused UDP datagram there too, a carried UDP
 //! flow where a service pass opens it, and a question where the nameserver
 //! takes it. A flow is decided by its address and by the names the nameserver
-//! resolved to it ([`Pins`]).
+//! resolved to it ([`Pins`]). Under name rules a TCP flow's first bytes are
+//! decided too, by the server they ask for, where a service pass reads them
+//! ([`TcpFlow::read_first_bytes`]), and a refusal there is reported where the
+//! pass or a deadline takes it.
 //!
 //! The interface owns the gateway addresses, answers ARP, neighbor
 //! discovery, and ICMP echo for them itself, and accepts any destination
@@ -659,7 +662,10 @@ impl Engine {
         }
         let handle = self.sockets.add(socket);
         match TcpFlow::connect(handle, src, dst, carried.target, std::time::Instant::now()) {
-            Ok(flow) => {
+            Ok(mut flow) => {
+                if let Some(hold) = self.plan.policy.hold(&carried.admission, dst.port) {
+                    flow.hold(hold, carried.name.clone());
+                }
                 self.flows.push(flow);
                 self.reports.offer(|| {
                     let name = carried.name.as_deref();
@@ -795,7 +801,9 @@ impl Engine {
         let now = std::time::Instant::now();
         for flow in &mut self.flows {
             let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
+            progress |= flow.read_first_bytes(socket, &self.plan.policy, now);
             progress |= flow.service(socket, now);
+            report_refusal(&mut self.reports, flow);
         }
         progress |= self.udp.service(
             &mut self.sockets,
@@ -836,6 +844,7 @@ impl Engine {
         for flow in &mut self.flows {
             let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
             aborted |= flow.enforce_deadline(socket, now);
+            report_refusal(&mut self.reports, flow);
         }
         if let Some(nameserver) = &mut self.nameserver {
             aborted |= nameserver.enforce_deadlines(&mut self.sockets, now);
@@ -857,6 +866,22 @@ impl Engine {
             nameserver.reap(&mut self.sockets);
         }
         self.udp.expire(&mut self.sockets, now);
+    }
+}
+
+/// Reports the refusal of `flow`'s first bytes that it holds, if it holds one.
+fn report_refusal(reports: &mut Reporter, flow: &mut TcpFlow) {
+    if let Some(refused) = flow.refusal.take() {
+        reports.offer(|| {
+            let name = refused.name.as_deref();
+            NetStackReport::refused(
+                Transport::Tcp,
+                flow.guest,
+                flow.destination,
+                name,
+                refused.refusal,
+            )
+        });
     }
 }
 
@@ -1613,6 +1638,7 @@ mod tests {
     };
     use std::net::{Ipv6Addr as StdIpv6Addr, SocketAddr as StdSocketAddr, TcpListener, UdpSocket};
 
+    use super::super::policy::Hold;
     use super::super::{GUEST_MAC, NetStackReports, Publication, PumpExit, listen};
     use super::sniff::classify;
 
@@ -2300,7 +2326,8 @@ mod tests {
         rst: bool,
         fin: bool,
         seq: u32,
-        payload: usize,
+        /// The payload's bytes.
+        data: Vec<u8>,
     }
 
     /// The TCP segments the stack has written to the guest's end of the pair
@@ -2335,7 +2362,7 @@ mod tests {
                 rst: tcp.rst(),
                 fin: tcp.fin(),
                 seq: u32::from_ne_bytes(tcp.seq_number().0.to_ne_bytes()),
-                payload: tcp.payload().len(),
+                data: tcp.payload().to_vec(),
             });
         }
     }
@@ -2496,7 +2523,7 @@ mod tests {
         );
         let delivered: usize = sent_to_guest(&guest)
             .iter()
-            .map(|segment| segment.payload)
+            .map(|segment| segment.data.len())
             .sum();
         assert!(
             delivered > 0 && delivered <= usize::from(GUEST_WINDOW),
@@ -2821,7 +2848,7 @@ mod tests {
                 .iter()
                 .find(|segment| segment.fin)
                 .unwrap_or_else(|| panic!("the stack never finished its side: {sent:?}"));
-            let length = u32::try_from(fin.payload).expect("a segment's payload fits");
+            let length = u32::try_from(fin.data.len()).expect("a segment's payload fits");
             self.stack_next = fin.seq.wrapping_add(length + 1);
         }
 
@@ -3382,5 +3409,358 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    // -- First bytes ------------------------------------------------------------
+
+    /// The destination the held flows below reach, by a name the stack
+    /// resolved to it.
+    const PINNED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+
+    /// A ClientHello naming `example.com`, in one record of 1,588 bytes: more
+    /// than one segment carries under the default MTU.
+    const LONG_HELLO: &[u8] = include_bytes!("../../tests/fixtures/client-hello/node-24.18.bin");
+
+    /// A ClientHello naming `example.com`, in one record of 517 bytes.
+    const SHORT_HELLO: &[u8] =
+        include_bytes!("../../tests/fixtures/client-hello/curl-8.5-openssl-3.0.bin");
+
+    /// How long a host side's peer reads on after the last byte or the start,
+    /// before a test takes it as quiet. Loopback hands a segment, or the reset
+    /// a closed socket sends, to the peer in the kernel's own time, which
+    /// under load trails the call that sent it.
+    const PEER_QUIET: Duration = Duration::from_millis(250);
+
+    /// How a host side's peer stands after a test has read it.
+    #[derive(Debug, PartialEq)]
+    enum PeerEnd {
+        /// Still open.
+        Open,
+        /// The flow passed an end of stream on.
+        Finished,
+        /// The flow reset the host side.
+        Reset,
+    }
+
+    /// A flow from the guest to port 443 of [`PINNED`], held to the rules as
+    /// `hold` says, its host side a connection to a listener of the test's on
+    /// the host's loopback, established on both sides with nothing sent.
+    struct HeldFlow {
+        /// The host side's peer, the listener's end of the connection.
+        peer: std::net::TcpStream,
+        /// The sequence number the guest's next byte carries.
+        guest_next: u32,
+        /// The sequence number the stack's next byte to the guest carries.
+        stack_next: u32,
+    }
+
+    impl HeldFlow {
+        /// Opens the flow, as the engine's admission of a TCP attempt to a
+        /// pinned name's address would, with `named.example` the name.
+        fn open(engine: &mut Engine, guest: &OwnedFd, hold: Hold) -> HeldFlow {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+            guest_sends(engine, &resolve_gateway());
+            let destination = to(PINNED, 443);
+            let mut socket = tcp::guest_facing_socket();
+            socket.listen(destination).expect("a fresh socket listens");
+            let handle = engine.sockets.add(socket);
+            let mut flow = TcpFlow::connect(
+                handle,
+                from_guest(GUEST_PORT),
+                destination,
+                listener.local_addr().expect("an address"),
+                std::time::Instant::now(),
+            )
+            .expect("the host side starts connecting");
+            flow.hold(hold, Some(Arc::from("named.example")));
+            engine.flows.push(flow);
+            let (peer, _) = listener.accept().expect("the host side arrives");
+            peer.set_read_timeout(Some(PEER_QUIET))
+                .expect("the peer's read timeout is set");
+            // The attempt finds its flow, as a retransmission would.
+            guest_sends(engine, &syn_from(GUEST_PORT, destination));
+            let sent = sent_to_guest(guest);
+            let syn_ack = sent
+                .iter()
+                .find(|segment| segment.syn)
+                .unwrap_or_else(|| panic!("the stack never answered the guest's SYN: {sent:?}"));
+            let mut held = HeldFlow {
+                peer,
+                guest_next: GUEST_ISN + 1,
+                stack_next: syn_ack.seq.wrapping_add(1),
+            };
+            held.guest_sends(engine, TcpControl::None, &[]);
+            // The host connect's conclusion, as poll would report it.
+            engine.flows[0].events = PollFlags::OUT;
+            engine.service();
+            held
+        }
+
+        /// Sends one segment from the guest, acknowledging everything the
+        /// stack has sent, and advances the guest's sequence past it.
+        fn guest_sends(&mut self, engine: &mut Engine, control: TcpControl, payload: &[u8]) {
+            guest_sends(
+                engine,
+                &tcp_v4(
+                    (GUEST, GUEST_PORT),
+                    (PINNED, 443),
+                    control,
+                    self.guest_next,
+                    Some(self.stack_next),
+                    payload,
+                ),
+            );
+            let flags = u32::from(control == TcpControl::Fin);
+            let length = u32::try_from(payload.len()).expect("a segment's payload fits");
+            self.guest_next = self.guest_next.wrapping_add(length + flags);
+        }
+
+        /// What the stack has since sent the guest, with the stack's next
+        /// sequence number advanced past it.
+        fn guest_receives(&mut self, engine: &mut Engine, guest: &OwnedFd) -> Vec<Sent> {
+            engine
+                .iface
+                .poll(engine.now(), &mut engine.device, &mut engine.sockets);
+            let sent = sent_to_guest(guest);
+            for segment in &sent {
+                let length = u32::try_from(segment.data.len()).expect("a segment's payload fits");
+                let end = segment.seq.wrapping_add(length + u32::from(segment.fin));
+                if end.wrapping_sub(self.stack_next) < u32::MAX / 2 {
+                    self.stack_next = end;
+                }
+            }
+            sent
+        }
+
+        /// What the host side's peer has received since the last call, until
+        /// it has been quiet for [`PEER_QUIET`], and how it stands.
+        fn host_receives(&mut self) -> (Vec<u8>, PeerEnd) {
+            use std::io::Read as _;
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match self.peer.read(&mut buf) {
+                    Ok(0) => return (received, PeerEnd::Finished),
+                    Ok(read) => received.extend_from_slice(&buf[..read]),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return (received, PeerEnd::Open);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                        return (received, PeerEnd::Reset);
+                    }
+                    Err(err) => panic!("the host side's peer failed: {err}"),
+                }
+            }
+        }
+    }
+
+    /// The payload bytes of `sent`, in order.
+    fn payload_of(sent: &[Sent]) -> Vec<u8> {
+        sent.iter()
+            .flat_map(|segment| segment.data.iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn a_held_flow_forwards_nothing_until_its_server_name_is_admitted() {
+        let (tap, guest) = tap_pair();
+        let plan = ruled(&["named.example", "example.com"], &[], None);
+        let (mut engine, reports) = reporting_engine(tap, plan, Vec::new());
+        let mut held = HeldFlow::open(&mut engine, &guest, Hold::AllowRules);
+
+        // The ClientHello in the two segments a guest sends it in: nothing
+        // reaches the host until it is whole and its server name admitted.
+        held.guest_sends(&mut engine, TcpControl::Psh, &LONG_HELLO[..1460]);
+        assert_eq!(held.host_receives(), (Vec::new(), PeerEnd::Open));
+        held.guest_sends(&mut engine, TcpControl::Psh, &LONG_HELLO[1460..]);
+        engine.flows[0].events = PollFlags::OUT;
+        engine.service();
+        assert_eq!(held.host_receives(), (LONG_HELLO.to_vec(), PeerEnd::Open));
+        // From then on, the flow carries what the guest sends as any other.
+        held.guest_sends(&mut engine, TcpControl::Psh, b"after");
+        assert_eq!(held.host_receives(), (b"after".to_vec(), PeerEnd::Open));
+        assert!(reported(&reports).is_empty());
+        assert!(
+            engine.flows[0]
+                .deadline_in(
+                    engine.sockets.get(engine.flows[0].handle),
+                    std::time::Instant::now()
+                )
+                .is_none(),
+            "a released flow is held to no deadline"
+        );
+    }
+
+    #[test]
+    fn a_server_name_the_rules_refuse_is_answered_in_its_protocol() {
+        for (first_bytes, answer) in [
+            (
+                SHORT_HELLO.to_vec(),
+                b"\x15\x03\x03\x00\x02\x02\x70".to_vec(),
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+                b"HTTP/1.1 403 Forbidden\r\n".to_vec(),
+            ),
+        ] {
+            let (tap, guest) = tap_pair();
+            let plan = ruled(&["named.example"], &[], None);
+            let (mut engine, reports) = reporting_engine(tap, plan, Vec::new());
+            let mut held = HeldFlow::open(&mut engine, &guest, Hold::AllowRules);
+            held.guest_sends(&mut engine, TcpControl::Psh, &first_bytes);
+
+            // The answer, then the stack's FIN; the host side is reset having
+            // received nothing.
+            let sent = held.guest_receives(&mut engine, &guest);
+            assert!(
+                payload_of(&sent).starts_with(&answer),
+                "{:?}",
+                payload_of(&sent).escape_ascii().to_string()
+            );
+            assert!(sent.iter().any(|segment| segment.fin), "{sent:?}");
+            assert!(!sent.iter().any(|segment| segment.rst), "{sent:?}");
+            assert_eq!(held.host_receives(), (Vec::new(), PeerEnd::Reset));
+            assert_eq!(
+                reported(&reports),
+                [NetStackReport::refused(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    to(PINNED, 443),
+                    Some("named.example"),
+                    FlowRefusal::ServerNameNotAllowed {
+                        name: "example.com".to_string()
+                    },
+                )]
+            );
+
+            // Whatever the guest sends from here is dropped, and its own close
+            // ends the flow.
+            held.guest_sends(&mut engine, TcpControl::Psh, b"more");
+            held.guest_receives(&mut engine, &guest);
+            held.guest_sends(&mut engine, TcpControl::Fin, &[]);
+            engine.reap(std::time::Instant::now());
+            assert!(engine.flows.is_empty(), "the guest's close ended the flow");
+            // The reset was read above; the peer reads only an end from here.
+            assert!(held.host_receives().0.is_empty(), "nothing more arrived");
+        }
+    }
+
+    #[test]
+    fn a_server_that_speaks_first_is_heard_while_the_flow_is_held() {
+        use std::io::Write as _;
+
+        let (tap, guest) = tap_pair();
+        let plan = ruled(&["named.example"], &[], None);
+        let (mut engine, reports) = reporting_engine(tap, plan, Vec::new());
+        let mut held = HeldFlow::open(&mut engine, &guest, Hold::AllowRules);
+        held.peer
+            .write_all(b"220 ready\r\n")
+            .expect("the host side speaks");
+        engine.flows[0].events = PollFlags::IN;
+        engine.service();
+        let sent = held.guest_receives(&mut engine, &guest);
+        assert_eq!(payload_of(&sent), b"220 ready\r\n");
+        // An answer in a protocol of no server name's is carried as it stands.
+        held.guest_sends(&mut engine, TcpControl::Psh, b"EHLO guest\r\n");
+        engine.flows[0].events = PollFlags::OUT;
+        engine.service();
+        assert_eq!(
+            held.host_receives(),
+            (b"EHLO guest\r\n".to_vec(), PeerEnd::Open)
+        );
+        assert!(reported(&reports).is_empty());
+    }
+
+    #[test]
+    fn first_bytes_begun_and_left_unfinished_are_reset_at_their_deadline() {
+        let (tap, guest) = tap_pair();
+        let plan = ruled(&["named.example", "example.com"], &[], None);
+        let (mut engine, reports) = reporting_engine(tap, plan, Vec::new());
+        let mut held = HeldFlow::open(&mut engine, &guest, Hold::AllowRules);
+        let now = std::time::Instant::now();
+        // A guest that has sent nothing is held to no deadline.
+        let flow = &engine.flows[0];
+        assert_eq!(flow.deadline_in(engine.sockets.get(flow.handle), now), None);
+
+        held.guest_sends(&mut engine, TcpControl::Psh, &SHORT_HELLO[..100]);
+        let began = std::time::Instant::now();
+        let flow = &engine.flows[0];
+        assert!(
+            flow.deadline_in(engine.sockets.get(flow.handle), began)
+                .is_some_and(|left| left <= tcp::FIRST_BYTES_DEADLINE),
+        );
+        engine.reap(began + tcp::FIRST_BYTES_DEADLINE - Duration::from_secs(1));
+        assert_eq!(engine.flows.len(), 1, "the deadline has not fallen due");
+        engine.reap(began + tcp::FIRST_BYTES_DEADLINE);
+        assert!(engine.flows.is_empty(), "the deadline reclaimed the flow");
+        let sent = held.guest_receives(&mut engine, &guest);
+        assert!(sent.iter().any(|segment| segment.rst), "{sent:?}");
+        assert_eq!(held.host_receives(), (Vec::new(), PeerEnd::Reset));
+        assert_eq!(
+            reported(&reports),
+            [NetStackReport::refused(
+                Transport::Tcp,
+                from_guest(GUEST_PORT),
+                to(PINNED, 443),
+                Some("named.example"),
+                FlowRefusal::ServerNameUnfinished,
+            )]
+        );
+    }
+
+    #[test]
+    fn first_bytes_the_guest_ends_unfinished_are_reset_at_once() {
+        let (tap, guest) = tap_pair();
+        let plan = ruled(&["named.example"], &[], None);
+        let (mut engine, reports) = reporting_engine(tap, plan, Vec::new());
+        let mut held = HeldFlow::open(&mut engine, &guest, Hold::AllowRules);
+        held.guest_sends(&mut engine, TcpControl::Psh, b"GET / HTTP/1.1\r\n");
+        held.guest_sends(&mut engine, TcpControl::Fin, &[]);
+        let sent = held.guest_receives(&mut engine, &guest);
+        assert!(sent.iter().any(|segment| segment.rst), "{sent:?}");
+        engine.reap(std::time::Instant::now());
+        assert!(engine.flows.is_empty());
+        assert_eq!(held.host_receives(), (Vec::new(), PeerEnd::Reset));
+        assert!(matches!(
+            reported(&reports)[..],
+            [NetStackReport::FlowRefused {
+                refusal: FlowRefusal::ServerNameUnfinished,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_guest_that_ends_its_side_unheard_passes_the_end_on() {
+        // Nothing to read is nothing to hold: the guest's FIN reaches the host
+        // as an end of stream, as it would on any flow.
+        let (tap, guest) = tap_pair();
+        let plan = ruled(&["named.example"], &[], None);
+        let (mut engine, _reports) = reporting_engine(tap, plan, Vec::new());
+        let mut held = HeldFlow::open(&mut engine, &guest, Hold::AllowRules);
+        held.guest_sends(&mut engine, TcpControl::Fin, &[]);
+        assert_eq!(held.host_receives(), (Vec::new(), PeerEnd::Finished));
+    }
+
+    #[test]
+    fn a_flow_admitted_by_a_name_is_held_and_one_by_an_address_is_not() {
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a host socket binds");
+        let address = upstream.local_addr().expect("an address");
+        let (tap, _guest) = tap_pair();
+        let plan = ruled(&["named.example", "198.51.100.8"], &[], None);
+        let (mut engine, _reports) = naming_engine(tap, plan, address);
+        resolve(&mut engine, &upstream, "named.example", PINNED);
+        let other = Ipv4Addr::new(198, 51, 100, 8);
+        resolve(&mut engine, &upstream, "named.example", other);
+        engine.consider(classify(&syn_from(GUEST_PORT, to(PINNED, 443))));
+        engine.consider(classify(&syn_from(GUEST_PORT, to(other, 443))));
+        assert_eq!(engine.flows.len(), 2);
+        assert!(engine.flows[0].is_held(), "admitted by its name");
+        assert!(!engine.flows[1].is_held(), "admitted by its address");
     }
 }
