@@ -520,6 +520,9 @@ consumer upgrading can skip it.
   rather than walking the whole working tree a second time. A tree whose bulk
   the command leaves alone, a `node_modules` or a `target`, is no longer
   listed twice.
+- The managed `/dev` tmpfs is mounted `nodev`, as the managed `/dev/shm` and
+  `/tmp` are. Each device node bound into it is a mount of its own, which the
+  kernel asks of when the node is opened, so the nodes work as before.
 
 ### Fixed
 

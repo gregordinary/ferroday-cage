@@ -392,11 +392,11 @@ can be disabled:
   character devices is denied in an unprivileged user namespace — together
   with the `stdin`, `stdout`, `stderr`, `fd`, and `ptmx` symlinks, a fresh
   `devpts` instance on `/dev/pts`, and a tmpfs on `/dev/shm`. The `/dev`
-  tmpfs is `nosuid` but, by design, not `nodev`: it has to carry those device
-  nodes, which `nodev` would render inoperable. This is deliberate and safe
-  in the sandbox's user namespace — the bound nodes are the host's own, not
-  fresh nodes the sandbox could use to reach an arbitrary device, and access
-  to them is governed by the namespace. `tty` is the exception to "the host's
+  tmpfs is `nosuid` and `nodev`. Each device node is a bind of its own, and
+  the kernel decides whether a node may be opened by the mount it is reached
+  through, so the bound nodes work while a node made in the tmpfs itself
+  would not. The bound nodes are the host's own, not fresh nodes the sandbox
+  could use to reach an arbitrary device. `tty` is the exception to "the host's
   own": it is the character device `5:0`, whose open returns the *opening
   process's* controlling terminal rather than the inode the bind carries, so
   what the sandbox reaches through it follows from the sandbox's session. See

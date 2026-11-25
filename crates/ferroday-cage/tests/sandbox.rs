@@ -306,9 +306,13 @@ fn dev_is_assembled() {
         test -L /dev/stdin && test -L /dev/stdout && test -L /dev/stderr && \
         test -L /dev/fd && test -L /dev/ptmx && \
         test -c /dev/pts/ptmx && \
-        test -d /dev/shm && touch /dev/shm/scribble";
+        test -d /dev/shm && touch /dev/shm/scribble && \
+        grep -q ' /dev tmpfs rw,nosuid,nodev' /proc/mounts";
     let status = run_sh(rootfs, script);
-    assert!(status.success(), "expected the minimal /dev profile");
+    assert!(
+        status.success(),
+        "expected the minimal /dev profile, its tmpfs nosuid and nodev",
+    );
 }
 
 #[test]
@@ -362,12 +366,13 @@ fn a_consumer_can_rebuild_the_managed_dev_by_hand() {
     let mut builder = Cage::builder()
         .rootfs(rootfs)
         .mount_dev(false)
-        // MS_NOSUID. Deliberately not MS_NODEV: the tmpfs has to carry the
-        // device nodes bound in below, which MS_NODEV would render inoperable.
+        // MS_NOSUID | MS_NODEV. Each device node bound in below is a mount of
+        // its own, which the kernel asks of when it is opened, so the tmpfs's
+        // MS_NODEV leaves them working.
         .raw_mount(
             RawMount::new("/dev")
                 .fstype("tmpfs")
-                .flags(0x2)
+                .flags(0x6)
                 .data("mode=0755"),
         );
     for device in ["null", "zero", "full", "random", "urandom", "tty"] {
@@ -392,6 +397,8 @@ fn a_consumer_can_rebuild_the_managed_dev_by_hand() {
             "for node in null zero full random urandom tty; do \
                [ -c \"/dev/$node\" ] || exit 1; \
              done; \
+             echo discard > /dev/null || exit 1; \
+             [ \"$(head -c 4 /dev/zero | wc -c)\" = 4 ] || exit 1; \
              [ -e /dev/pts/ptmx ] || exit 1; \
              grep -q ' /dev tmpfs ' /proc/mounts || exit 1; \
              grep -q ' /dev/shm tmpfs ' /proc/mounts || exit 1",

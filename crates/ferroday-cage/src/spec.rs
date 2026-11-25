@@ -5377,22 +5377,20 @@ impl Lowering {
     }
 
     fn push_dev(&mut self) -> Result<(), Error> {
-        // The /dev tmpfs is NOSUID but deliberately not NODEV: it must carry
-        // the device nodes bound below, which NODEV would render inoperable.
-        // The nodes themselves are bind-mounted read-write from the host, not
-        // recreated (mknod is denied to an unprivileged process, even in a
-        // user namespace). This is safe in the sandbox's user namespace: the
-        // bound nodes are the host's own null/zero/random/etc., not fresh
-        // nodes the sandbox could use to reach an arbitrary device, and access
-        // to them is governed by the namespace. It mirrors what bubblewrap
-        // does, and the choice is intentional rather than an oversight.
+        // The /dev tmpfs is `nosuid` and `nodev`. The device nodes are bound
+        // from the host rather than made (`mknod` of a device is refused to an
+        // unprivileged process, in a user namespace too), and each bind is a
+        // mount of its own: the kernel asks whether a device may be opened of
+        // the mount the node is reached through, which is the bind, carrying
+        // the host `/dev`'s flags. `nodev` on the tmpfs refuses a node made in
+        // the tmpfs itself, and nothing else.
         self.push(
             MountOp {
                 dirs: dir_chain(&["dev"], DIR_MODE)?,
                 create_file: None,
                 action: MountAction::Tmpfs {
                     target: rel_cstring(&["dev"])?,
-                    flags: MountFlags::NOSUID,
+                    flags: MountFlags::NOSUID | MountFlags::NODEV,
                     data: c"mode=0755".to_owned(),
                 },
             },
