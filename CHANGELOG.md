@@ -142,6 +142,16 @@ consumer upgrading can skip it.
   following a magic link: the init, the launch stage outside a sandbox without a
   PID namespace, a command writing its own nested map, a further command joining
   a sandbox, and every helper process that maps itself.
+- Removing a tree, through `provision::Remove`, `provision::remove_tree`, or
+  `ChangeSet::apply` and `ChangeSet::fork` removing a directory, no longer
+  climbs out of a directory it has emptied through `..`. A process renaming a directory the removal was inside to
+  somewhere outside the tree led the climb into the directory's new parent,
+  where it unlinked entries with the removal's privilege, which in its second
+  attempt covers every id the identity map holds. The removal now acts only on
+  the top of the tree and on directories it opens by name from there: a
+  non-empty directory deeper down is renamed up to the top under a `.removing-`
+  name before it is emptied. A removal that fails partway leaves such names
+  behind.
 
 ### Added
 

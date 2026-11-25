@@ -16,25 +16,17 @@
 //! module already enforces (no allocation, no locks, no panic, rustix
 //! syscalls only).
 //!
-//! The deletion walks the tree with one open descriptor and constant
-//! memory: entries are unlinked from a rescanning pass, a non-empty
-//! directory is descended into, an emptied one is left by re-opening `..`
-//! and removed when its parent's next pass reaches it. Symlinks are never
-//! followed and descents refuse to cross them, so nothing the tree itself
-//! holds can redirect the walk out of it. [`delete_tree`] is that walk, and
-//! the caller's own first attempt at a removal runs it too, in process, before
+//! The deletion walks the tree with a few open descriptors and constant
+//! memory, and never climbs: entries are unlinked from a rescanning pass over
+//! the top of the tree, a non-empty directory there is emptied in place, and a
+//! non-empty directory inside that one is renamed up to the top, for a later
+//! pass to reach. Symlinks are never followed and the walk refuses to open one
+//! as a directory, so nothing the tree itself holds can redirect the walk out
+//! of it, and every directory the walk acts on is the top or one it opened by
+//! name from there, so a concurrent writer renaming a directory out of the tree
+//! takes none of the walk's reach with it. [`delete_tree`] is that walk, and the
+//! caller's own first attempt at a removal runs it too, in process, before
 //! anything here is forked.
-//!
-//! The ascent is the one step that does not open a name the pass just read: it
-//! re-opens `..` and stops at the directory the caller pointed it at, identified
-//! by device and inode and re-checked at every level. That bounds it against the
-//! tree's own contents and against nothing else. A concurrent writer that
-//! renames a directory the walk is currently inside to somewhere outside the
-//! tree breaks the chain of `..` leading back to the start, and the ascent then
-//! climbs past where it should have stopped, unlinking as it goes with whatever
-//! privilege the walk holds: the calling user's in process, and root of the
-//! mapped namespace here. The bound is that the tree is one the caller owns and
-//! is finished with.
 
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
@@ -44,7 +36,7 @@ use rustix::fs::{self, AtFlags, Mode, OFlags, RawDir, SeekFrom};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
-use super::child::{MapDuty, MapFailure};
+use super::child::{MapDuty, MapFailure, StackBuf};
 use super::frame;
 use super::sys::{self, PidfdFork};
 use super::{ChildMap, Forked};
@@ -254,27 +246,34 @@ fn removal_child(gate: BorrowedFd<'_>, parent: &CStr, leaf: &CStr, duty: MapDuty
 /// Deletes `leaf` under the directory `parent`, whatever kind of entry it is,
 /// holding at most three descriptors and constant memory.
 ///
-/// Each pass over a directory unlinks what it can; a non-empty
-/// subdirectory is descended into and the pass restarts there, and an
-/// emptied directory is left through `..` — its parent's next pass removes
-/// it with `AT_REMOVEDIR`. The walk therefore needs no name stack: the
-/// only state is the current descriptor and the identity of the starting
-/// directory, remembered by device and inode so the ascent knows where to
-/// stop. A tree nested a hundred thousand levels deep costs what a shallow
-/// one does, where a recursive removal holds a descriptor and a stack frame
-/// per level and runs out of one or the other.
+/// Each pass over the start, the directory `leaf` names, unlinks what it can.
+/// A non-empty directory in it is emptied in place: its own entries are
+/// unlinked, and each non-empty directory among them is renamed up into the
+/// start under a name of the walk's own, for a later pass to empty in turn. The
+/// next pass removes the emptied one with `AT_REMOVEDIR`. Every directory is
+/// renamed at most once, so a tree nested a hundred thousand levels deep costs
+/// what a wide one of as many directories does, where a recursive removal holds
+/// a descriptor and a stack frame per level and runs out of one or the other.
+///
+/// The walk never climbs. Every directory it acts on is the start, which it
+/// holds open, or one it opened by name from the start, so a concurrent writer
+/// that renames a directory the walk is in somewhere outside the tree takes
+/// nothing of the walk out with it: the walk empties that directory where it
+/// now is, as it is the tree's, and never reaches the directory it was moved
+/// into. A walk that climbed back through `..` would follow such a directory
+/// out and unlink in its new parent, with whatever privilege the walk holds.
 ///
 /// It is the one walk every removal of a tree takes. The map-assisted child
 /// runs it under the post-fork discipline, which it meets: it allocates
 /// nothing, takes no lock, and cannot panic on what it reads. The caller's own
-/// first attempt runs it in process, as the calling user.
+/// first attempt runs it in process, as the calling user. A removal that fails
+/// partway leaves the tree partly removed, with directories from deeper in it
+/// standing in the start under the walk's names.
 ///
 /// A symbolic link is never followed: one at `leaf` is removed as a link, and
 /// one inside the tree is unlinked like any other entry. An entry that is
 /// already gone — `leaf` itself, or a name another process removed while a
 /// pass was reading its directory — is the outcome asked for, not a failure.
-/// The ascent's one exposure, a concurrent writer that moves the walk's own
-/// directory out of the tree, is the module's to state.
 pub(crate) fn delete_tree(parent: BorrowedFd<'_>, leaf: &CStr) -> Result<(), Errno> {
     // A plain entry (file or symlink) needs no walk at all. Linux reports the
     // attempt to unlink a directory as EISDIR; POSIX permits EPERM, so accept
@@ -294,84 +293,156 @@ pub(crate) fn delete_tree(parent: BorrowedFd<'_>, leaf: &CStr) -> Result<(), Err
         Err(Errno::NOTDIR) => return Err(refused),
         Err(errno) => return Err(errno),
     };
-    let start_stat = fs::fstat(&start)?;
-    let mut current = start;
-
-    'walk: loop {
-        // Rescan the current directory from the top; unlinking during
-        // getdents iteration is safe, but a fresh pass keeps the logic
-        // simple and the state constant.
-        fs::seek(&current, SeekFrom::Start(0))?;
+    let mut hoisted = 0;
+    loop {
+        // A fresh pass from the top each time: unlinking or renaming entries
+        // while `getdents` reads the directory is safe, and an entry added
+        // meanwhile is found by a later pass if not by this one.
+        fs::seek(&start, SeekFrom::Start(0))?;
+        let mut changed = false;
         let mut buf = [MaybeUninit::uninit(); 2048];
-        let mut entries = RawDir::new(&current, &mut buf);
-        let mut removed = false;
+        let mut entries = RawDir::new(&start, &mut buf);
         while let Some(entry) = entries.next() {
             let entry = entry?;
             let name = entry.file_name();
             if name == c"." || name == c".." {
                 continue;
             }
-            match fs::unlinkat(&current, name, AtFlags::empty()) {
-                Ok(()) => {
-                    removed = true;
-                }
-                // Something else removed it first; nothing is owed here.
-                Err(Errno::NOENT) => {}
-                // EISDIR on Linux, EPERM where POSIX allows it: a directory.
-                Err(refused @ (Errno::ISDIR | Errno::PERM)) => {
-                    match fs::unlinkat(&current, name, AtFlags::REMOVEDIR) {
-                        Ok(()) => {
-                            removed = true;
-                        }
-                        Err(Errno::NOENT) => {}
-                        // Not empty: descend and restart the walk there. Only a
-                        // directory proven non-empty is descended into, so the
-                        // parent's next pass removes it outright and no
-                        // directory is visited twice.
-                        Err(Errno::NOTEMPTY | Errno::EXIST) => {
-                            let child = crate::provision::containment::open_child_dir(
-                                &current,
-                                name,
-                                OFlags::RDONLY,
-                            )?;
-                            current = child;
-                            continue 'walk;
-                        }
-                        // Not a directory after all, so the EPERM that
-                        // suggested one — an immutable file, say — is the
-                        // failure worth reporting.
-                        Err(Errno::NOTDIR) => return Err(refused),
+            match remove_entry(start.as_fd(), name)? {
+                Removal::Removed => changed = true,
+                Removal::Gone => {}
+                Removal::NotEmpty => {
+                    let child = match crate::provision::containment::open_child_dir(
+                        start.as_fd(),
+                        name,
+                        OFlags::RDONLY,
+                    ) {
+                        Ok(child) => child,
+                        // Removed, or renamed away, since the pass found it.
+                        Err(Errno::NOENT) => continue,
                         Err(errno) => return Err(errno),
-                    }
+                    };
+                    empty_into(child.as_fd(), start.as_fd(), &mut hoisted)?;
+                    changed = true;
                 }
-                Err(errno) => return Err(errno),
             }
         }
-
-        if removed {
-            // Something went; the directory may be empty now. Rescan.
-            continue;
-        }
-
-        // An empty directory. The start is removed from its parent and the
-        // walk is done; anything deeper is left through `..`, for its
-        // parent's next pass to remove.
-        let here = fs::fstat(&current)?;
-        if here.st_dev == start_stat.st_dev && here.st_ino == start_stat.st_ino {
+        if !changed {
+            // Nothing was left to remove: the start is empty.
             return match fs::unlinkat(parent, leaf, AtFlags::REMOVEDIR) {
                 Ok(()) | Err(Errno::NOENT) => Ok(()),
                 Err(errno) => Err(errno),
             };
         }
-        let up = fs::openat(
-            &current,
-            c"..",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        current = up;
     }
 }
+
+/// Empties `dir`, a directory in `start`: unlinks every entry it can, and
+/// renames each non-empty directory in it up into `start`, for the walk to
+/// empty from there. Returns once a pass over `dir` finds nothing left.
+fn empty_into(dir: BorrowedFd<'_>, start: BorrowedFd<'_>, hoisted: &mut u32) -> Result<(), Errno> {
+    loop {
+        fs::seek(dir, SeekFrom::Start(0))?;
+        let mut changed = false;
+        let mut buf = [MaybeUninit::uninit(); 2048];
+        let mut entries = RawDir::new(dir, &mut buf);
+        while let Some(entry) = entries.next() {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
+                continue;
+            }
+            match remove_entry(dir, name)? {
+                Removal::Removed => changed = true,
+                Removal::Gone => {}
+                Removal::NotEmpty => {
+                    hoist(dir, name, start, hoisted)?;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+    }
+}
+
+/// What [`remove_entry`] did with an entry.
+enum Removal {
+    /// It is removed.
+    Removed,
+    /// Something else removed it first; nothing is owed here.
+    Gone,
+    /// It is a directory with entries of its own.
+    NotEmpty,
+}
+
+/// Removes the entry `name` in `dir` where it is a file, a link, or an empty
+/// directory, or reports it as a directory with entries of its own.
+fn remove_entry(dir: BorrowedFd<'_>, name: &CStr) -> Result<Removal, Errno> {
+    match fs::unlinkat(dir, name, AtFlags::empty()) {
+        Ok(()) => Ok(Removal::Removed),
+        Err(Errno::NOENT) => Ok(Removal::Gone),
+        // EISDIR on Linux, EPERM where POSIX allows it: a directory.
+        Err(refused @ (Errno::ISDIR | Errno::PERM)) => {
+            match fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
+                Ok(()) => Ok(Removal::Removed),
+                Err(Errno::NOENT) => Ok(Removal::Gone),
+                Err(Errno::NOTEMPTY | Errno::EXIST) => Ok(Removal::NotEmpty),
+                // Not a directory after all, so the EPERM that suggested one —
+                // an immutable file, say — is the failure worth reporting.
+                Err(Errno::NOTDIR) => Err(refused),
+                Err(errno) => Err(errno),
+            }
+        }
+        Err(errno) => Err(errno),
+    }
+}
+
+/// Renames the directory `name` in `dir` up into `start`, under the first name
+/// of the walk's own that `start` does not hold.
+///
+/// The names count up from `hoisted`, which keeps the count across the walk. A
+/// name already taken, by an entry of the tree or by a concurrent writer, is
+/// passed over: `RENAME_NOREPLACE` refuses it. A filesystem without that flag
+/// has the name looked up first and the rename made plainly, which replaces
+/// at most an empty directory that took the name in between.
+fn hoist(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    start: BorrowedFd<'_>,
+    hoisted: &mut u32,
+) -> Result<(), Errno> {
+    loop {
+        *hoisted = hoisted.wrapping_add(1);
+        let mut new = StackBuf::<HOIST_NAME_LEN>::new();
+        new.push(HOIST_PREFIX);
+        new.push_decimal(*hoisted);
+        let new = new.as_cstr();
+        let renamed = match fs::renameat_with(dir, name, start, new, fs::RenameFlags::NOREPLACE) {
+            Err(Errno::INVAL) => match fs::statat(start, new, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => fs::renameat(dir, name, start, new),
+                Ok(_) => Err(Errno::EXIST),
+                Err(errno) => Err(errno),
+            },
+            renamed => renamed,
+        };
+        match renamed {
+            Ok(()) => return Ok(()),
+            // Removed meanwhile: nothing left to hoist.
+            Err(Errno::NOENT) => return Ok(()),
+            Err(Errno::EXIST | Errno::NOTEMPTY | Errno::NOTDIR | Errno::ISDIR) => continue,
+            Err(errno) => return Err(errno),
+        }
+    }
+}
+
+/// The start of every name the walk gives a directory it renames up into the
+/// start.
+const HOIST_PREFIX: &[u8] = b".removing-";
+
+/// A buffer that holds [`HOIST_PREFIX`] and the decimal digits of any `u32`.
+const HOIST_NAME_LEN: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -409,6 +480,84 @@ mod tests {
             decode_record([0xFFu8; 8]),
             RemoveFailure::Malformed
         ));
+    }
+
+    /// A tree with directories nested several deep, each holding a file, and
+    /// one of them at the top a writer can move.
+    fn nested_tree(tree: &std::path::Path, depth: usize) {
+        let mut level = tree.join("moved");
+        for _ in 0..depth {
+            std::fs::create_dir_all(&level).expect("a level is creatable");
+            std::fs::write(level.join("file"), b"").expect("a file is writable");
+            level = level.join("level");
+        }
+    }
+
+    #[test]
+    fn a_tree_nested_deep_and_wide_is_removed_without_climbing() {
+        let dir = Scratch::new("remove-hoist");
+        let tree = dir.join("tree");
+        nested_tree(&tree, 40);
+        for wide in 0..40 {
+            std::fs::create_dir_all(tree.join(format!("wide/{wide}/inner"))).unwrap();
+            std::fs::write(tree.join(format!("wide/{wide}/inner/file")), b"").unwrap();
+        }
+        // A name the walk would give a directory it renames up is taken
+        // already, and is passed over.
+        std::fs::create_dir_all(tree.join(".removing-1/kept")).unwrap();
+        let parent = rustix::fs::open(
+            dir.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        delete_tree(parent.as_fd(), c"tree").expect("the tree is removed");
+        assert!(!tree.exists());
+    }
+
+    #[test]
+    fn a_directory_renamed_out_of_the_tree_takes_the_walk_nowhere() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A writer moves a directory of the tree out of it and back, over and
+        // over, while the walk removes the tree. Beside the tree, where the
+        // directory goes, nothing is touched: the walk empties the directory
+        // wherever it is, and never follows it to its new parent.
+        for round in 0..10 {
+            let dir = Scratch::new("remove-renamed");
+            let (tree, outside) = (dir.join("tree"), dir.join("outside"));
+            nested_tree(&tree, 32);
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), b"").unwrap();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let stop = Arc::clone(&stop);
+                let (inside, away) = (tree.join("moved"), outside.join("moved"));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::fs::rename(&inside, &away);
+                        let _ = std::fs::rename(&away, &inside);
+                    }
+                })
+            };
+            let parent = rustix::fs::open(
+                dir.path(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            let removed = delete_tree(parent.as_fd(), c"tree");
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+
+            assert!(
+                outside.join("sentinel").exists(),
+                "round {round}: the walk reached beside the tree ({removed:?})",
+            );
+        }
     }
 
     /// A delegate that resolves the map, forks a bystander process, and then
