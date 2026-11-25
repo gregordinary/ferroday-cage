@@ -1293,6 +1293,16 @@ impl DebianBuilder {
     /// staged under a name unique to the writer and published with a rename,
     /// so a package two bootstraps download at once resolves to the one file
     /// they both name, and is verified against its digest before reuse.
+    ///
+    /// The cache also records the date of the newest release each mirror
+    /// served for each suite, and a later run refuses a release from that
+    /// mirror dated before it with [`DebianError::Release`]. That holds for
+    /// every release freshness applies to: a signed repository's, from a mirror
+    /// that is not a snapshot, unless [`allow_stale_release`] is set. Without a
+    /// cache directory nothing is recorded, and a mirror can serve any release
+    /// the key signed that has not passed its `Valid-Until`.
+    ///
+    /// [`allow_stale_release`]: Self::allow_stale_release
     pub fn cache_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cache_dir = Some(dir.as_ref().to_path_buf());
         self
@@ -1450,7 +1460,9 @@ impl DebianBuilder {
     /// key that made the signature must still be in force: a state signed
     /// only by keys that have since expired is refused. It has no effect on a
     /// [`trust_unsigned`](Self::trust_unsigned) mirror, which is never
-    /// freshness-checked.
+    /// freshness-checked. Nor is a release held to the newest one a
+    /// [`cache_dir`](Self::cache_dir) records its mirror serving, and none is
+    /// recorded.
     ///
     /// The finished rootfs's source for the repository carries the same
     /// posture, `check-valid-until=no`, so the root's `apt` reads the release
@@ -1700,6 +1712,7 @@ impl Observed<'_> {
             config.repositories,
             config.architecture,
             &Pins::none(),
+            config.cache_dir,
             self.sink,
         )?;
         Ok(index.into_available())
@@ -1818,6 +1831,7 @@ fn resolve_packages(
         config.repositories,
         config.architecture,
         config.pin,
+        config.cache_dir,
         observer,
     )?;
 
@@ -1902,6 +1916,7 @@ fn resolve_delta(
         config.repositories,
         config.architecture,
         config.pin,
+        config.cache_dir,
         observer,
     )?;
 
@@ -1934,11 +1949,16 @@ fn resolve_delta(
 /// verified against its own keyring and bound to its own suite; the per-component
 /// indexes are tagged with their repository's index and the rank its release
 /// marks itself with, and merged into one ranked set.
+///
+/// Where the caller keeps a package cache, `cache_dir`, a release held to
+/// freshness is also held to the newest the cache records its mirror serving
+/// for the suite ([`release::Newest`]), and recorded there where it is newer.
 fn merged_index(
     fetcher: &mut dyn Fetch,
     repositories: &[Repository],
     architecture: &str,
     pins: &Pins,
+    cache_dir: Option<&Path>,
     observer: &mut dyn DebianObserver,
 ) -> Result<(Index, Vec<ResolvedArchive>), DebianError> {
     // Each repository contributes one text block per component, tagged with the
@@ -1965,6 +1985,12 @@ fn merged_index(
                 subject: served.url.clone(),
                 reason,
             })?;
+        if let Some(cache) = cache_dir
+            && repository.require_fresh(&served.mirror)
+        {
+            release::Newest::of(cache, &served.mirror, &repository.suite)
+                .hold(&release, &served.url)?;
+        }
         let text = fetch_index(
             fetcher,
             repository,
@@ -4128,6 +4154,63 @@ mod tests {
                     .expect("the repository builds"),
             )
             .fetcher(fetcher)
+    }
+
+    #[test]
+    fn a_release_older_than_one_the_cache_recorded_from_its_mirror_is_refused() {
+        // Debian's stable suite states no `Valid-Until`, so nothing but what
+        // the mirror served before bounds how old a release it serves may be.
+        use crate::provision::openpgp::fixture;
+
+        let scratch = Scratch::new("debian-newest-release");
+        let index = index_stanza("base-files", "13.8", "Priority: required\n");
+        let key = fixture::signing_key("trixie <archive@test.invalid>");
+        let keyring = scratch.join("trixie.gpg");
+        std::fs::write(&keyring, fixture::binary([key.to_public_key()])).unwrap();
+        let cache = scratch.join("cache");
+        let debian = |date: &str, stale: bool| {
+            let release = release_of("trixie", &format!("Date: {date}\n"), &index);
+            let fetcher = Canned::new(
+                [
+                    (
+                        "https://deb.example/debian/dists/trixie/InRelease".to_string(),
+                        fixture::clearsign(&key, &release).into_bytes(),
+                    ),
+                    (
+                        "https://deb.example/debian/dists/trixie/main/binary-amd64/Packages"
+                            .to_string(),
+                        index.clone().into_bytes(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            Debian::builder("trixie")
+                .architecture("amd64")
+                .mirror("https://deb.example/debian")
+                .keyring(&keyring)
+                .cache_dir(&cache)
+                .allow_stale_release(stale)
+                .fetcher(fetcher)
+                .build()
+                .expect("the builder validates")
+        };
+        let (older, newer) = (
+            "Sat, 10 May 2025 10:00:00 UTC",
+            "Sat, 17 May 2025 10:00:00 UTC",
+        );
+
+        debian(newer, false)
+            .available()
+            .expect("the first release is accepted");
+        let refused = debian(older, false).available();
+        assert!(
+            matches!(&refused, Err(DebianError::Release { reason, .. }) if reason.contains("before")),
+            "{refused:?}",
+        );
+        debian(older, true)
+            .available()
+            .expect("a repository that allows a stale release is held to no record");
     }
 
     /// Each planned package's name, version, and the archive it came from.

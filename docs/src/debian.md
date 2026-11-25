@@ -153,6 +153,19 @@ downloading the same package at once therefore both succeed, and both end up
 naming the one file. A builder that provisions several trees in parallel can
 point them all at a single cache.
 
+A cache also records, for each mirror and suite, the date of the newest release
+a run accepted from it, and a later run refuses a release from that mirror
+dated before it. A signed release verifies whenever it was signed, so a mirror,
+or whatever answers for one over plain HTTP, could otherwise serve a superseded
+release and the packages it names. `Valid-Until` bounds that only where a
+release states one, and Debian's stable suite states none. The record covers
+the releases freshness applies to: a signed repository's, from a mirror that is
+not a snapshot, unless [`allow_stale_release`] is set. A mirror is told apart by
+its URL, so two mirrors an update apart are each held to their own date.
+Without a cache directory the record goes with the run's own cache. Each record
+is a hidden file beside the packages, `.fcage-release.` and a digest of the
+mirror and the suite, and removing it forgets that mirror's date.
+
 ## Selecting packages
 
 The install set is the base system, plus the packages `include` names, closed
@@ -391,8 +404,8 @@ transport therefore cannot serve a release signed after the snapshot was taken.
 For a suite that states a `Valid-Until`, it cannot serve one that had expired by
 then either. A suite that states none, as Debian's stable suite does, is bounded
 from above alone. Any earlier release the same key signed passes, as it does
-from a live mirror. A mirror whose URL ends in anything else holds its release
-to no moment.
+from a live mirror whose newest release no [cache](#the-package-cache) records.
+A mirror whose URL ends in anything else holds its release to no moment.
 
 Every authenticity check runs once per repository: the signature against that
 repository's keyring, the release bound to its suite, and the transport

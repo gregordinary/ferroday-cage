@@ -231,8 +231,13 @@ fn create_own(path: &Path) -> Result<(), ProvisionError> {
 /// Returns [`ProvisionError::Io`] naming the directory. A cache that cannot be
 /// created is a host failure whichever layer's cache it is.
 fn create(path: &Path) -> Result<(), ProvisionError> {
-    fs::create_dir_all(path)
-        .map_err(|err| ProvisionError::io("creating the package cache", path, err))?;
+    create_dir(path).map_err(|err| ProvisionError::io("creating the package cache", path, err))
+}
+
+/// [`create`], for a caller that names the failure in its own error: a layer
+/// that writes into the cache before any download makes it.
+pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
     Staged::sweep(path);
     Ok(())
 }

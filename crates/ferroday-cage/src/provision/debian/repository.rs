@@ -390,9 +390,10 @@ impl RepositoryBuilder {
     /// through [`snapshot_fallback`](Self::snapshot_fallback). The signature is
     /// still verified, and the key that made it must still be in force. It has
     /// no effect on a [`trust_unsigned`](Self::trust_unsigned) repository,
-    /// which is never freshness-checked. The repository's source in the finished rootfs
-    /// carries `check-valid-until=no`, so the root's `apt` accepts what the
-    /// bootstrap accepted.
+    /// which is never freshness-checked. Nor is the release held to the newest
+    /// one the bootstrap's cache records its mirror serving. The repository's
+    /// source in the finished rootfs carries `check-valid-until=no`, so the
+    /// root's `apt` accepts what the bootstrap accepted.
     pub fn allow_stale_release(mut self, allow: bool) -> Self {
         self.allow_stale = allow;
         self

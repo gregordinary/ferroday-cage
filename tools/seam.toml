@@ -359,9 +359,9 @@ why = "As above."
 
 [[reach]]
 item = "provision::lock_exclusive"
-code = 1
+code = 2
 cost = "share"
-why = "The publication lock `ensure` takes, which the Debian pool takes too."
+why = "The publication lock `ensure` takes, which the Debian pool takes too, and the Debian layer's lock on the release dates its cache records."
 
 [[reach]]
 item = "provision::now_epoch"
@@ -545,9 +545,9 @@ why = "A `Tarball` over a stage3 the Gentoo layer has already opened and verifie
 
 [[reach]]
 item = "provision::write_atomically"
-code = 2
+code = 3
 cost = "move"
-why = "A small file published by rename: the Debian pool's index and a Gentoo document."
+why = "A small file published by rename: the Debian pool's index, a release date the Debian layer's cache records, and a Gentoo document."
 
 [[reach]]
 item = "roster::roster_enum"
@@ -569,7 +569,7 @@ why = "As above."
 
 [[reach]]
 item = "scratch::Scratch::new"
-tests = 75
+tests = 78
 cost = "test"
 why = "As above."
 

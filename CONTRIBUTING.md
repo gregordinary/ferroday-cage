@@ -563,7 +563,7 @@ report name a package and its version bare.
 | Decode a URL's percent escapes | `provision::fetch::percent_decode` |
 | Where does a run keep its downloads, and is that directory its own? | `provision::cache::PackageCache`, which `PackageCache::beside` creates, the run's own afresh, and `PackageCache::is_derived` for whether a directory a caller named is the run's own |
 | Download into a package cache, checked before it is published there | `provision::cache::download`, or `cache::prefetch` for a batch, and `cache::acquire` for a run's packages: the cache pass, the announcement, the batch and the walk |
-| Create a package cache, or open the regular file at a path in a directory others write, a cache entry or a build's output | `provision::cache::PackageCache::beside`, `cache::open_entry` |
+| Create a package cache, or open the regular file at a path in a directory others write, a cache entry or a build's output | `provision::cache::PackageCache::beside`, and `cache::create_dir` for a layer that writes into the cache before a download makes it, `cache::open_entry` |
 | What time is it, as a Unix timestamp? | `provision::now_epoch` |
 | What Debian architecture is the host? | `provision::debian::host_architecture` |
 | What Alpine architecture is the host? | `provision::alpine::host_architecture` |

@@ -168,6 +168,17 @@ consumer upgrading can skip it.
   them. A directory that already exists keeps its mode. The guide's
   provisioning chapter gains "Who can reach a root", and `hardening.md` no
   longer says the root's `nosuid` covers what the command writes on the host.
+- The Debian layer refuses a release older than the newest one a run accepted
+  from the same mirror for the same suite, where the caller names a
+  `cache_dir`, with `DebianError::Release`. A mirror, or whatever answered for
+  one over plain HTTP, could serve any superseded release the archive key had
+  signed, and the packages it named, for a suite that states no `Valid-Until`,
+  as Debian's stable suite states none. The cache records each mirror's newest
+  `Date` per suite in a hidden file, for a signed repository's release from a
+  mirror that is not a snapshot, unless `allow_stale_release` is set. The
+  Alpine and Gentoo layers record nothing: an Alpine index and a Gentoo
+  binhost's index state no date, and a Gentoo stage3 pointer stays bounded by
+  its signed timestamp and `max_pointer_age`.
 
 ### Added
 

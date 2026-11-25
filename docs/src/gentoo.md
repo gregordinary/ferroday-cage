@@ -843,7 +843,9 @@ A pointer older than thirty days is refused. That is about four regeneration
 cycles, so a live archive never approaches it. A pointer stating no timestamp is
 refused on the same terms. It is the only bound there is. Reading its absence as
 permission would let whoever serves the document disable the check by deleting a
-line.
+line. The bound is the clock's: no cache records the newest pointer a mirror
+served, as the Debian layer's records the newest release, and the binhost's
+index states no date of its own.
 
 ```rust,no_run
 use ferroday_cage::provision::gentoo::Gentoo;

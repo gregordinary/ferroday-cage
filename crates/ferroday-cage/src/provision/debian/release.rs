@@ -11,9 +11,14 @@
 use crate::provision::number;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::{self, Read as _};
+use std::path::{Path, PathBuf};
 
+use super::DebianError;
 use super::digests::{Digests, RECORDED};
-use crate::provision::{document, now_epoch};
+use crate::provision::cache;
+use crate::provision::digest::Algorithm;
+use crate::provision::{document, lock_exclusive, now_epoch, write_atomically};
 
 /// Why a release cannot be used: it is malformed, expired, or does not offer
 /// what was asked.
@@ -424,6 +429,160 @@ impl Release {
 /// `Acquire::Max-FutureTime`, whose default is 10 seconds.
 const MAX_FUTURE_SECONDS: i64 = 10;
 
+/// The newest release a package cache records one mirror having served for one
+/// suite, which a later run keeping the same cache refuses a release dated
+/// before.
+///
+/// A signed release verifies whenever it was signed, so a mirror, or whatever
+/// answers for one over plain HTTP, can serve a superseded release and the
+/// packages it names. [`check_freshness`](Release::check_freshness) bounds its
+/// age where the release states a `Valid-Until`, and Debian's stable suite
+/// states none. This bounds it by what the mirror served before. A mirror is
+/// told apart by its URL, so two mirrors an update apart are each held to
+/// their own date.
+///
+/// The record is a hidden file in the cache directory, [`NEWEST_PREFIX`] and
+/// the SHA-256 of the mirror and the suite, holding both and the date, as
+/// [`format_rfc5322`] writes it, in the field-and-stanza form. It is read as a
+/// cache entry is, only where no other user could write it. One another user
+/// could write is not read, and the run's own replaces it. One lock in the
+/// cache, [`NEWEST_LOCK`], serializes every record's read and replacement, so
+/// two runs never record an older date over a newer one.
+pub(crate) struct Newest {
+    /// The cache directory.
+    cache: PathBuf,
+    /// The record's path in it.
+    path: PathBuf,
+    /// The mirror's URL.
+    mirror: String,
+    /// The suite.
+    suite: String,
+}
+
+/// What a record's name begins with, before the digest of what it records.
+const NEWEST_PREFIX: &str = ".fcage-release.";
+
+/// The name of the lock beside the records.
+const NEWEST_LOCK: &str = ".fcage-release.lock";
+
+/// The most of a record read: three short fields.
+const NEWEST_MAX_BYTES: u64 = 4096;
+
+impl Newest {
+    /// The record of the newest release `mirror` served for `suite`, in the
+    /// package cache `cache`.
+    pub(crate) fn of(cache: &Path, mirror: &str, suite: &str) -> Newest {
+        let key = Algorithm::Sha256.hex_of(format!("{mirror}\n{suite}").as_bytes());
+        Newest {
+            cache: cache.to_path_buf(),
+            path: cache.join(format!("{NEWEST_PREFIX}{key}")),
+            mirror: mirror.to_string(),
+            suite: suite.to_string(),
+        }
+    }
+
+    /// Holds `release`, which `subject` names, to the date recorded, and
+    /// records its own where it is later.
+    ///
+    /// A release dated before the record is refused, and so is one stating no
+    /// date the record can be held against. One dated as the record is, the
+    /// mirror serving the same release again, is accepted. Where nothing is
+    /// recorded, the release's date becomes the record, and a release stating
+    /// none leaves nothing to record.
+    ///
+    /// # Errors
+    ///
+    /// [`DebianError::Release`] naming `subject` for a release the record
+    /// refuses, and [`DebianError::Io`] for a record that cannot be read or
+    /// written, or one that does not read as a record of this mirror and suite.
+    pub(crate) fn hold(&self, release: &Release, subject: &str) -> Result<(), DebianError> {
+        let dated = release.date().and_then(parse_rfc5322);
+        let refuse = |reason: String| DebianError::Release {
+            subject: subject.to_string(),
+            reason,
+        };
+        let lock = self.cache.join(NEWEST_LOCK);
+        if !self.cache.is_dir() {
+            if dated.is_none() {
+                return Ok(());
+            }
+            cache::create_dir(&self.cache)
+                .map_err(DebianError::at("creating the package cache", &self.cache))?;
+        }
+        let _held = lock_exclusive(&lock).map_err(DebianError::at("locking", &lock))?;
+        let recorded = self.read()?;
+        match (recorded, dated) {
+            (Some(recorded), Some(dated)) if dated < recorded => Err(refuse(format!(
+                "it is dated {:?}, before the {:?} this cache records as the newest release \
+                 the mirror served for the suite",
+                release.date().unwrap_or_default(),
+                format_rfc5322(recorded),
+            ))),
+            (Some(recorded), None) => Err(refuse(format!(
+                "it states no Date to hold to the {:?} this cache records as the newest \
+                 release the mirror served for the suite",
+                format_rfc5322(recorded),
+            ))),
+            (Some(recorded), Some(dated)) if dated == recorded => Ok(()),
+            (_, Some(dated)) => {
+                let record = format!(
+                    "Mirror: {}\nSuite: {}\nDate: {}\n",
+                    self.mirror,
+                    self.suite,
+                    format_rfc5322(dated),
+                );
+                write_atomically(&self.path, record.as_bytes())
+                    .map_err(DebianError::at("recording the release date in", &self.path))
+            }
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// The date the record holds, or `None` where there is none, or where
+    /// another user could write the one there.
+    fn read(&self) -> Result<Option<i64>, DebianError> {
+        let unreadable = |err: io::Error| {
+            DebianError::at("reading the release date recorded in", &self.path)(err)
+        };
+        let file = match cache::open_own_entry(&self.path) {
+            Ok(file) => file,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(unreadable(err)),
+        };
+        let mut text = String::new();
+        file.take(NEWEST_MAX_BYTES)
+            .read_to_string(&mut text)
+            .map_err(unreadable)?;
+        let stanza = document::parse(&text).next();
+        let field = |name: &str| {
+            stanza
+                .as_ref()
+                .and_then(|stanza| stanza.get(name))
+                .map(|value| value.trim().to_string())
+        };
+        let ours = field("Mirror").as_deref() == Some(self.mirror.as_str())
+            && field("Suite").as_deref() == Some(self.suite.as_str());
+        match field("Date").as_deref().and_then(parse_rfc5322) {
+            Some(date) if ours => Ok(Some(date)),
+            _ => Err(unreadable(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "it is not a record of {:?} for {}; remove it to record the next release \
+                     afresh",
+                    self.mirror, self.suite,
+                ),
+            ))),
+        }
+    }
+}
+
 /// The system clock, as a Unix timestamp, for judging a release's dates.
 ///
 /// A clock before the epoch cannot judge one, and the release is refused
@@ -667,6 +826,82 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A release of trixie dated `date`, or stating no date.
+    fn dated(date: Option<&str>) -> Release {
+        let date = date
+            .map(|date| format!("Date: {date}\n"))
+            .unwrap_or_default();
+        Release::parse(&format!("Suite: trixie\n{date}")).unwrap()
+    }
+
+    #[test]
+    fn a_release_older_than_the_newest_a_mirror_served_is_refused() {
+        let scratch = crate::scratch::Scratch::new("debian-newest");
+        let cache = scratch.join("cache");
+        let mirror = "http://deb.example/debian";
+        let newest = Newest::of(&cache, mirror, "trixie");
+        let (older, newer, newest_yet) = (
+            Some("Sat, 10 May 2025 10:00:00 UTC"),
+            Some("Sat, 17 May 2025 10:00:00 UTC"),
+            Some("Sat, 24 May 2025 10:00:00 UTC"),
+        );
+
+        // The first release is recorded, in a cache made for it, and the same
+        // release again is accepted.
+        newest.hold(&dated(newer), "newer").unwrap();
+        newest.hold(&dated(newer), "newer").unwrap();
+        let refused = |date| match newest.hold(&dated(date), "replayed") {
+            Err(DebianError::Release { subject, reason }) => {
+                assert_eq!(subject, "replayed");
+                reason
+            }
+            other => panic!("{date:?} is refused: {other:?}"),
+        };
+        assert!(refused(older).contains("before"));
+        assert!(refused(None).contains("no Date"));
+
+        // A later release moves the record, and the one before it is refused.
+        newest.hold(&dated(newest_yet), "newest").unwrap();
+        refused(newer);
+
+        // Another mirror, or another suite, is held to a record of its own.
+        Newest::of(&cache, "http://mirror.example/debian", "trixie")
+            .hold(&dated(older), "elsewhere")
+            .unwrap();
+        Newest::of(&cache, mirror, "bookworm")
+            .hold(&dated(older), "bookworm")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_record_another_user_could_write_is_not_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = crate::scratch::Scratch::new("debian-newest-shared");
+        let newest = Newest::of(&scratch, "http://deb.example/debian", "trixie");
+        newest
+            .hold(&dated(Some("Sat, 24 May 2025 10:00:00 UTC")), "newer")
+            .unwrap();
+        std::fs::set_permissions(&newest.path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        newest
+            .hold(&dated(Some("Sat, 10 May 2025 10:00:00 UTC")), "older")
+            .expect("a record another user could write records nothing");
+        let mode = std::fs::metadata(&newest.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o022, 0, "the run's own record replaced it");
+
+        // A record of the run's own that does not read as one is refused
+        // rather than read as no record.
+        std::fs::write(&newest.path, b"Mirror: elsewhere\n").unwrap();
+        std::fs::set_permissions(&newest.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            newest.hold(&dated(Some("Sat, 31 May 2025 10:00:00 UTC")), "newest"),
+            Err(DebianError::Io { .. })
+        ));
+    }
 
     #[test]
     fn an_index_listed_under_both_algorithms_carries_both_digests() {

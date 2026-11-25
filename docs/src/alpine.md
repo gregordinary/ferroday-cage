@@ -712,7 +712,9 @@ to be stale against. The apk index carries no validity window and no date — it
 would be this layer's fiction rather than the archive's policy. The release
 binding refuses another release's index, not an older index of the same one: a
 mirror can still serve a superseded `v3.23` index, and the packages it names. An
-`https://` transport to a trusted mirror closes that too.
+`https://` transport to a trusted mirror closes that too. Nor does a cache record
+the newest index a mirror served, as the Debian layer's records the newest
+release: an index states no date to order two by.
 
 The same reasoning is why **the index is never cached**. A cache would need a
 staleness rule the format does not express. `cache_dir` holds packages, which are
