@@ -247,6 +247,14 @@ impl UdpTables {
         self.ports.get(&port).map(|entry| entry.handle)
     }
 
+    /// Whether the tables hold a flow from `guest` to `destination`, which a
+    /// datagram between them is carried on without being decided again.
+    pub(super) fn carries(&self, guest: IpEndpoint, destination: IpEndpoint) -> bool {
+        self.flows
+            .iter()
+            .any(|flow| flow.guest == guest && flow.destination == destination)
+    }
+
     /// How many flows the tables hold, which is the most host sockets
     /// [`reply_interest`](Self::reply_interest) yields.
     pub(super) fn flow_count(&self) -> usize {

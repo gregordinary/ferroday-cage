@@ -418,6 +418,10 @@ A flow is then held to the names pinned at its address:
 - A deny name rule refuses a flow on its ports to an address pinned to a name it
   matches. It refuses both transports, unless `tcp:` qualifies it.
 
+A flow is held to the names pinned as it opens: a TCP flow at its connection
+attempt, and a UDP flow at its first datagram. It keeps that decision while it
+lasts, whatever is pinned at its address later.
+
 An address rule admits what a name rule leaves out. Under allow rules, the stack
 refuses a flow to an address it resolved no name to, unless an address rule
 admits it. Such an address is a literal, or one the guest learned from a

@@ -778,6 +778,11 @@ consumer upgrading can skip it.
   share, which powerpc, mips and sparc encode otherwise, so attaching failed
   there. The request also sets `IFF_TUN_EXCL`, so it creates the interface or
   fails, and never attaches to one of the name that already exists.
+- A UDP flow the network stack carries keeps the decision taken at its first
+  datagram, as a TCP flow keeps the one taken at its connection attempt. Each
+  later datagram was decided again, against every rule and every name pinned at
+  its address, and once a name a deny rule matches was pinned there, the flow
+  was reported refused while the stack went on carrying it.
 - A mirror at the filesystem's root, `file:///`, is joined to a path as
   `file:///debian/...`. Every trailing slash was taken from a mirror, which
   left `file:` and the path read as an authority.

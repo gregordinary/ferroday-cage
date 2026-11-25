@@ -773,11 +773,20 @@ impl Engine {
     /// the nameserver. The flow itself is created lazily when the datagram is
     /// drained, and reported then. A refused datagram is reported here, where
     /// it is decided, as the first of its flow's.
+    ///
+    /// A datagram of a flow the stack already carries is not decided again.
+    /// The flow was decided when it opened and keeps that decision while it
+    /// lasts, as a TCP flow keeps the one taken at its connection attempt, so
+    /// a name pinned at its address later, or a pin evicted, changes nothing
+    /// for it; its port socket is held while it lasts.
     fn admit_udp(&mut self, src: IpEndpoint, dst: IpEndpoint) {
         if self.plan.serves(dst) {
             if self.nameserver.is_some() {
                 self.udp.keep_port(dst.port, &mut self.sockets);
             }
+            return;
+        }
+        if self.udp.carries(src, dst) {
             return;
         }
         if let Err(refused) = host_target(Transport::Udp, dst, &self.plan, self.pins()) {
@@ -3353,6 +3362,83 @@ mod tests {
                     to(Ipv4Addr::new(198, 51, 100, 8), 443),
                     None,
                     FlowAdmission::Default,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_udp_flow_keeps_the_decision_it_opened_with() {
+        use ferroday_cage_testkit::require;
+        let Some(own) = require::routable_v4() else {
+            return;
+        };
+        let peer = UdpSocket::bind((own, 0)).expect("a host socket binds");
+        let port = peer.local_addr().expect("an address").port();
+        let destination = to(own, port);
+        let denied = format!("denied.example:{port}");
+        let plan = ruled(&[], &[denied.as_str()], None);
+        if !require::TUN.holds(
+            host_target(Transport::Udp, destination, &plan, None).is_ok(),
+            format!("the stack refuses the host's own address {own}"),
+        ) {
+            return;
+        }
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a host socket binds");
+        let address = upstream.local_addr().expect("an address");
+        let (tap, _guest) = tap_pair();
+        let (mut engine, reports) = naming_engine(tap, plan, address);
+
+        // The flow opens with no name pinned at its address, which no rule
+        // refuses. A name the deny rule matches is pinned there next: the
+        // flow is carried as it was decided, and not decided or reported
+        // again, while another port's flow is decided with the pin.
+        let sends = |engine: &mut Engine, guest_port| {
+            let frame = datagram_from(guest_port, destination);
+            assert!(engine.consider(classify(&frame)));
+            deliver(engine, &frame);
+        };
+        sends(&mut engine, 40_000);
+        resolve(&mut engine, &upstream, "denied.example", own);
+        sends(&mut engine, 40_000);
+        sends(&mut engine, 40_001);
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a read timeout");
+        let mut received = [0u8; 64];
+        for _ in 0..2 {
+            let (len, _) = recv_retrying(&peer, &mut received).expect("the flow's datagram");
+            assert_eq!(received[..len], *b"datagram");
+        }
+        peer.set_nonblocking(true)
+            .expect("the peer reads without waiting");
+        assert!(
+            peer.recv_from(&mut received).is_err(),
+            "the refused flow's datagram reached the peer"
+        );
+        assert_eq!(
+            reported(&reports),
+            [
+                NetStackReport::admitted(
+                    Transport::Udp,
+                    from_guest(40_000),
+                    destination,
+                    None,
+                    FlowAdmission::Default,
+                ),
+                NetStackReport::relayed(
+                    from_guest(5353),
+                    "denied.example",
+                    1,
+                    FlowAdmission::Default
+                ),
+                NetStackReport::refused(
+                    Transport::Udp,
+                    from_guest(40_001),
+                    destination,
+                    Some("denied.example"),
+                    FlowRefusal::Denied {
+                        rule: denied.parse().unwrap()
+                    },
                 ),
             ]
         );
