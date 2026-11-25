@@ -3470,6 +3470,67 @@ mod layered_tests {
         fs::set_permissions(&carried, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[test]
+    fn a_base_directorys_file_capability_is_left_behind_by_the_carry() {
+        // A sandbox, root in its namespace, can give a directory it owns a file
+        // capability, which lands rooted at the namespace's root. The calling
+        // user carrying that directory up is outside the namespace and cannot
+        // set it, and on a directory it grants nothing.
+        use crate::IdentityMap;
+        use crate::mechanism::{COPY_DIR, COPY_END, COPY_LEAVE, start_copy_in};
+        use crate::provision::identity::compose_child_map;
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let scratch = Scratch::for_test("extract-layered", "capability");
+        let base = scratch.join("base");
+        fs::create_dir(&base).unwrap();
+
+        // `d`, owned by the namespace's root, with a revision 2 capability
+        // granting `CAP_NET_RAW`, which the kernel restates rooted at the
+        // caller.
+        let capability = [
+            1, 0, 0, 2, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let name = b"security.capability";
+        let mut frames = vec![COPY_DIR];
+        frames.extend_from_slice(&1u16.to_le_bytes());
+        frames.push(b'd');
+        frames.extend_from_slice(&0o755u32.to_le_bytes());
+        frames.extend_from_slice(&0u32.to_le_bytes());
+        frames.extend_from_slice(&0u32.to_le_bytes());
+        frames.extend_from_slice(&0i64.to_le_bytes());
+        frames.push(COPY_LEAVE);
+        frames.extend_from_slice(&1u16.to_le_bytes());
+        frames.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        frames.extend_from_slice(name);
+        frames.extend_from_slice(&(capability.len() as u32).to_le_bytes());
+        frames.extend_from_slice(&capability);
+        frames.push(COPY_END);
+        let map = compose_child_map(&IdentityMap::Single, None).expect("the single map");
+        let base_c = CString::new(base.as_os_str().as_bytes()).unwrap();
+        let child = start_copy_in(&base_c, map.child_map()).expect("the child starts");
+        crate::mechanism::frame::write_full(child.stream(), &frames).expect("the frames are sent");
+        child
+            .finish()
+            .expect("the child gives the directory a capability");
+        assert!(
+            xattr::get(&base.join("d"), "security.capability").is_some(),
+            "the base's directory holds a capability",
+        );
+
+        let upper = scratch.join("upper");
+        fs::create_dir(&upper).unwrap();
+        let mut tar = Tar::new();
+        tar.file("d/note", 0o644, b"a note\n");
+        extract_over(&upper, &base, &tar.finish()).expect("the increment extracts");
+        assert_eq!(fs::read(upper.join("d/note")).unwrap(), b"a note\n");
+        assert_eq!(xattr::get(&upper.join("d"), "security.capability"), None);
+    }
+
     /// The proof that matters for ownership: a base whose directory a range map
     /// chowned to a group of its own, an increment extracted beneath it, and the
     /// merged view a build sandbox is rooted on.

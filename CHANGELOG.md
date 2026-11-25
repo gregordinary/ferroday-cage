@@ -897,6 +897,10 @@ consumer upgrading can skip it.
 - `Export::write_to_path`'s documentation, and the guide's, give the archive's
   mode as `0o644`, which the umask can only narrow. Both said `0o666` less the
   umask, as a shell redirection makes a file.
+- A layered build carries a base directory up into the upper without its file
+  capability. A sandbox can give a directory it owns one, and the calling user
+  could not set it on the copy, so an increment beneath such a directory failed
+  to extract with `EPERM`. A capability on a directory grants nothing.
 
 ### Internal
 

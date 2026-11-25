@@ -704,7 +704,10 @@ mod layered {
     /// bookkeeping would mean something else in the upper, and a security
     /// module labels the new directory as it creates it. A `trusted.` attribute
     /// is never listed for an unprivileged caller, and the overlay a sandbox
-    /// mounts cannot read one either.
+    /// mounts cannot read one either. Nor is a file capability, which the
+    /// kernel reads at an exec of a regular file alone: on a directory it
+    /// grants nothing, and the calling user, outside the namespace a sandbox
+    /// that set one ran in, is refused setting it.
     ///
     /// An access control list the new directory inherited from a default on its
     /// parent, where the lower's directory carries none, is removed: the copy
@@ -730,7 +733,7 @@ mod layered {
         };
         let mut carried = [false; ACLS.len()];
         for (name, value) in xattr::read_all(Holder::Fd(lower.as_fd()))? {
-            if host_assigned_xattr(&name) {
+            if host_assigned_xattr(&name) || name == xattr::CAPABILITY.to_bytes() {
                 continue;
             }
             let Ok(name) = CString::new(name) else {
