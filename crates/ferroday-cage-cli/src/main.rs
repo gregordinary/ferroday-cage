@@ -2015,10 +2015,11 @@ const FLAGS: &[Flag] = &[
             "ports in brackets), and tcp: or udp: for one",
             "transport. A name is resolved through the stack's",
             "nameserver, which refuses the names no rule admits,",
-            "and admits TCP alone. Once one is given, everything no",
-            "allow rule admits is refused. Loopback, link-local",
-            "and the sandbox's own network stay refused whatever",
-            "the rules say",
+            "and admits TCP alone, whose TLS server name or HTTP",
+            "host is held to the rules too. Once one is given,",
+            "everything no allow rule admits is refused. Loopback,",
+            "link-local and the sandbox's own network stay refused",
+            "whatever the rules say",
         ],
         take: Take::One(|options, flag, value| {
             options
@@ -2036,7 +2037,9 @@ const FLAGS: &[Flag] = &[
             "Refuse the sandbox's traffic to what RULE matches,",
             "whatever an allow rule admits (repeatable; the form",
             "--netstack-allow takes). With deny rules alone,",
-            "everything else is carried",
+            "everything else is carried. A name rule refuses the",
+            "name's questions to the stack's nameserver, and a TCP",
+            "flow whose TLS server name or HTTP host it matches",
         ],
         take: Take::One(|options, flag, value| {
             options
