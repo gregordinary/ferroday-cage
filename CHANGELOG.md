@@ -293,6 +293,9 @@ consumer upgrading can skip it.
   Gentoo dependency class, each holding its reader to an invariant beyond not
   panicking. A `Fuzzing` workflow runs every target for fifteen minutes, weekly
   and by hand, and prints a failing input in its log.
+- CI's new `arm64` job runs the test suite natively on aarch64, with the
+  user-namespace, seccomp and Landlock suites required, where the architectures
+  job only checks that the library builds for each one.
 - `tools/check-seam.py` measures the userland side of `provision`: the three
   layers and the archive machinery only they use. It records each item that
   side reaches in the rest of the crate that is not public API (79, read from

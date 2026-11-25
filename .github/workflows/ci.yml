@@ -453,6 +453,53 @@ jobs:
         # linker, so nothing here runs.
         run: cargo clippy --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
 
+  arm64:
+    name: Test on aarch64
+    # The architectures job checks that the library builds for each one, and
+    # runs nothing. This runs the suite natively on a second architecture, so
+    # the seccomp filters' syscall numbers and audit-architecture checks, and
+    # Landlock's enforcement, are measured there rather than only compiled. The
+    # enforcement suites' REQUIRE variables are set; the rest of the facilities
+    # are provisioned as the checks job provisions them, and a skip among them
+    # is listed rather than failed.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (pinned)
+        run: rustup toolchain install
+      - name: Cache the dependency build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: aarch64-native
+      - name: Enable the sandbox facilities
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo modprobe tun || true
+          sudo apt-get update
+          sudo apt-get install -y uidmap
+          user="$(id -un)"
+          printf '%s:500000:65536\n' "$user" | sudo tee /etc/subuid > /dev/null
+          printf '%s:500000:65536\n' "$user" | sudo tee /etc/subgid > /dev/null
+      - name: Test
+        run: cargo test --workspace --all-features
+        env:
+          FERRODAY_CAGE_SKIP_LOG: ${{ runner.temp }}/skips.log
+          FERRODAY_CAGE_REQUIRE_USERNS: '1'
+          FERRODAY_CAGE_REQUIRE_SECCOMP: '1'
+          FERRODAY_CAGE_REQUIRE_LANDLOCK: '1'
+      - name: Skipped tests
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/skips.log"
+          if [ -f "$log" ]; then
+            cut -f3 "$log" | sort | uniq -c
+            cut -f2- "$log" | sort
+          else
+            echo "No test skipped."
+          fi
+
   container:
     name: Inside a container
     # A launch inside a container started with its runtime's defaults meets the
