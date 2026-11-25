@@ -14,8 +14,10 @@
 //! them is only the error each reports, so the failure leaves as the reason
 //! text and each caller wraps it in its own variant.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use super::ProvisionError;
 use crate::IdentityMap;
 use crate::error::ConfigError;
 use crate::failure::ErrorChain;
@@ -87,6 +89,21 @@ pub(super) enum ChildMapSource {
 }
 
 impl ChildMapSource {
+    /// Refuses to fork a child for the tree at `path` that would write its own
+    /// map from a caller whose children cannot; see
+    /// [`idmap::caller_undumpable`](crate::idmap::caller_undumpable). A range
+    /// map's delegate writes it from outside, and is not judged here.
+    pub(super) fn ensure_writable(&self, path: &Path) -> Result<(), ProvisionError> {
+        match self {
+            ChildMapSource::SelfMap { .. } if crate::idmap::caller_undumpable() => {
+                Err(ProvisionError::NotDumpable {
+                    path: path.to_path_buf(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The map to hand the child, borrowed from this.
     pub(super) fn child_map(&self) -> ChildMap<'_> {
         match self {

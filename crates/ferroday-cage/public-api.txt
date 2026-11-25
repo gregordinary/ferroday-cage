@@ -1280,6 +1280,8 @@ pub ferroday_cage::provision::ProvisionError::FormatUnrecognized::path: std::pat
 pub ferroday_cage::provision::ProvisionError::Io::op: &'static str
 pub ferroday_cage::provision::ProvisionError::Io::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::Io::source: core::io::error::Error
+#[non_exhaustive] pub ferroday_cage::provision::ProvisionError::NotDumpable
+pub ferroday_cage::provision::ProvisionError::NotDumpable::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::Other
 pub ferroday_cage::provision::ProvisionError::Other::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::OverlayLayerMissing
@@ -2062,6 +2064,7 @@ pub ferroday_cage::Error::MountRefused::step: ferroday_cage::SetupStep
 #[non_exhaustive] pub ferroday_cage::Error::NamespaceLimitReached
 pub ferroday_cage::Error::NamespaceLimitReached::source: core::io::error::Error
 pub ferroday_cage::Error::NamespaceLimitReached::step: ferroday_cage::SetupStep
+pub ferroday_cage::Error::NotDumpable
 #[non_exhaustive] pub ferroday_cage::Error::ProcfsRefused
 pub ferroday_cage::Error::ProcfsRefused::blocker: ferroday_cage::host::ProcfsBlocker
 pub ferroday_cage::Error::ProcfsRefused::source: core::io::error::Error

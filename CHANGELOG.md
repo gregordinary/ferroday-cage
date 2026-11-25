@@ -440,6 +440,12 @@ consumer upgrading can skip it.
   pipes the root already held, naming the paths. Portage refuses such a merge
   by default where another package owns the path; this layer replaces it, and
   now says so. `fcage` prints a line for it.
+- A launch from a caller the kernel does not dump fails with the new
+  `Error::NotDumpable` before it forks, and an export, a copy in or a removal
+  under the single-identity map with the new `ProvisionError::NotDumpable`,
+  unless the caller is root of its user namespace. Each failed at its identity
+  map's first write with `EACCES`, since such a caller's `/proc/<pid>` files,
+  and its children's, belong to root. `fcage` names the error `not-dumpable`.
 
 ### Changed
 

@@ -28,6 +28,15 @@ refused](how-the-sandbox-is-built.md#when-the-join-is-refused) describes it.
 Such a launch on a host that cannot install a filter fails at
 `SetupStep::ReplaceSessionKeyring`.
 
+A sandbox needs a caller the kernel dumps, unless the caller is root of its user
+namespace. A process that set `PR_SET_DUMPABLE` to 0, or changed its
+credentials as a set-user-ID program does, has its `/proc/<pid>` files given to
+root, and so does every process it forks, the files that establish an identity
+map among them. A launch from it fails with `Error::NotDumpable` before it
+forks, and an export, a copy in or a removal under the single-identity map with
+`ProvisionError::NotDumpable`. A restriction writes no identity map, and
+launches from such a caller.
+
 Three opt-in capabilities have host requirements of their own. A [uid/gid range
 map](identity-maps.md) requested by an unprivileged caller needs the shadow
 suite's `newuidmap` and `newgidmap` helpers and a subordinate-id allocation,

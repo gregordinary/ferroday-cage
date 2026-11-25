@@ -393,6 +393,7 @@ fn copy_in_inner(
             path: rootfs.to_path_buf(),
             reason,
         })?;
+    map_source.ensure_writable(rootfs)?;
     let child_map = map_source.child_map();
 
     // The extents the source's ids are read through, as host-to-inside pairs.
@@ -522,6 +523,7 @@ pub(crate) fn reown(
             path: root.to_path_buf(),
             reason,
         })?;
+    map_source.ensure_writable(root)?;
     let child_map = map_source.child_map();
     let translation = Translation::of(&child_map);
 

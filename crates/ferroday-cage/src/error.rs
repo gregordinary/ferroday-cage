@@ -1776,6 +1776,23 @@ pub enum Error {
     /// `ESRCH` and a fork into an ended PID namespace `ENOMEM`, and either only
     /// says the same thing again.
     SandboxEnded,
+    /// The calling process is not dumpable, so the identity maps a sandbox
+    /// needs cannot be written, and the launch was refused before it forked.
+    ///
+    /// The kernel gives a process it does not dump `/proc/<pid>` files owned by
+    /// root of its user namespace, and every stage of a launch inherits that
+    /// from the caller. The files that establish a user namespace's identity
+    /// map are among them, and neither the stage writing its own map nor the
+    /// sandbox's root writing its command's is that root, so the kernel would
+    /// refuse each write. A process stops being dumpable through
+    /// `PR_SET_DUMPABLE`, or by changing its credentials, as a set-user-ID
+    /// program does; setting `PR_SET_DUMPABLE` to 1 again is the caller's to
+    /// decide, and the library does not.
+    ///
+    /// A caller that is root of its user namespace owns those files still, and
+    /// is not refused. A restriction writes no identity map, and launches from
+    /// a caller that is not dumpable.
+    NotDumpable,
 }
 
 /// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
@@ -1979,6 +1996,10 @@ impl fmt::Display for Error {
                      a profile that allows mount, remount, umount and pivot_root, or none)"
                 )
             }
+            Error::NotDumpable => f.write_str(
+                "the calling process is not dumpable, so the sandbox's identity maps cannot be \
+                 written",
+            ),
         }
     }
 }
@@ -1991,10 +2012,11 @@ impl std::error::Error for Error {
     /// came from. The variants that answer `None` carry nothing, since no
     /// syscall failed: [`SupervisorLost`](Self::SupervisorLost),
     /// [`SupervisorUnreceived`](Self::SupervisorUnreceived) and
-    /// [`SandboxEnded`](Self::SandboxEnded) are absences the library noticed, [`StreamIsDirectory`](Self::StreamIsDirectory) and
-    /// [`ListenRefused`](Self::ListenRefused) are refusals it made before it
-    /// made any, and [`Listen`](Self::Listen) answers `None` where its helper
-    /// ended without saying why.
+    /// [`SandboxEnded`](Self::SandboxEnded) are absences the library noticed, [`StreamIsDirectory`](Self::StreamIsDirectory),
+    /// [`ListenRefused`](Self::ListenRefused) and
+    /// [`NotDumpable`](Self::NotDumpable) are refusals it made before it made
+    /// any, and [`Listen`](Self::Listen) answers `None` where its helper ended
+    /// without saying why.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Config(err) => Some(err),
@@ -2021,7 +2043,8 @@ impl std::error::Error for Error {
             | Error::SandboxEnded
             | Error::StreamIsDirectory { .. }
             | Error::ListenRefused { .. }
-            | Error::CgroupRefused { .. } => None,
+            | Error::CgroupRefused { .. }
+            | Error::NotDumpable => None,
         }
     }
 }

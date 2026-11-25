@@ -1083,6 +1083,82 @@ fn a_subreaper_caller_is_left_no_zombie_init() {
     );
 }
 
+/// Set in the child [`an_undumpable_caller_is_refused_what_would_write_a_map`]
+/// starts.
+const UNDUMPABLE: &str = "FERRODAY_CAGE_TEST_PROCESS_UNDUMPABLE";
+
+#[test]
+fn an_undumpable_caller_is_refused_what_would_write_a_map() {
+    // A caller the kernel does not dump has its identity-map files, and every
+    // stage's it forks, given to root, so a launch or a provisioning child
+    // writing a map would fail at the write.
+    if !common::require::userns() {
+        return;
+    }
+    if !common::require::not_root("root owns a process's identity-map files dumpable or not") {
+        return;
+    }
+    let output = common::run_bounded(
+        common::rerun("probe_undumpable_caller").env(UNDUMPABLE, "1"),
+        Duration::from_secs(120),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("refused"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// The probe [`an_undumpable_caller_is_refused_what_would_write_a_map`]
+/// starts: starts a sandbox while it is dumpable, stops being dumpable, and
+/// asks for a launch, a further command in the sandbox, and a copy in under
+/// the single-identity map.
+#[test]
+fn probe_undumpable_caller() {
+    if std::env::var_os(UNDUMPABLE).is_none() {
+        return;
+    }
+    let cage = common::host_userland()
+        .command("/bin/sleep")
+        .arg("30")
+        .resolv_conf(false)
+        .stdout(Stdio::Null)
+        .stop_with_caller(true)
+        .build()
+        .expect("a valid sandbox configuration");
+    let mut sandbox = cage.spawn().expect("a dumpable caller launches");
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .expect("the probe stops being dumpable");
+
+    assert!(
+        matches!(cage.run(), Err(Error::NotDumpable)),
+        "a launch is refused"
+    );
+    assert!(
+        matches!(
+            sandbox.exec(&ferroday_cage::Exec::new("/bin/true")),
+            Err(Error::NotDumpable)
+        ),
+        "a further command is refused"
+    );
+    let scratch = common::scratch_dir("undumpable-copy-in");
+    let (source, rootfs) = (scratch.join("source"), scratch.join("rootfs"));
+    std::fs::create_dir_all(&source).expect("the source is made");
+    std::fs::create_dir_all(&rootfs).expect("the root is made");
+    std::fs::write(source.join("file"), b"contents").expect("the file is written");
+    assert!(
+        matches!(
+            ferroday_cage::provision::CopyIn::new(&source, &rootfs).run(),
+            Err(ferroday_cage::provision::ProvisionError::NotDumpable { .. })
+        ),
+        "a copy in under the single-identity map is refused"
+    );
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+    println!("refused");
+}
+
 /// The probe [`a_subreaper_caller_is_left_no_zombie_init`] starts: becomes a
 /// child subreaper, runs three sandboxes to their outcome, and reports
 /// whether any child of its own is left to collect.

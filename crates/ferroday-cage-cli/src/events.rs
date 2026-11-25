@@ -962,6 +962,7 @@ pub fn error_kind(error: &Error) -> &'static str {
         Error::MountRefused { .. } => "mount-refused",
         Error::SeccompListenerHeld { .. } => "seccomp-listener-held",
         Error::SandboxEnded => "sandbox-ended",
+        Error::NotDumpable => "not-dumpable",
         _ => "other",
     }
 }

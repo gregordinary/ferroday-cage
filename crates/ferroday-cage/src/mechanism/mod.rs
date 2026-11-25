@@ -1890,6 +1890,11 @@ fn fork_launch(
     cgroup_procs: Option<BorrowedFd<'_>>,
     join: Option<JoinTarget<'_>>,
 ) -> Result<ParentSide, Error> {
+    // Every launch that builds or joins a sandbox writes an identity map in a
+    // stage forked from here; see `idmap::caller_undumpable`.
+    if plan.nested.is_some() && crate::idmap::caller_undumpable() {
+        return Err(Error::NotDumpable);
+    }
     refuse_directory_streams(plan, observe, terminal.is_some())?;
     let foreground = Foreground::lend(plan, observe, terminal.is_some())?;
 

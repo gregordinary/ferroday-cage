@@ -742,6 +742,23 @@ which arises for the same reason.
         /// What stopped it.
         source: io::Error,
     },
+    /// A tree could not be worked on under the single-identity map: the
+    /// calling process is not dumpable, so the child that enters the map
+    /// cannot write it.
+    ///
+    /// An export, a copy in, and a removal that escalates work in a forked
+    /// child under the tree's identity map, and under the single-identity map
+    /// the child writes its own. The kernel gives a process it does not dump,
+    /// and a child forked from it, `/proc/<pid>` files owned by root of its
+    /// user namespace, which the child is not inside the namespace it created,
+    /// so the run is refused before it forks; see
+    /// [`Error::NotDumpable`](crate::Error::NotDumpable). A range map is
+    /// written by a delegate, which this does not judge.
+    #[non_exhaustive]
+    NotDumpable {
+        /// The tree the run was to work on.
+        path: PathBuf,
+    },
 }
 
 impl ProvisionError {
@@ -940,6 +957,12 @@ impl fmt::Display for ProvisionError {
                  so the archive would be a member of itself",
                 path.display(),
                 rootfs.display(),
+            ),
+            ProvisionError::NotDumpable { path } => write!(
+                f,
+                "cannot work on {} under the single-identity map: the calling process is not \
+                 dumpable, so the child that enters the map cannot write it",
+                path.display(),
             ),
         }
     }
@@ -1702,6 +1725,7 @@ pub(crate) fn remove_tree(
         Ok(source) => source,
         Err(reason) => return Err(unprivileged(denied, reason)),
     };
+    map_source.ensure_writable(dest)?;
 
     let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
         ProvisionError::io(

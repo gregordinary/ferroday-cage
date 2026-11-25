@@ -903,6 +903,32 @@ pub(crate) fn no_new_privs() -> bool {
     rustix::thread::no_new_privs().unwrap_or(false)
 }
 
+/// Whether this process is one whose children cannot write identity maps: one
+/// the kernel does not dump, which is not root of its user namespace.
+///
+/// The kernel gives a process it does not dump `/proc/<pid>` files owned by
+/// root of the user namespace the process's image was executed in, and a child
+/// forked from it inherits the state. The files that establish a new user
+/// namespace's identity map, `setgroups`, `gid_map` and `uid_map`, are then
+/// that root's: a child writing its own map does so from inside the namespace
+/// it created, which maps no id to that root, and a sandbox's init writes its
+/// command's as the sandbox's root, which is not that root either, so the
+/// kernel refuses both with `EACCES`. A caller that is that root owns the files
+/// all the same. A process stops being dumpable through `PR_SET_DUMPABLE`, or
+/// by changing its credentials, as a set-user-ID program does.
+///
+/// Asked before a fork whose child writes a map, which the launch and the
+/// provisioning children refuse up front rather than fail at the write. They
+/// do not make the caller dumpable again, which is the caller's to decide. A
+/// state the kernel does not answer is no refusal.
+pub(crate) fn caller_undumpable() -> bool {
+    use rustix::process::DumpableBehavior;
+    matches!(
+        rustix::process::dumpable_behavior(),
+        Ok(DumpableBehavior::NotDumpable | DumpableBehavior::DumpableReadableOnlyByRoot)
+    ) && !rustix::process::geteuid().is_root()
+}
+
 /// The single-identity map's `uid_map` and `gid_map` contents, in that order:
 /// root inside as the caller's effective uid and gid outside.
 ///

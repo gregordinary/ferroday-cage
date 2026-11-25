@@ -473,6 +473,7 @@ fn export_inner<W: Write>(
             path: rootfs.to_path_buf(),
             reason,
         })?;
+    source.ensure_writable(rootfs)?;
 
     let overflow = Overflow::of(&Translation::of(&source.child_map()));
     let child = match start_export(&rootfs_c, source.child_map(), filter.is_some()) {

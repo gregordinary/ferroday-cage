@@ -607,6 +607,7 @@ report name a package and its version bare.
 | Can the shadow helpers establish a range map on this host at all? | `host::helper_blocker`, which `SubidMapper` and `host::range_map_blocker` both ask |
 | Can this caller write a range map directly, without a delegate? | `idmap::direct_write_refusal`, over `idmap::effective_capabilities`, which `DirectMapper` asks of a request and `host::range_map_blocker` of no extent at all |
 | Is a gid map the caller's own gid alone, under which no group list can be set? | `idmap::is_own_gid_alone` |
+| Can a child of this process write an identity map, or does the caller's dumpability refuse it? | `idmap::caller_undumpable`, which a launch asks before it forks, and a provisioning child through `provision::identity::ChildMapSource::ensure_writable` |
 | What does the single-identity map write? | `idmap::single_identity_lines` |
 | Validate the command a sandbox or a restriction executes | `spec::validate_command`, and `spec::lookup_candidates` for the paths a bare name is executed through |
 | Compose a command's environment over a base, or read a composed one back as variables | `spec::compose_env`, `spec::env_pairs`, which an `Exec` composes over its launch's environment with |
