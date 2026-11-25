@@ -540,7 +540,7 @@ report name a package and its version bare.
 | Hold a Debian index or package to every digest its archive records | `provision::debian::digests::Digests`, whose `check_bytes` and `check_stream` compare each, as apt does, and whose `planned` is the one a plan keeps |
 | Is this cleartext-signed document authentic against this keyring? | `provision::openpgp::Keyring::verify` |
 | What bounds a signed document whose length nothing signed states? | `provision::openpgp::MAX_SIGNED_DOCUMENT_BYTES` |
-| Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode`. `fcage`'s event stream and its JSON listings, a crate apart, spell bytes with `events::base64`, an encoder of its own |
+| Spell bytes in base64, or read base64 back | `provision::alpine::base64::encode`, `base64::decode`. `fcage`'s event stream and its JSON listings, a crate apart, spell bytes with `events::base64`, and a session's requests are read back with `events::unbase64`, an encoder and a decoder of its own |
 | Is this text a run of digits, and what number does it spell, without the leading `+` Rust's parsers take? How do two runs of digits compare? | `provision::number::is_digits`, `number::digits`, `number::digits_in` for HTTP's hexadecimal framing, `number::compare_digit_runs`. The network stack builds without the provisioners and asks of a port itself, `netstack::server_name::is_port`. Portage's merge counters, in a Gentoo root's `COUNTER` files and its counter file, are read as portage's `int()` reads them, sign included, where they are read |
 | Spell bytes as lowercase hex, or read lowercase hex back | `provision::digest::hex`, `digest::unhex`; a percent escape, which either case spells, is `fetch::percent_decode`'s to read |
 | Read a field-and-stanza document one stanza at a time, in place, or carry a stanza on whole, or write a plan document and read its header, its number fields and its list fields | `provision::document::parse`, `Stanza::get`, `Stanza::get_each`, `Stanza::text`, `document::header`, `document::number`, `document::list` |
@@ -584,7 +584,7 @@ report name a package and its version bare.
 | Retry one call a signal interrupted | `mechanism::frame::retry_on_intr!` |
 | Encode, decode, or read a helper child's outcome record | `mechanism::frame::encode_record`, `decode_record`, `read_record` |
 | Encode or decode the supervisor's status record, the command's outcome and what it used | `mechanism::encode_status`, `mechanism::decode_status`, with the usage read by `mechanism::sys::children_usage` |
-| Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd` |
+| Hand a descriptor across a socket, on a message of its own protocol | `mechanism::frame::send_with_fd`, `recv_with_fd`. A session's connection in `fcage`, a crate apart, reads a request's descriptors with the CLI's `session::Reader`, from the first byte of a line of JSON |
 | What limits do both ends of that protocol agree on? | `mechanism::bounds` |
 | Resolve a range identity map into the extents a delegate writes, validated | `idmap::resolve_delegate`, through the configured delegate or the bundled chain |
 | Can a provisioner establish its range map, asked before it downloads anything? | `idmap::establishable` |
@@ -632,7 +632,7 @@ report name a package and its version bare.
 | Which server do a TCP flow's first bytes ask for, and what does the stack answer first bytes it refuses with? | `netstack::server_name::read`, `server_name::answer` |
 | Which names did the stack's nameserver resolve to an address? | `netstack::pins::Pins`, which the nameserver fills from `netstack::dns::answer_addresses` |
 | Read a destination rule, or write one back | `DestinationRule`'s `FromStr` and `Display`, which the builder, the stack's profile format and `fcage` share |
-| Hand the caller a report, without its source waiting on a reader | `reports::Reporter`, whose `offer` never waits, and which the caller reads as `Reports`. The network stack's is `netstack::report::Reporter`, and a refused UDP flow is reported once through `netstack::udp::UdpTables::refuse`. `fcage`'s own lines have the CLI's `Reports`, a crate apart |
+| Hand the caller a report, without its source waiting on a reader | `reports::Reporter`, whose `offer` never waits, and which the caller reads as `Reports`. The network stack's is `netstack::report::Reporter`, and a refused UDP flow is reported once through `netstack::udp::UdpTables::refuse`. `fcage`'s own lines have the CLI's `Reports`, a crate apart, and a session's connection the CLI's `session::Outbox`, which also carries the responses it must not drop |
 | A prefix length's mask, whether a network holds an address, and the IPv4 address NAT64's well-known prefix embeds | `netstack::prefix` |
 | Which IPv4 address of the host's own does a test reach a server on through the network stack? | the testkit's `require::routable_v4` |
 | Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `blocked`, `no_records`, `truncated` |
@@ -656,6 +656,8 @@ report name a package and its version bare.
 | Make a scratch tree for a test that leaves nothing to accumulate | `scratch::Scratch`, removed when it drops, or from a test suite `common::scratch_dir`, emptied when the next run reuses it, and `common::ranged_scratch` for a tree of subordinate-owned entries |
 | What happens when a run's timeout runs out? | `relay::Escalation` |
 | Drive an interactive terminal session from the caller's terminal | `relay::Relay` |
+| Read the signals that end a program as data, in a poll loop of its own | `relay::Signals`, which a relay and `fcage --serve` both read |
+| Is a descriptor `fcage` would hand a command one it hands over as it is, relays through a pipe, or refuses? | the CLI's `streams::handling`, which a launch's standard streams and a session's passed descriptors are both judged by |
 | Parse an argument in an example | `examples/common` |
 | Build a fixture a test suite needs | the `ferroday-cage-testkit` crate |
 | Hand a provisioner a transport standing in for a mirror, in a unit test | `provision::fetch::fixture`: `Canned`, `Uniform`, `Unreachable` |

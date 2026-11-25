@@ -101,7 +101,7 @@ const STREAMS: [&str; 3] = ["standard input", "standard output", "standard error
 
 /// What `fcage` does with one of its own standard streams that a launch would
 /// hand to the command.
-enum Handling {
+pub enum Handling {
     /// Handed over as it is: a pipe, a socket, or a character device.
     HandOver,
     /// Relayed through a pipe: a regular file or a block device. The status
@@ -113,7 +113,10 @@ enum Handling {
 }
 
 /// Judges a stream by its kind; see the module documentation.
-fn handling(stream: BorrowedFd<'_>) -> io::Result<Handling> {
+///
+/// A session's server judges each descriptor an exec request passes by this
+/// too, and refuses what a launch would relay, since it relays nothing.
+pub fn handling(stream: BorrowedFd<'_>) -> io::Result<Handling> {
     // An `O_PATH` descriptor answers `fstat` with the kind of what it names,
     // so it is recognized by its flags before its kind is read.
     if rustix::fs::fcntl_getfl(stream)?.contains(OFlags::PATH) {

@@ -84,6 +84,15 @@ with their parts as members. A program passes a pipe as `/dev/fd/N`:
 fcage --events /dev/fd/3 --rootfs ./root -- make test 3>events.jsonl
 ```
 
+`--serve SOCKET` keeps one sandbox for a session. It runs further commands in it, about a
+millisecond each, for the programs that connect to a unix socket at `SOCKET`. A request is
+a line of JSON, and an `exec` passes the command's standard streams as descriptors. A
+process outside `fcage`'s own user namespace, as every sandbox's is, is refused:
+
+```sh
+fcage --serve "$XDG_RUNTIME_DIR/build.sock" --host-rootfs --bind ~/project ~/project &
+```
+
 ## Confining the command
 
 The default profile is a rootless convenience for code you trust. Untrusted code calls for

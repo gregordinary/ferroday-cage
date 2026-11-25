@@ -107,6 +107,23 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `fcage --serve SOCKET` starts the sandbox with no command and serves further
+  commands in it on a unix socket it creates at `SOCKET`, mode 0600, in a
+  directory only the caller's user can write, and removes once done. A program
+  that connects sends requests as lines of JSON, in JSON-RPC's shapes without
+  the `jsonrpc` member: `hello`, answered with the protocol version; `exec`, a
+  command with its arguments, environment, working directory, path lookup,
+  timeout and standard streams, `null` or passed as descriptors attached to the
+  request's first byte, answered with how it ended, after a `started` event and
+  the exec's seccomp reports; and `stop`. A connection runs one exec at a time,
+  and its close ends its exec. A peer outside the server's user namespace, as
+  every sandbox's process is, is refused before its request is read, and so is
+  a passed file, which the command could reopen with more access than the
+  descriptor carries. The session ends on `stop`, on `SIGINT`, `SIGTERM`,
+  `SIGHUP` or `SIGQUIT`, or with `--serve-until-closed PATH` at the end of that
+  input, terminating the sandbox and killing it after `--kill-after`. Its event
+  stream says `serving` once the socket listens and `ended` last
+  (`ferroday-cage-cli`).
 - `relay::Signals` serves a poll loop of the caller's own as well as a
   relay's: it is the descriptor the blocked signals arrive on (`AsFd`), and
   `Signals::read` takes each pending signal by its number.

@@ -49,6 +49,7 @@ mod listing;
 mod netstack;
 mod output;
 mod seccomp;
+mod session;
 mod streams;
 mod terminal;
 
@@ -66,7 +67,7 @@ use ferroday_cage::provision::gentoo::Gentoo;
 use ferroday_cage::provision::{
     ChangeSet, Interrupt, Protected, Provision, ProvisionError, Provisioned, Tarball,
 };
-use ferroday_cage::relay::{Escalation, RelayError};
+use ferroday_cage::relay::{Escalation, RelayError, Signals};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
     ExitStatus, FsAccess, Hide, IdRange, Identity, IdentityMap, LandlockScope, Limit, Mount,
@@ -77,7 +78,7 @@ use ferroday_cage::{
 };
 use serde::Deserialize as _;
 
-use crate::events::{Event, Fault};
+use crate::events::{EndReason, Event, Fault};
 
 /// The exit code of a command line `fcage` cannot understand.
 const USAGE: u8 = 2;
@@ -1915,6 +1916,43 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--serve",
+        section: Section::Command,
+        placeholder: "SOCKET",
+        help: &[
+            "Start the sandbox with no command and serve further",
+            "commands in it on a unix socket that fcage creates at",
+            "SOCKET, in a directory only you can write, and removes",
+            "when done. A program that connects runs commands, one",
+            "at a time per connection, each confined as a launch's",
+            "command; a process outside fcage's own user namespace,",
+            "as a sandbox's is, is refused. Takes no command. Ends",
+            "on a stop request or SIGINT, SIGTERM, SIGHUP or",
+            "SIGQUIT, terminating the sandbox and killing it",
+            "--kill-after seconds later",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.serve = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--serve-until-closed",
+        section: Section::Command,
+        placeholder: "PATH",
+        help: &[
+            "End the --serve session when PATH reaches end of",
+            "file: a pipe whose write end the caller holds, passed",
+            "as /dev/fd/N, so the session ends with its caller",
+        ],
+        take: Take::One(|options, _flag, value| {
+            options.serve_until_closed = Some(PathBuf::from(value));
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--share-net",
         section: Section::Networking,
         help: &["Share the host network (default: isolated loopback)"],
@@ -3139,6 +3177,10 @@ struct Options {
     json: bool,
     /// `--events`: where the run says what it has to say, as events.
     events: Option<PathBuf>,
+    /// `--serve`: the socket a session serves on, in place of a command.
+    serve: Option<PathBuf>,
+    /// `--serve-until-closed`: the input whose end ends the session.
+    serve_until_closed: Option<PathBuf>,
     netstack: bool,
     netstack_cidr: Option<(Ipv4Addr, u8)>,
     netstack_cidr6: Option<(Ipv6Addr, u8)>,
@@ -3695,6 +3737,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         print_resolved: false,
         json: false,
         events: None,
+        serve: None,
+        serve_until_closed: None,
         netstack: false,
         netstack_cidr: None,
         netstack_cidr6: None,
@@ -3755,9 +3799,10 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
 
     // --kill-after is the grace period before the SIGKILL that follows a
     // --timeout; without a timeout it has nothing to hang on and would be
-    // silently ignored.
-    if options.kill_after_given && options.timeout.is_none() {
-        return Err("--kill-after requires --timeout".to_string());
+    // silently ignored. A session's end is such a termination too, so a
+    // session takes it alone.
+    if options.kill_after_given && options.timeout.is_none() && options.serve.is_none() {
+        return Err("--kill-after requires --timeout or --serve".to_string());
     }
 
     // A launch prints no listing but the resolved inputs, so `--json` has
@@ -3809,6 +3854,48 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
             );
         }
         return Ok(Invocation::Run(Box::new(options)));
+    }
+
+    if options.serve_until_closed.is_some() && options.serve.is_none() {
+        return Err("--serve-until-closed requires --serve".to_string());
+    }
+    // A session's commands are its exec requests, each with its own streams
+    // and timeout, run in a sandbox an init of its own holds, so what states
+    // a launch's command has nothing to state.
+    if options.serve.is_some() {
+        if !options.command_line.is_empty() {
+            return Err("--serve takes no command: each exec request names its own".to_string());
+        }
+        let refused = [
+            (
+                options.terminal,
+                "--terminal",
+                "a terminal is an exec's own",
+            ),
+            (
+                options.timeout.is_some(),
+                "--timeout",
+                "each exec request states its own",
+            ),
+            (
+                options.stdin.is_some(),
+                "--stdin",
+                "each exec request states its own streams",
+            ),
+            (
+                options.pid_namespace == Some(false),
+                "--share-pid",
+                "a session's sandbox is held by an init of its own",
+            ),
+            (
+                options.print_resolved,
+                "--print-resolved",
+                "it prints a launch's inputs and starts nothing",
+            ),
+        ];
+        if let Some((_, flag, why)) = refused.iter().find(|(given, _, _)| *given) {
+            return Err(format!("--serve cannot be used with {flag}: {why}"));
+        }
     }
 
     // The native stack configures the isolated network; sharing the host
@@ -3969,7 +4056,11 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         || options.provision_debian.is_some()
         || options.provision_alpine.is_some()
         || options.provision_gentoo.is_some();
-    if options.command_line.is_empty() && options.profile.is_none() && !provisioning {
+    if options.command_line.is_empty()
+        && options.profile.is_none()
+        && options.serve.is_none()
+        && !provisioning
+    {
         return Err("no command given".to_string());
     }
     // Nothing is launched, so a flag that configures a launch has nothing to
@@ -3978,6 +4069,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     // the way the command line said.
     if options.command_line.is_empty()
         && options.profile.is_none()
+        && options.serve.is_none()
         && let Some(flag) = applied.into_iter().find(|flag| !provisions(flag.long))
     {
         return Err(format!(
@@ -5712,6 +5804,14 @@ fn parse_seconds(name: &str, value: &OsStr) -> Result<Duration, String> {
         .to_str()
         .and_then(|value| value.parse().ok())
         .ok_or(format!("{name} requires a number of seconds"))?;
+    duration_of_seconds(name, seconds)
+}
+
+/// `seconds` as a duration, where it is a positive number of seconds the clock
+/// can hold and at least a nanosecond: what `--timeout` and `--kill-after` take,
+/// and a session's exec request in its own `timeout` and `kill-after`. `name`
+/// is what the refusal names.
+fn duration_of_seconds(name: &str, seconds: f64) -> Result<Duration, String> {
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err(format!("{name} requires a positive number of seconds"));
     }
@@ -6175,7 +6275,7 @@ fn run(options: Options) -> ExitCode {
     let rootfs = options.rootfs.clone();
 
     // A provisioning run with no command and no profile provisions and exits.
-    if options.command_line.is_empty() && options.profile.is_none() {
+    if options.command_line.is_empty() && options.profile.is_none() && options.serve.is_none() {
         let rootfs = rootfs.as_deref().expect("checked at parse time");
         let provisioner = provisioner.as_mut().expect("checked at parse time");
         return match provision(rootfs, provisioner) {
@@ -6201,6 +6301,8 @@ fn run(options: Options) -> ExitCode {
 
     let print_resolved = options.print_resolved;
     let json = options.json;
+    let serve = options.serve.clone();
+    let until_closed = options.serve_until_closed.clone();
     let launch = match Launch::prepare(options) {
         Ok(launch) => launch,
         Err(code) => return code,
@@ -6217,13 +6319,56 @@ fn run(options: Options) -> ExitCode {
         let added = around.table();
         return print_resolved_inputs(launch.builder, added, json);
     }
+    // A session's socket is placed before anything is provisioned or started,
+    // so a path it refuses costs nothing, and the input that ends it is
+    // opened first, so a path that cannot be read leaves no socket behind.
+    let session = match serve {
+        Some(path) => match Serving::place(&path, until_closed.as_deref()) {
+            Ok(serving) => Some(serving),
+            Err(code) => return code,
+        },
+        None => None,
+    };
     if let Some(provisioner) = provisioner.as_mut() {
         let rootfs = rootfs.as_deref().expect("checked at parse time");
         if let Err(code) = provision(rootfs, provisioner) {
             return code;
         }
     }
-    launch.run()
+    match session {
+        Some(serving) => launch.serve(serving),
+        None => launch.run(),
+    }
+}
+
+/// What `--serve` places before the sandbox starts: the socket, and the input
+/// whose end ends the session, where `--serve-until-closed` names one.
+struct Serving {
+    socket: session::Socket,
+    until_closed: Option<std::fs::File>,
+}
+
+impl Serving {
+    /// Opens `until_closed` and binds the socket at `path`, refusing what
+    /// either refuses with [`FAILED`].
+    fn place(path: &Path, until_closed: Option<&Path>) -> Result<Serving, ExitCode> {
+        let until_closed = until_closed
+            .map(|input| {
+                session::open_until_closed(input).map_err(|error| {
+                    fail(format_args!(
+                        "opening {} for --serve-until-closed: {}",
+                        input.display(),
+                        ErrorChain::new(&error)
+                    ))
+                })
+            })
+            .transpose()?;
+        let socket = session::Socket::bind(path).map_err(|fault| fail(Diagnostic(fault)))?;
+        Ok(Serving {
+            socket,
+            until_closed,
+        })
+    }
 }
 
 /// A sandbox launch composed and checked, waiting only for its root
@@ -6491,7 +6636,11 @@ impl Launch {
         // network stack is driven by the library's terminal launch, which
         // takes no stream of `fcage`'s at all. A launch held at the pending
         // seam, for the stack or a forward, takes the streams in either case.
-        let streams = if options.terminal && stack.is_none() && options.forwards.is_empty() {
+        // A session's sandbox takes none of `fcage`'s streams: its init runs on
+        // none, and each exec names its own.
+        let streams = if options.serve.is_some()
+            || (options.terminal && stack.is_none() && options.forwards.is_empty())
+        {
             None
         } else {
             Some(judge_streams(&builder, &CAGE_STREAMS, options.terminal)?)
@@ -6551,6 +6700,138 @@ impl Launch {
             })?)
         });
         finish(relay, outcome)
+    }
+
+    /// Starts the sandbox with no command, attaches what a launch attaches,
+    /// and serves further commands in it on the socket `serving` placed until
+    /// the session ends: `--serve`.
+    ///
+    /// Says `serving` once the socket listens, which is the session's
+    /// readiness, and `ended` last, once the sandbox has ended and the socket
+    /// is gone. A session that ended as asked exits 0, and one whose sandbox
+    /// ended on its own exits as its init did.
+    fn serve(self, serving: Serving) -> ExitCode {
+        let Launch {
+            builder,
+            stack,
+            shown,
+            kill_after,
+            publications,
+            forwards,
+            ..
+        } = self;
+        let Serving {
+            mut socket,
+            until_closed,
+        } = serving;
+        // Blocked before any thread of the run's exists, so each inherits the
+        // mask and a signal that ends the session reaches the session's poll
+        // rather than ending `fcage` with the socket left behind.
+        let signals = match Signals::install() {
+            Ok(signals) => signals,
+            Err(error) => return fail(error),
+        };
+        let path_lookup = builder.get_path_lookup();
+        let pending = match start(builder, Cage::start_pending) {
+            Ok(pending) => pending,
+            Err(failure) => return failure.report(),
+        };
+        let handle = match stack.map(|stack| stack.attach(&pending)).transpose() {
+            Ok(handle) => handle,
+            Err(error) => return fail(error),
+        };
+        let mut beside = Beside {
+            handle,
+            ..Beside::default()
+        };
+        // The session's own reports, a refused connection among them, go
+        // through the run's reports thread as the forwards' do, so the session
+        // never waits on their reader.
+        let reporter = beside
+            .start_forwards_and_reports(&pending, forwards, shown)
+            .and_then(|()| beside.reporter());
+        let reporter = match reporter {
+            Ok(reporter) => reporter,
+            Err(failure) => {
+                drop(pending);
+                let _ = beside.stop();
+                return failure.report();
+            }
+        };
+        let published = beside
+            .handle
+            .as_ref()
+            .map_or_else(Vec::new, |handle| handle.published().to_vec());
+        for ((requested, guest_port), bound) in publications.iter().zip(published) {
+            if output::say_event(&Event::published(*guest_port, bound, requested.port() == 0))
+                .is_err()
+            {
+                drop(pending);
+                let _ = beside.stop();
+                return Failure::ReaderGone.report();
+            }
+        }
+        let mut sandbox = match pending.proceed() {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                let _ = beside.stop();
+                return Failure::from(error).report();
+            }
+        };
+        let listener = match socket.listen() {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = sandbox.kill();
+                let _ = sandbox.wait();
+                let _ = beside.stop();
+                return fail(format_args!(
+                    "listening on {}: {}",
+                    socket.path().display(),
+                    ErrorChain::new(&error)
+                ));
+            }
+        };
+        // Said once the socket listens: a program waiting for this connects
+        // and is served. A reader that has gone is told nothing more, so the
+        // session ends before it serves anyone.
+        if output::say_event(&Event::serving(socket.path(), sandbox.pid())).is_err() {
+            drop(listener);
+            let _ = sandbox.kill();
+            let _ = sandbox.wait();
+            let _ = beside.stop();
+            return Failure::ReaderGone.report();
+        }
+        let session = session::Session::new(
+            sandbox,
+            listener,
+            &signals,
+            until_closed,
+            reporter,
+            kill_after,
+            path_lookup,
+        );
+        let outcome = session.run();
+        let stopped = beside.stop();
+        // The socket goes before the session says it ended, so a program that
+        // reads `ended` finds the path free.
+        drop(socket);
+        if let Err(error) = stopped {
+            output::report(format_args!(
+                "fcage: the network stack did not stop cleanly: {}",
+                ErrorChain::new(&error)
+            ));
+        }
+        match outcome {
+            Ok(reason) => {
+                let code = match reason {
+                    EndReason::SandboxEnded(status) => status.shell_code(),
+                    EndReason::Stop | EndReason::Signal(_) | EndReason::Closed => 0,
+                };
+                output::report_event(&Event::ended(reason, code));
+                ExitCode::from(code)
+            }
+            Err(fault) => fail(Diagnostic(fault)),
+        }
     }
 }
 
@@ -7177,16 +7458,7 @@ impl Beside {
         if wanted.is_empty() && shown.is_none() {
             return Ok(());
         }
-        let reports = self.reports.insert(output::Reports::start().map_err(|err| {
-            Failure::Fcage(
-                format!(
-                    "starting the thread that writes the run's reports: {}",
-                    ErrorChain::new(&err)
-                )
-                .into(),
-            )
-        })?);
-        let reporter = reports.reporter();
+        let reporter = self.reporter()?;
         if let (Some(shown), Some(handle)) = (shown, self.handle.as_mut()) {
             let taken = handle
                 .take_reports()
@@ -7207,6 +7479,24 @@ impl Beside {
             self.forwards = Some(forward::Forwards::start(pending, wanted, &reporter)?);
         }
         Ok(())
+    }
+
+    /// A reporter writing through the run's reports thread, which this starts
+    /// where nothing has yet.
+    fn reporter(&mut self) -> Result<output::Reporter, Failure> {
+        if let Some(reports) = &self.reports {
+            return Ok(reports.reporter());
+        }
+        let reports = output::Reports::start().map_err(|err| {
+            Failure::Fcage(
+                format!(
+                    "starting the thread that writes the run's reports: {}",
+                    ErrorChain::new(&err)
+                )
+                .into(),
+            )
+        })?;
+        Ok(self.reports.insert(reports).reporter())
     }
 
     /// Stops what started, once the sandbox is gone or was never released: the
@@ -12489,6 +12779,91 @@ mod tests {
             .expect("a Landlock grant is enough");
         parse_run(&["--restrict", "--seccomp-errno", "ptrace=EPERM", "/bin/true"])
             .expect("a seccomp errno is enough");
+    }
+
+    #[test]
+    fn a_session_takes_no_command_and_no_setting_of_one() {
+        let options = run_options(&[
+            "--serve",
+            "/run/user/1000/s.sock",
+            "--serve-until-closed",
+            "/dev/fd/3",
+            "--host-rootfs",
+            "--kill-after",
+            "3",
+            "--chdir",
+            "/work",
+            "--setenv",
+            "A",
+            "b",
+            "--path-lookup",
+        ]);
+        assert_eq!(
+            options.serve.as_deref(),
+            Some(Path::new("/run/user/1000/s.sock"))
+        );
+        assert_eq!(
+            options.serve_until_closed.as_deref(),
+            Some(Path::new("/dev/fd/3"))
+        );
+        assert_eq!(
+            options.kill_after,
+            Duration::from_secs(3),
+            "a session's grace stands alone, without --timeout"
+        );
+
+        let serving = ["--serve", "/s.sock", "--host-rootfs"];
+        let refused = |extra: &[&str]| {
+            let args: Vec<&str> = serving.iter().chain(extra).copied().collect();
+            parse_error(&args)
+        };
+        assert!(
+            refused(&["--", "/bin/true"]).contains("--serve takes no command"),
+            "a command"
+        );
+        for (flag, extra) in [
+            ("--terminal", &["--terminal"][..]),
+            ("--timeout", &["--timeout", "5"]),
+            ("--stdin", &["--stdin", "null"]),
+            ("--share-pid", &["--share-pid"]),
+            ("--print-resolved", &["--print-resolved"]),
+        ] {
+            let error = refused(extra);
+            assert!(
+                error.contains(&format!("--serve cannot be used with {flag}")),
+                "{flag}: {error}"
+            );
+        }
+        let restricted = parse_error(&["--restrict", "--seccomp", "curated", "--serve", "/s.sock"]);
+        assert!(
+            restricted.contains("--serve cannot be used with --restrict"),
+            "{restricted}"
+        );
+        let alone = parse_error(&[
+            "--host-rootfs",
+            "--serve-until-closed",
+            "/dev/fd/3",
+            "/bin/true",
+        ]);
+        assert!(
+            alone.contains("--serve-until-closed requires --serve"),
+            "{alone}"
+        );
+    }
+
+    #[test]
+    fn a_session_parses_with_a_provisioner_and_without_a_profile() {
+        // A provisioning run with no command provisions and exits; one that
+        // serves goes on to serve in what it provisioned.
+        let options = run_options(&[
+            "--rootfs",
+            "/roots/alpine",
+            "--provision-tar",
+            "/tarballs/alpine.tar.gz",
+            "--serve",
+            "/s.sock",
+        ]);
+        assert!(options.serve.is_some() && options.provision_tar.is_some());
     }
 
     #[test]

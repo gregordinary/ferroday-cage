@@ -17,7 +17,8 @@
 #   code       The setting takes executable behavior -- a trait object, an open
 #              descriptor. An argument cannot carry one.
 #   positional The setting is spelled somewhere other than a flag: the command
-#              line after `--`, or a shell facility.
+#              line after `--`, a shell facility, or a member of the `exec`
+#              request a `--serve` session takes.
 #   library    A capability `fcage` does not offer at all. The reason says what
 #              the tool would have to grow first.
 #
@@ -879,53 +880,53 @@ path = "ferroday_cage::Exec"
 
 [[builder.setting]]
 name = "arg"
-kind = "library"
-why = "`fcage` runs one command per invocation and keeps no sandbox running for another command to join. The tool would have to grow a session mode first: one invocation that holds a sandbox and runs the commands others send it."
+kind = "positional"
+why = "The `args` member of the `exec` request a `--serve` session takes, after its `command`."
 
 [[builder.setting]]
 name = "args"
-kind = "library"
+kind = "positional"
 why = "As `arg`."
 
 [[builder.setting]]
 name = "current_dir"
-kind = "library"
-why = "As `arg`."
+kind = "positional"
+why = "The `cwd` member of the `exec` request a `--serve` session takes."
 
 [[builder.setting]]
 name = "env"
-kind = "library"
-why = "As `arg`."
+kind = "positional"
+why = "The `env` member of the `exec` request a `--serve` session takes, a list of name and value pairs in order."
 
 [[builder.setting]]
 name = "envs"
-kind = "library"
-why = "As `arg`."
+kind = "positional"
+why = "As `env`."
 
 [[builder.setting]]
 name = "path_lookup"
-kind = "library"
-why = "As `arg`."
+kind = "positional"
+why = "The `path-lookup` member of the `exec` request a `--serve` session takes, which defaults to the session's own `--path-lookup`."
 
 [[builder.setting]]
 name = "stderr"
-kind = "library"
-why = "As `arg`."
+kind = "positional"
+why = "As `stdin`."
 
 [[builder.setting]]
 name = "stdin"
-kind = "library"
-why = "As `arg`."
+kind = "positional"
+why = "The `stdin` member of the `exec` request a `--serve` session takes: `null`, or `passed` with the descriptor attached to the request."
 
 [[builder.setting]]
 name = "stdout"
-kind = "library"
-why = "As `arg`."
+kind = "positional"
+why = "As `stdin`."
 
 [[builder.setting]]
 name = "stop_with_caller"
 kind = "library"
-why = "As `arg`."
+why = "A `--serve` session ties every exec it starts to itself, so the server's end takes its execs with it. An exec that outlives the session, unanswered, is not something the tool offers."
 
 # The provisioners' own collaborators.
 [[builder]]

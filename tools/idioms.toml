@@ -609,6 +609,11 @@ path = "crates/ferroday-cage/src/path.rs"
 count = 1
 why = "The answer."
 
+[[idiom.site]]
+path = "crates/ferroday-cage-cli/src/session.rs"
+count = 1
+why = """`fcage --serve` opens the directory its socket is named in, to check who may write it and to bind and remove the socket through it. `fcage` is a crate apart, and the library keeps `path::parent_of` to itself, so the CLI states the same fallback where it opens the directory."""
+
 [[idiom]]
 name = "a syscall's number read from its name"
 # Both spellings of the `syscalls` crate's parse: the method `str::parse` with

@@ -24,12 +24,13 @@ use crate::events::{self, Event};
 use crate::output;
 
 /// How long a run waits, once the command has exited, for the last of the
-/// reports.
+/// reports, and a session for the last of an exec's.
 ///
 /// They end once no process under the filter is left, which with a PID
-/// namespace is as soon as the sandbox has gone. Without one, a process the
-/// command left behind holds them open, and the run does not wait for it.
-const LAST_REPORTS: Duration = Duration::from_secs(2);
+/// namespace is as soon as the sandbox has gone. Without one, as for a
+/// session's exec, a process the command left behind holds them open, and the
+/// run does not wait for it.
+pub(crate) const LAST_REPORTS: Duration = Duration::from_secs(2);
 
 /// Runs `wait` over `running`, writing the seccomp filter's refusals while it
 /// waits, where the launch reports them, and the last of them once it has.

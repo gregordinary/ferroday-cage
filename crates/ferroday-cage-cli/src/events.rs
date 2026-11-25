@@ -7,7 +7,7 @@
 //!
 //! - **Each event names its kind** in its `event` member: `hello`, `started`,
 //!   `published`, `network`, `seccomp`, `dropped`, `provision`, `warning`,
-//!   `exited` or `failed`.
+//!   `exited` or `failed`, and for a session's server `serving` and `ended`.
 //! - **A stream begins with `hello`.** Its `protocol` is this vocabulary's
 //!   version, [`PROTOCOL`], and its `fcage` is the release that wrote it.
 //! - **A reader ignores the members and the kinds it does not know.** Within one
@@ -18,9 +18,10 @@
 //!   vocabulary does not name yet is still an event: its `report` is `other`,
 //!   and its `text` says what it is.
 //! - **Bytes that are not UTF-8** are written as `{"base64": "..."}`, and any
-//!   other byte string as a JSON string; see [`Bytes`].
-//! - **A launch's last event is `exited` or `failed`**, and its `shell-code` is
-//!   `fcage`'s exit status. A `failed` follows an `exited` where the command
+//!   other byte string as a JSON string; see [`Bytes`]. A session's requests
+//!   spell a byte string either way.
+//! - **A launch's last event is `exited` or `failed`**, and a session's server's
+//!   `ended` or `failed`. Its `shell-code` is `fcage`'s exit status. A `failed` follows an `exited` where the command
 //!   ended and `fcage` failed after it, as a relay that lost output does. A run
 //!   that only provisions ends with neither.
 //!
@@ -41,8 +42,9 @@ use ferroday_cage::{
     Error, ExitStatus, FlowAdmission, FlowRefusal, NetStackReport, ResourceUsage, SeccompReport,
     SetupStep, Transport,
 };
-use serde::Serialize;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeMap as _, Serializer};
+use serde::{Deserialize, Serialize};
 
 /// The version of the vocabulary, which every stream's `hello` carries.
 pub const PROTOCOL: u32 = 1;
@@ -71,6 +73,10 @@ pub enum Event {
     Exited(Exited),
     /// A failure that decides `fcage`'s exit status.
     Failed(Failed),
+    /// A session's server listens on its socket.
+    Serving(Serving),
+    /// A session's server is done.
+    Ended(SessionEnded),
 }
 
 /// `hello`: the stream's first event.
@@ -298,6 +304,55 @@ pub struct Failed {
     text: String,
 }
 
+/// `serving`: a session's server listens on its socket, its sandbox started.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Serving {
+    /// The socket's path, as `--serve` named it.
+    socket: Bytes,
+    /// The host's process id of the sandbox's init.
+    pid: u32,
+    /// The line standard error carries.
+    text: String,
+}
+
+/// `ended`: a session's server is done, its sandbox ended and its socket
+/// removed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SessionEnded {
+    /// Why: `stop`, a request; `signal`, a signal to the server; `closed`,
+    /// the end of `--serve-until-closed`'s input; or `sandbox-ended`, the
+    /// sandbox's own end.
+    reason: &'static str,
+    /// The signal, by number, for `signal`, or the one that ended the
+    /// sandbox's init, for `sandbox-ended`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<i32>,
+    /// The init's exit code, for `sandbox-ended` where it exited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<i32>,
+    /// `fcage`'s exit status.
+    shell_code: u8,
+    /// The line standard error carries: only for `sandbox-ended`, since every
+    /// other end is one the caller asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+}
+
+/// Why a session ended, as [`Event::ended`] names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// A `stop` request.
+    Stop,
+    /// A signal to the server, by number.
+    Signal(i32),
+    /// `--serve-until-closed`'s input reached its end.
+    Closed,
+    /// The sandbox ended on its own, with its init's status.
+    SandboxEnded(ExitStatus),
+}
+
 /// What a failure names, for [`Event::failed`]: what failed, the setup step
 /// and the errno where it carries them, and its message.
 ///
@@ -375,12 +430,58 @@ impl Serialize for Bytes {
     }
 }
 
+impl<'de> Deserialize<'de> for Bytes {
+    /// Reads either spelling [`Bytes`] writes: a string, as its UTF-8 bytes,
+    /// or `{"base64": "..."}`, decoded, and nothing else.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Bytes, D::Error> {
+        deserializer.deserialize_any(BytesVisitor)
+    }
+}
+
+/// The visitor behind [`Bytes`]'s `Deserialize`.
+struct BytesVisitor;
+
+impl<'de> Visitor<'de> for BytesVisitor {
+    type Value = Bytes;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(r#"a string, or {"base64": "..."} for bytes that are not UTF-8"#)
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<Bytes, E> {
+        Ok(Bytes(text.as_bytes().to_vec()))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Bytes, A::Error> {
+        let mut decoded = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key != "base64" {
+                return Err(de::Error::unknown_field(&key, &["base64"]));
+            }
+            if decoded.is_some() {
+                return Err(de::Error::duplicate_field("base64"));
+            }
+            let text: String = map.next_value()?;
+            decoded = Some(unbase64(&text).ok_or_else(|| {
+                de::Error::invalid_value(
+                    de::Unexpected::Str(&text),
+                    &"base64 in RFC 4648's standard alphabet, padded",
+                )
+            })?);
+        }
+        decoded
+            .map(Bytes)
+            .ok_or_else(|| de::Error::missing_field("base64"))
+    }
+}
+
 /// `bytes` in base64, as RFC 4648 section 4 defines it: the standard alphabet,
 /// padded.
 ///
 /// A second answer to the library's `provision::alpine::base64::encode`, which
-/// is private to the Alpine layer: `fcage` is a crate apart, and this is the
-/// one encoder its event stream needs. It decodes nothing.
+/// is private to the Alpine layer: `fcage` is a crate apart, and this and
+/// [`unbase64`] are the encoder its event stream and its listings need and the
+/// decoder a session's requests need.
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -401,6 +502,66 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// `text` read back from base64 as [`base64`] writes it: RFC 4648's standard
+/// alphabet, padded to a whole number of four-character groups, with the bits a
+/// padded group leaves over zero. `None` for anything else, so one byte string
+/// has one spelling.
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let value = |character: u8| -> Option<u32> {
+        Some(u32::from(match character {
+            b'A'..=b'Z' => character - b'A',
+            b'a'..=b'z' => character - b'a' + 26,
+            b'0'..=b'9' => character - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        }))
+    };
+    let text = text.as_bytes();
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let groups = text.len() / 4;
+    let mut out = Vec::with_capacity(groups * 3);
+    for (at, group) in text.chunks(4).enumerate() {
+        let padding = group
+            .iter()
+            .rev()
+            .take_while(|&&character| character == b'=')
+            .count();
+        if padding > 2 || (padding > 0 && at + 1 != groups) {
+            return None;
+        }
+        let mut packed = 0u32;
+        for (place, &character) in group[..4 - padding].iter().enumerate() {
+            packed |= value(character)? << (18 - 6 * place);
+        }
+        if padding > 0 && packed & ((1 << (8 * padding)) - 1) != 0 {
+            return None;
+        }
+        for place in 0..3 - padding {
+            out.push((packed >> (16 - 8 * place)) as u8);
+        }
+    }
+    Some(out)
+}
+
+impl Exited {
+    /// The command ended with `status`, or with `None` its timeout expired,
+    /// `fcage` reports `shell_code`, and the command used `usage`: the members
+    /// of an `exited` event, and of a session's answer to an `exec`.
+    pub fn of(status: Option<ExitStatus>, usage: Option<&ResourceUsage>, shell_code: u8) -> Exited {
+        Exited {
+            code: status.and_then(|status| status.code()),
+            signal: status.and_then(|status| status.signal()),
+            core_dumped: status.is_some_and(|status| status.core_dumped()),
+            timed_out: status.is_none(),
+            shell_code,
+            usage: usage.map(Usage::of),
+        }
+    }
 }
 
 impl Event {
@@ -474,14 +635,7 @@ impl Event {
         usage: Option<&ResourceUsage>,
         shell_code: u8,
     ) -> Event {
-        Event::Exited(Exited {
-            code: status.and_then(|status| status.code()),
-            signal: status.and_then(|status| status.signal()),
-            core_dumped: status.is_some_and(|status| status.core_dumped()),
-            timed_out: status.is_none(),
-            shell_code,
-            usage: usage.map(Usage::of),
-        })
+        Event::Exited(Exited::of(status, usage, shell_code))
     }
 
     /// `failed`: `failure`, after which `fcage` exits `shell_code`.
@@ -492,6 +646,42 @@ impl Event {
             errno: failure.errno,
             shell_code,
             text: format!("fcage: {}", failure.message),
+        })
+    }
+
+    /// `serving`: the session's server listens on `socket`, and its sandbox's
+    /// init is `pid`.
+    pub fn serving(socket: &std::path::Path, pid: u32) -> Event {
+        use std::os::unix::ffi::OsStrExt as _;
+        Event::Serving(Serving {
+            socket: Bytes(socket.as_os_str().as_bytes().to_vec()),
+            pid,
+            text: format!("fcage: serving on {}", socket.display()),
+        })
+    }
+
+    /// `ended`: the session ended for `reason`, and `fcage` exits
+    /// `shell_code`.
+    pub fn ended(reason: EndReason, shell_code: u8) -> Event {
+        let (name, signal, code, text) = match reason {
+            EndReason::Stop => ("stop", None, None, None),
+            EndReason::Signal(signal) => ("signal", Some(signal), None, None),
+            EndReason::Closed => ("closed", None, None, None),
+            EndReason::SandboxEnded(status) => (
+                "sandbox-ended",
+                status.signal(),
+                status.code(),
+                Some(format!(
+                    "fcage: the sandbox ended ({status}), and the session with it"
+                )),
+            ),
+        };
+        Event::Ended(SessionEnded {
+            reason: name,
+            signal,
+            code,
+            shell_code,
+            text,
         })
     }
 
@@ -506,6 +696,8 @@ impl Event {
             Event::Provision(provision) => provision.text.as_deref(),
             Event::Warning(warning) => Some(&warning.text),
             Event::Failed(failed) => Some(&failed.text),
+            Event::Serving(serving) => Some(&serving.text),
+            Event::Ended(ended) => ended.text.as_deref(),
         }
     }
 
@@ -929,6 +1121,74 @@ mod tests {
         for (input, encoded) in vectors {
             assert_eq!(base64(input.as_bytes()), encoded, "{input:?}");
         }
+    }
+
+    #[test]
+    fn base64_reads_back_what_it_writes_and_nothing_else() {
+        for input in ["", "f", "fo", "foo", "foob", "fooba", "foobar"] {
+            assert_eq!(
+                unbase64(&base64(input.as_bytes())).as_deref(),
+                Some(input.as_bytes()),
+                "{input:?}"
+            );
+        }
+        let every: Vec<u8> = (0..=255).collect();
+        assert_eq!(unbase64(&base64(&every)), Some(every));
+        // A length that is no whole group, a character outside the alphabet,
+        // padding inside the text or past two, the URL-safe alphabet, and
+        // leftover bits that are not zero, which would give one byte string a
+        // second spelling.
+        for refused in ["Zg", "Zg=", "Zm9v!", "Zg==Zg==", "Z===", "-_8=", "Zh=="] {
+            assert_eq!(unbase64(refused), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_byte_string_is_read_in_either_spelling() {
+        let read = |text: &str| serde_json::from_str::<Bytes>(text).map(|bytes| bytes.0);
+        assert_eq!(read(r#""plain""#).expect("a string"), b"plain");
+        assert_eq!(
+            read(r#"{"base64": "//4AbmFtZQ=="}"#).expect("base64"),
+            b"\xff\xfe\x00name"
+        );
+        for refused in [
+            r#"{"base64": "not base64"}"#,
+            r#"{"base64": "Zg==", "base64": "Zg=="}"#,
+            r#"{"hex": "00"}"#,
+            r#"{}"#,
+            "42",
+            "null",
+        ] {
+            assert!(read(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_session_says_it_serves_and_how_it_ended() {
+        let serving = Event::serving(std::path::Path::new("/run/user/1000/s.sock"), 4321);
+        assert_eq!(members(&serving), ["event", "pid", "socket", "text"]);
+        assert_eq!(
+            serving.text(),
+            Some("fcage: serving on /run/user/1000/s.sock")
+        );
+
+        let stopped = Event::ended(EndReason::Stop, 0);
+        assert_eq!(members(&stopped), ["event", "reason", "shell-code"]);
+        assert_eq!(stopped.text(), None, "a stop asked for is not said");
+        let signalled = Event::ended(EndReason::Signal(15), 0);
+        assert_eq!(
+            members(&signalled),
+            ["event", "reason", "shell-code", "signal"]
+        );
+        let ended = Event::ended(EndReason::SandboxEnded(ExitStatus::signaled(9)), 137);
+        assert_eq!(
+            members(&ended),
+            ["event", "reason", "shell-code", "signal", "text"]
+        );
+        assert_eq!(
+            ended.text(),
+            Some("fcage: the sandbox ended (terminated by signal 9), and the session with it")
+        );
     }
 
     #[test]
