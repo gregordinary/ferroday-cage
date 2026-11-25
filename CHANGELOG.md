@@ -840,6 +840,10 @@ consumer upgrading can skip it.
   already exited records nothing, so a supervisor that ended some other way,
   as by the kernel's out-of-memory killer, reads as `Error::SupervisorLost`.
   It read as termination by `SIGKILL`.
+- `CageBuilder::read_only`, `ReadOnly` and the guide say that before Linux 5.12,
+  which lacks `mount_setattr`, a path made read-only has only the top mount of
+  its tree made read-only, as a read-only bind has, and that a mount beneath it
+  keeps its own flags.
 
 ### Internal
 

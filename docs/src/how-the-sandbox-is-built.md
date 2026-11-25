@@ -448,7 +448,9 @@ fails there rather than hide nothing.
 [`read_only`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.read_only)
 binds the tree at a path onto itself, read-only, mounts beneath it included. It
 protects a path inside a writable bind, such as a working tree's `.git`,
-without naming the host path the bind came from. Its path must exist when the
+without naming the host path the bind came from. Before Linux 5.12, which
+lacks `mount_setattr`, only the top mount of that tree is made read-only, as
+with a read-only bind. Its path must exist when the
 sequence reaches it: a path left writable because it was missing is one the
 command could create.
 

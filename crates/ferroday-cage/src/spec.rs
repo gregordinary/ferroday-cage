@@ -1115,7 +1115,9 @@ impl Hide {
 
 /// A path inside the sandbox made read-only where it stands: the tree at the
 /// path is bound onto itself, read-only, with every mount beneath it, and its
-/// name is held.
+/// name is held. On a kernel that predates `mount_setattr` (before Linux 5.12)
+/// only the top mount of the tree is made read-only, and a mount beneath the
+/// path keeps its own flags, as with [`CageBuilder::bind_ro`].
 ///
 /// Added with [`CageBuilder::read_only`], or as a `[[mount]]` table with
 /// `kind = "read-only"` in a profile. It takes its place in the mount
@@ -2556,9 +2558,12 @@ impl CageBuilder {
     ///
     /// The tree at the path is bound onto itself read-only, mounts beneath it
     /// included, so a path inside a writable bind is protected without naming
-    /// the host path the bind came from. The directories above it, up to the
-    /// nearest mount, are held in place, so the name stays the path's. See
-    /// [`ReadOnly`]. The path must exist when the sequence reaches it.
+    /// the host path the bind came from. On a kernel that predates
+    /// `mount_setattr` (before Linux 5.12) only the top mount is made
+    /// read-only, and a mount beneath the path keeps its own flags. The
+    /// directories above it, up to the nearest mount, are held in place, so
+    /// the name stays the path's. See [`ReadOnly`]. The path must exist when
+    /// the sequence reaches it.
     pub fn read_only(mut self, path: impl AsRef<Path>) -> Self {
         self.mounts.push(Mount::ReadOnly(ReadOnly::new(path)));
         self
