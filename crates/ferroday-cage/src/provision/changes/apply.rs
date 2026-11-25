@@ -1127,8 +1127,8 @@ fn align_attributes(from: BorrowedFd<'_>, to: BorrowedFd<'_>) -> Result<(), Errn
 /// or an access control list, and not one the host assigns.
 pub(super) fn carries(name: &[u8]) -> bool {
     (name.starts_with(b"user.")
-        || name == b"system.posix_acl_access"
-        || name == b"system.posix_acl_default")
+        || name == xattr::ACCESS_ACL.to_bytes()
+        || name == xattr::DEFAULT_ACL.to_bytes())
         && !containment::host_assigned_xattr(name)
 }
 
