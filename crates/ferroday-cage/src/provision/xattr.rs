@@ -371,6 +371,40 @@ impl Acl {
         value
     }
 
+    #[cfg(feature = "tarball")]
+    /// The list in the text form a `SCHILY.acl.access` or `SCHILY.acl.default`
+    /// pax record holds, as GNU tar writes it: an entry a line, its tag spelled
+    /// out, its permissions as three letters, and a named user or group by its
+    /// id.
+    ///
+    /// GNU tar applies a list from this form and no other, and passes over the
+    /// attribute's own value ([`ACCESS_ACL`]) where it finds both. The ids are
+    /// the ones the list holds rather than names looked up anywhere, so the
+    /// record means what the attribute means and an export is a function of
+    /// the tree alone.
+    pub(super) fn text(&self) -> Vec<u8> {
+        let mut text = Vec::new();
+        for entry in &self.entries {
+            let tag: &[u8] = match entry.tag {
+                ACL_USER_OBJ | ACL_USER => b"user",
+                ACL_GROUP_OBJ | ACL_GROUP => b"group",
+                ACL_MASK => b"mask",
+                _ => b"other",
+            };
+            text.extend_from_slice(tag);
+            text.push(b':');
+            if matches!(entry.tag, ACL_USER | ACL_GROUP) {
+                text.extend_from_slice(entry.id.to_string().as_bytes());
+            }
+            text.push(b':');
+            for (bit, letter) in [(0o4, b'r'), (0o2, b'w'), (0o1, b'x')] {
+                text.push(if entry.perm & bit != 0 { letter } else { b'-' });
+            }
+            text.push(b'\n');
+        }
+        text
+    }
+
     /// The list with each named entry's id read through `uid` or `gid`, or
     /// `None` where either has no answer for one, or the answers make no list:
     /// two ids read as one.
@@ -687,6 +721,27 @@ mod tests {
                 (ACL_MASK, 6, NONE),
                 (ACL_OTHER, 0, NONE),
             ]),
+        );
+    }
+
+    #[cfg(feature = "tarball")]
+    #[test]
+    fn a_list_is_written_as_gnu_tar_writes_its_text() {
+        // GNU tar 1.35's `SCHILY.acl.access` for this list, with numbers where
+        // it wrote names.
+        let acl = list(&[
+            (ACL_USER_OBJ, 6, NONE),
+            (ACL_USER, 4, 0),
+            (ACL_USER, 5, 4242),
+            (ACL_GROUP_OBJ, 4, NONE),
+            (ACL_GROUP, 6, 4243),
+            (ACL_MASK, 7, NONE),
+            (ACL_OTHER, 0, NONE),
+        ]);
+        let text = acl.text();
+        assert_eq!(
+            text,
+            b"user::rw-\nuser:0:r--\nuser:4242:r-x\ngroup::r--\ngroup:4243:rw-\nmask::rwx\nother::---\n",
         );
     }
 

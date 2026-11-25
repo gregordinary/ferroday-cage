@@ -1957,6 +1957,64 @@ fn an_export_refuses_a_list_naming_a_user_the_map_does_not_hold() {
     }
 }
 
+/// GNU tar applies a list from its text record and passes the attribute's own
+/// record over, so `tar --acls` restores what the export read only because the
+/// export writes the text too. The list lands naming the ids the archive
+/// records, which under the single map are the root's: the caller is root
+/// inside.
+#[test]
+fn gnu_tar_applies_an_exported_access_control_list() {
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("acl-gnu-tar");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let shared = root.join("shared");
+    std::fs::write(&shared, b"for the named user\n").unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let list = |named| {
+        xattr::acl(&[
+            (0x01, 6, xattr::NO_ID),
+            (0x02, 6, named),
+            (0x04, 0, xattr::NO_ID),
+            (0x10, 6, xattr::NO_ID),
+            (0x20, 0, xattr::NO_ID),
+        ])
+    };
+    if !xattr::set(&shared, xattr::ACCESS_ACL, &list(uid)) {
+        common::require::FILESYSTEM.skip("this filesystem holds no POSIX access control lists");
+        return;
+    }
+    let mut out = Vec::new();
+    provision::export_tar(&root, &mut out, IdentityMap::Single).expect("the export succeeds");
+    let archive = dir.join("export.tar");
+    std::fs::write(&archive, &out).unwrap();
+    let dest = dir.join("extracted");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    let extracted = common::run_bounded(
+        std::process::Command::new("tar")
+            .arg("--acls")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&dest),
+        std::time::Duration::from_secs(60),
+    );
+    if !extracted.status.success() {
+        common::require::premise_unmet(format!(
+            "GNU tar with --acls did not extract the archive: {}",
+            String::from_utf8_lossy(&extracted.stderr),
+        ));
+        return;
+    }
+    assert_eq!(
+        xattr::get(&dest.join("shared"), xattr::ACCESS_ACL),
+        Some(list(0))
+    );
+}
+
 /// A pax keyword ends at its first `=`, so an attribute whose name holds one is
 /// spelled as GNU tar spells it, `%3D`, with `%` itself as `%25`, and GNU tar
 /// reads it back whole.

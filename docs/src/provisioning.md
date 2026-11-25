@@ -401,6 +401,12 @@ first `=`, so a name holding one is spelled as GNU `tar` spells it. An `=` is
 written `%3D` and a `%` is written `%25`, and GNU `tar` restores the name
 whole.
 
+A POSIX access control list is written twice: as its attribute's record, and as
+the text a `SCHILY.acl.access` record holds, or `SCHILY.acl.default` for a
+directory's default list. The text names users and groups by id. GNU `tar
+--acls` applies the text and passes the attribute's record over, so without it a
+list would not survive extraction by GNU `tar`.
+
 Member names match `tar -C rootfs .`. The archive leads with a `./` directory
 entry for the root and every other member is `./`-prefixed (`./etc/`,
 `./etc/hostname`). A consumer that selects a member by path or strips leading

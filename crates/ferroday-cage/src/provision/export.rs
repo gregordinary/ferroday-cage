@@ -60,7 +60,10 @@ use crate::{IdMapper, IdentityMap};
 /// namespaces, which an unprivileged export can neither read in full nor an
 /// unprivileged extraction restore. Each is a `SCHILY.xattr.` pax record, its
 /// name spelled as GNU tar spells it where it holds an `=` or a `%`, so GNU tar
-/// restores it whole. The attributes the host assigns rather than
+/// restores it whole. A POSIX access control list is also written as the text
+/// a `SCHILY.acl.access` or `SCHILY.acl.default` record holds, its users and
+/// groups by id, since that is the form `tar --acls` applies and it passes the
+/// attribute's own record over. The attributes the host assigns rather than
 /// the tree carries are left out: security-module labels, integrity
 /// measurements, and overlayfs's own bookkeeping. Character and block devices,
 /// FIFOs, and sockets are skipped, as a deployed image's runtime provides its
@@ -1008,6 +1011,22 @@ impl<'f, W: Write> TarWriter<'f, W> {
         }
         for (name, value) in xattrs {
             pax.extend_from_slice(&pax_record(&xattr_keyword(name), value));
+        }
+        // Each access control list again in its text form, which is the one
+        // GNU tar applies: it passes over the attribute's value above. This
+        // crate's extractor reads the value where both are present.
+        for (attribute, keyword) in [
+            (ACCESS_ACL, &b"SCHILY.acl.access"[..]),
+            (DEFAULT_ACL, b"SCHILY.acl.default"),
+        ] {
+            let list = xattrs
+                .iter()
+                .find(|(name, _)| name.as_slice() == attribute.to_bytes());
+            if let Some((_, value)) = list
+                && let Ok(Some(acl)) = Acl::parse(value)
+            {
+                pax.extend_from_slice(&pax_record(keyword, &acl.text()));
+            }
         }
 
         if !pax.is_empty() {

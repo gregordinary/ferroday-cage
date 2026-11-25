@@ -31,6 +31,9 @@ consumer upgrading can skip it.
   group the identity map does not hold, with `ProvisionError::EntryRefused`. The
   kernel reports such an entry with the id that stands for no one, not the
   overflow id, so the export recorded a list no extraction could apply.
+- An `Export` writes each access control list also as a `SCHILY.acl.access` or
+  `SCHILY.acl.default` record, its users and groups by id. GNU `tar --acls`
+  applies only that form, so it extracted an export without its lists.
 - Extraction refuses an entry whose access control list the kernel would not
   store with `ProvisionError::EntryRefused`, naming what is wrong with it, rather
   than failing to set it with an I/O error. A list naming one user or group twice,
