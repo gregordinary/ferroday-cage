@@ -981,7 +981,7 @@ impl Hide {
 /// `kind = "read-only"` in a profile. It takes its place in the mount
 /// sequence, after the mount that brought the path, and works on every kind
 /// of root. It protects a path inside a writable bind, such as a working
-/// tree's `.git/hooks`, without naming the host path the bind came from, so it
+/// tree's `.git`, without naming the host path the bind came from, so it
 /// holds wherever the tree is bound from.
 ///
 /// The path must exist when the sequence reaches it, or the launch fails at
@@ -1636,7 +1636,7 @@ impl CageBuilder {
     /// let cage = ferroday_cage::Cage::builder()
     ///     .host_rootfs()
     ///     .bind("/home/user/project", "/home/user/project")
-    ///     .read_only("/home/user/project/.git/hooks")
+    ///     .read_only("/home/user/project/.git")
     ///     .current_dir("/home/user/project")
     ///     .command("/usr/bin/make")
     ///     .build()?;

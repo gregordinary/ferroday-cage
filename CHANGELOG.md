@@ -25,6 +25,25 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Security
+
+- The `agent-tools` example no longer lets the command it confines write a
+  gitdir the user's git reads. It held `.git/hooks` and `.git/config` read-only
+  inside a writable `.git`, so a command could replace `.git`, or write a
+  `commondir` file or a submodule's `.git` file, and run code as the user at
+  the next git command outside the sandbox. Git in the sandbox now works
+  against private gitdirs in a session directory, each bound at its gitdir's
+  path and borrowing the repository's objects read-only. The command's commits
+  come back through a `git fetch` whose `upload-pack` runs in a sandbox and
+  which checks every object, into `refs/agent/<session>/`, and the checked-out
+  branch fast-forwards to the command's where that adds no submodule.
+  `--git read-only` and `--git isolated` are the other modes, `--session` keeps
+  a session across commands, and `--protected` lists the paths held read-only.
+  A repository the command creates in the tree is reported. The guide's `fcage`
+  command line and the example's profile hold the whole `.git` read-only. A
+  posture copied from the example's earlier one holds the whole gitdir rather
+  than its hooks and configuration.
+
 ### Added
 
 - `Capped`, an observer that keeps the beginning and the end of each stream a

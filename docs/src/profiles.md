@@ -144,7 +144,7 @@ target = "/home/user/project"
 
 [[mount]]
 kind = "read-only"
-target = "/home/user/project/.git/hooks"
+target = "/home/user/project/.git"
 ```
 
 `[env]` is a table of environment variables, added on top of the

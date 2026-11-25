@@ -1,18 +1,21 @@
 # A coding agent's tool commands, confined as the agent-tools example confines
-# them. The working tree, its protected paths, and the command come from the
-# command line:
+# them under its --git read-only. The working tree, its repository read-only, and
+# the command come from the command line:
 #
 #   fcage --profile agent-tools.toml \
-#       --bind "$PWD" "$PWD" --chdir "$PWD" --hide "$PWD/.env" \
-#       --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
-#       --forward-loopback 8080 127.0.0.1:8080 -- git status
+#       --bind "$PWD" "$PWD" --chdir "$PWD" --read-only "$PWD/.git" \
+#       --hide "$PWD/.env" --forward-loopback 8080 127.0.0.1:8080 -- git status
 #
 # --netstack adds the package registries, as the example's --registries does:
 #
 #   fcage --profile agent-tools.toml --netstack \
-#       --bind "$PWD" "$PWD" --chdir "$PWD" --hide "$PWD/.env" \
-#       --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
-#       --forward-loopback 8080 127.0.0.1:8080 -- cargo fetch
+#       --bind "$PWD" "$PWD" --chdir "$PWD" --read-only "$PWD/.git" \
+#       --hide "$PWD/.env" --forward-loopback 8080 127.0.0.1:8080 -- cargo fetch
+#
+# A submodule's .git file takes a --read-only of its own; `agent-tools --git
+# read-only --protected` lists every path to hold. Git that writes, against a
+# private gitdir whose commits come back checked, is the example's alone, since
+# it takes steps before and after the command.
 #
 # The host's own tree is the root, read-only. /home, /root, /run, /var/run and
 # /var/tmp are hidden, and Landlock refuses the command the pathname sockets

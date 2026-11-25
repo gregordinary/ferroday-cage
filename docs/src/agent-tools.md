@@ -31,9 +31,13 @@ let cage = Cage::builder()
     .host_rootfs()
     .bind(tree, tree)
     .current_dir(tree)
+    // The repository's gitdir, and the private one standing in for it.
+    .bind("/tmp/agent-tools-session/git/0", "/home/user/project/.git")
+    .bind_ro(
+        "/home/user/project/.git/objects",
+        "/home/user/project/.git/host-objects",
+    )
     .hide("/home/user/project/.env")
-    .read_only("/home/user/project/.git/hooks")
-    .read_only("/home/user/project/.git/config")
     .present_as(PresentedIdentity::Own)
     .env("HOME", "/tmp")
     .network(Network::Isolated)
@@ -77,21 +81,83 @@ it back read-only.
 
 The working tree is bound read-write at its own path, so a path in the command's
 output names the same file on the host. It is the one place the command writes,
-besides the sandbox's own `/tmp`. Three paths in it are treated apart:
-
-- `.env` is hidden, since it conventionally holds the project's secrets. A
-  hidden file reads empty and refuses a write, and a tree without one hides
-  nothing.
-- `.git/hooks` and `.git/config` are read-only. Git runs the hooks, and obeys
-  the configuration, the next time the user runs git outside the sandbox. A
-  command that can write them can run code there.
+besides the sandbox's own `/tmp`. Its `.env` is hidden, since it conventionally
+holds the project's secrets. A hidden file reads empty and refuses a write, and
+a tree without one hides nothing. Its git repository is the next section's.
 
 A path that [`read_only`] protects must exist, since a path left missing is one
-the command can create. Where a git working tree lacks either path, the example
-creates it empty first, and says so on standard error. `--hide` and
-`--read-only` add paths of the caller's, and a relative one is taken inside the
-working tree. `--expose` binds a host path read-only at its own path, such as a
-toolchain installed under the hidden home directory.
+the command can create. `--hide` and `--read-only` add paths of the caller's,
+and a relative one is taken inside the working tree. `--expose` binds a host
+path read-only at its own path, such as a toolchain installed under the hidden
+home directory.
+
+### Git
+
+A working tree the command writes is input a host tool acts on later, and git
+acts on it unasked. Every git command reads the configuration of the
+repository it finds, and `git status` runs that configuration's
+`core.fsmonitor`. A command that wrote a gitdir the user's git reads could run
+code as the user the next time the user runs git.
+
+Making the configuration and the hooks read-only does not close that. Git also
+reads a `commondir` file beside them, a submodule's `.git` file, and a rebase's
+list of commands to run. So in every mode the command writes no gitdir the
+user's git reads. `--git` chooses how git in the sandbox reaches the
+repository:
+
+| Mode | What the command's git does | What reaches the repository |
+| --- | --- | --- |
+| `private`, the default | Stages, commits, branches, stashes, rebases | Its commits, checked, and the checked-out branch where they fast-forward it |
+| `read-only` | Reads history and reports status, and fails to write | Nothing |
+| `isolated` | As `private`, in a checkout of `HEAD` in the session | Its commits, checked, and no branch moves |
+
+**Private gitdirs.** Each gitdir the tree uses gets a private one in the
+session, bound at the gitdir's own path. That is the top level's, each
+submodule's, and a linked working tree's. A private gitdir starts from the
+repository's refs, `HEAD` and index. It borrows the repository's objects
+read-only through `objects/info/alternates`. The repository's own hooks are
+bound read-only in it, so the project's hooks run on the command's commits,
+inside the sandbox.
+
+**Taking commits in.** After the command, an ordinary `git fetch` takes its
+branches, tags and `HEAD` into the repository, under `refs/agent/<session>/`.
+The side git fetches from, `git upload-pack`, runs in a sandbox of its own over
+the private gitdir. The fetch checks every object as it would from an untrusted
+server, so a commit whose tree holds a `.git` entry is refused.
+
+In private mode the branch the user has checked out then moves to the
+command's. It moves only as a fast-forward that adds no submodule and leaves
+`.gitmodules` as it was. Its index follows, and the working tree stays as the
+command left it. A branch the user moved on meanwhile is not a fast-forward, so
+the command's stays under `refs/agent/` for the user to merge. A ref the
+repository already has at the same commit leaves the namespace.
+
+**Sessions.** A session holds the private gitdirs and an isolated checkout.
+Without `--session`, each run has a temporary one, removed once its commits are
+in. What the command staged and did not commit goes with it. `--session DIR`
+keeps one across commands, as a runtime does for one task's many commands. A
+session holds what commands wrote, so nobody runs git inside one. A temporary
+session whose commits could not be taken in is kept, and the example names it.
+
+**Held paths.** The paths in the tree that git obeys are bound read-only:
+
+- Each submodule's `.git` file, and the directory of each submodule not
+  checked out.
+- A linked working tree's `.git` file, and every other repository already in
+  the tree.
+- The files and the hooks directory the configuration names inside the tree.
+
+`--protected` prints them, with the gitdir mounts, and exits. A runtime's own
+editing tool runs outside the sandbox, so it refuses the same paths. A
+submodule that keeps its gitdir inside the tree, where a command could have
+written it, is refused until `git submodule absorbgitdirs` moves it out. So is
+a repository using an extension a private gitdir cannot stand in for, such as a
+partial clone's, which runs with `--git read-only` instead.
+
+**Reported.** A repository the command creates in the tree is past what a mount
+can hold, and git honors one. Added with `git add -A`, it becomes a submodule,
+and `git status` then runs its `core.fsmonitor`. The example reports each one
+after the command, unless `--no-repository-report` is given.
 
 ### The identity
 
@@ -415,16 +481,19 @@ the signal that ended it. A command that outlives `--timeout` gives 124, as
 
 `crates/ferroday-cage/examples/agent-tools.toml` gives `fcage` the same sandbox.
 The profile holds what every command shares, the registries included. The
-command line adds the working tree, its protected paths, and a forward of the
-loopback port to the runtime's service on the host:
+command line adds the working tree, its repository read-only, and a forward of
+the loopback port to the runtime's service on the host:
 
 ```sh
 fcage --profile crates/ferroday-cage/examples/agent-tools.toml \
-    --bind "$PWD" "$PWD" --chdir "$PWD" --hide "$PWD/.env" \
-    --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
-    --forward-loopback 8080 127.0.0.1:8080 \
+    --bind "$PWD" "$PWD" --chdir "$PWD" --read-only "$PWD/.git" \
+    --hide "$PWD/.env" --forward-loopback 8080 127.0.0.1:8080 \
     --timeout 600 -- git status
 ```
+
+`fcage` offers the read-only mode alone, since a private gitdir needs the
+example's steps before and after the command. A submodule's `.git` file takes a
+`--read-only` of its own, as `agent-tools --git read-only --protected` lists.
 
 `--forward-loopback` carries each connection to the target the service listens
 at on the host, a TCP address or a unix socket. It holds at most 128
@@ -441,9 +510,8 @@ table is unused, and `fcage` says so:
 
 ```sh
 fcage --profile crates/ferroday-cage/examples/agent-tools.toml --netstack \
-    --bind "$PWD" "$PWD" --chdir "$PWD" --hide "$PWD/.env" \
-    --read-only "$PWD/.git/hooks" --read-only "$PWD/.git/config" \
-    --forward-loopback 8080 127.0.0.1:8080 \
+    --bind "$PWD" "$PWD" --chdir "$PWD" --read-only "$PWD/.git" \
+    --hide "$PWD/.env" --forward-loopback 8080 127.0.0.1:8080 \
     --timeout 600 -- cargo fetch
 ```
 
@@ -464,7 +532,7 @@ the example builds. They hold its `[netstack]` table to the stack
 
 ## Running the example
 
-The example lives at `crates/ferroday-cage/examples/agent-tools.rs` and needs
+The example lives in `crates/ferroday-cage/examples/agent-tools/` and needs
 the `hardening` and `netstack` features. `--worktree` names the working tree,
 and the current directory is the working tree without it. A command without a
 slash is found on the sandbox's `PATH`:
@@ -500,12 +568,16 @@ systemd-run --user --scope -p Delegate=yes \
 
 ## What stays in view
 
-The sandbox confines what the command writes and whom it talks to. Four things
+The sandbox confines what the command writes and whom it talks to. Five things
 remain the caller's to decide:
 
 - The rest of the host's tree stays readable, `/etc`, `/opt` and `/sys` among
   it. A path there that holds a secret is hidden with `--hide`, or left out by
   `--empty-root`.
+- The project's files are the command's to write, those a tool runs included.
+  That covers a Makefile and an `.envrc`. It covers the scripts a hook manager
+  such as husky, pre-commit or lefthook keeps in the tree, which the user's own
+  commit runs.
 - The service is as narrow as its policy. A proxy that admits every
   destination gives the command the network.
 - The registries are as narrow as a name rule. Each sits behind a content

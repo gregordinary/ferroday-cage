@@ -491,6 +491,17 @@ whether it succeeds or fails: a sandbox ran in it, and an overlay's work \
 directory is left mode `0` with something inside it, which the caller cannot \
 remove by itself."""
 
+[[idiom.site]]
+path = "crates/ferroday-cage/examples/agent-tools/git.rs"
+count = 1
+why = """\
+A git session's temporary directory, for the reason `overlay-race.rs` gives: \
+`Scratch` is not public, and an example is a consumer of the public API alone. \
+It is named for the session, by the time, the process and a count, and \
+removed through `provision::Remove` when the session ends, since sandboxes \
+wrote it. The one it keeps is a session whose commits could not be taken in, \
+which the example names, so nothing a command committed is lost."""
+
 [[idiom]]
 name = "a write whose zero-byte case is decided inline"
 # Anchored on the `match` over a write with an `Ok(0)` arm directly under it,

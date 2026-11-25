@@ -11,9 +11,12 @@
 //! - **The root** is the host's own tree, read-only, with the home directories
 //!   and the runtime directories hidden. `--empty-root` composes one from the
 //!   host's `/usr` and `/etc` instead.
-//! - **The working tree** is bound read-write at its own path. `.env` is
-//!   hidden, and `.git/hooks` and `.git/config` are read-only, since git runs or
-//!   obeys what they hold the next time the user runs git outside the sandbox.
+//! - **The working tree** is bound read-write at its own path, and `.env` is
+//!   hidden.
+//! - **Git** in the sandbox works against private gitdirs, so the command
+//!   writes no gitdir the user's git reads, and its commits come back through
+//!   a fetch that checks every object. The [`git`] module sets out the modes,
+//!   the paths held read-only, and what is reported.
 //! - **The identity** is the caller's own: the command runs as the caller's uid
 //!   and gid, so files read as the caller's and the host's account database
 //!   agrees with it. Its home directory is its own `/tmp`, since the caller's is
@@ -69,22 +72,15 @@ use ferroday_cage::{
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 
+#[path = "../common/mod.rs"]
 mod common;
+mod git;
 
 use common::{failure, flag_value, into_string, string_value, usage_error, value_for};
 
 /// Paths of a working tree hidden by default: they conventionally hold the
 /// project's secrets.
 const HIDDEN: &[&str] = &[".env"];
-
-/// Paths of a git working tree made read-only by default, with what each is.
-/// Git runs the hooks, and obeys the configuration, the next time the user runs
-/// git outside the sandbox, so a command that could write them could run code
-/// there.
-const PROTECTED: &[(&str, Entry)] = &[
-    (".git/hooks", Entry::Directory),
-    (".git/config", Entry::File),
-];
 
 /// The home directory the command runs with: the sandbox's own `/tmp`, empty at
 /// each launch and discarded with the sandbox.
@@ -169,14 +165,28 @@ Usage:
 
 The working tree:
   --worktree DIR        The working tree, bound read-write at its own path
-                        (default: the current directory). Its .env is hidden,
-                        and its .git/hooks and .git/config are read-only
+                        (default: the current directory). Its .env is hidden
   --hide PATH           Hide PATH, so it reads empty and cannot be written
                         (repeatable). A relative PATH is in the working tree
   --read-only PATH      Make PATH read-only (repeatable). A relative PATH is in
                         the working tree, and PATH must exist
   --expose PATH         Bind host PATH read-only at its own path, such as a
                         toolchain in the hidden home directory (repeatable)
+
+Git, where the working tree is a repository's:
+  --git MODE            How the command's git reaches the repository. private
+                        (the default): a private gitdir for each of the tree's,
+                        whose commits come back into the repository and move
+                        the checked-out branch where they fast-forward it.
+                        read-only: the repository's gitdirs, read-only.
+                        isolated: a checkout of HEAD in the session, whose
+                        commits come back and move nothing
+  --session DIR         Keep the session in DIR across commands, made where
+                        missing (default: a temporary one, removed at exit)
+  --no-repository-report
+                        Report no repository the command makes in the tree
+  --protected           Print the paths the command may not write, which a
+                        runtime's own editing tool refuses as well, and exit
 
 The root:
   --empty-root          Compose the root from the host's /usr and /etc alone,
@@ -237,15 +247,16 @@ struct Config {
     timeout: Option<Duration>,
     /// Environment variables for the command.
     env: Vec<(OsString, OsString)>,
+    /// How the command's git reaches the repository.
+    git: git::Mode,
+    /// The session directory kept across commands, where one is named.
+    session: Option<PathBuf>,
+    /// Whether a repository the command makes in the tree is reported.
+    report: bool,
+    /// Whether the run prints the protected paths rather than running.
+    print_protected: bool,
     /// The command line, never empty.
     command: Vec<OsString>,
-}
-
-/// What a protected path is, for creating one that is missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Entry {
-    Directory,
-    File,
 }
 
 /// Why a run did not reach the command's outcome.
@@ -310,6 +321,10 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         allow: Vec::new(),
         timeout: None,
         env: Vec::new(),
+        git: git::Mode::Private,
+        session: None,
+        report: true,
+        print_protected: false,
         command: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -342,6 +357,18 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
                 .push(PathBuf::from(value_for("--expose", &mut args)?));
         } else if let Some(value) = flag_value(&arg, b"--expose=") {
             config.expose.push(PathBuf::from(value));
+        } else if arg == "--git" {
+            config.git = git::Mode::parse(&string_value("--git", &mut args)?)?;
+        } else if let Some(value) = flag_value(&arg, b"--git=") {
+            config.git = git::Mode::parse(&into_string("--git", value)?)?;
+        } else if arg == "--session" {
+            config.session = Some(PathBuf::from(value_for("--session", &mut args)?));
+        } else if let Some(value) = flag_value(&arg, b"--session=") {
+            config.session = Some(PathBuf::from(value));
+        } else if arg == "--no-repository-report" {
+            config.report = false;
+        } else if arg == "--protected" {
+            config.print_protected = true;
         } else if arg == "--empty-root" {
             config.empty_root = true;
         } else if arg == "--port" {
@@ -375,7 +402,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
             break;
         }
     }
-    if config.command.is_empty() {
+    if config.command.is_empty() && !config.print_protected {
         return Err("a command to run is required".to_string());
     }
     if !config.allow.is_empty() && !config.registries {
@@ -441,8 +468,46 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
             worktree.display()
         )));
     }
-    prepare_protected(&worktree)?;
+    let session = git::Session::open(
+        &worktree,
+        config.git,
+        config.session.as_deref(),
+        config.report,
+    )
+    .map_err(Failure::Own)?;
+    if config.print_protected {
+        if let Some(session) = session {
+            for path in session.protected() {
+                println!("{}", path.display());
+            }
+            session.discard();
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Once the command has run, what it committed is taken in, whatever its
+    // outcome; a launch that never reached the command leaves nothing to take.
+    let launched = launch(&config, &worktree, session.as_ref());
+    match (session, launched) {
+        (Some(session), Ok(code)) => {
+            session.finish().map_err(Failure::Own)?;
+            Ok(code)
+        }
+        (Some(session), Err(failure)) => {
+            session.discard();
+            Err(failure)
+        }
+        (None, launched) => launched,
+    }
+}
 
+/// Launches the command in its sandbox over `worktree`, with the mounts the
+/// git `session` needs where the tree is a repository's, serves its one way out
+/// until it exits, and reports its outcome and what it used.
+fn launch(
+    config: &Config,
+    worktree: &Path,
+    session: Option<&git::Session>,
+) -> Result<ExitCode, Failure> {
     let cgroup = match delegated_cgroup() {
         Ok(parent) => {
             eprintln!(
@@ -473,8 +538,9 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
         None
     };
     let cage = posture(
-        &config,
-        &worktree,
+        config,
+        worktree,
+        session,
         cgroup.as_deref(),
         resolve_unix,
         stack.as_ref(),
@@ -520,6 +586,7 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
 fn posture(
     config: &Config,
     worktree: &Path,
+    session: Option<&git::Session>,
     cgroup: Option<&Path>,
     resolve_unix: bool,
     stack: Option<&NetStack>,
@@ -532,12 +599,18 @@ fn posture(
     for path in &config.expose {
         builder = builder.bind_ro(path, path);
     }
-    builder = builder.bind(worktree, worktree).current_dir(worktree);
+    // The caller's tree, or an isolated session's checkout of it, at the
+    // working tree's path.
+    let tree = session.map_or(worktree, git::Session::tree);
+    builder = builder.bind(tree, worktree).current_dir(worktree);
+    if let Some(session) = session {
+        builder = session.mount(builder);
+    }
     // In order: each hide and read-only path lands on the working tree's bind.
     for path in defaults(worktree, HIDDEN).chain(within(worktree, &config.hide)) {
         builder = builder.hide(path);
     }
-    for path in protected(worktree).chain(within(worktree, &config.read_only)) {
+    for path in within(worktree, &config.read_only) {
         builder = builder.read_only(path);
     }
 
@@ -682,42 +755,6 @@ fn defaults<'a>(worktree: &'a Path, names: &'a [&str]) -> impl Iterator<Item = P
 /// The paths a caller named, a relative one taken inside the working tree.
 fn within<'a>(worktree: &'a Path, paths: &'a [PathBuf]) -> impl Iterator<Item = PathBuf> + 'a {
     paths.iter().map(move |path| worktree.join(path))
-}
-
-/// The default read-only paths, with what each is, for a working tree whose
-/// `.git` is a directory.
-fn protected_entries(worktree: &Path) -> impl Iterator<Item = (PathBuf, Entry)> + '_ {
-    let git = worktree.join(".git").is_dir();
-    PROTECTED
-        .iter()
-        .filter(move |_| git)
-        .map(move |&(name, entry)| (worktree.join(name), entry))
-}
-
-/// The default read-only paths of a working tree.
-fn protected(worktree: &Path) -> impl Iterator<Item = PathBuf> + '_ {
-    protected_entries(worktree).map(|(path, _)| path)
-}
-
-/// Creates whichever default read-only path is missing from a git working tree,
-/// empty. A path left missing is one the command could create, and a hook it
-/// created would run outside the sandbox.
-fn prepare_protected(worktree: &Path) -> Result<(), Failure> {
-    for (path, entry) in protected_entries(worktree) {
-        if path.symlink_metadata().is_ok() {
-            continue;
-        }
-        let created = match entry {
-            Entry::Directory => std::fs::create_dir(&path),
-            Entry::File => std::fs::File::create_new(&path).map(drop),
-        };
-        created.map_err(|err| Failure::Own(format!("cannot create {}: {err}", path.display())))?;
-        eprintln!(
-            "agent-tools: created an empty {}, to make it read-only",
-            path.display()
-        );
-    }
-    Ok(())
 }
 
 /// The cgroup this process runs in, made ready to hold each command's cgroup,
@@ -966,6 +1003,47 @@ mod tests {
         dir
     }
 
+    /// A git repository with one commit on `main`, made fresh for the test.
+    fn repository(name: &str) -> PathBuf {
+        let dir = ferroday_cage_testkit::scratch::scratch_dir(&format!("agent-tools-{name}"));
+        let dir = std::fs::canonicalize(dir).expect("the scratch directory resolves");
+        host_git_in(&dir, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(dir.join("README"), "one\n").unwrap();
+        host_git_in(&dir, &["add", "README"]);
+        host_git_in(&dir, &["commit", "--quiet", "--message", "one"]);
+        dir
+    }
+
+    /// Runs git in `dir` as the caller does, with an identity of its own and
+    /// nothing of the caller's environment.
+    fn host_git_in(dir: &Path, args: &[&str]) -> String {
+        let mut command = std::process::Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(name);
+            }
+        }
+        let output = command
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=tester",
+                "-c",
+                "user.email=tester@example.invalid",
+            ])
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     #[test]
     fn the_documented_invocations_parse() {
         let config = parse_run(&["--worktree", "/w", "--", "git", "status"]);
@@ -1072,6 +1150,7 @@ mod tests {
                 let built = posture(
                     &config,
                     &tree,
+                    None,
                     cgroup,
                     host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
                     None,
@@ -1103,6 +1182,7 @@ mod tests {
             &config,
             &tree,
             None,
+            None,
             host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
             Some(&stack),
         );
@@ -1110,23 +1190,6 @@ mod tests {
         if let Err(error) = built.command("cargo").arg("fetch").build() {
             panic!("{}", ErrorChain::new(&error));
         }
-    }
-
-    #[test]
-    fn a_git_tree_s_hooks_and_configuration_are_protected_and_a_missing_one_is_made() {
-        let tree = worktree("protected");
-        assert_eq!(
-            protected(&tree).collect::<Vec<_>>(),
-            [tree.join(".git/hooks"), tree.join(".git/config")]
-        );
-        assert!(prepare_protected(&tree).is_ok());
-        assert!(tree.join(".git/hooks").is_dir());
-        assert!(tree.join(".git/config").is_file());
-        // A tree that is not a git working tree has nothing to protect.
-        let plain = ferroday_cage_testkit::scratch::scratch_dir("agent-tools-plain");
-        assert_eq!(protected(&plain).count(), 0);
-        assert!(prepare_protected(&plain).is_ok());
-        assert!(!plain.join(".git").exists());
     }
 
     /// `fcage` reads the profile beside this file, and the guide's command line
@@ -1155,7 +1218,12 @@ mod tests {
         assert_eq!(serialized(&stack), serialized(&registries(&[])));
         let stack = stack.build().expect("the profile's stack builds");
 
-        let tree = worktree("profile");
+        let tree = repository("profile");
+        // `fcage` can offer the read-only posture alone: the private ones need
+        // the example's own steps before and after the command.
+        let session = git::Session::open(&tree, git::Mode::ReadOnly, None, false)
+            .expect("the session opens")
+            .expect("the tree is a repository's");
         let parent = Path::new("/sys/fs/cgroup/agent");
         for (cgroup, attached) in [None, Some(parent)]
             .into_iter()
@@ -1168,9 +1236,8 @@ mod tests {
                 .clone()
                 .bind(&tree, &tree)
                 .current_dir(&tree)
+                .read_only(tree.join(".git"))
                 .hide(tree.join(".env"))
-                .read_only(tree.join(".git/hooks"))
-                .read_only(tree.join(".git/config"))
                 .command("git");
             let from_profile = match cgroup {
                 Some(parent) => from_profile.cgroup_parent(parent),
@@ -1185,6 +1252,7 @@ mod tests {
             let example = posture(
                 &parse_run(&["git"]),
                 &tree,
+                Some(&session),
                 cgroup,
                 host::landlock_enforces_fs(FsAccess::RESOLVE_UNIX),
                 attached,
@@ -1211,6 +1279,290 @@ mod tests {
                 attached.is_some()
             );
         }
+    }
+
+    // -- Git, end to end ------------------------------------------------------
+    //
+    // A real repository, a real sandbox, and a command that tries what a
+    // hostile one would, writing a marker file where the caller's git would
+    // run what it planted. Each needs user namespaces.
+
+    /// Runs `script` as the command over `tree` under `--git mode`, with the
+    /// example's other `flags`.
+    fn run_script(
+        tree: &Path,
+        mode: &str,
+        flags: &[&str],
+        script: &str,
+    ) -> Result<ExitCode, String> {
+        let mut line = vec!["--worktree", tree.to_str().unwrap(), "--git", mode];
+        line.extend_from_slice(flags);
+        line.extend_from_slice(&["--", "/bin/sh", "-c", script]);
+        match run(parse_run(&line)) {
+            Ok(code) => Ok(code),
+            Err(Failure::Own(message)) => Err(message),
+            Err(Failure::Sandbox(error)) => Err(ErrorChain::new(&error).to_string()),
+            Err(Failure::Stack(error)) => Err(ErrorChain::new(&error).to_string()),
+        }
+    }
+
+    /// A repository whose own configuration names the identity its commits
+    /// carry, so a private gitdir carries it too.
+    fn identified(name: &str) -> PathBuf {
+        let tree = repository(name);
+        host_git_in(&tree, &["config", "user.name", "tester"]);
+        host_git_in(&tree, &["config", "user.email", "tester@example.invalid"]);
+        tree
+    }
+
+    #[test]
+    fn a_private_gitdir_keeps_what_the_command_plants_and_its_commits_come_back() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let tree = identified("git-private");
+        let marker = tree.parent().unwrap().join("git-private-marker");
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "set -e
+             echo two >> README && git add README && git commit -q -m two
+             # The caller's hooks are read-only, here as everywhere.
+             if printf '#!/bin/sh\\ntouch {m}\\n' > .git/hooks/post-checkout 2>/dev/null; then
+                 exit 5
+             fi
+             git config core.fsmonitor 'touch {m}; false'
+             if mv .git moved 2>/dev/null; then exit 3; fi
+             mkdir decoy
+             if mv -T decoy .git 2>/dev/null; then exit 4; fi
+             rmdir decoy",
+            m = marker.display()
+        );
+        let code = run_script(&tree, "private", &[], &script).expect("the run settles");
+        assert_eq!(code, ExitCode::SUCCESS);
+        // The caller's branch moved to the command's commit, and its tree and
+        // index agree with it.
+        assert_eq!(host_git_in(&tree, &["log", "-1", "--format=%s"]), "two");
+        assert_eq!(host_git_in(&tree, &["status", "--porcelain"]), "");
+        // What the command planted stayed in its session.
+        assert!(!tree.join(".git/hooks/post-checkout").exists());
+        assert!(!host_git_in(&tree, &["config", "--list"]).contains("fsmonitor"));
+        host_git_in(&tree, &["checkout", "--quiet", "-b", "other"]);
+        assert!(
+            !marker.exists(),
+            "the caller's git ran what the command planted"
+        );
+        // Nothing is left under the session's namespace once taken in.
+        assert_eq!(host_git_in(&tree, &["for-each-ref", "refs/agent"]), "");
+    }
+
+    #[test]
+    fn a_planted_commondir_never_reaches_the_callers_gitdir() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let tree = identified("git-commondir");
+        let session =
+            ferroday_cage_testkit::scratch::scratch_dir("agent-tools-git-commondir-session");
+        // The command breaks its own private gitdir, so nothing can be taken in
+        // from it, and the run says so.
+        let refused = run_script(
+            &tree,
+            "private",
+            &["--session", session.to_str().unwrap()],
+            "echo /tmp > .git/commondir",
+        );
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(!tree.join(".git/commondir").exists());
+        assert_eq!(host_git_in(&tree, &["log", "-1", "--format=%s"]), "one");
+    }
+
+    #[test]
+    fn a_commit_git_would_not_fetch_from_a_server_is_refused() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let tree = identified("git-hostile");
+        let script = "set -e
+             blob=$(echo x | git hash-object -w --stdin)
+             subtree=$(printf '100644 blob %s\\tconfig\\n' \"$blob\" | git mktree)
+             top=$(printf '040000 tree %s\\t.git\\n' \"$subtree\" | git mktree)
+             commit=$(echo hostile | git commit-tree \"$top\" -p HEAD)
+             git update-ref refs/heads/main \"$commit\"";
+        let refused = run_script(&tree, "private", &[], script);
+        let message = refused.expect_err("the commits are refused");
+        assert!(message.contains("refused"), "{message}");
+        assert_eq!(host_git_in(&tree, &["log", "-1", "--format=%s"]), "one");
+    }
+
+    #[test]
+    fn a_submodule_gets_a_private_gitdir_and_its_gitfile_is_held() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let inner = identified("git-inner");
+        let tree = identified("git-outer");
+        host_git_in(
+            &tree,
+            &[
+                "submodule",
+                "--quiet",
+                "add",
+                inner.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        host_git_in(&tree, &["commit", "--quiet", "-m", "sub"]);
+        host_git_in(&tree.join("sub"), &["config", "user.name", "tester"]);
+        host_git_in(
+            &tree.join("sub"),
+            &["config", "user.email", "tester@example.invalid"],
+        );
+        let gitfile = std::fs::read(tree.join("sub/.git")).unwrap();
+        let script = "set -e
+             if echo 'gitdir: /tmp' > sub/.git 2>/dev/null; then exit 3; fi
+             cd sub && echo change > inner && git add inner && git commit -q -m inner-change
+             cd .. && git add sub && git commit -q -m bump";
+        let code = run_script(&tree, "private", &[], script).expect("the run settles");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(std::fs::read(tree.join("sub/.git")).unwrap(), gitfile);
+        assert_eq!(host_git_in(&tree, &["log", "-1", "--format=%s"]), "bump");
+        assert_eq!(
+            host_git_in(&tree.join("sub"), &["log", "-1", "--format=%s"]),
+            "inner-change"
+        );
+        assert_eq!(host_git_in(&tree, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn an_isolated_session_leaves_the_tree_and_its_branch_alone() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let tree = identified("git-isolated");
+        let script = "set -e
+             echo two >> README && git commit -q -a -m two";
+        let code = run_script(&tree, "isolated", &[], script).expect("the run settles");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read_to_string(tree.join("README")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(host_git_in(&tree, &["log", "-1", "--format=%s"]), "one");
+        let taken = host_git_in(
+            &tree,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(subject)",
+                "refs/agent",
+            ],
+        );
+        assert!(
+            taken.lines().any(|line| line.ends_with("/heads/main two")),
+            "{taken}"
+        );
+    }
+
+    #[test]
+    fn the_read_only_mode_reads_and_refuses_writes() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let tree = identified("git-read-only");
+        let script = "git status --short >/dev/null || exit 3
+             if git commit -q --allow-empty -m nope 2>/dev/null; then exit 4; fi
+             if echo /tmp > .git/commondir 2>/dev/null; then exit 5; fi";
+        let code = run_script(&tree, "read-only", &[], script).expect("the run settles");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(host_git_in(&tree, &["log", "-1", "--format=%s"]), "one");
+    }
+
+    #[test]
+    fn a_linked_working_tree_gets_a_private_gitdir_of_its_own() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let main = identified("git-linked-main");
+        let linked = std::fs::canonicalize(ferroday_cage_testkit::scratch::scratch_dir(
+            "agent-tools-git-linked-worktree",
+        ))
+        .unwrap();
+        host_git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let gitfile = std::fs::read(linked.join(".git")).unwrap();
+        let script = "set -e
+             if echo 'gitdir: /tmp' > .git 2>/dev/null; then exit 3; fi
+             echo two >> README && git commit -q -a -m two";
+        let code = run_script(&linked, "private", &[], script).expect("the run settles");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(std::fs::read(linked.join(".git")).unwrap(), gitfile);
+        assert_eq!(
+            host_git_in(&main, &["log", "-1", "--format=%s", "feature"]),
+            "two"
+        );
+        assert_eq!(
+            host_git_in(&main, &["log", "-1", "--format=%s", "main"]),
+            "one"
+        );
+    }
+
+    #[test]
+    fn the_paths_git_obeys_in_the_tree_are_held_and_listed() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let inner = identified("git-held-inner");
+        let tree = identified("git-held");
+        // A submodule the tree does not check out, a repository of its own
+        // inside the tree, and configuration the repository includes from it.
+        host_git_in(
+            &tree,
+            &[
+                "submodule",
+                "--quiet",
+                "add",
+                inner.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        host_git_in(&tree, &["commit", "--quiet", "-m", "sub"]);
+        host_git_in(&tree, &["submodule", "--quiet", "deinit", "--force", "sub"]);
+        let vendored = tree.join("vendor/tool");
+        std::fs::create_dir_all(&vendored).unwrap();
+        host_git_in(&vendored, &["init", "--quiet"]);
+        std::fs::write(tree.join("shared.gitconfig"), "").unwrap();
+        host_git_in(&tree, &["config", "include.path", "../shared.gitconfig"]);
+
+        let session = git::Session::open(&tree, git::Mode::Private, None, false)
+            .expect("the session opens")
+            .expect("the tree is a repository's");
+        let listed = session.protected();
+        session.discard();
+        for path in [".git", "sub", "vendor/tool/.git", "shared.gitconfig"] {
+            assert!(
+                listed.contains(&tree.join(path)),
+                "{path} is not listed: {listed:?}"
+            );
+        }
+
+        let script = "if mkdir sub/.git 2>/dev/null; then exit 3; fi
+             if echo '[core]' >> vendor/tool/.git/config 2>/dev/null; then exit 4; fi
+             if echo '[core]' >> shared.gitconfig 2>/dev/null; then exit 5; fi
+             echo free > free";
+        let code = run_script(&tree, "private", &[], script).expect("the run settles");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read_to_string(tree.join("free")).unwrap(),
+            "free\n"
+        );
     }
 
     #[test]
