@@ -254,7 +254,7 @@ of two:
 [`SeccompRules::curated`] is the built-in deny-list of dangerous and
 rarely-legitimate syscalls, answering each with `EPERM` and allowing the rest.
 It covers mounting, creating or entering a namespace, kernel modules, the
-keyring, tracing, time-setting, and similar. Some entries name an argument
+keyring, tracing, time-setting, reading the kernel's log, and similar. Some entries name an argument
 rather than a whole syscall. `ioctl` is denied for the `TIOCSTI` and
 `TIOCLINUX` requests, which write to a terminal's input queue. `clone` and
 `unshare` are denied when their flags create a namespace, so processes and

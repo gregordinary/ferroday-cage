@@ -1231,8 +1231,8 @@ impl SeccompRules {
     /// and the roster keeps it.
     ///
     /// The roster covers mounting, creating or entering a namespace, kernel
-    /// modules, the keyring, tracing, setting the time, and similar
-    /// administrative surfaces. Some entries are conditioned on an argument
+    /// modules, the keyring, tracing, setting the time, reading the kernel's
+    /// log, and similar administrative surfaces. Some entries are conditioned on an argument
     /// rather than naming a whole syscall. `ioctl` is denied for the `TIOCSTI`
     /// and `TIOCLINUX` requests, which write to a terminal's input queue, and
     /// allowed for everything else. `unshare` and `clone` are denied whenever
@@ -1670,10 +1670,14 @@ fn curated_denylist() -> Vec<i64> {
         // descriptor theft, reachable against another process of the same uid
         // in a restriction (no PID namespace) where ptrace alone would not
         // suffice. `pidfd_getfd` copies a descriptor out of a process under
-        // the same ptrace check `process_vm_readv` makes.
+        // the same ptrace check `process_vm_readv` makes, and `kcmp` compares
+        // two processes' open files, memory and other kernel objects under
+        // it. A program comparing two descriptors of its own with `kcmp` is
+        // refused as well.
         Sysno::process_vm_readv,
         Sysno::process_vm_writev,
         Sysno::pidfd_getfd,
+        Sysno::kcmp,
         Sysno::perf_event_open,
         // Handing page-fault resolution to userspace is a standard primitive
         // for widening a kernel race into a reliable exploit, and nothing a
@@ -1695,6 +1699,14 @@ fn curated_denylist() -> Vec<i64> {
         Sysno::setns,
         Sysno::acct,
         Sysno::quotactl,
+        // `quotactl` on a filesystem named by a descriptor rather than by its
+        // block device.
+        Sysno::quotactl_fd,
+        // The kernel's log, which no namespace partitions: where
+        // `kernel.dmesg_restrict` is off, any process reads every message the
+        // host's kernel logged, its addresses and other users' devices among
+        // them.
+        Sysno::syslog,
     ];
 
     // `modify_ldt` changes the execution domain like `personality` does, and is
@@ -3762,6 +3774,7 @@ mod tests {
             Sysno::ptrace,
             Sysno::process_vm_readv,
             Sysno::pidfd_getfd,
+            Sysno::kcmp,
             Sysno::perf_event_open,
             Sysno::bpf,
             Sysno::userfaultfd,
@@ -3769,8 +3782,12 @@ mod tests {
             // cannot see through.
             Sysno::personality,
             Sysno::io_uring_setup,
-            // The clock.
+            // The clock, quotas by device and by descriptor, and the kernel's
+            // log.
             Sysno::clock_settime,
+            Sysno::quotactl,
+            Sysno::quotactl_fd,
+            Sysno::syslog,
         ] {
             assert!(
                 list.contains(&(sysno.id() as i64)),

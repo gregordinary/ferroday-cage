@@ -27,6 +27,10 @@ consumer upgrading can skip it.
 
 ### Security
 
+- The curated seccomp roster refuses `quotactl_fd`, `quotactl`'s twin naming
+  a filesystem by a descriptor; `kcmp`, which compares two processes' open
+  files and memory under the check `process_vm_readv` makes; and `syslog`,
+  which reads the host kernel's log wherever `kernel.dmesg_restrict` is off.
 - **Breaking.** Wherever the Landlock signal scope holds a command that shares
   the PID namespace of processes outside the sandbox, in a restriction, whose
   default it is from Landlock ABI 6, and in a sandbox under
