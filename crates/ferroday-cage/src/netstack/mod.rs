@@ -35,6 +35,11 @@
 //! whether the stack happens to hold a socket on that port for some other
 //! destination, so a caller must not read anything into either outcome.
 //!
+//! The stack reports each decision it takes about a flow of the guest's, carried
+//! or refused and why, to a queue the caller reads through
+//! [`NetStackHandle::take_reports`]. The pump never waits on that reader: a
+//! report the queue has no room for is dropped and counted.
+//!
 //! Connections run the other way only where the caller publishes a port:
 //! [`publish`](NetStackBuilder::publish) has the stack listen on a host address
 //! and carry each connection it accepts to a TCP port of the guest's.
@@ -83,6 +88,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint};
 use crate::running::Pending;
 
 pub use policy::{DestinationRule, ParseDestinationRuleError, Transport};
+pub use report::{FlowAdmission, FlowRefusal, NetStackReport, NetStackReports};
 
 mod device;
 mod dns;
@@ -100,6 +106,7 @@ mod nameserver;
 mod policy;
 mod prefix;
 mod pump;
+mod report;
 mod sniff;
 mod tap;
 mod tcp;
@@ -332,7 +339,7 @@ impl NetStack {
     /// assert!(!bounded.forwards(Transport::Udp, "192.0.2.53:53".parse().unwrap()));
     /// ```
     pub fn forwards(&self, transport: Transport, destination: SocketAddr) -> bool {
-        pump::host_target(transport, destination.into(), &self.plan).is_some()
+        pump::host_target(transport, destination.into(), &self.plan).is_ok()
     }
 
     /// The addresses the stack's nameserver answers on, for the sandbox's
@@ -454,11 +461,12 @@ impl NetStack {
             .plan
             .nameserver
             .then(|| self.plan.upstream.unwrap_or_else(nameserver::host_upstream));
+        let (reporter, reports) = report::Reporter::new();
         let pump = std::thread::Builder::new()
             .name("fcage-netstack".to_string())
             .spawn(move || {
                 run_caught(
-                    || pump::run(tap, polled, plan, listeners, upstream),
+                    || pump::run(tap, polled, plan, listeners, upstream, reporter),
                     &running_pump,
                 )
             })
@@ -469,6 +477,7 @@ impl NetStack {
             stop,
             running,
             published,
+            reports: Some(reports),
         })
     }
 }
@@ -575,6 +584,8 @@ pub struct NetStackHandle {
     /// The host addresses the published ports listen on, in publication
     /// order.
     published: Vec<SocketAddr>,
+    /// The receiving end of the pump's reports, until the caller takes it.
+    reports: Option<NetStackReports>,
 }
 
 impl NetStackHandle {
@@ -586,6 +597,47 @@ impl NetStackHandle {
     /// that publishes nothing.
     pub fn published(&self) -> &[SocketAddr] {
         &self.published
+    }
+
+    /// Takes the receiving end of the stack's reports: each decision the stack
+    /// takes about a flow the guest opens, carried or refused and why. `None`
+    /// once it has been taken.
+    ///
+    /// The stack reports whether or not the caller takes the reports, and
+    /// never waits on a reader: its queue holds 1024 reports, and a report
+    /// it has no room for is dropped and counted. A handle whose reports are
+    /// never taken therefore holds 1024 at most. Dropping the receiving end
+    /// stops the stack making them.
+    ///
+    /// The reports end once the stack has stopped and every queued report has
+    /// been read, so a thread that reads them ends after [`stop`](Self::stop):
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let cage = ferroday_cage::Cage::builder().rootfs("/r").command("/bin/x").build()?;
+    /// use ferroday_cage::NetStack;
+    ///
+    /// let stack = NetStack::builder().allow("tcp:192.0.2.0/24:443".parse()?).build()?;
+    /// let pending = cage.spawn_pending()?;
+    /// let mut handle = stack.attach(&pending)?;
+    /// let reports = handle.take_reports().expect("the reports are not yet taken");
+    /// let reader = std::thread::spawn(move || {
+    ///     while let Ok(report) = reports.recv() {
+    ///         if report.is_refusal() {
+    ///             eprintln!("{report}");
+    ///         }
+    ///     }
+    /// });
+    /// let mut running = pending.proceed()?;
+    /// let status = running.wait()?;
+    /// handle.stop()?;
+    /// reader.join().expect("the reader finishes");
+    /// # let _ = status;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn take_reports(&mut self) -> Option<NetStackReports> {
+        self.reports.take()
     }
 
     /// Stops the stack and reports how the pump fared.
@@ -879,6 +931,9 @@ impl NetStackBuilder {
     /// do not decide. The nameserver relays the guest's queries to a resolver of
     /// the host's, so a caller whose rules must be the guest's only way out
     /// turns it off.
+    ///
+    /// The stack reports each flow it decides, naming the rule that admitted or
+    /// refused it; see [`NetStackHandle::take_reports`].
     ///
     /// The stack decides a flow by its address, so [`build`](Self::build)
     /// refuses a [name rule](DestinationRule) with
@@ -1804,6 +1859,7 @@ mod tests {
             stop,
             running,
             published: Vec::new(),
+            reports: None,
         };
         let reported = handle.stop().expect_err("a panicked pump is reported");
         assert!(

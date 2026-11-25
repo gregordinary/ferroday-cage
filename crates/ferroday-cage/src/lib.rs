@@ -328,8 +328,8 @@ pub use limits::{Limit, Resource};
 pub use mechanism::SockFilter;
 #[cfg(feature = "netstack")]
 pub use netstack::{
-    DestinationRule, NetStack, NetStackBuilder, NetStackError, NetStackHandle,
-    ParseDestinationRuleError, Transport,
+    DestinationRule, FlowAdmission, FlowRefusal, NetStack, NetStackBuilder, NetStackError,
+    NetStackHandle, NetStackReport, NetStackReports, ParseDestinationRuleError, Transport,
 };
 pub use observer::{Observer, Output, Progress};
 pub use resolved::{

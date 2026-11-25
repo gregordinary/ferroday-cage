@@ -9,8 +9,10 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use super::prefix;
+use super::report::{FlowAdmission, FlowRefusal};
 
 /// A transport the stack carries the guest's traffic over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,6 +31,13 @@ impl Transport {
             Transport::Tcp => "tcp",
             Transport::Udp => "udp",
         }
+    }
+}
+
+/// A transport writes as a rule spells it, `tcp` or `udp`.
+impl fmt::Display for Transport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.spelling())
     }
 }
 
@@ -80,6 +89,9 @@ impl Transport {
 /// assert!("udp:example.com".parse::<DestinationRule>().is_err());
 /// assert!("127.1".parse::<DestinationRule>().is_err());
 /// ```
+// A rule's parts are shared rather than owned, so a clone costs no allocation:
+// the stack clones the rule that decides a flow into the flow's report, and it
+// decides a flow at each datagram the guest sends.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DestinationRule {
     /// The transport the rule covers, or `None` for every transport its target
@@ -88,17 +100,17 @@ pub struct DestinationRule {
     /// What the rule matches.
     target: Target,
     /// The ports the rule covers, in the order given, or none for every port.
-    ports: Vec<Ports>,
+    ports: Arc<[Ports]>,
 }
 
 /// What a rule matches.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Target {
     /// One name, exactly: lower case, with no trailing dot.
-    Name(String),
+    Name(Arc<str>),
     /// Every name below this one, at any depth, and not the name itself. Empty
     /// for the root, below which every name is.
-    Below(String),
+    Below(Arc<str>),
     /// Every address in a network.
     Network {
         /// The network's address, with no bit set past the prefix.
@@ -160,8 +172,8 @@ impl FromStr for DestinationRule {
         let (target, ports) = split_ports(rest).map_err(refused)?;
         let target = parse_target(target).map_err(refused)?;
         let ports = match ports {
-            Some(ports) => parse_ports(ports).map_err(refused)?,
-            None => Vec::new(),
+            Some(ports) => parse_ports(ports).map_err(refused)?.into(),
+            None => Arc::from([]),
         };
         if transport == Some(Transport::Udp) && matches!(target, Target::Name(_) | Target::Below(_))
         {
@@ -296,7 +308,7 @@ fn parse_name(text: &str) -> Result<Target, &'static str> {
     let lowered = text.to_ascii_lowercase();
     let name = lowered.strip_suffix('.').unwrap_or(&lowered);
     if name == "*" {
-        return Ok(Target::Below(String::new()));
+        return Ok(Target::Below(Arc::from("")));
     }
     let (below, name) = match name.strip_prefix("*.") {
         Some(base) => (true, base),
@@ -304,8 +316,8 @@ fn parse_name(text: &str) -> Result<Target, &'static str> {
     };
     validate_name(name)?;
     Ok(match below {
-        true => Target::Below(name.to_string()),
-        false => Target::Name(name.to_string()),
+        true => Target::Below(name.into()),
+        false => Target::Name(name.into()),
     })
 }
 
@@ -386,7 +398,7 @@ impl fmt::Display for DestinationRule {
     /// ports follow it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(transport) = self.transport {
-            write!(f, "{}:", transport.spelling())?;
+            write!(f, "{transport}:")?;
         }
         let bracketed = !self.ports.is_empty()
             && matches!(
@@ -496,31 +508,44 @@ pub(super) struct Policy {
 }
 
 impl Policy {
-    /// Whether the rules carry a flow over `transport` to `address` on `port`.
+    /// What the rules decide of a flow over `transport` to `address` on `port`,
+    /// and which rule decided it.
     ///
-    /// A deny rule that matches refuses, whatever else matches. Otherwise a
-    /// policy with any allow rule admits what an allow rule matches and refuses
-    /// the rest, and one without admits everything. The destinations no rule
-    /// can admit are the caller's to refuse first.
+    /// A deny rule that matches refuses, whatever else matches, and the first
+    /// that matches is the one named. Otherwise a policy with any allow rule
+    /// admits what an allow rule matches, naming the first, and refuses the
+    /// rest, and one without admits everything by default. The destinations no
+    /// rule can admit are the caller's to refuse first.
     ///
     /// An address under NAT64's well-known prefix is matched as itself and as
     /// the IPv4 address it embeds, since a translator carries the flow to that
     /// address ([`prefix::nat64_embedded`]). An IPv4 rule therefore covers the
     /// address's translated spelling as well, and a deny rule cannot be passed
     /// by way of the translator.
-    pub(super) fn admits(&self, transport: Transport, address: IpAddr, port: u16) -> bool {
+    pub(super) fn decide(
+        &self,
+        transport: Transport,
+        address: IpAddr,
+        port: u16,
+    ) -> Result<FlowAdmission, FlowRefusal> {
         let embedded = match address {
             IpAddr::V6(address) => prefix::nat64_embedded(address).map(IpAddr::V4),
             IpAddr::V4(_) => None,
         };
-        let matches = |rule: &DestinationRule| {
+        let matches = |rule: &&DestinationRule| {
             rule.matches(transport, address, port)
                 || embedded.is_some_and(|embedded| rule.matches(transport, embedded, port))
         };
-        if self.deny.iter().any(matches) {
-            return false;
+        if let Some(rule) = self.deny.iter().find(matches) {
+            return Err(FlowRefusal::Denied { rule: rule.clone() });
         }
-        self.allow.is_empty() || self.allow.iter().any(matches)
+        if self.allow.is_empty() {
+            return Ok(FlowAdmission::Default);
+        }
+        match self.allow.iter().find(matches) {
+            Some(rule) => Ok(FlowAdmission::Allowed { rule: rule.clone() }),
+            None => Err(FlowRefusal::NotAllowed),
+        }
     }
 }
 
@@ -756,56 +781,80 @@ mod tests {
     #[test]
     fn no_rules_admit_everything() {
         let open = Policy::default();
-        assert!(open.admits(Transport::Tcp, ip("203.0.113.9"), 443));
-        assert!(open.admits(Transport::Udp, ip("2001:db8::1"), 53));
+        assert!(open.decide(Transport::Tcp, ip("203.0.113.9"), 443).is_ok());
+        assert!(open.decide(Transport::Udp, ip("2001:db8::1"), 53).is_ok());
     }
 
     #[test]
     fn any_allow_rule_refuses_what_no_allow_rule_admits() {
         let policy = rules(&["192.0.2.0/24", "[2001:db8::/32]:443"], &[]);
-        assert!(policy.admits(Transport::Tcp, ip("192.0.2.7"), 22));
-        assert!(policy.admits(Transport::Udp, ip("192.0.2.255"), 53));
-        assert!(!policy.admits(Transport::Tcp, ip("192.0.3.1"), 22));
-        assert!(policy.admits(Transport::Tcp, ip("2001:db8::1"), 443));
-        assert!(!policy.admits(Transport::Tcp, ip("2001:db8::1"), 80));
-        assert!(!policy.admits(Transport::Tcp, ip("2001:db9::1"), 443));
+        assert!(policy.decide(Transport::Tcp, ip("192.0.2.7"), 22).is_ok());
+        assert!(policy.decide(Transport::Udp, ip("192.0.2.255"), 53).is_ok());
+        assert!(policy.decide(Transport::Tcp, ip("192.0.3.1"), 22).is_err());
+        assert!(
+            policy
+                .decide(Transport::Tcp, ip("2001:db8::1"), 443)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .decide(Transport::Tcp, ip("2001:db8::1"), 80)
+                .is_err()
+        );
+        assert!(
+            policy
+                .decide(Transport::Tcp, ip("2001:db9::1"), 443)
+                .is_err()
+        );
     }
 
     #[test]
     fn deny_rules_alone_admit_what_they_do_not_refuse() {
         let policy = rules(&[], &["192.168.0.0/16", "tcp:203.0.113.9:25"]);
-        assert!(!policy.admits(Transport::Tcp, ip("192.168.1.1"), 80));
-        assert!(!policy.admits(Transport::Udp, ip("192.168.1.1"), 53));
-        assert!(policy.admits(Transport::Tcp, ip("192.169.0.1"), 80));
-        assert!(!policy.admits(Transport::Tcp, ip("203.0.113.9"), 25));
-        assert!(policy.admits(Transport::Udp, ip("203.0.113.9"), 25));
-        assert!(policy.admits(Transport::Tcp, ip("203.0.113.9"), 26));
+        assert!(
+            policy
+                .decide(Transport::Tcp, ip("192.168.1.1"), 80)
+                .is_err()
+        );
+        assert!(
+            policy
+                .decide(Transport::Udp, ip("192.168.1.1"), 53)
+                .is_err()
+        );
+        assert!(policy.decide(Transport::Tcp, ip("192.169.0.1"), 80).is_ok());
+        assert!(
+            policy
+                .decide(Transport::Tcp, ip("203.0.113.9"), 25)
+                .is_err()
+        );
+        assert!(policy.decide(Transport::Udp, ip("203.0.113.9"), 25).is_ok());
+        assert!(policy.decide(Transport::Tcp, ip("203.0.113.9"), 26).is_ok());
     }
 
     #[test]
     fn a_deny_rule_beats_an_allow_rule() {
         let policy = rules(&["192.0.2.0/24"], &["192.0.2.7:22"]);
-        assert!(!policy.admits(Transport::Tcp, ip("192.0.2.7"), 22));
-        assert!(policy.admits(Transport::Tcp, ip("192.0.2.7"), 23));
-        assert!(policy.admits(Transport::Tcp, ip("192.0.2.8"), 22));
+        assert!(policy.decide(Transport::Tcp, ip("192.0.2.7"), 22).is_err());
+        assert!(policy.decide(Transport::Tcp, ip("192.0.2.7"), 23).is_ok());
+        assert!(policy.decide(Transport::Tcp, ip("192.0.2.8"), 22).is_ok());
     }
 
     #[test]
     fn a_transport_qualifies_a_rule_to_itself() {
         let udp = rules(&["udp:192.0.2.53:53"], &[]);
-        assert!(udp.admits(Transport::Udp, ip("192.0.2.53"), 53));
-        assert!(!udp.admits(Transport::Tcp, ip("192.0.2.53"), 53));
+        assert!(udp.decide(Transport::Udp, ip("192.0.2.53"), 53).is_ok());
+        assert!(udp.decide(Transport::Tcp, ip("192.0.2.53"), 53).is_err());
         let tcp = rules(&["tcp:0.0.0.0/0"], &[]);
-        assert!(tcp.admits(Transport::Tcp, ip("192.0.2.1"), 443));
-        assert!(!tcp.admits(Transport::Udp, ip("192.0.2.1"), 443));
+        assert!(tcp.decide(Transport::Tcp, ip("192.0.2.1"), 443).is_ok());
+        assert!(tcp.decide(Transport::Udp, ip("192.0.2.1"), 443).is_err());
     }
 
     #[test]
     fn a_name_rule_matches_no_address() {
         let allow = rules(&["example.com", "*"], &[]);
-        assert!(!allow.admits(Transport::Tcp, ip("192.0.2.1"), 443));
+        assert!(allow.decide(Transport::Tcp, ip("192.0.2.1"), 443).is_err());
         let deny = rules(&[], &["*"]);
-        assert!(deny.admits(Transport::Tcp, ip("192.0.2.1"), 443));
+        assert!(deny.decide(Transport::Tcp, ip("192.0.2.1"), 443).is_ok());
     }
 
     #[test]
@@ -813,18 +862,93 @@ mod tests {
         // Denied as itself, the address is denied under NAT64's prefix too,
         // which the translator would carry it to.
         let deny = rules(&[], &["203.0.113.0/24"]);
-        assert!(!deny.admits(Transport::Tcp, ip("64:ff9b::203.0.113.9"), 443));
-        assert!(deny.admits(Transport::Tcp, ip("64:ff9b::198.51.100.1"), 443));
+        assert!(
+            deny.decide(Transport::Tcp, ip("64:ff9b::203.0.113.9"), 443)
+                .is_err()
+        );
+        assert!(
+            deny.decide(Transport::Tcp, ip("64:ff9b::198.51.100.1"), 443)
+                .is_ok()
+        );
         // Allowed as itself, so it is under the prefix.
         let allow = rules(&["203.0.113.0/24"], &[]);
-        assert!(allow.admits(Transport::Tcp, ip("64:ff9b::203.0.113.9"), 443));
-        assert!(!allow.admits(Transport::Tcp, ip("64:ff9b::198.51.100.1"), 443));
+        assert!(
+            allow
+                .decide(Transport::Tcp, ip("64:ff9b::203.0.113.9"), 443)
+                .is_ok()
+        );
+        assert!(
+            allow
+                .decide(Transport::Tcp, ip("64:ff9b::198.51.100.1"), 443)
+                .is_err()
+        );
         // Outside the well-known /96 an address embeds nothing.
-        assert!(!allow.admits(Transport::Tcp, ip("64:ff9b:1::cb00:7109"), 443));
+        assert!(
+            allow
+                .decide(Transport::Tcp, ip("64:ff9b:1::cb00:7109"), 443)
+                .is_err()
+        );
         // An IPv6 rule over the prefix is a rule like any other, and a deny of
         // the embedded address still beats it.
         let both = rules(&["64:ff9b::/96"], &["203.0.113.9"]);
-        assert!(both.admits(Transport::Tcp, ip("64:ff9b::198.51.100.1"), 443));
-        assert!(!both.admits(Transport::Tcp, ip("64:ff9b::203.0.113.9"), 443));
+        assert!(
+            both.decide(Transport::Tcp, ip("64:ff9b::198.51.100.1"), 443)
+                .is_ok()
+        );
+        assert!(
+            both.decide(Transport::Tcp, ip("64:ff9b::203.0.113.9"), 443)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_first_rule_that_matches_is_the_one_named() {
+        let policy = rules(
+            &["192.0.2.0/24", "192.0.2.7"],
+            &["192.0.2.7:22", "192.0.2.0/24:22"],
+        );
+        assert_eq!(
+            policy.decide(Transport::Tcp, ip("192.0.2.7"), 22),
+            Err(FlowRefusal::Denied {
+                rule: rule("192.0.2.7:22")
+            })
+        );
+        assert_eq!(
+            policy.decide(Transport::Tcp, ip("192.0.2.8"), 22),
+            Err(FlowRefusal::Denied {
+                rule: rule("192.0.2.0/24:22")
+            })
+        );
+        assert_eq!(
+            policy.decide(Transport::Tcp, ip("192.0.2.7"), 80),
+            Ok(FlowAdmission::Allowed {
+                rule: rule("192.0.2.0/24")
+            })
+        );
+        assert_eq!(
+            policy.decide(Transport::Tcp, ip("198.51.100.1"), 80),
+            Err(FlowRefusal::NotAllowed)
+        );
+        // An address under NAT64's prefix names the IPv4 rule that matched what
+        // it embeds.
+        assert_eq!(
+            policy.decide(Transport::Tcp, ip("64:ff9b::192.0.2.9"), 80),
+            Ok(FlowAdmission::Allowed {
+                rule: rule("192.0.2.0/24")
+            })
+        );
+    }
+
+    #[test]
+    fn without_allow_rules_what_no_deny_rule_refuses_is_admitted_by_default() {
+        assert_eq!(
+            Policy::default().decide(Transport::Tcp, ip("192.0.2.1"), 443),
+            Ok(FlowAdmission::Default)
+        );
+        let deny = rules(&[], &["192.0.2.0/24"]);
+        assert_eq!(
+            deny.decide(Transport::Udp, ip("198.51.100.1"), 53),
+            Ok(FlowAdmission::Default)
+        );
     }
 }

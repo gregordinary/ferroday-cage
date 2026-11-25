@@ -614,8 +614,9 @@ report name a package and its version bare.
 | Is the managed `resolv.conf` wanted, or has a mount of the caller's claimed it, or the file its link leads to? | `CageBuilder::get_resolv_conf`, over `spec::claims_resolv_conf` and `spec::claims_target` |
 | Give a sandbox a `resolv.conf` naming chosen nameservers, where it reads one | `CageBuilder::nameservers`, lowered by `Lowering::push_nameservers` |
 | Make a file of the launch's own, empty or holding given bytes, to mount over a target | `mechanism::child::own_file`, which a hidden file and a placed one share |
-| Does the network stack carry the guest's traffic over this transport to this destination? | `NetStack::forwards`, over `netstack::pump::host_target`, which settles the refusals no rule lifts and then asks `netstack::policy::Policy::admits` |
+| Does the network stack carry the guest's traffic over this transport to this destination, and if not, why not? | `NetStack::forwards`, over `netstack::pump::host_target`, which settles the refusals no rule lifts, naming which as a `FlowRefusal`, and then asks `netstack::policy::Policy::decide`, which names the rule that decided |
 | Read a destination rule, or write one back | `DestinationRule`'s `FromStr` and `Display`, which the builder, the stack's profile format and `fcage` share |
+| Hand the caller a decision the network stack took, without the pump waiting on a reader | `netstack::report::Reporter`, whose `offer` never waits, and which the caller reads as `NetStackReports`, and for a refused UDP flow `netstack::udp::UdpTables::refuse`, which reports it once. `fcage`'s own lines have the CLI's `Reports`, a crate apart |
 | A prefix length's mask, whether a network holds an address, and the IPv4 address NAT64's well-known prefix embeds | `netstack::prefix` |
 | Which IPv4 address of the host's own does a test reach a server on through the network stack? | the testkit's `require::routable_v4` |
 | Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `truncated` |

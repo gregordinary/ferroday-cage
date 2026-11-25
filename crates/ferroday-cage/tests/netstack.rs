@@ -9,12 +9,15 @@ use common::dns::{KNOWN_NAME, Resolver};
 use common::{Collect, sleeper, wait_gone};
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use ferroday_cage::{Cage, NetStack, NetStackError, Network, RawMount, Transport};
+use ferroday_cage::{
+    Cage, FlowAdmission, FlowRefusal, NetStack, NetStackError, NetStackReport, Network, RawMount,
+    Transport,
+};
 
 #[test]
 fn attach_creates_the_guest_interface() {
@@ -660,11 +663,21 @@ fn ruled(builder: ferroday_cage::NetStackBuilder, allow: &[String], deny: &[Stri
 /// and returns whether it exited successfully in that time and what it
 /// printed. One still running then is killed.
 fn run_under(rootfs: &Path, stack: &NetStack, script: &str) -> (bool, String) {
+    let (ok, stdout, _) = run_reporting(rootfs, stack, script);
+    (ok, stdout)
+}
+
+/// [`run_under`], returning the stack's reports too, each as [`summary`]
+/// writes it.
+fn run_reporting(rootfs: &Path, stack: &NetStack, script: &str) -> (bool, String, Vec<Summary>) {
     let mut observer = Collect::default();
     let pending = common::shell(rootfs, script)
         .spawn_pending_with(&mut observer)
         .expect("the pending sandbox launches");
-    let handle = stack.attach(&pending).expect("the stack attaches");
+    let mut handle = stack.attach(&pending).expect("the stack attaches");
+    let reports = handle
+        .take_reports()
+        .expect("a fresh handle holds its reports");
     let mut running = pending.proceed().expect("the command is released");
     let status = running.wait_timeout(Duration::from_secs(10)).ok().flatten();
     if status.is_none() {
@@ -673,10 +686,59 @@ fn run_under(rootfs: &Path, stack: &NetStack, script: &str) -> (bool, String) {
     }
     drop(running);
     handle.stop().expect("the stack stops cleanly");
+    let summaries = std::iter::from_fn(|| reports.recv().ok())
+        .map(|report| summary(&report))
+        .collect();
     (
         status.is_some_and(|status| status.success()),
         String::from_utf8_lossy(&observer.stdout).into_owned(),
+        summaries,
     )
+}
+
+/// What a report says of a flow: its transport, its destination, and the
+/// decision, naming the rule that took it where one did.
+type Summary = (Transport, SocketAddr, String);
+
+/// A report as a test compares it. The guest's port is left out, since the
+/// guest's kernel chooses it; its address is the guest's own.
+fn summary(report: &NetStackReport) -> Summary {
+    let (transport, guest, destination, decision) = match report {
+        NetStackReport::FlowAdmitted {
+            transport,
+            guest,
+            destination,
+            admission,
+            ..
+        } => {
+            let decision = match admission {
+                FlowAdmission::Allowed { rule, .. } => format!("allowed by {rule}"),
+                other => format!("carried as {other:?}"),
+            };
+            (transport, guest, destination, decision)
+        }
+        NetStackReport::FlowRefused {
+            transport,
+            guest,
+            destination,
+            refusal,
+            ..
+        } => {
+            let decision = match refusal {
+                FlowRefusal::Denied { rule, .. } => format!("denied by {rule}"),
+                other => format!("refused as {other:?}"),
+            };
+            (transport, guest, destination, decision)
+        }
+        other => panic!("a report of something other than a flow: {other}"),
+    };
+    assert_eq!(guest.ip(), IpAddr::from([10, 0, 2, 15]), "{report}");
+    (*transport, *destination, decision)
+}
+
+/// The summary of a flow over TCP to `destination`.
+fn tcp(destination: impl Into<SocketAddr>, decision: impl Into<String>) -> Summary {
+    (Transport::Tcp, destination.into(), decision.into())
 }
 
 /// Whether a host server's receiver stays empty: the guest never reached it.
@@ -699,8 +761,12 @@ fn an_allow_rule_carries_its_range_and_refuses_the_rest() {
 
     let (port, received) = banner_listener_on(host, b"admitted\n");
     let stack = ruled(NetStack::builder(), &[format!("{host}/32:{port}")], &[]);
-    let (ok, stdout) = run_under(rootfs, &stack, &connect(port));
+    let (ok, stdout, reports) = run_reporting(rootfs, &stack, &connect(port));
     assert!(ok && stdout.contains("admitted"), "{stdout}");
+    assert_eq!(
+        reports,
+        [tcp((host, port), format!("allowed by {host}:{port}"))]
+    );
     let from_guest = received
         .recv_timeout(Duration::from_secs(2))
         .expect("the host's server heard from the guest");
@@ -711,9 +777,10 @@ fn an_allow_rule_carries_its_range_and_refuses_the_rest() {
     for allow in ["192.0.2.0/24".to_string(), format!("{host}:1")] {
         let (port, received) = banner_listener_on(host, b"refused\n");
         let stack = ruled(NetStack::builder(), std::slice::from_ref(&allow), &[]);
-        let (ok, stdout) = run_under(rootfs, &stack, &connect(port));
+        let (ok, stdout, reports) = run_reporting(rootfs, &stack, &connect(port));
         assert!(!ok && !stdout.contains("refused"), "{allow}: {stdout}");
         assert!(never_reached(&received), "{allow}");
+        assert_eq!(reports, [tcp((host, port), "refused as NotAllowed")]);
     }
 }
 
@@ -742,10 +809,22 @@ fn a_deny_rule_refuses_what_an_allow_rule_admits_and_alone_admits_the_rest() {
             &allow,
             &[format!("tcp:{host}:{denied}")],
         );
-        let (_, stdout) = run_under(rootfs, &stack, &both(denied, carried));
+        let (_, stdout, reports) = run_reporting(rootfs, &stack, &both(denied, carried));
         assert!(
             !stdout.contains("denied") && stdout.contains("carried"),
             "under {allow:?}: {stdout}"
+        );
+        let admitted = match allow.is_empty() {
+            true => "carried as Default".to_string(),
+            false => format!("allowed by {host}"),
+        };
+        assert_eq!(
+            reports,
+            [
+                tcp((host, denied), format!("denied by tcp:{host}:{denied}")),
+                tcp((host, carried), admitted),
+            ],
+            "under {allow:?}"
         );
         assert!(never_reached(&denied_received), "under {allow:?}");
         carried_received
@@ -853,6 +932,122 @@ fn rules_that_admit_nothing_leave_the_stacks_own_grants() {
     common::outcome_within(&mut running, Duration::from_secs(10));
     drop(running);
     handle.stop().expect("the stack stops cleanly");
+}
+
+// Each flow the stack decides is reported, carried or refused, to the queue the
+// handle hands out. The destinations here are refused before anything leaves
+// the host, or carried to a listener on the host's loopback, so no test needs a
+// route outward.
+
+#[test]
+fn each_refusal_arrives_as_its_report() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let (mapped, received) = banner_listener(b"mapped\n");
+    let stack = ruled(
+        NetStack::builder().host_loopback_port(mapped),
+        &["tcp:198.51.100.0/24:443".to_string()],
+        &["tcp:198.51.100.66".to_string()],
+    );
+    // A refused connection is reset, so each `nc` ends at once. The datagrams
+    // are three from one socket, one flow.
+    let script = format!(
+        "echo ping | /usr/bin/nc -w 3 10.0.2.2 {mapped}; \
+         for target in '192.0.2.1 443' '198.51.100.66 443' '169.254.169.254 80' \
+             '10.0.2.2 9' '10.0.2.3 80'; do \
+             /usr/bin/nc -w 3 $target < /dev/null; \
+         done; \
+         (echo a; sleep 0.2; echo b; sleep 0.2; echo c) | /usr/bin/nc -u -w 1 192.0.2.1 53; \
+         true"
+    );
+    let (_, stdout, reports) = run_reporting(rootfs, &stack, &script);
+    assert!(stdout.contains("mapped"), "{stdout}");
+    received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the mapped port's server heard from the guest");
+    assert_eq!(
+        reports,
+        [
+            tcp(
+                (Ipv4Addr::new(10, 0, 2, 2), mapped),
+                "carried as HostLoopback"
+            ),
+            tcp(([192, 0, 2, 1], 443), "refused as NotAllowed"),
+            tcp(([198, 51, 100, 66], 443), "denied by tcp:198.51.100.66"),
+            tcp(([169, 254, 169, 254], 80), "refused as LinkLocal"),
+            tcp(([10, 0, 2, 2], 9), "refused as GatewayUnmapped"),
+            tcp(([10, 0, 2, 3], 80), "refused as GuestNetwork"),
+            (
+                Transport::Udp,
+                ([192, 0, 2, 1], 53).into(),
+                "refused as NotAllowed".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_reader_that_never_reads_costs_reports_and_never_a_flow() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    // More refused connections than the queue holds, then one the stack
+    // carries, while nothing reads the reports.
+    const REFUSED: usize = 1100;
+    const QUEUED: usize = 1024;
+    let (mapped, received) = banner_listener(b"carried past the full queue\n");
+    let script = format!(
+        "i=0; while [ $i -lt {REFUSED} ]; do \
+             /usr/bin/nc -w 1 10.0.2.2 9 < /dev/null 2> /dev/null; i=$((i + 1)); \
+         done; \
+         echo ping | /usr/bin/nc -w 3 10.0.2.2 {mapped}"
+    );
+    let mut observer = Collect::default();
+    let pending = common::shell(rootfs, &script)
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let stack = NetStack::builder()
+        .host_loopback_port(mapped)
+        .build()
+        .expect("a valid stack configuration");
+    let mut handle = stack.attach(&pending).expect("the stack attaches");
+    let reports = handle
+        .take_reports()
+        .expect("a fresh handle holds its reports");
+    let mut running = pending.proceed().expect("the command is released");
+    let status = common::outcome_within(&mut running, Duration::from_secs(60));
+    drop(running);
+    handle.stop().expect("the stack stops cleanly");
+
+    assert!(status.success(), "{status:?}");
+    assert!(
+        String::from_utf8_lossy(&observer.stdout).contains("carried past the full queue"),
+        "the last connection was carried"
+    );
+    received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the mapped port's server heard from the guest");
+
+    // The queue kept the first reports it was offered, and counted the rest,
+    // the carried connection's among them.
+    let kept: Vec<NetStackReport> = std::iter::from_fn(|| reports.recv().ok()).collect();
+    assert_eq!(kept.len(), QUEUED);
+    assert!(
+        kept.iter()
+            .all(|report| summary(report) == tcp(([10, 0, 2, 2], 9), "refused as GatewayUnmapped")),
+        "{kept:?}"
+    );
+    assert_eq!(
+        reports.dropped(),
+        u64::try_from(REFUSED + 1 - QUEUED).unwrap()
+    );
 }
 
 #[test]

@@ -1936,6 +1936,44 @@ impl core::marker::Unpin for ferroday_cage::Error
 impl core::marker::UnsafeUnpin for ferroday_cage::Error
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::Error
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::Error
+#[non_exhaustive] pub enum ferroday_cage::FlowAdmission
+#[non_exhaustive] pub ferroday_cage::FlowAdmission::Allowed
+pub ferroday_cage::FlowAdmission::Allowed::rule: ferroday_cage::DestinationRule
+pub ferroday_cage::FlowAdmission::Default
+pub ferroday_cage::FlowAdmission::HostLoopback
+impl core::fmt::Display for ferroday_cage::FlowAdmission
+pub fn ferroday_cage::FlowAdmission::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::FlowAdmission
+impl core::marker::Send for ferroday_cage::FlowAdmission
+impl core::marker::Sync for ferroday_cage::FlowAdmission
+impl core::marker::Unpin for ferroday_cage::FlowAdmission
+impl core::marker::UnsafeUnpin for ferroday_cage::FlowAdmission
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::FlowAdmission
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::FlowAdmission
+#[non_exhaustive] pub enum ferroday_cage::FlowRefusal
+pub ferroday_cage::FlowRefusal::AwsInstanceServices
+pub ferroday_cage::FlowRefusal::Broadcast
+#[non_exhaustive] pub ferroday_cage::FlowRefusal::Denied
+pub ferroday_cage::FlowRefusal::Denied::rule: ferroday_cage::DestinationRule
+pub ferroday_cage::FlowRefusal::EmbeddedIpv4
+pub ferroday_cage::FlowRefusal::GatewayUnmapped
+pub ferroday_cage::FlowRefusal::GuestNetwork
+pub ferroday_cage::FlowRefusal::LinkLocal
+pub ferroday_cage::FlowRefusal::Loopback
+pub ferroday_cage::FlowRefusal::Multicast
+pub ferroday_cage::FlowRefusal::NotAllowed
+pub ferroday_cage::FlowRefusal::ProtocolDisabled
+pub ferroday_cage::FlowRefusal::TooManyFlows
+pub ferroday_cage::FlowRefusal::Unspecified
+impl core::fmt::Display for ferroday_cage::FlowRefusal
+pub fn ferroday_cage::FlowRefusal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::FlowRefusal
+impl core::marker::Send for ferroday_cage::FlowRefusal
+impl core::marker::Sync for ferroday_cage::FlowRefusal
+impl core::marker::Unpin for ferroday_cage::FlowRefusal
+impl core::marker::UnsafeUnpin for ferroday_cage::FlowRefusal
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::FlowRefusal
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::FlowRefusal
 #[non_exhaustive] pub enum ferroday_cage::IdMapError
 #[non_exhaustive] pub ferroday_cage::IdMapError::HelperFailed
 pub ferroday_cage::IdMapError::HelperFailed::detail: alloc::string::String
@@ -2082,6 +2120,28 @@ impl core::marker::Unpin for ferroday_cage::NetStackError
 impl core::marker::UnsafeUnpin for ferroday_cage::NetStackError
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackError
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackError
+#[non_exhaustive] pub enum ferroday_cage::NetStackReport
+#[non_exhaustive] pub ferroday_cage::NetStackReport::FlowAdmitted
+pub ferroday_cage::NetStackReport::FlowAdmitted::admission: ferroday_cage::FlowAdmission
+pub ferroday_cage::NetStackReport::FlowAdmitted::destination: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::FlowAdmitted::guest: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::FlowAdmitted::transport: ferroday_cage::Transport
+#[non_exhaustive] pub ferroday_cage::NetStackReport::FlowRefused
+pub ferroday_cage::NetStackReport::FlowRefused::destination: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::FlowRefused::guest: core::net::socket_addr::SocketAddr
+pub ferroday_cage::NetStackReport::FlowRefused::refusal: ferroday_cage::FlowRefusal
+pub ferroday_cage::NetStackReport::FlowRefused::transport: ferroday_cage::Transport
+impl ferroday_cage::NetStackReport
+pub fn ferroday_cage::NetStackReport::is_refusal(&self) -> bool
+impl core::fmt::Display for ferroday_cage::NetStackReport
+pub fn ferroday_cage::NetStackReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::NetStackReport
+impl core::marker::Send for ferroday_cage::NetStackReport
+impl core::marker::Sync for ferroday_cage::NetStackReport
+impl core::marker::Unpin for ferroday_cage::NetStackReport
+impl core::marker::UnsafeUnpin for ferroday_cage::NetStackReport
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackReport
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackReport
 #[non_exhaustive] pub enum ferroday_cage::Network
 pub ferroday_cage::Network::Host
 pub ferroday_cage::Network::Isolated
@@ -2421,6 +2481,8 @@ impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::Stdio
 #[non_exhaustive] pub enum ferroday_cage::Transport
 pub ferroday_cage::Transport::Tcp
 pub ferroday_cage::Transport::Udp
+impl core::fmt::Display for ferroday_cage::Transport
+pub fn ferroday_cage::Transport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for ferroday_cage::Transport
 impl core::marker::Send for ferroday_cage::Transport
 impl core::marker::Sync for ferroday_cage::Transport
@@ -2822,15 +2884,29 @@ impl ferroday_cage::NetStackHandle
 pub fn ferroday_cage::NetStackHandle::is_running(&self) -> bool
 pub fn ferroday_cage::NetStackHandle::published(&self) -> &[core::net::socket_addr::SocketAddr]
 pub fn ferroday_cage::NetStackHandle::stop(self) -> core::result::Result<(), ferroday_cage::NetStackError>
+pub fn ferroday_cage::NetStackHandle::take_reports(&mut self) -> core::option::Option<ferroday_cage::NetStackReports>
 impl core::ops::drop::Drop for ferroday_cage::NetStackHandle
 pub fn ferroday_cage::NetStackHandle::drop(&mut self)
-impl core::marker::Freeze for ferroday_cage::NetStackHandle
+impl !core::marker::Freeze for ferroday_cage::NetStackHandle
 impl core::marker::Send for ferroday_cage::NetStackHandle
 impl core::marker::Sync for ferroday_cage::NetStackHandle
 impl core::marker::Unpin for ferroday_cage::NetStackHandle
 impl core::marker::UnsafeUnpin for ferroday_cage::NetStackHandle
 impl !core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackHandle
 impl !core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackHandle
+pub struct ferroday_cage::NetStackReports
+impl ferroday_cage::NetStackReports
+pub fn ferroday_cage::NetStackReports::dropped(&self) -> u64
+pub fn ferroday_cage::NetStackReports::recv(&self) -> core::result::Result<ferroday_cage::NetStackReport, std::sync::mpsc::RecvError>
+pub fn ferroday_cage::NetStackReports::recv_timeout(&self, core::time::Duration) -> core::result::Result<ferroday_cage::NetStackReport, std::sync::mpsc::RecvTimeoutError>
+pub fn ferroday_cage::NetStackReports::try_recv(&self) -> core::result::Result<ferroday_cage::NetStackReport, std::sync::mpsc::TryRecvError>
+impl !core::marker::Freeze for ferroday_cage::NetStackReports
+impl core::marker::Send for ferroday_cage::NetStackReports
+impl core::marker::Sync for ferroday_cage::NetStackReports
+impl core::marker::Unpin for ferroday_cage::NetStackReports
+impl core::marker::UnsafeUnpin for ferroday_cage::NetStackReports
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::NetStackReports
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::NetStackReports
 #[non_exhaustive] pub struct ferroday_cage::Output
 pub ferroday_cage::Output::status: ferroday_cage::ExitStatus
 pub ferroday_cage::Output::stderr: alloc::vec::Vec<u8>

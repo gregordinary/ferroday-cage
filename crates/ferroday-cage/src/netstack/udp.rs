@@ -17,6 +17,13 @@
 //! reaped when its timeout falls due rather than waiting on the next unrelated
 //! wakeup. The clock is injected, so expiry is testable.
 //!
+//! A flow is reported once, carried or refused. A carried flow is reported
+//! when it opens. A refused one has no flow to hold it, and the guest repeats
+//! a refused datagram as it would any other that went unanswered, so a third
+//! table remembers the flows refused lately, at most [`MAX_FLOWS`] of them: a
+//! refused flow is reported at its first datagram, and again only once it has
+//! sat idle for [`IDLE_TIMEOUT`], as a carried flow would have expired.
+//!
 //! The port sockets are indexed by port, and each counts the flows using it,
 //! so a pass costs what its flows and datagrams do: a flow finds its port
 //! socket in logarithmic time, and expiry removes a port socket by its count
@@ -49,6 +56,7 @@ use super::Plan;
 use super::nameserver::Nameserver;
 use super::policy::Transport;
 use super::pump::host_target;
+use super::report::{FlowAdmission, FlowRefusal, NetStackReport, Reporter};
 use crate::mechanism::netns::socket_for;
 
 /// The most guest UDP flows tracked at once. A datagram that would open a
@@ -134,12 +142,25 @@ struct UdpFlow {
     dead: bool,
 }
 
+/// A UDP flow the stack refused lately, remembered so its refusal is reported
+/// once rather than at each datagram.
+struct RefusedFlow {
+    /// The guest endpoint that sent it.
+    guest: IpEndpoint,
+    /// The destination the guest addressed.
+    destination: IpEndpoint,
+    /// When the guest last sent it a datagram.
+    last_seen: Instant,
+}
+
 /// The UDP forwarding tables: the per-port receive sockets and the
 /// per-endpoint-pair host flows.
 pub(super) struct UdpTables {
     /// The port sockets, by the port each is bound to.
     ports: BTreeMap<u16, UdpPort>,
     flows: Vec<UdpFlow>,
+    /// The flows refused lately, at most [`MAX_FLOWS`] of them.
+    refused: Vec<RefusedFlow>,
     /// The interface MTU, which sets the reply ceiling; see [`deliverable`].
     mtu: usize,
     /// The payload bytes each port socket's receive and transmit rings hold,
@@ -162,6 +183,7 @@ impl UdpTables {
         UdpTables {
             ports: BTreeMap::new(),
             flows: Vec::new(),
+            refused: Vec::new(),
             mtu: usize::from(mtu),
             payload_bytes: PACKET_SLOTS * usize::from(mtu),
             scratch: vec![0u8; MAX_DATAGRAM].into_boxed_slice(),
@@ -254,19 +276,39 @@ impl UdpTables {
             .map(|flow| &flow.host)
     }
 
+    /// Records that the stack refuses the flow from `guest` to `destination`
+    /// for `refusal`, and reports it where this is the flow's first datagram,
+    /// or its first since it sat idle for [`IDLE_TIMEOUT`].
+    ///
+    /// The table holds [`MAX_FLOWS`] refused flows. A refusal past that takes
+    /// the place of the one seen longest ago, which is reported again if the
+    /// guest sends it more.
+    pub(super) fn refuse(
+        &mut self,
+        guest: IpEndpoint,
+        destination: IpEndpoint,
+        refusal: FlowRefusal,
+        now: Instant,
+        reports: &mut Reporter,
+    ) {
+        note_refusal(&mut self.refused, guest, destination, refusal, now, reports);
+    }
+
     /// Moves both directions of every flow: the guest's datagrams out to
     /// the host, and the host's replies back to the guest. A datagram to the
-    /// stack's nameserver goes to `nameserver` instead. Returns whether
+    /// stack's nameserver goes to `nameserver` instead. A flow that opens, or
+    /// that the stack refuses, is reported to `reports`. Returns whether
     /// anything moved.
     pub(super) fn service(
         &mut self,
         sockets: &mut SocketSet<'static>,
         plan: &Plan,
         nameserver: Option<&mut Nameserver>,
+        reports: &mut Reporter,
         now: Instant,
     ) -> bool {
         let mut progress = false;
-        progress |= self.guest_to_host(sockets, plan, nameserver, now);
+        progress |= self.guest_to_host(sockets, plan, nameserver, reports, now);
         progress |= self.host_to_guest(sockets, now);
         progress
     }
@@ -279,15 +321,17 @@ impl UdpTables {
         sockets: &mut SocketSet<'static>,
         plan: &Plan,
         mut nameserver: Option<&mut Nameserver>,
+        reports: &mut Reporter,
         now: Instant,
     ) -> bool {
         let mut progress = false;
-        // The three fields touched below — the port table, the flow table, and
-        // the scratch buffer — are borrowed separately, which is why
-        // `forward_out` takes the flow table rather than the whole of `self`.
+        // The fields touched below — the port table, the flow tables, and the
+        // scratch buffer — are borrowed separately, which is why `forward_out`
+        // takes the flow table rather than the whole of `self`.
         let UdpTables {
             ports,
             flows,
+            refused,
             scratch,
             ..
         } = self;
@@ -337,8 +381,17 @@ impl UdpTables {
                     }
                     continue;
                 }
-                if forward_out(flows, guest, destination, &scratch[..len], plan, now) {
-                    entry.flows += 1;
+                match forward_out(flows, guest, destination, &scratch[..len], plan, now) {
+                    Forwarded::Opened(admission) => {
+                        entry.flows += 1;
+                        reports.offer(|| {
+                            NetStackReport::admitted(Transport::Udp, guest, destination, admission)
+                        });
+                    }
+                    Forwarded::Refused(refusal) => {
+                        note_refusal(refused, guest, destination, refusal, now, reports);
+                    }
+                    Forwarded::Carried | Forwarded::Lost => {}
                 }
             }
         }
@@ -451,7 +504,13 @@ impl UdpTables {
     /// than to the flow: dropping it while another flow shares the port would
     /// silently stop that flow's replies.
     pub(super) fn expire(&mut self, sockets: &mut SocketSet<'static>, now: Instant) {
-        let UdpTables { ports, flows, .. } = self;
+        let UdpTables {
+            ports,
+            flows,
+            refused,
+            ..
+        } = self;
+        refused.retain(|flow| now.saturating_duration_since(flow.last_seen) < IDLE_TIMEOUT);
         flows.retain(|flow| {
             let live = !flow.dead && now.saturating_duration_since(flow.last_active) < IDLE_TIMEOUT;
             if !live && let Some(port) = ports.get_mut(&flow.destination.port) {
@@ -469,9 +528,23 @@ impl UdpTables {
     }
 }
 
+/// What became of one guest datagram [`forward_out`] was handed.
+#[derive(Debug)]
+enum Forwarded {
+    /// It went out the flow its endpoint pair already has.
+    Carried,
+    /// It opened a flow for its endpoint pair, which the caller counts against
+    /// the destination's port and reports, admitted as this says.
+    Opened(FlowAdmission),
+    /// The stack refuses its flow, for this reason.
+    Refused(FlowRefusal),
+    /// No flow could be opened for it on the host: it is dropped, and the next
+    /// datagram of the pair tries again.
+    Lost,
+}
+
 /// Sends one guest datagram out its host flow, opening a flow in `flows` if the
-/// endpoint pair is new and policy admits the destination. Returns whether it
-/// opened one, which the caller counts against the destination's port.
+/// endpoint pair is new and policy admits the destination.
 ///
 /// Takes the flow table rather than the whole of [`UdpTables`] so its caller can
 /// hold the shared scratch buffer across the call.
@@ -482,7 +555,7 @@ fn forward_out(
     payload: &[u8],
     plan: &Plan,
     now: Instant,
-) -> bool {
+) -> Forwarded {
     if let Some(flow) = flows
         .iter_mut()
         .find(|flow| flow.guest == guest && flow.destination == destination)
@@ -490,19 +563,22 @@ fn forward_out(
         if rustix::net::send(&flow.host, payload, SendFlags::NOSIGNAL).is_ok() {
             flow.last_active = now;
         }
-        return false;
+        return Forwarded::Carried;
     }
-    if flows.len() >= MAX_FLOWS {
-        return false;
-    }
-    let Some(target) = host_target(Transport::Udp, destination, plan) else {
-        return false;
+    // The destination is decided before the budget, so a refused one is
+    // reported for its own reason whatever the table holds.
+    let carried = match host_target(Transport::Udp, destination, plan) {
+        Ok(carried) => carried,
+        Err(refusal) => return Forwarded::Refused(refusal),
     };
-    let Ok(host) = connect_host(target) else {
-        return false;
+    if flows.len() >= MAX_FLOWS {
+        return Forwarded::Refused(FlowRefusal::TooManyFlows);
+    }
+    let Ok(host) = connect_host(carried.target) else {
+        return Forwarded::Lost;
     };
     if rustix::net::send(&host, payload, SendFlags::NOSIGNAL).is_err() {
-        return false;
+        return Forwarded::Lost;
     }
     flows.push(UdpFlow {
         guest,
@@ -511,7 +587,49 @@ fn forward_out(
         last_active: now,
         dead: false,
     });
-    true
+    Forwarded::Opened(carried.admission)
+}
+
+/// Records in `refused` that the stack refuses the flow from `guest` to
+/// `destination`, and reports the refusal where the flow is new to the table
+/// or sat idle there for [`IDLE_TIMEOUT`]; see [`UdpTables::refuse`].
+///
+/// Takes the table rather than the whole of [`UdpTables`] for the reason
+/// [`forward_out`] does.
+fn note_refusal(
+    refused: &mut Vec<RefusedFlow>,
+    guest: IpEndpoint,
+    destination: IpEndpoint,
+    refusal: FlowRefusal,
+    now: Instant,
+    reports: &mut Reporter,
+) {
+    let seen = refused
+        .iter_mut()
+        .find(|flow| flow.guest == guest && flow.destination == destination);
+    let news = match seen {
+        Some(flow) => {
+            let idle = now.saturating_duration_since(flow.last_seen) >= IDLE_TIMEOUT;
+            flow.last_seen = now;
+            idle
+        }
+        None => {
+            let flow = RefusedFlow {
+                guest,
+                destination,
+                last_seen: now,
+            };
+            if refused.len() < MAX_FLOWS {
+                refused.push(flow);
+            } else if let Some(oldest) = refused.iter_mut().min_by_key(|flow| flow.last_seen) {
+                *oldest = flow;
+            }
+            true
+        }
+    };
+    if news {
+        reports.offer(|| NetStackReport::refused(Transport::Udp, guest, destination, refusal));
+    }
 }
 
 /// Opens a connected, nonblocking host UDP socket to `target`.
@@ -818,5 +936,131 @@ mod tests {
         // An MTU below a bare header pair yields no room at all rather than
         // wrapping; the builder's floor keeps this out of reach in practice.
         assert_eq!(deliverable(16, &v6), 0);
+    }
+
+    /// An IPv4 endpoint.
+    fn endpoint(a: u8, b: u8, c: u8, d: u8, port: u16) -> IpEndpoint {
+        IpEndpoint::new(IpAddress::v4(a, b, c, d), port)
+    }
+
+    /// The guest's endpoint on `port`.
+    fn guest(port: u16) -> IpEndpoint {
+        endpoint(10, 0, 2, 15, port)
+    }
+
+    /// Every report queued so far.
+    fn reported(reports: &super::super::NetStackReports) -> Vec<NetStackReport> {
+        std::iter::from_fn(|| reports.try_recv().ok()).collect()
+    }
+
+    /// A report that the flow from the guest's `port` to `destination` is
+    /// refused as the gateway's unmapped port.
+    fn unmapped(port: u16, destination: IpEndpoint) -> NetStackReport {
+        NetStackReport::refused(
+            Transport::Udp,
+            guest(port),
+            destination,
+            FlowRefusal::GatewayUnmapped,
+        )
+    }
+
+    #[test]
+    fn a_refused_flow_is_reported_again_only_once_it_sat_idle() {
+        let mut tables = UdpTables::new(1500);
+        let (mut reporter, reports) = Reporter::new();
+        let destination = endpoint(10, 0, 2, 2, 9);
+        let start = Instant::now();
+        let refuse = |tables: &mut UdpTables, reporter: &mut Reporter, at| {
+            tables.refuse(
+                guest(40_000),
+                destination,
+                FlowRefusal::GatewayUnmapped,
+                at,
+                reporter,
+            );
+        };
+
+        // Datagrams closer together than the idle timeout keep the flow, so
+        // the refusal is reported once, however long they go on.
+        for step in 0..4u32 {
+            refuse(&mut tables, &mut reporter, start + IDLE_TIMEOUT / 2 * step);
+        }
+        assert_eq!(reported(&reports), [unmapped(40_000, destination)]);
+
+        // Past the idle timeout since the last, the flow is a new one.
+        let resumed = start + IDLE_TIMEOUT / 2 * 3 + IDLE_TIMEOUT;
+        refuse(&mut tables, &mut reporter, resumed);
+        assert_eq!(reported(&reports), [unmapped(40_000, destination)]);
+
+        // Expiry forgets a refused flow idle as long, as it would a carried one.
+        let sockets = &mut SocketSet::new(Vec::new());
+        tables.expire(sockets, resumed + IDLE_TIMEOUT);
+        assert!(tables.refused.is_empty());
+    }
+
+    #[test]
+    fn the_refused_table_gives_up_the_flow_seen_longest_ago() {
+        let mut tables = UdpTables::new(1500);
+        let (mut reporter, reports) = Reporter::new();
+        let destination = endpoint(10, 0, 2, 2, 9);
+        let start = Instant::now();
+        let first_port = 40_000;
+        let ports = (first_port..).take(MAX_FLOWS + 1);
+        for (offset, port) in ports.clone().enumerate() {
+            let at = start + Duration::from_millis(u64::try_from(offset).unwrap());
+            let refusal = FlowRefusal::GatewayUnmapped;
+            tables.refuse(guest(port), destination, refusal, at, &mut reporter);
+        }
+        assert_eq!(tables.refused.len(), MAX_FLOWS);
+        assert_eq!(reported(&reports).len(), MAX_FLOWS + 1);
+
+        // The first flow gave its place to the last, so it is news again; the
+        // second is still held.
+        let later = start + Duration::from_secs(1);
+        for port in [first_port + 1, first_port] {
+            let refusal = FlowRefusal::GatewayUnmapped;
+            tables.refuse(guest(port), destination, refusal, later, &mut reporter);
+        }
+        assert_eq!(reported(&reports), [unmapped(first_port, destination)]);
+    }
+
+    #[test]
+    fn a_flow_past_the_budget_is_refused_for_it() {
+        let peer = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a host socket binds");
+        let port = peer.local_addr().expect("an address").port();
+        let plan = super::super::NetStack::builder()
+            .host_loopback_port(port)
+            .build()
+            .expect("a valid configuration")
+            .plan;
+        let gateway = endpoint(10, 0, 2, 2, port);
+        let now = Instant::now();
+        let mut flows = Vec::new();
+
+        let first_port = 20_000;
+        for guest_port in (first_port..).take(MAX_FLOWS) {
+            let forwarded = forward_out(&mut flows, guest(guest_port), gateway, b"x", &plan, now);
+            assert!(
+                matches!(forwarded, Forwarded::Opened(FlowAdmission::HostLoopback)),
+                "{forwarded:?}"
+            );
+        }
+        let again = forward_out(&mut flows, guest(first_port), gateway, b"x", &plan, now);
+        assert!(matches!(again, Forwarded::Carried), "{again:?}");
+
+        // One past the budget is refused for it, and a destination refused for
+        // a reason of its own is refused for that reason, budget or none.
+        let past = forward_out(&mut flows, guest(30_000), gateway, b"x", &plan, now);
+        assert!(
+            matches!(past, Forwarded::Refused(FlowRefusal::TooManyFlows)),
+            "{past:?}"
+        );
+        let unmapped = endpoint(10, 0, 2, 2, 9);
+        let refused = forward_out(&mut flows, guest(30_000), unmapped, b"x", &plan, now);
+        assert!(
+            matches!(refused, Forwarded::Refused(FlowRefusal::GatewayUnmapped)),
+            "{refused:?}"
+        );
     }
 }

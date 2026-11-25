@@ -15,6 +15,10 @@
 //! in place. A refused or unadmitted attempt creates nothing, and the
 //! interface answers it with a reset.
 //!
+//! Each decision is reported through the engine's [`Reporter`]: a TCP attempt
+//! where ingestion decides it, a refused UDP datagram there too, and a carried
+//! UDP flow where a service pass opens it.
+//!
 //! The interface owns the gateway addresses, answers ARP, neighbor
 //! discovery, and ICMP echo for them itself, and accepts any destination
 //! (`any_ip`) so the sniffed listeners see segments addressed to the wider
@@ -59,6 +63,7 @@ use super::device::TapDevice;
 use super::nameserver::{self, Nameserver};
 use super::policy::Transport;
 use super::prefix;
+use super::report::{FlowAdmission, FlowRefusal, NetStackReport, Reporter};
 use super::sniff::{self, Sniff};
 use super::tcp::{self, TcpFlow};
 use super::udp::UdpTables;
@@ -94,15 +99,17 @@ const LOCAL_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
 /// this returns, and so do the published ports' listeners.
 ///
 /// `upstream` is the resolver the stack's nameserver asks, `None` where the
-/// configuration turns the nameserver off.
+/// configuration turns the nameserver off, and `reports` where the pump offers
+/// each decision it takes.
 pub(super) fn run(
     tap: OwnedFd,
     stop: OwnedFd,
     plan: Plan,
     listeners: Vec<Listener>,
     upstream: Option<SocketAddr>,
+    reports: Reporter,
 ) -> PumpExit {
-    match Engine::new(tap, plan, listeners, upstream) {
+    match Engine::new(tap, plan, listeners, upstream, reports) {
         Ok(mut engine) => engine.run(&stop),
         Err(exit) => exit,
     }
@@ -184,6 +191,8 @@ struct Engine {
     nameserver: Option<Nameserver>,
     /// The published ports.
     inbound: Vec<Inbound>,
+    /// Where each decision about a flow of the guest's is reported.
+    reports: Reporter,
     /// Where the search for a free local port for the next published
     /// connection starts, so successive connections spread over the range.
     next_local_port: u16,
@@ -216,6 +225,7 @@ impl Engine {
         plan: Plan,
         listeners: Vec<Listener>,
         upstream: Option<SocketAddr>,
+        reports: Reporter,
     ) -> Result<Engine, PumpExit> {
         // The guest is untrusted, so the TCP initial sequence numbers need
         // real entropy.
@@ -286,6 +296,7 @@ impl Engine {
             udp: UdpTables::new(plan.mtu),
             nameserver: upstream.map(|upstream| Nameserver::new(upstream, plan.mtu)),
             inbound,
+            reports,
             next_local_port: *LOCAL_PORTS.start(),
             plan,
             epoch: std::time::Instant::now(),
@@ -585,7 +596,10 @@ impl Engine {
 
     /// Admits a TCP connection attempt: a listening socket on the sniffed
     /// destination and a parallel host connect, so the interface's
-    /// processing of the same segment lands on the listener.
+    /// processing of the same segment lands on the listener. The attempt is
+    /// reported, carried or refused, once: a retransmission finds its flow, and
+    /// a refused attempt is answered with a reset, which the guest does not
+    /// retry.
     ///
     /// The classifier does not verify checksums, so the host connect is
     /// initiated on a segment the interface has not yet validated. A guest
@@ -614,19 +628,34 @@ impl Engine {
             }
             return;
         }
-        if self.held(false) >= tcp::MAX_FLOWS {
-            return;
-        }
-        let Some(target) = host_target(Transport::Tcp, dst, &self.plan) else {
-            return;
+        // The destination is decided before the budget, so a refused one is
+        // reported for its own reason whatever the stack holds.
+        let decided = host_target(Transport::Tcp, dst, &self.plan).and_then(|carried| {
+            match self.held(false) >= tcp::MAX_FLOWS {
+                true => Err(FlowRefusal::TooManyFlows),
+                false => Ok(carried),
+            }
+        });
+        let carried = match decided {
+            Ok(carried) => carried,
+            Err(refusal) => {
+                self.reports
+                    .offer(|| NetStackReport::refused(Transport::Tcp, src, dst, refusal));
+                return;
+            }
         };
         let mut socket = tcp::guest_facing_socket();
         if socket.listen(dst).is_err() {
             return;
         }
         let handle = self.sockets.add(socket);
-        match TcpFlow::connect(handle, src, dst, target, std::time::Instant::now()) {
-            Ok(flow) => self.flows.push(flow),
+        match TcpFlow::connect(handle, src, dst, carried.target, std::time::Instant::now()) {
+            Ok(flow) => {
+                self.flows.push(flow);
+                self.reports.offer(|| {
+                    NetStackReport::admitted(Transport::Tcp, src, dst, carried.admission)
+                });
+            }
             // The host side could not even start (say, IPv6 without an
             // IPv6 host stack). Withdraw the listener; the interface then
             // answers the attempt with a reset.
@@ -726,15 +755,18 @@ impl Engine {
     /// Admits a UDP datagram by binding a receive socket to its destination
     /// port, if policy allows the destination at all, or if it is addressed to
     /// the nameserver. The flow itself is created lazily when the datagram is
-    /// drained.
-    fn admit_udp(&mut self, _src: IpEndpoint, dst: IpEndpoint) {
+    /// drained, and reported then. A refused datagram is reported here, where
+    /// it is decided, as the first of its flow's.
+    fn admit_udp(&mut self, src: IpEndpoint, dst: IpEndpoint) {
         if self.plan.serves(dst) {
             if self.nameserver.is_some() {
                 self.udp.keep_port(dst.port, &mut self.sockets);
             }
             return;
         }
-        if host_target(Transport::Udp, dst, &self.plan).is_none() {
+        if let Err(refusal) = host_target(Transport::Udp, dst, &self.plan) {
+            let now = std::time::Instant::now();
+            self.udp.refuse(src, dst, refusal, now, &mut self.reports);
             return;
         }
         self.udp.ensure_port(dst.port, &mut self.sockets);
@@ -749,9 +781,13 @@ impl Engine {
             let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
             progress |= flow.service(socket, now);
         }
-        progress |= self
-            .udp
-            .service(&mut self.sockets, &self.plan, self.nameserver.as_mut(), now);
+        progress |= self.udp.service(
+            &mut self.sockets,
+            &self.plan,
+            self.nameserver.as_mut(),
+            &mut self.reports,
+            now,
+        );
         if let Some(nameserver) = &mut self.nameserver {
             progress |= nameserver.service(&mut self.sockets, now);
             // The answers go out through the port socket their queries came in
@@ -808,8 +844,8 @@ impl Engine {
 }
 
 /// Applies the forwarding policy to a guest-addressed destination over
-/// `transport`, returning the host socket address to connect to, or `None` for
-/// a destination the stack refuses (the interface answers those with a
+/// `transport`: where the stack carries the flow and what admitted it, or why
+/// the stack refuses it (the interface answers a refused connection with a
 /// reset).
 ///
 /// This is an egress NAT: an accepted destination is reached from the host's
@@ -830,16 +866,21 @@ impl Engine {
 ///   compatible `::a.b.c.d` alike — so an IPv4 refusal cannot be re-expressed in
 ///   the other family.
 /// - An address under NAT64's well-known prefix, `64:ff9b::/96`, whose embedded
-///   IPv4 address the IPv4 rules refuse; see [`prefix::nat64_embedded`].
+///   IPv4 address the IPv4 rules refuse, for that address's reason; see
+///   [`prefix::nat64_embedded`].
 /// - The guest's own subnet, which is a private link between the guest and this
 ///   stack. Forwarding it would send the guest's on-link traffic to the host's
 ///   view of those addresses instead, colliding with a real LAN wherever the two
 ///   overlap. This subsumes the subnet's broadcast address.
 ///
 /// A destination past those is then held to the caller's destination rules
-/// ([`Policy::admits`](super::policy::Policy::admits)), which refuse what a
+/// ([`Policy::decide`](super::policy::Policy::decide)), which refuse what a
 /// deny rule matches, and what no allow rule admits where there are allow
 /// rules. Without rules the refusals above are the whole policy.
+///
+/// A destination in a special-purpose block that falls in the guest's subnet
+/// too, as a subnet the caller configures may make one, is refused for its
+/// block.
 ///
 /// Every refusal but the guest's own subnet is answered with a reset: the guest
 /// routes those destinations through the gateway, so its segment arrives, finds
@@ -866,73 +907,116 @@ pub(super) fn host_target(
     transport: Transport,
     dst: IpEndpoint,
     plan: &Plan,
-) -> Option<SocketAddr> {
+) -> Result<Carried, FlowRefusal> {
     let address = IpAddr::from(dst.addr);
     match address {
         IpAddr::V4(addr) => {
-            let v4 = plan.v4.as_ref()?;
+            let v4 = plan.v4.as_ref().ok_or(FlowRefusal::ProtocolDisabled)?;
             if addr == v4.gateway {
-                return plan
-                    .host_loopback
-                    .admits(dst.port)
-                    .then(|| SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, dst.port)));
+                return gateway(
+                    plan,
+                    SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, dst.port)),
+                );
             }
-            if refuses_v4(addr, Some(v4)) {
-                return None;
+            if let Some(refusal) = refusal_v4(addr, Some(v4)) {
+                return Err(refusal);
             }
         }
         IpAddr::V6(addr) => {
-            let v6 = plan.v6.as_ref()?;
+            let v6 = plan.v6.as_ref().ok_or(FlowRefusal::ProtocolDisabled)?;
             if addr == v6.gateway {
-                return plan
-                    .host_loopback
-                    .admits(dst.port)
-                    .then(|| SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, dst.port)));
+                return gateway(
+                    plan,
+                    SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, dst.port)),
+                );
             }
-            let on_link = prefix::contains(IpAddr::V6(v6.gateway), v6.prefix_len, address);
-            let translated_refusal = prefix::nat64_embedded(addr)
-                .is_some_and(|embedded| refuses_v4(embedded, plan.v4.as_ref()));
-            if addr.is_unspecified()
-                || addr.is_multicast()
-                || addr.is_loopback()
-                || addr.is_unicast_link_local()
+            let refusal = if addr.is_unspecified() {
+                Some(FlowRefusal::Unspecified)
+            } else if addr.is_multicast() {
+                Some(FlowRefusal::Multicast)
+            } else if addr.is_loopback() {
+                Some(FlowRefusal::Loopback)
+            } else if addr.is_unicast_link_local() {
+                Some(FlowRefusal::LinkLocal)
+            } else if addr.to_ipv4().is_some() {
                 // Both IPv4-in-IPv6 forms: mapped and the deprecated
                 // compatible. `to_ipv4` accepts either, where `to_ipv4_mapped`
                 // would let `::a.b.c.d` through.
-                || addr.to_ipv4().is_some()
-                || translated_refusal
-                || is_aws_instance_service(addr)
-                || on_link
+                Some(FlowRefusal::EmbeddedIpv4)
+            } else if let Some(embedded) = prefix::nat64_embedded(addr)
+                && let Some(refusal) = refusal_v4(embedded, plan.v4.as_ref())
             {
-                return None;
+                Some(refusal)
+            } else if is_aws_instance_service(addr) {
+                Some(FlowRefusal::AwsInstanceServices)
+            } else if prefix::contains(IpAddr::V6(v6.gateway), v6.prefix_len, address) {
+                Some(FlowRefusal::GuestNetwork)
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
+                return Err(refusal);
             }
         }
     }
-    plan.policy
-        .admits(transport, address, dst.port)
-        .then_some(SocketAddr::new(address, dst.port))
+    let admission = plan.policy.decide(transport, address, dst.port)?;
+    Ok(Carried {
+        target: SocketAddr::new(address, dst.port),
+        admission,
+    })
 }
 
-/// Whether the IPv4 rules refuse `addr`, other than as the gateway: the
-/// special-purpose blocks, and the guest's own subnet where the plan has an
-/// IPv4 side.
+/// Where the stack carries a flow it admits, and what admitted it:
+/// [`host_target`]'s answer for a destination it does not refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Carried {
+    /// The host socket address the flow is carried to.
+    pub(super) target: SocketAddr,
+    /// What admitted the flow, for its report.
+    pub(super) admission: FlowAdmission,
+}
+
+/// The gateway's answer: carried to `loopback`, the host's loopback on the
+/// port the guest addressed, where the plan maps that port, and refused on any
+/// other.
+fn gateway(plan: &Plan, loopback: SocketAddr) -> Result<Carried, FlowRefusal> {
+    if !plan.host_loopback.admits(loopback.port()) {
+        return Err(FlowRefusal::GatewayUnmapped);
+    }
+    Ok(Carried {
+        target: loopback,
+        admission: FlowAdmission::HostLoopback,
+    })
+}
+
+/// Why the IPv4 rules refuse `addr`, other than as the gateway, or `None`
+/// where they do not: the special-purpose blocks, and the guest's own subnet
+/// where the plan has an IPv4 side.
 ///
 /// The gateway is the caller's to settle first, since a connection to it may
 /// map to host loopback. Reached through NAT64 it is just an address on the
 /// guest's subnet, and refused as one.
-fn refuses_v4(addr: std::net::Ipv4Addr, v4: Option<&PlanV4>) -> bool {
+fn refusal_v4(addr: std::net::Ipv4Addr, v4: Option<&PlanV4>) -> Option<FlowRefusal> {
     let on_link = v4.is_some_and(|v4| {
         prefix::contains(IpAddr::V4(v4.gateway), v4.prefix_len, IpAddr::V4(addr))
     });
-    addr.is_unspecified()
-        // 0.0.0.0/8: `is_unspecified` covers only 0.0.0.0 itself, and the rest
-        // of the block is no more routable.
-        || addr.octets()[0] == 0
-        || addr.is_multicast()
-        || addr.is_broadcast()
-        || addr.is_loopback()
-        || addr.is_link_local()
-        || on_link
+    // 0.0.0.0/8: `is_unspecified` covers only 0.0.0.0 itself, and the rest of
+    // the block is no more routable.
+    if addr.octets()[0] == 0 {
+        Some(FlowRefusal::Unspecified)
+    } else if addr.is_multicast() {
+        Some(FlowRefusal::Multicast)
+    } else if addr.is_broadcast() {
+        Some(FlowRefusal::Broadcast)
+    } else if addr.is_loopback() {
+        Some(FlowRefusal::Loopback)
+    } else if addr.is_link_local() {
+        Some(FlowRefusal::LinkLocal)
+    } else if on_link {
+        Some(FlowRefusal::GuestNetwork)
+    } else {
+        None
+    }
 }
 
 /// Whether `addr` is in `fd00:ec2::/32`, the block AWS serves its IPv6 instance
@@ -988,15 +1072,27 @@ mod tests {
         IpEndpoint::new(IpAddress::Ipv6(addr.parse::<Ipv6Addr>().unwrap()), port)
     }
 
+    /// Where the stack carries a flow to `dst`, or `None` where it refuses it.
+    fn target(transport: Transport, dst: IpEndpoint, plan: &Plan) -> Option<SocketAddr> {
+        host_target(transport, dst, plan)
+            .ok()
+            .map(|carried| carried.target)
+    }
+
+    /// Why the stack refuses a flow to `dst`, or `None` where it carries it.
+    fn refusal(transport: Transport, dst: IpEndpoint, plan: &Plan) -> Option<FlowRefusal> {
+        host_target(transport, dst, plan).err()
+    }
+
     #[test]
     fn ordinary_destinations_pass_through_unchanged() {
         let plan = plan(false);
         assert_eq!(
-            host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
+            target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
             Some("203.0.113.9:443".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Tcp, v6("2001:db8::1", 443), &plan),
+            target(Transport::Tcp, v6("2001:db8::1", 443), &plan),
             Some("[2001:db8::1]:443".parse().unwrap()),
         );
     }
@@ -1004,26 +1100,26 @@ mod tests {
     #[test]
     fn loopback_link_local_and_group_destinations_are_refused() {
         let plan = plan(false);
-        for dst in [
-            v4(127, 0, 0, 1, 80),
-            v4(127, 9, 9, 9, 80),
-            v4(169, 254, 1, 1, 80),
-            v4(224, 0, 0, 1, 80),
-            v4(255, 255, 255, 255, 80),
-            v4(0, 0, 0, 0, 80),
+        for (dst, why) in [
+            (v4(127, 0, 0, 1, 80), FlowRefusal::Loopback),
+            (v4(127, 9, 9, 9, 80), FlowRefusal::Loopback),
+            (v4(169, 254, 1, 1, 80), FlowRefusal::LinkLocal),
+            (v4(224, 0, 0, 1, 80), FlowRefusal::Multicast),
+            (v4(255, 255, 255, 255, 80), FlowRefusal::Broadcast),
+            (v4(0, 0, 0, 0, 80), FlowRefusal::Unspecified),
             // The rest of 0.0.0.0/8, not just the unspecified address itself.
-            v4(0, 1, 2, 3, 80),
-            v6("::1", 80),
-            v6("fe80::1", 80),
-            v6("ff02::1", 80),
-            v6("::", 80),
-            v6("::ffff:127.0.0.1", 80),
-            v6("::ffff:203.0.113.9", 80),
+            (v4(0, 1, 2, 3, 80), FlowRefusal::Unspecified),
+            (v6("::1", 80), FlowRefusal::Loopback),
+            (v6("fe80::1", 80), FlowRefusal::LinkLocal),
+            (v6("ff02::1", 80), FlowRefusal::Multicast),
+            (v6("::", 80), FlowRefusal::Unspecified),
+            (v6("::ffff:127.0.0.1", 80), FlowRefusal::EmbeddedIpv4),
+            (v6("::ffff:203.0.113.9", 80), FlowRefusal::EmbeddedIpv4),
             // The deprecated IPv4-compatible form of the same addresses.
-            v6("::127.0.0.1", 80),
-            v6("::203.0.113.9", 80),
+            (v6("::127.0.0.1", 80), FlowRefusal::EmbeddedIpv4),
+            (v6("::203.0.113.9", 80), FlowRefusal::EmbeddedIpv4),
         ] {
-            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
+            assert_eq!(refusal(Transport::Tcp, dst, &plan), Some(why), "{dst}");
         }
     }
 
@@ -1032,19 +1128,22 @@ mod tests {
         // The IPv4 service is link-local; AWS's IPv6 block is a unique local
         // one the host routes, so it is refused by name.
         let plan = plan(false);
-        for dst in [
-            v4(169, 254, 169, 254, 80),
-            v6("fd00:ec2::254", 80),
-            v6("fd00:ec2::253", 53),
-            v6("fd00:ec2:ffff::1", 443),
+        for (dst, why) in [
+            (v4(169, 254, 169, 254, 80), FlowRefusal::LinkLocal),
+            (v6("fd00:ec2::254", 80), FlowRefusal::AwsInstanceServices),
+            (v6("fd00:ec2::253", 53), FlowRefusal::AwsInstanceServices),
+            (
+                v6("fd00:ec2:ffff::1", 443),
+                FlowRefusal::AwsInstanceServices,
+            ),
         ] {
-            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
+            assert_eq!(refusal(Transport::Tcp, dst, &plan), Some(why), "{dst}");
         }
         // The block is exactly a /32: its neighbours are ordinary unique local
         // destinations.
         for dst in [v6("fd00:ec3::254", 80), v6("fd00:ec1:ffff::1", 80)] {
             assert_eq!(
-                host_target(Transport::Tcp, dst, &plan),
+                target(Transport::Tcp, dst, &plan),
                 Some(SocketAddr::from((IpAddr::from(dst.addr), dst.port))),
                 "{dst}",
             );
@@ -1057,21 +1156,22 @@ mod tests {
         // position, possibly the host's, so that address is held to the IPv4
         // rules: the metadata service, loopback, and the guest's own IPv4
         // subnet stay refused when spelled under the well-known prefix.
+        // Each is refused for the reason its embedded address is.
         let plan = plan(false);
-        for dst in [
-            v6("64:ff9b::169.254.169.254", 80),
-            v6("64:ff9b::127.0.0.1", 80),
-            v6("64:ff9b::10.0.2.2", 80),
-            v6("64:ff9b::10.0.2.15", 80),
-            v6("64:ff9b::0.1.2.3", 80),
-            v6("64:ff9b::224.0.0.1", 80),
+        for (dst, why) in [
+            (v6("64:ff9b::169.254.169.254", 80), FlowRefusal::LinkLocal),
+            (v6("64:ff9b::127.0.0.1", 80), FlowRefusal::Loopback),
+            (v6("64:ff9b::10.0.2.2", 80), FlowRefusal::GuestNetwork),
+            (v6("64:ff9b::10.0.2.15", 80), FlowRefusal::GuestNetwork),
+            (v6("64:ff9b::0.1.2.3", 80), FlowRefusal::Unspecified),
+            (v6("64:ff9b::224.0.0.1", 80), FlowRefusal::Multicast),
         ] {
-            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
+            assert_eq!(refusal(Transport::Tcp, dst, &plan), Some(why), "{dst}");
         }
         // What the IPv4 rules carry, a translator is asked to carry too: an
         // IPv6-only host reaches the IPv4 world this way.
         assert_eq!(
-            host_target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &plan),
+            target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &plan),
             Some("[64:ff9b::cb00:7109]:443".parse().unwrap()),
         );
         // Only the well-known /96 embeds an address in its last 32 bits. Its
@@ -1081,7 +1181,7 @@ mod tests {
             v6("64:ff9b:0:0:0:1:a9fe:a9fe", 80),
         ] {
             assert_eq!(
-                host_target(Transport::Tcp, dst, &plan),
+                target(Transport::Tcp, dst, &plan),
                 Some(SocketAddr::from((IpAddr::from(dst.addr), dst.port))),
                 "{dst}",
             );
@@ -1094,11 +1194,11 @@ mod tests {
             .expect("a v6-only configuration is valid")
             .plan;
         assert_eq!(
-            host_target(Transport::Tcp, v6("64:ff9b::10.0.2.7", 80), &v6_only),
+            target(Transport::Tcp, v6("64:ff9b::10.0.2.7", 80), &v6_only),
             Some("[64:ff9b::a00:207]:80".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Tcp, v6("64:ff9b::169.254.169.254", 80), &v6_only),
+            target(Transport::Tcp, v6("64:ff9b::169.254.169.254", 80), &v6_only),
             None
         );
     }
@@ -1117,12 +1217,18 @@ mod tests {
             v4(10, 0, 2, 0, 80),
             v6("fd00::15", 80),
             v6("fd00::7", 80),
+            // The nameserver's address on any port but its own.
+            v4(10, 0, 2, 3, 80),
         ] {
-            assert_eq!(host_target(Transport::Tcp, dst, &plan), None, "{dst}");
+            assert_eq!(
+                refusal(Transport::Tcp, dst, &plan),
+                Some(FlowRefusal::GuestNetwork),
+                "{dst}"
+            );
         }
         // A neighbouring subnet is not the guest's own and still forwards.
         assert_eq!(
-            host_target(Transport::Tcp, v4(10, 0, 3, 7, 80), &plan),
+            target(Transport::Tcp, v4(10, 0, 3, 7, 80), &plan),
             Some("10.0.3.7:80".parse().unwrap()),
         );
     }
@@ -1131,21 +1237,21 @@ mod tests {
     fn the_gateway_is_refused_by_default_and_maps_with_host_loopback() {
         let closed = plan(false);
         assert_eq!(
-            host_target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &closed),
-            None
+            refusal(Transport::Tcp, v4(10, 0, 2, 2, 8080), &closed),
+            Some(FlowRefusal::GatewayUnmapped)
         );
         assert_eq!(
-            host_target(Transport::Tcp, v6("fd00::2", 8080), &closed),
-            None
+            refusal(Transport::Tcp, v6("fd00::2", 8080), &closed),
+            Some(FlowRefusal::GatewayUnmapped)
         );
 
         let open = plan(true);
         assert_eq!(
-            host_target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &open),
+            target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &open),
             Some("127.0.0.1:8080".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Tcp, v6("fd00::2", 8080), &open),
+            target(Transport::Tcp, v6("fd00::2", 8080), &open),
             Some("[::1]:8080".parse().unwrap()),
         );
     }
@@ -1160,18 +1266,15 @@ mod tests {
             .expect("a valid configuration")
             .plan;
         assert_eq!(
-            host_target(Transport::Tcp, v4(10, 0, 2, 2, 5432), &plan),
+            target(Transport::Tcp, v4(10, 0, 2, 2, 5432), &plan),
             Some("127.0.0.1:5432".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Tcp, v6("fd00::2", 5432), &plan),
+            target(Transport::Tcp, v6("fd00::2", 5432), &plan),
             Some("[::1]:5432".parse().unwrap()),
         );
-        assert_eq!(
-            host_target(Transport::Tcp, v4(10, 0, 2, 2, 5433), &plan),
-            None
-        );
-        assert_eq!(host_target(Transport::Tcp, v6("fd00::2", 80), &plan), None);
+        assert_eq!(target(Transport::Tcp, v4(10, 0, 2, 2, 5433), &plan), None);
+        assert_eq!(target(Transport::Tcp, v6("fd00::2", 80), &plan), None);
     }
 
     #[test]
@@ -1190,7 +1293,7 @@ mod tests {
         ] {
             let plan = plan.expect("a valid configuration").plan;
             assert_eq!(
-                host_target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &plan),
+                target(Transport::Tcp, v4(10, 0, 2, 2, 8080), &plan),
                 Some("127.0.0.1:8080".parse().unwrap()),
             );
         }
@@ -1203,8 +1306,53 @@ mod tests {
             .build()
             .expect("a v4-only configuration is valid");
         assert_eq!(
-            host_target(Transport::Tcp, v6("2001:db8::1", 443), &stack.plan),
-            None
+            refusal(Transport::Tcp, v6("2001:db8::1", 443), &stack.plan),
+            Some(FlowRefusal::ProtocolDisabled)
+        );
+    }
+
+    #[test]
+    fn a_carried_flow_names_what_admitted_it() {
+        let admission = |plan: &Plan, dst| {
+            host_target(Transport::Tcp, dst, plan)
+                .expect("the stack carries the flow")
+                .admission
+        };
+        let open = plan(true);
+        assert_eq!(
+            admission(&open, v4(203, 0, 113, 9, 443)),
+            FlowAdmission::Default
+        );
+        assert_eq!(
+            admission(&open, v4(10, 0, 2, 2, 5432)),
+            FlowAdmission::HostLoopback
+        );
+        let denying = ruled(&[], &["192.168.0.0/16"], None);
+        assert_eq!(
+            admission(&denying, v4(203, 0, 113, 9, 443)),
+            FlowAdmission::Default
+        );
+        let allowing = ruled(&["198.51.100.0/24", "203.0.113.0/24:443"], &[], Some(5432));
+        assert_eq!(
+            admission(&allowing, v4(203, 0, 113, 9, 443)),
+            FlowAdmission::Allowed {
+                rule: "203.0.113.0/24:443".parse().unwrap()
+            }
+        );
+        // The gateway's mapping is outside the rules, and says so.
+        assert_eq!(
+            admission(&allowing, v4(10, 0, 2, 2, 5432)),
+            FlowAdmission::HostLoopback
+        );
+        assert_eq!(
+            refusal(Transport::Tcp, v4(192, 0, 2, 1, 443), &allowing),
+            Some(FlowRefusal::NotAllowed)
+        );
+        assert_eq!(
+            refusal(Transport::Tcp, v4(192, 168, 1, 1, 443), &denying),
+            Some(FlowRefusal::Denied {
+                rule: "192.168.0.0/16".parse().unwrap()
+            })
         );
     }
 
@@ -1227,53 +1375,38 @@ mod tests {
     fn allow_rules_carry_what_they_admit_and_nothing_else() {
         let plan = ruled(&["203.0.113.0/24:443", "udp:198.51.100.53:53"], &[], None);
         assert_eq!(
-            host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
+            target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
             Some("203.0.113.9:443".parse().unwrap()),
         );
+        assert_eq!(target(Transport::Tcp, v4(203, 0, 113, 9, 80), &plan), None);
         assert_eq!(
-            host_target(Transport::Tcp, v4(203, 0, 113, 9, 80), &plan),
+            target(Transport::Tcp, v4(198, 51, 100, 7, 443), &plan),
             None
         );
         assert_eq!(
-            host_target(Transport::Tcp, v4(198, 51, 100, 7, 443), &plan),
-            None
-        );
-        assert_eq!(
-            host_target(Transport::Udp, v4(198, 51, 100, 53, 53), &plan),
+            target(Transport::Udp, v4(198, 51, 100, 53, 53), &plan),
             Some("198.51.100.53:53".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Tcp, v4(198, 51, 100, 53, 53), &plan),
+            target(Transport::Tcp, v4(198, 51, 100, 53, 53), &plan),
             None
         );
         // An IPv4 allow rule leaves IPv6 refused, and the reverse.
-        assert_eq!(
-            host_target(Transport::Tcp, v6("2001:db8::1", 443), &plan),
-            None
-        );
+        assert_eq!(target(Transport::Tcp, v6("2001:db8::1", 443), &plan), None);
     }
 
     #[test]
     fn deny_rules_alone_carry_everything_else() {
         let plan = ruled(&[], &["192.168.0.0/16", "2001:db8::/32"], None);
+        assert_eq!(target(Transport::Tcp, v4(192, 168, 1, 1, 80), &plan), None);
+        assert_eq!(target(Transport::Udp, v4(192, 168, 1, 1, 53), &plan), None);
+        assert_eq!(target(Transport::Tcp, v6("2001:db8::1", 443), &plan), None);
         assert_eq!(
-            host_target(Transport::Tcp, v4(192, 168, 1, 1, 80), &plan),
-            None
-        );
-        assert_eq!(
-            host_target(Transport::Udp, v4(192, 168, 1, 1, 53), &plan),
-            None
-        );
-        assert_eq!(
-            host_target(Transport::Tcp, v6("2001:db8::1", 443), &plan),
-            None
-        );
-        assert_eq!(
-            host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
+            target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
             Some("203.0.113.9:443".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Udp, v6("2001:db9::1", 443), &plan),
+            target(Transport::Udp, v6("2001:db9::1", 443), &plan),
             Some("[2001:db9::1]:443".parse().unwrap()),
         );
     }
@@ -1281,16 +1414,13 @@ mod tests {
     #[test]
     fn a_deny_rule_beats_an_allow_rule_for_the_flow_it_names() {
         let plan = ruled(&["203.0.113.0/24"], &["tcp:203.0.113.9:22"], None);
+        assert_eq!(target(Transport::Tcp, v4(203, 0, 113, 9, 22), &plan), None);
         assert_eq!(
-            host_target(Transport::Tcp, v4(203, 0, 113, 9, 22), &plan),
-            None
-        );
-        assert_eq!(
-            host_target(Transport::Udp, v4(203, 0, 113, 9, 22), &plan),
+            target(Transport::Udp, v4(203, 0, 113, 9, 22), &plan),
             Some("203.0.113.9:22".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Tcp, v4(203, 0, 113, 10, 22), &plan),
+            target(Transport::Tcp, v4(203, 0, 113, 10, 22), &plan),
             Some("203.0.113.10:22".parse().unwrap()),
         );
     }
@@ -1315,11 +1445,11 @@ mod tests {
             v6("fd00::7", 80),
         ] {
             for transport in [Transport::Tcp, Transport::Udp] {
-                assert_eq!(host_target(transport, dst, &plan), None, "{dst}");
+                assert_eq!(target(transport, dst, &plan), None, "{dst}");
             }
         }
         assert_eq!(
-            host_target(Transport::Tcp, v4(203, 0, 113, 9, 80), &plan),
+            target(Transport::Tcp, v4(203, 0, 113, 9, 80), &plan),
             Some("203.0.113.9:80".parse().unwrap()),
         );
     }
@@ -1334,21 +1464,15 @@ mod tests {
             ruled(&[], &["0.0.0.0/0", "::/0"], Some(5432)),
         ] {
             assert_eq!(
-                host_target(Transport::Tcp, v4(10, 0, 2, 2, 5432), &plan),
+                target(Transport::Tcp, v4(10, 0, 2, 2, 5432), &plan),
                 Some("127.0.0.1:5432".parse().unwrap()),
             );
             assert_eq!(
-                host_target(Transport::Udp, v6("fd00::2", 5432), &plan),
+                target(Transport::Udp, v6("fd00::2", 5432), &plan),
                 Some("[::1]:5432".parse().unwrap()),
             );
-            assert_eq!(
-                host_target(Transport::Tcp, v4(10, 0, 2, 2, 5433), &plan),
-                None
-            );
-            assert_eq!(
-                host_target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan),
-                None
-            );
+            assert_eq!(target(Transport::Tcp, v4(10, 0, 2, 2, 5433), &plan), None);
+            assert_eq!(target(Transport::Tcp, v4(203, 0, 113, 9, 443), &plan), None);
             // The nameserver is the stack's own: served, never forwarded.
             assert!(plan.serves(v4(10, 0, 2, 3, 53)));
         }
@@ -1358,16 +1482,16 @@ mod tests {
     fn a_translated_destination_is_held_to_the_ipv4_rules() {
         let denied = ruled(&[], &["203.0.113.0/24"], None);
         assert_eq!(
-            host_target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &denied),
+            target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &denied),
             None
         );
         let allowed = ruled(&["203.0.113.0/24"], &[], None);
         assert_eq!(
-            host_target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &allowed),
+            target(Transport::Tcp, v6("64:ff9b::203.0.113.9", 443), &allowed),
             Some("[64:ff9b::cb00:7109]:443".parse().unwrap()),
         );
         assert_eq!(
-            host_target(Transport::Tcp, v6("64:ff9b::198.51.100.1", 443), &allowed),
+            target(Transport::Tcp, v6("64:ff9b::198.51.100.1", 443), &allowed),
             None
         );
     }
@@ -1404,7 +1528,7 @@ mod tests {
                 for transport in [Transport::Tcp, Transport::Udp] {
                     assert_eq!(
                         stack.forwards(transport, destination),
-                        host_target(transport, dst, &stack.plan).is_some(),
+                        target(transport, dst, &stack.plan).is_some(),
                         "{dst} over {transport:?}",
                     );
                 }
@@ -1432,7 +1556,7 @@ mod tests {
     };
     use std::net::{Ipv6Addr as StdIpv6Addr, SocketAddr as StdSocketAddr, TcpListener, UdpSocket};
 
-    use super::super::{GUEST_MAC, Publication, PumpExit, listen};
+    use super::super::{GUEST_MAC, NetStackReports, Publication, PumpExit, listen};
     use super::sniff::classify;
 
     /// The guest's own IPv4 address under the default plan.
@@ -1615,10 +1739,21 @@ mod tests {
         .expect("a socket pair stands in for the tap")
     }
 
-    /// An engine over `tap`, for a test that drives it on its own thread.
+    /// An engine over `tap`, for a test that drives it on its own thread. Its
+    /// reports go nowhere.
     fn engine(tap: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> Engine {
-        match Engine::new(tap, plan, listeners, None) {
-            Ok(engine) => engine,
+        reporting_engine(tap, plan, listeners).0
+    }
+
+    /// An engine over `tap`, and the receiving end of its reports.
+    fn reporting_engine(
+        tap: OwnedFd,
+        plan: Plan,
+        listeners: Vec<Listener>,
+    ) -> (Engine, NetStackReports) {
+        let (reporter, reports) = Reporter::new();
+        match Engine::new(tap, plan, listeners, None, reporter) {
+            Ok(engine) => (engine, reports),
             Err(_) => panic!("the engine could not gather entropy"),
         }
     }
@@ -1642,7 +1777,7 @@ mod tests {
             let (tid_send, tid_receive) = std::sync::mpsc::channel();
             let pump = std::thread::spawn(move || {
                 let _ = tid_send.send(rustix::thread::gettid().as_raw_nonzero().get());
-                run(tap, polled, plan, listeners, None)
+                run(tap, polled, plan, listeners, None, Reporter::new().0)
             });
             let tid = tid_receive.recv().expect("the pump thread reports its id");
             Driven {
@@ -2768,5 +2903,185 @@ mod tests {
         engine.reap(std::time::Instant::now());
         assert!(engine.flows.is_empty(), "the finished flow is still held");
         assert_eq!(published.host_reads(&mut engine, 13), b"the last word");
+    }
+
+    // -- Reports -------------------------------------------------------------
+
+    /// Every report the engine has queued so far.
+    fn reported(reports: &NetStackReports) -> Vec<NetStackReport> {
+        std::iter::from_fn(|| reports.try_recv().ok()).collect()
+    }
+
+    /// The guest's IPv4 endpoint on `port`.
+    fn from_guest(port: u16) -> IpEndpoint {
+        IpEndpoint::new(GUEST.into(), port)
+    }
+
+    /// An IPv4 endpoint.
+    fn to(address: Ipv4Addr, port: u16) -> IpEndpoint {
+        IpEndpoint::new(address.into(), port)
+    }
+
+    /// A connection-opening segment from the guest's `guest_port` to
+    /// `destination`.
+    fn syn_from(guest_port: u16, destination: IpEndpoint) -> Vec<u8> {
+        let IpAddress::Ipv4(address) = destination.addr else {
+            panic!("an IPv4 destination");
+        };
+        tcp_v4(
+            (GUEST, guest_port),
+            (address, destination.port),
+            TcpControl::Syn,
+            GUEST_ISN,
+            None,
+            &[],
+        )
+    }
+
+    /// A datagram from the guest's `guest_port` to `destination`.
+    fn datagram_from(guest_port: u16, destination: IpEndpoint) -> Vec<u8> {
+        let IpAddress::Ipv4(address) = destination.addr else {
+            panic!("an IPv4 destination");
+        };
+        let udp = datagram(from_guest(guest_port), destination, b"datagram");
+        ipv4(GUEST, address, IpProtocol::Udp, &udp)
+    }
+
+    /// The gateway's port 9, which no test maps to the host's loopback.
+    const UNMAPPED: u16 = 9;
+
+    #[test]
+    fn each_connection_attempt_is_reported_once_carried_or_refused() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, _guest) = tap_pair();
+        let (mut engine, reports) = reporting_engine(tap, mapping(port), Vec::new());
+
+        // The mapped port is carried, and reported once however often the
+        // guest repeats its opening segment.
+        let syn = syn_from(GUEST_PORT, to(GATEWAY, port));
+        assert!(engine.consider(classify(&syn)));
+        assert!(engine.consider(classify(&syn)));
+        // Another port of the gateway, and the metadata service, are refused.
+        let metadata = to(Ipv4Addr::new(169, 254, 169, 254), 80);
+        engine.consider(classify(&syn_from(GUEST_PORT, to(GATEWAY, UNMAPPED))));
+        engine.consider(classify(&syn_from(GUEST_PORT, metadata)));
+
+        assert_eq!(
+            reported(&reports),
+            [
+                NetStackReport::admitted(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    to(GATEWAY, port),
+                    FlowAdmission::HostLoopback,
+                ),
+                NetStackReport::refused(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    to(GATEWAY, UNMAPPED),
+                    FlowRefusal::GatewayUnmapped,
+                ),
+                NetStackReport::refused(
+                    Transport::Tcp,
+                    from_guest(GUEST_PORT),
+                    metadata,
+                    FlowRefusal::LinkLocal,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_connection_past_the_budget_is_reported_refused_for_it() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a listener binds");
+        let port = listener.local_addr().expect("an address").port();
+        let (tap, _guest) = tap_pair();
+        let (mut engine, reports) = reporting_engine(tap, mapping(port), Vec::new());
+
+        let first_port = 20_000;
+        for guest_port in (first_port..).take(tcp::MAX_FLOWS) {
+            engine.consider(classify(&syn_from(guest_port, to(GATEWAY, port))));
+        }
+        assert_eq!(engine.flows.len(), tcp::MAX_FLOWS);
+        let carried = reported(&reports);
+        assert_eq!(carried.len(), tcp::MAX_FLOWS);
+        assert!(
+            carried.iter().all(|report| matches!(
+                report,
+                NetStackReport::FlowAdmitted {
+                    admission: FlowAdmission::HostLoopback,
+                    ..
+                }
+            )),
+            "{carried:?}"
+        );
+
+        // One past the budget is refused for it, and a destination refused for
+        // a reason of its own is refused for that reason, budget or none.
+        engine.consider(classify(&syn_from(30_000, to(GATEWAY, port))));
+        engine.consider(classify(&syn_from(30_001, to(GATEWAY, UNMAPPED))));
+        assert_eq!(
+            reported(&reports),
+            [
+                NetStackReport::refused(
+                    Transport::Tcp,
+                    from_guest(30_000),
+                    to(GATEWAY, port),
+                    FlowRefusal::TooManyFlows,
+                ),
+                NetStackReport::refused(
+                    Transport::Tcp,
+                    from_guest(30_001),
+                    to(GATEWAY, UNMAPPED),
+                    FlowRefusal::GatewayUnmapped,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_udp_flow_is_reported_at_its_first_datagram() {
+        let (tap, _guest) = tap_pair();
+        let (mut engine, reports) = reporting_engine(tap, NetStack::default().plan, Vec::new());
+
+        // A guest repeats a datagram nothing answered, and the flow is
+        // reported once; another port of the guest's is another flow.
+        for _ in 0..3 {
+            engine.consider(classify(&datagram_from(40_000, to(GATEWAY, UNMAPPED))));
+        }
+        engine.consider(classify(&datagram_from(40_001, to(GATEWAY, UNMAPPED))));
+        assert_eq!(
+            reported(&reports),
+            [40_000, 40_001].map(|guest_port| NetStackReport::refused(
+                Transport::Udp,
+                from_guest(guest_port),
+                to(GATEWAY, UNMAPPED),
+                FlowRefusal::GatewayUnmapped,
+            ))
+        );
+    }
+
+    #[test]
+    fn a_carried_udp_flow_is_reported_when_it_opens() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a host socket binds");
+        let port = socket.local_addr().expect("an address").port();
+        let (tap, _guest) = tap_pair();
+        let (mut engine, reports) = reporting_engine(tap, mapping(port), Vec::new());
+
+        for _ in 0..2 {
+            let frame = datagram_from(40_000, to(GATEWAY, port));
+            assert!(engine.consider(classify(&frame)));
+            deliver(&mut engine, &frame);
+        }
+        assert_eq!(
+            reported(&reports),
+            [NetStackReport::admitted(
+                Transport::Udp,
+                from_guest(40_000),
+                to(GATEWAY, port),
+                FlowAdmission::HostLoopback,
+            )]
+        );
     }
 }

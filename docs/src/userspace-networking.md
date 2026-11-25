@@ -345,7 +345,8 @@ assert!(!outward.forwards(Transport::Tcp, "192.168.1.1:80".parse()?));
 ```
 
 A refused destination is refused as the stack refuses any other: a TCP
-connection is reset and a datagram is dropped. The rules belong to the stack's
+connection is reset and a datagram is dropped. The stack [reports](#reports)
+each refusal, naming the rule that took it. The rules belong to the stack's
 configuration, so every attachment of one `NetStack` applies them, and they do
 not change while a sandbox runs.
 
@@ -372,6 +373,71 @@ decides each flow by its address, though, so
 (`*`) or every name under one label (`*.com`). Parsing refuses a name whose last
 label is a number, such as `2130706433` or `127.1`, which a resolver may read as
 an address.
+
+### Reports
+
+The stack reports each decision it takes about a flow of the guest's. A flow is
+a TCP connection attempt, or the datagrams between one port of the guest's and
+one UDP destination. A [`NetStackReport`] names the transport, the guest's end,
+and the destination, and then what admitted the flow or why the stack refused
+it:
+
+- A [`FlowAdmission`] says what admitted the flow: no rule refuses it, a named
+  allow rule admits it, or the gateway's loopback mapping carries it.
+- A [`FlowRefusal`] says why the stack refused it: no allow rule admits it, or a
+  named deny rule refuses it. Otherwise it names the kind of destination the
+  stack always refuses, or says the stack already carries all the flows it
+  holds.
+
+A report writes as one line:
+
+```text
+refused tcp from 10.0.2.15:41234 to 198.51.100.7:443: no allow rule admits it
+```
+
+[`take_reports`][`NetStackHandle::take_reports`] hands over the receiving end, a
+[`NetStackReports`], which a thread of the caller's reads:
+
+```rust,no_run
+# use ferroday_cage::{Cage, NetStack};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let cage = Cage::builder().rootfs("/srv/rootfs").command("/usr/bin/job").build()?;
+let stack = NetStack::builder()
+    .allow("tcp:203.0.113.0/24:443".parse()?)
+    .build()?;
+let pending = cage.spawn_pending()?;
+let mut handle = stack.attach(&pending)?;
+let reports = handle.take_reports().expect("the reports are not yet taken");
+let reader = std::thread::spawn(move || {
+    while let Ok(report) = reports.recv() {
+        if report.is_refusal() {
+            eprintln!("{report}");
+        }
+    }
+});
+let mut running = pending.proceed()?;
+let status = running.wait()?;
+handle.stop()?;
+reader.join().expect("the reader finishes");
+# let _ = status;
+# Ok(())
+# }
+```
+
+A flow is reported once. A refused TCP attempt is answered with a reset, so the
+guest does not repeat it. A refused UDP flow is reported at its first datagram.
+It is reported again only after the guest has sent it nothing for two minutes,
+as an idle flow expires.
+
+The pump never waits on the reader. Its queue holds 1024 reports, and a report
+it has no room for is dropped and counted, which
+[`dropped`][`NetStackReports::dropped`] answers. A caller that never takes the
+reports pays for the queue and nothing more. Dropping the receiving end stops
+the stack making them. The reports end once the stack has stopped and
+every queued report has been read, so a thread reading them ends after `stop`.
+
+The stack's own grants are not reported: the connections a published port
+accepts, and the guest's queries to the nameserver.
 
 ### What answers, and what checks reachability
 
@@ -688,5 +754,11 @@ outside the sandbox and is not filtered.
 [`NetStackHandle`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html
 [`NetStackHandle::stop`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.stop
 [`NetStackHandle::is_running`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.is_running
+[`NetStackHandle::take_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.take_reports
+[`NetStackReport`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.NetStackReport.html
+[`NetStackReports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackReports.html
+[`NetStackReports::dropped`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackReports.html#method.dropped
+[`FlowAdmission`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.FlowAdmission.html
+[`FlowRefusal`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.FlowRefusal.html
 [`pasta`]: https://passt.top/
 [`slirp4netns`]: https://github.com/rootless-containers/slirp4netns

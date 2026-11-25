@@ -76,6 +76,15 @@ consumer upgrading can skip it.
   with the new `NetStackError::RuleInvalid`. The stack's profile format gains
   the `allow` and `deny` keys, and `fcage` the `--netstack-allow RULE` and
   `--netstack-deny RULE` flags.
+- The native network stack reports each flow of the guest's it carries or
+  refuses. `NetStackHandle::take_reports` hands over the new `NetStackReports`,
+  the receiving end of a queue of 1024 reports that the stack never waits on: a
+  report it has no room for is dropped and counted. Each `NetStackReport` names
+  the transport, the guest's end and the destination, with a `FlowAdmission`
+  saying what admitted the flow or a `FlowRefusal` saying why the stack refused
+  it, naming the rule where one decided, and writes as one line. A TCP attempt
+  is reported once, and a refused UDP flow once until it has sat idle for two
+  minutes. `Transport` writes as `tcp` or `udp`.
 
 ### Changed
 
