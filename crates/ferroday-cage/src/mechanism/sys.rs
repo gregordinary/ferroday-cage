@@ -192,6 +192,18 @@ pub(crate) fn kill_all(signal: Signal) -> Result<(), Errno> {
         .map_err(errno)
 }
 
+/// Whether any process is left that [`kill_all`] would reach: `kill(-1, 0)`,
+/// which signals nothing and answers `ESRCH` where no process is.
+///
+/// Asked by the init of a PID namespace, it says whether the namespace holds a
+/// process besides the init. Any answer but `ESRCH` counts as one left, so a
+/// failure to ask never ends a sandbox early.
+pub(crate) fn others_remain() -> bool {
+    // SAFETY: the call takes two integers and touches no memory.
+    let asked = unsafe { syscalls::syscall!(Sysno::kill, -1i32, 0i32) };
+    !matches!(asked.map_err(errno), Err(Errno::SRCH))
+}
+
 /// Replaces the process image, returning only the reason it could not.
 ///
 /// # Safety

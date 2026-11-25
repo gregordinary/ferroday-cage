@@ -123,6 +123,14 @@ consumer upgrading can skip it.
   sandbox that has ended answers `Error::SandboxEnded`, and a restriction's
   handle `ConfigError::ExecIntoRestriction`. Library only: `fcage` runs one
   command per invocation.
+- A sandbox can start with no command of its own: `Cage::start` sets the
+  sandbox up and returns its handle, its init holding it for further commands
+  rather than running one, and `Cage::start_pending` holds it at the gate for
+  a network stack to attach first. The init takes none of the caller's
+  streams. `terminate` sends `SIGTERM` to every process of such a sandbox,
+  which ends once none is left, reporting an exit code of 0. A cage that
+  shares the caller's PID namespace is refused with
+  `ConfigError::StartWithoutPidNamespace`.
 - A sandbox or a restriction can report each call its seccomp filter refuses
   the command: `seccomp_reports(true)` on `CageBuilder` and
   `RestrictionBuilder`, `seccomp-reports` in a profile's `[hardening]` table.
@@ -291,6 +299,10 @@ consumer upgrading can skip it.
 
 ### Changed
 
+- `CageBuilder::build` accepts a cage with no command, which only starts:
+  `run`, `spawn` and the other launches that run the cage's command refuse it
+  with `ConfigError::CommandMissing`, where the build refused it before. A
+  command given empty is still refused at build.
 - **Breaking.** `CageBuilder::get_stop_with_caller` returns `Option<bool>`, the
   tie as stated, `None` where nothing stated it. A profile rendered from a
   builder no longer writes `stop-with-caller = false` for a tie nobody stated,

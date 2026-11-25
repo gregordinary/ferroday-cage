@@ -583,6 +583,12 @@ pub(crate) struct LaunchPlan {
     pub(crate) program_search: Vec<CString>,
     /// The command's arguments, excluding the conventional `argv[0]`.
     pub(crate) args: Vec<CString>,
+    /// Whether the launch runs the command. `false` where the sandbox is
+    /// started with no command of its own, by `Cage::start`: the init then
+    /// sets the sandbox up, forks nothing, and holds it for further commands
+    /// until it is ended. A cage built without a command carries `false`, and
+    /// only starts.
+    pub(crate) runs_command: bool,
     /// The command's complete environment, as frozen `NAME=value` entries.
     pub(crate) env: Vec<CString>,
     /// The root the sandbox stage pivots into, validated at build time.

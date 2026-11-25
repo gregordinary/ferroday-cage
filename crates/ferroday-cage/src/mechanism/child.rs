@@ -435,9 +435,9 @@ fn run_stage_a(context: &Context<'_>) -> Result<Infallible, Failure> {
             supervisor_hygiene(context, Role::Outside);
             supervise(
                 context,
-                pidfd.as_fd(),
+                Some(pidfd.as_fd()),
                 children.as_fd(),
-                child,
+                Some(child),
                 Role::Outside,
             )
         }
@@ -669,6 +669,11 @@ fn stage_init(context: &Context<'_>, launch_stage: Option<OwnedFd>) -> ! {
         report(context.report_fd, step, errno, detail);
         sys::exit_group(127)
     }
+    if !context.plan.runs_command {
+        drop(seam);
+        drop(replica);
+        hold_sandbox(context)
+    }
 
     // SAFETY: as at every fork here: the child process touches only frozen
     // data and raw syscalls, and never returns.
@@ -739,13 +744,52 @@ fn stage_init(context: &Context<'_>, launch_stage: Option<OwnedFd>) -> ! {
             supervisor_hygiene(context, Role::Init);
             supervise(
                 context,
-                pidfd.as_fd(),
+                Some(pidfd.as_fd()),
                 children.as_fd(),
-                command,
+                Some(command),
                 Role::Init,
             )
         }
     }
+}
+
+/// Holds a sandbox started with no command of its own, as its init: in place of
+/// forking a command, waits at the gate where the launch is held there, and then
+/// supervises the sandbox until it is ended.
+///
+/// The gate is the one a command waits at before its own confinement, and the
+/// init reports itself held at it as a command does, so a caller attaches a
+/// network stack to a started sandbox as to any other. The listener channel
+/// has no command to send over it, and this process's copy closes, so the
+/// caller's end reads end-of-file.
+///
+/// The supervisor then has nothing of its own to wait for. A further command
+/// joins the sandbox from outside, and what it leaves behind is reparented here
+/// and collected. The sandbox ends when the caller ends it, and on a
+/// termination request once every process of it has ended; see [`supervise`].
+fn hold_sandbox(context: &Context<'_>) -> ! {
+    if let Some(channel) = context.listener_channel_fd {
+        // SAFETY: the raw descriptor is this process's own copy of the
+        // channel's sandbox end, closed exactly once here and never used again
+        // in this process.
+        unsafe { rustix::io::close(channel.as_raw_fd()) };
+    }
+    if let Some(proceed) = context.proceed_fd {
+        report_held(context.report_fd);
+        if let Err((step, errno)) = await_proceed(proceed) {
+            report(context.report_fd, step, errno, 0);
+            sys::exit_group(127)
+        }
+    }
+    let children = match watch_children() {
+        Ok(children) => children,
+        Err(errno) => {
+            report(context.report_fd, SetupStep::WatchCommand, errno, 0);
+            sys::exit_group(127)
+        }
+    };
+    supervisor_hygiene(context, Role::Init);
+    supervise(context, None, children.as_fd(), None, Role::Init)
 }
 
 /// Kills and collects the command after the delegate failed to establish its
@@ -2102,18 +2146,21 @@ enum Watch {
 /// caller's job control, and the supervisor does not ask about stops.
 fn supervise(
     context: &Context<'_>,
-    exit: BorrowedFd<'_>,
+    exit: Option<BorrowedFd<'_>>,
     children: BorrowedFd<'_>,
-    child: Pid,
+    child: Option<Pid>,
     role: Role,
 ) -> ! {
     let stops = match role {
         Role::Init => WaitOptions::UNTRACED,
         Role::Outside => WaitOptions::empty(),
     };
-    let mut watch_exit = true;
+    let mut watch_exit = exit.is_some();
     let mut watch_control = true;
     let mut released = false;
+    // A sandbox with no command of its own, asked to terminate: every process
+    // of it has been sent `SIGTERM`, and it ends once none is left.
+    let mut terminating = false;
     loop {
         // Only the live channels are polled, gathered to the front: a retired
         // pidfd would be ready on every pass.
@@ -2124,9 +2171,9 @@ fn supervise(
             PollFd::new(&children, PollFlags::IN),
         ];
         let mut live = 1;
-        if watch_exit {
+        if let (true, Some(exit)) = (watch_exit, &exit) {
             watched[live] = Watch::Exit;
-            fds[live] = PollFd::new(&exit, PollFlags::IN);
+            fds[live] = PollFd::new(exit, PollFlags::IN);
             live += 1;
         }
         if watch_control {
@@ -2134,7 +2181,11 @@ fn supervise(
             fds[live] = PollFd::new(&context.control_fd, PollFlags::IN);
             live += 1;
         }
-        match rustix::event::poll(&mut fds[..live], None) {
+        // Terminating with no command of its own, the sandbox's other processes
+        // are no children of this one, so nothing wakes it as they end: it
+        // looks again at an interval instead.
+        let timeout = terminating.then(|| crate::poll::timeout(ALONE_INTERVAL));
+        match rustix::event::poll(&mut fds[..live], timeout.as_ref()) {
             Ok(_) => {}
             Err(Errno::INTR) => continue,
             // An unpollable descriptor set has no recovery; exit visibly.
@@ -2168,9 +2219,17 @@ fn supervise(
                     // namespace: SIGTERM is deliverable and trappable there,
                     // docker-stop style. ESRCH means it already exited; the
                     // wait below handles the rest.
-                    CONTROL_TERMINATE => {
-                        let _ = process::kill_process(child, Signal::TERM);
-                    }
+                    CONTROL_TERMINATE => match child {
+                        Some(child) => {
+                            let _ = process::kill_process(child, Signal::TERM);
+                        }
+                        // With no command of its own, termination is a request
+                        // to every process of the sandbox.
+                        None => {
+                            terminating = true;
+                            let _ = sys::kill_all(Signal::TERM);
+                        }
+                    },
                     CONTROL_END => end_sandbox(role, child),
                     _ => {}
                 },
@@ -2204,13 +2263,16 @@ fn supervise(
                         let _ = process::kill_process(pid, Signal::CONT);
                     }
                 }
-                Ok(Some((pid, status))) if pid == child => {
+                Ok(Some((pid, status))) if Some(pid) == child => {
                     collect_exited();
                     report_status(context.status_fd, status);
                     sys::exit_group(0)
                 }
                 Ok(Some(_)) | Err(Errno::INTR) => {}
                 Ok(None) => break,
+                // With no command of its own, no child at all is the init's
+                // ordinary state between further commands.
+                Err(Errno::CHILD) if child.is_none() => break,
                 // No children left yet no status for the supervised
                 // process: something else reaped it. Unreportable;
                 // exiting without a record surfaces as a lost
@@ -2219,9 +2281,17 @@ fn supervise(
             }
         }
 
+        // Terminating with no command of its own, and nothing left: the
+        // sandbox has ended as its command's exit would end it.
+        if terminating && !sys::others_remain() {
+            collect_exited();
+            report_outcome(context.status_fd, STATUS_EXITED, 0);
+            sys::exit_group(0)
+        }
+
         // The supervised process has exited, and no wait could collect it: a
         // tracer holds its exit. See "A held exit" above.
-        if !watch_exit && !released && role == Role::Init {
+        if child.is_some() && !watch_exit && !released && role == Role::Init {
             let _ = sys::kill_all(Signal::KILL);
             released = true;
         }
@@ -2245,14 +2315,16 @@ pub(super) const CONTROL_END: u8 = b'E';
 /// process of the namespace; no status is reported, since whoever asked has
 /// let go of the sandbox. From outside, it kills the command and keeps
 /// supervising, so the command's exit is still collected and reported.
-fn end_sandbox(role: Role, child: Pid) {
-    match role {
-        Role::Init => sys::exit_group(1),
+fn end_sandbox(role: Role, child: Option<Pid>) {
+    match (role, child) {
+        (Role::Init, _) => sys::exit_group(1),
         // The command is this process's unreaped child until the wait in the
         // supervisor loop collects it, so its pid names nothing else.
-        Role::Outside => {
+        (Role::Outside, Some(child)) => {
             let _ = process::kill_process(child, Signal::KILL);
         }
+        // Outside the sandbox there is always a command; nothing to end.
+        (Role::Outside, None) => {}
     }
 }
 
@@ -2302,11 +2374,21 @@ fn report_status(fd: BorrowedFd<'_>, status: WaitStatus) {
         // exit without a record rather than invent one.
         sys::exit_group(127)
     };
+    report_outcome(fd, kind, value);
+}
+
+/// Writes the status record for an outcome of `kind` and `value`, with what
+/// this process's collected descendants used; see [`report_status`].
+fn report_outcome(fd: BorrowedFd<'_>, kind: u32, value: i32) {
     // A failure reports the outcome without usage rather than losing it.
     let usage = sys::children_usage().ok();
     let record = encode_status(kind, value, usage.as_ref());
     let _ = rustix::io::write(fd, &record);
 }
+
+/// How often a sandbox with no command of its own, terminating, looks whether
+/// any process of it is left.
+const ALONE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Resets every signal disposition to the default, then replaces the signal
 /// mask with `blocked`.

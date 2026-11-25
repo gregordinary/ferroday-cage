@@ -265,6 +265,7 @@ impl Exec {
         };
         Ok(LaunchPlan {
             program: command.program,
+            runs_command: true,
             program_search,
             args,
             env,

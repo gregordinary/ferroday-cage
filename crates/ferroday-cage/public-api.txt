@@ -1854,6 +1854,7 @@ pub ferroday_cage::ConfigError::SeccompReportsUnrewritable
 pub ferroday_cage::ConfigError::SeccompUnsupportedArch::arch: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::SetidCapWithNonRootIdentity
 pub ferroday_cage::ConfigError::SetidCapWithNonRootIdentity::capability: &'static str
+pub ferroday_cage::ConfigError::StartWithoutPidNamespace
 #[non_exhaustive] pub ferroday_cage::ConfigError::StreamAttachmentConflict
 pub ferroday_cage::ConfigError::StreamAttachmentConflict::attachment: &'static str
 pub ferroday_cage::ConfigError::StreamAttachmentConflict::stream: &'static str
@@ -2590,6 +2591,8 @@ pub fn ferroday_cage::Cage::spawn_pending_terminal(&self, &ferroday_cage::Termin
 pub fn ferroday_cage::Cage::spawn_pending_with<'obs>(&self, &'obs mut dyn ferroday_cage::Observer) -> core::result::Result<ferroday_cage::Pending<'obs>, ferroday_cage::Error>
 pub fn ferroday_cage::Cage::spawn_terminal(&self, &ferroday_cage::Terminal) -> core::result::Result<(ferroday_cage::Running<'static>, ferroday_cage::Pty), ferroday_cage::Error>
 pub fn ferroday_cage::Cage::spawn_with<'obs>(&self, &'obs mut dyn ferroday_cage::Observer) -> core::result::Result<ferroday_cage::Running<'obs>, ferroday_cage::Error>
+pub fn ferroday_cage::Cage::start(&self) -> core::result::Result<ferroday_cage::Running<'static>, ferroday_cage::Error>
+pub fn ferroday_cage::Cage::start_pending(&self) -> core::result::Result<ferroday_cage::Pending<'static>, ferroday_cage::Error>
 impl core::marker::Freeze for ferroday_cage::Cage
 impl core::marker::Send for ferroday_cage::Cage
 impl core::marker::Sync for ferroday_cage::Cage

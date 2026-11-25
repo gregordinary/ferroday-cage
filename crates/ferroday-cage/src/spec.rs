@@ -689,7 +689,7 @@ impl Cage {
     /// of the wait; see [`Running::wait`](crate::Running::wait) for the case
     /// where the command leaves descendants behind.
     pub fn output(&self) -> Result<Output, Error> {
-        Running::output(&self.plan)
+        Running::output(self.runnable()?)
     }
 
     /// Starts the command inside the sandbox and returns a handle to it.
@@ -700,7 +700,7 @@ impl Cage {
     /// the stream dispositions the sandbox carries; the returned [`Running`] waits for,
     /// signals, or kills it.
     pub fn spawn(&self) -> Result<Running<'static>, Error> {
-        Running::launch(&self.plan, None)
+        Running::launch(self.runnable()?, None)
     }
 
     /// Starts the command inside the sandbox, capturing its output for the
@@ -714,7 +714,7 @@ impl Cage {
         &self,
         observer: &'obs mut dyn Observer,
     ) -> Result<Running<'obs>, Error> {
-        Running::launch(&self.plan, Some(observer))
+        Running::launch(self.runnable()?, Some(observer))
     }
 
     /// Starts the sandbox but holds the command before it runs, returning a
@@ -744,7 +744,7 @@ impl Cage {
     /// A caller that needs no pause uses [`spawn`](Self::spawn) instead; this
     /// entry point exists for the attach-then-run sequence.
     pub fn spawn_pending(&self) -> Result<Pending<'static>, Error> {
-        Pending::launch(&self.plan, None)
+        Pending::launch(self.runnable()?, None)
     }
 
     /// Starts the sandbox held before its command runs, capturing the
@@ -758,7 +758,7 @@ impl Cage {
         &self,
         observer: &'obs mut dyn Observer,
     ) -> Result<Pending<'obs>, Error> {
-        Pending::launch(&self.plan, Some(observer))
+        Pending::launch(self.runnable()?, Some(observer))
     }
 
     /// Starts the command on a pseudoterminal of its own, returning a handle to
@@ -801,7 +801,7 @@ impl Cage {
     /// # }
     /// ```
     pub fn spawn_terminal(&self, terminal: &Terminal) -> Result<(Running<'static>, Pty), Error> {
-        Running::launch_terminal(&self.plan, terminal)
+        Running::launch_terminal(self.runnable()?, terminal)
     }
 
     /// [`spawn_terminal`](Self::spawn_terminal), held at the gate before the
@@ -819,7 +819,76 @@ impl Cage {
         &self,
         terminal: &Terminal,
     ) -> Result<(Pending<'static>, Pty), Error> {
-        Pending::launch_terminal(&self.plan, terminal)
+        Pending::launch_terminal(self.runnable()?, terminal)
+    }
+
+    /// Starts the sandbox with no command of its own, and returns a handle to
+    /// it, for further commands to run in through [`Running::exec`].
+    ///
+    /// The sandbox is set up as for any launch, and its init holds it rather
+    /// than run a command: a session's sandbox, which lives for the session
+    /// rather than for one command, and which needs nothing in its root to keep
+    /// it up. A cage built without a command is made for this, and one built
+    /// with a command starts the same way, without running it. The init takes
+    /// none of the caller's streams.
+    ///
+    /// The handle ends the sandbox as it ends any: [`kill`](Running::kill)
+    /// ends every process of it, and dropping the last handle does where
+    /// [`stop_with_caller`](CageBuilder::stop_with_caller) ties it to them,
+    /// which a session usually wants. [`terminate`](Running::terminate) sends
+    /// `SIGTERM` to every process of the sandbox, and the sandbox ends once none
+    /// is left, its wait reporting an exit code of 0. A further command still
+    /// running then ends with it.
+    ///
+    /// Blocks until the sandbox is set up, so a failure of its setup is
+    /// reported here. [`start_pending`](Self::start_pending) holds it there for
+    /// a network stack to attach.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::StartWithoutPidNamespace`] where the cage shares the
+    /// caller's PID namespace, since the init that holds the sandbox is that
+    /// namespace's; otherwise as [`spawn`](Self::spawn).
+    pub fn start(&self) -> Result<Running<'static>, Error> {
+        Running::launch(&self.started()?, None)
+    }
+
+    /// [`start`](Self::start), held at the gate before the sandbox is handed
+    /// over: the userspace-network seam for a sandbox with no command of its
+    /// own.
+    ///
+    /// The init reports itself held as a command does at the gate, so a
+    /// [`NetStack`](crate::NetStack) attaches to the sandbox as to a pending
+    /// launch's, and [`proceed`](Pending::proceed) returns the sandbox's
+    /// handle.
+    pub fn start_pending(&self) -> Result<Pending<'static>, Error> {
+        Pending::launch(&self.started()?, None)
+    }
+
+    /// The plan, for a launch that runs the cage's command: refused for a cage
+    /// built without one, which only starts.
+    fn runnable(&self) -> Result<&Arc<LaunchPlan>, Error> {
+        if self.plan.runs_command {
+            Ok(&self.plan)
+        } else {
+            Err(ConfigError::CommandMissing.into())
+        }
+    }
+
+    /// The plan of the sandbox started with no command of its own: the cage's,
+    /// running nothing, its init on none of the caller's streams.
+    fn started(&self) -> Result<Arc<LaunchPlan>, Error> {
+        if !self.plan.pid_namespace {
+            return Err(ConfigError::StartWithoutPidNamespace.into());
+        }
+        Ok(Arc::new(LaunchPlan {
+            runs_command: false,
+            stdin: StdioPlan::Null,
+            stdout: StdioPlan::Null,
+            stderr: StdioPlan::Null,
+            own_session: true,
+            ..(*self.plan).clone()
+        }))
     }
 }
 
@@ -1799,6 +1868,10 @@ impl CageBuilder {
     /// be absolute, unless [`path_lookup`](Self::path_lookup) is enabled and
     /// the command is a bare name, in which case it is resolved against the
     /// sandbox's `PATH`.
+    ///
+    /// A cage built without one is a sandbox to [`start`](Cage::start) and run
+    /// further commands in; the launches that run the cage's own command refuse
+    /// it with [`ConfigError::CommandMissing`].
     pub fn command(mut self, program: impl AsRef<Path>) -> Self {
         self.command = Some(program.as_ref().to_path_buf());
         self
@@ -3006,7 +3079,14 @@ impl CageBuilder {
             (None, None) if self.empty_rootfs || self.host_rootfs => None,
             (None, None) => return Err(ConfigError::RootfsMissing.into()),
         };
-        let command = validate_command(self.command, Some(self.path_lookup))?;
+        // A cage built without a command is a sandbox to start, with
+        // `Cage::start`, and to run further commands in, and a launch that runs
+        // the cage's own command refuses it then. A command given empty is no
+        // command, and is refused here as one.
+        let command = self
+            .command
+            .map(|command| validate_command(Some(command), Some(self.path_lookup)))
+            .transpose()?;
         // With the base opted out of, the caller's pairs are the whole
         // environment; the library contributes nothing, in this release or a
         // later one. A command that runs as another identity than uid 0 gets
@@ -3026,12 +3106,18 @@ impl CageBuilder {
         // against the value that carries it rather than a candidate built
         // from it.
         let env = compose_env(base, &self.env)?;
-        let program_search = lookup_candidates(&command, &env)?;
+        let program_search = match &command {
+            Some(command) => lookup_candidates(command, &env)?,
+            None => Vec::new(),
+        };
         // The label a failed exec step reports. `ENOENT` from `execve` means
         // either "no such binary" or "no such ELF interpreter", so naming the
         // command — and, for a path lookup, every candidate that was tried —
         // is what makes the report actionable.
-        let exec_label = exec_label(&command.path, &program_search);
+        let exec_label = command
+            .as_ref()
+            .map(|command| exec_label(&command.path, &program_search))
+            .unwrap_or_default();
         let (rlimits, rlimit_labels) = lower_rlimits(&self.rlimits)?;
         let cgroup = self.cgroup.plan()?;
         let cgroup_unapplied = self.cgroup.unapplied();
@@ -3320,7 +3406,8 @@ impl CageBuilder {
                 nested: Some(nested),
                 run_as,
                 present_as,
-                program: command.program,
+                runs_command: command.is_some(),
+                program: command.map(|command| command.program).unwrap_or_default(),
                 program_search,
                 args,
                 env,
@@ -6100,9 +6187,33 @@ mod tests {
     }
 
     #[test]
-    fn build_requires_a_command() {
-        let err = Cage::builder().rootfs("/").build().unwrap_err();
-        assert!(matches!(err, Error::Config(ConfigError::CommandMissing)));
+    fn a_cage_without_a_command_builds_and_only_starts() {
+        let cage = Cage::builder()
+            .rootfs("/tmp")
+            .build()
+            .expect("a cage without a command builds");
+        assert!(!cage.plan.runs_command);
+        assert!(matches!(
+            cage.spawn(),
+            Err(Error::Config(ConfigError::CommandMissing))
+        ));
+        assert!(matches!(
+            cage.output(),
+            Err(Error::Config(ConfigError::CommandMissing))
+        ));
+        assert!(matches!(
+            cage.spawn_pending(),
+            Err(Error::Config(ConfigError::CommandMissing))
+        ));
+        let shared = Cage::builder()
+            .rootfs("/tmp")
+            .pid_namespace(false)
+            .build()
+            .expect("a cage without a command builds");
+        assert!(matches!(
+            shared.start(),
+            Err(Error::Config(ConfigError::StartWithoutPidNamespace))
+        ));
     }
 
     #[test]

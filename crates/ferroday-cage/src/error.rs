@@ -302,7 +302,10 @@ pub enum ConfigError {
     RootfsIsHostRoot,
     /// No command was provided, or the path given names nothing.
     ///
-    /// An empty path is the second: it is not a command that could not be
+    /// A cage built without a command is one to start, with `Cage::start`, and
+    /// is refused this by a launch that runs the cage's own command, `run`,
+    /// `spawn` and their kin; a restriction is refused it at build. An empty
+    /// path is refused at build, by both: it is not a command that could not be
     /// found, it is the absence of one written down. Every later check reads it
     /// as something else — it carries no slash, so a path lookup takes it for a
     /// bare name and joining it onto a `PATH` entry yields that entry — so it is
@@ -1020,6 +1023,11 @@ rendered as text.
     /// command to join, so there is nothing to run it in; launching the
     /// restriction again with the other command is the same thing.
     ExecIntoRestriction,
+    /// A sandbox was to start with no command of its own, through
+    /// `Cage::start`, without a PID namespace. The init that holds such a
+    /// sandbox is its PID namespace's, so without one there is nothing to hold
+    /// it.
+    StartWithoutPidNamespace,
 }
 
 impl fmt::Display for ConfigError {
@@ -1099,6 +1107,10 @@ impl fmt::Display for ConfigError {
             ConfigError::SeccompReportsUndelivered => f.write_str(
                 "seccomp reports are on, and the policy refuses sendmsg, which hands the \
                  reports' listener to the caller; allow sendmsg, or turn the reports off",
+            ),
+            ConfigError::StartWithoutPidNamespace => f.write_str(
+                "a sandbox started with no command of its own needs a PID namespace, whose init \
+                 holds it",
             ),
             ConfigError::ExecIntoRestriction => f.write_str(
                 "a restriction has no namespaces for a further command to join; launch the \

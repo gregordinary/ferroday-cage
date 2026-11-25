@@ -354,9 +354,9 @@ fn run_group(
     };
 
     match compose(builder, overrides, command_line).build() {
-        Ok(cage) => launch(cage),
+        Ok(cage) => launch(group, cage),
         Err(error) => {
-            report_build_error(group, &error);
+            report_error(group, &error);
             ExitCode::from(error.shell_code())
         }
     }
@@ -429,19 +429,21 @@ fn load_group(path: &Path) -> Result<CageBuilder, String> {
 
 /// Launches a built cage with inherited standard streams and waits for it,
 /// mapping the outcome onto the process exit status.
-fn launch(cage: Cage) -> ExitCode {
+fn launch(group: &str, cage: Cage) -> ExitCode {
     match cage.spawn().and_then(|mut running| running.wait()) {
         Ok(status) => ExitCode::from(status.shell_code()),
         Err(error) => {
-            eprintln!("orchestrator: {}", ErrorChain::new(&error));
+            report_error(group, &error);
             ExitCode::from(error.shell_code())
         }
     }
 }
 
-/// Explains a build failure, naming the group and pointing at the fix for the
-/// two configuration errors a group profile most often omits.
-fn report_build_error(group: &str, error: &Error) {
+/// Explains a failure to build or launch a group's sandbox, naming the group
+/// and pointing at the fix for the two configuration errors a group profile
+/// most often omits. A missing rootfs is refused by the build, and a missing
+/// command by the launch, since a cage with no command builds as one to start.
+fn report_error(group: &str, error: &Error) {
     match error {
         Error::Config(ConfigError::CommandMissing) => {
             eprintln!("orchestrator: group '{group}' defines no default command; give one after --")

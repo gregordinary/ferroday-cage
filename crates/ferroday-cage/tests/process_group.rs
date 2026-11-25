@@ -27,9 +27,10 @@ use rustix::process::{Pid, WaitOptions};
 const ROLE: &str = "FERRODAY_CAGE_TEST_GROUP_ROLE";
 
 /// What the caller launches and how it stands: `interrupt`, `suspend`,
-/// `suspend-subreaper`, `inner-job`, `pipeline`, `pipe`, or `exec`, where the
+/// `suspend-subreaper`, `inner-job`, `pipeline`, `pipe`, `exec`, where the
 /// command is a further command run in a sandbox the caller started off the
-/// terminal.
+/// terminal, or `start`, where it is a further command run in a sandbox
+/// started with no command of its own.
 const SCENARIO: &str = "FERRODAY_CAGE_TEST_GROUP_SCENARIO";
 
 /// The command every scenario runs: it signals its own process group, which
@@ -180,20 +181,34 @@ fn helper_caller() {
     // leave the sandbox behind. In `exec` the sandbox's own command keeps it
     // running off the terminal, and the scenario's command is a further one,
     // on the caller's standard streams.
-    let sandbox = (scenario == "exec").then(|| {
-        Cage::builder()
-            .rootfs(rootfs)
-            .command("/bin/sleep")
-            .arg("60")
-            .stdin(Stdio::Null)
-            .stdout(Stdio::Null)
-            .stderr(Stdio::Null)
-            .stop_with_caller(true)
-            .build()
-            .expect("a valid sandbox configuration")
-            .spawn()
-            .expect("the sandbox launches")
-    });
+    let sandbox = match scenario.as_str() {
+        "exec" => Some(
+            Cage::builder()
+                .rootfs(rootfs)
+                .command("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Null)
+                .stderr(Stdio::Null)
+                .stop_with_caller(true)
+                .build()
+                .expect("a valid sandbox configuration")
+                .spawn()
+                .expect("the sandbox launches"),
+        ),
+        // Started on the caller's own streams, which its init takes none of:
+        // the caller keeps the foreground to lend the further command.
+        "start" => Some(
+            Cage::builder()
+                .rootfs(rootfs)
+                .stop_with_caller(true)
+                .build()
+                .expect("a cage without a command builds")
+                .start()
+                .expect("the sandbox starts"),
+        ),
+        _ => None,
+    };
     let mut running = match &sandbox {
         Some(sandbox) => sandbox
             .exec(
@@ -351,6 +366,23 @@ fn a_further_command_on_the_callers_terminal_signals_only_its_own_group() {
     // group misses the caller, and a `^C` reaches it.
     assert_contained(&session(
         "exec",
+        &[
+            Step::Expect("ready"),
+            Step::Expect("caller-launched"),
+            Step::Type("\x03"),
+        ],
+    ));
+}
+
+#[test]
+fn a_started_sandbox_leaves_the_terminal_to_its_further_command() {
+    if common::fixture_rootfs().is_none() {
+        return;
+    }
+    // The started sandbox's init takes no foreground of the caller's, so the
+    // further command on the caller's terminal gets it, as in `exec`.
+    assert_contained(&session(
+        "start",
         &[
             Step::Expect("ready"),
             Step::Expect("caller-launched"),

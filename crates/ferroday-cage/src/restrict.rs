@@ -920,6 +920,7 @@ impl RestrictionBuilder {
                 run_as: None,
                 present_as: None,
                 program: command.program,
+                runs_command: true,
                 // A restriction keeps the absolute-command contract: no PATH
                 // search over the shared host filesystem.
                 program_search: Vec::new(),

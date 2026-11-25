@@ -418,6 +418,128 @@ fn a_further_command_on_a_terminal_names_no_stream_of_its_own() {
     sandbox.wait().expect("the outcome is collected");
 }
 
+/// A cage on the fixture root with no command of its own, tied to its handles.
+fn session(rootfs: &std::path::Path) -> Cage {
+    Cage::builder()
+        .rootfs(rootfs)
+        .stop_with_caller(true)
+        .hostname("session")
+        .build()
+        .expect("a cage without a command builds")
+}
+
+#[test]
+fn a_started_sandbox_runs_no_command_and_holds_for_further_ones() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut sandbox = session(rootfs).start().expect("the sandbox starts");
+    // The init forks nothing: the further command is the first process of the
+    // sandbox after it.
+    let (status, out) = exec_script(&sandbox, "hostname; echo self=$$");
+    assert!(status.success(), "{status:?}: {out}");
+    assert_eq!(out, "session\nself=2\n");
+    // Between further commands, the sandbox holds.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(sandbox.try_wait().expect("the handle polls"), None);
+    let (status, out) = exec_script(&sandbox, "echo again");
+    assert!(status.success() && out == "again\n", "{status:?}: {out}");
+    sandbox.kill().expect("the kill is delivered");
+    let status = sandbox.wait().expect("the outcome is collected");
+    assert_eq!(status.signal(), Some(9));
+}
+
+#[test]
+fn a_started_sandbox_collects_what_further_commands_leave() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut sandbox = session(rootfs).start().expect("the sandbox starts");
+    let (status, _) = exec_script(&sandbox, "sleep 0.2 & exit 0");
+    assert!(status.success());
+    std::thread::sleep(Duration::from_millis(600));
+    // The sleep was reparented to the init when its shell exited, and the init
+    // collected it when it exited in turn: no zombie is left.
+    let (status, out) = exec_script(
+        &sandbox,
+        "grep -l ') Z ' /proc/[0-9]*/stat 2>/dev/null | wc -l",
+    );
+    assert!(status.success() && out == "0\n", "{status:?}: {out}");
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+}
+
+#[test]
+fn terminating_a_started_sandbox_ends_it_once_nothing_is_left() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let mut sandbox = session(rootfs).start().expect("the sandbox starts");
+    let mut further = sandbox
+        .exec(&Exec::new("/bin/sleep").arg("86399").stop_with_caller(true))
+        .expect("the further command launches");
+    sandbox.terminate().expect("the termination is delivered");
+    let status = common::outcome_within(&mut further, PATIENCE);
+    assert_eq!(status.signal(), Some(15), "every process is sent SIGTERM");
+    let status = common::outcome_within(&mut sandbox, PATIENCE);
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    // A process that ignores the request keeps the sandbox up until a kill.
+    let mut sandbox = session(rootfs).start().expect("the sandbox starts");
+    let mut stubborn = sandbox
+        .exec(
+            &Exec::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; echo ready > /tmp/ready; while :; do sleep 1; done",
+                ])
+                .stop_with_caller(true),
+        )
+        .expect("the further command launches");
+    let (status, _) = exec_script(&sandbox, "while [ ! -s /tmp/ready ]; do sleep 0.01; done");
+    assert!(status.success());
+    sandbox.terminate().expect("the termination is delivered");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(sandbox.try_wait().expect("the handle polls"), None);
+    sandbox.kill().expect("the kill is delivered");
+    assert_eq!(
+        sandbox.wait().expect("the outcome is collected").signal(),
+        Some(9)
+    );
+    let status = common::outcome_within(&mut stubborn, PATIENCE);
+    assert_eq!(status.signal(), Some(9), "{status:?}");
+}
+
+#[test]
+fn dropping_a_tied_started_sandboxs_handle_ends_it() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let sandbox = session(rootfs).start().expect("the sandbox starts");
+    let mut further = sandbox
+        .exec(&Exec::new("/bin/sleep").arg("86399").stop_with_caller(true))
+        .expect("the further command launches");
+    drop(sandbox);
+    let status = common::outcome_within(&mut further, PATIENCE);
+    assert_eq!(status.signal(), Some(9), "{status:?}");
+}
+
+#[test]
+fn a_started_sandbox_held_at_the_gate_proceeds_to_its_handle() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    let pending = session(rootfs)
+        .start_pending()
+        .expect("the sandbox starts held");
+    assert!(pending.netns_pid() > 0);
+    let mut sandbox = pending.proceed().expect("the sandbox proceeds");
+    let (status, out) = exec_script(&sandbox, "hostname");
+    assert!(status.success() && out == "session\n", "{status:?}: {out}");
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+}
+
 #[test]
 fn a_range_map_reaches_a_further_command() {
     let Some(rootfs) = common::fixture_rootfs() else {
