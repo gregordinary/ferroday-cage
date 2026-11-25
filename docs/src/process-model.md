@@ -291,10 +291,13 @@ usual.
 
 On the caller's side, a launch never leaks a zombie when it is waited: the
 short-lived launch stage is collected during `spawn` (or by `wait`, without a
-PID namespace). The in-namespace init is not the caller's child process, unless
-the caller is a child subreaper (`PR_SET_CHILD_SUBREAPER`), to which the
-kernel reparents it once the launch stage has exited. The wait collects it
-then too, once it has exited.
+PID namespace), and a further command's join stage by that command's `wait`. A
+handle dropped without waiting leaves a stage that supervises from outside, the
+launch stage without a PID namespace and every join stage, a zombie child of
+the caller once it exits, until the caller exits. The in-namespace init is not
+the caller's child process, unless the caller is a child subreaper
+(`PR_SET_CHILD_SUBREAPER`), to which the kernel reparents it once the launch
+stage has exited. The wait collects it then too, once it has exited.
 
 ## Resource usage
 

@@ -253,8 +253,10 @@ consumer upgrading can skip it.
   own beneath the sandbox's, held to the sandbox's limits, whose `cgroup.kill`
   its handle's kill writes and whose processor time its usage reports. A
   sandbox that has ended answers `Error::SandboxEnded`, and a restriction's
-  handle `ConfigError::ExecIntoRestriction`. Library only: `fcage` runs one
-  command per invocation.
+  handle `ConfigError::ExecIntoRestriction`. The command's join stage is the
+  caller's child process, which its handle's wait collects; a handle dropped
+  without waiting leaves it a zombie once it exits, with a PID namespace as
+  without one. Library only: `fcage` runs one command per invocation.
 - The `session-sandbox` example keeps one sandbox for a session, started with
   no command of its own, and runs each line of its standard input in it as a
   further command. The guide's process model chapter describes further

@@ -47,11 +47,14 @@ const PUMP_BUF: usize = 8192;
 ///
 /// Dropping the handle without waiting neither kills the sandbox (unless
 /// [`stop_with_caller`] is set, whose tie the drop severs) nor collects its
-/// outcome. Without a PID namespace the launch stage, the command's parent
-/// outside the sandbox, then remains a zombie child process of the caller
-/// until the caller exits. A file the launch created in the root as a file
-/// bind's target stays there too, since removing it would unmount the running
-/// sandbox's bind. Prefer waiting — including after a kill.
+/// outcome. Where a stage supervises the command from outside the sandbox, as
+/// its parent, that stage then remains a zombie child process of the caller
+/// once it exits, until the caller exits: the launch stage without a PID
+/// namespace, and the join stage of every further command's handle, from
+/// [`exec`](Self::exec), with a PID namespace or without. A file the launch
+/// created in the root as a file bind's target stays there too, since removing
+/// it would unmount the running sandbox's bind. Prefer waiting — including
+/// after a kill.
 ///
 /// A sandbox with a cgroup of its own, from [`cgroup_parent`], has it removed
 /// once the handle collects the outcome, where nothing is left in it then.
