@@ -1802,7 +1802,13 @@ mod tests {
             _ => panic!("the second message"),
         }
         assert!(matches!(next(&mut reader, &server), Framed::Pending));
-        drop(client);
+        // Shut rather than dropped: a test beside this one that forks copies
+        // the descriptor into its child until the child executes, and the
+        // input ends only once no copy is left, where a shutdown ends it at
+        // once.
+        client
+            .shutdown(Shutdown::Write)
+            .expect("the client's side shuts");
         assert!(matches!(next(&mut reader, &server), Framed::Closed));
     }
 
