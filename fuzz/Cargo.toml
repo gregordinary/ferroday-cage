@@ -1,0 +1,24 @@
+[package]
+name = "ferroday-cage-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ferroday-cage = { path = "../crates/ferroday-cage", features = ["netstack"] }
+
+# A workspace of its own, so the fuzzing harness never joins the library's
+# build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "dns_query"
+path = "fuzz_targets/dns_query.rs"
+test = false
+doc = false
+bench = false

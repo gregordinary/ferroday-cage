@@ -47,7 +47,7 @@ mod streams;
 mod terminal;
 
 use std::ffi::{OsStr, OsString};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1956,6 +1956,35 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--netstack-no-nameserver",
+        section: Section::Networking,
+        help: &[
+            "Serve no DNS from the stack, which otherwise answers",
+            "on port 53 of 10.0.2.3 and fd00::3 by asking the",
+            "host's resolver",
+        ],
+        take: Take::Bare(|options| {
+            options.netstack_no_nameserver = true;
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--netstack-upstream",
+        section: Section::Networking,
+        placeholder: "ADDRESS",
+        help: &[
+            "Have the stack's nameserver ask the resolver at",
+            "ADDRESS, or ADDRESS:PORT with an IPv6 address in",
+            "brackets (default: the first nameserver of the",
+            "host's resolv.conf, a loopback one included)",
+        ],
+        take: Take::One(|options, flag, value| {
+            options.netstack_upstream = Some(parse_upstream(flag, &into_string(flag, value)?)?);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--restrict",
         section: Section::Hardening,
         help: &[
@@ -2693,6 +2722,8 @@ struct Options {
     netstack_interface: Option<String>,
     netstack_mtu: Option<u16>,
     netstack_host_loopback: bool,
+    netstack_no_nameserver: bool,
+    netstack_upstream: Option<SocketAddr>,
     netstack_host_ports: Vec<u16>,
     netstack_publish: Vec<(SocketAddr, u16)>,
     /// The `--forward-loopback` listeners, each with its target on the host.
@@ -3225,6 +3256,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         netstack_interface: None,
         netstack_mtu: None,
         netstack_host_loopback: false,
+        netstack_no_nameserver: false,
+        netstack_upstream: None,
         netstack_host_ports: Vec::new(),
         netstack_publish: Vec::new(),
         forwards: Vec::new(),
@@ -4013,6 +4046,18 @@ fn parse_host_address(flag: &str, value: &str) -> Result<SocketAddr, String> {
     value
         .parse::<SocketAddr>()
         .map_err(|_| format!("{flag} expects ADDRESS:PORT or a bare PORT, not {value:?}"))
+}
+
+/// Parses the resolver `--netstack-upstream` names: an `ADDRESS:PORT`, with an
+/// IPv6 address in brackets, or a bare `ADDRESS`, asked on port 53, the port
+/// `resolv.conf` implies for every nameserver it names.
+fn parse_upstream(flag: &str, value: &str) -> Result<SocketAddr, String> {
+    if let Ok(address) = value.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(address, DNS_PORT));
+    }
+    value
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("{flag} expects ADDRESS or ADDRESS:PORT, not {value:?}"))
 }
 
 /// Parses an IPv4 `address/prefix` for `--netstack-cidr`.
@@ -5811,7 +5856,11 @@ fn netstack_from(options: &Options) -> Result<NetStack, ferroday_cage::NetStackE
     let mut stack = NetStack::builder()
         .ipv4(!options.netstack_no_ipv4)
         .ipv6(!options.netstack_no_ipv6)
-        .host_loopback(options.netstack_host_loopback);
+        .host_loopback(options.netstack_host_loopback)
+        .nameserver(!options.netstack_no_nameserver);
+    if let Some(upstream) = options.netstack_upstream {
+        stack = stack.upstream(upstream);
+    }
     for port in &options.netstack_host_ports {
         stack = stack.host_loopback_port(*port);
     }
@@ -10105,6 +10154,52 @@ mod tests {
     }
 
     #[test]
+    fn the_nameserver_flags_reach_the_stack() {
+        assert_eq!(
+            parse_upstream("--netstack-upstream", "127.0.0.53").unwrap(),
+            "127.0.0.53:53".parse::<SocketAddr>().unwrap(),
+            "a bare address is asked on port 53",
+        );
+        assert_eq!(
+            parse_upstream("--netstack-upstream", "[::1]:5353").unwrap(),
+            "[::1]:5353".parse::<SocketAddr>().unwrap(),
+        );
+        // An IPv6 address and a port need the brackets: without them, the
+        // value is an address of its own.
+        assert_eq!(
+            parse_upstream("--netstack-upstream", "::1:5353").unwrap(),
+            "[::1:5353]:53".parse::<SocketAddr>().unwrap(),
+        );
+        for value in ["resolver.example", "[::1]", "127.0.0.1:"] {
+            let err = parse_upstream("--netstack-upstream", value).unwrap_err();
+            assert!(err.contains("ADDRESS:PORT"), "{err}");
+        }
+
+        let options = run_options(&[
+            "--rootfs",
+            "/r",
+            "--netstack",
+            "--netstack-upstream",
+            "192.0.2.53",
+            "/bin/true",
+        ]);
+        netstack_from(&options).expect("a stack asking that resolver");
+        // The library refuses an upstream for a nameserver turned off, and the
+        // flags reach it as they stand.
+        let options = run_options(&[
+            "--rootfs",
+            "/r",
+            "--netstack",
+            "--netstack-no-nameserver",
+            "--netstack-upstream",
+            "192.0.2.53",
+            "/bin/true",
+        ]);
+        let err = netstack_from(&options).expect_err("an upstream nothing asks");
+        assert!(err.to_string().contains("turned off"), "{err}");
+    }
+
+    #[test]
     fn netstack_modifiers_require_netstack() {
         let err = parse_run(&["--rootfs", "/r", "--netstack-mtu", "1400", "/bin/true"])
             .err()
@@ -10207,6 +10302,7 @@ mod tests {
             "--netstack-mtu" => &["1400"],
             "--netstack-host-port" | "--landlock-bind" | "--landlock-connect" => &["80"],
             "--netstack-publish" => &["8080", "80"],
+            "--netstack-upstream" => &["127.0.0.53"],
             "--landlock-scope" => &["signal"],
             "--seccomp" => &["curated"],
             "--seccomp-allow"

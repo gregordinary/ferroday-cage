@@ -371,6 +371,29 @@ jobs:
         with:
           command: check licenses advisories sources
 
+  fuzz:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    env:
+      # cargo-fuzz needs a nightly compiler for its sanitizer flags. Pinned, so
+      # this job fails on a change to the targets rather than on a nightly's
+      # regression, and bumped deliberately.
+      FUZZ_NIGHTLY: nightly-2026-07-09
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (pinned nightly) and cargo-fuzz
+        run: |
+          rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Build every target
+        # Building, not running: a fuzzing run is not a pass or fail a pull
+        # request can wait on. What this catches is a target left behind by a
+        # change to the reader it drives.
+        working-directory: fuzz
+        run: cargo "+$FUZZ_NIGHTLY" fuzz build
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest

@@ -18,11 +18,14 @@ homepage = "https://gregordinary.github.io/ferroday-cage/"
 unsafe_code = "deny"
 missing_docs = "warn"
 # The post-fork async-signal-safety guard in ferroday-cage::mechanism keys on
-# the same build cfgs rustix reads to select its backend. Declare them so the
-# unexpected-cfg lint stays quiet on a normal build, where neither is set.
+# the same build cfgs rustix reads to select its backend, and the fuzz targets
+# under `fuzz/` reach the library's readers of untrusted input through the one
+# cargo-fuzz sets. Declare them so the unexpected-cfg lint stays quiet on a
+# normal build, where none is set.
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(rustix_use_libc)',
     'cfg(rustix_no_linux_raw)',
+    'cfg(fuzzing)',
 ] }
 
 [workspace.lints.clippy]

@@ -46,6 +46,7 @@ use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use super::Plan;
+use super::nameserver::Nameserver;
 use super::pump::host_target;
 use crate::mechanism::netns::socket_for;
 
@@ -85,7 +86,7 @@ const UDP_HEADER: usize = 8;
 /// Neither IPv4 nor IPv6 fragmentation is compiled in, so this is a hard
 /// ceiling rather than a preference: smoltcp discards a larger packet at egress
 /// and reports nothing, so the relay refuses it here instead.
-fn deliverable(mtu: usize, destination: &IpEndpoint) -> usize {
+pub(super) fn deliverable(mtu: usize, destination: &IpEndpoint) -> usize {
     let ip_header = match destination.addr {
         IpAddress::Ipv4(_) => IPV4_HEADER,
         IpAddress::Ipv6(_) => IPV6_HEADER,
@@ -110,6 +111,10 @@ struct UdpPort {
     handle: SocketHandle,
     /// How many flows use the port, which keeps its socket while any does.
     flows: usize,
+    /// The stack's nameserver answers on the port, which keeps its socket for
+    /// the attachment's life: an answer goes out through the socket its query
+    /// came in on, and a query in flight is no flow to count.
+    kept: bool,
 }
 
 /// One guest UDP flow and its host side.
@@ -187,7 +192,35 @@ impl UdpTables {
             sockets.remove(handle);
             return;
         }
-        self.ports.insert(port, UdpPort { handle, flows: 0 });
+        self.ports.insert(
+            port,
+            UdpPort {
+                handle,
+                flows: 0,
+                kept: false,
+            },
+        );
+    }
+
+    /// Ensures a receive socket is bound for `port`, as
+    /// [`ensure_port`](Self::ensure_port) does, and keeps it for the
+    /// attachment's life: the port the stack's nameserver answers on.
+    ///
+    /// The nameserver has no socket of its own. smoltcp hands a datagram to
+    /// the first socket bound to accept it, and the port socket accepts every
+    /// address on its port, the nameserver's included, so a second socket on the
+    /// nameserver's address would depend on which of the two the socket set
+    /// happened to hold first.
+    pub(super) fn keep_port(&mut self, port: u16, sockets: &mut SocketSet<'static>) {
+        self.ensure_port(port, sockets);
+        if let Some(entry) = self.ports.get_mut(&port) {
+            entry.kept = true;
+        }
+    }
+
+    /// The socket bound to `port`, if one is.
+    pub(super) fn port_socket(&self, port: u16) -> Option<SocketHandle> {
+        self.ports.get(&port).map(|entry| entry.handle)
     }
 
     /// How many flows the tables hold, which is the most host sockets
@@ -221,26 +254,30 @@ impl UdpTables {
     }
 
     /// Moves both directions of every flow: the guest's datagrams out to
-    /// the host, and the host's replies back to the guest. Returns whether
+    /// the host, and the host's replies back to the guest. A datagram to the
+    /// stack's nameserver goes to `nameserver` instead. Returns whether
     /// anything moved.
     pub(super) fn service(
         &mut self,
         sockets: &mut SocketSet<'static>,
         plan: &Plan,
+        nameserver: Option<&mut Nameserver>,
         now: Instant,
     ) -> bool {
         let mut progress = false;
-        progress |= self.guest_to_host(sockets, plan, now);
+        progress |= self.guest_to_host(sockets, plan, nameserver, now);
         progress |= self.host_to_guest(sockets, now);
         progress
     }
 
     /// Drains each port socket's received datagrams to their host sockets,
-    /// creating a host flow for a new endpoint pair.
+    /// creating a host flow for a new endpoint pair, or to the stack's
+    /// nameserver where one is addressed to it.
     fn guest_to_host(
         &mut self,
         sockets: &mut SocketSet<'static>,
         plan: &Plan,
+        mut nameserver: Option<&mut Nameserver>,
         now: Instant,
     ) -> bool {
         let mut progress = false;
@@ -289,6 +326,14 @@ impl UdpTables {
                 // that it never classified. Its replies would have nowhere to
                 // go; see `Plan::is_guest`.
                 if !plan.is_guest(guest.addr) {
+                    continue;
+                }
+                // The nameserver's address is on the guest's subnet, which
+                // `host_target` refuses, so a datagram to it opens no flow.
+                if plan.serves(destination) {
+                    if let Some(nameserver) = nameserver.as_deref_mut() {
+                        nameserver.query_datagram(guest, destination, &scratch[..len], now);
+                    }
                     continue;
                 }
                 if forward_out(flows, guest, destination, &scratch[..len], plan, now) {
@@ -397,7 +442,8 @@ impl UdpTables {
     }
 
     /// Reaps every flow idle past [`IDLE_TIMEOUT`] or marked dead, then removes
-    /// any port socket the reaping left with no flows behind it.
+    /// any port socket the reaping left with no flows behind it, unless the
+    /// port is [kept](Self::keep_port).
     ///
     /// A port socket outlives its flows for exactly as long as one of them is
     /// still using the port, since the interface delivers to the socket rather
@@ -413,7 +459,7 @@ impl UdpTables {
             live
         });
         ports.retain(|_, port| {
-            let used = port.flows > 0;
+            let used = port.flows > 0 || port.kept;
             if !used {
                 sockets.remove(port.handle);
             }

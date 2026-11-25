@@ -281,6 +281,16 @@ pub mod limits;
 mod mechanism;
 #[cfg(feature = "netstack")]
 mod netstack;
+
+/// The library's readers of untrusted input, reached by the fuzz targets under
+/// `fuzz/` and by nothing else: the module exists only where cargo-fuzz builds
+/// with `--cfg fuzzing`, so no build a consumer makes has it.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    #[cfg(feature = "netstack")]
+    pub use crate::netstack::fuzzing::dns_query;
+}
 mod observer;
 mod path;
 mod poll;

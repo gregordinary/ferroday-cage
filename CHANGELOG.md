@@ -25,6 +25,23 @@ consumer upgrading can skip it.
 
 ## [Unreleased]
 
+### Added
+
+- The native network stack serves the guest's DNS. Its nameserver answers on
+  port 53, over UDP and TCP, at host 3 of each network, `10.0.2.3` and `fd00::3`
+  by default, and relays each query to the first nameserver the host's
+  `resolv.conf` names when the stack attaches, a loopback resolver such as
+  systemd-resolved's stub included. `NetStack::nameservers` returns the
+  addresses to name in the sandbox's `resolv.conf`.
+  `NetStackBuilder::upstream` names another resolver, and
+  `NetStackBuilder::nameserver(false)` turns the nameserver off; an upstream the
+  build cannot use is refused with the new `NetStackError::UpstreamInvalid`. An
+  answer too long for one packet is answered truncated, which sends the guest's
+  resolver to TCP. The profile format gains the `nameserver` and `upstream`
+  keys.
+- `fcage --netstack-upstream ADDRESS` and `--netstack-no-nameserver` set the
+  nameserver's upstream and turn it off.
+
 ### Fixed
 
 - An `Export` refuses an entry whose POSIX access control list names a user or
@@ -67,6 +84,10 @@ consumer upgrading can skip it.
   counts for code and tests apart. Paths are resolved through `use` bindings,
   re-exports, glob imports and test modules. It recorded crate-level names
   outside `provision` before, and read no test code.
+- The repository gains `fuzz/`, cargo-fuzz targets over the library's readers
+  of untrusted input, reached through a `fuzzing` module that exists only under
+  `--cfg fuzzing`. The first target reads a guest's DNS message as the stack's
+  nameserver does. CI's new `fuzz` job builds every target on a pinned nightly.
 
 ## [0.6.0] - 2026-11-13
 

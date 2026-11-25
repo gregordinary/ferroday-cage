@@ -51,10 +51,12 @@ use rustix::io::Errno;
 use rustix::net::SocketFlags;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp as tcp_socket;
+use smoltcp::socket::udp as udp_socket;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 use super::device::TapDevice;
+use super::nameserver::{self, Nameserver};
 use super::sniff::{self, Sniff};
 use super::tcp::{self, TcpFlow};
 use super::udp::UdpTables;
@@ -88,8 +90,17 @@ const LOCAL_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
 /// Runs the pump until `stop`, the descriptor a [`Stop`] wakes, becomes
 /// readable. The tap descriptor's lifetime is the attachment's: it closes when
 /// this returns, and so do the published ports' listeners.
-pub(super) fn run(tap: OwnedFd, stop: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> PumpExit {
-    match Engine::new(tap, plan, listeners) {
+///
+/// `upstream` is the resolver the stack's nameserver asks, `None` where the
+/// configuration turns the nameserver off.
+pub(super) fn run(
+    tap: OwnedFd,
+    stop: OwnedFd,
+    plan: Plan,
+    listeners: Vec<Listener>,
+    upstream: Option<SocketAddr>,
+) -> PumpExit {
+    match Engine::new(tap, plan, listeners, upstream) {
         Ok(mut engine) => engine.run(&stop),
         Err(exit) => exit,
     }
@@ -154,6 +165,9 @@ enum SlotOwner {
     Udp,
     /// A published port's listener, by index.
     Listener(usize),
+    /// A socket of the nameserver's toward its upstream; like a UDP flow's, a
+    /// ready slot merely wakes the loop, which serves every exchange.
+    Nameserver,
 }
 
 /// The engine state: the device, the interface terminating the guest's
@@ -164,6 +178,8 @@ struct Engine {
     sockets: SocketSet<'static>,
     flows: Vec<TcpFlow>,
     udp: UdpTables,
+    /// The nameserver, where the configuration serves one.
+    nameserver: Option<Nameserver>,
     /// The published ports.
     inbound: Vec<Inbound>,
     /// Where the search for a free local port for the next published
@@ -193,7 +209,12 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(tap: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> Result<Engine, PumpExit> {
+    fn new(
+        tap: OwnedFd,
+        plan: Plan,
+        listeners: Vec<Listener>,
+        upstream: Option<SocketAddr>,
+    ) -> Result<Engine, PumpExit> {
         // The guest is untrusted, so the TCP initial sequence numbers need
         // real entropy.
         let seed = random_seed().map_err(|errno| PumpExit::Failed {
@@ -204,16 +225,13 @@ impl Engine {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC)));
         config.random_seed = seed;
         let mut iface = Interface::new(config, &mut device, Instant::from_micros(0));
+        // The gateway first in each family, then the nameserver: smoltcp
+        // takes a source address for what it sends unprompted from the front.
         iface.update_ip_addrs(|addrs| {
-            if let Some(v4) = &plan.v4 {
+            for (address, prefix_len) in plan.held() {
                 addrs
-                    .push(IpCidr::new(v4.gateway.into(), v4.prefix_len))
-                    .expect("the interface holds at most two addresses");
-            }
-            if let Some(v6) = &plan.v6 {
-                addrs
-                    .push(IpCidr::new(v6.gateway.into(), v6.prefix_len))
-                    .expect("the interface holds at most two addresses");
+                    .push(IpCidr::new(address.into(), prefix_len))
+                    .expect("the interface holds a gateway and a nameserver in each family");
             }
         });
         if let Some(v4) = &plan.v4 {
@@ -264,6 +282,7 @@ impl Engine {
             sockets: SocketSet::new(Vec::new()),
             flows: Vec::new(),
             udp: UdpTables::new(plan.mtu),
+            nameserver: upstream.map(|upstream| Nameserver::new(upstream, plan.mtu)),
             inbound,
             next_local_port: *LOCAL_PORTS.start(),
             plan,
@@ -326,6 +345,12 @@ impl Engine {
                 self.owners.push(SlotOwner::Udp);
                 fds.push(PollFd::new(host, PollFlags::IN));
             }
+            if let Some(nameserver) = &self.nameserver {
+                for (host, interest) in nameserver.interest() {
+                    self.owners.push(SlotOwner::Nameserver);
+                    fds.push(PollFd::new(host, interest));
+                }
+            }
             // A listener sitting out its backoff is left out, which is what
             // keeps a connection it cannot accept from waking the loop.
             for (index, inbound) in self.inbound.iter().enumerate() {
@@ -366,9 +391,9 @@ impl Engine {
                     SlotOwner::Stop => stop_requested = !revents.is_empty(),
                     SlotOwner::Tap => tap_readable = !revents.is_empty(),
                     SlotOwner::Tcp(index) => self.flows[*index].events = revents,
-                    // UDP draining is unconditional, so its wakeups need no
-                    // per-flow bookkeeping.
-                    SlotOwner::Udp => {}
+                    // UDP draining and the nameserver's exchanges are served
+                    // unconditionally, so their wakeups need no bookkeeping.
+                    SlotOwner::Udp | SlotOwner::Nameserver => {}
                     SlotOwner::Listener(index) if !revents.is_empty() => {
                         self.accepting.push(*index);
                     }
@@ -408,14 +433,19 @@ impl Engine {
 
     /// The most slots the next poll set can hold, which it is sized to up
     /// front: the stop and the tap, then one for each TCP flow, each UDP flow,
-    /// and each published port, whether or not it wants attention this time.
+    /// each published port, and each of the nameserver's upstream sockets,
+    /// whether or not it wants attention this time.
     fn poll_slots(&self) -> usize {
-        2 + self.flows.len() + self.udp.flow_count() + self.inbound.len()
+        2 + self.flows.len()
+            + self.udp.flow_count()
+            + self.inbound.len()
+            + self.nameserver.as_ref().map_or(0, Nameserver::socket_count)
     }
 
     /// How long the next poll may sleep: bounded by the interface's own
-    /// timers, the nearest TCP establish deadline, and the nearest UDP idle
-    /// expiry.
+    /// timers, the nearest TCP establish deadline, the nearest UDP idle expiry,
+    /// and the nameserver's nearest deadline. It does not sleep at all while a
+    /// nameserver answer waits for a port socket that has room for it.
     ///
     /// The interface's `poll_delay` already accounts for the TCP sockets'
     /// keep-alive and timeout timers, so an idle established flow's liveness
@@ -446,6 +476,22 @@ impl Engine {
         }
         if let Some(remaining) = self.udp.next_deadline(now_std) {
             tighten(remaining);
+        }
+        if let Some(nameserver) = &self.nameserver {
+            if let Some(remaining) = nameserver.next_deadline(now_std) {
+                tighten(remaining);
+            }
+            // The answers wait in the nameserver until a service pass hands them
+            // to the port socket, which nothing on the interface's side wakes
+            // the loop for. Where the socket has no room, its ring drains on
+            // the interface's own schedule, which `poll_delay` follows.
+            let room = self
+                .udp
+                .port_socket(nameserver::PORT)
+                .is_some_and(|handle| self.sockets.get::<udp_socket::Socket>(handle).can_send());
+            if nameserver.has_datagrams() && room {
+                tighten(Duration::ZERO);
+            }
         }
         for inbound in &self.inbound {
             if let Some(at) = inbound.retry_at {
@@ -526,15 +572,13 @@ impl Engine {
     ///
     /// Not [`Interface::has_ip_addr`], which answers `true` for everything
     /// under `any_ip` — that switch is exactly what this question exists to see
-    /// past. The interface holds its gateway addresses and nothing else: the
-    /// guest's own address is the guest's, and the rest of the guest's subnet
-    /// is nobody's, which is what makes it safe to refuse in
-    /// [`host_target`].
+    /// past. The interface holds its gateway addresses, and its nameserver's
+    /// where it serves one, and nothing else: the guest's own address is the
+    /// guest's, and the rest of the guest's subnet is nobody's, which is what
+    /// makes it safe to refuse in [`host_target`].
     fn holds(&self, addr: IpAddress) -> bool {
-        match IpAddr::from(addr) {
-            IpAddr::V4(addr) => self.plan.v4.as_ref().is_some_and(|v4| v4.gateway == addr),
-            IpAddr::V6(addr) => self.plan.v6.as_ref().is_some_and(|v6| v6.gateway == addr),
-        }
+        let addr = IpAddr::from(addr);
+        self.plan.held().any(|(held, _)| held == addr)
     }
 
     /// Admits a TCP connection attempt: a listening socket on the sniffed
@@ -558,6 +602,14 @@ impl Engine {
             .iter()
             .any(|flow| flow.guest == src && flow.destination == dst)
         {
+            return;
+        }
+        // A connection to the nameserver is served here rather than forwarded,
+        // against a budget of its own.
+        if self.plan.serves(dst) {
+            if let Some(nameserver) = &mut self.nameserver {
+                nameserver.open_session(&mut self.sockets, src, dst, std::time::Instant::now());
+            }
             return;
         }
         if self.held(false) >= tcp::MAX_FLOWS {
@@ -670,17 +722,24 @@ impl Engine {
     }
 
     /// Admits a UDP datagram by binding a receive socket to its destination
-    /// port, if policy allows the destination at all. The flow itself is
-    /// created lazily when the datagram is drained.
+    /// port, if policy allows the destination at all, or if it is addressed to
+    /// the nameserver. The flow itself is created lazily when the datagram is
+    /// drained.
     fn admit_udp(&mut self, _src: IpEndpoint, dst: IpEndpoint) {
+        if self.plan.serves(dst) {
+            if self.nameserver.is_some() {
+                self.udp.keep_port(dst.port, &mut self.sockets);
+            }
+            return;
+        }
         if host_target(dst, &self.plan).is_none() {
             return;
         }
         self.udp.ensure_port(dst.port, &mut self.sockets);
     }
 
-    /// Services every flow once, both protocols. Returns whether anything
-    /// moved.
+    /// Services every flow once, both protocols, and the nameserver. Returns
+    /// whether anything moved.
     fn service(&mut self) -> bool {
         let mut progress = false;
         let now = std::time::Instant::now();
@@ -688,7 +747,20 @@ impl Engine {
             let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
             progress |= flow.service(socket, now);
         }
-        progress |= self.udp.service(&mut self.sockets, &self.plan, now);
+        progress |= self
+            .udp
+            .service(&mut self.sockets, &self.plan, self.nameserver.as_mut(), now);
+        if let Some(nameserver) = &mut self.nameserver {
+            progress |= nameserver.service(&mut self.sockets, now);
+            // The answers go out through the port socket their queries came in
+            // on, which the first query to the nameserver kept.
+            if nameserver.has_datagrams()
+                && let Some(handle) = self.udp.port_socket(nameserver::PORT)
+            {
+                let socket = self.sockets.get_mut::<udp_socket::Socket>(handle);
+                progress |= nameserver.send_datagrams(socket);
+            }
+        }
         progress
     }
 
@@ -710,6 +782,9 @@ impl Engine {
             let socket = self.sockets.get_mut::<tcp_socket::Socket>(flow.handle);
             aborted |= flow.enforce_deadline(socket, now);
         }
+        if let Some(nameserver) = &mut self.nameserver {
+            aborted |= nameserver.enforce_deadlines(&mut self.sockets, now);
+        }
         if aborted {
             self.iface
                 .poll(self.now(), &mut self.device, &mut self.sockets);
@@ -722,6 +797,9 @@ impl Engine {
             } else {
                 index += 1;
             }
+        }
+        if let Some(nameserver) = &mut self.nameserver {
+            nameserver.reap(&mut self.sockets);
         }
         self.udp.expire(&mut self.sockets, now);
     }
@@ -1376,7 +1454,7 @@ mod tests {
 
     /// An engine over `tap`, for a test that drives it on its own thread.
     fn engine(tap: OwnedFd, plan: Plan, listeners: Vec<Listener>) -> Engine {
-        match Engine::new(tap, plan, listeners) {
+        match Engine::new(tap, plan, listeners, None) {
             Ok(engine) => engine,
             Err(_) => panic!("the engine could not gather entropy"),
         }
@@ -1401,7 +1479,7 @@ mod tests {
             let (tid_send, tid_receive) = std::sync::mpsc::channel();
             let pump = std::thread::spawn(move || {
                 let _ = tid_send.send(rustix::thread::gettid().as_raw_nonzero().get());
-                run(tap, polled, plan, listeners)
+                run(tap, polled, plan, listeners, None)
             });
             let tid = tid_receive.recv().expect("the pump thread reports its id");
             Driven {

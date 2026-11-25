@@ -963,3 +963,258 @@ fn a_published_port_reaches_a_server_in_the_guest_over_ipv6() {
     assert!(status.success(), "the guest's server ran to completion");
     assert_eq!(String::from_utf8_lossy(&observer.stdout).trim(), "ping");
 }
+
+/// The name [`Resolver`] knows.
+const KNOWN_NAME: &str = "resolver.example";
+
+/// A stand-in for the host's resolver, on one loopback port over UDP and TCP,
+/// counting the queries it takes over each.
+///
+/// It answers an A query for [`KNOWN_NAME`] with as many addresses as it was
+/// made with, from `192.0.2.1` up, a query of another type for that name with
+/// no records, and a query for any other name with NXDOMAIN. Over UDP it sends
+/// an answer whole, however long: a resolver bounded by the protocol would not,
+/// and what becomes of an answer the guest cannot take in one packet is the
+/// nameserver's to show.
+struct Resolver {
+    address: std::net::SocketAddr,
+    udp: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tcp: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Resolver {
+    fn new(records: usize) -> Resolver {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let udp_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback UDP socket");
+        let address = udp_socket.local_addr().expect("the socket has an address");
+        let listener = TcpListener::bind(address).expect("a TCP listener on the same port");
+        let (udp, tcp) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+
+        let counted = Arc::clone(&udp);
+        udp_socket
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("the read timeout is set");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((len, peer)) = udp_socket.recv_from(&mut buf) {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = udp_socket.send_to(&resolver_answer(&buf[..len], records), peer);
+            }
+        });
+        let counted = Arc::clone(&tcp);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut prefix = [0u8; 2];
+                if stream.read_exact(&mut prefix).is_err() {
+                    continue;
+                }
+                let mut query = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+                if stream.read_exact(&mut query).is_err() {
+                    continue;
+                }
+                let answer = resolver_answer(&query, records);
+                let length = u16::try_from(answer.len()).expect("an answer a prefix states");
+                let _ = stream.write_all(&[&length.to_be_bytes()[..], &answer].concat());
+            }
+        });
+        Resolver { address, udp, tcp }
+    }
+
+    /// How many queries it has taken over UDP and over TCP.
+    fn asked(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.udp.load(Ordering::SeqCst),
+            self.tcp.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// [`Resolver`]'s answer to `query`, which a guest's C library wrote: one
+/// question, its name uncompressed.
+fn resolver_answer(query: &[u8], records: usize) -> Vec<u8> {
+    let mut labels = Vec::new();
+    let mut at = 12;
+    while query[at] != 0 {
+        let len = usize::from(query[at]);
+        labels.push(String::from_utf8_lossy(&query[at + 1..at + 1 + len]).into_owned());
+        at += 1 + len;
+    }
+    let question_end = at + 5;
+    let qtype = u16::from_be_bytes([query[at + 1], query[at + 2]]);
+    let known = labels.join(".").eq_ignore_ascii_case(KNOWN_NAME);
+    let (rcode, count) = match (known, qtype) {
+        (false, _) => (3, 0),
+        (true, 1) => (0, records),
+        (true, _) => (0, 0),
+    };
+    let mut answer = query[..2].to_vec();
+    answer.extend_from_slice(&[0x81, 0x80 | rcode, 0, 1]);
+    answer.extend_from_slice(&u16::try_from(count).unwrap().to_be_bytes());
+    answer.extend_from_slice(&[0, 0, 0, 0]);
+    answer.extend_from_slice(&query[12..question_end]);
+    for index in 0..count {
+        let last = u8::try_from(index % 250 + 1).unwrap();
+        answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, last]);
+    }
+    answer
+}
+
+/// Runs `script` in a sandbox whose `resolv.conf` is `resolv_conf`, with a
+/// stack whose nameserver asks `resolver`, and returns what it printed.
+fn resolve_in_guest(rootfs: &Path, resolver: &Resolver, resolv_conf: &str, script: &str) -> String {
+    let dir = common::scratch_dir(&format!(
+        "netstack-nameserver-{:x}",
+        resolver.address.port()
+    ));
+    let file = dir.join("resolv.conf");
+    std::fs::write(&file, resolv_conf).expect("the resolv.conf is written");
+    let mut observer = Collect::default();
+    let cage = Cage::builder()
+        .rootfs(rootfs)
+        .bind_ro(&file, "/etc/resolv.conf")
+        .command("/bin/sh")
+        .args(["-c", script])
+        .build()
+        .expect("a valid sandbox configuration");
+    let pending = cage
+        .spawn_pending_with(&mut observer)
+        .expect("the pending sandbox launches");
+    let handle = NetStack::builder()
+        .upstream(resolver.address)
+        .build()
+        .expect("a stack asking the stand-in resolver")
+        .attach(&pending)
+        .expect("the stack attaches");
+    let mut running = pending.proceed().expect("the command is released");
+    common::outcome_within(&mut running, Duration::from_secs(60));
+    handle.stop().expect("the stack stops cleanly");
+    String::from_utf8_lossy(&observer.stdout).into_owned()
+}
+
+#[test]
+fn the_nameserver_answers_the_guest_from_its_upstream() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    // musl's resolver, through `getent`: a name the upstream knows, and one
+    // it answers NXDOMAIN for, which reaches the guest as such.
+    let resolver = Resolver::new(1);
+    let printed = resolve_in_guest(
+        rootfs,
+        &resolver,
+        "nameserver 10.0.2.3\n",
+        &format!(
+            "getent hosts {KNOWN_NAME}; echo known=$?; \
+             getent hosts missing.example; echo missing=$?"
+        ),
+    );
+    assert!(printed.contains("192.0.2.1"), "{printed}");
+    assert!(printed.contains(KNOWN_NAME), "{printed}");
+    assert!(printed.contains("known=0"), "{printed}");
+    assert!(
+        printed.contains("missing=2"),
+        "the name does not resolve: {printed}"
+    );
+    let (udp, tcp) = resolver.asked();
+    assert!(udp > 0, "the queries went upstream over UDP");
+    assert_eq!(tcp, 0, "nothing needed TCP");
+}
+
+#[test]
+fn an_answer_too_long_for_one_packet_reaches_the_guest_over_tcp() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    // A hundred and twenty addresses make an answer of nearly 2,000 bytes,
+    // past what one 1,500-byte packet carries. The nameserver answers the
+    // datagram truncated, and the guest's resolver asks again over TCP, where
+    // the whole answer goes.
+    let resolver = Resolver::new(120);
+    let printed = resolve_in_guest(
+        rootfs,
+        &resolver,
+        "nameserver 10.0.2.3\n",
+        &format!("getent hosts {KNOWN_NAME}; echo known=$?"),
+    );
+    assert!(
+        printed.contains("known=0"),
+        "{printed} {:?}",
+        resolver.asked()
+    );
+    assert!(printed.contains("192.0.2."), "{printed}");
+    let (_, tcp) = resolver.asked();
+    assert!(tcp > 0, "the guest asked again over TCP: {printed}");
+}
+
+#[test]
+fn the_nameserver_answers_on_its_ipv6_address() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let resolver = Resolver::new(1);
+    let printed = resolve_in_guest(
+        rootfs,
+        &resolver,
+        "nameserver fd00::3\n",
+        &format!("getent hosts {KNOWN_NAME}; echo known=$?"),
+    );
+    assert!(printed.contains("known=0"), "{printed}");
+    assert!(printed.contains("192.0.2.1"), "{printed}");
+}
+
+#[test]
+fn a_tcp_connection_to_the_nameserver_carries_each_of_its_queries() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    // Two queries for the known name, ids 0x1234 and 0x1235, each with its
+    // length prefix, sent back to back on one connection, which the guest then
+    // closes. Each answer comes back framed, under its own id.
+    let query = |id: &str| {
+        format!(
+            "\\000\\042{id}\\001\\000\\000\\001\\000\\000\\000\\000\\000\\000\\010resolver\\007example\\000\\000\\001\\000\\001"
+        )
+    };
+    let resolver = Resolver::new(1);
+    let printed = resolve_in_guest(
+        rootfs,
+        &resolver,
+        "nameserver 10.0.2.3\n",
+        &format!(
+            "printf '{}{}' | nc -w 5 10.0.2.3 53 | od -An -v -tx1 | tr -s ' \\n' ' '",
+            query("\\022\\064"),
+            query("\\022\\065"),
+        ),
+    );
+    // The answer is 50 bytes: the 34-byte query, as a response, and one A
+    // record of 16.
+    let answer = |id: &str| format!("00 32 12 {id} 81 80 00 01 00 01 00 00 00 00 ");
+    assert!(printed.contains(&answer("34")), "{printed}");
+    assert!(printed.contains(&answer("35")), "{printed}");
+    assert!(
+        printed.contains("c0 0c 00 01 00 01 00 00 00 3c 00 04 c0 00 02 01"),
+        "{printed}"
+    );
+    assert_eq!(
+        resolver.asked(),
+        (0, 2),
+        "each query went upstream over TCP"
+    );
+}

@@ -40,6 +40,15 @@ the monotonic clock. Both are constants of the stack's own rather than a \
 caller's number, and no duration that short can carry the clock past what it \
 expresses."""
 
+[[idiom.site]]
+path = "crates/ferroday-cage/src/netstack/nameserver.rs"
+count = 1
+why = """\
+A relayed query's deadline, `EXCHANGE_DEADLINE` (5 seconds), added to a \
+reading of the monotonic clock, as a TCP flow's deadlines are: a constant of \
+the stack's own that no clock is near the end of. `SESSION_IDLE` is added the \
+same way, under a name the pattern does not match."""
+
 [[idiom]]
 name = "the kernel's retry-the-walk answer"
 pattern = 'Errno::AGAIN\) => continue'
@@ -344,12 +353,17 @@ Both are a plural Rust field naming a singular TOML table, which no \
 name = "reading a nameserver out of a resolv.conf"
 pattern = 'strip_prefix\("nameserver"\)'
 answer = """\
-Neither site, which is why this entry exists. The library composes no \
-`resolv.conf` and so owns no answer, and the two that ask the question are in \
-different crates with no way to share one. What the record buys is that a \
-change to either arrives as a diff naming the other: the rule they must agree \
-on is glibc's, where the keyword and its value are separated by whitespace and \
-a line running them together is ignored."""
+`netstack::nameserver::first_nameserver`, which the network stack's nameserver \
+reads the host's resolver with. It is crate-private, so a site in another \
+crate cannot reach it, and each such site says why it reads the file at all. \
+What the record buys is that a change to one arrives as a diff naming the \
+others: the rule they must agree on is glibc's, where the keyword and its value \
+are separated by whitespace and a line running them together is ignored."""
+
+[[idiom.site]]
+path = "crates/ferroday-cage/src/netstack/nameserver.rs"
+count = 1
+why = "The answer."
 
 [[idiom.site]]
 path = "crates/ferroday-cage-cli/src/main.rs"

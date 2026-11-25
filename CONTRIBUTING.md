@@ -280,6 +280,17 @@ Two further gates matter when the public API moves:
   chapter](https://gregordinary.github.io/ferroday-cage/stability.html) records
   how the userlands version with the library.
 
+A reader of input the library does not trust lands with a fuzz target in
+`fuzz/`. What a sandbox sends the network stack is such input. A target reaches
+its reader through the `fuzzing` module, which exists only where cargo-fuzz
+builds with `--cfg fuzzing`. CI builds every target and runs none. Run one for a while after
+changing the reader it drives, on the nightly the `fuzz` job pins:
+
+```sh
+cd fuzz
+cargo +nightly-2026-07-09 fuzz run dns_query -- -max_total_time=300
+```
+
 One gate deliberately does not run here. `tools/check-keyrings.py` compares each
 vendored trust anchor against what its distribution publishes today, and it
 reaches the network to do it. The anchors are Debian's archive keyring, Alpine's
@@ -588,6 +599,8 @@ report name a package and its version bare.
 | Freeze a sandbox path as a mount target, or name a frozen target as the sandbox path it is | `spec::sandbox_target`, and `spec::sandbox_path` back |
 | Does a launch bind the host's `resolv.conf`, or has a mount of the caller's claimed it? | `CageBuilder::get_resolv_conf` |
 | Does the network stack carry the guest's traffic to this destination? | `NetStack::forwards` |
+| Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `truncated` |
+| Which resolver does the host ask, as its `resolv.conf` names it? | `netstack::nameserver::host_upstream`, over `nameserver::first_nameserver` |
 | Declare what surrounds a layer's observer trait: a closure as an observer, a download's view of it, a run's, and the layer with a sink bound | `provision::observe::layer_observer!` |
 | Report a step over a wire, by number | `wire::wire_enum!` |
 | Declare an enum together with the roster of its own variants | `roster::roster_enum!` |

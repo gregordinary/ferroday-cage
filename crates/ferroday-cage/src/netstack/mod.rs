@@ -27,8 +27,8 @@
 //! answered with a reset, with one exception: the guest's own subnet is
 //! on-link from the guest's point of view, so it resolves a hardware address
 //! before it sends a segment, and the stack answers address resolution only
-//! for the gateway. Those destinations fail when the guest's own resolution
-//! gives up rather than on a reset. A refused UDP datagram is dropped, and
+//! for the addresses it holds. Those destinations fail when the guest's own
+//! resolution gives up rather than on a reset. A refused UDP datagram is dropped, and
 //! whether the guest also receives an ICMP port-unreachable depends on
 //! whether the stack happens to hold a socket on that port for some other
 //! destination, so a caller must not read anything into either outcome.
@@ -37,10 +37,19 @@
 //! [`publish`](NetStackBuilder::publish) has the stack listen on a host address
 //! and carry each connection it accepts to a TCP port of the guest's.
 //!
+//! The stack serves the guest's DNS itself, on port 53 of host 3 of each
+//! network, `10.0.2.3` and `fd00::3` by default: the addresses
+//! [`NetStack::nameservers`] names for the sandbox's `resolv.conf`. Its
+//! nameserver relays each query to a resolver of the host's and the answer
+//! back, over host sockets as everything else the stack carries. The host's
+//! resolver is commonly on its loopback, which the guest itself cannot reach;
+//! see [`NetStackBuilder::nameserver`].
+//!
 //! Only TCP and UDP are forwarded, and only from the guest's own address: a
 //! segment or datagram from any other source is dropped, since nothing sent
-//! back to it could be delivered. The stack answers ICMP echo for the gateway
-//! address and for nothing else, and a sandboxed command cannot send one: it
+//! back to it could be delivered. The stack answers ICMP echo for the addresses
+//! it holds, the gateway's and the nameserver's, and for nothing else, and a
+//! sandboxed command cannot send one: it
 //! holds no capability over its network namespace and is outside the
 //! namespace's `ping_group_range`, so `ping` is refused inside a sandbox
 //! whether or not a stack is attached. Reachability is what a TCP or UDP
@@ -67,11 +76,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use smoltcp::wire::IpAddress;
+use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use crate::running::Pending;
 
 mod device;
+mod dns;
+#[cfg(fuzzing)]
+pub(crate) mod fuzzing {
+    //! The stack's readers of guest input, for the fuzz targets alone.
+
+    /// Reads `message` as the stack's nameserver reads a guest's DNS message,
+    /// and writes every reply it can write to it.
+    pub fn dns_query(message: &[u8]) {
+        super::dns::exercise(message);
+    }
+}
+mod nameserver;
 mod pump;
 mod sniff;
 mod tap;
@@ -94,6 +115,11 @@ const GATEWAY_HOST_V4: u32 = 2;
 const GUEST_HOST_V6: u128 = 0x15;
 /// The host part of the gateway's IPv6 address (`::2`).
 const GATEWAY_HOST_V6: u128 = 0x2;
+/// The host part of the nameserver's IPv4 address. The stack's interface owns
+/// this address where the stack serves the guest's DNS.
+const NAMESERVER_HOST_V4: u32 = 3;
+/// The host part of the nameserver's IPv6 address (`::3`).
+const NAMESERVER_HOST_V6: u128 = 0x3;
 
 /// The widest IPv4 prefix that leaves room for the address plan: the
 /// gateway at host 2 and the guest at host 15, below the broadcast address.
@@ -149,9 +175,46 @@ struct Plan {
     /// The guest ports published on the host, in the order they were asked
     /// for.
     publish: Vec<Publication>,
+    /// Whether the stack serves the guest's DNS at its nameserver addresses.
+    nameserver: bool,
+    /// The resolver the nameserver asks, where the configuration names one;
+    /// otherwise the host's, read when the stack attaches.
+    upstream: Option<SocketAddr>,
 }
 
 impl Plan {
+    /// The addresses the stack's interface holds, each with its network's
+    /// prefix length: in each enabled family the gateway, then the
+    /// nameserver where the stack serves one.
+    fn held(&self) -> impl Iterator<Item = (IpAddr, u8)> + '_ {
+        let v4 = self.v4.iter().flat_map(move |v4| {
+            let nameserver = self.nameserver.then_some(IpAddr::V4(v4.nameserver));
+            [Some(IpAddr::V4(v4.gateway)), nameserver]
+                .into_iter()
+                .flatten()
+                .map(move |address| (address, v4.prefix_len))
+        });
+        let v6 = self.v6.iter().flat_map(move |v6| {
+            let nameserver = self.nameserver.then_some(IpAddr::V6(v6.nameserver));
+            [Some(IpAddr::V6(v6.gateway)), nameserver]
+                .into_iter()
+                .flatten()
+                .map(move |address| (address, v6.prefix_len))
+        });
+        v4.chain(v6)
+    }
+
+    /// Whether `destination` is the stack's nameserver: port 53 of a
+    /// nameserver address, where the stack serves one.
+    fn serves(&self, destination: IpEndpoint) -> bool {
+        self.nameserver
+            && destination.port == nameserver::PORT
+            && match IpAddr::from(destination.addr) {
+                IpAddr::V4(addr) => self.v4.as_ref().is_some_and(|v4| v4.nameserver == addr),
+                IpAddr::V6(addr) => self.v6.as_ref().is_some_and(|v6| v6.nameserver == addr),
+            }
+    }
+
     /// Whether `addr` is the guest's own address in its family.
     ///
     /// TCP and UDP are carried from that address alone. A segment or datagram
@@ -201,12 +264,13 @@ struct Publication {
     guest_port: u16,
 }
 
-/// The IPv4 half of the plan: the guest address the tap carries and the
-/// gateway address the stack's interface answers for.
+/// The IPv4 half of the plan: the guest address the tap carries, and the
+/// gateway and nameserver addresses the stack's interface answers for.
 #[derive(Debug, Clone)]
 struct PlanV4 {
     guest: Ipv4Addr,
     gateway: Ipv4Addr,
+    nameserver: Ipv4Addr,
     prefix_len: u8,
 }
 
@@ -215,6 +279,7 @@ struct PlanV4 {
 struct PlanV6 {
     guest: Ipv6Addr,
     gateway: Ipv6Addr,
+    nameserver: Ipv6Addr,
     prefix_len: u8,
 }
 
@@ -250,6 +315,32 @@ impl NetStack {
     /// ```
     pub fn forwards(&self, destination: SocketAddr) -> bool {
         pump::host_target(destination.into(), &self.plan).is_some()
+    }
+
+    /// The addresses the stack's nameserver answers on, for the sandbox's
+    /// `resolv.conf` to name: host 3 of each enabled network, `10.0.2.3` and
+    /// `fd00::3` by default, IPv4 first. Empty where
+    /// [`nameserver(false)`](NetStackBuilder::nameserver) turns the
+    /// nameserver off.
+    ///
+    /// The stack serves these, so [`forwards`](Self::forwards) answers `false`
+    /// for them: nothing to them is carried on to the host.
+    ///
+    /// ```
+    /// use ferroday_cage::NetStack;
+    ///
+    /// let stack = NetStack::default();
+    /// let named: Vec<String> = stack.nameservers().iter().map(|a| a.to_string()).collect();
+    /// assert_eq!(named, ["10.0.2.3", "fd00::3"]);
+    /// assert!(!stack.forwards("10.0.2.3:53".parse().unwrap()));
+    /// ```
+    pub fn nameservers(&self) -> Vec<IpAddr> {
+        if !self.plan.nameserver {
+            return Vec::new();
+        }
+        let v4 = self.plan.v4.iter().map(|v4| IpAddr::V4(v4.nameserver));
+        let v6 = self.plan.v6.iter().map(|v6| IpAddr::V6(v6.nameserver));
+        v4.chain(v6).collect()
     }
 
     /// Attaches the stack to a pending sandbox launch.
@@ -334,9 +425,21 @@ impl NetStack {
         let running = Arc::new(AtomicBool::new(true));
         let running_pump = Arc::clone(&running);
         let plan = self.plan.clone();
+        // The host's resolver is read now, on the caller's thread, so the
+        // pump does no file I/O and a stack attached later reads the host's
+        // configuration as it stands then.
+        let upstream = self
+            .plan
+            .nameserver
+            .then(|| self.plan.upstream.unwrap_or_else(nameserver::host_upstream));
         let pump = std::thread::Builder::new()
             .name("fcage-netstack".to_string())
-            .spawn(move || run_caught(|| pump::run(tap, polled, plan, listeners), &running_pump))
+            .spawn(move || {
+                run_caught(
+                    || pump::run(tap, polled, plan, listeners, upstream),
+                    &running_pump,
+                )
+            })
             .map_err(|err| NetStackError::Spawn { source: err })?;
 
         Ok(NetStackHandle {
@@ -548,6 +651,9 @@ pub struct NetStackBuilder {
     host_loopback: bool,
     host_loopback_ports: Vec<u16>,
     publish: Vec<Publication>,
+    nameserver: bool,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    upstream: Option<SocketAddr>,
 }
 
 impl Default for NetStackBuilder {
@@ -562,6 +668,8 @@ impl Default for NetStackBuilder {
             host_loopback: false,
             host_loopback_ports: Vec::new(),
             publish: Vec::new(),
+            nameserver: true,
+            upstream: None,
         }
     }
 }
@@ -684,6 +792,46 @@ impl NetStackBuilder {
         self
     }
 
+    /// Serves the guest's DNS from the stack itself. On by default.
+    ///
+    /// The nameserver answers on port 53, over UDP and TCP, at host 3 of each
+    /// enabled network: `10.0.2.3` and `fd00::3` by default, the addresses
+    /// [`NetStack::nameservers`] names. It relays each query to the host's own
+    /// resolver, or to [`upstream`](Self::upstream)'s, and the answer back. The
+    /// sandbox's `resolv.conf` has to name it for the guest to ask it.
+    ///
+    /// The stack does not fragment, so an answer longer than one packet cannot
+    /// go back over UDP. The nameserver sends a truncated answer in its place,
+    /// and the guest's resolver asks again over TCP, as it does of any resolver
+    /// that truncates.
+    ///
+    /// Off, host 3 is an address of the guest's subnet like any other, refused
+    /// as the rest of it is, and the guest resolves through whatever its
+    /// `resolv.conf` names that the stack forwards to.
+    pub fn nameserver(mut self, enabled: bool) -> Self {
+        self.nameserver = enabled;
+        self
+    }
+
+    /// Names the resolver the stack's nameserver asks, in place of the host's.
+    ///
+    /// By default the nameserver asks the first nameserver the host's
+    /// `/etc/resolv.conf` names when the stack attaches, on port 53, or
+    /// `127.0.0.1` where it names none, as the host's C library takes such a
+    /// file. The stack's sockets are the host's, so a resolver on the host's
+    /// loopback is reached, systemd-resolved's stub at `127.0.0.53` among them,
+    /// although the guest's own connections to loopback are refused. The port
+    /// is the caller's to give, which is how a resolver on another port is
+    /// reached.
+    ///
+    /// [`build`](Self::build) refuses port 0, the unspecified address, and an
+    /// upstream for a nameserver [`nameserver(false)`](Self::nameserver) turns
+    /// off.
+    pub fn upstream(mut self, resolver: SocketAddr) -> Self {
+        self.upstream = Some(resolver);
+        self
+    }
+
     /// Validates the configuration and freezes it into a [`NetStack`].
     pub fn build(self) -> Result<NetStack, NetStackError> {
         if !self.ipv4 && !self.ipv6 {
@@ -716,6 +864,7 @@ impl NetStackBuilder {
                 Ok(PlanV4 {
                     guest: Ipv4Addr::from(base | GUEST_HOST_V4),
                     gateway: Ipv4Addr::from(base | GATEWAY_HOST_V4),
+                    nameserver: Ipv4Addr::from(base | NAMESERVER_HOST_V4),
                     prefix_len,
                 })
             })
@@ -743,6 +892,7 @@ impl NetStackBuilder {
                 Ok(PlanV6 {
                     guest: Ipv6Addr::from(base | GUEST_HOST_V6),
                     gateway: Ipv6Addr::from(base | GATEWAY_HOST_V6),
+                    nameserver: Ipv6Addr::from(base | NAMESERVER_HOST_V6),
                     prefix_len,
                 })
             })
@@ -779,6 +929,20 @@ impl NetStackBuilder {
                 ));
             }
         }
+        if let Some(upstream) = self.upstream {
+            let refused = |reason| NetStackError::UpstreamInvalid { upstream, reason };
+            if !self.nameserver {
+                return Err(refused(
+                    "the nameserver is turned off, so nothing would ask the resolver",
+                ));
+            }
+            if upstream.port() == 0 {
+                return Err(refused("port 0 names no resolver"));
+            }
+            if upstream.ip().is_unspecified() {
+                return Err(refused("the unspecified address names no resolver"));
+            }
+        }
         Ok(NetStack {
             plan: Plan {
                 v4,
@@ -790,6 +954,8 @@ impl NetStackBuilder {
                     ports: self.host_loopback_ports.into_iter().collect(),
                 },
                 publish: self.publish,
+                nameserver: self.nameserver,
+                upstream: self.upstream,
             },
         })
     }
@@ -971,6 +1137,15 @@ pub enum NetStackError {
     /// nothing else: the sandbox runs on without connectivity, and the caller's
     /// process is unaffected.
     PumpPanicked,
+    /// The resolver named for the stack's nameserver to ask cannot be asked;
+    /// see [`NetStackBuilder::upstream`].
+    #[non_exhaustive]
+    UpstreamInvalid {
+        /// The resolver as it was given to the builder.
+        upstream: SocketAddr,
+        /// What makes it unusable.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for NetStackError {
@@ -1050,6 +1225,9 @@ impl fmt::Display for NetStackError {
                 "the network stack pump panicked; the stack caught the panic and stopped \
                  serving the sandbox",
             ),
+            NetStackError::UpstreamInvalid { upstream, reason } => {
+                write!(f, "cannot ask {upstream} for the sandbox's DNS: {reason}")
+            }
         }
     }
 }
@@ -1059,8 +1237,8 @@ impl std::error::Error for NetStackError {
     ///
     /// The configuration refusals — an unusable prefix, an MTU below the
     /// minimum, an invalid interface name, no protocols, an unusable
-    /// publication, a shared namespace, an unenforceable network grant — carry
-    /// no inner error: nothing failed, the request was refused.
+    /// publication or upstream, a shared namespace, an unenforceable network
+    /// grant — carry no inner error: nothing failed, the request was refused.
     /// [`HelperLost`](Self::HelperLost) carries none either: the helper's
     /// silence is the failure. Nor does [`PumpPanicked`](Self::PumpPanicked):
     /// the panic is the failure, and its message went to the panic hook.
@@ -1198,6 +1376,89 @@ mod tests {
         assert_eq!(v6.prefix_len, 64);
         assert_eq!(stack.plan.mtu, 1500);
         assert_eq!(stack.plan.interface, "tap0");
+    }
+
+    #[test]
+    fn the_nameserver_is_host_3_of_each_enabled_network() {
+        let stack = NetStack::default();
+        assert_eq!(
+            stack.nameservers(),
+            [
+                IpAddr::from([10, 0, 2, 3]),
+                "fd00::3".parse::<IpAddr>().unwrap()
+            ],
+        );
+        let custom = NetStack::builder()
+            .ipv4_cidr(Ipv4Addr::new(192, 168, 100, 0), 24)
+            .ipv6(false)
+            .build()
+            .expect("a valid custom network");
+        assert_eq!(custom.nameservers(), [IpAddr::from([192, 168, 100, 3])]);
+        let off = NetStack::builder()
+            .nameserver(false)
+            .build()
+            .expect("a stack without a nameserver");
+        assert!(off.nameservers().is_empty());
+    }
+
+    #[test]
+    fn the_plan_holds_and_serves_the_nameserver_only_where_it_is_on() {
+        let on = NetStack::default().plan;
+        let held: Vec<IpAddr> = on.held().map(|(address, _)| address).collect();
+        assert_eq!(
+            held,
+            [
+                IpAddr::from([10, 0, 2, 2]),
+                IpAddr::from([10, 0, 2, 3]),
+                "fd00::2".parse().unwrap(),
+                "fd00::3".parse().unwrap(),
+            ],
+            "the gateway first in each family",
+        );
+        let server =
+            |address: &str, port| IpEndpoint::new(address.parse::<IpAddr>().unwrap().into(), port);
+        assert!(on.serves(server("10.0.2.3", 53)));
+        assert!(on.serves(server("fd00::3", 53)));
+        assert!(!on.serves(server("10.0.2.3", 54)), "port 53 alone");
+        assert!(
+            !on.serves(server("10.0.2.2", 53)),
+            "the gateway is not the nameserver"
+        );
+
+        let off = NetStack::builder().nameserver(false).build().unwrap().plan;
+        assert_eq!(off.held().count(), 2, "the two gateways alone");
+        assert!(!off.serves(server("10.0.2.3", 53)));
+    }
+
+    #[test]
+    fn an_upstream_that_cannot_be_asked_is_refused() {
+        for (builder, said) in [
+            (
+                NetStack::builder().upstream("127.0.0.53:0".parse().unwrap()),
+                "port 0",
+            ),
+            (
+                NetStack::builder().upstream("0.0.0.0:53".parse().unwrap()),
+                "unspecified",
+            ),
+            (
+                NetStack::builder()
+                    .nameserver(false)
+                    .upstream("127.0.0.53:53".parse().unwrap()),
+                "turned off",
+            ),
+        ] {
+            let err = builder.build().expect_err("an unusable upstream");
+            assert!(
+                matches!(err, NetStackError::UpstreamInvalid { .. }),
+                "{err}"
+            );
+            assert!(err.to_string().contains(said), "{err}");
+        }
+        NetStack::builder()
+            .upstream("127.0.0.53:53".parse().unwrap())
+            .build()
+            .expect("a loopback resolver is the stack's to ask");
     }
 
     #[test]
@@ -1458,6 +1719,21 @@ mod tests {
         let err = toml::from_str::<NetStackBuilder>("gateway = \"10.0.2.1\"")
             .expect_err("unknown keys are refused");
         assert!(err.to_string().contains("gateway"), "{err}");
+
+        // The nameserver's two keys: a switch, and the resolver as a string.
+        let builder: NetStackBuilder =
+            toml::from_str("nameserver = true\nupstream = \"[::1]:5353\"\n")
+                .expect("the profile parses");
+        assert_eq!(builder.upstream, Some("[::1]:5353".parse().unwrap()));
+        let serialized = toml::to_string(&builder).expect("the builder serializes");
+        let reparsed: NetStackBuilder = toml::from_str(&serialized).expect("and round-trips");
+        assert_eq!(reparsed.upstream, builder.upstream);
+        assert!(reparsed.nameserver);
+        let unset = toml::to_string(&NetStack::builder()).expect("the defaults serialize");
+        assert!(
+            !unset.contains("upstream"),
+            "an unset upstream is left out: {unset}"
+        );
     }
 
     /// Every key the builder's serde format can carry, pinned as the profile
@@ -1469,7 +1745,8 @@ mod tests {
         let builder = NetStack::builder()
             .host_loopback(true)
             .host_loopback_port(5432)
-            .publish("127.0.0.1:8080".parse().unwrap(), 80);
+            .publish("127.0.0.1:8080".parse().unwrap(), 80)
+            .upstream("127.0.0.53:53".parse().unwrap());
         let rendered = toml::to_string(&builder).expect("the builder serializes");
         assert_eq!(
             crate::spec::serde_tests::profile_keys(&rendered),
@@ -1482,9 +1759,11 @@ mod tests {
                 "ipv6",
                 "ipv6-cidr",
                 "mtu",
+                "nameserver",
                 "publish",
                 "publish[].guest-port",
                 "publish[].host",
+                "upstream",
             ],
             "the network stack's format keys moved",
         );

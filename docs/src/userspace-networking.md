@@ -166,8 +166,8 @@ configuration, ready to attach as-is.
 ### Defaults
 
 The builder configures the addressing and interface. Within a configured
-network the stack always places the gateway at host 2 and the guest at host
-15.
+network the stack always places the gateway at host 2, its nameserver at host
+3, and the guest at host 15.
 
 | Setting | Default | Builder method |
 |---|---|---|
@@ -179,6 +179,7 @@ network the stack always places the gateway at host 2 and the guest at host
 | Interface name | `tap0` | [`interface`][`NetStackBuilder::interface`] |
 | Host-loopback mapping | off | [`host_loopback`][`NetStackBuilder::host_loopback`], [`host_loopback_port`][`NetStackBuilder::host_loopback_port`] |
 | Published ports | none | [`publish`][`NetStackBuilder::publish`] |
+| Nameserver | on, asking the host's resolver | [`nameserver`][`NetStackBuilder::nameserver`], [`upstream`][`NetStackBuilder::upstream`] |
 
 With the `serde` feature the builder is also the stack's profile format: it
 serializes and deserializes as the stack specification, for embedding in a
@@ -296,16 +297,17 @@ own address resolution gives up.
 
 ### What answers, and what checks reachability
 
-The stack holds one address per family — the gateway — and answers for that and
-nothing else. That is narrower than it sounds, because the interface accepts
+The stack holds the gateway's address in each family, and the nameserver's where
+it serves one, and answers for those and nothing else. That is narrower than it
+sounds, because the interface accepts
 packets for every destination so that routed traffic reaches its sockets, and
 accepting a packet and answering for its address are the same question to the
 underlying stack. The pump asks the narrower one instead: an address-resolution
 request or an ICMP echo request naming an address the stack does not hold is
 dropped before the interface can answer it.
 
-The stack answers ICMP echo for the gateway, and a sandboxed command cannot send
-one. `ping` needs a raw socket or an ICMP datagram socket, and the command holds
+The stack answers ICMP echo for the addresses it holds, and a sandboxed command
+cannot send one. `ping` needs a raw socket or an ICMP datagram socket, and the command holds
 no capability over the sandbox's network namespace and is outside that
 namespace's `ping_group_range`, so `ping` is refused in every sandbox, with a
 stack attached or without one; [what the command gives
@@ -390,36 +392,56 @@ delivered in part, and a larger datagram from the guest never leaves it, since
 the guest's own kernel fragments what it cannot send whole.
 
 This matters mostly for DNS. A resolver that advertises a large EDNS receive
-buffer — 4096 bytes is a common default for diagnostic tools, and DNSSEC
-answers do reach that size — asks for answers the stack cannot carry, and the
-guest sees a timeout rather than an error. Raise the MTU with
-[`mtu`][`NetStackBuilder::mtu`] if the guest needs larger datagrams, or
-configure its resolver for a smaller EDNS buffer.
+buffer asks for answers too long for one packet. Diagnostic tools commonly
+advertise 4096 bytes, and DNSSEC answers do reach that size. The stack's
+own [nameserver](#dns) answers such a query truncated, and the guest's resolver
+asks again over TCP. A guest that asks a resolver past the stack directly gets
+no such answer: the reply is dropped, and the guest sees a timeout rather than
+an error. Raise the MTU with [`mtu`][`NetStackBuilder::mtu`] if the guest needs
+larger datagrams from such a resolver, or configure the resolver for a smaller
+EDNS buffer.
 
 TCP is unaffected: the stack terminates the guest's connections, so each side
 segments to its own path.
 
 ### DNS
 
-The stack carries packets; it does not resolve names. A sandbox resolves
-through whatever `/etc/resolv.conf` it has, and that file is the caller's to
-provide. One case needs care: a host running systemd-resolved lists only
-`127.0.0.53`, a loopback stub the stack refuses, so binding that
-`resolv.conf` into the sandbox yields no working DNS. A cloud host's
-link-local resolver is refused the same way. Bind the host's `resolv.conf`
-only when it names a nameserver the stack forwards to, point the sandbox at a
-public resolver, or address services by IP.
-[`forwards`][`NetStack::forwards`] answers the first question for each
-address, by the stack's own rules. The [`fcage`](#the-command-line) command and
-the `fetch-sandbox` example both ask it. Large answers have a size ceiling of
-their own — see [One datagram, one packet](#one-datagram-one-packet).
+The stack serves the guest's DNS. Its nameserver answers on port 53, over UDP
+and TCP, at host 3 of each network: `10.0.2.3` and `fd00::3` by default, the
+addresses [`nameservers`][`NetStack::nameservers`] returns. It relays each query
+to a resolver of the host's and the answer back. That resolver is the first
+nameserver the host's `/etc/resolv.conf` names when the stack attaches. Where
+the file names none, the stack asks `127.0.0.1`, as the host's C library does.
+[`upstream`][`NetStackBuilder::upstream`] names another, on any port.
 
-Reaching a host-local resolver through the gateway is the remaining option,
-and it has a precise requirement: the resolver must listen on `127.0.0.1`,
-because that is the only address the gateway maps onto. Give the sandbox a
-`resolv.conf` naming the gateway address and enable
-[`host_loopback`][`NetStackBuilder::host_loopback`]. This does not work for
-systemd-resolved's stub as shipped, which listens on `127.0.0.53` instead.
+The stack's sockets are the host's, so a resolver on the host's loopback is
+reached, though the guest's own connections to loopback are refused. A host
+running systemd-resolved names only its `127.0.0.53` stub, which is the common
+case. A cloud host's link-local resolver is reached the same way. The stub then
+resolves for the sandbox as it does for the host, split DNS and VPN routes
+included.
+
+The sandbox's `resolv.conf` has to name the nameserver for the guest to ask it.
+A caller writes one naming the addresses `nameservers` returns and binds it at
+`/etc/resolv.conf`:
+
+```text
+nameserver 10.0.2.3
+nameserver fd00::3
+```
+
+Each query goes upstream on a socket of its own, over the transport the guest
+asked on. An answer too long for one packet is answered truncated, which sends
+the guest's resolver to TCP. The nameserver relays at most 64 queries at once,
+each given up after five seconds, and serves at most 16 TCP connections. A
+datagram past those bounds is dropped, and a query on a TCP connection is
+answered with SERVFAIL. So is a query the resolver refuses.
+
+[`nameserver(false)`][`NetStackBuilder::nameserver`] turns the nameserver off.
+Host 3 is then refused, as the rest of the guest's subnet is. The sandbox
+resolves through whatever its `resolv.conf` names that the stack forwards to.
+[`forwards`][`NetStack::forwards`] answers that for each address, by the stack's
+own rules.
 
 ### One namespace move, on a helper process
 
@@ -447,7 +469,10 @@ and `--netstack-host-loopback` maps the gateway address onto host `127.0.0.1`.
 or a workload where the other is unwanted; turning both off is refused, there
 being no stack left to attach.
 
-`--netstack-host-port PORT` maps one port of the gateway onto host loopback.
+`--netstack-upstream ADDRESS` has the nameserver ask another resolver, on port 53
+or on the port of an `ADDRESS:PORT`, and `--netstack-no-nameserver` turns the
+nameserver off. `--netstack-host-port PORT` maps one port of the gateway onto
+host loopback.
 `--netstack-publish HOST GUEST_PORT` publishes a guest port, where `HOST` is an
 `ADDRESS:PORT` or a bare port on `127.0.0.1`. A publication on port 0 has
 `fcage` report the port the kernel chose, on standard error, before the command
@@ -549,6 +574,7 @@ outside the sandbox and is not filtered.
 [`NetStack::attach`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.attach
 [`NetStack::default`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html
 [`NetStack::forwards`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.forwards
+[`NetStack::nameservers`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.nameservers
 [`CageBuilder::get_resolv_conf`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.get_resolv_conf
 [`NetStackBuilder`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html
 [`NetStackBuilder::ipv4`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv4
@@ -560,6 +586,8 @@ outside the sandbox and is not filtered.
 [`NetStackBuilder::host_loopback`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.host_loopback
 [`NetStackBuilder::host_loopback_port`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.host_loopback_port
 [`NetStackBuilder::publish`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.publish
+[`NetStackBuilder::nameserver`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.nameserver
+[`NetStackBuilder::upstream`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.upstream
 [`NetStackHandle::published`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.published
 [`NetStackHandle`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html
 [`NetStackHandle::stop`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackHandle.html#method.stop

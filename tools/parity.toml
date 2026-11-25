@@ -399,6 +399,14 @@ flags = ["--netstack-host-port"]
 name = "publish"
 flags = ["--netstack-publish"]
 
+[[builder.setting]]
+name = "nameserver"
+flags = ["--netstack-no-nameserver"]
+
+[[builder.setting]]
+name = "upstream"
+flags = ["--netstack-upstream"]
+
 # The Debian bootstrap.
 [[builder]]
 name = "DebianBuilder"
