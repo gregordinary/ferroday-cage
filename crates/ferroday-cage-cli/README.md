@@ -50,12 +50,24 @@ Each provisioner carries its own option set:
 `fcage --gentoo-keyring-horizon` prints what the vendored Gentoo keyring can still vouch
 for and until when, reaching no network to do it.
 
-Two further modes stand on their own:
+Further modes stand on their own:
 
 ```sh
 fcage --remove-rootfs ./root                      # including trees not owned by you
 fcage --remove-overlay-upper ./run-42             # an overlay upper, with its work directory
 fcage --export-rootfs ./root --export-to root.tar # ownership and xattrs preserved
+```
+
+A run over `--overlay-tree DIR UPPER` leaves `DIR` as it was. `--changes` prints what
+the run wrote, and `--apply-changes` writes it into a tree. An apply refuses a path the
+tree changed meanwhile, and paths such as `.git` and `.envrc` where a tool acts on what
+it finds:
+
+```sh
+fcage --host-rootfs --overlay-tree ~/project ./run-42 -- make test
+fcage --changes ./run-42 --overlay-lower ~/project
+fcage --apply-changes ./run-42 --overlay-lower ~/project --to ~/project
+fcage --remove-overlay-upper ./run-42 --identity-map single
 ```
 
 `fcage --host-report` prints what the host offers a sandbox, as TOML, and

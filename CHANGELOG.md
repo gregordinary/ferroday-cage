@@ -119,6 +119,12 @@ consumer upgrading can skip it.
   `ProvisionError::EntryRefused`, an overlay naming no upper or no lower with
   `ProvisionError::OverlayLayerMissing`, and an entry the caller cannot read
   is listed as incomplete.
+- `fcage --changes UPPER --overlay-lower DIR` prints what a run wrote through
+  an overlay, one change a line (`A`, `M` with what differs, `D`, `T`), and
+  `fcage --apply-changes UPPER --overlay-lower DIR --to DIR` writes it into a
+  tree, with `--only`, `--protect`, `--protect-name`, `--no-protection` and
+  `--since`; a refused apply names each refused path and writes nothing
+  (`ferroday-cage-cli`).
 - An upper can be copied to a new one, so two sessions continue from one
   point: `ChangeSet::fork` copies the upper the changes were read from,
   whiteouts, opaque markers and escaped attributes included, keeping holes,

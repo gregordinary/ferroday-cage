@@ -735,26 +735,25 @@ why = "An identity-map delegate is a trait object. `--identity-map` names the de
 [[builder]]
 name = "Apply"
 path = "ferroday_cage::provision::Apply"
+mode = "ApplyChanges"
 
 [[builder.setting]]
 name = "filter"
-kind = "code"
-why = "The filter is a predicate over each change, as an export's is over each entry."
+flags = ["--only"]
+why = "The filter is a predicate over each change, which an argument cannot carry; --only spells the one a command line names, a path and what lies beneath it."
 
 [[builder.setting]]
 name = "protect"
-kind = "library"
-why = "`fcage` offers no apply of a change set: it would have to grow a mode naming the upper, its lowers and the target. The protected paths would follow that mode."
+flags = ["--protect", "--protect-name"]
 
 [[builder.setting]]
 name = "protected"
-kind = "library"
-why = "As `protect`."
+flags = ["--no-protection"]
+why = "--no-protection replaces the default set with an empty one, which --protect and --protect-name then add to."
 
 [[builder.setting]]
 name = "since"
-kind = "library"
-why = "As `protect`."
+flags = ["--since"]
 
 # No settings, and recorded so that gaining one is a difference rather than a
 # silence. A tarball is named and then provisioned from; `--provision-tar`

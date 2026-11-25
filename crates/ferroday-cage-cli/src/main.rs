@@ -60,7 +60,10 @@ use std::time::Duration;
 use ferroday_cage::provision::alpine::{Alpine, KeySet as AlpineKeySet};
 use ferroday_cage::provision::debian::{Debian, Priority, Repository};
 use ferroday_cage::provision::gentoo::Gentoo;
-use ferroday_cage::provision::{Interrupt, Provision, ProvisionError, Provisioned, Tarball};
+use ferroday_cage::provision::{
+    ChangeKind, ChangeSet, EntryKind, Interrupt, Protected, Provision, ProvisionError, Provisioned,
+    Tarball,
+};
 use ferroday_cage::relay::{Escalation, RelayError};
 use ferroday_cage::{
     Bind, Cage, CageBuilder, Capability, CgroupLimit, DestinationRule, Error, ErrorChain,
@@ -173,6 +176,10 @@ enum Mode {
     Remove,
     /// `--export-rootfs`.
     Export,
+    /// `--changes`.
+    Changes,
+    /// `--apply-changes`.
+    ApplyChanges,
     /// `--gentoo-variants`.
     GentooVariants,
     /// `--gentoo-packages`.
@@ -1280,6 +1287,109 @@ const FLAGS: &[Flag] = &[
             "is byte-reproducible given the tree",
         ],
         mode: Mode::Export,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--changes",
+        section: Section::Provisioning,
+        placeholder: "UPPER",
+        help: &[
+            "Print what a run wrote through an overlay whose upper",
+            "is UPPER, against the lowers --overlay-lower names, one",
+            "change a line, and exit: A added, M modified with what",
+            "differs, D removed, T replaced by another type, each",
+            "with its path quoted. Takes no other option",
+        ],
+        mode: Mode::Changes,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--apply-changes",
+        section: Section::Provisioning,
+        placeholder: "UPPER",
+        help: &[
+            "Write what a run wrote through an overlay whose upper",
+            "is UPPER, against the lowers --overlay-lower names,",
+            "into the directory --to names, and exit. A change the",
+            "target also made after the upper was created, or one",
+            "touching a protected path (.git, .envrc, editor, CI",
+            "and shell startup files), refuses the whole apply,",
+            "naming each; nothing is written then",
+        ],
+        mode: Mode::ApplyChanges,
+        selects: true,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--to",
+        section: Section::Provisioning,
+        placeholder: "DIR",
+        help: &["Where --apply-changes writes: usually the lower the run started from"],
+        mode: Mode::ApplyChanges,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--protect",
+        section: Section::Provisioning,
+        placeholder: "PATH",
+        help: &[
+            "Refuse an --apply-changes that changes PATH, relative",
+            "to the target's top, or what lies beneath it (repeatable)",
+        ],
+        mode: Mode::ApplyChanges,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--protect-name",
+        section: Section::Provisioning,
+        placeholder: "NAME",
+        help: &[
+            "Refuse an --apply-changes that changes an entry named",
+            "NAME at any depth, or what lies beneath one (repeatable)",
+        ],
+        mode: Mode::ApplyChanges,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--no-protection",
+        section: Section::Provisioning,
+        help: &[
+            "Drop the paths --apply-changes protects by default;",
+            "--protect and --protect-name still add theirs",
+        ],
+        mode: Mode::ApplyChanges,
+        take: Take::Refused(Arity::Bare),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--only",
+        section: Section::Provisioning,
+        placeholder: "PATH",
+        help: &[
+            "Apply only the changes at PATH, relative to the",
+            "target's top, and beneath it (repeatable)",
+        ],
+        mode: Mode::ApplyChanges,
+        take: Take::Refused(Arity::One),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--since",
+        section: Section::Provisioning,
+        placeholder: "EPOCH",
+        help: &[
+            "Hold the --apply-changes target to EPOCH, a Unix",
+            "timestamp in seconds, rather than to when the upper",
+            "was created: an entry it changed since is refused",
+        ],
+        mode: Mode::ApplyChanges,
         take: Take::Refused(Arity::One),
         ..Flag::DEFAULTS
     },
@@ -2695,6 +2805,8 @@ Usage: fcage [--rootfs DIR | --empty-rootfs | --overlay-lower DIR | --profile FI
        fcage --remove-rootfs DIR [--identity-map M] [--keep-lock]
        fcage --remove-overlay-upper DIR [--identity-map M]
        fcage --export-rootfs DIR [--export-to FILE] [--identity-map M] [--clamp-mtime EPOCH]
+       fcage --changes UPPER --overlay-lower DIR...
+       fcage --apply-changes UPPER --overlay-lower DIR... --to DIR [--only PATH] [--protect PATH] [--protect-name NAME] [--no-protection] [--since EPOCH]
        fcage --gentoo-variants ARCH [--gentoo-mirror URL] [--gentoo-mirror-fallback URL] [--gentoo-max-pointer-age DAYS]
        fcage --gentoo-packages ARCH --gentoo-binhost SUBARCH [--gentoo-mirror URL] [--gentoo-mirror-fallback URL]
        fcage --gentoo-installed ROOT
@@ -2810,6 +2922,25 @@ enum Invocation {
         /// The `SOURCE_DATE_EPOCH` ceiling that makes the archive
         /// byte-reproducible, when given.
         clamp_mtime: Option<i64>,
+    },
+    /// Print what a run wrote through an overlay.
+    Changes {
+        /// The overlay whose upper and lowers are read.
+        overlay: Overlay,
+    },
+    /// Write what a run wrote through an overlay into a tree.
+    ApplyChanges {
+        overlay: Overlay,
+        /// The tree written into.
+        to: PathBuf,
+        /// The protected paths: the library's defaults and the caller's, or
+        /// the caller's alone.
+        protected: Vec<Protected>,
+        /// The paths whose changes are applied, with what lies beneath them;
+        /// every change where empty.
+        only: Vec<PathBuf>,
+        /// The reference time, where one was given.
+        since: Option<std::time::SystemTime>,
     },
     Help,
     Version,
@@ -3357,6 +3488,14 @@ fn main() -> ExitCode {
             map,
             clamp_mtime,
         }) => export_rootfs(&source, dest.as_deref(), map, clamp_mtime),
+        Ok(Invocation::Changes { overlay }) => list_changes(&overlay),
+        Ok(Invocation::ApplyChanges {
+            overlay,
+            to,
+            protected,
+            only,
+            since,
+        }) => apply_changes(&overlay, &to, protected, only, since),
         Err(message) => usage_error(format_args!("{message}")),
     }
 }
@@ -3378,6 +3517,8 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         Some(Mode::HostReport) => return parse_host_report(args),
         Some(Mode::Remove) => return parse_removal(args),
         Some(Mode::Export) => return parse_export(args),
+        Some(Mode::Changes) => return parse_changes(args),
+        Some(Mode::ApplyChanges) => return parse_apply_changes(args),
         _ => {}
     }
     let mut args = args.into_iter();
@@ -4251,6 +4392,150 @@ fn parse_export(args: Vec<OsString>) -> Result<Invocation, String> {
         map,
         clamp_mtime,
     })
+}
+
+/// Parses a `--changes` invocation.
+fn parse_changes(args: Vec<OsString>) -> Result<Invocation, String> {
+    if let Some(answer) = help_or_version(&args) {
+        return Ok(answer);
+    }
+    let mut overlay = Overlay::new();
+    let mut upper = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if let Some(value) = mode_value("--changes", &arg, &mut args)? {
+            overlay = overlay.upper(tree_value("--changes", value)?);
+            upper = true;
+        } else if let Some(value) = mode_value("--overlay-lower", &arg, &mut args)? {
+            overlay = overlay.lower(tree_value("--overlay-lower", value)?);
+        } else {
+            return Err(mode_conflict(
+                &arg,
+                "--changes",
+                &["--changes", "--overlay-lower"],
+            ));
+        }
+    }
+    // The caller established that the flag is present, so this is a guard
+    // rather than a live path.
+    if !upper {
+        return Err("--changes requires a value".to_string());
+    }
+    if overlay.get_lowers().is_empty() {
+        return Err(
+            "--changes requires --overlay-lower, the lowers the run's changes are read against"
+                .to_string(),
+        );
+    }
+    Ok(Invocation::Changes { overlay })
+}
+
+/// Parses an `--apply-changes` invocation.
+fn parse_apply_changes(args: Vec<OsString>) -> Result<Invocation, String> {
+    if let Some(answer) = help_or_version(&args) {
+        return Ok(answer);
+    }
+    let mut overlay = Overlay::new();
+    let mut upper = false;
+    let mut to = None;
+    let mut defaults = true;
+    let mut protected = Vec::new();
+    let mut only = Vec::new();
+    let mut since = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if let Some(value) = mode_value("--apply-changes", &arg, &mut args)? {
+            overlay = overlay.upper(tree_value("--apply-changes", value)?);
+            upper = true;
+        } else if let Some(value) = mode_value("--overlay-lower", &arg, &mut args)? {
+            overlay = overlay.lower(tree_value("--overlay-lower", value)?);
+        } else if let Some(value) = mode_value("--to", &arg, &mut args)? {
+            to = Some(tree_value("--to", value)?);
+        } else if let Some(value) = mode_value("--protect", &arg, &mut args)? {
+            protected.push(Protected::path(relative_value("--protect", value)?));
+        } else if let Some(value) = mode_value("--protect-name", &arg, &mut args)? {
+            if value.is_empty() || value.as_bytes().contains(&b'/') {
+                return Err(format!(
+                    "--protect-name requires one path component, and was given {value:?}"
+                ));
+            }
+            protected.push(Protected::name(value));
+        } else if arg == "--no-protection" {
+            defaults = false;
+        } else if let Some(value) = mode_value("--only", &arg, &mut args)? {
+            only.push(relative_value("--only", value)?);
+        } else if let Some(value) = mode_value("--since", &arg, &mut args)? {
+            let epoch = parse_epoch("--since", &into_string("--since", value)?)?;
+            since = Some(
+                u64::try_from(epoch)
+                    .ok()
+                    .and_then(|seconds| {
+                        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds))
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "--since: {epoch} is no time a run began at: it is before 1970 or \
+                             past what the clock holds"
+                        )
+                    })?,
+            );
+        } else {
+            return Err(mode_conflict(
+                &arg,
+                "--apply-changes",
+                &[
+                    "--apply-changes",
+                    "--overlay-lower",
+                    "--to",
+                    "--protect",
+                    "--protect-name",
+                    "--no-protection",
+                    "--only",
+                    "--since",
+                ],
+            ));
+        }
+    }
+    if !upper {
+        return Err("--apply-changes requires a value".to_string());
+    }
+    if overlay.get_lowers().is_empty() {
+        return Err(
+            "--apply-changes requires --overlay-lower, the lowers the run's changes \
+                    are read against"
+                .to_string(),
+        );
+    }
+    let to = to.ok_or_else(|| {
+        "--apply-changes requires --to, the directory the changes are written into".to_string()
+    })?;
+    if defaults {
+        protected.splice(0..0, Protected::defaults());
+    }
+    Ok(Invocation::ApplyChanges {
+        overlay,
+        to,
+        protected,
+        only,
+        since,
+    })
+}
+
+/// A path relative to an apply's target that `flag` takes: one that names
+/// something beneath the top, with no `..`.
+fn relative_value(flag: &str, value: OsString) -> Result<PathBuf, String> {
+    let path = PathBuf::from(&value);
+    let plain = !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if !plain {
+        return Err(format!(
+            "{flag} requires a path relative to the target's top, with no '..', and was \
+             given {value:?}"
+        ));
+    }
+    Ok(path)
 }
 
 /// Parses the Unix timestamp in seconds that `flag` takes: `--clamp-mtime`'s
@@ -5527,6 +5812,116 @@ fn remove_tree(dest: &Path, map: IdentityMap, removal: Removal) -> ExitCode {
 /// wherever the walk happened to meet it, described in the walk's own
 /// vocabulary ("while opening an entry in the exported tree"), which names the
 /// step rather than the mistake.
+/// Prints what a run wrote through `overlay`, one change a line.
+fn list_changes(overlay: &Overlay) -> ExitCode {
+    let changes = match ChangeSet::read(overlay) {
+        Ok(changes) => changes,
+        Err(error) => return fail(error),
+    };
+    output::print_stdout("the change listing", |out| {
+        for change in changes.changes() {
+            writeln!(out, "{}", change_line(change))?;
+        }
+        Ok(())
+    })
+}
+
+/// One line of a change listing: a letter for the kind, the path quoted, and
+/// what a modified entry differs in, or the types a replaced one changed
+/// between.
+fn change_line(change: &ferroday_cage::provision::Change) -> String {
+    let kind_name = |kind: Option<EntryKind>| match kind {
+        Some(EntryKind::File) => "file",
+        Some(EntryKind::Directory) => "directory",
+        Some(EntryKind::Symlink) => "link",
+        _ => "other",
+    };
+    let mut line = match change.kind() {
+        ChangeKind::Added => format!("A {:?}", change.path()),
+        ChangeKind::Removed => format!("D {:?}", change.path()),
+        ChangeKind::Replaced => format!(
+            "T {:?} {} {}",
+            change.path(),
+            kind_name(change.before()),
+            kind_name(change.now()),
+        ),
+        _ => {
+            let differs: Vec<&str> = [
+                (change.content_differs(), "content"),
+                (change.mode_differs(), "mode"),
+                (change.owner_differs(), "owner"),
+                (change.attributes_differ(), "attributes"),
+            ]
+            .into_iter()
+            .filter_map(|(differs, name)| differs.then_some(name))
+            .collect();
+            format!("M {:?} {}", change.path(), differs.join(","))
+        }
+    };
+    if !change.is_readable() {
+        line.push_str(" unreadable");
+    }
+    line
+}
+
+/// Writes what a run wrote through `overlay` into `to`, printing each path
+/// written on standard output, and on a refusal each refused path with why.
+fn apply_changes(
+    overlay: &Overlay,
+    to: &Path,
+    protected: Vec<Protected>,
+    only: Vec<PathBuf>,
+    since: Option<std::time::SystemTime>,
+) -> ExitCode {
+    let changes = match ChangeSet::read(overlay) {
+        Ok(changes) => changes,
+        Err(error) => return fail(error),
+    };
+    let mut apply = changes.apply(to).protected(protected);
+    if !only.is_empty() {
+        apply = apply.filter(move |change| only.iter().any(|path| change.path().starts_with(path)));
+    }
+    if let Some(since) = since {
+        apply = apply.since(since);
+    }
+    match apply.run() {
+        Ok(report) => {
+            for skipped in report.skipped() {
+                if output::say(format_args!(
+                    "fcage: {skipped:?} is a named pipe, a socket or a device, and is not written"
+                ))
+                .is_err()
+                {
+                    return ExitCode::from(output::broken_pipe());
+                }
+            }
+            output::print_stdout("the applied listing", |out| {
+                for path in report.applied() {
+                    writeln!(out, "{path:?}")?;
+                }
+                Ok(())
+            })
+        }
+        Err(ProvisionError::ApplyRefused {
+            target, refusals, ..
+        }) => {
+            for refusal in &refusals {
+                output::report(format_args!(
+                    "fcage: refused {:?}: {}",
+                    refusal.path(),
+                    refusal.reason()
+                ));
+            }
+            fail(format_args!(
+                "nothing was written to {}: {} of the changes are refused",
+                target.display(),
+                refusals.len(),
+            ))
+        }
+        Err(error) => fail(error),
+    }
+}
+
 fn export_rootfs(
     source: &Path,
     dest: Option<&Path>,
@@ -7980,6 +8375,17 @@ mod tests {
         assert_eq!(options.setenv.len(), 1);
     }
 
+    /// The flags a mode requires beside the one that selects it, given so a
+    /// test of one of its options reaches that option rather than the
+    /// refusal of what is missing.
+    fn mode_companions(owner: &str) -> &'static [&'static str] {
+        match owner {
+            "--apply-changes" => &["--overlay-lower", "/roots/l", "--to", "/roots/t"],
+            "--changes" => &["--overlay-lower", "/roots/l"],
+            _ => &[],
+        }
+    }
+
     #[test]
     fn every_option_of_a_mode_is_refused_by_a_launch_and_taken_by_its_mode() {
         // The roster is the table's `mode`, so this is what keeps that honest:
@@ -8009,7 +8415,9 @@ mod tests {
                 launch.contains("unrecognized option"),
                 "a launch accepts {long}, which the roster calls {owner}'s: {launch:?}",
             );
-            let mut args = vec![owner, "/roots/a", long];
+            let mut args = vec![owner, "/roots/a"];
+            args.extend_from_slice(mode_companions(owner));
+            args.push(long);
             if flag.arity() != Arity::Bare {
                 args.push("1700000000");
             }
@@ -9192,10 +9600,11 @@ mod tests {
                 continue;
             }
             let long = flag.long;
-            let vocabularies: [Vec<&str>; 3] = [
+            let vocabularies: [Vec<&str>; 4] = [
                 vec![long],
                 vec!["--remove-rootfs", "/roots/a", long],
                 vec!["--export-rootfs", "/roots/a", long],
+                vec!["--apply-changes", "/roots/a", long],
             ];
             let recognized = vocabularies.iter().any(|args| match parse_args(args) {
                 // A flag needing a value reports that, which is recognition.
