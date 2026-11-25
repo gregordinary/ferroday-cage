@@ -194,12 +194,11 @@ fn a_hardlink_reaching_its_target_through_a_merged_usr_alias_is_already_done() {
 }
 
 #[test]
-fn fifos_extract_devices_and_labels_skip() {
+fn fifos_extract_and_devices_skip() {
     let mut tar = archive();
     tar.dir("dev", 0o755)
         .char_device("dev/console")
-        .fifo("pipe", 0o666)
-        .header(b"volume-label", b'V', 0, 0, 0, b"");
+        .fifo("pipe", 0o666);
     let rootfs = provision("extract-fifo-dev", &tar.finish());
 
     assert!(
@@ -212,7 +211,20 @@ fn fifos_extract_devices_and_labels_skip() {
     // The /dev directory extracts; the node inside it does not.
     assert!(rootfs.join("dev").is_dir());
     assert!(!rootfs.join("dev/console").exists());
-    assert!(!rootfs.join("volume-label").exists());
+}
+
+#[test]
+fn a_volume_label_is_refused() {
+    // GNU tar reads a label as the archive's name, and Python extracts it as a
+    // file, so the two lay down different trees from one archive.
+    let mut tar = archive();
+    tar.header(b"volume-label", b'V', 0, 0, 0, b"")
+        .file("after", 0o644, b"x");
+    let err = provision_err("extract-volume-label", &tar.finish());
+    assert!(
+        matches!(&err, ProvisionError::Archive { reason, .. } if *reason == ferrotape::ErrorKind::VolumeLabel.to_string()),
+        "{err}"
+    );
 }
 
 #[test]
@@ -474,8 +486,9 @@ fn record_padding_after_the_archive_is_read_past_but_more_is_refused() {
     let mut overlong = tar.finish();
     overlong.resize(overlong.len() + (16 << 20) + 1, 0);
     let err = provision_err("extract-overlong-trailer", &gzip(&overlong));
+    let past = ferrotape::ErrorKind::TrailingLimit { limit: 16 << 20 };
     assert!(
-        matches!(&err, ProvisionError::Archive { reason, .. } if reason.contains("follow the end")),
+        matches!(&err, ProvisionError::Archive { reason, .. } if *reason == past.to_string()),
         "{err}"
     );
 
@@ -647,12 +660,17 @@ fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
     let err = provision_err("malformed-empty-symlink", &empty_target.finish());
     assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
 
-    // A hard link naming no entry is malformed in the same way: it names
-    // nothing outside the root.
+    // A hard link naming no entry names nothing outside the root either. The
+    // reader refuses it, since the tar readers it is measured against link it
+    // to the directory being extracted into, or to nothing, or read the member
+    // as no link at all.
     let mut empty_hardlink = archive();
     empty_hardlink.hardlink("link", "");
     let err = provision_err("malformed-empty-hardlink", &empty_hardlink.finish());
-    assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+    assert!(
+        matches!(&err, ProvisionError::Archive { reason, .. } if *reason == ferrotape::ErrorKind::HardLinkWithoutTarget.to_string()),
+        "{err}"
+    );
 
     // A symbolic link whose target no filesystem can store is refused before
     // extraction, by the reader, as the malformed archive it is.
@@ -720,10 +738,9 @@ fn a_corrupt_first_header_is_reported_as_what_is_wrong_with_it() {
     bytes[0] = b'g';
     let err = provision_err("extract-corrupt-first-header", &bytes);
     assert!(
-        matches!(err, ProvisionError::Archive { offset: 0, .. }),
+        matches!(&err, ProvisionError::Archive { offset: 0, reason, .. } if *reason == ferrotape::ErrorKind::Checksum.to_string()),
         "{err}"
     );
-    assert!(err.to_string().contains("checksum"), "{err}");
 
     // A recognized compression whose payload is too short to be a tar archive
     // is not one, and the report does not claim the compression went
@@ -873,7 +890,7 @@ fn a_gzip_tarball_bsdtar_wrote_through_a_pipe_extracts() {
 #[test]
 fn sparse_entries_are_unsupported() {
     let mut tar = archive();
-    tar.header(b"sparse-file", b'S', 0o644, 0, 0, b"");
+    tar.gnu_sparse_file("sparse-file", 0o644, &[(4096, &b"data"[..])], 1 << 20);
     let err = provision_err("extract-sparse", &tar.finish());
     assert!(
         matches!(err, ProvisionError::EntryUnsupported { kind: b'S', .. }),
@@ -888,9 +905,10 @@ fn pax_sparse_members_are_unsupported_in_every_format() {
     // 0.0 extracts the packed data as the whole file, and 0.1 and 1.0 extract a
     // `GNUSparseFile.<pid>/` directory holding the map and the packed data,
     // with the real path missing. Each record set below is the one GNU tar 1.35
-    // writes for a 10 MiB file holding 4 KiB of data, in that format.
+    // writes for a 10 MiB file holding 4 KiB of data, in that format: its map
+    // ends in an empty region at the real size.
     let packed = [b'd'; 4096];
-    let mut map_then_data = b"1\n4997120\n4096\n".to_vec();
+    let mut map_then_data = b"2\n4997120\n4096\n10485760\n0\n".to_vec();
     map_then_data.resize(512, 0);
     map_then_data.extend_from_slice(&packed);
     // One format: its records, the name its member is stored under, and the
@@ -906,9 +924,11 @@ fn pax_sparse_members_are_unsupported_in_every_format() {
             name: "0.0",
             records: &[
                 ("GNU.sparse.size", "10485760"),
-                ("GNU.sparse.numblocks", "1"),
+                ("GNU.sparse.numblocks", "2"),
                 ("GNU.sparse.offset", "4997120"),
                 ("GNU.sparse.numbytes", "4096"),
+                ("GNU.sparse.offset", "10485760"),
+                ("GNU.sparse.numbytes", "0"),
             ],
             stored_name: b"holes",
             data: &packed,
@@ -917,9 +937,9 @@ fn pax_sparse_members_are_unsupported_in_every_format() {
             name: "0.1",
             records: &[
                 ("GNU.sparse.size", "10485760"),
-                ("GNU.sparse.numblocks", "1"),
+                ("GNU.sparse.numblocks", "2"),
                 ("GNU.sparse.name", "holes"),
-                ("GNU.sparse.map", "4997120,4096"),
+                ("GNU.sparse.map", "4997120,4096,10485760,0"),
             ],
             stored_name: b"./GNUSparseFile.4242/holes",
             data: &packed,

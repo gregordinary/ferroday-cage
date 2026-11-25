@@ -2703,7 +2703,7 @@ fn extract_packages(
             &mut file,
             &mut extraction,
             &mut |entry, components| {
-                if entry.uid != 0 || entry.gid != 0 {
+                if entry.uid() != 0 || entry.gid() != 0 {
                     if components
                         .iter()
                         .any(|component| component.contains(&b'\n'))
@@ -2711,7 +2711,7 @@ fn extract_packages(
                         malformed.get_or_insert_with(|| (&installable.name, components.to_vec()));
                         return Ok(Placement::Write);
                     }
-                    statoverride.record(entry.mode, absolute_path(components));
+                    statoverride.record(entry.mode(), absolute_path(components));
                 }
                 // A `.deb`'s files are dpkg's to arbitrate, and this hook only
                 // records ownership as they go past, so every entry is written.

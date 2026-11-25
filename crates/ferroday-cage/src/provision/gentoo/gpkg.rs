@@ -107,6 +107,7 @@ use crate::provision::digest::{self, Algorithm, Digest};
 use crate::provision::openpgp::{Keyring, MAX_SIGNED_DOCUMENT_BYTES};
 use crate::provision::tar::{self, TarReader};
 use crate::provision::{ProvisionError, compress};
+use ferrotape::EntryKind;
 
 /// The member every container must carry, and the marker that says which format
 /// it is.
@@ -325,8 +326,8 @@ impl Package {
         io::Seek::rewind(&mut file).map_err(GentooError::at("rewinding the container", path))?;
         let mut archive = TarReader::new(io::BufReader::new(file), path);
         while let Some(entry) = archive.next_entry().map_err(|err| unreadable(path, err))? {
-            let is_image = entry.typeflag != b'5'
-                && split_member(&entry.path)
+            let is_image = entry.kind() != EntryKind::Directory
+                && split_member(entry.path())
                     .and_then(|(_, name)| std::str::from_utf8(name).ok())
                     .is_some_and(|name| Role::of(name) == Role::Image);
             if !is_image {
@@ -334,7 +335,7 @@ impl Package {
             }
             let member = Member {
                 archive,
-                left: entry.size,
+                left: entry.size(),
             };
             // As in the first pass, a failure under the member is the tar
             // reader's, and says the container is cut short or unreadable.
@@ -419,10 +420,10 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
         }
         // Directory entries describe the container's own layout rather than
         // being members of it, and the Manifest does not list them.
-        if entry.typeflag == b'5' {
+        if entry.kind() == EntryKind::Directory {
             continue;
         }
-        let full = entry.path.clone();
+        let full = entry.path().to_vec();
         let Some((held, name)) = split_member(&full) else {
             return Err(GentooError::container(
                 path,
@@ -502,7 +503,7 @@ fn scan(path: &Path, file: &mut std::fs::File) -> Result<Scan, GentooError> {
             None => {
                 let mut member = Member {
                     archive,
-                    left: entry.size,
+                    left: entry.size(),
                 };
                 // What fails here is the tar reader under the member, which
                 // reports a container cut short or unreadable the way the
@@ -740,7 +741,7 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
     // it costs what decompressing a kept one does.
     let mut left = MAX_METADATA_BYTES;
     while let Some(entry) = inner.next_entry().map_err(|err| unreadable(path, err))? {
-        if entry.typeflag == b'5' {
+        if entry.kind() == EntryKind::Directory {
             continue;
         }
         let bytes = inner
@@ -749,7 +750,7 @@ fn read_metadata(path: &Path, scan: &Scan) -> Result<BTreeMap<String, Vec<u8>>, 
         left -= bytes.len() as u64;
         // Anything that is not a plain file directly under `metadata/` is not a
         // metadata file, and the layer writes out only what it recognizes.
-        if let Some(name) = std::str::from_utf8(&entry.path)
+        if let Some(name) = std::str::from_utf8(entry.path())
             .ok()
             .and_then(|name| name.strip_prefix(METADATA_DIR))
             .filter(|name| path::is_ordinary_component(name.as_bytes()))
@@ -2046,7 +2047,7 @@ mod tests {
         let mut archive = package.image(&path).expect("the image opens");
         let mut names = Vec::new();
         while let Some(entry) = archive.next_entry().expect("the image reads") {
-            names.push(String::from_utf8_lossy(&entry.path).into_owned());
+            names.push(String::from_utf8_lossy(entry.path()).into_owned());
         }
         assert_eq!(
             names,

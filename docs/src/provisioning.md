@@ -696,7 +696,7 @@ With the `tarball` cargo feature, `Tarball` provisions from a tar archive. The
 archive is either uncompressed or compressed with gzip, xz, or zstd, detected
 from the content and never the file name. It uses the POSIX ustar, GNU, or pax
 dialect, or the pre-POSIX v7 one that predates all three. Decoding is pure Rust
-throughout.
+throughout, and the archive is read by ferrotape at its compatible level.
 
 v7 is worth naming because it still turns up. It carries no magic, no
 `uname`/`gname`, no device numbers, and no `prefix` field. A v7 path therefore
@@ -769,7 +769,8 @@ always ends with a CRC. An xz block and a zstd frame carry a check where the
 encoder wrote one, as the `xz` and `zstd` tools do by default. The last check
 follows the end marker, and reading on is what compares it. A damaged final
 block that a check covers therefore fails the run rather than extracting. More
-than sixteen mebibytes after the marker, once decompressed, is refused. That
+than sixteen mebibytes after the marker, once decompressed, is refused, and so
+is anything there but zeros, which GNU `tar --ignore-zeros` reads on into. That
 leaves room for the record padding `tar` writes, up to a GNU `tar` blocking
 factor of 32768 and every one `bsdtar` takes. A plain archive has no check to
 read on for, and is read to its marker and no further.
@@ -802,21 +803,25 @@ filesystem:
   behavior. For a directory that holds whatever path reached it: an entry for
   `usr/lib/private/` and a later one for `lib/private/`, where `lib` links to
   `usr/lib`, describe one directory, and the later one's metadata is what it
-  ends with. A directory no entry describes is `0755`. Sparse members fail with `ProvisionError::EntryUnsupported`,
-  whichever GNU format wrote them. That is the old `S` type, and the pax
-  formats 0.0, 0.1 and 1.0, whose headers claim a regular file. Multi-volume
-  members fail the same way.
+  ends with. A directory no entry describes is `0755`. Sparse members fail
+  with `ProvisionError::EntryUnsupported`, whichever GNU format wrote them.
+  That is the old `S` type, and the pax formats 0.0, 0.1 and 1.0, whose
+  headers claim a regular file.
 - **An archive that tar readers read differently fails** with
-  `ProvisionError::Archive`. One such archive describes an entry with two pax
-  headers, two long names, or two long links. Another holds a NUL inside a pax
-  `path` or `linkpath`. A third has a pax global header that sets a record
-  other than `comment`. A global header also fails where it follows another
-  with no entry between them, or separates an entry from its metadata. So
-  do a Solaris `X` extended header, an empty pax `path`, `linkpath`,
-  `uname` or `gname` record, and an entry whose name is empty. A pax `size`
-  record declaring data for a link, a device, a directory or a named pipe
-  fails too, since GNU `tar` skips the bytes it counts and other readers read
-  them as the next member.
+  `ProvisionError::Archive`, which names the rule it breaks. The compatible
+  level refuses every archive that GNU `tar`, `bsdtar`, Go's `archive/tar` and
+  Python's `tarfile` read as different members or with different metadata,
+  and ferrotape's documentation states each rule and the readers it protects.
+  Among them: an entry described by two pax headers, two long names, or two
+  long links; a NUL inside a pax `path` or `linkpath`; a pax global header that
+  sets a record other than `comment`; a pax `size` record declaring data for a
+  link, a device, a directory or a named pipe; a Solaris `X` extended header or
+  `A` access control list; and a GNU volume label, or a continuation from
+  another volume. One kind of member those readers extract differently is read:
+  setuid, setgid or sticky beside a `SCHILY.acl.access` list, which `bsdtar`
+  extracts without the bits and GNU `tar` with them. It is extracted as GNU
+  `tar` extracts it, which is how an export of a shared setgid directory
+  provisions again.
 
 An archive records an access control list in either of two forms, or both. One
 is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in

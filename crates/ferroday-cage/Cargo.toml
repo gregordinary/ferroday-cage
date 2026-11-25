@@ -52,8 +52,10 @@ lzma-rust2 = { version = "0.25", optional = true, default-features = false, feat
 # the floor because 0.9.0 lets a block decode past `Block_Maximum_Size`, which
 # the window cap does not bound (RUSTSEC-2026-0344).
 ruzstd = { version = "0.9.1", optional = true, default-features = false, features = ["std", "hash"] }
-# The tar format (safe Rust, no dependencies): an export's headers are encoded
-# by it, so that every tar reader reads them back alike.
+# The tar format, read and written (safe Rust, no dependencies): every archive a
+# provisioner unpacks is read through it, which refuses an archive the reference
+# readers read differently; and an export's headers are encoded by it, so that
+# every tar reader reads them back alike.
 ferrotape = { version = "0.1.0", optional = true }
 # The three userland add-ons' signature verification (safe Rust, no
 # dependencies): OpenPGP for the Debian and Gentoo archives' signed documents,
@@ -366,3 +368,6 @@ rand = "0.8"
 # The Alpine key reader's tests hold it to the `rsa` crate's reading of the same
 # PEM. rPGP depends on it already, so it adds nothing to the test build.
 rsa = { version = "0.9.10", default-features = false, features = ["pem"] }
+# The provisioning tests compare a refused archive's reason with ferrotape's
+# own account of the rule it breaks, rather than with a copy of its words.
+ferrotape = "0.1.0"

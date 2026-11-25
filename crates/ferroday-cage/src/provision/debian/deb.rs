@@ -400,9 +400,9 @@ fn control_from_tar(path: &Path, at: u64, member: &[u8]) -> Result<String, Provi
         // The control file is `./control` in a conforming `.deb`; tolerate a
         // bare `control` as well.
         let name = entry
-            .path
+            .path()
             .strip_prefix(b"./".as_slice())
-            .unwrap_or(&entry.path);
+            .unwrap_or(entry.path());
         if name != b"control" {
             continue;
         }
@@ -897,7 +897,14 @@ mod tests {
         let archive = gzipped_control(&control_tar(&vec![b'x'; CONTROL_MEMBER_LIMIT as usize + 1]));
         let err = read_control_from(Path::new("tool.deb"), &mut Cursor::new(&archive))
             .expect_err("a control file past the ceiling is refused");
-        assert!(err.to_string().contains("more than the"), "{err}");
+        let past = ferrotape::ErrorKind::EntryLimit {
+            size: CONTROL_MEMBER_LIMIT + 1,
+            limit: CONTROL_MEMBER_LIMIT,
+        };
+        assert!(
+            matches!(&err, ProvisionError::Archive { reason, .. } if *reason == past.to_string()),
+            "{err:?}"
+        );
 
         // An entry ahead of `./control` is decompressed to be skipped, so the
         // ceiling holds the stream as well as the file it is after.
@@ -914,7 +921,11 @@ mod tests {
             &mut Cursor::new(&gzipped_control(&skipped)),
         )
         .expect_err("a control archive past the ceiling is refused");
-        assert!(err.to_string().contains("ends inside an entry"), "{err}",);
+        let cut = ferrotape::ErrorKind::Truncated(ferrotape::Truncation::Data);
+        assert!(
+            matches!(&err, ProvisionError::Archive { reason, .. } if *reason == cut.to_string()),
+            "{err:?}"
+        );
     }
 
     #[test]

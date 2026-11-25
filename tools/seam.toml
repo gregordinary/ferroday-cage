@@ -462,12 +462,6 @@ cost = "test"
 why = "A scratch directory opened as a root, for the bootstraps' tests."
 
 [[reach]]
-item = "provision::tar::Entry"
-code = 3
-cost = "share"
-why = "A tar member, as the reader `Tarball` uses reads it."
-
-[[reach]]
 item = "provision::tar::TarReader"
 code = 4
 cost = "share"
@@ -568,11 +562,6 @@ why = "As above."
 item = "provision::debian::DebianError::io"
 tests = 1
 why = "As above."
-
-[[reverse]]
-item = "provision::digest::unhex"
-code = 1
-why = "The tar reader decodes apk's `APK-TOOLS.checksum.SHA1` record."
 
 [[reverse]]
 item = "provision::fetch::FetchError"
@@ -685,8 +674,7 @@ tests = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/tar.rs"
-code = 9
-tests = 1
+code = 4
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/tarball.rs"

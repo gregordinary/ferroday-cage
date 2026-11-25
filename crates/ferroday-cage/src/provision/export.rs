@@ -1338,14 +1338,14 @@ mod tests {
         }
         let mut reader = TarReader::in_memory(&buf[..]);
         let dir = reader.next_entry().unwrap().unwrap();
-        assert_eq!(dir.path, b"etc/");
-        assert_eq!(dir.typeflag, b'5');
+        assert_eq!(dir.path(), b"etc/");
+        assert_eq!(dir.typeflag(), b'5');
         let file = reader.next_entry().unwrap().unwrap();
-        assert_eq!(file.path, b"etc/shadow");
-        assert_eq!(file.uid, 0);
-        assert_eq!(file.gid, 42);
-        assert_eq!(file.mode, 0o640);
-        assert_eq!(file.size, 5);
+        assert_eq!(file.path(), b"etc/shadow");
+        assert_eq!(file.uid(), 0);
+        assert_eq!(file.gid(), 42);
+        assert_eq!(file.mode(), 0o640);
+        assert_eq!(file.size(), 5);
         assert!(reader.next_entry().unwrap().is_none());
     }
 
@@ -1370,15 +1370,16 @@ mod tests {
         }
         let mut reader = TarReader::in_memory(&buf[..]);
         let file = reader.next_entry().unwrap().unwrap();
-        assert_eq!((file.uid, file.gid), (large, u32::MAX));
+        assert_eq!((file.uid(), file.gid()), (large, u32::MAX));
+        // The first entry's own header block holds the clamped placeholder.
+        assert_eq!(
+            &file.header_block()[108..116],
+            b"7777777\0",
+            "the clamped uid field"
+        );
         let within = reader.next_entry().unwrap().unwrap();
-        assert_eq!((within.uid, within.gid), (largest, 7));
+        assert_eq!((within.uid(), within.gid()), (largest, 7));
         assert!(reader.next_entry().unwrap().is_none());
-
-        // The header block of the first entry, after its pax header and data,
-        // holds the clamped placeholder.
-        let header = &buf[2 * 512..3 * 512];
-        assert_eq!(&header[108..116], b"7777777\0", "the clamped uid field");
     }
 
     #[test]
@@ -1393,9 +1394,9 @@ mod tests {
         }
         let mut reader = TarReader::in_memory(&buf[..]);
         let link = reader.next_entry().unwrap().unwrap();
-        assert_eq!(link.path, b"sh");
-        assert_eq!(link.typeflag, b'2');
-        assert_eq!(link.link_target, b"bin/busybox");
+        assert_eq!(link.path(), b"sh");
+        assert_eq!(link.typeflag(), b'2');
+        assert_eq!(link.link_target(), b"bin/busybox");
     }
 
     #[test]
@@ -1419,12 +1420,12 @@ mod tests {
         }
         let mut reader = TarReader::in_memory(&buf[..]);
         let first = reader.next_entry().unwrap().unwrap();
-        assert_eq!(first.path, b"a");
-        assert_eq!(first.typeflag, b'0');
+        assert_eq!(first.path(), b"a");
+        assert_eq!(first.typeflag(), b'0');
         let second = reader.next_entry().unwrap().unwrap();
-        assert_eq!(second.path, b"b");
-        assert_eq!(second.typeflag, b'1');
-        assert_eq!(second.link_target, b"a");
+        assert_eq!(second.path(), b"b");
+        assert_eq!(second.typeflag(), b'1');
+        assert_eq!(second.link_target(), b"a");
     }
 
     #[test]
@@ -1444,7 +1445,7 @@ mod tests {
         }
         let mut reader = TarReader::in_memory(&buf[..]);
         let entry = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry.path, long.as_bytes());
+        assert_eq!(entry.path(), long.as_bytes());
     }
 
     #[test]
@@ -1465,7 +1466,8 @@ mod tests {
                 .next_entry()
                 .unwrap()
                 .unwrap()
-                .mtime
+                .mtime()
+                .secs()
         }
         let epoch = 1_600_000_000;
         assert_eq!(exported_mtime(1_700_000_000, Some(epoch)), epoch);
@@ -1492,7 +1494,8 @@ mod tests {
                 .next_entry()
                 .unwrap()
                 .unwrap()
-                .mtime
+                .mtime()
+                .secs()
         }
         // The most eleven octal digits hold, which is the ustar field's ceiling.
         let ceiling = 0o77777777777;
@@ -1582,10 +1585,10 @@ mod tests {
             tar.finish().unwrap();
         }
         let mut reader = TarReader::in_memory(&buf[..]);
-        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/");
+        assert_eq!(reader.next_entry().unwrap().unwrap().path(), b"etc/");
         let file = reader.next_entry().unwrap().unwrap();
-        assert_eq!(file.path, b"etc/hostname");
-        assert_eq!(file.size, 3);
+        assert_eq!(file.path(), b"etc/hostname");
+        assert_eq!(file.size(), 3);
         assert!(reader.next_entry().unwrap().is_none());
     }
 
@@ -1630,7 +1633,7 @@ mod tests {
         );
         let mut reader = TarReader::in_memory(&buf[..]);
         let paths: Vec<Vec<u8>> = std::iter::from_fn(|| reader.next_entry().unwrap())
-            .map(|e| e.path)
+            .map(|e| e.path().to_vec())
             .collect();
         assert_eq!(paths, [b"var/".to_vec(), b"var/lib/".to_vec()]);
     }
@@ -1656,12 +1659,16 @@ mod tests {
         }
         let mut reader = TarReader::in_memory(&buf[..]);
         let first = reader.next_entry().unwrap().unwrap();
-        assert_eq!(first.path, b"b");
-        assert_eq!(first.typeflag, b'0', "the first kept name carries the data");
+        assert_eq!(first.path(), b"b");
+        assert_eq!(
+            first.typeflag(),
+            b'0',
+            "the first kept name carries the data"
+        );
         let second = reader.next_entry().unwrap().unwrap();
-        assert_eq!(second.path, b"c");
-        assert_eq!(second.typeflag, b'1');
-        assert_eq!(second.link_target, b"b");
+        assert_eq!(second.path(), b"c");
+        assert_eq!(second.typeflag(), b'1');
+        assert_eq!(second.link_target(), b"b");
         assert!(reader.next_entry().unwrap().is_none());
     }
 
@@ -1752,8 +1759,11 @@ mod tests {
             tar.finish().unwrap();
         }
         let mut reader = TarReader::in_memory(&buf[..]);
-        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/");
-        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"etc/hostname");
+        assert_eq!(reader.next_entry().unwrap().unwrap().path(), b"etc/");
+        assert_eq!(
+            reader.next_entry().unwrap().unwrap().path(),
+            b"etc/hostname"
+        );
         assert!(reader.next_entry().unwrap().is_none());
     }
 
@@ -1781,8 +1791,8 @@ mod tests {
         }
         assert_eq!(*seen.lock().unwrap(), ["/", "/etc"]);
         let mut reader = TarReader::in_memory(&buf[..]);
-        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"./");
-        assert_eq!(reader.next_entry().unwrap().unwrap().path, b"./etc/");
+        assert_eq!(reader.next_entry().unwrap().unwrap().path(), b"./");
+        assert_eq!(reader.next_entry().unwrap().unwrap().path(), b"./etc/");
     }
 
     #[test]

@@ -191,6 +191,51 @@ impl Tar {
         self
     }
 
+    /// A sparse file of `real_size` bytes in GNU's old form (typeflag `S`), as
+    /// GNU tar writes one with `--sparse`: `regions`, each an offset and the
+    /// bytes there, and holes between and after them. The map is in the
+    /// header, ending in an empty region at the real size, and the regions'
+    /// bytes follow it.
+    pub fn gnu_sparse_file(
+        &mut self,
+        path: &str,
+        mode: u32,
+        regions: &[(u64, &[u8])],
+        real_size: u64,
+    ) -> &mut Tar {
+        assert!(
+            regions.len() < 4,
+            "a fixture's map fits the header's four slots, the empty region at the end among them",
+        );
+        assert!(path.len() <= 100, "a fixture path fits the name field");
+        let stored: Vec<u8> = regions
+            .iter()
+            .flat_map(|(_, data)| data.iter().copied())
+            .collect();
+        let mut block = [0u8; 512];
+        block[..path.len()].copy_from_slice(path.as_bytes());
+        octal(&mut block[100..108], u64::from(mode));
+        octal(&mut block[108..116], 0);
+        octal(&mut block[116..124], 0);
+        octal(&mut block[124..136], stored.len() as u64);
+        octal(&mut block[136..148], self.mtime);
+        block[156] = b'S';
+        block[257..265].copy_from_slice(b"ustar  \0");
+        let slots = regions
+            .iter()
+            .map(|(offset, data)| (*offset, data.len() as u64))
+            .chain([(real_size, 0)]);
+        for (slot, (offset, length)) in slots.enumerate() {
+            let at = 386 + 24 * slot;
+            number(&mut block[at..at + 12], offset);
+            number(&mut block[at + 12..at + 24], length);
+        }
+        number(&mut block[483..495], real_size);
+        seal(&mut block);
+        self.data.extend_from_slice(&block);
+        self.body(&stored)
+    }
+
     /// Appends `data`, padded to the block boundary.
     pub fn body(&mut self, data: &[u8]) -> &mut Tar {
         self.data.extend_from_slice(data);
@@ -245,22 +290,26 @@ impl Tar {
                 block[297..297 + gname.len()].copy_from_slice(gname.as_bytes());
             }
         }
-        // The checksum is computed with its own field read as spaces, which is
-        // the format's own rule.
-        let sum: u64 = block
-            .iter()
-            .enumerate()
-            .map(|(i, byte)| {
-                if (148..156).contains(&i) {
-                    u64::from(b' ')
-                } else {
-                    u64::from(*byte)
-                }
-            })
-            .sum();
-        octal(&mut block[148..156], sum);
+        seal(&mut block);
         self.data.extend_from_slice(&block);
     }
+}
+
+/// Writes `block`'s checksum, computed with its own field read as spaces,
+/// which is the format's own rule.
+fn seal(block: &mut [u8; 512]) {
+    let sum: u64 = block
+        .iter()
+        .enumerate()
+        .map(|(i, byte)| {
+            if (148..156).contains(&i) {
+                u64::from(b' ')
+            } else {
+                u64::from(*byte)
+            }
+        })
+        .sum();
+    octal(&mut block[148..156], sum);
 }
 
 /// A pax record: `"<length> <key>=<value>\n"`, where the decimal length counts
@@ -286,6 +335,19 @@ pub fn pax_record(key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Vec<u8> {
     let mut record = length.to_string().into_bytes();
     record.extend_from_slice(&content);
     record
+}
+
+/// Writes a numeric tar field as GNU tar writes one: octal where the field's
+/// digits hold the value, and GNU's base-256 form past them.
+fn number(field: &mut [u8], value: u64) {
+    if value < 1 << (3 * (field.len() - 1)) {
+        octal(field, value);
+    } else {
+        let width = field.len();
+        field.fill(0);
+        field[width - 8..].copy_from_slice(&value.to_be_bytes());
+        field[0] |= 0x80;
+    }
 }
 
 /// Writes a zero-padded, NUL-terminated octal tar field.

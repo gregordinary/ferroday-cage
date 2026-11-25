@@ -1280,7 +1280,10 @@ mod tests {
         let mut reader = crate::provision::tar::TarReader::in_memory(&archive[..]);
         let mut owners = std::collections::HashMap::new();
         while let Some(entry) = reader.next_entry().expect("the archive reads") {
-            owners.insert(entry.path.clone(), (entry.uid, entry.gid, entry.mode));
+            owners.insert(
+                entry.path().to_vec(),
+                (entry.uid(), entry.gid(), entry.mode()),
+            );
         }
         let owner = |path: &str| owners.get(path.as_bytes()).copied();
         assert_eq!(owner("./usr/libexec/helper"), Some((0, 101, 0o4750)));

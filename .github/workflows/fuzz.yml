@@ -31,7 +31,6 @@ jobs:
           - dns_query
           - client_hello
           - http_head
-          - tar_archive
           - gentoo_dependencies
           - stanza_document
           - decompress

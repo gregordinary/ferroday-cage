@@ -38,13 +38,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "tar_archive"
-path = "fuzz_targets/tar_archive.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "gentoo_dependencies"
 path = "fuzz_targets/gentoo_dependencies.rs"
 test = false

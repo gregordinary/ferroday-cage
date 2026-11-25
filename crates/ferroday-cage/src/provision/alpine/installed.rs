@@ -1196,7 +1196,7 @@ mod tests {
         let name = format!("{long}-1.0.0-r0.X1{}.post-install", "0".repeat(40));
         // Past the 100 bytes a ustar header's name field holds.
         assert!(name.len() > 100);
-        assert_eq!(entry.path, name.as_bytes());
+        assert_eq!(entry.path(), name.as_bytes());
         let mut body = vec![0; 16];
         let read = reader.read_data(&mut body).expect("the body reads");
         assert_eq!(&body[..read], b"#!/bin/sh\n");
@@ -1220,8 +1220,8 @@ mod tests {
         let mut reader = crate::provision::tar::TarReader::in_memory(&archive[..]);
         let mut names = Vec::new();
         while let Some(entry) = reader.next_entry().expect("the archive parses") {
-            assert_eq!(entry.mode, 0o755, "a script is executable");
-            names.push(String::from_utf8(entry.path.clone()).expect("the name is text"));
+            assert_eq!(entry.mode(), 0o755, "a script is executable");
+            names.push(String::from_utf8(entry.path().to_vec()).expect("the name is text"));
         }
         assert_eq!(
             names,

@@ -83,12 +83,6 @@ pub mod digest;
 /// targets alone.
 #[cfg(fuzzing)]
 pub(crate) mod fuzzing {
-    /// Reads `archive` as an extraction reads a tar archive, each entry whole.
-    #[cfg(feature = "tarball")]
-    pub fn tar_archive(archive: &[u8]) {
-        super::tar::exercise(archive);
-    }
-
     /// Reads `text` as a Gentoo runtime dependency class.
     #[cfg(feature = "gentoo")]
     pub fn gentoo_dependencies(text: &[u8]) {
@@ -570,9 +564,8 @@ pub enum ProvisionError {
     },
     /// An archive entry has a type the extractor does not support.
     ///
-    /// Sparse and multi-volume entries are not supported. (Character and
-    /// block devices and GNU volume labels are not errors; they are skipped,
-    /// as documented on the `Tarball` provisioner.)
+    /// Sparse entries are not supported. (Character and block devices are not
+    /// errors; they are skipped, as documented on the `Tarball` provisioner.)
     #[non_exhaustive]
     EntryUnsupported {
         /// The entry's path as recorded in the archive.

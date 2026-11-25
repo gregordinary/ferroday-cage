@@ -593,7 +593,7 @@ pub(super) fn read_members(tar: &[u8]) -> Result<Vec<Member>, ProvisionError> {
     let mut reader = TarReader::in_memory(tar);
     let mut members = Vec::new();
     while let Some(entry) = reader.next_entry()? {
-        let name = String::from_utf8_lossy(&entry.path).into_owned();
+        let name = String::from_utf8_lossy(entry.path()).into_owned();
         let data = reader.read_entry(tar.len() as u64)?;
         members.push(Member { name, data });
     }

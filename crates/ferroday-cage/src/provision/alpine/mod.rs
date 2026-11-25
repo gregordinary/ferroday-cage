@@ -71,7 +71,7 @@ pub use repository::{Repository, RepositoryBuilder};
 use super::binfmt;
 use super::cache;
 
-use super::digest::{Algorithm, Digest};
+use super::digest::{self, Algorithm, Digest};
 use super::extract::{Cancelled, Extraction, Placement};
 use super::identity::Ownership;
 // `super::layer` is the shared one; this module has a `layer` of its own, which
@@ -90,6 +90,7 @@ use super::{
 use crate::{IdMapper, IdentityMap};
 use bootstrap::{Declared, ScriptSubject};
 use ferrata::record::Record;
+use ferrotape::{Entry, EntryKind};
 use index::Index;
 use installed::{Carried, Claim, Database, Shape};
 use pin::Pins;
@@ -2313,19 +2314,19 @@ fn lay_down(
 /// An owner is root where its name is `root` or absent and its id is 0, which
 /// is how nearly every entry of every package is owned. The name `root` is not
 /// looked up: a root whose `/etc/passwd` gave it another id would be no root.
-fn stated_owner(at: usize, entry: &crate::provision::tar::Entry, path: &[u8]) -> Option<Declared> {
+fn stated_owner(at: usize, entry: &Entry, path: &[u8]) -> Option<Declared> {
     let root = |name: &[u8], id: u32| (name.is_empty() || name == b"root") && id == 0;
-    if root(&entry.uname, entry.uid) && root(&entry.gname, entry.gid) {
+    if root(entry.uname(), entry.uid()) && root(entry.gname(), entry.gid()) {
         return None;
     }
     Some(Declared {
         record: at,
         path: path.to_vec(),
-        directory: entry.typeflag == b'5',
-        uname: entry.uname.clone(),
-        gname: entry.gname.clone(),
-        uid: entry.uid,
-        gid: entry.gid,
+        directory: entry.kind() == EntryKind::Directory,
+        uname: entry.uname().to_vec(),
+        gname: entry.gname().to_vec(),
+        uid: entry.uid(),
+        gid: entry.gid(),
         dev: 0,
         ino: 0,
     })
@@ -2352,7 +2353,7 @@ fn lay_package<R: std::io::Read>(
     database: &mut Database,
     at: usize,
     archive: &mut TarReader<R>,
-    written: &mut dyn FnMut(&crate::provision::tar::Entry, Vec<u8>),
+    written: &mut dyn FnMut(&Entry, Vec<u8>),
     cancelled: &mut Cancelled<'_>,
 ) -> Result<(), ProvisionError> {
     let mut through = Vec::new();
@@ -2410,7 +2411,7 @@ fn lay_package<R: std::io::Read>(
 fn record_entry(
     database: &mut Database,
     at: usize,
-    entry: &crate::provision::tar::Entry,
+    entry: &Entry,
     components: &[Vec<u8>],
     through: &mut Vec<(Vec<u8>, String)>,
 ) -> Result<Placement, ProvisionError> {
@@ -2421,13 +2422,17 @@ fn record_entry(
             reason: "holds a newline, which the installed database cannot record".to_string(),
         });
     }
+    // Read on every entry, whatever its kind, though only a file's and a
+    // link's is recorded: a package whose record is garbled anywhere is one
+    // apk wrote no such record into.
+    let checksum = stated_checksum(entry)?;
     // Root, which is what the extraction leaves every entry owned by. An entry
     // whose package states another owner is given it, and the record told so,
     // in the configure wave.
     let (uid, gid) = (0, 0);
-    let shape = match entry.typeflag {
-        b'5' => Shape::Directory,
-        b'2' => Shape::Link,
+    let shape = match entry.kind() {
+        EntryKind::Directory => Shape::Directory,
+        EntryKind::Symlink => Shape::Link,
         _ => Shape::File,
     };
     let collision = |database: &mut Database, owner, directory| {
@@ -2452,14 +2457,37 @@ fn record_entry(
     match shape {
         // Directories are shared by construction — every package ships the
         // ones it writes into — so every package that ships one records it.
-        Shape::Directory => database.record(at).directory(&path, uid, gid, entry.mode),
+        Shape::Directory => database.record(at).directory(&path, uid, gid, entry.mode()),
         Shape::Link | Shape::File => {
             database
                 .record(at)
-                .file(&path, uid, gid, entry.mode, entry.checksum_sha1);
+                .file(&path, uid, gid, entry.mode(), checksum);
         }
     }
     Ok(Placement::Write)
+}
+
+/// The SHA-1 an `APK-TOOLS.checksum.SHA1` pax record states for `entry`, where
+/// it carries one.
+///
+/// apk writes the record for every file and symbolic link of a package's data
+/// segment -- over the contents of a file, over the target of a link -- and it
+/// is what an installed-database record carries as its `Z:` field, so it is
+/// read here rather than by digesting a tree just written. The record reaches
+/// the layer as the archive spells it, a vendor's keyword the tar reader passes
+/// through. A value that is not a SHA-1 in lowercase hex refuses the entry: the
+/// record is the package's own statement of what the file holds, and a
+/// database written from a garbled one would disagree with the file.
+fn stated_checksum(entry: &Entry) -> Result<Option<[u8; 20]>, ProvisionError> {
+    let Some(value) = entry.pax_records().get(b"APK-TOOLS.checksum.SHA1") else {
+        return Ok(None);
+    };
+    digest::unhex(value)
+        .map(Some)
+        .ok_or_else(|| ProvisionError::EntryRefused {
+            path: PathBuf::from(OsStr::from_bytes(entry.path())),
+            reason: "its apk file checksum record is not a SHA-1 in lowercase hex".to_string(),
+        })
 }
 
 /// Checks that a full bootstrap for `target` can execute on `host`.
@@ -5508,6 +5536,43 @@ mod tests {
         )
         .expect("the .PKGINFO reads");
         installed::Record::open(&info, "x86_64", 1024, format!("Q1{name}"), name.to_string())
+    }
+
+    #[test]
+    fn an_apk_file_checksum_record_is_held_to_its_form_on_every_entry() {
+        // apk writes one for every file and symbolic link of a data segment,
+        // and the database's `Z:` field is it. One that is not a SHA-1 in
+        // lowercase hex, on any entry, is not one apk wrote: skipping it would
+        // leave a file unverified while the package claimed a digest for it.
+        let segment = |name: &[u8], typeflag: u8, value: &[u8]| {
+            let record = ferroday_cage_testkit::tar::pax_record(b"APK-TOOLS.checksum.SHA1", value);
+            let mut tar = ferroday_cage_testkit::tar::Tar::new();
+            tar.header(b"PaxHeader/entry", b'x', 0o644, record.len() as u64, 0, b"")
+                .body(&record)
+                .header(name, typeflag, 0o755, 0, 0, b"");
+            tar.finish()
+        };
+        let hex = b"000102030405060708090a0b0c0d0e0f10111213";
+        for (name, typeflag) in [(&b"usr/bin/tool"[..], b'0'), (b"usr/share/", b'5')] {
+            let (_scratch, laid) = lay(&[("pkg", "", segment(name, typeflag, hex))]);
+            if let Err(err) = laid {
+                panic!("{} with its record: {err:?}", typeflag as char);
+            }
+            for spelled in [
+                &hex[2..],
+                b"g00102030405060708090a0b0c0d0e0f10111213",
+                b"000102030405060708090A0B0C0D0E0F10111213",
+                b"+f0102030405060708090a0b0c0d0e0f10111213",
+            ] {
+                let (_scratch, laid) = lay(&[("pkg", "", segment(name, typeflag, spelled))]);
+                let err = laid.err().expect("the record is refused");
+                assert!(
+                    matches!(&err, ProvisionError::EntryRefused { reason, .. } if reason.contains("lowercase hex")),
+                    "{} {spelled:?}: {err:?}",
+                    typeflag as char,
+                );
+            }
+        }
     }
 
     /// Lays `packages` — each a name, its extra `.PKGINFO` lines, and its data

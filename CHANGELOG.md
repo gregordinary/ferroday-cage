@@ -701,6 +701,19 @@ consumer upgrading can skip it.
   header block as well as in its record. An export's bytes therefore differ
   from an earlier release's for the same tree, and so does any digest taken of
   them. GNU tar, bsdtar and Python list the two alike.
+- **Breaking.** Every tar archive the provisioners read is read by ferrotape,
+  at its compatible level, which refuses an archive that GNU tar, bsdtar, Go's
+  `archive/tar` and Python's `tarfile` read as different members or with
+  different metadata, with `ProvisionError::Archive` naming the rule it
+  breaks. Archives read before and refused now include: a GNU volume label,
+  which was skipped; a hard link naming no target, which was
+  `ProvisionError::EntryRefused`; a continuation from another volume, which
+  was `ProvisionError::EntryUnsupported`; anything but zeros after the end
+  marker of a compressed archive; and the others the guide lists. A GNU
+  dumpdir (`D`) is extracted as a directory. An Alpine package whose
+  `APK-TOOLS.checksum.SHA1` record is not a SHA-1 in lowercase hex fails with
+  `ProvisionError::EntryRefused` naming the entry, where it was
+  `ProvisionError::Archive`.
 
 ### Fixed
 
@@ -1093,6 +1106,10 @@ consumer upgrading can skip it.
   as an export is, so no tar header is encoded by hand in the library.
   `provision::tar`'s `ustar_block`, `pax_record` and `pax_header_block` are
   gone.
+- `provision::tar` holds the tar reader's side of the boundary alone: a
+  ferrotape reader that names the archive a failure belongs to. Its own header
+  and pax parsing are gone. The `tar_archive` fuzz target is retired: the
+  reader it drove is ferrotape's, which fuzzes it.
 
 ## [0.6.0] - 2026-11-13
 

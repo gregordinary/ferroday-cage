@@ -500,7 +500,7 @@ report name a package and its version bare.
 | Is this extended attribute the host's rather than the tree's? | `provision::containment::host_assigned_xattr` |
 | Read an entry's extended attributes, or restate an access control list or a file capability for the other side of an identity map | `provision::xattr::read_all`, `file_acl::Acl::map_ids_partial`, which leaves out an entry the map cannot name (`xattr::narrowed`, a mode, where no list can be given at all), `xattr::capability_mapped` |
 | Is this attribute value an access control list the kernel stores and libacl passes, and what is wrong with it if not? Read or write one as the text a `SCHILY.acl.*` record holds | `file_acl::xattr::decode`, its `DecodeError`, and `xattr::encode`; `file_acl::text::parse`, `Parsed::resolve_partial` for a name the root has no account for, and `text::write` |
-| Which list does an archive entry's records give it, in the root's own ids and names? | `provision::extract::ListIds::stated`, over `tar::AclRecords` |
+| Which list does an archive entry's records give it, in the root's own ids and names? | `provision::extract::ListIds::stated`, over ferrotape's `AclRecords`, held as `extract::ListRecords` |
 | Open the regular file a walk just inspected, refusing whatever took its name | `provision::containment::open_typed_file` |
 | Open a named pipe just created, to set its metadata through a descriptor | `provision::containment::open_created_fifo` |
 | Read or write a host-side file in a tree that is not fully trusted | `provision::rooted::Rooted` |
@@ -547,6 +547,7 @@ report name a package and its version bare.
 | Read a field-and-stanza document one stanza at a time, in place, or carry a stanza on whole, or write a plan document and read its header, its number fields and its list fields | `provision::document::parse`, `Stanza::get`, `Stanza::get_each`, `Stanza::text`, `document::header`, `document::number`, `document::list` |
 | Which names does a Debian or Alpine index offer, real or virtual? | `provision::Available` |
 | Why can a bootstrap for a foreign architecture not run on this host? | `provision::binfmt::preflight` |
+| Read a tar archive, naming the archive a failure belongs to | `provision::tar::TarReader`, over ferrotape's `Reader`, and `tar::read_failure` and `tar::into_io` for a failure beneath it |
 | Hold a tar entry whole, bounded | `provision::tar::TarReader::read_entry` |
 | Write a tar member's header | ferrotape's `Header`, through its `Writer` |
 | Which compression does a stream begin with, and what does it decode to? | `provision::compress::decoder`, or `compress::Codec::of` for a document already in memory, and `compress::lzma` for a stream its container names as LZMA, which carries no magic |

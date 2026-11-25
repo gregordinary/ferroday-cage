@@ -82,6 +82,7 @@ use crate::provision::ProvisionError;
 use crate::provision::digest;
 use crate::provision::extract::{Cancelled, Extraction, Placement};
 use crate::provision::rooted::{AncestorLink, Merged, Rooted, merged_lookup};
+use ferrotape::EntryKind;
 
 /// Where portage keeps the ordinal it stamped the last merge into a root with:
 /// one number for the whole root, beside the one each entry records in its
@@ -291,7 +292,7 @@ fn extract_image(
                     format!("ships a path that {why}"),
                 ))
             })?;
-            if entry.typeflag != b'5'
+            if entry.kind() != EntryKind::Directory
                 && !named.contains(&path)
                 && holds_other_than_a_directory(layers, &path)
                     .map_err(|err| GentooError::io("inspecting", root.join(&path), err))?
@@ -299,21 +300,21 @@ fn extract_image(
                 replaced.push(path.clone());
             }
             named.insert(path.clone());
-            laid.push(match entry.typeflag {
-                b'5' => Laid::Directory(path),
-                b'2' => {
-                    let target = recordable(entry.link_target.clone()).map_err(|why| {
+            laid.push(match entry.kind() {
+                EntryKind::Directory => Laid::Directory(path),
+                EntryKind::Symlink => {
+                    let target = recordable(entry.link_target().to_vec()).map_err(|why| {
                         ProvisionError::from(GentooError::container(
                             container,
                             format!("ships a link at {path:?} whose target {why}"),
                         ))
                     })?;
-                    Laid::Link(path, target, entry.mtime)
+                    Laid::Link(path, target, entry.mtime().secs())
                 }
-                b'6' => Laid::Fifo(path),
-                // Regular files, and the unknown typeflags POSIX says to treat as
-                // regular files -- which is what the extractor does with them too.
-                _ => Laid::File(path, entry.mtime),
+                EntryKind::Fifo => Laid::Fifo(path),
+                // Regular files, and what the reader reads as one -- which is
+                // what the extractor writes them as too.
+                _ => Laid::File(path, entry.mtime().secs()),
             });
             Ok(Placement::Write)
         },

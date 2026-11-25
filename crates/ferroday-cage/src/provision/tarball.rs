@@ -120,8 +120,7 @@ enum Source {
 ///   Extract untrusted archives as an unprivileged user.
 /// - Character and block devices are skipped: they cannot be created without
 ///   privilege, and the sandbox assembles its own minimal `/dev`. FIFOs are
-///   extracted; a tar archive has no socket entry type. GNU volume labels,
-///   which are archive metadata, are skipped.
+///   extracted; a tar archive has no socket entry type.
 /// - Of the extended attributes an archive records, the POSIX access control
 ///   lists an [`Export`](super::Export) writes are applied, a directory's once
 ///   its contents are written. Their named users and groups are read through
@@ -132,9 +131,18 @@ enum Source {
 ///   group keeps what the list gave it rather than the mask its mode shows. No
 ///   other attribute is applied.
 /// - A later entry for the same path replaces the earlier one, as with
-///   tar itself. Sparse and multi-volume members are unsupported and fail
-///   with [`ProvisionError::EntryUnsupported`]. That includes a sparse member
-///   in any of GNU's pax formats, whose header claims a regular file.
+///   tar itself. Sparse members are unsupported and fail with
+///   [`ProvisionError::EntryUnsupported`]. That includes a sparse member in
+///   any of GNU's pax formats, whose header claims a regular file.
+/// - The archive is read by ferrotape at its compatible level, which refuses
+///   an archive the reference tar readers (GNU tar, bsdtar, Go's
+///   `archive/tar` and Python's `tarfile`) read differently, as a
+///   [`ProvisionError::Archive`] naming the rule it breaks. A GNU volume
+///   label and a continuation from another volume are among them. It reads
+///   one kind of member those readers extract differently, setuid, setgid or
+///   sticky beside an access control list, as GNU tar extracts it, the bits
+///   kept and the list applied, which is how an export of a shared setgid
+///   directory provisions again.
 ///
 /// Extraction imposes no size or entry-count quota, so a caller extracting
 /// untrusted archives should bound disk usage externally. Decoder memory is

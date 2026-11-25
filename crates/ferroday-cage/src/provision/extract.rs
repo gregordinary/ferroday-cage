@@ -22,10 +22,10 @@
 //! permission bits apply verbatim, and entry types that cannot be created
 //! without privilege — character and block devices — are skipped, as the
 //! sandbox assembles its own `/dev`. (A tar archive has no socket entry
-//! type; GNU volume labels, archive metadata, are skipped too.) Of the
-//! extended attributes an archive records, the POSIX access control lists are
-//! applied ([`apply_lists`]), since a mode laid down without its list can give
-//! the owning group more than the list did; no other attribute is.
+//! type.) Of the extended attributes an archive records, the POSIX access
+//! control lists are applied ([`apply_lists`]), since a mode laid down without
+//! its list can give the owning group more than the list did; no other
+//! attribute is.
 //!
 //! A layered build extracts into an overlay upper over a base it never
 //! writes, and [`Extraction::over`] names that base: every entry is then
@@ -65,8 +65,9 @@ use super::containment::{self, Made, Reached};
 use super::copyin::{Owed, Translation, reown};
 use super::identity::Ownership;
 use super::rooted::Rooted;
-use super::tar::{AclRecords, Entry, TarReader};
+use super::tar::TarReader;
 use super::xattr;
+use ferrotape::{AclRecords, Entry, EntryKind};
 
 /// How every path an extraction writes through is resolved: inside the root,
 /// with an absolute link re-anchored there, as the root filesystem resolves it
@@ -189,11 +190,11 @@ struct DirMeta {
     mode: u32,
     mtime: Option<i64>,
     /// The access control list the entry records, in the archive's forms.
-    acl_access: AclRecords,
+    acl_access: ListRecords,
     /// The default list the entry records, in the archive's forms. Applied
     /// once every entry is written, as the mode is, so no entry the extraction
     /// creates beneath the directory inherits it.
-    acl_default: AclRecords,
+    acl_default: ListRecords,
 }
 
 impl DirMeta {
@@ -202,18 +203,45 @@ impl DirMeta {
         DirMeta {
             mode,
             mtime,
-            acl_access: AclRecords::default(),
-            acl_default: AclRecords::default(),
+            acl_access: ListRecords::default(),
+            acl_default: ListRecords::default(),
         }
     }
 
     /// What a directory entry records about the directory.
     fn of_entry(entry: &Entry) -> DirMeta {
         DirMeta {
-            mode: entry.mode,
-            mtime: Some(entry.mtime),
-            acl_access: entry.acl_access.clone(),
-            acl_default: entry.acl_default.clone(),
+            mode: entry.mode(),
+            mtime: Some(entry.mtime().secs()),
+            acl_access: ListRecords::of(entry.pax_records().access_acl()),
+            acl_default: ListRecords::of(entry.pax_records().default_acl()),
+        }
+    }
+}
+
+/// One access control list's records in an archive's two forms, the
+/// attribute's value and the list's text, held apart from the entry that
+/// carried them.
+///
+/// ferrotape's [`AclRecords`] borrows the two from the entry. A directory's
+/// lists are applied once every entry beneath it is written, long after the
+/// entry is gone, and keeping only these, rather than every record the entry
+/// carried, holds what a deferred directory costs to the lists it states.
+#[derive(Clone, Default)]
+struct ListRecords {
+    /// `SCHILY.xattr.system.posix_acl_access` or `_default`: the attribute's
+    /// value.
+    value: Option<Vec<u8>>,
+    /// `SCHILY.acl.access` or `SCHILY.acl.default`: the list's text.
+    text: Option<Vec<u8>>,
+}
+
+impl ListRecords {
+    /// The records `records` borrows from an entry, held.
+    fn of(records: AclRecords<'_>) -> ListRecords {
+        ListRecords {
+            value: records.binary().map(<[u8]>::to_vec),
+            text: records.text().map(<[u8]>::to_vec),
         }
     }
 }
@@ -306,7 +334,7 @@ impl ListIds<'_> {
     /// since nothing about the entry's access could then be relied on. A list
     /// a text gives with more entries than an attribute's value holds is one
     /// ([`file_acl::xattr::MAX_ENTRIES`]); a value cannot be longer.
-    fn stated(&self, records: &AclRecords, path: &Path) -> Result<Stated, ProvisionError> {
+    fn stated(&self, records: &ListRecords, path: &Path) -> Result<Stated, ProvisionError> {
         let refused = |reason: String| ProvisionError::EntryRefused {
             path: path.to_path_buf(),
             reason,
@@ -588,8 +616,8 @@ impl Extraction {
     ///
     /// `on_entry` is called for each entry that is extracted, with its
     /// metadata and validated path components, before the entry is written;
-    /// skipped entries (character and block devices, volume labels) and the `./` root
-    /// entry do not call it. It lets a caller act on entry metadata the
+    /// skipped entries (character and block devices) and the `./` root entry do
+    /// not call it. It lets a caller act on entry metadata the
     /// extractor itself ignores — recording non-root ownership, reporting
     /// progress — without a second pass over the archive. It also decides
     /// whether the entry is written at all ([`Placement`]), so a caller that
@@ -619,36 +647,29 @@ impl Extraction {
             if cancelled() {
                 return Err(ProvisionError::Cancelled);
             }
-            let Some(mut entry) = archive.next_entry()? else {
+            let Some(entry) = archive.next_entry()? else {
                 break;
             };
-            match entry.typeflag {
-                // Unextractable without privilege; the sandbox provides its
-                // own /dev. GNU volume labels are archive metadata.
-                b'3' | b'4' | b'V' => continue,
-                // Multi-volume members are not supported. A sparse member is
-                // the reader's to refuse, since it cannot frame every one.
-                b'M' => {
-                    return Err(ProvisionError::EntryUnsupported {
-                        path: bytes_to_path(&entry.path),
-                        kind: entry.typeflag,
-                    });
-                }
-                _ => {}
+            // Unextractable without privilege; the sandbox provides its own
+            // /dev. The members a tar archive holds that describe no file, a
+            // volume label or a continuation from another volume, are the
+            // reader's to refuse.
+            if matches!(entry.kind(), EntryKind::CharDevice | EntryKind::BlockDevice) {
+                continue;
             }
 
             // A prefixed archive names the extraction root by a directory of
             // its own, so what is validated and written is the path below it.
             let path = match &self.under {
-                None => entry.path.as_slice(),
-                Some(prefix) => match strip_prefix(&entry.path, prefix) {
+                None => entry.path(),
+                Some(prefix) => match strip_prefix(entry.path(), prefix) {
                     Some(rest) => rest,
                     // Anything outside the wrapper. The archive is read past
                     // it, so what follows is unaffected.
                     None => continue,
                 },
             };
-            let components = validate_path(path, &entry.path, "path")?;
+            let components = validate_path(path, entry.path(), "path")?;
             // The wrapper's own entry, however it is spelled: `image`,
             // `image/`, `image/.` and `image/./` all name the directory below
             // which the path is empty, which the `./` arm below reads as the
@@ -665,29 +686,30 @@ impl Extraction {
             // does not is naming something the archive is not laying down, and
             // resolving it against the root would point it at whatever happens
             // to be there.
-            if entry.typeflag == b'1'
-                && let Some(prefix) = &self.under
-            {
-                match strip_prefix(&entry.link_target, prefix) {
-                    Some(rest) => entry.link_target = rest.to_vec(),
-                    None => {
-                        return Err(entry_unsafe(
-                            &entry.path,
-                            "the hardlink target is outside the archive's own root directory",
-                        ));
+            let link_target = match &self.under {
+                Some(prefix) if entry.kind() == EntryKind::HardLink => {
+                    match strip_prefix(entry.link_target(), prefix) {
+                        Some(rest) => rest,
+                        None => {
+                            return Err(entry_unsafe(
+                                entry.path(),
+                                "the hardlink target is outside the archive's own root directory",
+                            ));
+                        }
                     }
                 }
-            }
+                _ => entry.link_target(),
+            };
             if components.is_empty() {
                 // The `./` entry: metadata for the extraction root itself,
                 // unless the caller fixed the root's mode instead.
-                if entry.typeflag == b'5' {
+                if entry.kind() == EntryKind::Directory {
                     if !self.root_mode_fixed {
                         self.root_meta = Some(DirMeta::of_entry(&entry));
                     }
                     continue;
                 }
-                return Err(entry_refused(&entry.path, "the entry path is empty"));
+                return Err(entry_refused(entry.path(), "the entry path is empty"));
             }
 
             if on_entry(&entry, &components)? == Placement::Skip {
@@ -697,13 +719,18 @@ impl Extraction {
                 continue;
             }
 
-            match entry.typeflag {
-                b'5' => extract_dir(tree, &entry, &components, &mut self.dir_meta)?,
-                b'2' => extract_symlink(tree, &entry, &components, &mut self.dir_meta)?,
-                b'1' => extract_hardlink(tree, &entry, &components, &mut self.dir_meta)?,
-                b'6' => extract_fifo(tree, &entry, &components, &mut self.dir_meta)?,
-                // Regular files, and unknown typeflags, which POSIX says to
-                // treat as regular files.
+            match entry.kind() {
+                EntryKind::Directory => extract_dir(tree, &entry, &components, &mut self.dir_meta)?,
+                EntryKind::Symlink => {
+                    extract_symlink(tree, &entry, &components, &mut self.dir_meta)?;
+                }
+                EntryKind::HardLink => {
+                    extract_hardlink(tree, &entry, link_target, &components, &mut self.dir_meta)?
+                }
+                EntryKind::Fifo => extract_fifo(tree, &entry, &components, &mut self.dir_meta)?,
+                // Regular files, and what the reader reads as one: a contiguous
+                // file, and an unknown typeflag, which POSIX says to treat as
+                // a regular file.
                 _ => extract_file(
                     tree,
                     archive,
@@ -1139,12 +1166,12 @@ fn extract_file<R: Read>(
     dir_meta: &mut DeferredDirs,
     cancelled: &mut Cancelled<'_>,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
-    let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
-    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
+    let parent = open_parent(tree, components, entry.path(), dir_meta)?;
+    let leaf = component_cstr(components.last().expect("non-empty"), entry.path())?;
+    refuse_superseding_a_base_directory(&parent, &leaf, entry.path())?;
 
     let fd = create_replacing(
-        &entry.path,
+        entry.path(),
         || {
             rustix::fs::openat(
                 &parent.dir,
@@ -1166,29 +1193,29 @@ fn extract_file<R: Read>(
             break;
         }
         file.write_all(&buf[..got])
-            .map_err(|err| ProvisionError::io("writing", bytes_to_path(&entry.path), err))?;
+            .map_err(|err| ProvisionError::io("writing", bytes_to_path(entry.path()), err))?;
         paced(&mut unasked, got, cancelled)?;
     }
 
-    rustix::fs::fchmod(&file, Mode::from_raw_mode(entry.mode)).map_err(|errno| {
+    rustix::fs::fchmod(&file, Mode::from_raw_mode(entry.mode())).map_err(|errno| {
         ProvisionError::io(
             "setting the mode of",
-            bytes_to_path(&entry.path),
+            bytes_to_path(entry.path()),
             errno.into(),
         )
     })?;
     apply_lists(
         file.as_fd(),
-        entry.mode,
-        &entry.acl_access,
+        entry.mode(),
+        &ListRecords::of(entry.pax_records().access_acl()),
         None,
         tree.lists,
-        &bytes_to_path(&entry.path),
+        &bytes_to_path(entry.path()),
     )?;
-    rustix::fs::futimens(&file, &timestamps(entry.mtime)).map_err(|errno| {
+    rustix::fs::futimens(&file, &timestamps(entry.mtime().secs())).map_err(|errno| {
         ProvisionError::io(
             "setting the times of",
-            bytes_to_path(&entry.path),
+            bytes_to_path(entry.path()),
             errno.into(),
         )
     })?;
@@ -1203,9 +1230,9 @@ fn extract_dir(
     components: &[Vec<u8>],
     dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
-    let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
-    prepare_dir(tree, components, &entry.path, dir_meta)?;
+    let parent = open_parent(tree, components, entry.path(), dir_meta)?;
+    let leaf = component_cstr(components.last().expect("non-empty"), entry.path())?;
+    prepare_dir(tree, components, entry.path(), dir_meta)?;
 
     match rustix::fs::mkdirat(&parent.dir, &leaf, Mode::from_raw_mode(0o700)) {
         Ok(()) => {}
@@ -1214,21 +1241,21 @@ fn extract_dir(
             // entry) is kept; a merged-usr alias is left untouched, its
             // directory already present through the symlink; anything else is
             // replaced.
-            match classify_existing_dir(tree.root, &parent.dir, &leaf, components, &entry.path)? {
+            match classify_existing_dir(tree.root, &parent.dir, &leaf, components, entry.path())? {
                 DirClash::Directory => {}
                 // No metadata is recorded for an alias: the deferred pass opens
                 // no-follow and would drop it, and the target owns its own.
                 DirClash::AliasedDirectory => return Ok(()),
                 DirClash::Replace => {
-                    remove_at(&parent.dir, &leaf, &entry.path)?;
-                    make_replacement_dir(tree, &parent.dir, &leaf, &entry.path)?;
+                    remove_at(&parent.dir, &leaf, entry.path())?;
+                    make_replacement_dir(tree, &parent.dir, &leaf, entry.path())?;
                 }
             }
         }
         Err(errno) => {
             return Err(ProvisionError::io(
                 "creating",
-                bytes_to_path(&entry.path),
+                bytes_to_path(entry.path()),
                 errno.into(),
             ));
         }
@@ -1236,7 +1263,7 @@ fn extract_dir(
 
     let made =
         rustix::fs::statat(&parent.dir, &leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| {
-            ProvisionError::io("inspecting", bytes_to_path(&entry.path), errno.into())
+            ProvisionError::io("inspecting", bytes_to_path(entry.path()), errno.into())
         })?;
     dir_meta.state(&made, join(components), DirMeta::of_entry(entry));
     Ok(())
@@ -1249,19 +1276,19 @@ fn extract_symlink(
     components: &[Vec<u8>],
     dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
-    if entry.link_target.is_empty() {
-        return Err(entry_refused(&entry.path, "the symlink target is empty"));
+    if entry.link_target().is_empty() {
+        return Err(entry_refused(entry.path(), "the symlink target is empty"));
     }
     // A link's target is stored and never resolved here, so a NUL in it is a
     // malformed entry rather than a reach for anything outside the root.
-    let target = CString::new(entry.link_target.clone())
-        .map_err(|_| entry_refused(&entry.path, "the symlink target contains a NUL byte"))?;
-    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
-    let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
-    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
+    let target = CString::new(entry.link_target().to_vec())
+        .map_err(|_| entry_refused(entry.path(), "the symlink target contains a NUL byte"))?;
+    let parent = open_parent(tree, components, entry.path(), dir_meta)?;
+    let leaf = component_cstr(components.last().expect("non-empty"), entry.path())?;
+    refuse_superseding_a_base_directory(&parent, &leaf, entry.path())?;
 
     create_replacing(
-        &entry.path,
+        entry.path(),
         || rustix::fs::symlinkat(&target, &parent.dir, &leaf),
         &parent.dir,
         &leaf,
@@ -1270,20 +1297,21 @@ fn extract_symlink(
     rustix::fs::utimensat(
         &parent.dir,
         &leaf,
-        &timestamps(entry.mtime),
+        &timestamps(entry.mtime().secs()),
         AtFlags::SYMLINK_NOFOLLOW,
     )
     .map_err(|errno| {
         ProvisionError::io(
             "setting the times of",
-            bytes_to_path(&entry.path),
+            bytes_to_path(entry.path()),
             errno.into(),
         )
     })?;
     Ok(())
 }
 
-/// Extracts a hardlink to an already-extracted entry. The link target is
+/// Extracts a hardlink to an already-extracted entry, `target`, the entry's
+/// link target less any wrapper directory the extraction strips. The target is
 /// validated and resolved under the same containment as entry paths.
 ///
 /// The target is an entry this extraction wrote, so in a layered one its chain
@@ -1297,22 +1325,23 @@ fn extract_symlink(
 fn extract_hardlink(
     tree: Tree<'_>,
     entry: &Entry,
+    target: &[u8],
     components: &[Vec<u8>],
     dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
     // The context is the entry's own path — the archive member at fault — while
     // the noun names which of its two paths was rejected.
-    let target_components = validate_path(&entry.link_target, &entry.path, "hardlink target")?;
+    let target_components = validate_path(target, entry.path(), "hardlink target")?;
     if target_components.is_empty() {
-        return Err(entry_refused(&entry.path, "the hardlink target is empty"));
+        return Err(entry_refused(entry.path(), "the hardlink target is empty"));
     }
     let target_parent = open_dir_at(tree.root, &target_components[..target_components.len() - 1])
-        .map_err(|errno| resolve_error(errno, &entry.path))?;
-    let target_leaf = component_cstr(target_components.last().expect("non-empty"), &entry.path)?;
+        .map_err(|errno| resolve_error(errno, entry.path()))?;
+    let target_leaf = component_cstr(target_components.last().expect("non-empty"), entry.path())?;
 
-    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
-    let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
-    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
+    let parent = open_parent(tree, components, entry.path(), dir_meta)?;
+    let leaf = component_cstr(components.last().expect("non-empty"), entry.path())?;
+    refuse_superseding_a_base_directory(&parent, &leaf, entry.path())?;
 
     containment::link_replacing(
         target_parent.as_fd(),
@@ -1320,7 +1349,7 @@ fn extract_hardlink(
         parent.dir.as_fd(),
         &leaf,
     )
-    .map_err(|errno| creating_error(errno, &entry.path))
+    .map_err(|errno| creating_error(errno, entry.path()))
 }
 
 /// Extracts a FIFO.
@@ -1338,12 +1367,12 @@ fn extract_fifo(
     components: &[Vec<u8>],
     dir_meta: &mut DeferredDirs,
 ) -> Result<(), ProvisionError> {
-    let parent = open_parent(tree, components, &entry.path, dir_meta)?;
-    let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
-    refuse_superseding_a_base_directory(&parent, &leaf, &entry.path)?;
+    let parent = open_parent(tree, components, entry.path(), dir_meta)?;
+    let leaf = component_cstr(components.last().expect("non-empty"), entry.path())?;
+    refuse_superseding_a_base_directory(&parent, &leaf, entry.path())?;
 
     create_replacing(
-        &entry.path,
+        entry.path(),
         || {
             rustix::fs::mknodat(
                 &parent.dir,
@@ -1357,27 +1386,28 @@ fn extract_fifo(
         &leaf,
     )?;
 
-    let pipe = containment::open_created_fifo(parent.dir.as_fd(), &leaf)
-        .map_err(|errno| ProvisionError::io("opening", bytes_to_path(&entry.path), errno.into()))?;
-    rustix::fs::fchmod(&pipe, Mode::from_raw_mode(entry.mode)).map_err(|errno| {
+    let pipe = containment::open_created_fifo(parent.dir.as_fd(), &leaf).map_err(|errno| {
+        ProvisionError::io("opening", bytes_to_path(entry.path()), errno.into())
+    })?;
+    rustix::fs::fchmod(&pipe, Mode::from_raw_mode(entry.mode())).map_err(|errno| {
         ProvisionError::io(
             "setting the mode of",
-            bytes_to_path(&entry.path),
+            bytes_to_path(entry.path()),
             errno.into(),
         )
     })?;
     apply_lists(
         pipe.as_fd(),
-        entry.mode,
-        &entry.acl_access,
+        entry.mode(),
+        &ListRecords::of(entry.pax_records().access_acl()),
         None,
         tree.lists,
-        &bytes_to_path(&entry.path),
+        &bytes_to_path(entry.path()),
     )?;
-    rustix::fs::futimens(&pipe, &timestamps(entry.mtime)).map_err(|errno| {
+    rustix::fs::futimens(&pipe, &timestamps(entry.mtime().secs())).map_err(|errno| {
         ProvisionError::io(
             "setting the times of",
-            bytes_to_path(&entry.path),
+            bytes_to_path(entry.path()),
             errno.into(),
         )
     })?;
@@ -1530,8 +1560,8 @@ fn apply_meta_fd(
 fn apply_lists(
     fd: BorrowedFd<'_>,
     mode: u32,
-    access: &AclRecords,
-    default: Option<&AclRecords>,
+    access: &ListRecords,
+    default: Option<&ListRecords>,
     lists: &ListIds<'_>,
     path: &Path,
 ) -> Result<(), ProvisionError> {
@@ -2563,8 +2593,6 @@ mod naming_tests {
         let escaping = format!("{}/../escape", hostile::TEXT);
         let mut traversal = Tar::new();
         traversal.file(&escaping, 0o644, b"x");
-        let mut sparse = Tar::new();
-        sparse.entry(hostile::TEXT, b'S', 0o644, 0, 0, "", b"");
         let below = format!("{}/beneath", hostile::TEXT);
         let mut under_a_file = Tar::new();
         under_a_file
@@ -2572,7 +2600,6 @@ mod naming_tests {
             .file(&below, 0o644, b"x");
         for (case, archive) in [
             ("a traversal", traversal),
-            ("an unsupported type", sparse),
             ("a component that is a file", under_a_file),
         ] {
             let root = Scratch::for_test("extract", "hostile-name");

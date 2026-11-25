@@ -1,213 +1,56 @@
-//! A read-only tar parser for POSIX ustar, GNU, pax, and pre-POSIX v7
-//! archives.
+//! Where the provisioners' tar archives meet ferrotape, which reads and writes
+//! them.
 //!
-//! The parser yields entry metadata and streams entry data; it interprets
-//! GNU long-name (`L`)/long-link (`K`) entries and pax extended headers
-//! (`x` per-entry, and `g` global, refused unless it holds only a `comment`)
-//! internally, and refuses Solaris's `X` extended header, so a consumer only
-//! ever sees concrete file entries with their effective path, link target,
-//! size, and times. Header checksums are verified.
+//! ferrotape reads POSIX ustar and pax, GNU, and pre-POSIX v7 archives, folds
+//! long names and pax records into the member they describe, and refuses an
+//! archive that GNU tar, bsdtar, Go's `archive/tar` and Python's `tarfile`
+//! read differently from one another. A reader here reads at its
+//! [`Level::Compatible`], which holds an archive to those four readers, and
+//! with its default for a global extended header, which refuses one that would
+//! change a member.
 //!
-//! v7 is a subset rather than a separate format: the first 257 bytes of a
-//! header are laid out identically, and what v7 lacks is everything after them
-//! — the magic, the version, `uname`/`gname`, the device numbers, and the
-//! `prefix`. A v7 header is therefore read as a ustar one whose fields beyond
-//! 257 are absent. It is worth reading because the archives a caller hands this
-//! parser are no longer only rootfs tarballs, which contemporary tooling
-//! produces: an upstream release tarball was produced by whoever released the
-//! software, on whatever machine, in whatever year.
+//! [`TarReader`] is that reader with the archive's name beside it, so a
+//! failure is reported as a [`ProvisionError`] naming the archive it belongs
+//! to: a refusal of what the archive declares as [`ProvisionError::Archive`],
+//! a source that failed as [`ProvisionError::Io`] ([`read_failure`]). Its
+//! members are ferrotape's [`Entry`] values. [`into_io`] carries a failure
+//! through a `Read`, for an archive read from another archive's member.
+//!
+//! Writing goes through ferrotape's `Header` and `Writer` directly: nothing
+//! about a header's encoding is decided in this crate.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use ferrotape::{Entry, ErrorKind, Level, Reader};
+
 use super::ProvisionError;
-use super::compress::{Refusal, read_fully};
+use super::compress::Refusal;
 
-/// The size of a tar block, and of a tar header.
-pub(crate) const BLOCK: u64 = 512;
-
-/// The largest metadata entry (GNU long name, pax header) accepted.
-///
-/// Real metadata entries are at most a few kilobytes; a huge one is a
-/// malformed or hostile archive, not a rootfs.
-const METADATA_LIMIT: u64 = 1 << 20;
-
-/// One entry's effective metadata.
-///
-/// Paths and link targets are byte strings as recorded in the archive; the
-/// extractor validates and interprets them.
-#[derive(Debug)]
-pub(crate) struct Entry {
-    /// The entry's path bytes, after long-name and pax resolution.
-    pub path: Vec<u8>,
-    /// The link target for symlink and hardlink entries.
-    pub link_target: Vec<u8>,
-    /// The tar typeflag byte.
-    ///
-    /// Never `S`: the reader refuses a GNU sparse member, whichever of GNU's
-    /// formats wrote it, rather than yield it ([`TarReader::next_entry`]).
-    pub typeflag: u8,
-    /// The permission bits, as stored (may include setuid/setgid/sticky).
-    pub mode: u32,
-    /// The owning user id, as stored. The extractor does not apply it; it
-    /// is read so a consumer can act on non-root ownership. The Debian layer
-    /// records it for dpkg's statoverride, a `.deb`'s setgid helpers for
-    /// instance, and the Alpine layer gives an entry its owner by it where the
-    /// root has no account by the entry's [`uname`](Self::uname). A build with
-    /// neither parses the field and reads no further.
-    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
-    pub uid: u32,
-    /// The owning group id, as stored. Not applied by the extractor; read by
-    /// the same two layers as [`uid`](Self::uid), for the same reasons.
-    #[cfg_attr(not(any(feature = "debian", feature = "alpine")), allow(dead_code))]
-    pub gid: u32,
-    /// The owning user's name, as stored: the ustar header's `uname`, or a pax
-    /// `uname` record. Empty where the archive states none, as a v7 header
-    /// cannot.
-    ///
-    /// Read for the Alpine layer, which gives a package's entries their owner
-    /// as `apk` does: by this name, looked up in the root being built, with
-    /// [`uid`](Self::uid) where the root has no such account.
-    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
-    pub uname: Vec<u8>,
-    /// The owning group's name, as stored, and read for the same reason as
-    /// [`uname`](Self::uname).
-    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
-    pub gname: Vec<u8>,
-    /// The data size in bytes.
-    pub size: u64,
-    /// Modification time, seconds since the epoch.
-    pub mtime: i64,
-    /// The SHA-1 an `APK-TOOLS.checksum.SHA1` pax record states for this
-    /// entry, where it carries one.
-    ///
-    /// A vendor record, read for the same reason [`uid`](Self::uid) is: one
-    /// layer needs it and the reader is the only place it can be seen. apk
-    /// writes it for every file and symbolic link of a package's data segment
-    /// — over the contents of a file, over the target of a link — and it is
-    /// what an installed-database record carries as its `Z:` field, so the
-    /// Alpine layer reads it here rather than digesting a tree it has just
-    /// written. A build without that layer passes the record over, as it does
-    /// any vendor keyword, and this is `None`.
-    #[cfg_attr(not(feature = "alpine"), allow(dead_code))]
-    pub checksum_sha1: Option<[u8; 20]>,
-    /// What the entry's records state about its POSIX access control list.
-    ///
-    /// Read for the extractor, which gives the entry the list rather than the
-    /// mode alone: where a list has a mask, the mode's group bits are the mask,
-    /// and the mode alone would give the owning group what the mask allows.
-    pub acl_access: AclRecords,
-    /// What they state about a directory's default list, read for the same
-    /// reason.
-    pub acl_default: AclRecords,
-}
-
-/// What an entry's pax records state about one of its access control lists,
-/// in either of the two forms an archive carries one in, or both.
-///
-/// An [`Export`](super::Export) writes both for every entry that carries a
-/// list, as GNU tar does with `--acls --xattrs`; `--acls` alone writes the
-/// text. Which one an entry is given is the extractor's to decide.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct AclRecords {
-    /// The attribute's own value, from a `SCHILY.xattr.system.posix_acl_access`
-    /// or `..._default` record: the kernel's binary form, its named ids as the
-    /// archive's writer read them.
-    pub value: Option<Vec<u8>>,
-    /// The list's text, from a `SCHILY.acl.access` or `SCHILY.acl.default`
-    /// record: the form `getfacl` prints, users and groups by name or by id.
-    pub text: Option<Vec<u8>>,
-}
-
-/// Whether entries of type `typeflag` carry a data stream.
-///
-/// Hardlinks, symlinks, devices, directories, and FIFOs have none;
-/// everything else — including unknown typeflags, which POSIX says to
-/// treat as regular files — is followed by `size` bytes of data.
-fn has_data(typeflag: u8) -> bool {
-    !matches!(typeflag, b'1' | b'2' | b'3' | b'4' | b'5' | b'6')
-}
-
-/// Pax keys collected from an `x` header.
-#[derive(Debug, Default, Clone)]
-struct PaxRecords {
-    path: Option<Vec<u8>>,
-    link_target: Option<Vec<u8>>,
-    size: Option<u64>,
-    mtime: Option<i64>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    uname: Option<Vec<u8>>,
-    gname: Option<Vec<u8>>,
-    checksum_sha1: Option<[u8; 20]>,
-    acl_access: AclRecords,
-    acl_default: AclRecords,
-    /// Whether any `GNU.sparse.*` record was present, which makes the entry a
-    /// GNU sparse member in one of the pax formats.
-    gnu_sparse: bool,
-}
-
-/// Reasons a header block is rejected.
-#[derive(Debug, PartialEq, Eq)]
-enum HeaderFlaw {
-    NotATarHeader,
-    Checksum,
-    /// A numeric field, named as the header names it, that does not read as a
-    /// value it may hold.
-    Field(&'static str, Numeric),
-}
-
-/// What is wrong with a numeric header field.
-#[derive(Debug, PartialEq, Eq)]
-enum Numeric {
-    /// It is neither octal digits nor the base-256 form.
-    Unreadable,
-    /// It reads, as a value the field cannot hold: a negative mode, id or
-    /// size, or one too large for the type it is read into.
-    OutOfRange,
-}
-
-impl HeaderFlaw {
-    fn describe(&self) -> String {
-        match self {
-            HeaderFlaw::NotATarHeader => "the block is not a tar header: it carries no ustar or \
-                                          GNU magic and its checksum does not match"
-                .to_string(),
-            HeaderFlaw::Checksum => "the header checksum does not match".to_string(),
-            HeaderFlaw::Field(field, Numeric::Unreadable) => {
-                format!("the header's {field} field is neither octal nor base-256")
-            }
-            HeaderFlaw::Field(field, Numeric::OutOfRange) => {
-                format!("the header's {field} field holds a value out of its range")
-            }
-        }
-    }
-}
-
-/// A streaming tar reader over any byte source.
+/// A tar reader over any byte source, with the archive's name for its
+/// failures.
 ///
 /// A read of the source that fails is reported as what it is
 /// ([`read_failure`]): the source failing, an OS error or a transport's, as
 /// [`ProvisionError::Io`] naming the archive, and a decoder beneath refusing
 /// the stream as [`ProvisionError::Archive`] with the decoder's failure as its
-/// cause. Every other failure is the archive's, a refusal of what it declares.
+/// cause. Every other failure is the archive's, a refusal of what it declares,
+/// with ferrotape's account of the rule it breaks as the reason.
 pub(crate) struct TarReader<R: Read> {
-    inner: R,
+    inner: Reader<R>,
     /// The archive, as a failure to read it names it.
     path: PathBuf,
     /// Whether the stream turned out not to be a tar archive at all. Read by
     /// [`not_a_tar`](Self::not_a_tar).
     not_a_tar: bool,
-    /// Bytes consumed from the (uncompressed) stream, for error offsets.
-    offset: u64,
-    /// Unread data bytes of the current entry.
-    data_remaining: u64,
-    /// Block-padding bytes following the current entry's data.
-    padding: u64,
-    /// Set once the archive terminator or EOF was seen.
-    finished: bool,
+    /// Where in the stream the current member's data has been read to, for a
+    /// source that fails while it is read. ferrotape reports the offset of
+    /// every failure but one: a source's own, which reaches a `Read` of a
+    /// member's data as the source's error and nothing else.
+    data_at: u64,
 }
 
 impl<'a> TarReader<&'a [u8]> {
@@ -221,19 +64,17 @@ impl<'a> TarReader<&'a [u8]> {
 }
 
 impl<R: Read> TarReader<R> {
-    /// A reader over `inner`, which holds the archive at `path`.
+    /// A reader over `inner`, which holds the archive at `path`, at
+    /// [`Level::Compatible`].
     ///
     /// `path` is what a failure to read `inner` names: the file, or, for a
     /// stream that has none, what the caller calls it.
     pub(crate) fn new(inner: R, path: impl Into<PathBuf>) -> Self {
         TarReader {
-            inner,
+            inner: Reader::new(inner).with_level(Level::Compatible),
             path: path.into(),
             not_a_tar: false,
-            offset: 0,
-            data_remaining: 0,
-            padding: 0,
-            finished: false,
+            data_at: 0,
         }
     }
 
@@ -241,483 +82,137 @@ impl<R: Read> TarReader<R> {
     ///
     /// Meaningful only after [`next_entry`](Self::next_entry) returned an
     /// error; a caller reports "not a tar archive" rather than "corrupt
-    /// archive" on it. True in exactly three cases: the stream ended before
-    /// its first byte, it ended inside its first block, or that block is no
-    /// header. The last is a block carrying neither magic whose checksum does
-    /// not match either, which with v7 accepted is what any other format's
-    /// first 512 bytes look like.
+    /// archive" on it. True where ferrotape found no archive
+    /// ([`ErrorKind::NotATar`]): the stream ended before its first block was
+    /// whole, or that block carries neither magic nor a checksum that
+    /// matches, which with v7 read is what any other format's first 512 bytes
+    /// look like.
     ///
     /// Every other failure keeps its own reason, however early it came. A first
     /// block carrying the magic with a checksum that does not match is a
-    /// corrupt tar header, and one the reader refuses for what it declares is a
-    /// malformed archive. A read that *failed* is the reader underneath: the
-    /// source, or a decompressor whose refusal (a dictionary over the bound, a
-    /// truncated stream, a frame it will not decode) is a diagnostic with a
-    /// reason in it. Calling any of these "not a tar archive" would replace the
-    /// reason with a guess about the format.
+    /// corrupt tar header, and one refused for what it declares is a malformed
+    /// archive. A read that *failed* is the reader underneath: the source, or a
+    /// decompressor whose refusal (a dictionary over the bound, a truncated
+    /// stream, a frame it will not decode) is a diagnostic with a reason in it.
+    /// Calling any of these "not a tar archive" would replace the reason with a
+    /// guess about the format.
     pub fn not_a_tar(&self) -> bool {
         self.not_a_tar
     }
 
-    /// Advances to the next file entry, returning `None` at the end of the
+    /// Advances to the next member, returning `None` at the end of the
     /// archive.
     ///
-    /// Any unread data of the previous entry is drained first. Metadata
-    /// entries (GNU long names, pax headers) are consumed internally and
-    /// folded into the entry they describe, which takes at most one of each
-    /// kind: a second is refused.
+    /// Any unread data of the previous member is passed over first. Long names
+    /// and pax records are folded into the member they describe, and members
+    /// that describe the archive rather than a file (a global header holding
+    /// only a `comment`) are passed over.
     ///
-    /// A GNU sparse member is refused, with
-    /// [`ProvisionError::EntryUnsupported`] and the type `S`, whichever of
-    /// GNU's formats wrote it. The old GNU format marks one with that typeflag,
-    /// and where the file has more than four runs of data, follows its header
-    /// with extension blocks that its size does not count; a reader that took
-    /// the size at its word would read those blocks as data and the archive's
-    /// next header from inside it, ending the archive early or reading members
-    /// that are not there. The pax formats (0.0, 0.1 and 1.0) write a regular
-    /// file's `0` and describe the sparseness only in `GNU.sparse.*` records,
-    /// so the member's data is a packed form of the file, or a map and the
-    /// packed form, rather than its contents, and a reader that took the `0` at
-    /// its word would hand on a file other than the one archived. The extractor
-    /// has no way to write one either, and no other reader in the crate has a
-    /// use for one, so every reader is held to one rule here rather than each
-    /// deciding what to make of a member it cannot frame.
+    /// A sparse member is refused, with [`ProvisionError::EntryUnsupported`]
+    /// and the type `S`, whichever of GNU's formats wrote it: the old `S`
+    /// type, or a pax format whose header claims a regular file. Its data is
+    /// the file it stands for only once its map is applied, which the
+    /// extractor has no way to do, and no other reader in the crate has a use
+    /// for one.
     pub fn next_entry(&mut self) -> Result<Option<Entry>, ProvisionError> {
-        if self.finished {
-            return Ok(None);
+        let entry = self.inner.next_entry().map_err(|err| self.failure(err))?;
+        if let Some(entry) = &entry {
+            if entry.sparse().is_some() {
+                return Err(ProvisionError::EntryUnsupported {
+                    path: PathBuf::from(OsStr::from_bytes(entry.path())),
+                    kind: b'S',
+                });
+            }
+            self.data_at = entry.data_offset();
         }
-        self.drain_current()?;
-
-        // Metadata accumulated for the upcoming file entry.
-        let mut gnu_longname: Option<Vec<u8>> = None;
-        let mut gnu_longlink: Option<Vec<u8>> = None;
-        let mut pax_entry: Option<PaxRecords> = None;
-        // Whether a global extended header has arrived since the last entry.
-        let mut after_global = false;
-
-        loop {
-            // Whether metadata read so far waits for an entry to describe.
-            let waiting = gnu_longname.is_some() || gnu_longlink.is_some() || pax_entry.is_some();
-            let header_offset = self.offset;
-            let mut block = [0u8; BLOCK as usize];
-            if !self.read_block(&mut block)? {
-                // EOF before the first header block: there is no archive here.
-                // The tolerance below is for an archive that ran out of
-                // terminator, which presupposes an archive; a stream that
-                // ended before its first header is a file of some other
-                // format, or an empty one, and calling it a complete archive
-                // of nothing publishes an empty rootfs as a finished tree.
-                if header_offset == 0 {
-                    self.not_a_tar = true;
-                    return Err(self.malformed(0, "the stream holds no archive"));
-                }
-                // EOF at a later header boundary. GNU tar tolerates a missing
-                // two-block terminator, and so do we — unless metadata was
-                // left dangling.
-                if waiting {
-                    return Err(
-                        self.malformed(header_offset, "the archive ends after a metadata entry")
-                    );
-                }
-                self.finished = true;
-                return Ok(None);
-            }
-
-            if block.iter().all(|b| *b == 0) {
-                // The terminator. The second zero block is not insisted on.
-                // Metadata waiting for an entry it never got is refused here as
-                // it is at the end of the stream: the two are one archive
-                // ending in one place, spelled with and without its marker.
-                if waiting {
-                    return Err(
-                        self.malformed(header_offset, "the archive ends after a metadata entry")
-                    );
-                }
-                self.finished = true;
-                return Ok(None);
-            }
-
-            let mut entry = match parse_header(&block) {
-                Ok(entry) => entry,
-                Err(flaw) => {
-                    self.not_a_tar = header_offset == 0 && flaw == HeaderFlaw::NotATarHeader;
-                    return Err(self.malformed(header_offset, &flaw.describe()));
-                }
-            };
-            self.set_current(&entry);
-
-            // One metadata entry of each kind describes the entry after it. No
-            // writer emits a second, and readers part ways over one: GNU tar and
-            // Go take the last, Python the first `L` and a merge of the `x`
-            // records, bsdtar refuses. Whichever this reader took, some other
-            // reader would name the member differently, so a second is refused.
-            match entry.typeflag {
-                // GNU long name / long link: the data names the next entry, as
-                // the C string GNU writes, so it ends at its first NUL.
-                b'L' | b'K' => {
-                    let (slot, second) = if entry.typeflag == b'L' {
-                        (&mut gnu_longname, "two GNU long names describe one entry")
-                    } else {
-                        (&mut gnu_longlink, "two GNU long links describe one entry")
-                    };
-                    if slot.is_some() {
-                        return Err(self.malformed(header_offset, second));
-                    }
-                    *slot = Some(field_bytes(&self.read_metadata()?).to_vec());
-                }
-                // Pax extended headers.
-                b'x' => {
-                    if pax_entry.is_some() {
-                        return Err(self.malformed(
-                            header_offset,
-                            "two pax extended headers describe one entry",
-                        ));
-                    }
-                    let data = self.read_metadata()?;
-                    let records =
-                        parse_pax(&data).map_err(|reason| self.malformed(header_offset, reason))?;
-                    pax_entry = Some(records);
-                }
-                b'g' => {
-                    // A global extended header states defaults for every entry
-                    // after it, and readers part ways over what to do with
-                    // them. GNU tar and Python apply them, and differ from each
-                    // other over a second header, an empty value, a vendor
-                    // keyword, and a `size`, which GNU tar frames the next
-                    // member by. bsdtar and Go apply none. Under a global
-                    // `linkpath`, GNU tar and Python point every symbolic link
-                    // somewhere bsdtar and Go do not. So whichever reading this
-                    // reader took, some other reader would see different
-                    // members, and a record that could change one is refused.
-                    // `comment` changes none; it is the record `git archive`
-                    // writes, carrying the commit an archive was made from.
-                    //
-                    // Where one falls is held as well. bsdtar refuses two with
-                    // no entry between them, and Go lets one consume metadata
-                    // already waiting for its entry, which the others apply to
-                    // that entry.
-                    if waiting {
-                        return Err(self.malformed(
-                            header_offset,
-                            "a global extended header separates an entry from its metadata",
-                        ));
-                    }
-                    if after_global {
-                        return Err(self.malformed(
-                            header_offset,
-                            "two global extended headers precede one entry",
-                        ));
-                    }
-                    let data = self.read_metadata()?;
-                    for field in pax_fields(&data) {
-                        let (key, _) =
-                            field.map_err(|reason| self.malformed(header_offset, reason))?;
-                        if key != b"comment" {
-                            return Err(self.malformed(
-                                header_offset,
-                                "a global extended header sets a record other than `comment`",
-                            ));
-                        }
-                    }
-                    after_global = true;
-                }
-                // Solaris tar's extended header, from before POSIX settled on
-                // `x`. GNU tar, bsdtar and Python apply its records to the
-                // entry after it, as an `x` header's, and Go reads it as a file
-                // whose data is the records, leaving the entry after it its own
-                // header's name. Whichever this reader took, some other reader
-                // would see different entries, so it is refused.
-                b'X' => {
-                    return Err(self.malformed(
-                        header_offset,
-                        "the archive holds a Solaris extended header (typeflag `X`)",
-                    ));
-                }
-                _ => {
-                    // A concrete file entry: fold in the accumulated
-                    // metadata, per-entry pax beating GNU long names.
-                    let pax = pax_entry.unwrap_or_default();
-                    if let Some(path) = pax.path {
-                        entry.path = path;
-                    } else if let Some(longname) = gnu_longname {
-                        entry.path = longname;
-                    }
-                    // An entry with no name at all. GNU tar substitutes `.`,
-                    // bsdtar skips the entry, and Python and Go report the
-                    // empty name, so readers put the entry in different places
-                    // or nowhere. A pax record cannot state one ([`parse_pax`]),
-                    // so this is the header's own name or a GNU long name.
-                    if entry.path.is_empty() {
-                        return Err(self.malformed(header_offset, "an entry has an empty name"));
-                    }
-                    if let Some(link) = pax.link_target {
-                        entry.link_target = link;
-                    } else if let Some(longlink) = gnu_longlink {
-                        entry.link_target = longlink;
-                    }
-                    if let Some(size) = pax.size {
-                        // A type that carries no data, stated to carry some.
-                        // GNU tar skips the bytes the record counts, and other
-                        // readers read them as the next header, so the same
-                        // bytes are one archive to one reader and another to
-                        // the next: a member hidden from GNU tar, extracted by
-                        // every reader that ignores the record. The type's
-                        // header `size` is no such statement, since every
-                        // reader ignores it.
-                        if size != 0 && !has_data(entry.typeflag) {
-                            return Err(self.malformed(
-                                header_offset,
-                                "a pax record declares data for an entry whose type carries none",
-                            ));
-                        }
-                        entry.size = size;
-                    }
-                    if let Some(mtime) = pax.mtime {
-                        entry.mtime = mtime;
-                    }
-                    if let Some(uid) = pax.uid {
-                        entry.uid = uid;
-                    }
-                    if let Some(gid) = pax.gid {
-                        entry.gid = gid;
-                    }
-                    if let Some(uname) = pax.uname {
-                        entry.uname = uname;
-                    }
-                    if let Some(gname) = pax.gname {
-                        entry.gname = gname;
-                    }
-                    entry.checksum_sha1 = pax.checksum_sha1;
-                    entry.acl_access = pax.acl_access;
-                    entry.acl_default = pax.acl_default;
-                    // A pax sparse member says `0` in its header, and an old
-                    // GNU one is followed by blocks its size does not count;
-                    // see `next_entry`.
-                    if pax.gnu_sparse || entry.typeflag == b'S' {
-                        return Err(ProvisionError::EntryUnsupported {
-                            path: PathBuf::from(std::ffi::OsStr::from_bytes(&entry.path)),
-                            kind: b'S',
-                        });
-                    }
-                    // A trailing slash marks a directory, whatever the typeflag
-                    // says. The oldest archives predate a reliably-set typeflag
-                    // and mark a directory this way and no other.
-                    //
-                    // Read from the *resolved* path rather than from the
-                    // header's own name field, which is what a long name or a
-                    // pax record has just replaced. A header's name field holds
-                    // at most 100 bytes, so for such an entry it is a truncation
-                    // of the real path -- and a truncation that happens to land
-                    // just after a separator would otherwise turn a regular file
-                    // into a directory. That is not a cosmetic misreading: a
-                    // directory carries no data, so the file's bytes would be
-                    // read as the next header, and the rest of the archive with
-                    // them. A real Gentoo stage3 is where that was found.
-                    if entry.typeflag == b'0' && entry.path.last() == Some(&b'/') {
-                        // Unless it declares data, which no directory has. Such
-                        // an entry says two incompatible things about itself,
-                        // and a reader that resolved the contradiction would
-                        // pick one of two archives: taking the name drops the
-                        // bytes it declared and reads them as the next header,
-                        // and taking the size writes a file at a directory's
-                        // name. Refusing is what keeps two readers of these
-                        // bytes from disagreeing, which is the shape a tar
-                        // parser differential takes.
-                        if entry.size != 0 {
-                            return Err(self.malformed(
-                                header_offset,
-                                "an entry names a directory and declares data",
-                            ));
-                        }
-                        entry.typeflag = b'5';
-                    }
-                    // The size and the type recorded when the header was parsed
-                    // may both have changed since; the data bookkeeping follows
-                    // the entry as it finally reads.
-                    self.set_current(&entry);
-                    return Ok(Some(entry));
-                }
-            }
-        }
+        Ok(entry)
     }
 
-    /// Reads from the current entry's data, returning `Ok(0)` when the
-    /// data is exhausted.
+    /// Reads the current member's data into `buf`, returning 0 once it is all
+    /// read.
     ///
-    /// The buffer is filled as far as the entry's remaining data reaches, through
-    /// [`read_fully`], which retries a read a signal interrupted: the archive may
-    /// arrive over a pipe or a socket, in a process whose signal handlers do not
-    /// restart the calls they interrupt, and one `EINTR` is not a broken archive.
-    /// Every byte asked for is one the entry declares, so a fill that ends short
-    /// is an archive that ends inside the entry.
+    /// The buffer is filled as far as the member's remaining data reaches, a
+    /// read that a signal interrupted retried: the archive may arrive over a
+    /// pipe or a socket, in a process whose signal handlers do not restart the
+    /// calls they interrupt. Every byte asked for is one the member declares,
+    /// so a fill that ends short is an archive that ends inside the member.
     pub fn read_data(&mut self, buf: &mut [u8]) -> Result<usize, ProvisionError> {
-        if self.data_remaining == 0 {
-            return Ok(0);
-        }
-        let want = buf
-            .len()
-            .min(usize::try_from(self.data_remaining).unwrap_or(usize::MAX));
-        let got = read_fully(&mut self.inner, &mut buf[..want]).map_err(|err| self.failure(err))?;
-        self.offset += got as u64;
-        self.data_remaining -= got as u64;
-        if got < want {
-            return Err(self.malformed(self.offset, "the archive ends inside an entry's data"));
-        }
-        Ok(got)
-    }
-
-    /// Records the data and padding lengths for `entry`.
-    ///
-    /// The padded length always fits: header sizes are bounded to `i64` by
-    /// [`parse_header`], and pax sizes are validated by [`parse_pax`].
-    fn set_current(&mut self, entry: &Entry) {
-        let size = if has_data(entry.typeflag) {
-            entry.size
-        } else {
-            0
-        };
-        self.data_remaining = size;
-        self.padding = size.next_multiple_of(BLOCK) - size;
-    }
-
-    /// Skips whatever remains of the current entry: unread data, then the
-    /// block padding.
-    ///
-    /// Read through [`read_fully`], so an interrupted read is retried rather
-    /// than reported, as [`read_data`](Self::read_data) retries one.
-    fn drain_current(&mut self) -> Result<(), ProvisionError> {
-        let mut skip = self.data_remaining + self.padding;
-        self.data_remaining = 0;
-        self.padding = 0;
-        let mut scratch = [0u8; 4096];
-        while skip > 0 {
-            let want = scratch
-                .len()
-                .min(usize::try_from(skip).unwrap_or(usize::MAX));
-            let got = read_fully(&mut self.inner, &mut scratch[..want])
-                .map_err(|err| self.failure(err))?;
-            self.offset += got as u64;
-            if got < want {
-                return Err(self.malformed(self.offset, "the archive ends inside an entry"));
+        match self.inner.data().read(buf) {
+            Ok(got) => {
+                self.data_at += got as u64;
+                Ok(got)
             }
-            skip -= got as u64;
-        }
-        Ok(())
-    }
-
-    /// Reads one full block. Returns `false` on clean EOF at the block
-    /// boundary; a partial block is an error.
-    fn read_block(&mut self, block: &mut [u8; BLOCK as usize]) -> Result<bool, ProvisionError> {
-        let first = self.offset == 0;
-        let filled = read_fully(&mut self.inner, block).map_err(|err| self.failure(err))?;
-        self.offset += filled as u64;
-        match filled {
-            0 => Ok(false),
-            filled if filled == block.len() => Ok(true),
-            _ => {
-                // Fewer bytes than one header holds: no archive, if these were
-                // all the stream had.
-                self.not_a_tar = first;
-                Err(self.malformed(self.offset, "the archive ends inside a header block"))
-            }
+            // A refusal of the archive, carried in the `io::Error` a `Read`
+            // returns, or the source's own failure as the source returned it.
+            Err(err) => match err.downcast::<ferrotape::Error>() {
+                Ok(err) => Err(self.failure(err)),
+                Err(err) => Err(read_failure(&self.path, self.data_at, err)),
+            },
         }
     }
 
-    /// Reads the stream on past the end-of-archive marker to its end, refusing
-    /// more than `limit` bytes of it.
+    /// Reads the rest of the archive, then the stream on past the archive's
+    /// end to the stream's end, refusing more than `limit` bytes there, and
+    /// anything there but zeros.
     ///
-    /// A tar archive ends at its marker, and nothing after it is part of the
-    /// archive. The stream the archive is read from may not end there: the
+    /// A tar archive ends at its end marker, and nothing after it is part of
+    /// the archive. The stream the archive is read from may not end there: the
     /// rest of the last record is padding, and a compressed stream closes with
     /// the check over the last block it decoded, which covers the marker and
-    /// the entries before it. Stopping at the marker leaves that check unread,
+    /// the members before it. Stopping at the marker leaves that check unread,
     /// so a corrupt final block would be extracted as though it were sound.
     /// Reading on to the end is what has the decoder compare it.
     ///
     /// For an archive whose bytes are verified against a digest before it is
-    /// read, the decoder's check adds nothing, and a caller reading one need not
-    /// finish it. For one nothing else vouches for, the check is the only
+    /// read, the decoder's check adds nothing, and a caller reading one need
+    /// not finish it. For one nothing else vouches for, the check is the only
     /// thing that would say the stream is damaged.
     ///
-    /// What follows the marker is decoded only to be discarded, so `limit`
+    /// What follows the marker is decoded only to be checked, so `limit`
     /// bounds what a stream can make that cost: a few mebibytes of input can
     /// decompress to far more than any record padding.
     pub(crate) fn finish(&mut self, limit: u64) -> Result<(), ProvisionError> {
-        let mut remaining = limit;
-        let mut scratch = [0u8; 4096];
-        loop {
-            let got = match self.inner.read(&mut scratch) {
-                Ok(0) => return Ok(()),
-                Ok(got) => got as u64,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(self.failure(err)),
-            };
-            self.offset += got;
-            remaining = remaining.checked_sub(got).ok_or_else(|| {
-                self.malformed(
-                    self.offset,
-                    &format!("more than {limit} bytes follow the end of the archive"),
-                )
-            })?;
-        }
+        self.inner.finish(limit).map_err(|err| self.failure(err))
     }
 
-    /// Reads what is left of the current entry's data into memory, refusing an
-    /// entry that holds more than `limit` bytes.
+    /// Reads what is left of the current member's data into memory, refusing a
+    /// member that holds more than `limit` bytes.
     ///
-    /// The one way an entry is held whole, for the members a reader acts on as
-    /// a unit: a control file, a package's metadata, a GNU long name. The
-    /// ceiling is the caller's, since only the caller knows what the entry is.
-    ///
-    /// The refusal is made on the length the header declares, before a byte of
-    /// the data is read, and is never a truncation: [`read_data`](Self::read_data)
-    /// delivers exactly the declared length or fails, so what is returned is
-    /// the whole entry. A declared length is still the archive's own claim
-    /// until the bytes arrive, so the reservation made up front is the smaller
-    /// of it and [`RESERVE`], and the buffer grows from there with what the
-    /// archive actually holds. A header claiming the whole ceiling for an entry
-    /// that stops short of it costs the reservation, not the ceiling.
+    /// The one way a member is held whole, for the members a reader acts on as
+    /// a unit: a control file, a package's metadata. The ceiling is the
+    /// caller's, since only the caller knows what the member is. The refusal
+    /// is made on the length the header declares, before a byte of the data is
+    /// read, and is never a truncation: what is returned is the whole member,
+    /// and an archive that ends inside it is refused.
+    #[cfg_attr(
+        not(any(feature = "debian", feature = "alpine", feature = "gentoo")),
+        allow(dead_code)
+    )]
     pub(crate) fn read_entry(&mut self, limit: u64) -> Result<Vec<u8>, ProvisionError> {
-        let declared = self.data_remaining;
-        if declared > limit {
-            return Err(self.malformed(
-                self.offset,
-                &format!("an entry of {declared} bytes is more than the {limit} accepted for it"),
-            ));
-        }
-        let reserve = usize::try_from(declared).map_or(RESERVE, |declared| declared.min(RESERVE));
-        let mut data = Vec::with_capacity(reserve);
-        let mut chunk = [0u8; 8192];
-        loop {
-            let got = self.read_data(&mut chunk)?;
-            if got == 0 {
-                return Ok(data);
+        match self.inner.read_entry(limit) {
+            Ok(data) => {
+                self.data_at += data.len() as u64;
+                Ok(data)
             }
-            data.extend_from_slice(&chunk[..got]);
+            Err(err) => Err(self.failure(err)),
         }
     }
 
-    /// Reads the current (metadata) entry's data in full, under
-    /// [`METADATA_LIMIT`], and drains its padding.
-    fn read_metadata(&mut self) -> Result<Vec<u8>, ProvisionError> {
-        let data = self.read_entry(METADATA_LIMIT)?;
-        self.drain_current()?;
-        Ok(data)
-    }
-
-    /// `err`, a failed read of the source, as this archive reports it.
-    fn failure(&self, err: io::Error) -> ProvisionError {
-        read_failure(&self.path, self.offset, err)
-    }
-
-    /// [`ProvisionError::Archive`] for a refusal of what the archive declares,
-    /// which nothing beneath it caused, naming the archive.
-    fn malformed(&self, offset: u64, reason: &str) -> ProvisionError {
-        ProvisionError::Archive {
-            path: self.path.clone(),
-            offset,
-            reason: reason.to_string(),
-            source: None,
+    /// `err`, a failure of the reader, as this archive reports it.
+    fn failure(&mut self, err: ferrotape::Error) -> ProvisionError {
+        let offset = err.offset();
+        match err.kind() {
+            // The source failed: converting the error hands its failure back.
+            ErrorKind::Io => read_failure(&self.path, offset, io::Error::from(err)),
+            kind => {
+                self.not_a_tar = *kind == ErrorKind::NotATar;
+                ProvisionError::Archive {
+                    path: self.path.clone(),
+                    offset,
+                    reason: kind.to_string(),
+                    source: None,
+                }
+            }
         }
     }
 }
@@ -752,13 +247,13 @@ pub(crate) fn read_failure(path: &Path, offset: u64, err: io::Error) -> Provisio
     }
 }
 
-/// `err`, a failure of a [`TarReader`], as the `io::Error` a `Read` over an
-/// entry's data returns, so a reader of that data reports it as
+/// `err`, a failure of a [`TarReader`], as the `io::Error` a `Read` over a
+/// member's data returns, so a reader of that data reports it as
 /// [`read_failure`] does.
 ///
 /// An OS failure is returned as the OS returned it, which is what a reader above
 /// takes it for; it names the archive again by its own path, the archive that
-/// holds the entry. Any other failure is carried whole, and a reader above
+/// holds the member. Any other failure is carried whole, and a reader above
 /// returns it as it stands rather than as a failure of its own.
 #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
 pub(crate) fn into_io(err: ProvisionError) -> io::Error {
@@ -789,1075 +284,27 @@ impl std::error::Error for Carried {
     }
 }
 
-/// The most [`TarReader::read_entry`] reserves before an entry's data arrives.
-///
-/// Every entry read whole is a few kilobytes in practice, so this covers the
-/// real ones in one allocation, and a larger one grows past it as it is read.
-const RESERVE: usize = 64 * 1024;
-
-/// Parses a 512-byte header block into an [`Entry`].
-fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
-    // Magic: POSIX writes "ustar\0" + version "00"; GNU writes "ustar " +
-    // " \0". A v7 header has neither, those bytes being part of its unused
-    // tail, so the magic no longer decides whether a block is accepted — it
-    // decides only whether the fields beyond byte 257 are there to read.
-    let posix = &block[257..263] == b"ustar\0";
-    let gnu = &block[257..263] == b"ustar ";
-
-    // The checksum runs first, and with v7 accepted it is the only thing
-    // separating a header from arbitrary bytes. That makes the two failures
-    // worth telling apart: magic present and checksum wrong is a corrupt tar
-    // header, while neither present is a file that is very likely not a tar at
-    // all — a diagnostic worth keeping, since it is the one a caller who
-    // pointed the parser at the wrong file needs.
-    if verify_checksum(block).is_err() {
-        return Err(if posix || gnu {
-            HeaderFlaw::Checksum
-        } else {
-            HeaderFlaw::NotATarHeader
-        });
-    }
-
-    let mut path = field_bytes(&block[0..100]).to_vec();
-    // The POSIX prefix field extends the name; GNU reuses those bytes for
-    // other purposes, and v7 has no such field at all.
-    if posix {
-        let prefix = field_bytes(&block[345..500]);
-        if !prefix.is_empty() {
-            let mut joined = prefix.to_vec();
-            joined.push(b'/');
-            joined.extend_from_slice(&path);
-            path = joined;
-        }
-    }
-
-    // A mode and an id are both unsigned. The base-256 form is two's complement
-    // and can carry a negative value, which a cast would wrap into a
-    // plausible-looking permission set — the setuid, setgid, and sticky bits
-    // included — or into an unrelated id; refusing it keeps a malformed header
-    // from silently deciding either.
-    let field = |name: &'static str| move |flaw| HeaderFlaw::Field(name, flaw);
-    let mode = unsigned_field(&block[100..108]).map_err(field("mode"))?;
-    let uid = unsigned_field(&block[108..116]).map_err(field("uid"))?;
-    let gid = unsigned_field(&block[116..124]).map_err(field("gid"))?;
-    let size = numeric_field(&block[124..136])
-        .and_then(|size| u64::try_from(size).map_err(|_| Numeric::OutOfRange))
-        .map_err(field("size"))?;
-    let mtime = numeric_field(&block[136..148]).map_err(field("mtime"))?;
-    let typeflag = match block[156] {
-        // An old (v7-style) NUL typeflag is a regular file.
-        0 => b'0',
-        flag => flag,
-    };
-    let link_target = field_bytes(&block[157..257]).to_vec();
-    // Past byte 257, so a v7 header has neither; it names its owner by id
-    // alone.
-    let (uname, gname) = if posix || gnu {
-        (
-            field_bytes(&block[265..297]).to_vec(),
-            field_bytes(&block[297..329]).to_vec(),
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    Ok(Entry {
-        path,
-        link_target,
-        typeflag,
-        mode: mode & 0o7777,
-        uid,
-        gid,
-        uname,
-        gname,
-        size,
-        mtime,
-        // Stated by a pax record only; a ustar header has no field for it.
-        checksum_sha1: None,
-        acl_access: AclRecords::default(),
-        acl_default: AclRecords::default(),
-    })
-}
-
-/// Verifies the header checksum: the sum of all header bytes with the
-/// checksum field read as spaces. The unsigned sum is authoritative; the
-/// signed sum is accepted as a fallback, as GNU tar documents for archives
-/// from historical implementations.
-fn verify_checksum(block: &[u8; BLOCK as usize]) -> Result<(), HeaderFlaw> {
-    let stored = numeric_field(&block[148..156]).map_err(|_| HeaderFlaw::Checksum)?;
-    let mut unsigned: i64 = 0;
-    let mut signed: i64 = 0;
-    for (i, byte) in block.iter().enumerate() {
-        let byte = if (148..156).contains(&i) { b' ' } else { *byte };
-        unsigned += i64::from(byte);
-        signed += i64::from(byte as i8);
-    }
-    if stored == unsigned || stored == signed {
-        Ok(())
-    } else {
-        Err(HeaderFlaw::Checksum)
-    }
-}
-
-/// A text field: the bytes up to the first NUL.
-///
-/// A header's own name fields are NUL-padded, and a GNU long name or long link
-/// is a C string, so in either a NUL ends the text. GNU tar, bsdtar, Python and
-/// Go all read a long name holding one this way; a reader that kept the bytes
-/// after it would name a member none of them does.
-fn field_bytes(field: &[u8]) -> &[u8] {
-    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
-    &field[..end]
-}
-
-/// Parses a numeric header field: octal ASCII, or GNU base-256 when the
-/// first byte has its high bit set.
-fn numeric_field(field: &[u8]) -> Result<i64, Numeric> {
-    if field.first().is_some_and(|b| b & 0x80 != 0) {
-        return base256_field(field);
-    }
-    let mut value: i64 = 0;
-    let mut seen_digit = false;
-    for byte in field {
-        match byte {
-            b'0'..=b'7' => {
-                value = value
-                    .checked_mul(8)
-                    .and_then(|v| v.checked_add(i64::from(byte - b'0')))
-                    .ok_or(Numeric::OutOfRange)?;
-                seen_digit = true;
-            }
-            b' ' if !seen_digit => continue,
-            b' ' | 0 => break,
-            _ => return Err(Numeric::Unreadable),
-        }
-    }
-    // An all-blank field decodes as zero, as GNU tar treats it.
-    Ok(value)
-}
-
-/// Decodes a numeric header field that cannot be negative — a mode, a user id, a
-/// group id: the same decoding as [`numeric_field`], refusing a negative value
-/// rather than wrapping it into an unrelated one.
-///
-/// No capability is lost by refusing: an archive that means `0o7777`, or uid
-/// 4294967295, spells it in octal or in the positive base-256 form directly.
-fn unsigned_field(field: &[u8]) -> Result<u32, Numeric> {
-    u32::try_from(numeric_field(field)?).map_err(|_| Numeric::OutOfRange)
-}
-
-/// Decodes a GNU base-256 numeric field: big-endian two's complement with
-/// the top bit of the first byte as the format flag.
-fn base256_field(field: &[u8]) -> Result<i64, Numeric> {
-    // The top bit of the first byte is the format marker; the remaining
-    // bits begin the two's-complement value, sign-extended from bit 6.
-    let mut value = i64::from(field[0] & 0x7f);
-    if field[0] & 0x40 != 0 {
-        value -= 0x80;
-    }
-    for byte in &field[1..] {
-        value = value
-            .checked_mul(256)
-            .and_then(|v| v.checked_add(i64::from(*byte)))
-            .ok_or(Numeric::OutOfRange)?;
-    }
-    Ok(value)
-}
-
-/// One pax record's keyword and value.
-type PaxField<'a> = (&'a [u8], &'a [u8]);
-
-/// The keyword and value of each record in a pax header body, a sequence of
-/// `"%d key=value\n"` records whose decimal length counts the whole record.
-///
-/// A record that does not frame is the last item, its reason in place of a
-/// field: past it there is no boundary to read on from.
-fn pax_fields(data: &[u8]) -> impl Iterator<Item = Result<PaxField<'_>, &'static str>> {
-    let mut rest = data;
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let next = pax_field(rest);
-        rest = match next {
-            Ok((_, after)) => after,
-            Err(_) => &[],
-        };
-        Some(next.map(|(field, _)| field))
-    })
-}
-
-/// The first record of the non-empty pax header body `rest`, and the bytes
-/// after it.
-fn pax_field(rest: &[u8]) -> Result<(PaxField<'_>, &[u8]), &'static str> {
-    let space = rest
-        .iter()
-        .position(|b| *b == b' ')
-        .ok_or("a pax record has no length delimiter")?;
-    let length: usize =
-        super::number::digits(&rest[..space]).ok_or("a pax record length is not decimal")?;
-    if length <= space + 1 || length > rest.len() {
-        return Err("a pax record length is out of bounds");
-    }
-    let record = rest[space + 1..length]
-        .strip_suffix(b"\n")
-        .ok_or("a pax record does not end in a newline")?;
-    let eq = record
-        .iter()
-        .position(|b| *b == b'=')
-        .ok_or("a pax record has no '='")?;
-    Ok(((&record[..eq], &record[eq + 1..]), &rest[length..]))
-}
-
-/// Parses a per-entry pax header body ([`pax_fields`]) into the records this
-/// reader applies to the entry it describes. Unknown keys are ignored.
-fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
-    let mut records = PaxRecords::default();
-    for field in pax_fields(data) {
-        let (key, value) = field?;
-        // An empty value is POSIX's deletion of a record, leaving the header's
-        // own field to stand. bsdtar and Go read one that way, Python as the
-        // empty value, and GNU tar as the empty value for each of these but
-        // `path`. Whichever this reader took, the entry would have another name,
-        // link target or owner to some of them, so one is refused. A numeric
-        // record refuses one as no number, and a record this reader does not
-        // apply keeps it: an empty `SCHILY.acl.default` states that a directory
-        // has no default list.
-        if value.is_empty() && matches!(key, b"path" | b"linkpath" | b"uname" | b"gname") {
-            return Err("a pax path, link target or owner name record is empty");
-        }
-        match key {
-            // A record's length delimits its value, so a NUL in a name is part
-            // of it rather than its end, and no file has such a name. Readers
-            // part ways over one: GNU tar and bsdtar cut the name there, Python
-            // keeps the byte, Go refuses. Refusing is the one reading that names
-            // no member differently from any of them.
-            b"path" | b"linkpath" => {
-                if value.contains(&0) {
-                    return Err("a pax path or link target holds a NUL byte");
-                }
-                if key == b"path" {
-                    records.path = Some(value.to_vec());
-                } else {
-                    records.link_target = Some(value.to_vec());
-                }
-            }
-            b"size" => {
-                let size: u64 =
-                    super::number::digits(value).ok_or("a pax size record is not decimal")?;
-                // A size whose block-padded length does not fit in u64
-                // cannot describe real entry data; rejecting it here keeps
-                // the reader's data and padding arithmetic overflow-free.
-                if size.checked_next_multiple_of(BLOCK).is_none() {
-                    return Err("a pax size record is implausibly large");
-                }
-                records.size = Some(size);
-            }
-            // GNU tar writes these whenever an id will not fit the header's
-            // octal field, so an archive of a tree with high ids carries its
-            // ownership here and nowhere else. Ignoring them while reporting
-            // the header's ids as meaningful yields silently wrong ownership.
-            b"uid" | b"gid" => {
-                let id: u32 = super::number::digits(value)
-                    .ok_or("a pax uid or gid record is not a decimal id")?;
-                if key == b"uid" {
-                    records.uid = Some(id);
-                } else {
-                    records.gid = Some(id);
-                }
-            }
-            // The names a header's 32-byte fields cannot hold.
-            b"uname" => records.uname = Some(value.to_vec()),
-            b"gname" => records.gname = Some(value.to_vec()),
-            // apk writes one of these for every file and symbolic link of a
-            // package. A record naming a digest this reader does not know is
-            // not an error: the key is namespaced to a vendor, and a reader
-            // that refused an unfamiliar one would refuse an archive apk
-            // itself reads.
-            //
-            // Read only where the Alpine layer is built, the one reader of it.
-            // Elsewhere it is a vendor keyword like any other, and passed over.
-            #[cfg(feature = "alpine")]
-            b"APK-TOOLS.checksum.SHA1" => {
-                records.checksum_sha1 = Some(
-                    super::digest::unhex(value)
-                        .ok_or("an apk file checksum record is not a SHA-1 in lowercase hex")?,
-                );
-            }
-            b"mtime" => {
-                // Pax times may carry fractional seconds; whole seconds are
-                // what extraction applies. The fraction floors rather than
-                // truncates toward zero, as GNU tar does: `-1.5` is the instant
-                // between `-2` and `-1`, so the second containing it is `-2`.
-                let (whole, fraction) = match value.iter().position(|byte| *byte == b'.') {
-                    Some(dot) => (&value[..dot], &value[dot + 1..]),
-                    None => (value, &[][..]),
-                };
-                let (negative, magnitude) = match whole.strip_prefix(b"-") {
-                    Some(magnitude) => (true, magnitude),
-                    None => (false, whole),
-                };
-                if !fraction.iter().all(u8::is_ascii_digit) {
-                    return Err("a pax mtime record is not numeric");
-                }
-                let magnitude: u64 =
-                    super::number::digits(magnitude).ok_or("a pax mtime record is not numeric")?;
-                let seconds = if negative {
-                    0i64.checked_sub_unsigned(magnitude)
-                } else {
-                    i64::try_from(magnitude).ok()
-                }
-                .ok_or("a pax mtime record is out of range")?;
-                let negative_fraction = negative && fraction.iter().any(|b| *b != b'0');
-                let mtime = if negative_fraction {
-                    seconds
-                        .checked_sub(1)
-                        .ok_or("a pax mtime record is out of range")?
-                } else {
-                    seconds
-                };
-                records.mtime = Some(mtime);
-            }
-            // GNU's pax sparse formats describe the holes in these, and the
-            // member's data is not the file's contents without them. Only the
-            // presence is recorded: the member is refused rather than
-            // reassembled, so the map's values are never read.
-            _ if key.starts_with(b"GNU.sparse.") => records.gnu_sparse = true,
-            // The same two lists as text, the form GNU tar's `--acls` writes and
-            // applies, and star's before it.
-            b"SCHILY.acl.access" => records.acl_access.text = Some(value.to_vec()),
-            b"SCHILY.acl.default" => records.acl_default.text = Some(value.to_vec()),
-            // An extended attribute, its name spelled as GNU tar spells it in a
-            // keyword. Only the two access control lists are read; every other
-            // attribute is one the extractor does not apply.
-            _ if key.starts_with(XATTR_KEYWORD) => {
-                let name = xattr_name(&key[XATTR_KEYWORD.len()..]);
-                if name == b"system.posix_acl_access" {
-                    records.acl_access.value = Some(value.to_vec());
-                } else if name == b"system.posix_acl_default" {
-                    records.acl_default.value = Some(value.to_vec());
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(records)
-}
-
-/// The prefix of the pax keyword that records an extended attribute, the name
-/// following it.
-pub(crate) const XATTR_KEYWORD: &[u8] = b"SCHILY.xattr.";
-
-/// The attribute name a `SCHILY.xattr.` keyword's remainder spells, its
-/// `%3D` and `%25` read back as GNU tar reads them: GNU tar writes `=`, which
-/// would end the keyword, as `%3D`, and `%` as `%25`. Any other `%` stands for
-/// itself.
-fn xattr_name(spelled: &[u8]) -> Vec<u8> {
-    let mut name = Vec::with_capacity(spelled.len());
-    let mut at = 0;
-    while at < spelled.len() {
-        match &spelled[at..] {
-            [b'%', b'3', b'D', ..] => {
-                name.push(b'=');
-                at += 3;
-            }
-            [b'%', b'2', b'5', ..] => {
-                name.push(b'%');
-                at += 3;
-            }
-            [byte, ..] => {
-                name.push(*byte);
-                at += 1;
-            }
-            [] => break,
-        }
-    }
-    name
-}
-
-/// Reads `archive` as an extraction reads one, each entry's data whole within
-/// a bound, for a fuzz target: it may not panic, and it ends, since each entry
-/// consumes at least a header's block of the input.
-#[cfg(fuzzing)]
-pub(super) fn exercise(archive: &[u8]) {
-    let mut reader = TarReader::in_memory(archive);
-    while let Ok(Some(_)) = reader.next_entry() {
-        if reader.read_entry(1 << 20).is_err() {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferroday_cage_testkit::tar::pax_record;
-
-    /// Pads `out` with zeros to the block boundary after `size` bytes of data.
-    fn pad(out: &mut Vec<u8>, size: u64) {
-        let padded = size.next_multiple_of(BLOCK);
-        out.resize(out.len() + (padded - size) as usize, 0);
-    }
-
-    #[test]
-    fn octal_fields_decode() {
-        assert_eq!(numeric_field(b"0000755\0").unwrap(), 0o755);
-        assert_eq!(numeric_field(b"   755 \0").unwrap(), 0o755);
-        assert_eq!(numeric_field(b"        ").unwrap(), 0);
-        assert_eq!(numeric_field(b"\0\0\0\0").unwrap(), 0);
-    }
-
-    #[test]
-    fn octal_fields_reject_non_octal() {
-        assert!(numeric_field(b"12x4\0").is_err());
-        assert!(numeric_field(b"0008\0").is_err());
-    }
-
-    #[test]
-    fn base256_fields_decode() {
-        // 8 GiB + 1, too large for the 12-byte octal size field.
-        let mut field = [0u8; 12];
-        field[0] = 0x80;
-        field[7] = 0x02;
-        field[11] = 0x01;
-        assert_eq!(numeric_field(&field).unwrap(), (2i64 << 32) + 1);
-
-        // -1 in two's complement.
-        let field = [0xffu8; 12];
-        assert_eq!(numeric_field(&field).unwrap(), -1);
-    }
-
-    #[test]
-    fn pax_records_parse() {
-        let data = b"28 path=some/long/file/name\n19 size=1234567890\n23 mtime=1720000000.25\n";
-        let records = parse_pax(data).unwrap();
-        assert_eq!(records.path.as_deref(), Some(&b"some/long/file/name"[..]));
-        assert_eq!(records.size, Some(1234567890));
-        assert_eq!(records.mtime, Some(1720000000));
-    }
-
-    #[test]
-    fn an_attribute_names_escapes_are_read_as_gnu_tar_reads_them() {
-        // A keyword ends at the first `=`, so GNU tar spells one in a name as
-        // `%3D`, and `%` as `%25`.
-        assert_eq!(xattr_name(b"user.a%3Db%25c"), b"user.a=b%c");
-        assert_eq!(xattr_name(b"user.100%"), b"user.100%");
-        assert_eq!(xattr_name(b"user.%25%3D"), b"user.%=");
-        assert_eq!(xattr_name(b"user.plain"), b"user.plain");
-    }
-
-    #[test]
-    fn the_access_control_list_records_are_read_and_no_other_attribute() {
-        let mut data = Vec::new();
-        for (key, value) in [
-            (
-                &b"SCHILY.xattr.system.posix_acl_access"[..],
-                &b"\x02\0\0\0list"[..],
-            ),
-            (
-                b"SCHILY.xattr.system.posix_acl_default",
-                b"\x02\0\0\0default",
-            ),
-            (b"SCHILY.xattr.user.comment", b"ignored"),
-            (b"SCHILY.acl.access", b"user::rw-"),
-            (b"SCHILY.acl.default", b"user::rwx"),
-        ] {
-            data.extend_from_slice(&pax_record(key, value));
-        }
-        let records = parse_pax(&data).unwrap();
-        assert_eq!(
-            records.acl_access,
-            AclRecords {
-                value: Some(b"\x02\0\0\0list".to_vec()),
-                text: Some(b"user::rw-".to_vec()),
-            }
-        );
-        assert_eq!(
-            records.acl_default,
-            AclRecords {
-                value: Some(b"\x02\0\0\0default".to_vec()),
-                text: Some(b"user::rwx".to_vec()),
-            }
-        );
-    }
-
-    #[test]
-    fn pax_unknown_keys_are_ignored() {
-        // A record length that overruns the data is rejected.
-        let data_bad = b"22 uid=1000\n23 gname=abc\n";
-        let data_ok = b"12 uid=1000\n15 gname=users\n19 SCHILY.fflags=x\n";
-        assert!(parse_pax(data_bad).is_err());
-        let records = parse_pax(data_ok).unwrap();
-        assert!(records.path.is_none());
-        assert!(records.size.is_none());
-        assert_eq!(records.uid, Some(1000));
-        assert_eq!(records.gname.as_deref(), Some(&b"users"[..]));
-    }
-
-    #[test]
-    fn an_owner_is_read_by_name_as_well_as_by_id() {
-        // The header's own fields, and a pax record past them, the record
-        // winning as it does for every attribute it states. A v7 header has no
-        // field for a name, so it names no one.
-        let mut archive = ferroday_cage_testkit::tar::Tar::new();
-        archive.owner_names("root", "messagebus");
-        archive.entry("helper", b'0', 0o4750, 0, 101, "", b"x");
-        let record = ferroday_cage_testkit::tar::pax_record(
-            "gname",
-            "a-group-name-longer-than-the-header-field",
-        );
-        archive.entry("PaxHeaders/next", b'x', 0o644, 0, 0, "", &record);
-        archive.entry("next", b'0', 0o644, 0, 0, "", b"y");
-        let tar = archive.finish();
-        let mut reader = TarReader::in_memory(&tar[..]);
-        let helper = reader.next_entry().unwrap().expect("an entry");
-        assert_eq!(
-            (&helper.uname[..], &helper.gname[..], helper.gid),
-            (&b"root"[..], &b"messagebus"[..], 101),
-        );
-        let next = reader.next_entry().unwrap().expect("an entry");
-        assert_eq!(next.gname, b"a-group-name-longer-than-the-header-field");
-        assert_eq!(next.uname, b"root");
-
-        let mut v7 = ferroday_cage_testkit::tar::Tar::new().v7();
-        v7.file("old", 0o644, b"z");
-        let tar = v7.finish();
-        let old = TarReader::in_memory(&tar[..])
-            .next_entry()
-            .unwrap()
-            .expect("an entry");
-        assert!(old.uname.is_empty() && old.gname.is_empty());
-    }
-
-    #[test]
-    fn a_fractional_pax_mtime_floors() {
-        // Whole seconds are what extraction applies, and the fraction floors as
-        // GNU tar's does: `-1.5` names an instant inside the second `-2`, not
-        // inside `-1`.
-        assert_eq!(
-            parse_pax(b"23 mtime=1720000000.25\n").unwrap().mtime,
-            Some(1_720_000_000)
-        );
-        assert_eq!(parse_pax(b"14 mtime=-1.5\n").unwrap().mtime, Some(-2));
-        // A zero fraction is not a fraction, in either direction.
-        assert_eq!(parse_pax(b"14 mtime=-1.0\n").unwrap().mtime, Some(-1));
-        assert_eq!(parse_pax(b"12 mtime=-1\n").unwrap().mtime, Some(-1));
-    }
-
-    #[test]
-    fn a_pax_number_is_digits_and_nothing_else() {
-        // An integer parser also takes a leading `+`, which no pax writer
-        // emits. The record length decides where the next record begins, so a
-        // reader more lenient than the format reads an archive differently
-        // from the tools that wrote it.
-        assert!(parse_pax(b"+12 uid=1000\n").is_err());
-        assert!(parse_pax(b"14 size=+1234\n").is_err());
-        assert!(parse_pax(b"13 uid=+1000\n").is_err());
-        assert!(parse_pax(b"15 mtime=+1000\n").is_err());
-        assert!(parse_pax(b"17 mtime=1000.+5\n").is_err());
-        assert!(parse_pax(b"8 size=\n").is_err());
-        // The forms the format does have still read.
-        assert_eq!(parse_pax(b"13 size=1234\n").unwrap().size, Some(1234));
-        assert_eq!(
-            parse_pax(b"30 mtime=-9223372036854775808\n").unwrap().mtime,
-            Some(i64::MIN)
-        );
-        assert!(parse_pax(b"29 mtime=9223372036854775808\n").is_err());
-    }
-
-    #[test]
-    fn pax_ownership_records_are_read() {
-        // GNU tar writes these whenever an id will not fit the header's octal
-        // field, so an archive of a tree with high ids carries its ownership
-        // here and nowhere else.
-        let records = parse_pax(b"14 uid=888888\n14 gid=999999\n").unwrap();
-        assert_eq!(records.uid, Some(888_888));
-        assert_eq!(records.gid, Some(999_999));
-        // An id that is not a plain decimal is a malformed archive, not a
-        // record to skip: skipping would fall back on the header's octal field,
-        // which is exactly the value the record exists to correct.
-        assert!(parse_pax(b"13 uid=-1000\n").is_err());
-        assert!(parse_pax(b"12 gid=zzzz\n").is_err());
-    }
-
-    #[cfg(feature = "alpine")]
-    #[test]
-    fn an_apk_file_checksum_record_decodes_to_the_digest_it_states() {
-        // apk writes one of these for every file and symbolic link, and the
-        // Alpine layer verifies an extracted file against it. A record that
-        // decoded to the wrong bytes would fail every file it covers, so the
-        // decoding is pinned here rather than only through that layer.
-        let hex = b"000102030405060708090a0b0c0d0e0f10111213";
-        let mut data = Vec::from(&b"68 APK-TOOLS.checksum.SHA1="[..]);
-        data.extend_from_slice(hex);
-        data.push(b'\n');
-        let records = parse_pax(&data).unwrap();
-        assert_eq!(
-            records.checksum_sha1,
-            Some(std::array::from_fn(|index| index as u8)),
-        );
-
-        // A value that is not twenty bytes of hexadecimal is a malformed
-        // record, not one to skip: skipping would leave the file unverified
-        // while the archive claimed to state a digest for it.
-        let mut short = Vec::from(&b"66 APK-TOOLS.checksum.SHA1="[..]);
-        short.extend_from_slice(&hex[2..]);
-        short.push(b'\n');
-        assert!(parse_pax(&short).is_err());
-
-        // Nor is one spelled otherwise than apk spells it: a digit that is not
-        // hexadecimal, an uppercase one, or a sign that Rust's integer parsers
-        // would read as part of a number.
-        for spelled in [
-            &b"g00102030405060708090a0b0c0d0e0f10111213"[..],
-            b"000102030405060708090A0B0C0D0E0F10111213",
-            b"+f0102030405060708090a0b0c0d0e0f10111213",
-        ] {
-            let mut record = Vec::from(&b"68 APK-TOOLS.checksum.SHA1="[..]);
-            record.extend_from_slice(spelled);
-            record.push(b'\n');
-            assert!(parse_pax(&record).is_err(), "{spelled:?}");
-        }
-    }
-
-    #[test]
-    fn a_negative_unsigned_field_is_refused_rather_than_wrapped() {
-        // The base-256 form is two's complement. Casting a negative value to
-        // `u32` would produce a plausible-looking id — `-1` becomes 4294967295,
-        // the kernel's overflow id — and assign ownership from a malformed
-        // header without a word.
-        let field = [0xffu8; 8];
-        assert_eq!(numeric_field(&field).unwrap(), -1);
-        assert!(unsigned_field(&field).is_err());
-        // The ordinary octal form still decodes.
-        assert_eq!(unsigned_field(b"0001750\0").unwrap(), 0o1750);
-    }
-
-    #[test]
-    fn a_negative_mode_is_refused_alongside_the_ids_it_sits_beside() {
-        // The mode takes the same decoding as the ids beside it, so a negative
-        // base-256 value is refused there too. Wrapped, `-1 as u32 & 0o7777`
-        // would be `0o7777`: every permission bit plus setuid, setgid, and
-        // sticky, granted by a header no archive can have meant.
-        let mut block = ustar_header(b"file.txt", b"");
-        block[100..108].copy_from_slice(&[0xffu8; 8]);
-        checksum(&mut block);
-        let flaw = parse_header(&block).unwrap_err();
-        assert_eq!(flaw, HeaderFlaw::Field("mode", Numeric::OutOfRange));
-        // The refusal names the field and says the value is base-256 that does
-        // not fit, rather than that it is not base-256 at all.
-        assert_eq!(
-            flaw.describe(),
-            "the header's mode field holds a value out of its range"
-        );
-
-        // The same header with an ordinary octal mode parses, so what is refused
-        // is the sign and not the field.
-        assert_eq!(
-            parse_header(&ustar_header(b"file.txt", b"")).unwrap().mode,
-            0o644,
-        );
-    }
-
-    #[test]
-    fn a_numeric_field_refusal_names_the_field_and_what_is_wrong_with_it() {
-        // A digit that is not octal is unreadable; a value the type it is read
-        // into cannot hold is out of range. Each names the field it is in.
-        let mut block = ustar_header(b"file.txt", b"");
-        block[108..116].copy_from_slice(b"00017x0\0");
-        checksum(&mut block);
-        assert_eq!(
-            parse_header(&block).unwrap_err().describe(),
-            "the header's uid field is neither octal nor base-256",
-        );
-
-        let mut block = ustar_header(b"file.txt", b"");
-        // Base-256, negative: no size is.
-        block[124..136].copy_from_slice(&[0xffu8; 12]);
-        checksum(&mut block);
-        assert_eq!(
-            parse_header(&block).unwrap_err(),
-            HeaderFlaw::Field("size", Numeric::OutOfRange),
-        );
-
-        let mut block = ustar_header(b"file.txt", b"");
-        // Base-256 with more significant bits than an `i64` holds.
-        block[136..148].copy_from_slice(&[
-            0x80, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        ]);
-        checksum(&mut block);
-        assert_eq!(
-            parse_header(&block).unwrap_err(),
-            HeaderFlaw::Field("mtime", Numeric::OutOfRange),
-        );
-    }
-
-    #[test]
-    fn pax_sizes_that_cannot_be_block_padded_are_rejected() {
-        // The largest acceptable size is the last exact block multiple
-        // (u64::MAX - 511); anything above it would overflow the padded
-        // length.
-        let ok = parse_pax(b"29 size=18446744073709551104\n").unwrap();
-        assert_eq!(ok.size, Some(u64::MAX - 511));
-        assert!(parse_pax(b"29 size=18446744073709551615\n").is_err());
-    }
-
-    #[test]
-    fn pax_bad_lengths_are_rejected() {
-        assert!(parse_pax(b"999 path=x\n").is_err());
-        assert!(parse_pax(b"3 path=x\n").is_err());
-        assert!(parse_pax(b"path=x\n").is_err());
-    }
-
-    /// Writes the header checksum over `block`, in the six-octal-digits, NUL,
-    /// space form tar writes.
-    fn checksum(block: &mut [u8; BLOCK as usize]) {
-        block[148..156].copy_from_slice(b"        ");
-        let sum: u32 = block.iter().map(|byte| u32::from(*byte)).sum();
-        block[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-    }
-
-    /// A minimal POSIX `ustar` header block for a regular file, with `name` in
-    /// the 100-byte name field and `prefix` in the 155-byte prefix field.
-    fn ustar_header(name: &[u8], prefix: &[u8]) -> [u8; BLOCK as usize] {
-        let mut block = [0u8; BLOCK as usize];
-        block[..name.len()].copy_from_slice(name);
-        block[100..108].copy_from_slice(b"0000644\0");
-        block[108..116].copy_from_slice(b"0000000\0");
-        block[116..124].copy_from_slice(b"0000000\0");
-        block[124..136].copy_from_slice(b"00000000000\0");
-        block[136..148].copy_from_slice(b"00000000000\0");
-        block[156] = b'0';
-        block[257..263].copy_from_slice(b"ustar\0");
-        block[263..265].copy_from_slice(b"00");
-        block[345..345 + prefix.len()].copy_from_slice(prefix);
-        checksum(&mut block);
-        block
-    }
-
-    /// A ustar header block for a file of `size` bytes with `typeflag`, with
-    /// `name` in the 100-byte name field.
-    fn sized_header(name: &[u8], size: u64, typeflag: u8) -> [u8; BLOCK as usize] {
-        let mut block = ustar_header(&name[..name.len().min(100)], b"");
-        block[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
-        block[156] = typeflag;
-        checksum(&mut block);
-        block
-    }
-
-    #[test]
-    fn a_long_name_truncated_after_a_separator_is_still_the_file_it_is() {
-        // The defect a real Gentoo stage3 found. A GNU long name puts the real
-        // path in an `L` entry, and what the file's own header carries is the
-        // first hundred bytes of it. When that truncation happens to land just
-        // after a separator, a rule reading the header's name would take a
-        // regular file for a directory -- and a directory carries no data, so
-        // the file's bytes would be read as the next header and the rest of the
-        // archive lost with them.
-        //
-        // A hundred bytes of directory, then the file: the name field holds
-        // exactly the directory part, trailing separator and all.
-        let long_name = format!("./{}/deep.hpp", "d".repeat(97));
-        assert_eq!(long_name.as_bytes()[100 - 1], b'/');
-        let body = b"the contents of a file that is not a directory\n";
-
-        let mut archive = Vec::new();
-        // The `L` entry naming it, its data NUL-terminated as GNU writes it.
-        archive.extend_from_slice(&sized_header(
-            b"././@LongLink",
-            long_name.len() as u64 + 1,
-            b'L',
-        ));
-        archive.extend_from_slice(long_name.as_bytes());
-        archive.push(0);
-        pad(&mut archive, long_name.len() as u64 + 1);
-        // The file itself, its own name field truncated to the directory part.
-        archive.extend_from_slice(&sized_header(long_name.as_bytes(), body.len() as u64, b'0'));
-        archive.extend_from_slice(body);
-        pad(&mut archive, body.len() as u64);
-        // A second entry, which is only reachable if the first was skipped by
-        // the right number of bytes.
-        archive.extend_from_slice(&sized_header(b"after.txt", 0, b'0'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-
-        let mut reader = TarReader::in_memory(&archive[..]);
-        let entry = reader.next_entry().unwrap().expect("the long-named entry");
-        assert_eq!(entry.path, long_name.as_bytes());
-        assert_eq!(entry.typeflag, b'0', "a regular file, not a directory");
-        assert_eq!(entry.size, body.len() as u64);
-        let mut read = vec![0u8; body.len()];
-        let mut filled = 0;
-        while filled < read.len() {
-            let got = reader.read_data(&mut read[filled..]).unwrap();
-            assert_ne!(got, 0, "the data is the file's own");
-            filled += got;
-        }
-        assert_eq!(read, body);
-
-        let next = reader.next_entry().unwrap().expect("the entry after it");
-        assert_eq!(next.path, &b"after.txt"[..]);
-        assert!(reader.next_entry().unwrap().is_none(), "the archive ends");
-    }
-
-    /// A GNU long name (`L`) or long link (`K`) entry whose data is `value`.
-    fn long_link_entry(typeflag: u8, value: &[u8]) -> Vec<u8> {
-        let mut out = sized_header(b"././@LongLink", value.len() as u64, typeflag).to_vec();
-        out.extend_from_slice(value);
-        pad(&mut out, value.len() as u64);
-        out
-    }
-
-    #[test]
-    fn a_second_metadata_entry_of_one_kind_is_refused() {
-        // GNU tar and Go take the last of two, Python the first long name and
-        // a merge of the pax records, so a member described twice has no one
-        // name across readers.
-        let cases = [
-            (
-                [
-                    pax_block(b'x', &pax_record(b"path", b"first")),
-                    pax_block(b'x', &pax_record(b"mtime", b"100")),
-                ],
-                "two pax extended headers describe one entry",
-            ),
-            (
-                [
-                    long_link_entry(b'L', b"first-long\0"),
-                    long_link_entry(b'L', b"second-long\0"),
-                ],
-                "two GNU long names describe one entry",
-            ),
-            (
-                [
-                    long_link_entry(b'K', b"first-target\0"),
-                    long_link_entry(b'K', b"second-target\0"),
-                ],
-                "two GNU long links describe one entry",
-            ),
-        ];
-        for (metadata, reason) in cases {
-            let mut archive = metadata.concat();
-            archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
-            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-            let err = TarReader::in_memory(&archive[..])
-                .next_entry()
-                .expect_err("one entry described twice");
-            assert!(err.to_string().contains(reason), "{err}");
-        }
-
-        // One of each kind is the ordinary shape, the pax path winning.
-        let mut archive = long_link_entry(b'L', b"gnu-long-name\0");
-        archive.extend(pax_block(b'x', &pax_record(b"path", b"pax-path")));
-        archive.extend_from_slice(&sized_header(b"short", 0, b'0'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let entry = TarReader::in_memory(&archive[..])
-            .next_entry()
-            .unwrap()
-            .expect("the entry");
-        assert_eq!(entry.path, &b"pax-path"[..]);
-    }
-
-    #[test]
-    fn a_long_name_ends_at_its_first_nul() {
-        // The bytes after the NUL are not part of the name to any of GNU tar,
-        // bsdtar, Python or Go.
-        let mut archive = long_link_entry(b'L', b"abc\0def\0");
-        archive.extend(long_link_entry(b'K', b"target\0rest\0"));
-        archive.extend_from_slice(&sized_header(b"short", 0, b'2'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let entry = TarReader::in_memory(&archive[..])
-            .next_entry()
-            .unwrap()
-            .expect("the entry");
-        assert_eq!(entry.path, &b"abc"[..]);
-        assert_eq!(entry.link_target, &b"target"[..]);
-    }
-
-    #[test]
-    fn a_pax_name_holding_a_nul_is_refused() {
-        // A record's length, not a NUL, ends its value, so the byte is part of
-        // a name no file can have, and readers disagree about what it names.
-        for key in [&b"path"[..], b"linkpath"] {
-            let err = parse_pax(&pax_record(key, b"abc\0def")).expect_err("a NUL in a name");
-            assert_eq!(err, "a pax path or link target holds a NUL byte");
-        }
-        assert!(parse_pax(&pax_record(b"comment", b"abc\0def")).is_ok());
-    }
-
-    #[test]
-    fn an_empty_pax_name_link_target_or_owner_is_refused() {
-        // bsdtar and Go read an empty value as the record deleted, the header's
-        // own field standing; Python reads it as the empty value, and GNU tar
-        // does for each of these but `path`.
-        for key in [&b"path"[..], b"linkpath", b"uname", b"gname"] {
-            let err = parse_pax(&pax_record(key, b"")).expect_err("an empty value");
-            assert_eq!(err, "a pax path, link target or owner name record is empty");
-        }
-        // A numeric record refuses one as no number.
-        for key in [&b"size"[..], b"uid", b"gid", b"mtime"] {
-            assert!(parse_pax(&pax_record(key, b"")).is_err(), "{key:?}");
-        }
-        // A record this reader does not apply keeps its empty value, as GNU tar
-        // writes an empty default list for a directory without one.
-        let data = [
-            pax_record(b"SCHILY.acl.default", b""),
-            pax_record(b"SCHILY.xattr.user.k", b""),
-            pax_record(b"comment", b""),
-        ]
-        .concat();
-        let records = parse_pax(&data).unwrap();
-        assert_eq!(records.acl_default.text.as_deref(), Some(&b""[..]));
-
-        // Refused as the archive's, where the header is read.
-        let mut archive = pax_block(b'x', &pax_record(b"path", b""));
-        archive.extend_from_slice(&sized_header(b"hdrname", 0, b'0'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let err = entry_paths(&archive).expect_err("an empty pax path");
-        assert!(
-            matches!(err, ProvisionError::Archive { offset: 0, .. }),
-            "{err:?}",
-        );
-        assert!(err.to_string().contains("record is empty"), "{err}");
-    }
-
-    #[test]
-    fn a_pax_size_on_an_entry_without_data_is_refused() {
-        // GNU tar skips the bytes the record counts, and bsdtar and Python
-        // read them as the next header, finding the member `hidden` that GNU
-        // tar never sees. Read either way, it is two archives.
-        for typeflag in *b"123456" {
-            let mut archive = pax_block(b'x', &pax_record(b"size", b"1024"));
-            let mut entry = sized_header(b"entry", 0, typeflag);
-            entry[157..163].copy_from_slice(b"target");
-            checksum(&mut entry);
-            archive.extend_from_slice(&entry);
-            archive.extend_from_slice(&sized_header(b"hidden", 512, b'0'));
-            archive.extend_from_slice(&[b'h'; 512]);
-            archive.resize(archive.len() + 1024, 0);
-            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-            let err = entry_paths(&archive).expect_err("the entry contradicts itself");
-            assert!(
-                err.to_string()
-                    .contains("declares data for an entry whose type carries none"),
-                "{}: {err}",
-                typeflag as char
-            );
-        }
-        // A pax size of zero states what the type does, and reads.
-        let mut archive = pax_block(b'x', &pax_record(b"size", b"0"));
-        archive.extend_from_slice(&sized_header(b"dir/", 0, b'5'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        assert_eq!(entry_paths(&archive).expect("it reads"), [b"dir/".to_vec()]);
-    }
-
-    #[test]
-    fn an_entry_that_names_a_directory_and_declares_data_is_refused() {
-        // The other side of the rule above. An entry whose resolved name ends
-        // in a separator is a directory, and a directory carries no data, so
-        // one that declares some says two incompatible things about itself. No
-        // real writer emits that shape; a reader that resolved the
-        // contradiction rather than refusing it would be picking one of two
-        // archives, which is what a parser differential is made of.
-        let mut archive = Vec::new();
-        archive.extend_from_slice(&sized_header(b"dir/", 512, b'0'));
-        archive.extend_from_slice(&[b'x'; 512]);
-        archive.extend_from_slice(&sized_header(b"after.txt", 0, b'0'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-
-        let mut reader = TarReader::in_memory(&archive[..]);
-        let err = reader
-            .next_entry()
-            .expect_err("the entry contradicts itself");
-        assert!(
-            err.to_string()
-                .contains("names a directory and declares data"),
-            "{err}",
-        );
-
-        // A directory entry declaring nothing is the ordinary old-style shape
-        // and is read as the directory it names.
-        let mut plain = Vec::new();
-        plain.extend_from_slice(&sized_header(b"dir/", 0, b'0'));
-        plain.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let entry = TarReader::in_memory(&plain[..])
-            .next_entry()
-            .unwrap()
-            .expect("the directory entry");
-        assert_eq!(entry.typeflag, b'5');
-    }
-
-    #[test]
-    fn a_posix_prefix_joins_onto_the_name() {
-        // A ustar path too long for the 100-byte name field splits across the
-        // prefix and name fields, rejoined with a separator.
-        let entry = parse_header(&ustar_header(b"file.txt", b"a/very/long/directory")).unwrap();
-        assert_eq!(entry.path, &b"a/very/long/directory/file.txt"[..]);
-    }
-
-    #[test]
-    fn an_empty_posix_prefix_leaves_the_name_alone() {
-        // No separator is prepended: the prefix field is unset, not empty.
-        let entry = parse_header(&ustar_header(b"file.txt", b"")).unwrap();
-        assert_eq!(entry.path, &b"file.txt"[..]);
-    }
-
-    #[test]
-    fn a_gnu_header_never_joins_its_prefix_bytes() {
-        // GNU reuses the bytes POSIX gives the prefix for other fields, so
-        // whatever they hold must not reach the path.
-        let mut block = ustar_header(b"file.txt", b"not-a-prefix");
-        block[257..263].copy_from_slice(b"ustar ");
-        block[263..265].copy_from_slice(b" \0");
-        checksum(&mut block);
-        let entry = parse_header(&block).unwrap();
-        assert_eq!(entry.path, &b"file.txt"[..]);
-    }
-
-    /// A v7 header block: the ustar one with everything past byte 257 cleared,
-    /// which is exactly what the format is.
-    fn v7_header(name: &[u8]) -> [u8; BLOCK as usize] {
-        let mut block = ustar_header(name, b"");
-        block[257..].fill(0);
-        checksum(&mut block);
-        block
-    }
-
-    #[test]
-    fn a_v7_header_parses_without_magic() {
-        let entry = parse_header(&v7_header(b"file.txt")).unwrap();
-        assert_eq!(entry.path, &b"file.txt"[..]);
-        assert_eq!(entry.typeflag, b'0');
-        assert_eq!(entry.mode, 0o644);
-    }
-
-    #[test]
-    fn a_v7_header_never_reads_a_prefix() {
-        // The bytes a ustar header gives the prefix are not a field in v7 at
-        // all. Whatever an old writer left in them stays out of the path.
-        let mut block = v7_header(b"file.txt");
-        block[345..357].copy_from_slice(b"not-a-prefix");
-        checksum(&mut block);
-        let entry = parse_header(&block).unwrap();
-        assert_eq!(entry.path, &b"file.txt"[..]);
-    }
-
-    /// A pax metadata entry — `x` per-entry or `g` global — carrying `records`,
-    /// followed by the blocks its data occupies.
-    fn pax_block(typeflag: u8, records: &[u8]) -> Vec<u8> {
-        let mut out = sized_header(b"PaxHeaders/entry", records.len() as u64, typeflag).to_vec();
-        let mut data = records.to_vec();
-        data.resize(data.len().next_multiple_of(BLOCK as usize), 0);
-        out.extend_from_slice(&data);
-        out
-    }
+    use ferroday_cage_testkit::tar::Tar;
 
     /// A source that fails every read with `err`.
-    struct Failing(fn() -> std::io::Error);
+    struct Failing(fn() -> io::Error);
 
     impl Read for Failing {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
             Err((self.0)())
         }
+    }
+
+    /// An archive of one regular file holding `body`, with a header declaring
+    /// `declared` bytes for it.
+    fn one_file(declared: u64, body: &[u8]) -> Vec<u8> {
+        Tar::new()
+            .header(b"entry", b'0', 0o644, declared, 0, b"")
+            .body(body)
+            .finish()
     }
 
     #[test]
@@ -1865,14 +312,13 @@ mod tests {
         // The reader under the parser is a decompressor, and its refusals carry
         // reasons -- a dictionary over the bound, a frame it will not decode.
         // Reported as "not a tar archive" those reasons are gone, replaced by a
-        // guess about the format, and the guard that produced them exists for
-        // nothing.
+        // guess about the format.
         let mut reader = TarReader::new(
             Failing(|| {
                 Refusal::mark(
                     "the xz stream does not decode",
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
                         "the dictionary is larger than the bound",
                     ),
                 )
@@ -1901,13 +347,12 @@ mod tests {
         );
 
         // What the classification is for: bytes that arrived and are not a tar
-        // header, however few of them there were.
-        let mut reader = TarReader::in_memory(&b"not a tar archive at all"[..]);
-        assert!(reader.next_entry().is_err());
-        assert!(reader.not_a_tar());
-        let mut reader = TarReader::in_memory(&[b'X'; BLOCK as usize][..]);
-        assert!(reader.next_entry().is_err());
-        assert!(reader.not_a_tar());
+        // header, however few of them there were, or none.
+        for bytes in [&b"not a tar archive at all"[..], &[b'X'; 512][..], &b""[..]] {
+            let mut reader = TarReader::in_memory(bytes);
+            assert!(reader.next_entry().is_err());
+            assert!(reader.not_a_tar(), "{bytes:?}");
+        }
     }
 
     #[test]
@@ -1916,28 +361,37 @@ mod tests {
         // is no refusal of the archive: a caller that retries a transport
         // failure has to be able to see one. It names the archive, and the
         // OS's failure is its cause, whether it comes at the first block or
-        // part way through an entry.
-        let reset = || std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        // part way through a member, read whole or a buffer at a time.
+        let reset = || io::Error::from(io::ErrorKind::ConnectionReset);
         let mut reader = TarReader::new(Failing(reset), "/srv/rootfs.tar");
-        let err = reader.next_entry().expect_err("the source fails");
+        let first = reader.next_entry().expect_err("the source fails");
         assert!(!reader.not_a_tar());
 
         let archive = one_file(3000, &[b'x'; 3000]);
-        let mut reader =
-            TarReader::new((&archive[..1024]).chain(Failing(reset)), "/srv/rootfs.tar");
+        let cut = || TarReader::new((&archive[..1024]).chain(Failing(reset)), "/srv/rootfs.tar");
+        let mut reader = cut();
         reader
             .next_entry()
             .unwrap()
             .expect("the first header reads");
-        let later = reader
+        let whole = reader
             .read_entry(1 << 20)
-            .expect_err("the source fails inside the entry");
+            .expect_err("the source fails inside the member");
+        let mut reader = cut();
+        reader
+            .next_entry()
+            .unwrap()
+            .expect("the first header reads");
+        let mut buf = [0u8; 4096];
+        let piece = reader
+            .read_data(&mut buf)
+            .expect_err("the source fails inside the member");
 
-        for err in [err, later] {
+        for err in [first, whole, piece] {
             match &err {
                 ProvisionError::Io { path, source, .. } => {
                     assert_eq!(path, Path::new("/srv/rootfs.tar"));
-                    assert_eq!(source.kind(), std::io::ErrorKind::ConnectionReset);
+                    assert_eq!(source.kind(), io::ErrorKind::ConnectionReset);
                 }
                 other => panic!("expected the host's failure, got {other:?}"),
             }
@@ -1953,7 +407,7 @@ mod tests {
             into_io(ProvisionError::Archive {
                 path: PathBuf::from("/srv/package.gpkg.tar"),
                 offset: 9216,
-                reason: "the archive ends inside an entry's data".to_string(),
+                reason: "the archive ends inside a member's data".to_string(),
                 source: None,
             })
         };
@@ -1971,356 +425,139 @@ mod tests {
         // The magic says these bytes were meant to be a tar header, so a
         // checksum that does not match is a corrupt archive, with that reason,
         // however early in the stream it came.
-        let mut corrupt = ustar_header(b"file.txt", b"").to_vec();
+        let mut corrupt = Tar::new().file("file.txt", 0o644, b"").finish();
         corrupt[0] = b'X';
-        corrupt.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
         let mut reader = TarReader::in_memory(&corrupt[..]);
         let err = reader
             .next_entry()
             .expect_err("the checksum does not match");
-        assert!(err.to_string().contains("checksum"), "{err}");
+        assert!(
+            matches!(&err, ProvisionError::Archive { reason, .. } if *reason == ErrorKind::Checksum.to_string()),
+            "{err:?}"
+        );
         assert!(
             !reader.not_a_tar(),
             "a corrupt header is still a tar header"
         );
 
-        // A first header that parses, for an entry the reader refuses, is a
-        // malformed archive too: the whole stream past it has not been read,
-        // and nothing about it says it is some other format.
-        let mut contradictory = sized_header(b"dir/", 512, b'0').to_vec();
-        contradictory.extend_from_slice(&[b'x'; BLOCK as usize]);
-        contradictory.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        // A first header that reads, for a member the reader refuses, is a
+        // malformed archive too: nothing about it says it is some other format.
+        let contradictory = Tar::new()
+            .header(b"dir/", b'0', 0o755, 512, 0, b"")
+            .body(&[b'x'; 512])
+            .finish();
         let mut reader = TarReader::in_memory(&contradictory[..]);
-        reader
+        let err = reader
             .next_entry()
-            .expect_err("the entry contradicts itself");
+            .expect_err("the member contradicts itself");
+        assert!(
+            matches!(&err, ProvisionError::Archive { offset: 0, .. }),
+            "{err:?}"
+        );
         assert!(!reader.not_a_tar());
     }
 
     #[test]
-    fn an_old_gnu_sparse_member_is_refused_rather_than_misframed() {
-        // What GNU tar 1.35 writes under `--format=gnu --sparse` for a file of
-        // more than four runs of data: an `S` header with its `isextended`
-        // byte set, then an extension block its size does not count, then the
-        // data. A reader skipping the member by its size read the extension
-        // block as data and the archive's next header from inside the data;
-        // where that held zeros, the archive ended there, silently, and the
-        // member after it was never seen. Every reader meets the member here,
-        // so every reader refuses it.
-        let mut header = sized_header(b"sparse", BLOCK, b'S');
-        header[257..265].copy_from_slice(b"ustar  \0");
-        header[482] = 1;
-        checksum(&mut header);
-        let mut archive = header.to_vec();
-        // The extension block, extending no further, and the data, zeros as
-        // the end of a run of data leaves them.
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        archive.extend_from_slice(&sized_header(b"after", 0, b'0'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let err = TarReader::in_memory(&archive)
+    fn a_sparse_member_is_refused_whichever_form_wrote_it() {
+        // GNU's old form, which nothing in the crate can write as the file it
+        // stands for, is refused for its type rather than read as its stored
+        // regions.
+        let mut tar = Tar::new();
+        tar.gnu_sparse_file("holes", 0o644, &[(4096, b"data"), (8192, b"more")], 1 << 20);
+        tar.file("after", 0o644, b"x");
+        let err = TarReader::in_memory(&tar.finish())
             .next_entry()
             .expect_err("the sparse member is refused");
         assert!(
-            matches!(&err, ProvisionError::EntryUnsupported { kind: b'S', path } if path == Path::new("sparse")),
+            matches!(&err, ProvisionError::EntryUnsupported { kind: b'S', path } if path == Path::new("holes")),
             "{err:?}",
         );
     }
 
-    /// The paths of every entry in `archive`, or the first refusal.
-    fn entry_paths(archive: &[u8]) -> Result<Vec<Vec<u8>>, ProvisionError> {
-        let mut reader = TarReader::in_memory(archive);
-        let mut paths = Vec::new();
-        while let Some(entry) = reader.next_entry()? {
-            paths.push(entry.path);
-        }
-        Ok(paths)
-    }
-
     #[test]
-    fn a_global_header_holding_only_a_comment_is_passed_over() {
-        // The record `git archive` writes at the head of every archive, and
-        // one between entries, which no reader applies to either.
-        let commit = pax_record(b"comment", b"0123456789abcdef0123456789abcdef01234567");
-        let mut archive = pax_block(b'g', &commit);
-        archive.extend_from_slice(&sized_header(b"first", 0, b'0'));
-        archive.extend(pax_block(b'g', &pax_record(b"comment", b"another")));
-        archive.extend(pax_block(b'x', &pax_record(b"path", b"pax-path")));
-        archive.extend_from_slice(&sized_header(b"second", 0, b'0'));
-        archive.extend(pax_block(b'g', b""));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        assert_eq!(entry_paths(&archive).unwrap(), [&b"first"[..], b"pax-path"]);
-    }
-
-    #[test]
-    fn a_global_header_setting_any_other_record_is_refused() {
-        // GNU tar and Python apply these to every later member, and bsdtar and
-        // Go apply none; a `size` is also where GNU tar looks for the next
-        // header. A vendor keyword is refused with the rest: GNU tar does not
-        // apply a global extended attribute that Python reports on each member.
-        let records = [
-            pax_record(b"size", b"0"),
-            pax_record(b"path", b"renamed"),
-            pax_record(b"linkpath", b"elsewhere"),
-            pax_record(b"uid", b"1234"),
-            pax_record(b"mtime", b"1000000"),
-            pax_record(b"SCHILY.xattr.user.k", b"v"),
-            [
-                pax_record(b"comment", b"c"),
-                pax_record(b"uname", b"someone"),
-            ]
-            .concat(),
-        ];
-        for records in records {
-            let mut archive = pax_block(b'g', &records);
-            archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
-            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-            let err = entry_paths(&archive).expect_err("a global record that sets a member");
+    fn a_pax_size_on_an_entry_without_data_is_refused() {
+        // GNU tar skips the bytes the record counts, and bsdtar and Python
+        // read them as the next header, finding the member `hidden` that GNU
+        // tar never sees. Read either way, it is two archives.
+        for typeflag in *b"123456" {
+            let record = ferroday_cage_testkit::tar::pax_record(b"size", b"1024");
+            let mut tar = Tar::new();
+            tar.header(b"PaxHeader/entry", b'x', 0o644, record.len() as u64, 0, b"")
+                .body(&record)
+                .header(b"entry", typeflag, 0o644, 0, 0, b"target")
+                .header(b"hidden", b'0', 0o644, 512, 0, b"")
+                .body(&[b'h'; 512]);
+            let err = TarReader::in_memory(&tar.finish())
+                .next_entry()
+                .expect_err("the entry contradicts itself");
             assert!(
-                matches!(err, ProvisionError::Archive { offset: 0, .. }),
-                "{err:?}",
-            );
-            assert!(
-                err.to_string().contains("a record other than `comment`"),
-                "{err}",
+                matches!(&err, ProvisionError::Archive { offset: 1024, .. }),
+                "{}: {err:?}",
+                typeflag as char,
             );
         }
-
-        // One whose records do not frame is malformed as an `x` header is.
-        let mut archive = pax_block(b'g', b"99 comment=x\n");
-        archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let err = entry_paths(&archive).expect_err("an unframed record");
-        assert!(err.to_string().contains("out of bounds"), "{err}");
-    }
-
-    #[test]
-    fn a_global_header_does_not_fall_between_metadata_and_its_entry() {
-        // Go lets the global header consume an `x` or a long name waiting for
-        // its entry, which GNU tar, bsdtar and Python apply to that entry; and
-        // bsdtar refuses two global headers in a row, whatever they hold.
-        let comment = pax_block(b'g', &pax_record(b"comment", b"c"));
-        let cases = [
-            (
-                pax_block(b'x', &pax_record(b"path", b"xname")),
-                "separates an entry from its metadata",
-            ),
-            (
-                long_link_entry(b'L', b"long-name\0"),
-                "separates an entry from its metadata",
-            ),
-            (
-                long_link_entry(b'K', b"long-target\0"),
-                "separates an entry from its metadata",
-            ),
-            (
-                comment.clone(),
-                "two global extended headers precede one entry",
-            ),
-        ];
-        for (before, reason) in cases {
-            let mut archive = before;
-            archive.extend(comment.clone());
-            archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
-            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-            let err = entry_paths(&archive).expect_err("a global header out of place");
-            assert!(err.to_string().contains(reason), "{err}");
-        }
-    }
-
-    #[test]
-    fn a_solaris_extended_header_is_refused() {
-        // GNU tar, bsdtar and Python apply an `X` header's records to the entry
-        // after it and name that entry `renamed`; Go reads the header as a file
-        // and names the entry `victim`.
-        let mut archive = pax_block(b'X', &pax_record(b"path", b"renamed"));
-        archive.extend_from_slice(&sized_header(b"victim", 0, b'0'));
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let err = entry_paths(&archive).expect_err("a Solaris extended header");
-        assert!(
-            matches!(err, ProvisionError::Archive { offset: 0, .. }),
-            "{err:?}",
-        );
-        assert!(err.to_string().contains("Solaris extended header"), "{err}");
-    }
-
-    #[test]
-    fn an_entry_with_an_empty_name_is_refused() {
-        // GNU tar substitutes `.`, bsdtar skips the entry, and Python and Go
-        // report the empty name. The header's own name and a GNU long name can
-        // each be empty; a pax `path` cannot be.
-        let empty_header = sized_header(b"", 0, b'0').to_vec();
-        let mut empty_long_name = long_link_entry(b'L', b"\0");
-        empty_long_name.extend_from_slice(&sized_header(b"short", 0, b'0'));
-        for mut archive in [empty_header, empty_long_name] {
-            archive.extend_from_slice(&sized_header(b"after", 0, b'0'));
-            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-            let mut reader = TarReader::in_memory(&archive[..]);
-            let err = reader.next_entry().expect_err("an entry with no name");
-            assert!(err.to_string().contains("an empty name"), "{err}");
-            assert!(!reader.not_a_tar(), "a tar archive, if a malformed one");
-        }
-
-        // The root's own entry has a name, and reads.
-        let mut archive = sized_header(b"./", 0, b'5').to_vec();
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        assert_eq!(entry_paths(&archive).unwrap(), [&b"./"[..]]);
-    }
-
-    #[test]
-    fn a_v7_name_ending_in_a_separator_is_a_directory() {
-        // The convention the oldest writers used in place of a typeflag. GNU
-        // tar's own `--format=v7` output sets `5` as well, so this is the
-        // belt to that archive's braces.
-        //
-        // Read by the reader rather than by the header parse, which knows only
-        // the header's own name field: for an entry whose real path arrived in
-        // a long-name or pax record, that field is a truncation, and a rule
-        // applied to it would take a truncated regular file for a directory.
-        let mut archive = v7_header(b"olddir/").to_vec();
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        let mut reader = TarReader::in_memory(&archive[..]);
-        let entry = reader.next_entry().unwrap().expect("the directory");
-        assert_eq!(entry.typeflag, b'5');
-    }
-
-    #[test]
-    fn a_block_with_neither_magic_nor_a_valid_checksum_is_not_a_tar_header() {
-        // With v7 accepted the checksum is the only thing separating a header
-        // from arbitrary bytes, and the diagnostic has to stay useful to
-        // whoever pointed the parser at the wrong file.
-        let mut block = v7_header(b"file.txt");
-        block[0] = b'X'; // after the checksum was written, so it no longer matches
-        assert_eq!(parse_header(&block).unwrap_err(), HeaderFlaw::NotATarHeader);
-    }
-
-    #[test]
-    fn a_corrupt_ustar_header_reads_as_corrupt_rather_than_as_not_a_tar() {
-        // Magic present says this was meant to be a tar header, so the report
-        // is about the header rather than about the file.
-        let mut block = ustar_header(b"file.txt", b"");
-        block[0] = b'X';
-        assert_eq!(parse_header(&block).unwrap_err(), HeaderFlaw::Checksum);
-    }
-
-    #[test]
-    fn a_stream_that_ends_before_its_first_header_holds_no_archive() {
-        // The missing-terminator tolerance below presupposes an archive. A
-        // stream that ended before its first header is a file of some other
-        // format or an empty one, and answering `None` here would report a
-        // complete archive of nothing -- which a publication then publishes as
-        // a finished, empty rootfs that every later run trusts without
-        // reconsulting the source.
-        let mut reader = TarReader::in_memory(&b""[..]);
-        let err = reader
+        // A pax size of zero states what the type does, and reads.
+        let record = ferroday_cage_testkit::tar::pax_record(b"size", b"0");
+        let mut tar = Tar::new();
+        tar.header(b"PaxHeader/dir", b'x', 0o644, record.len() as u64, 0, b"")
+            .body(&record)
+            .header(b"dir/", b'5', 0o755, 0, 0, b"");
+        let entry = TarReader::in_memory(&tar.finish())
             .next_entry()
-            .expect_err("an empty stream is no archive");
-        assert!(
-            reader.not_a_tar(),
-            "{err}, expected a format classification",
-        );
+            .expect("it reads")
+            .expect("a member");
+        assert_eq!(entry.path(), b"dir/");
     }
 
     #[test]
     fn a_terminated_empty_archive_holds_no_entries_and_is_not_an_error() {
         // Two zero blocks are what `tar cf empty.tar --files-from /dev/null`
-        // writes, and it is a valid archive of nothing -- the case the rejection
-        // above must not take with it.
-        let archive = [0u8; 2 * BLOCK as usize];
+        // writes, and it is a valid archive of nothing, where a stream that
+        // ends before its first block is none.
+        let archive = Tar::new().finish();
         let mut reader = TarReader::in_memory(&archive[..]);
         assert!(reader.next_entry().unwrap().is_none());
     }
 
     #[test]
-    fn an_archive_missing_only_its_terminator_still_reads() {
-        // GNU tar tolerates a truncated two-block terminator and so does this
-        // reader, once at least one header has been consumed.
-        let archive = v7_header(b"file.txt").to_vec();
-        let mut reader = TarReader::in_memory(&archive[..]);
-        let entry = reader.next_entry().unwrap().expect("the file");
-        assert_eq!(entry.path, b"file.txt");
-        assert!(reader.next_entry().unwrap().is_none());
-    }
-
-    #[test]
-    fn metadata_with_no_entry_after_it_is_refused_with_or_without_a_terminator() {
-        // A pax header or a GNU long name describes the entry after it. One the
-        // archive ends after describes nothing, and whether the end is spelled
-        // with the two zero blocks or by the stream running out, it is one
-        // archive refused one way.
-        let mut long_name = sized_header(b"././@LongLink", 4, b'L').to_vec();
-        long_name.extend_from_slice(b"name");
-        long_name.resize(long_name.len().next_multiple_of(BLOCK as usize), 0);
-        for (kind, metadata) in [
-            ("a pax header", pax_block(b'x', b"16 path=renamed\n")),
-            ("a long name", long_name),
-        ] {
-            for terminated in [false, true] {
-                let mut archive = metadata.clone();
-                if terminated {
-                    archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-                }
-                let err = TarReader::in_memory(&archive[..])
-                    .next_entry()
-                    .expect_err("metadata describing nothing is refused");
-                assert!(
-                    err.to_string().contains("ends after a metadata entry"),
-                    "{kind}, terminated {terminated}: {err}",
-                );
-            }
-        }
-    }
-
-    /// An archive of one regular file holding `body`, with a header declaring
-    /// `declared` bytes for it.
-    fn one_file(declared: u64, body: &[u8]) -> Vec<u8> {
-        let mut archive = sized_header(b"entry", declared, b'0').to_vec();
-        archive.extend_from_slice(body);
-        archive.resize(archive.len().next_multiple_of(BLOCK as usize), 0);
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
-        archive
-    }
-
-    #[test]
-    fn an_entry_is_read_whole_up_to_its_ceiling_and_refused_past_it() {
+    fn a_member_is_read_whole_up_to_its_ceiling_and_refused_past_it() {
         let body = vec![b'x'; 3000];
-
-        // At the ceiling exactly, the entry is the whole of it, and the reader
-        // goes on to the next entry from where it ends.
+        // At the ceiling exactly, the member is the whole of it, and the reader
+        // goes on to the next member from where it ends.
         let archive = one_file(body.len() as u64, &body);
         let mut reader = TarReader::in_memory(&archive[..]);
         reader.next_entry().unwrap().expect("the file");
         assert_eq!(reader.read_entry(body.len() as u64).unwrap(), body);
         assert!(reader.next_entry().unwrap().is_none());
-
-        // One byte under it, the entry is refused on its declared length rather
-        // than read as far as the ceiling and handed back cut short.
+        // One byte under it, the member is refused on its declared length
+        // rather than read as far as the ceiling and handed back cut short.
         let mut reader = TarReader::in_memory(&archive[..]);
         reader.next_entry().unwrap().expect("the file");
         let err = reader
             .read_entry(body.len() as u64 - 1)
-            .expect_err("an entry past its ceiling is refused");
+            .expect_err("a member past its ceiling is refused");
+        let past = ErrorKind::EntryLimit {
+            size: 3000,
+            limit: 2999,
+        };
         assert!(
-            err.to_string()
-                .contains("of 3000 bytes is more than the 2999"),
-            "{err}",
+            matches!(&err, ProvisionError::Archive { reason, .. } if *reason == past.to_string()),
+            "{err:?}",
         );
-    }
 
-    #[test]
-    fn an_entry_declaring_more_than_the_archive_holds_is_not_returned_short() {
-        // The declared length is inside the ceiling, so it is believed until the
-        // bytes run out, and then the read fails: what comes back is a whole
-        // entry or nothing.
-        let mut archive = sized_header(b"entry", 1 << 20, b'0').to_vec();
-        archive.extend_from_slice(&[b'x'; 700]);
-        let mut reader = TarReader::in_memory(&archive[..]);
+        // Declaring more than the archive holds, within the ceiling, the
+        // declared length is believed until the bytes run out, and then the
+        // read fails: what comes back is a whole member or nothing.
+        let mut cut = one_file(1 << 20, &[b'x'; 700]);
+        cut.truncate(512 + 700);
+        let mut reader = TarReader::in_memory(&cut[..]);
         reader.next_entry().unwrap().expect("the file");
         let err = reader
             .read_entry(1 << 30)
-            .expect_err("an entry the archive does not hold is refused");
+            .expect_err("a member the archive does not hold is refused");
         assert!(
-            err.to_string().contains("ends inside an entry's data"),
-            "{err}",
+            matches!(&err, ProvisionError::Archive { source: None, .. }),
+            "{err:?}"
         );
     }
 
@@ -2332,10 +569,10 @@ mod tests {
     }
 
     impl<R: Read> Read for Interrupting<R> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             self.interrupt = !self.interrupt;
             if self.interrupt {
-                return Err(std::io::ErrorKind::Interrupted.into());
+                return Err(io::ErrorKind::Interrupted.into());
             }
             // A short read as well, so a fill has to come back for the rest.
             let short = buf.len().min(100);
@@ -2345,18 +582,13 @@ mod tests {
 
     #[test]
     fn an_interrupted_read_is_retried_rather_than_reported() {
-        // The entry's data is read once and drained once, and the headers on
-        // either side are read too: every read the reader makes meets the
-        // interruption.
+        // The member's data is read once and passed over once, and the headers
+        // on either side are read too: every read meets the interruption.
         let body = vec![b'x'; 3000];
-        let mut archive = one_file(body.len() as u64, &body);
-        let terminator = archive.split_off(archive.len() - 2 * BLOCK as usize);
-        let second = sized_header(b"second", 600, b'0');
-        archive.extend_from_slice(&second);
-        archive.extend_from_slice(&[b'y'; 600]);
-        archive.resize(archive.len().next_multiple_of(BLOCK as usize), 0);
-        archive.extend_from_slice(&terminator);
-
+        let archive = Tar::new()
+            .file("entry", 0o644, &body)
+            .file("second", 0o644, &[b'y'; 600])
+            .finish();
         let mut reader = TarReader::new(
             Interrupting {
                 inner: &archive[..],
@@ -2378,25 +610,18 @@ mod tests {
         }
         assert_eq!(read, body);
         let second = reader.next_entry().unwrap().expect("the second file");
-        assert_eq!(second.path, b"second");
-        // The second entry's data is left unread, so the reader drains it.
+        assert_eq!(second.path(), b"second");
+        // The second member's data is left unread, so the reader passes over
+        // it.
         assert!(
             reader
                 .next_entry()
-                .expect("the drain retries too")
+                .expect("passing over retries too")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn a_metadata_entry_is_held_to_its_ceiling() {
-        // A GNU long name past the metadata ceiling is refused, through the same
-        // read every whole-entry reader in the crate goes through.
-        let mut archive = sized_header(b"././@LongLink", METADATA_LIMIT + 1, b'L').to_vec();
-        archive.extend_from_slice(&[0u8; BLOCK as usize]);
-        let err = TarReader::in_memory(&archive[..])
-            .next_entry()
-            .expect_err("a long name past the ceiling is refused");
-        assert!(err.to_string().contains("more than the"), "{err}");
+        // The end marker's second block is all that follows its first.
+        reader
+            .finish(512)
+            .expect("nothing more follows the archive");
     }
 }
