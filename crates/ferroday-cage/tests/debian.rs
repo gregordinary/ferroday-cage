@@ -141,6 +141,9 @@ fn hermetic_a_bootstrap_establishes_its_map_through_the_callers_delegate() {
     // bundled chain cannot, so every place a bootstrap establishes the map has
     // to ask the caller's delegate: the preflight before any download, and the
     // cage each dpkg wave runs in.
+    // The host's own architecture, so a full bootstrap meets no
+    // foreign-architecture preflight on a host other than amd64.
+    let arch = ferroday_cage::provision::debian::host_architecture();
     let dir = common::scratch_dir("debian-delegate");
     let base = Tar::new()
         .dir("./usr", 0o755)
@@ -150,12 +153,12 @@ fn hermetic_a_bootstrap_establishes_its_map_through_the_callers_delegate() {
     let mirror = write_repo(
         &dir.join("repo"),
         "trixie",
-        "amd64",
+        &arch,
         &[Pkg::required("base", deb(&base), "")],
     );
     let bootstrap = |delegate: &Delegate, at: &str| {
         let mut debian = Debian::builder("trixie")
-            .architecture("amd64")
+            .architecture(&arch)
             .mirror(mirror.clone())
             .trust_unsigned(true)
             .cache_dir(dir.join(format!("{at}-cache")))
@@ -197,7 +200,7 @@ fn hermetic_a_bootstrap_establishes_its_map_through_the_callers_delegate() {
         ..Delegate::default()
     };
     let mut layered = Debian::builder("trixie")
-        .architecture("amd64")
+        .architecture(&arch)
         .mirror(mirror.clone())
         .trust_unsigned(true)
         .base_layer(dir.join("no-base"))
@@ -1685,6 +1688,9 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
     // exercises the empty-increment path hermetically — it runs no cage — so it
     // needs no network or real dpkg; it skips only where the overlay preflight
     // reports the host cannot overlay.
+    // The host's own architecture, so a full bootstrap meets no
+    // foreign-architecture preflight on a host other than amd64.
+    let arch = ferroday_cage::provision::debian::host_architecture();
     let dir = common::scratch_dir("debian-empty-layer");
     if !common::require::overlay(&dir) {
         return;
@@ -1696,7 +1702,7 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
     let mirror = write_repo(
         &dir.join("repo"),
         "trixie",
-        "amd64",
+        &arch,
         &[Pkg::required("base", deb(&base_data), "")],
     );
 
@@ -1719,7 +1725,7 @@ fn hermetic_stage_layer_empty_increment_stages_without_configuring() {
     let upper = dir.join("upper");
     let layer = {
         let mut debian = Debian::builder("trixie")
-            .architecture("amd64")
+            .architecture(&arch)
             .mirror(mirror)
             .trust_unsigned(true)
             .base_layer(&base_dir)
@@ -1756,6 +1762,9 @@ fn hermetic_a_plan_is_the_increment_a_layered_build_installs() {
     // path read no plan at all and `plan()` forbids `include()`, so the seed was
     // empty: `stage_layer` returned a build layer over an empty upper having
     // installed nothing, and `resolve_layer` reported that same empty closure.
+    // The host's own architecture, so a full bootstrap meets no
+    // foreign-architecture preflight on a host other than amd64.
+    let arch = ferroday_cage::provision::debian::host_architecture();
     let dir = common::scratch_dir("debian-layer-plan");
     if !common::require::overlay(&dir) {
         return;
@@ -1763,7 +1772,7 @@ fn hermetic_a_plan_is_the_increment_a_layered_build_installs() {
     let mirror = write_repo(
         &dir.join("repo"),
         "trixie",
-        "amd64",
+        &arch,
         &[
             Pkg::required("base", payload("base"), ""),
             Pkg::ordinary("extra", payload("extra")),
@@ -1782,7 +1791,7 @@ fn hermetic_a_plan_is_the_increment_a_layered_build_installs() {
 
     let layered = |plan: Option<Plan>| {
         let mut builder = Debian::builder("trixie")
-            .architecture("amd64")
+            .architecture(&arch)
             .mirror(mirror.clone())
             .trust_unsigned(true)
             .cache_dir(dir.join("cache"))
@@ -1827,7 +1836,7 @@ fn hermetic_a_plan_is_the_increment_a_layered_build_installs() {
     let watcher = Watching::default();
     let asked = std::sync::Arc::clone(&watcher.asked);
     let mut staging = Debian::builder("trixie")
-        .architecture("amd64")
+        .architecture(&arch)
         .mirror(mirror)
         .trust_unsigned(true)
         .cache_dir(dir.join("cache"))
