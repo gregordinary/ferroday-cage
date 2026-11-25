@@ -12,7 +12,10 @@
 //!   and the runtime directories hidden. `--empty-root` composes one from the
 //!   host's `/usr` and `/etc` instead.
 //! - **The working tree** is bound read-write at its own path, and `.env` is
-//!   hidden.
+//!   hidden. With `--overlay`, it is overlaid instead: the command's writes
+//!   land in an upper of the caller's, the tree is left as it was, and the
+//!   example prints what the command changed, for `--apply` to write into the
+//!   tree or `--discard` to throw away.
 //! - **Git** in the sandbox works against private gitdirs, so the command
 //!   writes no gitdir the user's git reads, and its commits come back through
 //!   a fetch that checks every object. The [`git`] module sets out the modes,
@@ -39,7 +42,8 @@
 //! tree's figures included where the limits are a cgroup's.
 //!
 //! It exists to exercise the library from the vantage of an agent runtime: the
-//! host root with `hide` and `read_only`, a presented identity, a listener on
+//! host root with `hide` and `read_only`, an overlay at the working tree's path
+//! and the change set read from it, a presented identity, a listener on
 //! the sandbox's loopback, the network stack's destination rules and reports,
 //! the unix-socket restriction, the seccomp filter's reports and the roster's
 //! relaxation, cgroup limits, and a wait driven through the handle's readiness
@@ -66,11 +70,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ferroday_cage::provision::{Change, ChangeKind, ChangeSet, Protected, ProvisionError, Remove};
 use ferroday_cage::relay::Escalation;
 use ferroday_cage::{
     Cage, CageBuilder, CgroupLimit, DestinationRule, Error, ErrorChain, ExitStatus, FsAccess,
-    NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Pending, PresentedIdentity,
-    Resource, ResourceUsage, Running, SeccompPolicy, SeccompReport, SeccompRules, Stdio, host,
+    IdentityMap, NetStack, NetStackBuilder, NetStackError, NetStackHandle, Network, Overlay,
+    Pending, PresentedIdentity, Resource, ResourceUsage, Running, SeccompPolicy, SeccompReport,
+    SeccompRules, Stdio, host,
 };
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -191,6 +197,22 @@ Git, where the working tree is a repository's:
   --protected           Print the paths the command may not write, which a
                         runtime's own editing tool refuses as well, and exit
 
+Reviewing what the command wrote:
+  --overlay DIR         Overlay the working tree rather than binding it: the
+                        command's writes land in DIR, which persists across
+                        commands, and the tree is left as it was. The changes
+                        are printed after each command
+  --apply               Write the overlay's changes into the working tree, then
+                        discard them; a change the tree also made since the
+                        overlay was created, or one to a path git or another
+                        tool acts on, refuses the whole apply. With no command,
+                        apply and exit
+  --skip PATH           Leave PATH, relative to the working tree, and what lies
+                        beneath it out of --apply; its changes are discarded
+                        with the rest (repeatable)
+  --discard             Discard the overlay's changes. With no command, discard
+                        and exit
+
 The root:
   --empty-root          Compose the root from the host's /usr and /etc alone,
                         rather than the host's whole tree, read-only
@@ -221,8 +243,20 @@ The command:
 The command's exit code is the example's, or 128 plus the signal number when a
 signal terminates it, and 124 when it outlives --timeout. 125 announces a
 sandbox that could not be built or launched, 126 a command that cannot be
-executed, 127 a command that does not exist, and 2 a usage error.
+executed, 127 a command that does not exist, 1 an --apply refused, and 2 a
+usage error.
 ";
+
+/// What becomes of an overlay's changes once the command, if any, has run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// They stay in the upper, for review.
+    Keep,
+    /// They are written into the working tree, then discarded.
+    Apply,
+    /// They are discarded.
+    Discard,
+}
 
 /// A parsed command line.
 enum Invocation {
@@ -264,6 +298,13 @@ struct Config {
     report: bool,
     /// Whether the run prints the protected paths rather than running.
     print_protected: bool,
+    /// The upper the working tree's overlay writes into, where `--overlay`
+    /// names one.
+    overlay: Option<PathBuf>,
+    /// What becomes of the overlay's changes after the command, if anything.
+    settle: Settle,
+    /// Paths in the tree `--apply` leaves out, with what lies beneath them.
+    skip: Vec<PathBuf>,
     /// The command line, never empty.
     command: Vec<OsString>,
 }
@@ -371,6 +412,9 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
         session: None,
         report: true,
         print_protected: false,
+        overlay: None,
+        settle: Settle::Keep,
+        skip: Vec::new(),
         command: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -415,6 +459,26 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
             config.report = false;
         } else if arg == "--protected" {
             config.print_protected = true;
+        } else if arg == "--overlay" {
+            config.overlay = Some(PathBuf::from(value_for("--overlay", &mut args)?));
+        } else if let Some(value) = flag_value(&arg, b"--overlay=") {
+            config.overlay = Some(PathBuf::from(value));
+        } else if arg == "--skip" {
+            config
+                .skip
+                .push(PathBuf::from(value_for("--skip", &mut args)?));
+        } else if let Some(value) = flag_value(&arg, b"--skip=") {
+            config.skip.push(PathBuf::from(value));
+        } else if arg == "--apply" || arg == "--discard" {
+            let settle = if arg == "--apply" {
+                Settle::Apply
+            } else {
+                Settle::Discard
+            };
+            if config.settle != Settle::Keep && config.settle != settle {
+                return Err("--apply and --discard are alternatives".to_string());
+            }
+            config.settle = settle;
         } else if arg == "--empty-root" {
             config.empty_root = true;
         } else if arg == "--port" {
@@ -454,7 +518,20 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
             break;
         }
     }
-    if config.command.is_empty() && !config.print_protected {
+    if !config.skip.is_empty() && config.settle != Settle::Apply {
+        return Err("--skip requires --apply, which it leaves paths out of".to_string());
+    }
+    if config.settle != Settle::Keep && config.overlay.is_none() {
+        return Err("--apply and --discard need --overlay, whose changes they settle".to_string());
+    }
+    if config.overlay.is_some() && config.git == git::Mode::Isolated {
+        return Err(
+            "--overlay and --git isolated are alternatives: an isolated session's checkout \
+             already keeps the command's writes apart from the working tree"
+                .to_string(),
+        );
+    }
+    if config.command.is_empty() && !config.print_protected && config.settle == Settle::Keep {
         return Err("a command to run is required".to_string());
     }
     if !config.allow.is_empty() && !config.registries {
@@ -505,7 +582,7 @@ fn seconds(value: String) -> Result<Duration, String> {
 
 /// Confines the command, serves its one way out until it exits, and reports
 /// its outcome and what it used.
-fn run(config: Config) -> Result<ExitCode, Failure> {
+fn run(mut config: Config) -> Result<ExitCode, Failure> {
     let given = match &config.worktree {
         Some(worktree) => worktree.clone(),
         None => std::env::current_dir()
@@ -525,7 +602,18 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
             worktree.display()
         )));
     }
-    let session = git::Session::open(
+    // Absolute, since the sandbox and a later invocation name it from
+    // wherever they run.
+    if let Some(upper) = &config.overlay {
+        let absolute = std::path::absolute(upper).map_err(|err| {
+            Failure::Own(format!(
+                "cannot resolve the overlay {}: {err}",
+                upper.display()
+            ))
+        })?;
+        config.overlay = Some(absolute);
+    }
+    let mut session = git::Session::open(
         &worktree,
         config.git,
         config.session.as_deref(),
@@ -541,27 +629,184 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    // Once the command has run, what it committed is taken in, whatever its
-    // outcome, and whatever failed while it was served; a launch that never
-    // reached the command leaves nothing to take.
-    let launched = launch(&config, &worktree, session.as_ref());
-    match (session, launched) {
-        (Some(session), Ok(code)) => {
-            session.finish().map_err(Failure::Own)?;
+    // What the session holds read-only, which an apply refuses to change too,
+    // as paths in the tree.
+    let held: Vec<PathBuf> = session.as_ref().map_or_else(Vec::new, |session| {
+        session
+            .protected()
+            .iter()
+            .filter_map(|path| path.strip_prefix(&worktree).ok().map(Path::to_path_buf))
+            .collect()
+    });
+    if config.overlay.is_some()
+        && let Some(session) = &mut session
+    {
+        session.keep_branches();
+    }
+    let code = if config.command.is_empty() {
+        if let Some(session) = session {
+            session.discard();
+        }
+        ExitCode::SUCCESS
+    } else {
+        // Once the command has run, what it committed is taken in, whatever
+        // its outcome, and whatever failed while it was served; a launch that
+        // never reached the command leaves nothing to take.
+        let launched = launch(&config, &worktree, session.as_ref());
+        match (session, launched) {
+            (Some(session), Ok(code)) => {
+                session.finish().map_err(Failure::Own)?;
+                code
+            }
+            (Some(session), Err(Launch::Ran(failure))) => {
+                if let Err(message) = session.finish() {
+                    eprintln!("agent-tools: {message}");
+                }
+                return Err(failure);
+            }
+            (Some(session), Err(Launch::NotRun(failure))) => {
+                session.discard();
+                return Err(failure);
+            }
+            (None, launched) => launched.map_err(Launch::failure)?,
+        }
+    };
+    match &config.overlay {
+        Some(upper) => settle_overlay(&worktree, upper, &held, (config.settle, &config.skip), code),
+        None => Ok(code),
+    }
+}
+
+/// Settles the overlay whose upper is `upper` over `worktree` as `settle`
+/// asks: prints its changes, and what an apply would refuse, for review;
+/// writes them into the tree and discards them; or discards them.
+///
+/// An apply protects the library's default paths and `held`, the paths the
+/// git session holds read-only, relative to the tree, and leaves out `skip`'s
+/// paths and what lies beneath them. A refused apply writes nothing, keeps the
+/// upper, and is the example's exit code, 1; otherwise the command's, `code`,
+/// stands.
+fn settle_overlay(
+    worktree: &Path,
+    upper: &Path,
+    held: &[PathBuf],
+    (settle, skip): (Settle, &[PathBuf]),
+    code: ExitCode,
+) -> Result<ExitCode, Failure> {
+    let own = |err: ProvisionError| Failure::Own(ErrorChain::new(&err).to_string());
+    if !upper.exists() {
+        if settle != Settle::Keep {
+            eprintln!(
+                "agent-tools: no command has written into {}",
+                upper.display()
+            );
+        }
+        return Ok(code);
+    }
+    let overlay = Overlay::new().lower(worktree).upper(upper);
+    let discard = || {
+        Remove::overlay_upper(upper)
+            .identity_map(IdentityMap::Single)
+            .run()
+            .map_err(own)
+    };
+    if settle == Settle::Discard {
+        discard()?;
+        eprintln!(
+            "agent-tools: the changes in {} are discarded",
+            upper.display()
+        );
+        return Ok(code);
+    }
+    let changes = ChangeSet::read(&overlay).map_err(own)?;
+    let protected = || {
+        Protected::defaults()
+            .into_iter()
+            .chain(held.iter().map(Protected::path))
+    };
+    let skip = skip.to_vec();
+    let apply = changes
+        .apply(worktree)
+        .protected(protected())
+        .filter(move |change| !skip.iter().any(|path| change.path().starts_with(path)));
+    if settle == Settle::Keep {
+        if changes.is_empty() {
+            eprintln!("agent-tools: the command changed nothing in the working tree");
+            return Ok(code);
+        }
+        eprintln!(
+            "agent-tools: the command's changes to the working tree, in {}:",
+            upper.display()
+        );
+        for change in changes.changes() {
+            eprintln!("  {}", described_change(change));
+        }
+        for refusal in apply.check().map_err(own)? {
+            eprintln!(
+                "agent-tools: --apply would refuse {:?}: {}",
+                refusal.path(),
+                refusal.reason()
+            );
+        }
+        return Ok(code);
+    }
+    match apply.run() {
+        Ok(report) => {
+            for path in report.skipped() {
+                eprintln!(
+                    "agent-tools: {path:?} is a pipe, a socket or a device, and is not written"
+                );
+            }
+            eprintln!(
+                "agent-tools: {} changes written into the working tree",
+                report.applied().len()
+            );
+            discard()?;
             Ok(code)
         }
-        (Some(session), Err(Launch::Ran(failure))) => {
-            if let Err(message) = session.finish() {
-                eprintln!("agent-tools: {message}");
+        Err(ProvisionError::ApplyRefused { refusals, .. }) => {
+            for refusal in &refusals {
+                eprintln!(
+                    "agent-tools: --apply refuses {:?}: {}",
+                    refusal.path(),
+                    refusal.reason()
+                );
             }
-            Err(failure)
+            eprintln!(
+                "agent-tools: nothing is written, and the changes stay in {}",
+                upper.display()
+            );
+            Ok(ExitCode::from(1))
         }
-        (Some(session), Err(Launch::NotRun(failure))) => {
-            session.discard();
-            Err(failure)
-        }
-        (None, launched) => launched.map_err(Launch::failure),
+        Err(err) => Err(own(err)),
     }
+}
+
+/// A change, as the review lists it: what kind, where, and what differs.
+fn described_change(change: &Change) -> String {
+    let kind = match change.kind() {
+        ChangeKind::Added => "added",
+        ChangeKind::Removed => "removed",
+        ChangeKind::Replaced => "replaced",
+        _ => "modified",
+    };
+    let differs: Vec<&str> = [
+        (change.content_differs(), "content"),
+        (change.mode_differs(), "mode"),
+        (change.owner_differs(), "owner"),
+        (change.attributes_differ(), "attributes"),
+    ]
+    .into_iter()
+    .filter_map(|(differs, name)| differs.then_some(name))
+    .collect();
+    let mut line = format!("{kind} {:?}", change.path());
+    if !differs.is_empty() {
+        line.push_str(&format!(" ({})", differs.join(", ")));
+    }
+    if !change.is_readable() {
+        line.push_str(", not readable whole");
+    }
+    line
 }
 
 /// Launches the command in its sandbox over `worktree`, with the mounts the
@@ -674,7 +919,11 @@ fn posture(
     // The caller's tree, or an isolated session's checkout of it, at the
     // working tree's path.
     let tree = session.map_or(worktree, git::Session::tree);
-    builder = builder.bind(tree, worktree).current_dir(worktree);
+    builder = match &config.overlay {
+        Some(upper) => builder.overlay_at(worktree, Overlay::new().lower(tree).upper(upper)),
+        None => builder.bind(tree, worktree),
+    }
+    .current_dir(worktree);
     if let Some(session) = session {
         builder = session.mount(builder);
     }
@@ -1245,6 +1494,36 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_flags_parse_and_settle_only_an_overlay() {
+        let config = parse_run(&["--overlay", "/u", "--apply", "--skip", ".envrc"]);
+        assert_eq!(config.overlay.as_deref(), Some(Path::new("/u")));
+        assert_eq!(config.settle, Settle::Apply);
+        assert_eq!(config.skip, [PathBuf::from(".envrc")]);
+        assert!(config.command.is_empty(), "an apply needs no command");
+        for (line, said) in [
+            (&["--apply"][..], "need --overlay"),
+            (
+                &["--overlay", "/u", "--apply", "--discard"][..],
+                "alternatives",
+            ),
+            (
+                &["--overlay", "/u", "--skip", "x", "true"][..],
+                "--skip requires --apply",
+            ),
+            (
+                &["--overlay", "/u", "--git", "isolated", "true"][..],
+                "alternatives",
+            ),
+            (&["--overlay", "/u"][..], "a command to run is required"),
+        ] {
+            match parse(line.iter().map(OsString::from)) {
+                Err(message) => assert!(message.contains(said), "{line:?}: {message}"),
+                Ok(_) => panic!("{line:?} parses"),
+            }
+        }
+    }
+
+    #[test]
     fn a_command_line_the_example_cannot_run_is_a_usage_error() {
         for line in [
             &[][..],
@@ -1455,6 +1734,75 @@ mod tests {
         host_git_in(&tree, &["config", "user.name", "tester"]);
         host_git_in(&tree, &["config", "user.email", "tester@example.invalid"]);
         tree
+    }
+
+    /// Under `--overlay` the tree is left as it was and the branch where it
+    /// was; `--apply` refuses a protected path, writes what `--skip` leaves it,
+    /// and discards the upper.
+    #[test]
+    fn an_overlaid_tree_takes_the_command_s_changes_only_when_applied() {
+        if !ferroday_cage_testkit::require::userns() {
+            return;
+        }
+        let tree = identified("overlay");
+        std::fs::write(tree.join(".envrc"), "export SAFE=1\n").unwrap();
+        let head = host_git_in(&tree, &["rev-parse", "HEAD"]);
+        let upper = tree.parent().unwrap().join("agent-tools-overlay-upper");
+        if !ferroday_cage_testkit::require::overlay(upper.parent().unwrap()) {
+            return;
+        }
+        let _ = ferroday_cage::provision::Remove::overlay_upper(&upper)
+            .identity_map(IdentityMap::Single)
+            .run();
+        // The upper's birth time is the reference an apply holds the tree to.
+        std::thread::sleep(Duration::from_millis(50));
+        let overlay = ["--overlay", upper.to_str().unwrap()];
+        let code = run_script(
+            &tree,
+            "private",
+            &overlay,
+            "set -e
+             echo two >> README && echo new > added && echo evil > .envrc
+             git add README && git commit -q -m two",
+        )
+        .expect("the command runs");
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read_to_string(tree.join("README")).unwrap(),
+            "one\n"
+        );
+        assert!(!tree.join("added").exists());
+        assert_eq!(
+            host_git_in(&tree, &["rev-parse", "HEAD"]),
+            head,
+            "the branch stays"
+        );
+
+        let settle = |flags: &[&str]| {
+            let mut line = vec!["--worktree", tree.to_str().unwrap()];
+            line.extend_from_slice(&overlay);
+            line.extend_from_slice(flags);
+            run(parse_run(&line)).map_err(|_| "the settle fails")
+        };
+        assert_eq!(settle(&["--apply"]), Ok(ExitCode::from(1)), "refused");
+        assert!(!tree.join("added").exists(), "nothing is written");
+        assert_eq!(
+            settle(&["--apply", "--skip", ".envrc"]),
+            Ok(ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join("README")).unwrap(),
+            "one\ntwo\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join("added")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join(".envrc")).unwrap(),
+            "export SAFE=1\n"
+        );
+        assert!(!upper.exists(), "the upper is discarded");
     }
 
     #[test]

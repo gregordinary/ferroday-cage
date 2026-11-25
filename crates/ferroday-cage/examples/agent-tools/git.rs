@@ -191,6 +191,9 @@ pub(crate) struct Session {
     held: Vec<(PathBuf, Option<Identity>)>,
     /// Whether a repository the command creates is reported.
     report: bool,
+    /// Whether the private mode moves the caller's checked-out branches to the
+    /// command's; see [`Session::keep_branches`].
+    adopt: bool,
 }
 
 /// What an entry is, as its filesystem and inode number say, whatever its name.
@@ -272,6 +275,7 @@ impl Session {
             walked: Walked::default(),
             held: Vec::new(),
             report,
+            adopt: true,
         };
         match session.set_up(gitdir, common, fresh) {
             Ok(()) => Ok(Some(session)),
@@ -865,6 +869,17 @@ impl Session {
         builder
     }
 
+    /// Leaves the caller's checked-out branches where they are after the
+    /// command, its commits under the session's namespace alone.
+    ///
+    /// For a tree the command writes through an overlay: the tree on the host
+    /// is the one before the command until its changes are applied, and a
+    /// branch and index moved to the command's commits would show that tree as
+    /// undoing them.
+    pub(crate) fn keep_branches(&mut self) {
+        self.adopt = false;
+    }
+
     /// Takes the command's commits in, moves the caller's checked-out branches
     /// on where the mode says, reports what is left, and removes a temporary
     /// session.
@@ -890,7 +905,7 @@ impl Session {
             for repository in self.repositories.iter().rev() {
                 self.import(repository)?;
             }
-            if self.mode == Mode::Private {
+            if self.mode == Mode::Private && self.adopt {
                 for repository in self.repositories.iter().rev() {
                     self.adopt(repository)?;
                 }

@@ -119,6 +119,14 @@ consumer upgrading can skip it.
   `ProvisionError::EntryRefused`, an overlay naming no upper or no lower with
   `ProvisionError::OverlayLayerMissing`, and an entry the caller cannot read
   is listed as incomplete.
+- The `agent-tools` example's `--overlay DIR` overlays the working tree, so
+  the command's writes land in `DIR` and the tree is left as it was; it prints
+  what changed and what an apply would refuse. `--apply` writes the changes
+  into the tree, protecting the library's default paths and the paths git
+  obeys, `--skip` leaves a path out, and `--discard` throws them away. In
+  overlay mode the checked-out branch does not move. The guide's provisioning
+  chapter gains "Reviewing what a run wrote", and the agent chapter shows the
+  review loop.
 - `fcage --changes UPPER --overlay-lower DIR` prints what a run wrote through
   an overlay, one change a line (`A`, `M` with what differs, `D`, `T`), and
   `fcage --apply-changes UPPER --overlay-lower DIR --to DIR` writes it into a

@@ -928,6 +928,108 @@ directory:
 fcage --remove-overlay-upper /var/cache/myapp/run-42 --identity-map single
 ```
 
+## Reviewing what a run wrote
+
+An overlay keeps a run's writes in its upper, so the upper is a record of what
+the run changed. `ChangeSet::read` turns that record into a list of changes
+against the lowers. `apply` writes chosen changes into a tree, `fork` copies the
+upper to a new one, and `Remove::overlay_upper` discards it. The overlay can be a
+root, or one mounted at a path with
+[`overlay_at`](how-the-sandbox-is-built.md#the-mount-profile), such as a working
+tree on the host's own root:
+
+```rust,no_run
+use ferroday_cage::{IdentityMap, Overlay};
+use ferroday_cage::provision::{ChangeSet, Remove};
+
+# fn main() -> Result<(), ferroday_cage::provision::ProvisionError> {
+let tree = "/home/user/project";
+let upper = "/home/user/.cache/runs/1/upper";
+let overlay = Overlay::new().lower(tree).upper(upper);
+let changes = ChangeSet::read(&overlay)?;
+for change in changes.changes() {
+    println!("{:?} {}", change.kind(), change.path().display());
+}
+changes
+    .apply(tree)
+    .filter(|change| !change.path().starts_with("target"))
+    .run()?;
+Remove::overlay_upper(upper)
+    .identity_map(IdentityMap::Single)
+    .run()?;
+# Ok(())
+# }
+```
+
+This holds for an upper and a target the calling user owns, which is how a
+sandbox under the single-identity map writes.
+
+### What a change set lists
+
+Each change names a path, relative to the overlay's top, and one of four kinds.
+An added path is one no lower holds. A modified path holds an entry of the
+type the lowers held, and the change names whether its content, mode, owner or
+extended attributes differ. A removed path is one the run deleted, and a
+removed directory is one change. A replaced path changed type, such as a file
+that became a directory.
+
+The list holds only what the merged view shows differently from the lowers. A
+directory the overlay copied up for a change beneath it is not a change. Nor is
+a file rewritten with the bytes it had, or a change of times alone. The upper
+is read by descriptor and never through a symbolic link, since the command
+that wrote it is untrusted.
+
+An overlay this library mounts records a deletion as a whiteout and nothing
+else. A layer holding another record, such as a renamed directory's redirect,
+came from elsewhere. The reader refuses it, naming the entry. An entry the run
+left unreadable to the caller is listed, and the change says it is incomplete.
+
+### Applying a change set
+
+An apply checks every chosen change before it writes anything. One that is
+refused refuses the whole apply, and nothing is written. `check` lists the
+refusals without writing, and a `filter` that leaves the refused paths out lets
+the rest through. A change is refused for one of these reasons:
+
+- It touches a protected path. By default those are `.git` and `.envrc` at any
+  depth, and at the top `.vscode`, `.idea`, `.github/workflows`,
+  `.gitlab-ci.yml` and the shell's startup files. A tool acts on each before
+  the user runs anything of the project's. `protect` adds a path, and
+  `protected` replaces the set.
+- The target changed the path after the run began. That is judged by the
+  entry's change time against the upper's birth time, or a time `since` names.
+- The target lacks the directory the change lies in, or reaches it through a
+  symbolic link.
+- The change lies on another filesystem than the target's top.
+
+The change-time check matters because an overlay hides a lower's later edits
+from the run. Say the user edits a file the run has already copied up. The run
+never sees the edit, and a plain copy would overwrite it.
+
+An apply stages every file and link in a directory at the target's top, then
+gives each its name. A failure while staging leaves the target as it was. A
+failure while naming stops there, and `ProvisionError::ApplyIncomplete` lists
+what was applied. Apply to a tree no sandbox has mounted as a lower.
+
+A file keeps its holes, and names that share an inode stay one file. The
+permission bits are carried without the set-id bits, and so are `user.`
+attributes and access control lists. Owners and times are not.
+
+### Forking an upper
+
+`ChangeSet::fork` copies an upper to a new directory and returns the overlay of
+the same lowers over it. Two sessions then continue from one point. The copy
+keeps whiteouts, opaque markers, holes, shared inodes, modes and times. Copy an
+upper no sandbox is writing.
+
+On the command line, `--changes` prints a change set, one change a line, and
+`--apply-changes` writes one into a tree:
+
+```sh
+fcage --changes ./run-42 --overlay-lower ~/project
+fcage --apply-changes ./run-42 --overlay-lower ~/project --to ~/project --only src
+```
+
 ## Custom provisioners
 
 `Provisioner` is one method:

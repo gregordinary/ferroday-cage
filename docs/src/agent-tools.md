@@ -233,6 +233,39 @@ unprivileged process cannot read them, and the command sees `EACCES`. [Reporting
 the filter's refusals](hardening.md#reporting-the-filters-refusals) sets out
 what reports cost and what they require.
 
+## Reviewing what the command wrote
+
+By default the command writes straight into the working tree. With `--overlay
+DIR`, the tree is overlaid instead, through [`overlay_at`]. The command's
+writes land in `DIR` and the tree is left as it was. After the command, the
+example prints what changed, and what an apply would refuse:
+
+```text
+agent-tools: the command's changes to the working tree, in /home/user/.cache/agent/1:
+  modified ".envrc" (content)
+  added "added"
+  modified "file" (content)
+agent-tools: --apply would refuse ".envrc": it touches the name ".envrc" at any depth
+```
+
+`DIR` persists, so further commands with the same `--overlay` add to the same
+changes. `--apply` writes them into the tree and discards them. `--skip PATH`
+leaves a path out of the apply, and `--discard` throws the changes away. Both
+work with no command:
+
+```sh
+agent-tools --worktree ~/project --overlay ~/.cache/agent/1 -- make fmt
+agent-tools --worktree ~/project --overlay ~/.cache/agent/1 --apply --skip .envrc
+```
+
+An apply protects the library's [default paths](provisioning.md#applying-a-change-set),
+and the held paths git obeys as well. It refuses a path the tree changed after
+the first command's overlay was made, and a refused apply writes nothing and
+exits 1. The command's commits still come back under `refs/agent/`, and the
+branch does not move. Until an apply, the tree on the host is the one before
+the command. A branch moved to the command's commits would show it as undoing
+them.
+
 ## One sandbox for a session
 
 The example runs each command in a sandbox of its own. That keeps what a command
@@ -642,6 +675,7 @@ remain the caller's to decide:
 
 [`host_rootfs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.host_rootfs
 [`read_only`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.read_only
+[`overlay_at`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.overlay_at
 [`present_as`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.present_as
 [`SeccompRules::curated`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.SeccompRules.html#method.curated
 [`seccomp_reports`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.seccomp_reports
