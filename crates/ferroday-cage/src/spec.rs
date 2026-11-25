@@ -5599,11 +5599,6 @@ fn merged_presence(layers: &[Option<Rooted>], relative: &Path) -> Presence {
     }
 }
 
-/// Splits an absolute sandbox path into its ordinary components.
-///
-/// The bare root is refused on top of what [`path::absolute_components`]
-/// refuses: a mount target names something *inside* the rootfs, and the rootfs
-/// itself is what the target would be established over.
 /// Resolves a configured rootfs to the canonical directory a launch roots on,
 /// and proves it can be opened as one, so a missing or unusable rootfs is a
 /// typed configuration error at build rather than a launch failure.
@@ -5628,6 +5623,11 @@ fn canonical_rootfs(rootfs: &Path) -> Result<PathBuf, Error> {
     Ok(canonical)
 }
 
+/// Splits an absolute sandbox path into its ordinary components.
+///
+/// The bare root is refused on top of what [`path::absolute_components`]
+/// refuses: a mount target names something *inside* the rootfs, and the rootfs
+/// itself is what the target would be established over.
 fn sandbox_path_components(path: &Path) -> Result<Vec<&OsStr>, Error> {
     let invalid = || {
         Error::from(ConfigError::MountTargetInvalid {
