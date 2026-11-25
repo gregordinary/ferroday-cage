@@ -773,6 +773,11 @@ consumer upgrading can skip it.
   routing table's routes without a gateway alone, which leave out a public
   `/32` reached through an `onlink` gateway, an address added with
   `noprefixroute`, and one whose routes are in another table.
+- The network stack creates its tap with the `TUNSETIFF` request number each
+  architecture's kernel headers give it. It used the one most architectures
+  share, which powerpc, mips and sparc encode otherwise, so attaching failed
+  there. The request also sets `IFF_TUN_EXCL`, so it creates the interface or
+  fails, and never attaches to one of the name that already exists.
 - A mirror at the filesystem's root, `file:///`, is joined to a path as
   `file:///debian/...`. Every trailing slash was taken from a mirror, which
   left `file:` and the path read as an authority.

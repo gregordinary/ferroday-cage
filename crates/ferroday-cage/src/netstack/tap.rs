@@ -27,7 +27,7 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_int};
 use std::net::Ipv4Addr;
 use std::os::fd::OwnedFd;
 
@@ -40,12 +40,18 @@ use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
 use crate::mechanism::netns::{self, HelperFailure, JoinSteps, Namespaces};
 use crate::wire::wire_enum;
 
-/// `TUNSETIFF`: create or attach to a tun/tap interface (`_IOW('T', 202, int)`).
-const TUNSETIFF: ioctl::Opcode = 0x400454CA;
+/// `TUNSETIFF`: create or attach to a tun/tap interface, `_IOW('T', 202,
+/// int)`, encoded as the architecture's own headers encode it: powerpc, mips
+/// and sparc place the direction bits elsewhere than the rest.
+const TUNSETIFF: ioctl::Opcode = ioctl::opcode::write::<c_int>(b'T', 202);
 /// `IFF_TAP`: an Ethernet-level device, frames in and out whole.
 const IFF_TAP: i16 = 0x0002;
 /// `IFF_NO_PI`: no packet-information header before each frame.
 const IFF_NO_PI: i16 = 0x1000;
+/// `IFF_TUN_EXCL`: create the interface, and fail with `EBUSY` where one of
+/// the name exists, rather than attach to it. The flags are a C `short`, so
+/// the high bit is its sign.
+const IFF_TUN_EXCL: i16 = 0x8000_u16.cast_signed();
 
 /// `IFF_UP` from the interface flags.
 const IFF_UP: i16 = 0x1;
@@ -332,9 +338,11 @@ fn build_tap(context: &HelperContext<'_>) -> Result<OwnedFd, (Step, Errno)> {
     )
     .map_err(|errno| (Step::OpenTun, errno))?;
 
+    // Exclusive, so the tap is always one this call creates: without it,
+    // TUNSETIFF attaches to an interface of the name where one exists.
     let mut request = IfreqFlags {
         name: context.name,
-        flags: IFF_TAP | IFF_NO_PI,
+        flags: IFF_TAP | IFF_NO_PI | IFF_TUN_EXCL,
         _pad: [0; 22],
     };
     // SAFETY: TUNSETIFF reads a `struct ifreq` carrying the requested name
@@ -640,6 +648,27 @@ mod tests {
             assert_eq!(Step::from_wire(step.wire()), Some(step));
             assert!(!step.describe().is_empty(), "{step:?} describes itself");
         }
+    }
+
+    /// `TUNSETIFF` is the number the kernel's headers give it on the
+    /// architecture built for.
+    #[test]
+    fn tunsetiff_is_the_architecture_s_own_number() {
+        let expected = if cfg!(any(
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+        )) {
+            0x800454CA
+        } else {
+            0x400454CA
+        };
+        assert_eq!(TUNSETIFF, expected);
     }
 
     /// Neither zero nor the success record is a step, and nothing past the
