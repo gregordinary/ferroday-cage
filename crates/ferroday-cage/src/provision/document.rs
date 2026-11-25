@@ -586,6 +586,25 @@ impl Draft {
     }
 }
 
+/// Reads `text` as a field-and-stanza document, every field of every stanza,
+/// for a fuzz target: it may not panic, and each field a stanza lists is one
+/// it answers for by name.
+#[cfg(fuzzing)]
+pub(super) fn exercise(text: &[u8]) {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return;
+    };
+    for stanza in parse(text) {
+        let _ = stanza.text();
+        for (name, _) in stanza.fields() {
+            assert!(
+                stanza.get(name).is_some(),
+                "{name:?} is listed and not found"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

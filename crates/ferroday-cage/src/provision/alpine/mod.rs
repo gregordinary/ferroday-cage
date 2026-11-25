@@ -2866,6 +2866,25 @@ pub(super) mod fixtures {
     pub(super) const ALPINE_KEY_NAME: &str = "alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub";
 }
 
+/// Reads `bytes` as an `APKINDEX` and as a `.PKGINFO`, for a fuzz target:
+/// neither may panic.
+#[cfg(fuzzing)]
+pub(super) fn exercise_metadata(bytes: &[u8]) {
+    let _ = index::parse("fuzzed", bytes);
+    let _ = pkginfo::PkgInfo::parse("fuzzed", bytes);
+}
+
+/// Reads `bytes` as an `.apk`, its segments and its file tree, for a fuzz
+/// target: it may not panic.
+#[cfg(fuzzing)]
+pub(super) fn exercise_package(bytes: &[u8]) {
+    let _ = apk::read_package(
+        "fuzzed",
+        &mut apk::Segments::new(bytes),
+        MAX_CONTROL_SEGMENT,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

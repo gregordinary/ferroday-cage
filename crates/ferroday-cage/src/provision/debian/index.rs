@@ -594,7 +594,7 @@ impl Index {
     /// Parses a single `Packages` index, keeping the highest version of each
     /// name and filtering to the requested architecture plus `all`. Every
     /// package is tagged with origin zero, of a default-ranked release.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn parse(text: &str, architecture: &str) -> Index {
         Index::merge(sources([(0, text)]), architecture, &Pins::none())
     }
@@ -1012,7 +1012,7 @@ fn pin_closer(pins: &Pins, offered: &Package, held: &Package) -> Option<bool> {
 /// The sources of single-component, default-ranked repositories, from
 /// `(origin, text)` pairs, for a test that is about something other than
 /// ranking.
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 pub(crate) fn sources<'a>(
     texts: impl IntoIterator<Item = (usize, &'a str)>,
 ) -> impl Iterator<Item = Source<'a>> {

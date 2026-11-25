@@ -432,6 +432,15 @@ fn ascii_field(field: &[u8]) -> String {
     String::from_utf8_lossy(field).trim().to_string()
 }
 
+/// Reads `bytes` as a `.deb`: its control member, and the way to its data
+/// member, for a fuzz target: neither may panic.
+#[cfg(fuzzing)]
+pub(super) fn exercise(bytes: &[u8]) {
+    let path = Path::new("fuzzed.deb");
+    let _ = read_control_from(path, &mut io::Cursor::new(bytes));
+    let _ = seek_to_member(path, &mut io::Cursor::new(bytes), Member::Data, None);
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;

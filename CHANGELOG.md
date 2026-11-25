@@ -597,6 +597,10 @@ consumer upgrading can skip it.
   identity through an `O_PATH` descriptor before anything else, so a socket or
   a device at the name is owned, or left alone, rather than failing an open for
   reading. No current caller reaches such an entry.
+- Seven fuzz targets join the weekly run: the field-and-stanza document
+  reader, the decompressors, the Debian `Release` and `Packages` readers, the
+  `.deb` container, the Alpine index and `.PKGINFO` readers, the `.apk` reader,
+  and the gpkg container reader.
 
 ## [0.6.0] - 2026-11-13
 

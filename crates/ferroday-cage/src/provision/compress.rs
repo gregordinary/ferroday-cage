@@ -1054,6 +1054,18 @@ fn read_le(header: &[u8], offset: usize, size: usize) -> Option<u64> {
     Some(value)
 }
 
+/// Decodes `bytes` as a stream whose leading bytes name its compression, and
+/// as a bare LZMA stream, each to a bound, for a fuzz target: neither may
+/// panic.
+#[cfg(fuzzing)]
+pub(super) fn exercise(bytes: &[u8]) {
+    const BOUND: u64 = 16 << 20;
+    if let Ok((_, decoded)) = decoder(bytes) {
+        let _ = io::copy(&mut decoded.take(BOUND), &mut io::sink());
+    }
+    let _ = io::copy(&mut lzma(bytes).take(BOUND), &mut io::sink());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

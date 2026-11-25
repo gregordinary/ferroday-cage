@@ -3014,6 +3014,12 @@ impl GentooBuilder {
     }
 }
 
+/// Reads `bytes` as a gpkg container, for a fuzz target.
+#[cfg(fuzzing)]
+pub(super) fn exercise_container(bytes: &[u8]) {
+    gpkg::exercise(bytes);
+}
+
 /// Reads `text` as a runtime dependency class of an index record or a
 /// database entry, for a fuzz target: it may not panic, and a class it reads
 /// names no more atoms than its text has bytes.

@@ -1273,6 +1273,26 @@ pub(super) mod fixture {
     }
 }
 
+/// Reads `bytes` as a gpkg container, its members and its metadata archive,
+/// for a fuzz target: it may not panic. The signature is not checked, since
+/// what is exercised is what the container's reader does before it is.
+#[cfg(fuzzing)]
+pub(super) fn exercise(bytes: &[u8]) {
+    use std::io::{Seek as _, Write as _};
+
+    let Ok(fd) = rustix::fs::memfd_create("gpkg", rustix::fs::MemfdFlags::CLOEXEC) else {
+        return;
+    };
+    let mut file = std::fs::File::from(fd);
+    if file.write_all(bytes).is_err() || file.rewind().is_err() {
+        return;
+    }
+    let path = Path::new("fuzzed.gpkg.tar");
+    if let Ok(scan) = scan(path, &mut file) {
+        let _ = read_metadata(path, &scan);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fixture::{

@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ferroday-cage = { path = "../crates/ferroday-cage", features = ["netstack", "tarball", "gentoo"] }
+ferroday-cage = { path = "../crates/ferroday-cage", features = ["netstack", "tarball", "debian", "alpine", "gentoo"] }
 
 # A workspace of its own, so the fuzzing harness never joins the library's
 # build.
@@ -54,6 +54,55 @@ bench = false
 [[bin]]
 name = "gentoo_dependencies"
 path = "fuzz_targets/gentoo_dependencies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stanza_document"
+path = "fuzz_targets/stanza_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "debian_indexes"
+path = "fuzz_targets/debian_indexes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deb"
+path = "fuzz_targets/deb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apk_metadata"
+path = "fuzz_targets/apk_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apk_package"
+path = "fuzz_targets/apk_package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gpkg"
+path = "fuzz_targets/gpkg.rs"
 test = false
 doc = false
 bench = false

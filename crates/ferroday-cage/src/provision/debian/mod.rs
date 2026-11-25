@@ -3325,6 +3325,23 @@ impl From<crate::Error> for DebianError {
     }
 }
 
+/// Reads `text` as a `Release` and as a `Packages` index, for a fuzz target:
+/// neither may panic.
+#[cfg(fuzzing)]
+pub(super) fn exercise_indexes(text: &[u8]) {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return;
+    };
+    let _ = release::Release::parse(text);
+    let _ = index::Index::parse(text, "amd64");
+}
+
+/// Reads `bytes` as a `.deb`, for a fuzz target.
+#[cfg(fuzzing)]
+pub(super) fn exercise_deb(bytes: &[u8]) {
+    deb::exercise(bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

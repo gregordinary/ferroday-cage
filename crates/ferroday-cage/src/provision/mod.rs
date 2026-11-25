@@ -100,6 +100,48 @@ pub(crate) mod fuzzing {
     pub fn gentoo_dependencies(text: &[u8]) {
         super::gentoo::exercise_dependencies(text);
     }
+
+    /// Reads `bytes` as a Gentoo binary package container.
+    #[cfg(feature = "gentoo")]
+    pub fn gpkg(bytes: &[u8]) {
+        super::gentoo::exercise_container(bytes);
+    }
+
+    /// Reads `text` as a field-and-stanza document.
+    #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
+    pub fn stanza_document(text: &[u8]) {
+        super::document::exercise(text);
+    }
+
+    /// Decodes `bytes` as a compressed stream.
+    #[cfg(feature = "tarball")]
+    pub fn decompress(bytes: &[u8]) {
+        super::compress::exercise(bytes);
+    }
+
+    /// Reads `text` as a Debian `Release` and `Packages` index.
+    #[cfg(feature = "debian")]
+    pub fn debian_indexes(text: &[u8]) {
+        super::debian::exercise_indexes(text);
+    }
+
+    /// Reads `bytes` as a `.deb`.
+    #[cfg(feature = "debian")]
+    pub fn deb(bytes: &[u8]) {
+        super::debian::exercise_deb(bytes);
+    }
+
+    /// Reads `bytes` as an `APKINDEX` and a `.PKGINFO`.
+    #[cfg(feature = "alpine")]
+    pub fn apk_metadata(bytes: &[u8]) {
+        super::alpine::exercise_metadata(bytes);
+    }
+
+    /// Reads `bytes` as an `.apk`.
+    #[cfg(feature = "alpine")]
+    pub fn apk_package(bytes: &[u8]) {
+        super::alpine::exercise_package(bytes);
+    }
 }
 
 #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]

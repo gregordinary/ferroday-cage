@@ -624,6 +624,36 @@ item = "provision::gentoo::exercise_dependencies"
 code = 1
 why = "The provisioners' fuzzing module, which exists only under `--cfg fuzzing` and hands the fuzz targets the Gentoo dependency reader. A crate of the userlands' own would carry the target with it."
 
+[[reverse]]
+item = "provision::alpine::exercise_metadata"
+code = 1
+why = "As above, for the Alpine index and `.PKGINFO` readers."
+
+[[reverse]]
+item = "provision::alpine::exercise_package"
+code = 1
+why = "As above, for the `.apk` reader."
+
+[[reverse]]
+item = "provision::debian::exercise_deb"
+code = 1
+why = "As above, for the `.deb` container reader."
+
+[[reverse]]
+item = "provision::debian::exercise_indexes"
+code = 1
+why = "As above, for the Debian `Release` and `Packages` readers."
+
+[[reverse]]
+item = "provision::document::exercise"
+code = 1
+why = "As above, for the field-and-stanza document reader."
+
+[[reverse]]
+item = "provision::gentoo::exercise_container"
+code = 1
+why = "As above, for the gpkg container reader."
+
 # Userland feature gates outside the userland side: `cfg` predicates naming
 # `debian`, `alpine` or `gentoo`, one per predicate.
 
@@ -638,7 +668,7 @@ tests = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/lib.rs"
-code = 4
+code = 7
 tests = 1
 
 [[gate]]
@@ -665,7 +695,7 @@ code = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/mod.rs"
-code = 37
+code = 43
 tests = 4
 
 [[gate]]
