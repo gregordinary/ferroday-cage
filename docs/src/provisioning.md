@@ -777,7 +777,9 @@ filesystem:
   headers, two long names, or two long links. Another holds a NUL inside a pax
   `path` or `linkpath`. A third has a pax global header that sets a record
   other than `comment`. A global header also fails where it follows another
-  with no entry between them, or separates an entry from its metadata.
+  with no entry between them, or separates an entry from its metadata. So
+  do a Solaris `X` extended header, an empty pax `path`, `linkpath`,
+  `uname` or `gname` record, and an entry whose name is empty.
 
 An archive records an access control list in either of two forms, or both. One
 is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in

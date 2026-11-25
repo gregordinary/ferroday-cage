@@ -185,6 +185,12 @@ consumer upgrading can skip it.
   record but `comment`, follows another global header with no entry between
   them, or falls between an entry and its metadata. The reader ignored a global
   header's records.
+- A tar archive is refused as malformed where it holds a Solaris `X` extended
+  header. The reader read one as a file.
+- A tar archive is refused as malformed where a pax `path`, `linkpath`, `uname`
+  or `gname` record is empty. The reader took the empty value.
+- A tar archive is refused as malformed where an entry's name is empty. The
+  reader passed the entry on with no name.
 
 ### Internal
 

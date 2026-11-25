@@ -4,9 +4,9 @@
 //! The parser yields entry metadata and streams entry data; it interprets
 //! GNU long-name (`L`)/long-link (`K`) entries and pax extended headers
 //! (`x` per-entry, and `g` global, refused unless it holds only a `comment`)
-//! internally, so a consumer only ever sees
-//! concrete file entries with their effective path, link target, size, and
-//! times. Header checksums are verified.
+//! internally, and refuses Solaris's `X` extended header, so a consumer only
+//! ever sees concrete file entries with their effective path, link target,
+//! size, and times. Header checksums are verified.
 //!
 //! The writing side is here too: [`ustar_block`], one header block and its
 //! checksum; [`pad`], the padding that follows an entry's data; and
@@ -428,6 +428,18 @@ impl<R: Read> TarReader<R> {
                     }
                     after_global = true;
                 }
+                // Solaris tar's extended header, from before POSIX settled on
+                // `x`. GNU tar, bsdtar and Python apply its records to the
+                // entry after it, as an `x` header's, and Go reads it as a file
+                // whose data is the records, leaving the entry after it its own
+                // header's name. Whichever this reader took, some other reader
+                // would see different entries, so it is refused.
+                b'X' => {
+                    return Err(self.malformed(
+                        header_offset,
+                        "the archive holds a Solaris extended header (typeflag `X`)",
+                    ));
+                }
                 _ => {
                     // A concrete file entry: fold in the accumulated
                     // metadata, per-entry pax beating GNU long names.
@@ -436,6 +448,14 @@ impl<R: Read> TarReader<R> {
                         entry.path = path;
                     } else if let Some(longname) = gnu_longname {
                         entry.path = longname;
+                    }
+                    // An entry with no name at all. GNU tar substitutes `.`,
+                    // bsdtar skips the entry, and Python and Go report the
+                    // empty name, so readers put the entry in different places
+                    // or nowhere. A pax record cannot state one ([`parse_pax`]),
+                    // so this is the header's own name or a GNU long name.
+                    if entry.path.is_empty() {
+                        return Err(self.malformed(header_offset, "an entry has an empty name"));
                     }
                     if let Some(link) = pax.link_target {
                         entry.link_target = link;
@@ -988,6 +1008,17 @@ fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
     let mut records = PaxRecords::default();
     for field in pax_fields(data) {
         let (key, value) = field?;
+        // An empty value is POSIX's deletion of a record, leaving the header's
+        // own field to stand. bsdtar and Go read one that way, Python as the
+        // empty value, and GNU tar as the empty value for each of these but
+        // `path`. Whichever this reader took, the entry would have another name,
+        // link target or owner to some of them, so one is refused. A numeric
+        // record refuses one as no number, and a record this reader does not
+        // apply keeps it: an empty `SCHILY.acl.default` states that a directory
+        // has no default list.
+        if value.is_empty() && matches!(key, b"path" | b"linkpath" | b"uname" | b"gname") {
+            return Err("a pax path, link target or owner name record is empty");
+        }
         match key {
             // A record's length delimits its value, so a NUL in a name is part
             // of it rather than its end, and no file has such a name. Readers
@@ -1817,6 +1848,42 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_pax_name_link_target_or_owner_is_refused() {
+        // bsdtar and Go read an empty value as the record deleted, the header's
+        // own field standing; Python reads it as the empty value, and GNU tar
+        // does for each of these but `path`.
+        for key in [&b"path"[..], b"linkpath", b"uname", b"gname"] {
+            let err = parse_pax(&pax_record(key, b"")).expect_err("an empty value");
+            assert_eq!(err, "a pax path, link target or owner name record is empty");
+        }
+        // A numeric record refuses one as no number.
+        for key in [&b"size"[..], b"uid", b"gid", b"mtime"] {
+            assert!(parse_pax(&pax_record(key, b"")).is_err(), "{key:?}");
+        }
+        // A record this reader does not apply keeps its empty value, as GNU tar
+        // writes an empty default list for a directory without one.
+        let data = [
+            pax_record(b"SCHILY.acl.default", b""),
+            pax_record(b"SCHILY.xattr.user.k", b""),
+            pax_record(b"comment", b""),
+        ]
+        .concat();
+        let records = parse_pax(&data).unwrap();
+        assert_eq!(records.acl_default.text.as_deref(), Some(&b""[..]));
+
+        // Refused as the archive's, where the header is read.
+        let mut archive = pax_block(b'x', &pax_record(b"path", b""));
+        archive.extend_from_slice(&sized_header(b"hdrname", 0, b'0'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let err = entry_paths(&archive).expect_err("an empty pax path");
+        assert!(
+            matches!(err, ProvisionError::Archive { offset: 0, .. }),
+            "{err:?}",
+        );
+        assert!(err.to_string().contains("record is empty"), "{err}");
+    }
+
+    #[test]
     fn an_entry_that_names_a_directory_and_declares_data_is_refused() {
         // The other side of the rule above. An entry whose resolved name ends
         // in a separator is a directory, and a directory carries no data, so
@@ -2191,6 +2258,45 @@ mod tests {
             let err = entry_paths(&archive).expect_err("a global header out of place");
             assert!(err.to_string().contains(reason), "{err}");
         }
+    }
+
+    #[test]
+    fn a_solaris_extended_header_is_refused() {
+        // GNU tar, bsdtar and Python apply an `X` header's records to the entry
+        // after it and name that entry `renamed`; Go reads the header as a file
+        // and names the entry `victim`.
+        let mut archive = pax_block(b'X', &pax_record(b"path", b"renamed"));
+        archive.extend_from_slice(&sized_header(b"victim", 0, b'0'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let err = entry_paths(&archive).expect_err("a Solaris extended header");
+        assert!(
+            matches!(err, ProvisionError::Archive { offset: 0, .. }),
+            "{err:?}",
+        );
+        assert!(err.to_string().contains("Solaris extended header"), "{err}");
+    }
+
+    #[test]
+    fn an_entry_with_an_empty_name_is_refused() {
+        // GNU tar substitutes `.`, bsdtar skips the entry, and Python and Go
+        // report the empty name. The header's own name and a GNU long name can
+        // each be empty; a pax `path` cannot be.
+        let empty_header = sized_header(b"", 0, b'0').to_vec();
+        let mut empty_long_name = long_link_entry(b'L', b"\0");
+        empty_long_name.extend_from_slice(&sized_header(b"short", 0, b'0'));
+        for mut archive in [empty_header, empty_long_name] {
+            archive.extend_from_slice(&sized_header(b"after", 0, b'0'));
+            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+            let mut reader = TarReader::in_memory(&archive[..]);
+            let err = reader.next_entry().expect_err("an entry with no name");
+            assert!(err.to_string().contains("an empty name"), "{err}");
+            assert!(!reader.not_a_tar(), "a tar archive, if a malformed one");
+        }
+
+        // The root's own entry has a name, and reads.
+        let mut archive = sized_header(b"./", 0, b'5').to_vec();
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        assert_eq!(entry_paths(&archive).unwrap(), [&b"./"[..]]);
     }
 
     #[test]
