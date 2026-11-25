@@ -27,6 +27,11 @@ consumer upgrading can skip it.
 
 ### Security
 
+- A sandbox's cgroup holds the cgroups beneath it to 512, and to 16 levels
+  deep, through `cgroup.max.descendants` and `cgroup.max.depth`. A sandbox's
+  root owns the leaf its cgroup namespace is rooted at, and could create
+  cgroups beneath it without bound, each holding kernel memory for as long as
+  it stands. A further command's cgroup counts against the bound.
 - **Breaking.** A `Restriction` applies the unix-socket restriction by default
   where the kernel enforces it, from Landlock ABI 9, and drops the default
   below, as it drops its default scopes. A restricted command could connect to

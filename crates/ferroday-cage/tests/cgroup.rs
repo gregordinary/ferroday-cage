@@ -1083,6 +1083,39 @@ fn a_caged_command_mounting_its_cgroup_namespace_sees_no_limit_to_lift() {
     assert_held_to_the_limit(&output, &report);
 }
 
+/// A sandbox's root can create cgroups beneath its leaf, and its cgroup holds
+/// them to a bound: 512 beneath it, the leaf among them, 16 levels deep, the
+/// leaf the first. Past either the kernel answers `EAGAIN`.
+#[test]
+fn a_caged_command_creates_a_bounded_tree_of_cgroups() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let output = common::host_userland()
+        .command(REACH_PROBE_PATH)
+        .args(common::rerun_args("probe_reach"))
+        .env(REACH_PROBE, "nest")
+        .resolv_conf(false)
+        .bind_ro(&exe, REACH_PROBE_PATH)
+        .cgroup_parent(parent)
+        .build()
+        .expect("a valid sandbox configuration")
+        .output()
+        .expect("the sandbox runs");
+    let report = reach_report(&output);
+    let eagain = format!("errno {}", libc::EAGAIN);
+    let read = |step: &str| report.get(step).map(String::as_str);
+    assert_eq!(read("mount"), Some("ok"), "{report:?}");
+    assert_eq!(read("deep"), Some("15"), "{report:?}");
+    assert_eq!(read("deep-ended"), Some(eagain.as_str()), "{report:?}");
+    assert_eq!(read("wide"), Some("511"), "{report:?}");
+    assert_eq!(read("wide-ended"), Some(eagain.as_str()), "{report:?}");
+}
+
 /// Starts a child that exits at once in the cgroup at `cgroup`, through
 /// `clone3` with `CLONE_INTO_CGROUP` and a descriptor of the cgroup opened with
 /// `O_PATH`, which no Landlock right governs.
@@ -1161,7 +1194,10 @@ fn lift(file: &Path) -> std::io::Result<()> {
 ///
 /// In a cage it creates a mount and a cgroup namespace of its own, which its
 /// user namespace owns, and mounts cgroup2 there, the hierarchy's root then
-/// being the root of the sandbox's cgroup namespace. In a restriction it uses
+/// being the root of the sandbox's cgroup namespace. Where it is asked to
+/// nest, it then creates cgroups beneath that root, first each inside the
+/// last and then each beside the last, until the kernel refuses one, reporting
+/// how many it made each way, and removes them again. In a restriction it uses
 /// the host's hierarchy: it writes `max` to each `pids.max` from its own
 /// cgroup up to the parent, writes its process id to the `cgroup.procs` of the
 /// cgroup [`REACH_OUTSIDE`] names, and starts a child there with `clone3`.
@@ -1181,7 +1217,7 @@ fn probe_reach() {
     };
     let own = std::fs::read_to_string("/proc/self/cgroup").expect("the probe names its cgroup");
     report("own", &own.trim().trim_start_matches("0::"));
-    if kind == "cage" {
+    if kind == "cage" || kind == "nest" {
         let mount = Path::new("/tmp/cgroup");
         std::fs::create_dir(mount).expect("the sandbox's /tmp is writable");
         // SAFETY: `unshare_unsafe` is unsafe only because
@@ -1204,6 +1240,9 @@ fn probe_reach() {
         report("mount", &attempt(mounted.map_err(Into::into)));
         for file in ["pids.max", "memory.max"] {
             report(file, &attempt(lift(&mount.join(file))));
+        }
+        if kind == "nest" {
+            nest(mount, &report);
         }
     }
     if kind == "restriction" {
@@ -1250,6 +1289,53 @@ fn probe_reach() {
         let _ = thread.join();
     }
     println!("probe done");
+}
+
+/// The most cgroups [`nest`] makes in a line before it gives up waiting for the
+/// kernel to refuse one.
+const NEST_CEILING: usize = 4096;
+
+/// Creates cgroups beneath the hierarchy mounted at `mount`, first each inside
+/// the last and then each beside the last, reporting how many the kernel
+/// allowed each way and the errno that ended each line, and removes them.
+fn nest(mount: &Path, report: &dyn Fn(&str, &dyn std::fmt::Display)) {
+    let attempt = |result: std::io::Result<()>| match result {
+        Ok(()) => "ok".to_string(),
+        Err(err) => format!("errno {}", err.raw_os_error().unwrap_or(0)),
+    };
+    let mut deep = vec![mount.join("nest")];
+    let ended = loop {
+        let next = deep.last().expect("the line starts").clone();
+        if deep.len() > NEST_CEILING {
+            break Ok(());
+        }
+        match std::fs::create_dir(&next) {
+            Ok(()) => deep.push(next.join("nest")),
+            Err(err) => break Err(err),
+        }
+    };
+    deep.pop();
+    report("deep", &deep.len());
+    report("deep-ended", &attempt(ended));
+    for cgroup in deep.iter().rev() {
+        std::fs::remove_dir(cgroup).expect("an empty cgroup is removed");
+    }
+    let mut wide = Vec::new();
+    let ended = loop {
+        let next = mount.join(format!("wide-{}", wide.len()));
+        if wide.len() > NEST_CEILING {
+            break Ok(());
+        }
+        match std::fs::create_dir(&next) {
+            Ok(()) => wide.push(next),
+            Err(err) => break Err(err),
+        }
+    };
+    report("wide", &wide.len());
+    report("wide-ended", &attempt(ended));
+    for cgroup in &wide {
+        std::fs::remove_dir(cgroup).expect("an empty cgroup is removed");
+    }
 }
 
 /// Set in the copy of this test binary that

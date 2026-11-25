@@ -674,6 +674,13 @@ in reach. A [restriction](restriction-fallback.md#cgroups) shares the host's
 cgroup namespace, and builds with a cgroup only where its Landlock grants and
 its seccomp policy keep both out of reach.
 
+The leaf itself is the sandbox's: its root can create cgroups beneath it, and a
+further command's cgroup is created there too. `fcage-<unique>` holds them to
+512 cgroups beneath it, and 16 levels deep, the leaf the first, through
+`cgroup.max.descendants` and `cgroup.max.depth`. Creating one past either fails
+with `EAGAIN`. A cgroup the sandbox leaves beneath the leaf keeps the leaf and
+`fcage-<unique>` from being removed.
+
 The cgroup does three things besides the limits:
 
 - **Whole-tree usage.** `ResourceUsage` gains the tree's processor time from

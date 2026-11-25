@@ -2707,7 +2707,9 @@ impl CageBuilder {
     /// them. A command that mounts the cgroup filesystem in its own namespace
     /// finds neither the limits nor the parent there, whatever the host's mount
     /// options, unless the cgroup filesystem is bound into the sandbox
-    /// writable.
+    /// writable. It can create cgroups beneath the leaf, which
+    /// `fcage-<unique>` holds to 512 beneath it and 16 levels deep, through
+    /// `cgroup.max.descendants` and `cgroup.max.depth`.
     ///
     /// The cgroup is what [`Running::kill`](crate::Running::kill) ends the
     /// whole tree through, descendants that left the command's process tree

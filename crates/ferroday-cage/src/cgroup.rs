@@ -28,6 +28,11 @@
 //! the usage files, `cgroup.events`, and `cgroup.kill`, each of which covers
 //! the cgroup's descendants.
 //!
+//! The leaf is the sandbox's own to create cgroups beneath, as the caller's
+//! user, through a cgroup filesystem it mounts in a namespace of its own, and
+//! each holds kernel memory for as long as it stands. The limits' cgroup bounds
+//! them, a further command's own among them, with [`HIERARCHY_BOUNDS`].
+//!
 //! The running handle reads what the whole tree used from the cgroup once the
 //! command's outcome is known, and removes the leaf and the cgroup then if
 //! nothing is left in them. A kill through the handle or one of its kill
@@ -755,6 +760,22 @@ const CGROUP2_SUPER_MAGIC: rustix::fs::FsWord = 0x6367_7270;
 /// offers them, whether or not a limit needs them.
 const ACCOUNTED: [&str; 2] = ["memory", "pids"];
 
+/// The bounds a sandbox's cgroup holds the cgroups beneath it to, each a file
+/// of the cgroup core's interface and the value written to it before the
+/// [`LEAF`] is created: at most 512 cgroups beneath it, the leaf and a further
+/// command's own among them, and at most 16 levels of them, the leaf the
+/// first. Creating one past either fails with `EAGAIN`.
+///
+/// The values are the library's, not a limit a caller sets. They hold a tree
+/// that creates cgroups without end to a bound, and leave room for what a
+/// sandbox legitimately nests: an init system of its own, which creates a
+/// cgroup a unit, half a dozen levels deep, and the further commands of a
+/// session, each of which is one more beneath the leaf.
+const HIERARCHY_BOUNDS: [(&str, &str); 2] = [
+    ("cgroup.max.descendants", "512"),
+    ("cgroup.max.depth", "16"),
+];
+
 /// The name of the cgroup beneath a sandbox's own that the launch stage joins:
 /// `<parent>/fcage-<unique>/sandbox`.
 ///
@@ -821,8 +842,9 @@ pub(crate) struct Cgroup {
 
 impl Cgroup {
     /// Creates the sandbox's cgroup beneath the plan's parent, enables the
-    /// controllers its limits need, writes the limits, and creates the
-    /// [`LEAF`] beneath it that the launch stage joins.
+    /// controllers its limits need, writes the limits and the
+    /// [`HIERARCHY_BOUNDS`], and creates the [`LEAF`] beneath it that the
+    /// launch stage joins.
     ///
     /// `tied` says whether the launch ties the sandbox to its handles, which
     /// the drop of the last of them then ends through the cgroup.
@@ -972,6 +994,16 @@ impl Cgroup {
                 rustix::io::write(&file, write.value.as_bytes())
                     .map(drop)
                     .map_err(io_error("writing a limit to the sandbox's cgroup", &limit))?;
+            }
+            // The cgroup core's own files, which every cgroup has, so nothing
+            // here is a refusal of the parent's.
+            for (file, value) in HIERARCHY_BOUNDS {
+                let bound = path.join(file);
+                let opened = open_write(&dir, file)
+                    .map_err(io_error("opening a bound of the sandbox's cgroup", &bound))?;
+                rustix::io::write(&opened, value.as_bytes())
+                    .map(drop)
+                    .map_err(io_error("writing a bound to the sandbox's cgroup", &bound))?;
             }
             // The leaf enables no controller for children of its own, so what
             // runs in it, or beneath it, is charged to this cgroup and held to
