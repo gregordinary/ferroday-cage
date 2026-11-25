@@ -157,8 +157,12 @@ enum Origin {
         guest: IpEndpoint,
         server: IpEndpoint,
     },
-    /// A query on the guest TCP connection whose socket this is.
-    Session(SocketHandle),
+    /// A query on the guest TCP connection with this [`Session::id`].
+    ///
+    /// Not its socket's handle: smoltcp gives a removed socket's slot to the
+    /// next one added, so a connection reaped while its queries were in flight
+    /// would hand their answers, and its count of them, to the next.
+    Session(u64),
 }
 
 /// One query relayed to the upstream, and its socket there.
@@ -194,6 +198,9 @@ struct Stream {
 
 /// One guest TCP connection to the nameserver.
 struct Session {
+    /// The connection's own number, which no other connection of this
+    /// nameserver is given; see [`Origin::Session`].
+    id: u64,
     /// The guest-facing smoltcp socket.
     handle: SocketHandle,
     /// The guest endpoint and the nameserver endpoint it connected to, the
@@ -228,6 +235,8 @@ pub(super) struct Nameserver {
     mtu: usize,
     exchanges: Vec<Exchange>,
     sessions: Vec<Session>,
+    /// The next connection's [`Session::id`].
+    next_session: u64,
     outbox: VecDeque<Datagram>,
     /// The names the upstream's answers resolved, by address.
     pins: Pins,
@@ -243,6 +252,7 @@ impl Nameserver {
             mtu: usize::from(mtu),
             exchanges: Vec::new(),
             sessions: Vec::new(),
+            next_session: 0,
             outbox: VecDeque::new(),
             pins: Pins::default(),
             scratch: vec![0; MAX_MESSAGE].into_boxed_slice(),
@@ -342,7 +352,10 @@ impl Nameserver {
         if socket.listen(server).is_err() {
             return false;
         }
+        let id = self.next_session;
+        self.next_session += 1;
         self.sessions.push(Session {
+            id,
             handle: sockets.add(socket),
             guest,
             server,
@@ -417,13 +430,12 @@ impl Nameserver {
         true
     }
 
-    /// How many of the TCP connection `handle`'s queries are in flight
-    /// upstream.
-    fn in_flight(&self, handle: SocketHandle) -> usize {
+    /// How many of the TCP connection `id`'s queries are in flight upstream.
+    fn in_flight(&self, id: u64) -> usize {
         self.exchanges
             .iter()
             .filter(|exchange| {
-                !exchange.done && matches!(exchange.origin, Origin::Session(of) if of == handle)
+                !exchange.done && matches!(exchange.origin, Origin::Session(of) if of == id)
             })
             .count()
     }
@@ -443,11 +455,11 @@ impl Nameserver {
                     });
                 }
             }
-            Origin::Session(handle) => {
+            Origin::Session(id) => {
                 let Some(session) = self
                     .sessions
                     .iter_mut()
-                    .find(|session| session.handle == handle && !session.dead)
+                    .find(|session| session.id == id && !session.dead)
                 else {
                     return;
                 };
@@ -515,11 +527,11 @@ impl Nameserver {
         let mut progress = false;
         let mut index = 0;
         while index < self.sessions.len() {
-            let (handle, guest) = (self.sessions[index].handle, self.sessions[index].guest);
+            let (id, guest) = (self.sessions[index].id, self.sessions[index].guest);
             while let Some(query) = self.next_query(index, sockets) {
                 progress = true;
                 self.sessions[index].last_active = now;
-                let origin = Origin::Session(handle);
+                let origin = Origin::Session(id);
                 match dns::read_query(&query) {
                     Ok(read) => self.take(origin, guest, read, policy, reports, now),
                     // A response, or a fragment of a header, has nothing to
@@ -543,7 +555,7 @@ impl Nameserver {
     /// A length prefix of zero, or past [`dns::MAX_QUERY`], names no query the
     /// nameserver takes, and the connection is reset.
     fn next_query(&mut self, index: usize, sockets: &mut SocketSet<'static>) -> Option<Vec<u8>> {
-        let in_flight = self.in_flight(self.sessions[index].handle);
+        let in_flight = self.in_flight(self.sessions[index].id);
         let session = &mut self.sessions[index];
         if session.dead
             || session.closing
@@ -579,7 +591,7 @@ impl Nameserver {
     fn flush_sessions(&mut self, sockets: &mut SocketSet<'static>, now: Instant) -> bool {
         let mut progress = false;
         for index in 0..self.sessions.len() {
-            let in_flight = self.in_flight(self.sessions[index].handle);
+            let in_flight = self.in_flight(self.sessions[index].id);
             let session = &mut self.sessions[index];
             if session.dead {
                 continue;
@@ -766,14 +778,22 @@ impl Nameserver {
     }
 
     /// Removes the finished exchanges, and the ended sessions with their
-    /// sockets.
+    /// sockets and the exchanges whose answers were theirs, which have
+    /// nowhere left to go.
     pub(super) fn reap(&mut self, sockets: &mut SocketSet<'static>) {
-        self.exchanges.retain(|exchange| !exchange.done);
         self.sessions.retain(|session| {
             if session.dead {
                 sockets.remove(session.handle);
             }
             !session.dead
+        });
+        let sessions = &self.sessions;
+        self.exchanges.retain(|exchange| {
+            !exchange.done
+                && match exchange.origin {
+                    Origin::Session(id) => sessions.iter().any(|session| session.id == id),
+                    Origin::Datagram { .. } => true,
+                }
         });
     }
 }
@@ -1055,6 +1075,7 @@ mod tests {
         ));
         let mut nameserver = Nameserver::new("127.0.0.1:53".parse().unwrap(), 1500);
         nameserver.sessions.push(Session {
+            id: 0,
             handle,
             guest: IpEndpoint::new(smoltcp::wire::IpAddress::v4(10, 0, 2, 15), 40000),
             server: IpEndpoint::new(smoltcp::wire::IpAddress::v4(10, 0, 2, 3), PORT),
@@ -1067,7 +1088,7 @@ mod tests {
         let query = query_under(11);
         let now = Instant::now();
         nameserver.exchanges.push(Exchange {
-            origin: Origin::Session(handle),
+            origin: Origin::Session(0),
             query: query.clone(),
             name: Arc::from("example.com"),
             id: 11,
@@ -1087,9 +1108,58 @@ mod tests {
         assert_eq!(backlog[2..4], query[..2], "under the query's id");
         assert_eq!(backlog[5] & 0x0f, Rcode::ServerFailure as u8);
         assert_eq!(
-            nameserver.in_flight(handle),
+            nameserver.in_flight(0),
             0,
             "the query is no longer in flight"
+        );
+    }
+
+    #[test]
+    fn a_reaped_session_s_queries_are_not_the_next_one_s() {
+        // smoltcp gives a removed socket's slot to the next socket added, so a
+        // connection keyed by its handle would inherit the queries, and the
+        // answers, of the one reaped before it.
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut nameserver = Nameserver::new("127.0.0.1:53".parse().unwrap(), 1500);
+        let guest = |port| IpEndpoint::new(smoltcp::wire::IpAddress::v4(10, 0, 2, 15), port);
+        let server = IpEndpoint::new(smoltcp::wire::IpAddress::v4(10, 0, 2, 3), PORT);
+        let now = Instant::now();
+        assert!(nameserver.open_session(&mut sockets, guest(40000), server, now));
+        let (first, first_handle) = (nameserver.sessions[0].id, nameserver.sessions[0].handle);
+        let (host, _upstream) = upstream_pair(SocketType::STREAM);
+        nameserver.exchanges.push(Exchange {
+            origin: Origin::Session(first),
+            query: query_under(5),
+            name: Arc::from("example.com"),
+            id: 5,
+            host,
+            stream: Some(Stream {
+                out: Vec::new(),
+                written: 0,
+                inbound: Vec::new(),
+            }),
+            deadline: now + std::time::Duration::from_secs(10),
+            done: false,
+        });
+        nameserver.sessions[0].dead = true;
+        nameserver.reap(&mut sockets);
+        assert!(
+            nameserver.exchanges.is_empty(),
+            "its queries went with it, having nowhere to answer"
+        );
+
+        assert!(nameserver.open_session(&mut sockets, guest(40001), server, now));
+        let second = nameserver.sessions[0].id;
+        assert_eq!(
+            nameserver.sessions[0].handle, first_handle,
+            "the slot is reused"
+        );
+        assert_ne!(second, first);
+        assert_eq!(nameserver.in_flight(second), 0);
+        nameserver.deliver(Origin::Session(first), vec![0; 12]);
+        assert!(
+            nameserver.sessions[0].backlog.is_empty(),
+            "an answer for the reaped connection reached the next"
         );
     }
 

@@ -459,6 +459,10 @@ consumer upgrading can skip it.
   as a request, and holds its host to the rules. It carried a request whose
   method ran past 32 bytes unread, while Go's `net/http` takes a method of any
   length and routes by the request's `Host`.
+- The network stack's nameserver keeps a guest TCP connection's queries apart
+  from the next connection's. It keyed them by the connection's socket handle,
+  which smoltcp reuses once a socket is removed, so a connection reaped with
+  queries in flight handed their answers, and its count of them, to the next.
 
 ### Internal
 
