@@ -721,6 +721,14 @@ consumer upgrading can skip it.
   at the compatible level, which reads such a member as GNU tar extracts it,
   the bits kept and the list applied, so an export of a shared setgid
   directory provisions again.
+- **Breaking.** A sparse member, in GNU's old form or, in a `Tarball`, any of
+  its pax formats, is extracted as the file it stands for, its holes left as
+  holes, where it was `ProvisionError::EntryUnsupported`. A map the readers
+  extract differently is `ProvisionError::Archive`. Where an archive is read
+  for anything but an extraction, such as a `.deb`'s control archive or a
+  Gentoo binary package's container, a sparse member is
+  `ProvisionError::EntryRefused`. `ProvisionError::EntryUnsupported` is
+  removed, since no entry is refused for its type any more.
 
 ### Fixed
 

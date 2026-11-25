@@ -52,8 +52,13 @@ pub(crate) struct TarReader<R: Read> {
     /// Where in the stream the current member's data has been read to, for a
     /// source that fails while it is read. ferrotape reports the offset of
     /// every failure but one: a source's own, which reaches a `Read` of a
-    /// member's data as the source's error and nothing else.
+    /// member's data as the source's error and nothing else. A sparse
+    /// member's holes are no bytes of the stream, so only its stored data
+    /// counts toward it.
     data_at: u64,
+    /// Whether the current member is sparse, its file holding more than the
+    /// archive stores.
+    sparse: bool,
 }
 
 impl<'a> TarReader<&'a [u8]> {
@@ -78,6 +83,7 @@ impl<R: Read> TarReader<R> {
             path: path.into(),
             not_a_tar: false,
             data_at: 0,
+            sparse: false,
         }
     }
 
@@ -119,22 +125,40 @@ impl<R: Read> TarReader<R> {
     /// that describe the archive rather than a file (a global header holding
     /// only a `comment`) are passed over.
     ///
-    /// A sparse member is refused, with [`ProvisionError::EntryUnsupported`]
-    /// and the type `S`, whichever of GNU's formats wrote it: the old `S`
-    /// type, or a pax format whose header claims a regular file. Its data is
-    /// the file it stands for only once its map is applied, which the
-    /// extractor has no way to do, and no other reader in the crate has a use
-    /// for one.
+    /// A sparse member is refused with [`ProvisionError::EntryRefused`],
+    /// whichever of GNU's formats wrote it: the old `S` type, or a pax format
+    /// whose header claims a regular file. Its data, as
+    /// [`read_data`](Self::read_data) reads it, is the file it stands for, up
+    /// to 2^60 bytes of it, and its [`Entry::size`] that file's length, so a
+    /// reader that sizes a read from the entry, as one hashing or holding a
+    /// member does, must never meet one. Only the extractor reads sparse
+    /// members, through
+    /// [`next_entry_with_sparse`](Self::next_entry_with_sparse).
     pub fn next_entry(&mut self) -> Result<Option<Entry>, ProvisionError> {
+        let entry = self.next_entry_with_sparse()?;
+        if let Some(entry) = &entry
+            && entry.sparse().is_some()
+        {
+            return Err(ProvisionError::EntryRefused {
+                path: PathBuf::from(OsStr::from_bytes(entry.path())),
+                reason: "it is a sparse member, which only an extraction reads".to_string(),
+            });
+        }
+        Ok(entry)
+    }
+
+    /// Advances to the next member as [`next_entry`](Self::next_entry) does,
+    /// yielding a sparse member rather than refusing it.
+    ///
+    /// For the extractor, which writes a sparse member's file with its holes:
+    /// its map is the member's [`Entry::sparse`], and
+    /// [`read_stored`](Self::read_stored) reads the regions it stores. A
+    /// sparse member is read in every form the reader's level reads.
+    pub(crate) fn next_entry_with_sparse(&mut self) -> Result<Option<Entry>, ProvisionError> {
         let entry = self.inner.next_entry().map_err(|err| self.failure(err))?;
         if let Some(entry) = &entry {
-            if entry.sparse().is_some() {
-                return Err(ProvisionError::EntryUnsupported {
-                    path: PathBuf::from(OsStr::from_bytes(entry.path())),
-                    kind: b'S',
-                });
-            }
             self.data_at = entry.data_offset();
+            self.sparse = entry.sparse().is_some();
         }
         Ok(entry)
     }
@@ -147,10 +171,36 @@ impl<R: Read> TarReader<R> {
     /// pipe or a socket, in a process whose signal handlers do not restart the
     /// calls they interrupt. Every byte asked for is one the member declares,
     /// so a fill that ends short is an archive that ends inside the member.
+    ///
+    /// A sparse member's data is the file it stands for, its holes as zeros.
     pub fn read_data(&mut self, buf: &mut [u8]) -> Result<usize, ProvisionError> {
-        match self.inner.data().read(buf) {
+        let read = self.inner.data().read(buf);
+        self.counted(read, false)
+    }
+
+    /// Reads the current member's data as the archive stores it into `buf`,
+    /// returning 0 once it is all read: for a sparse member, its regions'
+    /// bytes alone, in the map's order, and for any other, its data as
+    /// [`read_data`](Self::read_data) reads it.
+    ///
+    /// What the holes of a sparse member hold is never read, so passing over
+    /// a member through this costs what the archive holds, where its file
+    /// can be up to 2^60 bytes long.
+    pub fn read_stored(&mut self, buf: &mut [u8]) -> Result<usize, ProvisionError> {
+        let read = self.inner.stored_data().read(buf);
+        self.counted(read, true)
+    }
+
+    /// A read of the member's data, `stored` where it read what the archive
+    /// holds, counted toward where the stream has reached.
+    fn counted(&mut self, read: io::Result<usize>, stored: bool) -> Result<usize, ProvisionError> {
+        match read {
             Ok(got) => {
-                self.data_at += got as u64;
+                // A sparse member's file, read whole, holds bytes of its holes,
+                // which are the reader's rather than the stream's.
+                if stored || !self.sparse {
+                    self.data_at += got as u64;
+                }
                 Ok(got)
             }
             // A refusal of the archive, carried in the `io::Error` a `Read`
@@ -469,18 +519,89 @@ mod tests {
     }
 
     #[test]
-    fn a_sparse_member_is_refused_whichever_form_wrote_it() {
-        // GNU's old form, which nothing in the crate can write as the file it
-        // stands for, is refused for its type rather than read as its stored
-        // regions.
+    fn a_sparse_member_is_refused_where_nothing_extracts_it() {
+        // Read through `next_entry`, a sparse member's size and data are the
+        // file it stands for, which a reader sizing a read from the entry
+        // would hash or hold whole: a member of 2^50 bytes in an archive of a
+        // few blocks.
         let mut tar = Tar::new();
-        tar.gnu_sparse_file("holes", 0o644, &[(4096, b"data"), (8192, b"more")], 1 << 20);
+        tar.gnu_sparse_file("holes", 0o644, &[(4096, b"data")], 1 << 50);
         tar.file("after", 0o644, b"x");
         let err = TarReader::in_memory(&tar.finish())
             .next_entry()
             .expect_err("the sparse member is refused");
         assert!(
-            matches!(&err, ProvisionError::EntryUnsupported { kind: b'S', path } if path == Path::new("holes")),
+            matches!(&err, ProvisionError::EntryRefused { path, .. } if path == Path::new("holes")),
+            "{err:?}",
+        );
+    }
+
+    #[test]
+    fn a_sparse_member_is_read_with_its_map() {
+        // GNU's old form, which the strict level reads: its map is the
+        // member's, its stored regions are read alone, and its file is read
+        // whole with its holes as zeros.
+        let mut tar = Tar::new();
+        tar.gnu_sparse_file("holes", 0o644, &[(4096, b"data"), (8192, b"more")], 1 << 20);
+        tar.file("after", 0o644, b"x");
+        let archive = tar.finish();
+
+        let mut reader = TarReader::in_memory(&archive);
+        let entry = reader
+            .next_entry_with_sparse()
+            .expect("it reads")
+            .expect("a member");
+        let map: Vec<(u64, u64)> = entry
+            .sparse()
+            .expect("a sparse member")
+            .regions()
+            .iter()
+            .map(|region| (region.offset(), region.length()))
+            .collect();
+        assert_eq!(map, [(4096, 4), (8192, 4), (1 << 20, 0)]);
+        assert_eq!(entry.size(), 1 << 20);
+        let mut stored = Vec::new();
+        let mut buf = [0u8; 3];
+        loop {
+            let got = reader.read_stored(&mut buf).expect("the regions read");
+            if got == 0 {
+                break;
+            }
+            stored.extend_from_slice(&buf[..got]);
+        }
+        assert_eq!(stored, b"datamore");
+        let after = reader.next_entry().expect("it reads").expect("a member");
+        assert_eq!(after.path(), b"after");
+
+        let mut reader = TarReader::in_memory(&archive);
+        reader.next_entry_with_sparse().expect("it reads");
+        let mut file = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let got = reader.read_data(&mut buf).expect("the file reads");
+            if got == 0 {
+                break;
+            }
+            file.extend_from_slice(&buf[..got]);
+        }
+        assert_eq!(file.len(), 1 << 20);
+        assert_eq!(&file[4096..4100], b"data");
+        assert_eq!(&file[8192..8196], b"more");
+        assert_eq!(file.iter().filter(|byte| **byte != 0).count(), 8);
+    }
+
+    #[test]
+    fn a_sparse_map_the_readers_extract_otherwise_is_refused() {
+        // Regions out of order: GNU tar and Python extract different files,
+        // and bsdtar and Go fail. The refusal names the rule.
+        let mut tar = Tar::new();
+        tar.gnu_sparse_file("holes", 0o644, &[(8192, b"more"), (4096, b"data")], 1 << 20);
+        let err = TarReader::in_memory(&tar.finish())
+            .next_entry_with_sparse()
+            .expect_err("the map is refused");
+        let order = ErrorKind::Sparse(ferrotape::SparseFlaw::Order);
+        assert!(
+            matches!(&err, ProvisionError::Archive { reason, .. } if *reason == order.to_string()),
             "{err:?}",
         );
     }

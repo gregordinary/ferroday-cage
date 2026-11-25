@@ -803,10 +803,11 @@ filesystem:
   behavior. For a directory that holds whatever path reached it: an entry for
   `usr/lib/private/` and a later one for `lib/private/`, where `lib` links to
   `usr/lib`, describe one directory, and the later one's metadata is what it
-  ends with. A directory no entry describes is `0755`. Sparse members fail
-  with `ProvisionError::EntryUnsupported`, whichever GNU format wrote them.
-  That is the old `S` type, and the pax formats 0.0, 0.1 and 1.0, whose
-  headers claim a regular file.
+  ends with. A directory no entry describes is `0755`. A sparse member is
+  extracted as the file it stands for, its holes left as holes, whichever GNU
+  format wrote it: the old `S` type, or the pax formats 0.0, 0.1 and 1.0,
+  whose headers claim a regular file. The file takes the blocks its data
+  does, whatever length the archive states for it.
 - **An archive that tar readers read differently fails** with
   `ProvisionError::Archive`, which names the rule it breaks. The compatible
   level refuses every archive that GNU `tar`, `bsdtar`, Go's `archive/tar` and

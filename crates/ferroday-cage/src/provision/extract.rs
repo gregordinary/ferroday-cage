@@ -40,7 +40,7 @@ use std::ffi::CString;
 #[cfg(any(feature = "debian", feature = "alpine"))]
 use std::ffi::{CStr, OsStr};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -67,7 +67,7 @@ use super::identity::Ownership;
 use super::rooted::Rooted;
 use super::tar::TarReader;
 use super::xattr;
-use ferrotape::{AclRecords, Entry, EntryKind};
+use ferrotape::{AclRecords, Entry, EntryKind, Sparse};
 
 /// How every path an extraction writes through is resolved: inside the root,
 /// with an absolute link re-anchored there, as the root filesystem resolves it
@@ -647,7 +647,7 @@ impl Extraction {
             if cancelled() {
                 return Err(ProvisionError::Cancelled);
             }
-            let Some(entry) = archive.next_entry()? else {
+            let Some(entry) = archive.next_entry_with_sparse()? else {
                 break;
             };
             // Unextractable without privilege; the sandbox provides its own
@@ -780,6 +780,9 @@ pub(crate) fn extract_archive<R: Read>(
 
 /// Reads past what remains of the current entry's data, asking `cancelled`
 /// every [`CANCEL_EVERY`] bytes.
+///
+/// What is read past is what the archive stores: a sparse member's holes are
+/// no bytes of it, and its file can be up to 2^60 bytes long.
 fn skip_data<R: Read>(
     archive: &mut TarReader<R>,
     cancelled: &mut Cancelled<'_>,
@@ -787,12 +790,61 @@ fn skip_data<R: Read>(
     let mut buf = [0u8; 65536];
     let mut unasked = 0;
     loop {
-        let got = archive.read_data(&mut buf)?;
+        let got = archive.read_stored(&mut buf)?;
         if got == 0 {
             return Ok(());
         }
         paced(&mut unasked, got, cancelled)?;
     }
+}
+
+/// Writes a sparse member's file into `file`, a file just created and empty,
+/// with its holes as holes: each region's bytes where the region begins, and
+/// the length set to the real size at the end, which is what makes a hole at
+/// the end of the file. Only the regions take blocks on disk, so the file's
+/// length, which the archive states and can be up to 2^60 bytes, costs what
+/// the archive holds.
+///
+/// `cancelled` is asked every [`CANCEL_EVERY`] bytes written.
+///
+/// `mechanism::frame::receive_runs` writes runs into a file the same way. Its
+/// runs arrive framed on a descriptor; these come from the archive's map and
+/// its stored data, which the reader frames.
+fn write_sparse<R: Read>(
+    file: &mut File,
+    archive: &mut TarReader<R>,
+    entry: &Entry,
+    sparse: &Sparse,
+    cancelled: &mut Cancelled<'_>,
+) -> Result<(), ProvisionError> {
+    let writing = |err| ProvisionError::io("writing", bytes_to_path(entry.path()), err);
+    let mut buf = [0u8; 65536];
+    let mut unasked = 0;
+    for region in sparse.regions() {
+        if region.length() == 0 {
+            continue;
+        }
+        file.seek(SeekFrom::Start(region.offset()))
+            .map_err(writing)?;
+        let mut left = region.length();
+        while left > 0 {
+            let want = usize::try_from(left).map_or(buf.len(), |left| left.min(buf.len()));
+            let got = archive.read_stored(&mut buf[..want])?;
+            if got == 0 {
+                // The reader refuses an archive that ends inside a member, so
+                // its stored data ending before the map's regions do is a map
+                // it did not hold the member to.
+                return Err(entry_refused(
+                    entry.path(),
+                    "its stored data ends before its map's regions do",
+                ));
+            }
+            file.write_all(&buf[..got]).map_err(writing)?;
+            left -= got as u64;
+            paced(&mut unasked, got, cancelled)?;
+        }
+    }
+    file.set_len(sparse.real_size()).map_err(writing)
 }
 
 /// Counts `got` more bytes of an entry's data into `unasked`, the bytes since
@@ -1185,16 +1237,22 @@ fn extract_file<R: Read>(
     )?;
 
     let mut file = File::from(fd);
-    let mut buf = [0u8; 65536];
-    let mut unasked = 0;
-    loop {
-        let got = archive.read_data(&mut buf)?;
-        if got == 0 {
-            break;
+    match entry.sparse() {
+        Some(sparse) => write_sparse(&mut file, archive, entry, sparse, cancelled)?,
+        None => {
+            let mut buf = [0u8; 65536];
+            let mut unasked = 0;
+            loop {
+                let got = archive.read_data(&mut buf)?;
+                if got == 0 {
+                    break;
+                }
+                file.write_all(&buf[..got]).map_err(|err| {
+                    ProvisionError::io("writing", bytes_to_path(entry.path()), err)
+                })?;
+                paced(&mut unasked, got, cancelled)?;
+            }
         }
-        file.write_all(&buf[..got])
-            .map_err(|err| ProvisionError::io("writing", bytes_to_path(entry.path()), err))?;
-        paced(&mut unasked, got, cancelled)?;
     }
 
     rustix::fs::fchmod(&file, Mode::from_raw_mode(entry.mode())).map_err(|errno| {
@@ -2940,6 +2998,38 @@ mod list_tests {
             );
             assert!(!root.join("special").exists(), "{mode:o}");
         }
+    }
+
+    #[test]
+    fn a_sparse_member_is_written_with_holes_and_skipped_at_what_it_stores() {
+        // A file of 2^50 bytes holding four, in an archive of a few blocks.
+        // Written, it takes its data's blocks; skipped, the extractor passes
+        // over the four bytes the archive stores, never the file its map states.
+        const HUGE: u64 = 1 << 50;
+        let root = Scratch::for_test("extract", "sparse");
+        let mut tar = Tar::new();
+        tar.gnu_sparse_file("skipped", 0o644, &[(HUGE - 4, &b"tail"[..])], HUGE)
+            .gnu_sparse_file("written", 0o644, &[(1 << 20, &b"data"[..])], 2 << 20)
+            .file("after", 0o644, b"x");
+        extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |entry, _| {
+                Ok(if entry.path() == b"skipped" {
+                    Placement::Skip
+                } else {
+                    Placement::Write
+                })
+            },
+            &mut || false,
+        )
+        .expect("the archive extracts");
+        assert!(!root.join("skipped").exists());
+        let written = std::fs::read(root.join("written")).unwrap();
+        assert_eq!(written.len(), 2 << 20);
+        assert_eq!(&written[1 << 20..(1 << 20) + 4], b"data");
+        assert_eq!(written.iter().filter(|byte| **byte != 0).count(), 4);
+        assert_eq!(std::fs::read(root.join("after")).unwrap(), b"x");
     }
 
     #[test]

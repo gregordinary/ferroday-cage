@@ -1742,6 +1742,26 @@ mod tests {
     }
 
     #[test]
+    fn a_sparse_member_is_refused_before_anything_digests_it() {
+        // The scan streams a member it does not hold through a digest before
+        // the Manifest vouches for anything. Read as the file it stands for, a
+        // sparse member's data would be 2^50 bytes of zeros from an archive of
+        // a few blocks, so it is refused rather than digested.
+        let dir = Scratch::for_test("gentoo-gpkg", "sparse-member");
+        let path = dir.join("package.gpkg.tar");
+        let mut tar = ferroday_cage_testkit::tar::Tar::new();
+        tar.file(&format!("zlib-1.3.2-1/{FORMAT_MEMBER}"), 0o644, b"")
+            .gnu_sparse_file("zlib-1.3.2-1/other", 0o644, &[(0, &b"data"[..])], 1 << 50);
+        std::fs::write(&path, tar.finish()).expect("the container is written");
+        let mut file = std::fs::File::open(&path).expect("the container opens");
+        let err = scan(&path, &mut file)
+            .err()
+            .expect("the sparse member is refused");
+        assert!(matches!(err, GentooError::Container { .. }), "{err:?}");
+        assert!(err.to_string().contains("sparse member"), "{err}");
+    }
+
+    #[test]
     fn an_identity_or_a_target_reaches_a_refusal_with_its_control_characters_escaped() {
         // The container's identity and target are fields of its metadata,
         // which nothing holds to an alphabet, and the root's targets are what

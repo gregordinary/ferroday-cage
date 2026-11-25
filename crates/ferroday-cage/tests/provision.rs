@@ -887,26 +887,67 @@ fn a_gzip_tarball_bsdtar_wrote_through_a_pipe_extracts() {
     );
 }
 
+/// Whether the filesystem `dir` is on keeps a file's holes, which a test of
+/// a sparse extraction's blocks needs: a file of a gibibyte holding nothing
+/// takes no block there.
+fn keeps_holes(dir: &Path) -> bool {
+    let probe = dir.join("holes-probe");
+    let file = fs::File::create(&probe).unwrap();
+    file.set_len(1 << 30).unwrap();
+    let kept = file.metadata().unwrap().blocks() == 0;
+    drop(file);
+    fs::remove_file(&probe).unwrap();
+    kept
+}
+
 #[test]
-fn sparse_entries_are_unsupported() {
+fn a_sparse_member_extracts_with_its_holes() {
+    // GNU's old form, which GNU tar writes with `--sparse`: a file of 8 GiB
+    // holding four bytes at its start and four at its end, in an archive of
+    // a few kilobytes. Its holes are written as holes, so the file takes the
+    // blocks its data does and no more.
+    const SIZE: u64 = 8 << 30;
     let mut tar = archive();
-    tar.gnu_sparse_file("sparse-file", 0o644, &[(4096, &b"data"[..])], 1 << 20);
-    let err = provision_err("extract-sparse", &tar.finish());
+    tar.gnu_sparse_file(
+        "big",
+        0o640,
+        &[(0, &b"head"[..]), (SIZE - 4, b"tail")],
+        SIZE,
+    );
+    let archive = tar.finish();
+    assert!(archive.len() < 4096);
+    let rootfs = provision("extract-sparse", &archive);
+    let file = fs::File::open(rootfs.join("big")).unwrap();
+    let meta = file.metadata().unwrap();
+    assert_eq!((meta.len(), meta.mode() & 0o7777), (SIZE, 0o640));
+    let mut ends = [0u8; 4];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut ends, 0).unwrap();
+    assert_eq!(&ends, b"head");
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut ends, SIZE - 4).unwrap();
+    assert_eq!(&ends, b"tail");
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut ends, 1 << 30).unwrap();
+    assert_eq!(ends, [0; 4]);
+    if !keeps_holes(rootfs.parent().unwrap()) {
+        ferroday_cage_testkit::require::FILESYSTEM
+            .skip("this filesystem keeps no holes in a sparse file");
+        return;
+    }
     assert!(
-        matches!(err, ProvisionError::EntryUnsupported { kind: b'S', .. }),
-        "{err}"
+        meta.blocks() * 512 <= 1 << 20,
+        "{} bytes of blocks for 8 bytes of data",
+        meta.blocks() * 512,
     );
 }
 
 #[test]
-fn pax_sparse_members_are_unsupported_in_every_format() {
+fn pax_sparse_members_extract_in_every_format() {
     // GNU tar's pax sparse formats write a regular file's `0` typeflag and say
-    // the member is sparse only in `GNU.sparse.*` records. Taken at its word,
-    // 0.0 extracts the packed data as the whole file, and 0.1 and 1.0 extract a
-    // `GNUSparseFile.<pid>/` directory holding the map and the packed data,
-    // with the real path missing. Each record set below is the one GNU tar 1.35
-    // writes for a 10 MiB file holding 4 KiB of data, in that format: its map
-    // ends in an empty region at the real size.
+    // the member is sparse only in `GNU.sparse.*` records. A tarball is read at
+    // the compatible level, which reads each in the shapes GNU tar and bsdtar
+    // write, so each extracts as the 10 MiB file holding 4 KiB of data it
+    // stands for, under the name the records give. Each record set below is
+    // the one GNU tar 1.35 writes in that format: its map ends in an empty
+    // region at the real size.
     let packed = [b'd'; 4096];
     let mut map_then_data = b"2\n4997120\n4096\n10485760\n0\n".to_vec();
     map_then_data.resize(512, 0);
@@ -979,10 +1020,18 @@ fn pax_sparse_members_are_unsupported_in_every_format() {
         .body(&records)
         .header(stored_name, b'0', 0o644, data.len() as u64, MTIME, b"")
         .body(data);
-        let err = provision_err(&format!("extract-pax-sparse-{format}"), &tar.finish());
-        assert!(
-            matches!(err, ProvisionError::EntryUnsupported { kind: b'S', .. }),
-            "format {format}: {err}"
+        let rootfs = provision(&format!("extract-pax-sparse-{format}"), &tar.finish());
+        let file = fs::read(rootfs.join("holes")).unwrap();
+        assert_eq!(file.len(), 10_485_760, "format {format}");
+        assert_eq!(
+            &file[4_997_120..4_997_120 + 4096],
+            &packed[..],
+            "format {format}"
+        );
+        assert_eq!(
+            file.iter().filter(|byte| **byte != 0).count(),
+            4096,
+            "format {format}"
         );
     }
 }

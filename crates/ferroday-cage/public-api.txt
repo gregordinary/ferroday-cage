@@ -1266,9 +1266,6 @@ pub ferroday_cage::provision::ProvisionError::EntryRefused::reason: alloc::strin
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::EntryUnsafe
 pub ferroday_cage::provision::ProvisionError::EntryUnsafe::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::EntryUnsafe::reason: alloc::string::String
-#[non_exhaustive] pub ferroday_cage::provision::ProvisionError::EntryUnsupported
-pub ferroday_cage::provision::ProvisionError::EntryUnsupported::kind: u8
-pub ferroday_cage::provision::ProvisionError::EntryUnsupported::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::provision::ProvisionError::ExportDestInside
 pub ferroday_cage::provision::ProvisionError::ExportDestInside::path: std::path::PathBuf
 pub ferroday_cage::provision::ProvisionError::ExportDestInside::rootfs: std::path::PathBuf

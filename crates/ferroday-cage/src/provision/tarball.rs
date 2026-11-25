@@ -132,9 +132,10 @@ enum Source {
 ///   group keeps what the list gave it rather than the mask its mode shows. No
 ///   other attribute is applied.
 /// - A later entry for the same path replaces the earlier one, as with
-///   tar itself. Sparse members are unsupported and fail with
-///   [`ProvisionError::EntryUnsupported`]. That includes a sparse member in
-///   any of GNU's pax formats, whose header claims a regular file.
+///   tar itself. A sparse member, in GNU's old form or any of its pax
+///   formats, is extracted as the file it stands for, its holes left as
+///   holes: the file takes the blocks its data does, whatever length the
+///   archive states for it.
 /// - The archive is read by ferrotape at its compatible level, which refuses
 ///   an archive the reference tar readers (GNU tar, bsdtar, Go's
 ///   `archive/tar` and Python's `tarfile`) read differently, as a
