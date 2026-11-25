@@ -540,6 +540,9 @@ consumer upgrading can skip it.
 - A failure the export or copy-in process meets on an entry names that entry's
   path in `ProvisionError::Io`, or the directory it was reading where it failed
   on the directory itself. Both named only the tree's root.
+- The `agent-tools` example takes in what the command committed when serving
+  the command, or waiting for it, fails after it started. It discarded a
+  temporary session then, and the commits in it.
 
 ### Internal
 

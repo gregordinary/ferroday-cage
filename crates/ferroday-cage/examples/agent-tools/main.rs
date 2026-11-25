@@ -282,6 +282,42 @@ impl From<NetStackError> for Failure {
     }
 }
 
+/// Why a launch stopped, and whether the command had started by then, which
+/// is what decides whether a git session has commits to take in.
+enum Launch {
+    /// The launch failed before the command started.
+    NotRun(Failure),
+    /// The command started, and serving it or waiting for it failed.
+    Ran(Failure),
+}
+
+impl Launch {
+    /// The failure, whichever side of the start it was met on.
+    fn failure(self) -> Failure {
+        match self {
+            Launch::NotRun(failure) | Launch::Ran(failure) => failure,
+        }
+    }
+}
+
+impl From<Failure> for Launch {
+    fn from(failure: Failure) -> Launch {
+        Launch::NotRun(failure)
+    }
+}
+
+impl From<Error> for Launch {
+    fn from(error: Error) -> Launch {
+        Launch::NotRun(error.into())
+    }
+}
+
+impl From<NetStackError> for Launch {
+    fn from(error: NetStackError) -> Launch {
+        Launch::NotRun(error.into())
+    }
+}
+
 fn main() -> ExitCode {
     match parse(std::env::args_os().skip(1)) {
         Ok(Invocation::Help) => {
@@ -485,29 +521,38 @@ fn run(config: Config) -> Result<ExitCode, Failure> {
         return Ok(ExitCode::SUCCESS);
     }
     // Once the command has run, what it committed is taken in, whatever its
-    // outcome; a launch that never reached the command leaves nothing to take.
+    // outcome, and whatever failed while it was served; a launch that never
+    // reached the command leaves nothing to take.
     let launched = launch(&config, &worktree, session.as_ref());
     match (session, launched) {
         (Some(session), Ok(code)) => {
             session.finish().map_err(Failure::Own)?;
             Ok(code)
         }
-        (Some(session), Err(failure)) => {
+        (Some(session), Err(Launch::Ran(failure))) => {
+            if let Err(message) = session.finish() {
+                eprintln!("agent-tools: {message}");
+            }
+            Err(failure)
+        }
+        (Some(session), Err(Launch::NotRun(failure))) => {
             session.discard();
             Err(failure)
         }
-        (None, launched) => launched,
+        (None, launched) => launched.map_err(Launch::failure),
     }
 }
 
 /// Launches the command in its sandbox over `worktree`, with the mounts the
 /// git `session` needs where the tree is a repository's, serves its one way out
 /// until it exits, and reports its outcome and what it used.
+///
+/// A failure says whether the command had started ([`Launch`]).
 fn launch(
     config: &Config,
     worktree: &Path,
     session: Option<&git::Session>,
-) -> Result<ExitCode, Failure> {
+) -> Result<ExitCode, Launch> {
     let cgroup = match delegated_cgroup() {
         Ok(parent) => {
             eprintln!(
@@ -562,7 +607,7 @@ fn launch(
         .map_err(|err| Failure::Own(format!("cannot make the listener non-blocking: {err}")))?;
     let mut running = pending.proceed()?;
     let mut escalation = Escalation::new(config.timeout, KILL_AFTER);
-    let status = serve_until_exit(&mut running, &listener, &mut escalation)?;
+    let status = serve_until_exit(&mut running, &listener, &mut escalation).map_err(Launch::Ran)?;
     // The listener and the stack hold the sandbox's network namespace, which
     // nothing needs once the command has exited.
     drop(listener);
