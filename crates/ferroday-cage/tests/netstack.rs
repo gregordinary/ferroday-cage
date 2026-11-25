@@ -1064,19 +1064,18 @@ fn resolver_answer(query: &[u8], records: usize) -> Vec<u8> {
     answer
 }
 
-/// Runs `script` in a sandbox whose `resolv.conf` is `resolv_conf`, with a
+/// Runs `script` in a sandbox whose `resolv.conf` names `nameservers`, with a
 /// stack whose nameserver asks `resolver`, and returns what it printed.
-fn resolve_in_guest(rootfs: &Path, resolver: &Resolver, resolv_conf: &str, script: &str) -> String {
-    let dir = common::scratch_dir(&format!(
-        "netstack-nameserver-{:x}",
-        resolver.address.port()
-    ));
-    let file = dir.join("resolv.conf");
-    std::fs::write(&file, resolv_conf).expect("the resolv.conf is written");
+fn resolve_in_guest(
+    rootfs: &Path,
+    resolver: &Resolver,
+    nameservers: &[&str],
+    script: &str,
+) -> String {
     let mut observer = Collect::default();
     let cage = Cage::builder()
         .rootfs(rootfs)
-        .bind_ro(&file, "/etc/resolv.conf")
+        .nameservers(nameservers.iter().map(|address| address.parse().unwrap()))
         .command("/bin/sh")
         .args(["-c", script])
         .build()
@@ -1110,7 +1109,7 @@ fn the_nameserver_answers_the_guest_from_its_upstream() {
     let printed = resolve_in_guest(
         rootfs,
         &resolver,
-        "nameserver 10.0.2.3\n",
+        &["10.0.2.3"],
         &format!(
             "getent hosts {KNOWN_NAME}; echo known=$?; \
              getent hosts missing.example; echo missing=$?"
@@ -1144,7 +1143,7 @@ fn an_answer_too_long_for_one_packet_reaches_the_guest_over_tcp() {
     let printed = resolve_in_guest(
         rootfs,
         &resolver,
-        "nameserver 10.0.2.3\n",
+        &["10.0.2.3"],
         &format!("getent hosts {KNOWN_NAME}; echo known=$?"),
     );
     assert!(
@@ -1169,7 +1168,7 @@ fn the_nameserver_answers_on_its_ipv6_address() {
     let printed = resolve_in_guest(
         rootfs,
         &resolver,
-        "nameserver fd00::3\n",
+        &["fd00::3"],
         &format!("getent hosts {KNOWN_NAME}; echo known=$?"),
     );
     assert!(printed.contains("known=0"), "{printed}");
@@ -1196,7 +1195,7 @@ fn a_tcp_connection_to_the_nameserver_carries_each_of_its_queries() {
     let printed = resolve_in_guest(
         rootfs,
         &resolver,
-        "nameserver 10.0.2.3\n",
+        &["10.0.2.3"],
         &format!(
             "printf '{}{}' | nc -w 5 10.0.2.3 53 | od -An -v -tx1 | tr -s ' \\n' ' '",
             query("\\022\\064"),

@@ -1185,6 +1185,14 @@ pub(crate) enum MountAction {
         /// Rootfs-relative path to hide.
         target: CString,
     },
+    /// Place a read-only file of the launch's own, holding `contents`, over a
+    /// file target: the `resolv.conf` naming a caller's nameservers.
+    File {
+        /// Rootfs-relative path of the file it covers, which must exist.
+        target: CString,
+        /// What the file holds.
+        contents: Vec<u8>,
+    },
     /// Bind the tree at a path onto itself, read-only, with every mount
     /// beneath it.
     ReadOnly {
@@ -1276,7 +1284,8 @@ impl MountAction {
             MountAction::Tmpfs { target, .. }
             | MountAction::Procfs { target }
             | MountAction::Devpts { target, .. }
-            | MountAction::Hide { target } => Some((target, Arrival::Fresh)),
+            | MountAction::Hide { target }
+            | MountAction::File { target, .. } => Some((target, Arrival::Fresh)),
             MountAction::Bind { target, .. } | MountAction::ReadOnly { target } => {
                 Some((target, Arrival::Tree))
             }

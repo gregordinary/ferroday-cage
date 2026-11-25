@@ -422,12 +422,26 @@ resolves for the sandbox as it does for the host, split DNS and VPN routes
 included.
 
 The sandbox's `resolv.conf` has to name the nameserver for the guest to ask it.
-A caller writes one naming the addresses `nameservers` returns and binds it at
-`/etc/resolv.conf`:
+[`CageBuilder::nameservers`] places one, a file of the sandbox's own, under the
+same rules as the library's other managed mounts:
 
-```text
-nameserver 10.0.2.3
-nameserver fd00::3
+```rust,no_run
+# use ferroday_cage::{Cage, NetStack};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let stack = NetStack::default();
+let cage = Cage::builder()
+    .rootfs("/srv/rootfs")
+    .nameservers(stack.nameservers())
+    .command("/usr/bin/job")
+    .build()?;
+let pending = cage.spawn_pending()?;
+let handle = stack.attach(&pending)?;
+let mut running = pending.proceed()?;
+let status = running.wait()?;
+handle.stop()?;
+# let _ = status;
+# Ok(())
+# }
 ```
 
 Each query goes upstream on a socket of its own, over the transport the guest
@@ -575,6 +589,7 @@ outside the sandbox and is not filtered.
 [`NetStack::default`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html
 [`NetStack::forwards`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.forwards
 [`NetStack::nameservers`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStack.html#method.nameservers
+[`CageBuilder::nameservers`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.nameservers
 [`CageBuilder::get_resolv_conf`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.get_resolv_conf
 [`NetStackBuilder`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html
 [`NetStackBuilder::ipv4`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.NetStackBuilder.html#method.ipv4

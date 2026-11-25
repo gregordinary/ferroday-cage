@@ -124,7 +124,7 @@ model](process-model.md) describes.
     root](#an-empty-root) has no path: it is a tmpfs created for the launch.
 13. **The mount profile.** The init executes the frozen mount operations in
     order: the fresh `/proc`, the minimal `/dev`, the `/tmp` tmpfs, the
-    caller's own mounts, and the `resolv.conf` bind, as configured. Bind
+    caller's own mounts, and the managed `resolv.conf`, as configured. Bind
     sources are host paths, canonical at build time, and are opened as the
     root's path is, refusing a symbolic link, while the host tree is still
     mounted; each bind is cloned from that descriptor. Targets resolve against
@@ -402,7 +402,7 @@ can be disabled:
 - **`/tmp`** is a fresh tmpfs.
 
 The caller's own mounts apply after the managed profile, in configuration
-order, with one exception: the `resolv.conf` bind is applied last of all.
+order, with one exception: the managed `resolv.conf` is applied last of all.
 Binds, raw mounts (see [Profiles](profiles.md) for the escape hatch), and
 symbolic links share one sequence rather than being applied kind by kind. A
 mount that covers a path an earlier one established can then be ordered
@@ -430,16 +430,23 @@ without naming the host path the bind came from. Its path must exist when the
 sequence reaches it: a path left writable because it was missing is one the
 command could create.
 
-Last, the host's `resolv.conf` — resolved to its real file — is bound
-read-only onto `/etc/resolv.conf` when the host network is shared. Unless the
-caller mounted that target themselves: a mount of their own there replaces this
-one rather than sitting under it, so applying it last does not take back the
-rule that among the caller's mounts the order is theirs. Every kind of mount
-counts, a raw mount as much as a bind, and so does a link of the caller's at
-the target. A bind or a link of the caller's at a directory above the target,
-such as `/etc`, counts too. That directory is the caller's own, or where the
-link sends it, and the target would otherwise be created there. A tmpfs there
-is the sandbox's own, and the bind lands in it.
+Last comes the managed `resolv.conf`. Where
+[`nameservers`](https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.nameservers)
+names some, it is a file of the sandbox's own, under every network. The file
+holds a `nameserver` line for each, bound read-only from a tmpfs of its own as a
+hidden file is. Otherwise the host's `resolv.conf`, resolved to its real file,
+is bound read-only onto `/etc/resolv.conf` when the host network is shared.
+
+Neither is placed where the caller mounted that target themselves. A mount of
+their own there replaces this one rather than sitting under it. Applying it
+last therefore does not take back the rule that among the caller's mounts the
+order is theirs.
+
+Every kind of mount counts, a raw mount as much as a bind, and so does a
+link of the caller's at the target. A bind or a link of the caller's at a
+directory above the target, such as `/etc`, counts too. That directory is the
+caller's own, or where the link sends it, and the target would otherwise be
+created there. A tmpfs there is the sandbox's own, and the file lands in it.
 
 ### A read-only bind is a boundary
 
@@ -533,9 +540,12 @@ sandbox mounts must already exist, and `build` refuses one missing from the
 host with `ConfigError::MountTargetMissing`. Inside a hidden directory, the
 managed `/tmp`, or another tmpfs of the sandbox's own, a target is created as on
 any root. A symbolic link of the caller's is made only inside such a filesystem.
+
 With `Network::Host`, the host's `/etc/resolv.conf` is the sandbox's own and no
 `resolv.conf` is bound. A `resolv.conf` that links into `/run` reads through the
 hidden `/run`, and binding the file it links to at its own path brings it back.
+`nameservers` places its file at that path, inside the hidden `/run`, so the
+sandbox reads it through the link.
 
 The clone and its read-only marking need `mount_setattr`, which arrived in Linux
 5.12. An older kernel fails the launch at `SetupStep::MountHostRoot`, since a

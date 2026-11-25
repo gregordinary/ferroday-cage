@@ -1757,6 +1757,25 @@ const FLAGS: &[Flag] = &[
         ..Flag::DEFAULTS
     },
     Flag {
+        long: "--nameserver",
+        section: Section::Networking,
+        placeholder: "ADDRESS",
+        help: &[
+            "Name ADDRESS in the sandbox's resolv.conf, a file of",
+            "its own in place of the rootfs's and the host's",
+            "(repeatable, at most three)",
+        ],
+        take: Take::One(|options, flag, value| {
+            let value = into_string(flag, value)?;
+            let address = value
+                .parse::<IpAddr>()
+                .map_err(|_| format!("{flag} expects an IP address, not {value:?}"))?;
+            options.nameservers.push(address);
+            Ok(())
+        }),
+        ..Flag::DEFAULTS
+    },
+    Flag {
         long: "--forward-loopback",
         section: Section::Networking,
         placeholder: "PORT TARGET",
@@ -2685,6 +2704,7 @@ struct Options {
     mount_dev: Option<bool>,
     mount_tmp: Option<bool>,
     resolv_conf: Option<bool>,
+    nameservers: Vec<IpAddr>,
     managed_mounts: Option<bool>,
     base_env: Option<bool>,
     stop_with_caller: Option<bool>,
@@ -3229,6 +3249,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         mount_dev: None,
         mount_tmp: None,
         resolv_conf: None,
+        nameservers: Vec::new(),
         managed_mounts: None,
         base_env: None,
         // `None` like every other toggle, so a profile's setting survives. The
@@ -5492,6 +5513,9 @@ impl Launch {
         }
         if let Some(bind) = options.resolv_conf {
             builder = builder.resolv_conf(bind);
+        }
+        if !options.nameservers.is_empty() {
+            builder = builder.nameservers(options.nameservers.iter().copied());
         }
         if let Some(managed) = options.managed_mounts {
             builder = builder.managed_mounts(managed);
@@ -10154,6 +10178,33 @@ mod tests {
     }
 
     #[test]
+    fn nameserver_takes_addresses_in_order() {
+        let options = run_options(&[
+            "--rootfs",
+            "/r",
+            "--nameserver",
+            "192.0.2.53",
+            "--nameserver",
+            "2001:db8::53",
+            "/bin/true",
+        ]);
+        assert_eq!(
+            options.nameservers,
+            [
+                "192.0.2.53".parse::<IpAddr>().unwrap(),
+                "2001:db8::53".parse().unwrap()
+            ],
+        );
+        let err = parse_run(&["--rootfs", "/r", "--nameserver", "ns.example", "/bin/true"])
+            .err()
+            .expect("a name is no address");
+        assert!(
+            err.contains("IP address") && err.contains("ns.example"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn the_nameserver_flags_reach_the_stack() {
         assert_eq!(
             parse_upstream("--netstack-upstream", "127.0.0.53").unwrap(),
@@ -10302,7 +10353,7 @@ mod tests {
             "--netstack-mtu" => &["1400"],
             "--netstack-host-port" | "--landlock-bind" | "--landlock-connect" => &["80"],
             "--netstack-publish" => &["8080", "80"],
-            "--netstack-upstream" => &["127.0.0.53"],
+            "--netstack-upstream" | "--nameserver" => &["127.0.0.53"],
             "--landlock-scope" => &["signal"],
             "--seccomp" => &["curated"],
             "--seccomp-allow"

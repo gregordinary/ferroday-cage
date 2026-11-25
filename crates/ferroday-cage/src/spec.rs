@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::net::IpAddr;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
@@ -114,6 +115,13 @@ const RESOLV_CONF_TARGET: &CStr = c"etc/resolv.conf";
 /// mount whose target or flags [`build`](CageBuilder::build) refuses claims
 /// nothing, since no sandbox is built with it.
 fn claims_resolv_conf(mount: &Mount) -> bool {
+    claims_target(mount, RESOLV_CONF_TARGET)
+}
+
+/// Whether a mount of the caller's claims the root-relative file `file`, by
+/// the rule [`claims_resolv_conf`] states for `/etc/resolv.conf`: a mount at
+/// it, or a tree, a link or a path made read-only at a directory above it.
+fn claims_target(mount: &Mount, file: &CStr) -> bool {
     let arrival = match mount {
         // A link at the target or above it decides what the path names, as a
         // tree mounted there would. A path made read-only is a tree bound onto
@@ -130,9 +138,12 @@ fn claims_resolv_conf(mount: &Mount) -> bool {
     let (Some(arrival), Ok(target)) = (arrival, target) else {
         return false;
     };
-    target.as_c_str() == RESOLV_CONF_TARGET
-        || (arrival == Arrival::Tree && covers(&target, RESOLV_CONF_TARGET))
+    target.as_c_str() == file || (arrival == Arrival::Tree && covers(&target, file))
 }
+
+/// The most nameservers a `resolv.conf` names that the C libraries read: glibc
+/// and musl both stop at three (`MAXNS`).
+const MAX_NAMESERVERS: usize = 3;
 
 /// The mode of a mount point standing in for a world-writable sticky
 /// directory: `/tmp` and `/dev/shm`, which the profile covers with a
@@ -1371,6 +1382,8 @@ pub struct CageBuilder {
     mount_tmp: Option<bool>,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     resolv_conf: Option<bool>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Vec::is_empty"))]
+    nameservers: Vec<IpAddr>,
     // Whether the library's deterministic base environment is composed under
     // the caller's variables. `false` means the command's environment is
     // exactly what the caller set, with nothing of the library's underneath.
@@ -1509,6 +1522,7 @@ impl Default for CageBuilder {
             mount_dev: None,
             mount_tmp: None,
             resolv_conf: None,
+            nameservers: Vec::new(),
             base_env: None,
             stop_with_caller: false,
             path_lookup: false,
@@ -2507,8 +2521,9 @@ impl CageBuilder {
         self
     }
 
-    /// Controls whether the host's `resolv.conf` is bound into the sandbox
-    /// (default `true`).
+    /// Controls whether the library places a `resolv.conf` in the sandbox
+    /// (default `true`): the file [`nameservers`](Self::nameservers) composes
+    /// where it names some, and otherwise the host's own, bound in.
     ///
     /// A [`bind`](Self::bind) of the caller's own onto `/etc/resolv.conf`
     /// replaces the managed bind rather than sitting under it, so a caller who
@@ -2536,6 +2551,40 @@ impl CageBuilder {
     /// [`bind`](Self::bind).
     pub fn resolv_conf(mut self, bind: bool) -> Self {
         self.resolv_conf = Some(bind);
+        self
+    }
+
+    /// Names the sandbox's nameservers: its `/etc/resolv.conf` is a read-only
+    /// file of the launch's own holding a `nameserver` line for each, in the
+    /// order given, in place of the root's own and of the host's
+    /// [bind](Self::resolv_conf). It applies under every [`Network`]. Each call
+    /// replaces the list before it, and an empty list names none, which is the
+    /// default.
+    ///
+    /// It is the managed `resolv.conf` in another form, so it yields as the
+    /// host's bind does: a mount of the caller's own at `/etc/resolv.conf`, or a
+    /// tree of theirs over `/etc`, replaces it. A root that ships no
+    /// `/etc/resolv.conf` gets an empty one created to mount onto, removed once
+    /// the sandbox is gone. Under the [host's own root](Self::host_rootfs) the
+    /// file is placed where the host's `/etc/resolv.conf` leads, so a link into
+    /// the hidden `/run` reads it, and [`build`](Self::build) refuses a host
+    /// without that file with [`ConfigError::MountTargetMissing`].
+    ///
+    /// `build` refuses a list alongside [`resolv_conf(false)`](Self::resolv_conf)
+    /// with [`ConfigError::ResolvConfContradiction`], and alongside
+    /// [`managed_mounts(false)`](Self::managed_mounts) with
+    /// [`ConfigError::ManagedMountsContradiction`]. The C libraries read three
+    /// nameservers at most, so it refuses a fourth with
+    /// [`ConfigError::TooManyNameservers`], and an unspecified address, which
+    /// names no server, with [`ConfigError::NameserverInvalid`].
+    #[cfg_attr(
+        feature = "netstack",
+        doc = "",
+        doc = "A sandbox on the native network stack names the stack's own nameserver, \
+               which [`NetStack::nameservers`](crate::NetStack::nameservers) returns."
+    )]
+    pub fn nameservers(mut self, nameservers: impl IntoIterator<Item = IpAddr>) -> Self {
+        self.nameservers = nameservers.into_iter().collect();
         self
     }
 
@@ -2673,22 +2722,30 @@ impl CageBuilder {
         self.network
     }
 
-    /// Whether the host's `resolv.conf` bind is made: the
+    /// Whether the managed `resolv.conf` is wanted: the
     /// [`resolv_conf`](Self::resolv_conf) setting, with the managed-mount
     /// master switch folded in, and with the caller's own claim on the target.
     ///
     /// A mount or a symlink of the caller's at `/etc/resolv.conf`, a host tree
     /// bound or moved over a directory above it, or a symlink at such a
-    /// directory, replaces the bind, so this answers `false` for a sandbox
-    /// carrying one. So does the [host's own root](Self::host_rootfs), whose
-    /// `/etc` is the host's already. The library acts on this only under
-    /// [`Network::Host`]. A caller that composes resolver configuration of its
-    /// own, as `fcage` does for a native-stack run, reads it to honor the same
-    /// opt-outs and to yield to the same mounts.
+    /// directory, replaces the managed file, so this answers `false` for a
+    /// sandbox carrying one.
+    ///
+    /// The library places the file [`nameservers`](Self::nameservers) composes
+    /// where it names some, under any network. Otherwise it binds the host's own
+    /// under [`Network::Host`], except under the [host's own
+    /// root](Self::host_rootfs), whose `/etc` is the host's already. A caller
+    /// deciding whether to name nameservers, as `fcage` does for a native-stack
+    /// run, reads this to honor the same opt-outs and to yield to the same
+    /// mounts.
     pub fn get_resolv_conf(&self) -> bool {
-        self.managed(self.resolv_conf)
-            && !self.host_rootfs
-            && !self.mounts.iter().any(claims_resolv_conf)
+        self.managed(self.resolv_conf) && !self.mounts.iter().any(claims_resolv_conf)
+    }
+
+    /// The nameservers the sandbox's `resolv.conf` names; see
+    /// [`nameservers`](Self::nameservers).
+    pub fn get_nameservers(&self) -> &[IpAddr] {
+        &self.nameservers
     }
 
     /// Whether the sandbox gets its own PID namespace.
@@ -2828,11 +2885,34 @@ impl CageBuilder {
                 (self.mount_dev, "mount_dev"),
                 (self.mount_tmp, "mount_tmp"),
                 (self.resolv_conf, "resolv_conf"),
+                (
+                    (!self.nameservers.is_empty()).then_some(true),
+                    "nameservers",
+                ),
             ] {
                 if toggle == Some(true) {
                     return Err(ConfigError::ManagedMountsContradiction { toggle: name }.into());
                 }
             }
+        }
+        // The same contradiction one switch down: the managed `resolv.conf`
+        // declined, and the servers for it named.
+        if self.resolv_conf == Some(false) && !self.nameservers.is_empty() {
+            return Err(ConfigError::ResolvConfContradiction.into());
+        }
+        if self.nameservers.len() > MAX_NAMESERVERS {
+            return Err(ConfigError::TooManyNameservers {
+                count: self.nameservers.len(),
+                max: MAX_NAMESERVERS,
+            }
+            .into());
+        }
+        if let Some(&nameserver) = self.nameservers.iter().find(|ns| ns.is_unspecified()) {
+            return Err(ConfigError::NameserverInvalid {
+                nameserver,
+                reason: "the unspecified address names no server",
+            }
+            .into());
         }
 
         // The managed profile resolved to plain booleans up front, before any
@@ -3010,21 +3090,27 @@ impl CageBuilder {
                 Mount::ReadOnly(read_only) => lowering.push_read_only(read_only)?,
             }
         }
-        // The host's own root is read-only and the launch creates nothing in
-        // it, so every target outside a filesystem the sandbox mounts must
-        // already be there.
-        if self.host_rootfs {
-            settle_host_root_targets(&mut lowering.ops)?;
-        }
-        // The managed `resolv.conf` bind, which `resolv_conf` above already
+        // The managed `resolv.conf`, which `resolv_conf` above already
         // withholds where the caller mounted something of their own at that
         // target, or a tree of their own over it. Theirs was pushed by the loop
         // above and this would land on top of it, which takes back the "among
         // the caller's own, the order is theirs" rule for the one mount they
         // were most deliberate about. A caller who mounts it has replaced the
-        // managed one as surely as `resolv_conf(false)` declines it.
-        if resolv_conf && matches!(self.network, Network::Host) {
-            lowering.push_resolv_conf()?;
+        // managed one as surely as `resolv_conf(false)` declines it. It is
+        // pushed before the host root's targets are settled, so a file placed
+        // beneath a hidden path is created in that path's tmpfs.
+        if resolv_conf {
+            if !self.nameservers.is_empty() {
+                lowering.push_nameservers(&self.nameservers, self.host_rootfs, &self.mounts)?;
+            } else if matches!(self.network, Network::Host) && !self.host_rootfs {
+                lowering.push_resolv_conf()?;
+            }
+        }
+        // The host's own root is read-only and the launch creates nothing in
+        // it, so every target outside a filesystem the sandbox mounts must
+        // already be there.
+        if self.host_rootfs {
+            settle_host_root_targets(&mut lowering.ops)?;
         }
 
         // The presented identity: the single-identity map's one id as the
@@ -3435,6 +3521,9 @@ impl CageBuilder {
             mount_dev: _,
             mount_tmp: _,
             resolv_conf: _,
+            // Addresses written into a file of the launch's own, which maps
+            // nothing of the host in.
+            nameservers: _,
             // Both narrow the sandbox rather than widen it. Opting out of the
             // managed mounts removes mounts; opting out of the base
             // environment removes variables. Neither can reach a host resource
@@ -5000,6 +5089,62 @@ impl Lowering {
         Ok(())
     }
 
+    /// The sandbox's `resolv.conf` as a file of the launch's own naming
+    /// `nameservers`, placed at the path the sandbox reads it through:
+    /// `/etc/resolv.conf`, or under the host's own root, the file the host's
+    /// leads to. Nothing is pushed where a mount of the caller's claims that
+    /// file.
+    ///
+    /// The target is created where the root ships nothing there, and removed
+    /// once the sandbox is gone, as the host's bind's is; see
+    /// [`push_resolv_conf`](Self::push_resolv_conf).
+    fn push_nameservers(
+        &mut self,
+        nameservers: &[IpAddr],
+        host_rootfs: bool,
+        mounts: &[Mount],
+    ) -> Result<(), Error> {
+        // The host's own root shows the host's `/etc`, so the sandbox reads its
+        // `resolv.conf` through whatever link the host keeps there, commonly one
+        // into the hidden `/run`. The file goes where the link leads, created in
+        // the hidden path's tmpfs. A host without the file leads nowhere, and
+        // settling the host root's targets refuses the one named here.
+        let target = if host_rootfs {
+            std::fs::canonicalize(RESOLV_CONF).unwrap_or_else(|_| PathBuf::from(RESOLV_CONF))
+        } else {
+            PathBuf::from(RESOLV_CONF)
+        };
+        let components = path::absolute_components(&target)
+            .expect("the resolv.conf path, and any path canonicalize returns, is absolute");
+        let Some((_, directories)) = components.split_last() else {
+            return Ok(());
+        };
+        let file = rel_cstring(&components)?;
+        // A link at `/etc/resolv.conf` leads elsewhere only under the host's
+        // root, where a mount of the caller's over where it leads claims the
+        // file as one at `/etc/resolv.conf` does.
+        if mounts.iter().any(|mount| claims_target(mount, &file)) {
+            return Ok(());
+        }
+        let contents = nameservers
+            .iter()
+            .map(|nameserver| format!("nameserver {nameserver}\n"))
+            .collect::<String>()
+            .into_bytes();
+        self.push(
+            MountOp {
+                dirs: dir_chain(directories, DIR_MODE)?,
+                create_file: Some(file.clone()),
+                action: MountAction::File {
+                    target: file,
+                    contents,
+                },
+            },
+            target.to_string_lossy().into_owned(),
+        );
+        Ok(())
+    }
+
     /// The host's `resolv.conf`, bound read-only over the rootfs's own.
     ///
     /// Resolving the host's `resolv.conf` can fail — it is commonly a symlink
@@ -5069,7 +5214,8 @@ fn settle_host_root_targets(ops: &mut [MountOp]) -> Result<(), Error> {
             | MountAction::Procfs { target }
             | MountAction::Devpts { target, .. }
             | MountAction::Bind { target, .. }
-            | MountAction::Raw { target, .. } => target.clone(),
+            | MountAction::Raw { target, .. }
+            | MountAction::File { target, .. } => target.clone(),
         };
         let cover = ops[..at]
             .iter()
@@ -7651,6 +7797,145 @@ mod tests {
         assert!(cage.plan.managed_placeholders.is_empty());
     }
 
+    /// What the file the plan places at `target` holds, if it places one.
+    fn placed_file(cage: &Cage, target: &str) -> Option<String> {
+        cage.plan.ops.iter().find_map(|op| match &op.action {
+            MountAction::File {
+                target: at,
+                contents,
+            } if sandbox_path(at) == Path::new(target) => {
+                Some(String::from_utf8_lossy(contents).into_owned())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn named_nameservers_are_a_file_of_the_launchs_own_under_every_network() {
+        let servers = [IpAddr::from([10, 0, 2, 3]), "fd00::3".parse().unwrap()];
+        for network in [Network::Isolated, Network::Host, Network::None] {
+            let cage = sh_in("/tmp")
+                .network(network)
+                .nameservers(servers)
+                .build()
+                .unwrap();
+            assert_eq!(
+                placed_file(&cage, "/etc/resolv.conf").as_deref(),
+                Some("nameserver 10.0.2.3\nnameserver fd00::3\n"),
+                "{network:?}",
+            );
+            // In place of the host's bind, not beside it.
+            let host_bind = cage.plan.ops.iter().any(|op| {
+                matches!(&op.action, MountAction::Bind { target, .. } if target.as_c_str() == RESOLV_CONF_TARGET)
+            });
+            assert!(!host_bind, "{network:?}");
+            assert!(
+                cage.resolved_inputs()
+                    .mounts
+                    .contains(&crate::ResolvedMount::File {
+                        target: PathBuf::from("/etc/resolv.conf"),
+                        contents: "nameserver 10.0.2.3\nnameserver fd00::3\n".to_string(),
+                    }),
+                "the provenance record names the file and what it holds",
+            );
+        }
+        // An empty list names none, and the host's bind stays the default.
+        let none = sh_in("/tmp").nameservers([]).build().unwrap();
+        assert_eq!(placed_file(&none, "/etc/resolv.conf"), None);
+    }
+
+    #[test]
+    fn nameservers_the_build_cannot_place_are_refused() {
+        let one = [IpAddr::from([192, 0, 2, 53])];
+        let err = sh_in("/tmp")
+            .resolv_conf(false)
+            .nameservers(one)
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Config(ConfigError::ResolvConfContradiction)),
+            "{err}"
+        );
+        let err = sh_in("/tmp")
+            .managed_mounts(false)
+            .nameservers(one)
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Config(ConfigError::ManagedMountsContradiction {
+                    toggle: "nameservers"
+                })
+            ),
+            "{err}"
+        );
+        let four = [1, 2, 3, 4].map(|last| IpAddr::from([192, 0, 2, last]));
+        let err = sh_in("/tmp").nameservers(four).build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Config(ConfigError::TooManyNameservers { count: 4, max: 3 })
+            ),
+            "{err}"
+        );
+        sh_in("/tmp")
+            .nameservers(four.into_iter().take(3))
+            .build()
+            .expect("three is the most a resolv.conf is read for");
+        for unspecified in [IpAddr::from([0, 0, 0, 0]), "::".parse().unwrap()] {
+            let err = sh_in("/tmp")
+                .nameservers([unspecified])
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Config(ConfigError::NameserverInvalid { .. })),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callers_own_resolv_conf_replaces_the_named_nameservers() {
+        let one = [IpAddr::from([192, 0, 2, 53])];
+        for claimed in [
+            sh_in("/tmp").bind_ro("/etc/hosts", "/etc/resolv.conf"),
+            sh_in("/tmp").bind_ro("/etc", "/etc"),
+        ] {
+            let claimed = claimed.nameservers(one);
+            assert!(!claimed.get_resolv_conf());
+            assert_eq!(
+                placed_file(&claimed.build().unwrap(), "/etc/resolv.conf"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn under_the_host_root_the_file_goes_where_the_hosts_resolv_conf_leads() {
+        if !resolv_conf_to_bind() {
+            return;
+        }
+        let host_root = || Cage::builder().host_rootfs().command("/bin/sh");
+        assert!(
+            host_root().get_resolv_conf(),
+            "the host's own root takes the file as any root does"
+        );
+        let leads = std::fs::canonicalize("/etc/resolv.conf").unwrap();
+        let cage = host_root()
+            .nameservers([IpAddr::from([192, 0, 2, 53])])
+            .build()
+            .expect("the file's target is the host's, or inside a hidden path");
+        assert_eq!(
+            placed_file(&cage, leads.to_str().unwrap()).as_deref(),
+            Some("nameserver 192.0.2.53\n"),
+        );
+        // A host-network sandbox there binds nothing of the host's: the host's
+        // file is in view already.
+        let host = host_root().network(Network::Host).build().unwrap();
+        assert!(!binds_resolv_conf(&host));
+    }
+
     #[test]
     fn a_callers_own_resolv_conf_mount_replaces_the_managed_one() {
         // The caller's mounts go last so their order is theirs, and a managed
@@ -8693,6 +8978,7 @@ mount-proc = true
 mount-dev = false
 mount-tmp = true
 resolv-conf = false
+nameservers = ["10.0.2.3", "fd00::3"]
 base-env = false
 stop-with-caller = true
 path-lookup = true
@@ -8841,7 +9127,7 @@ target = "/work/.git/hooks"
 
     /// The keys the profiles above render between them, in sorted order.
     #[cfg(feature = "hardening")]
-    const EXPECTED_PROFILE_KEYS: [&str; 106] = [
+    const EXPECTED_PROFILE_KEYS: [&str; 107] = [
         "args",
         "base-env",
         "cgroup",
@@ -8915,6 +9201,7 @@ target = "/work/.git/hooks"
         "mount[].read-only",
         "mount[].source",
         "mount[].target",
+        "nameservers",
         "network",
         "overlay",
         "overlay.lower",
@@ -9117,7 +9404,7 @@ seccomp = "curated"
 landlock-scope = ["signal"]
 resolve-unix = true
 "#,
-        "empty-rootfs = true\n",
+        "empty-rootfs = true\nnameservers = [\"10.0.2.3\"]\n",
     ];
 
     /// Every key of the profile format is either one a profile the restricted
@@ -9621,6 +9908,7 @@ read-only = true
             .mount_dev(false)
             .mount_tmp(false)
             .resolv_conf(false)
+            .nameservers([IpAddr::from([10, 0, 2, 3])])
             .managed_mounts(true)
             .base_env(false)
             .stop_with_caller(true)
@@ -9682,6 +9970,7 @@ read-only = true
                 "mount-dev",
                 "mount-proc",
                 "mount-tmp",
+                "nameservers",
                 "network",
                 "overlay",
                 "path-lookup",

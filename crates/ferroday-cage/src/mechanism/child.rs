@@ -2669,6 +2669,7 @@ fn execute_op(
 
     let done = match &op.action {
         MountAction::Hide { target } => return hide(root, target),
+        MountAction::File { target, contents } => return place_file(root, target, contents),
         MountAction::ReadOnly { target } => {
             let target = open_in_root(root, target, OFlags::PATH)
                 .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
@@ -2773,19 +2774,13 @@ fn execute_op(
 }
 
 /// Hides what `target` names in `root`: an empty tmpfs over a directory, and an
-/// empty read-only file over anything else. Nothing at the path hides nothing.
+/// empty read-only file of the launch's own over anything else. Nothing at the
+/// path hides nothing.
 ///
 /// Returns a hidden directory's tmpfs, writable, so that a later op can still
 /// make a mount point in it; the setup makes it read-only once the profile is
 /// in place. A hidden file is read-only from the start: nothing is made in a
 /// file.
-///
-/// The file is created in a tmpfs of its own and bound over the target, so the
-/// command sees a regular file, not a device. A clone of a path is taken only
-/// of a mount attached in the caller's mount namespace, so that tmpfs is
-/// attached for the moment the clone takes, stacked on the root mount, where no
-/// lookup crosses it, and detached again at once: a lookup that starts at a
-/// mount's root does not cross a mount stacked on that root.
 fn hide(root: BorrowedFd<'_>, target: &CStr) -> Result<Option<OwnedFd>, (SetupStep, Errno)> {
     let at = match open_in_root(root, target, OFlags::PATH) {
         Ok(at) => at,
@@ -2796,43 +2791,74 @@ fn hide(root: BorrowedFd<'_>, target: &CStr) -> Result<Option<OwnedFd>, (SetupSt
     let directory = fs::fstat(&at)
         .map(|stat| fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::Directory)
         .map_err(failed)?;
-    let tmpfs = empty_tmpfs(
-        mount::MountAttrFlags::MOUNT_ATTR_NOSUID
-            | mount::MountAttrFlags::MOUNT_ATTR_NODEV
-            | mount::MountAttrFlags::MOUNT_ATTR_NOEXEC,
-    )
-    .map_err(failed)?;
     if directory {
+        let tmpfs = empty_tmpfs(OWN_TMPFS_ATTRIBUTES).map_err(failed)?;
         attach(tmpfs.as_fd(), at.as_fd()).map_err(failed)?;
         return Ok(Some(tmpfs));
     }
-    let file = fs::openat(
-        &tmpfs,
-        HIDDEN_FILE,
-        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
-        Mode::from_raw_mode(HIDDEN_FILE_MODE),
-    )
-    .map_err(failed)?;
-    drop(file);
-    attach(tmpfs.as_fd(), root).map_err(failed)?;
-    let clone = mount::open_tree(
-        &tmpfs,
-        HIDDEN_FILE,
-        mount::OpenTreeFlags::OPEN_TREE_CLONE | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC,
-    );
-    let detached = mount::unmount(fd_path(&tmpfs).as_cstr(), UnmountFlags::DETACH);
-    let clone = clone.map_err(failed)?;
-    detached.map_err(failed)?;
-    attach_tree(clone, at.as_fd(), true, SetupStep::HidePath)?;
+    let file = own_file(root, &[]).map_err(failed)?;
+    attach_tree(file, at.as_fd(), true, SetupStep::HidePath)?;
     Ok(None)
 }
 
-/// The name of the empty file a hidden file is bound from, inside its own
-/// tmpfs.
-const HIDDEN_FILE: &CStr = c"hidden";
+/// Places a read-only file of the launch's own, holding `contents`, over the
+/// file `target` names in `root`, which must exist: the build has the launch
+/// create it where the root holds nothing there.
+fn place_file(
+    root: BorrowedFd<'_>,
+    target: &CStr,
+    contents: &[u8],
+) -> Result<Option<OwnedFd>, (SetupStep, Errno)> {
+    let at = open_in_root(root, target, OFlags::PATH)
+        .map_err(|errno| (SetupStep::OpenMountTarget, errno))?;
+    let file = own_file(root, contents).map_err(|errno| (SetupStep::PlaceFile, errno))?;
+    attach_tree(file, at.as_fd(), true, SetupStep::PlaceFile)?;
+    Ok(None)
+}
 
-/// The mode of the empty file a hidden file is bound from: an ordinary file's.
-const HIDDEN_FILE_MODE: u32 = 0o644;
+/// A regular file holding `contents`, as a detached mount of its own ready to
+/// attach over a target: what a hidden file and a placed one are bound from.
+///
+/// The file is created in a tmpfs of its own, so the command sees a regular
+/// file, not a device, and nothing of the host's holds it. A clone of a path is
+/// taken only of a mount attached in the caller's mount namespace, so that
+/// tmpfs is attached for the moment the clone takes, stacked on the root mount
+/// `root` names, where no lookup crosses it, and detached again at once: a
+/// lookup that starts at a mount's root does not cross a mount stacked on that
+/// root.
+fn own_file(root: BorrowedFd<'_>, contents: &[u8]) -> Result<OwnedFd, Errno> {
+    let tmpfs = empty_tmpfs(OWN_TMPFS_ATTRIBUTES)?;
+    let file = fs::openat(
+        &tmpfs,
+        OWN_FILE,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::from_raw_mode(OWN_FILE_MODE),
+    )?;
+    frame::write_full(file.as_fd(), contents)?;
+    drop(file);
+    attach(tmpfs.as_fd(), root)?;
+    let clone = mount::open_tree(
+        &tmpfs,
+        OWN_FILE,
+        mount::OpenTreeFlags::OPEN_TREE_CLONE | mount::OpenTreeFlags::OPEN_TREE_CLOEXEC,
+    );
+    let detached = mount::unmount(fd_path(&tmpfs).as_cstr(), UnmountFlags::DETACH);
+    let clone = clone?;
+    detached?;
+    Ok(clone)
+}
+
+/// What a tmpfs of the launch's own carries: nothing in it is a device, set-id
+/// or executable.
+const OWN_TMPFS_ATTRIBUTES: mount::MountAttrFlags = mount::MountAttrFlags::MOUNT_ATTR_NOSUID
+    .union(mount::MountAttrFlags::MOUNT_ATTR_NODEV)
+    .union(mount::MountAttrFlags::MOUNT_ATTR_NOEXEC);
+
+/// The name of a file of the launch's own, inside its own tmpfs.
+const OWN_FILE: &CStr = c"file";
+
+/// The mode of a file of the launch's own: an ordinary file's.
+const OWN_FILE_MODE: u32 = 0o644;
 
 /// Makes the tree at `target` read-only where it stands: a clone of it, every
 /// mount beneath it included, read-only, bound onto it.

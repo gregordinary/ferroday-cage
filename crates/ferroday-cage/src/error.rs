@@ -34,7 +34,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::cgroup::{CgroupReach, CgroupRefusal};
@@ -216,6 +216,9 @@ wire_enum! {
         /// Move the launch stage into the sandbox's cgroup, through the
         /// `cgroup.procs` the caller opened, before any namespace is created.
         JoinCgroup = 67 => "joining the sandbox's cgroup",
+        /// Place a read-only file of the launch's own over its target; see
+        /// [`CageBuilder::nameservers`](crate::CageBuilder::nameservers).
+        PlaceFile = 68 => "placing a file of the sandbox's own",
     }
 }
 
@@ -930,6 +933,30 @@ rendered as text.
         /// The upper, as the launch opens it.
         upper: PathBuf,
     },
+    /// [`resolv_conf(false)`](crate::CageBuilder::resolv_conf) declines the
+    /// sandbox's managed `resolv.conf`, and
+    /// [`nameservers`](crate::CageBuilder::nameservers) names the servers for
+    /// one. Either side winning quietly would hand back a sandbox other than the
+    /// one described.
+    ResolvConfContradiction,
+    /// [`nameservers`](crate::CageBuilder::nameservers) names more servers than
+    /// the C libraries read from a `resolv.conf`, which is three.
+    #[non_exhaustive]
+    TooManyNameservers {
+        /// How many it names.
+        count: usize,
+        /// The most a `resolv.conf` is read for.
+        max: usize,
+    },
+    /// [`nameservers`](crate::CageBuilder::nameservers) names an address that
+    /// is no server.
+    #[non_exhaustive]
+    NameserverInvalid {
+        /// The address as it was given to the builder.
+        nameserver: IpAddr,
+        /// What makes it no server.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -1289,6 +1316,17 @@ impl fmt::Display for ConfigError {
                 "the overlay work directory {work:?} is on another filesystem than its upper \
                  {upper:?}; the overlay moves files between the two, so they share one",
             ),
+            ConfigError::ResolvConfContradiction => f.write_str(
+                "resolv_conf(false) declines the sandbox's resolv.conf, but nameservers names \
+                 the servers for one; drop one of the two",
+            ),
+            ConfigError::TooManyNameservers { count, max } => write!(
+                f,
+                "{count} nameservers are named, and a resolv.conf is read for the first {max} alone",
+            ),
+            ConfigError::NameserverInvalid { nameserver, reason } => {
+                write!(f, "cannot name {nameserver} as a nameserver: {reason}")
+            }
             ConfigError::NestedUsernsProcfsReadOnly { target } => write!(
                 f,
                 "the procfs at {target:?} is read-only, and the nested user namespace that locks \

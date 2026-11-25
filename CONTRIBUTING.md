@@ -597,7 +597,9 @@ report name a package and its version bare.
 | Read a raw mount's flags as `mount(2)` acts on them | `mechanism::raw_mount_flags` |
 | Is this path at or under a mount target the launch froze? | `spec::covers` |
 | Freeze a sandbox path as a mount target, or name a frozen target as the sandbox path it is | `spec::sandbox_target`, and `spec::sandbox_path` back |
-| Does a launch bind the host's `resolv.conf`, or has a mount of the caller's claimed it? | `CageBuilder::get_resolv_conf` |
+| Is the managed `resolv.conf` wanted, or has a mount of the caller's claimed it, or the file its link leads to? | `CageBuilder::get_resolv_conf`, over `spec::claims_resolv_conf` and `spec::claims_target` |
+| Give a sandbox a `resolv.conf` naming chosen nameservers, where it reads one | `CageBuilder::nameservers`, lowered by `Lowering::push_nameservers` |
+| Make a file of the launch's own, empty or holding given bytes, to mount over a target | `mechanism::child::own_file`, which a hidden file and a placed one share |
 | Does the network stack carry the guest's traffic to this destination? | `NetStack::forwards` |
 | Read a DNS message a guest sent, or write the reply the stack's nameserver gives in place of an answer | `netstack::dns`: `read_query`, `refusal`, `failure`, `truncated` |
 | Which resolver does the host ask, as its `resolv.conf` names it? | `netstack::nameserver::host_upstream`, over `nameserver::first_nameserver` |

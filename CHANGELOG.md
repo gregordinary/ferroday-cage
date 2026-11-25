@@ -41,6 +41,26 @@ consumer upgrading can skip it.
   keys.
 - `fcage --netstack-upstream ADDRESS` and `--netstack-no-nameserver` set the
   nameserver's upstream and turn it off.
+- `CageBuilder::nameservers` names the sandbox's nameservers. Its
+  `/etc/resolv.conf` is then a read-only file of the sandbox's own holding a
+  `nameserver` line for each, in place of the root's own and of the host's
+  bind, under every network. It yields to a mount of the caller's at the target
+  as the host's bind does. Under the host's own root it is placed where the
+  host's `/etc/resolv.conf` leads, so a link into the hidden `/run` reads it.
+  The build refuses more than three, an unspecified address, and a list beside
+  `resolv_conf(false)` or `managed_mounts(false)`, with the new
+  `ConfigError::TooManyNameservers`, `ConfigError::NameserverInvalid`,
+  `ConfigError::ResolvConfContradiction` and
+  `ConfigError::ManagedMountsContradiction`. A failure placing the file is the
+  new `SetupStep::PlaceFile`, and the resolved inputs report it as the new
+  `ResolvedMount::File`. The profile format gains the `nameservers` key, and
+  `fcage` the `--nameserver ADDRESS` flag.
+
+### Changed
+
+- `CageBuilder::get_resolv_conf` answers whether the managed `resolv.conf` is
+  wanted under the host's own root as under any other, since `nameservers`
+  places one there. The host's own file is still not bound there.
 
 ### Fixed
 

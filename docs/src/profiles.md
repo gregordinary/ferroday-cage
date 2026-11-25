@@ -45,8 +45,9 @@ mount-proc = true           # default true; see below before turning it off
 mount-dev = true            # default true
 mount-tmp = true            # default true
 resolv-conf = true          # default true; binds the host resolv.conf with
-                            # network = "host", and governs the one fcage
-                            # composes for --netstack
+                            # network = "host", or places the file below
+nameservers = ["10.0.2.3"]  # default none; the sandbox's resolv.conf names
+                            # these, at most three, under any network
 managed-mounts = true       # default true; false establishes none of the four
                             # above, nor any managed mount a later release adds
 base-env = true             # default true; false gives the command exactly the

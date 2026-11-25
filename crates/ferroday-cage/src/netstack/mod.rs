@@ -318,8 +318,10 @@ impl NetStack {
     }
 
     /// The addresses the stack's nameserver answers on, for the sandbox's
-    /// `resolv.conf` to name: host 3 of each enabled network, `10.0.2.3` and
-    /// `fd00::3` by default, IPv4 first. Empty where
+    /// `resolv.conf` to name through
+    /// [`CageBuilder::nameservers`](crate::CageBuilder::nameservers): host 3 of
+    /// each enabled network, `10.0.2.3` and `fd00::3` by default, IPv4 first.
+    /// Empty where
     /// [`nameserver(false)`](NetStackBuilder::nameserver) turns the
     /// nameserver off.
     ///
@@ -798,7 +800,8 @@ impl NetStackBuilder {
     /// enabled network: `10.0.2.3` and `fd00::3` by default, the addresses
     /// [`NetStack::nameservers`] names. It relays each query to the host's own
     /// resolver, or to [`upstream`](Self::upstream)'s, and the answer back. The
-    /// sandbox's `resolv.conf` has to name it for the guest to ask it.
+    /// sandbox's `resolv.conf` has to name it for the guest to ask it, which
+    /// [`CageBuilder::nameservers`](crate::CageBuilder::nameservers) arranges.
     ///
     /// The stack does not fragment, so an answer longer than one packet cannot
     /// go back over UDP. The nameserver sends a truncated answer in its place,

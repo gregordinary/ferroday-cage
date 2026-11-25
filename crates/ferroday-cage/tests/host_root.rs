@@ -476,3 +476,35 @@ fn the_unix_socket_restriction_refuses_a_host_socket_and_admits_a_granted_one() 
         "{report:?}"
     );
 }
+
+#[test]
+fn named_nameservers_are_read_through_the_host_s_resolv_conf() {
+    if !common::require::userns() {
+        return;
+    }
+    // On a systemd-resolved host the host's `/etc/resolv.conf` links into
+    // `/run`, which this root hides; the file is placed where the link leads,
+    // inside the hidden path's tmpfs, so the sandbox reads it through the link.
+    let Ok(leads) = std::fs::canonicalize("/etc/resolv.conf") else {
+        common::require::premise_unmet("the host has no /etc/resolv.conf to read through");
+        return;
+    };
+    let before = std::fs::read(&leads).expect("the host's resolv.conf reads");
+    let (ok, printed) = run(
+        Cage::builder()
+            .host_rootfs()
+            .nameservers(["192.0.2.53".parse().unwrap()]),
+        "cat /etc/resolv.conf; echo scribble >> /etc/resolv.conf || echo refused",
+    );
+    assert!(ok, "{printed}");
+    assert!(printed.starts_with("nameserver 192.0.2.53\n"), "{printed}");
+    assert!(
+        printed.contains("refused"),
+        "the file is read-only: {printed}"
+    );
+    assert_eq!(
+        std::fs::read(&leads).expect("the host's resolv.conf reads"),
+        before,
+        "the host's own file is untouched",
+    );
+}

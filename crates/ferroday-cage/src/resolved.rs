@@ -704,6 +704,16 @@ pub enum ResolvedMount {
         /// The path inside the sandbox it makes read-only.
         target: PathBuf,
     },
+    /// A read-only file of the sandbox's own, holding text the build composed:
+    /// the `resolv.conf` naming
+    /// [`nameservers`](crate::CageBuilder::nameservers).
+    #[non_exhaustive]
+    File {
+        /// The path inside the sandbox it covers.
+        target: PathBuf,
+        /// What the file holds.
+        contents: String,
+    },
 }
 
 impl ResolvedMount {
@@ -719,7 +729,8 @@ impl ResolvedMount {
             | ResolvedMount::Bind { target, .. }
             | ResolvedMount::Raw { target, .. }
             | ResolvedMount::Hide { target }
-            | ResolvedMount::ReadOnly { target } => target,
+            | ResolvedMount::ReadOnly { target }
+            | ResolvedMount::File { target, .. } => target,
             ResolvedMount::Symlink { path, .. } => path,
         }
     }
@@ -1027,6 +1038,11 @@ fn project_mount(action: &MountAction) -> ResolvedMount {
         MountAction::ReadOnly { target } => ResolvedMount::ReadOnly {
             target: sandbox_path(target),
         },
+        // The build composes the contents as text, so nothing is lost here.
+        MountAction::File { target, contents } => ResolvedMount::File {
+            target: sandbox_path(target),
+            contents: String::from_utf8_lossy(contents).into_owned(),
+        },
     }
 }
 
@@ -1105,7 +1121,7 @@ mod serde_tests {
     use crate::{Cage, Network, RawMount};
 
     /// The keys the records below render between them, in sorted order.
-    const EXPECTED_RECORD_KEYS: [&str; 75] = [
+    const EXPECTED_RECORD_KEYS: [&str; 76] = [
         "cgroup",
         "cgroup.kind",
         "cgroup.limits",
@@ -1144,6 +1160,7 @@ mod serde_tests {
         "identity.uid[].inside",
         "identity.uid[].outside",
         "mounts",
+        "mounts[].contents",
         "mounts[].data",
         "mounts[].flags",
         "mounts[].fstype",
@@ -1244,6 +1261,10 @@ mod serde_tests {
                 },
                 ResolvedMount::ReadOnly {
                     target: PathBuf::from("/work/.git/hooks"),
+                },
+                ResolvedMount::File {
+                    target: PathBuf::from("/etc/resolv.conf"),
+                    contents: "nameserver 10.0.2.3\n".to_string(),
                 },
             ],
             identity: ResolvedIdentity::Ranged {
@@ -1362,6 +1383,7 @@ mod serde_tests {
             ResolvedMount::Symlink { .. } => "mount symlink",
             ResolvedMount::Hide { .. } => "mount hide",
             ResolvedMount::ReadOnly { .. } => "mount read-only",
+            ResolvedMount::File { .. } => "mount file",
         });
         [root, identity, hardening]
             .into_iter()
@@ -1395,6 +1417,7 @@ mod serde_tests {
                 "identity single",
                 "mount bind",
                 "mount devpts",
+                "mount file",
                 "mount hide",
                 "mount procfs",
                 "mount raw",

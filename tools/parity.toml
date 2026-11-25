@@ -117,6 +117,10 @@ name = "resolv_conf"
 flags = ["--resolv-conf", "--no-resolv-conf"]
 
 [[builder.setting]]
+name = "nameservers"
+flags = ["--nameserver"]
+
+[[builder.setting]]
 name = "command"
 kind = "positional"
 why = "The command line after `--`, which is where a shell already writes one."

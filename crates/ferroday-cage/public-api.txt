@@ -1749,6 +1749,9 @@ pub ferroday_cage::ConfigError::MountTargetInvalid::path: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::MountTargetMissing
 pub ferroday_cage::ConfigError::MountTargetMissing::source: core::io::error::Error
 pub ferroday_cage::ConfigError::MountTargetMissing::target: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ConfigError::NameserverInvalid
+pub ferroday_cage::ConfigError::NameserverInvalid::nameserver: core::net::ip_addr::IpAddr
+pub ferroday_cage::ConfigError::NameserverInvalid::reason: &'static str
 pub ferroday_cage::ConfigError::NestedUsernsNeedsProcfs
 #[non_exhaustive] pub ferroday_cage::ConfigError::NestedUsernsProcfsReadOnly
 pub ferroday_cage::ConfigError::NestedUsernsProcfsReadOnly::target: std::path::PathBuf
@@ -1782,6 +1785,7 @@ pub ferroday_cage::ConfigError::PresentAsRoot::identity: ferroday_cage::Presente
 pub ferroday_cage::ConfigError::PresentAsWithRangeMap
 #[non_exhaustive] pub ferroday_cage::ConfigError::ProfileOperationForbidden
 pub ferroday_cage::ConfigError::ProfileOperationForbidden::operation: &'static str
+pub ferroday_cage::ConfigError::ResolvConfContradiction
 #[non_exhaustive] pub ferroday_cage::ConfigError::ResolveUnixUnhandled
 pub ferroday_cage::ConfigError::ResolveUnixUnhandled::grant: alloc::string::String
 #[non_exhaustive] pub ferroday_cage::ConfigError::RestrictionCgroupReachable
@@ -1829,6 +1833,9 @@ pub ferroday_cage::ConfigError::SymlinkInHostRoot::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ConfigError::SymlinkTargetInvalid
 pub ferroday_cage::ConfigError::SymlinkTargetInvalid::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::SymlinkTargetInvalid::target: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ConfigError::TooManyNameservers
+pub ferroday_cage::ConfigError::TooManyNameservers::count: usize
+pub ferroday_cage::ConfigError::TooManyNameservers::max: usize
 #[non_exhaustive] pub ferroday_cage::ConfigError::WorkdirNotAbsolute
 pub ferroday_cage::ConfigError::WorkdirNotAbsolute::path: std::path::PathBuf
 impl core::convert::From<ferroday_cage::ConfigError> for ferroday_cage::Error
@@ -2163,6 +2170,9 @@ pub ferroday_cage::ResolvedMount::Bind::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Devpts
 pub ferroday_cage::ResolvedMount::Devpts::data: alloc::string::String
 pub ferroday_cage::ResolvedMount::Devpts::target: std::path::PathBuf
+#[non_exhaustive] pub ferroday_cage::ResolvedMount::File
+pub ferroday_cage::ResolvedMount::File::contents: alloc::string::String
+pub ferroday_cage::ResolvedMount::File::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Hide
 pub ferroday_cage::ResolvedMount::Hide::target: std::path::PathBuf
 #[non_exhaustive] pub ferroday_cage::ResolvedMount::Procfs
@@ -2337,6 +2347,7 @@ pub ferroday_cage::SetupStep::NosuidRootfs = 54
 pub ferroday_cage::SetupStep::OpenMountTarget = 11
 pub ferroday_cage::SetupStep::OpenSandboxProcfs = 52
 pub ferroday_cage::SetupStep::PivotRoot = 17
+pub ferroday_cage::SetupStep::PlaceFile = 68
 pub ferroday_cage::SetupStep::PrivatizeMounts = 7
 pub ferroday_cage::SetupStep::ReadOnlyEmptyRoot = 60
 pub ferroday_cage::SetupStep::ReadOnlyPath = 66
@@ -2455,6 +2466,7 @@ pub fn ferroday_cage::CageBuilder::get_mount_dev(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_mount_proc(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_mount_tmp(&self) -> bool
 pub fn ferroday_cage::CageBuilder::get_mounts(&self) -> &[ferroday_cage::Mount]
+pub fn ferroday_cage::CageBuilder::get_nameservers(&self) -> &[core::net::ip_addr::IpAddr]
 pub fn ferroday_cage::CageBuilder::get_network(&self) -> ferroday_cage::Network
 pub fn ferroday_cage::CageBuilder::get_overlay(&self) -> core::option::Option<&ferroday_cage::Overlay>
 pub fn ferroday_cage::CageBuilder::get_path_lookup(&self) -> bool
@@ -2481,6 +2493,7 @@ pub fn ferroday_cage::CageBuilder::mount_dev(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::mount_proc(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::mount_tmp(self, bool) -> Self
 pub fn ferroday_cage::CageBuilder::mounts<I>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = ferroday_cage::Mount>
+pub fn ferroday_cage::CageBuilder::nameservers(self, impl core::iter::traits::collect::IntoIterator<Item = core::net::ip_addr::IpAddr>) -> Self
 pub fn ferroday_cage::CageBuilder::network(self, ferroday_cage::Network) -> Self
 pub fn ferroday_cage::CageBuilder::overlay(self, ferroday_cage::Overlay) -> Self
 pub fn ferroday_cage::CageBuilder::overlay_rootfs(self, impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>) -> Self

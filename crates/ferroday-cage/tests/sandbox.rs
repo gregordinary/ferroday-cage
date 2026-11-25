@@ -1149,6 +1149,59 @@ fn the_host_resolv_conf_is_bound_read_only_with_the_host_network() {
 }
 
 #[test]
+fn named_nameservers_are_the_sandbox_s_resolv_conf_read_only() {
+    let Some(rootfs) = common::scratch_rootfs("nameservers") else {
+        return;
+    };
+    let status = Cage::builder()
+        .rootfs(&rootfs)
+        .nameservers([
+            "192.0.2.53".parse().unwrap(),
+            "2001:db8::53".parse().unwrap(),
+        ])
+        .env("EXPECTED", "nameserver 192.0.2.53\nnameserver 2001:db8::53")
+        .command("/bin/sh")
+        .args([
+            "-c",
+            r#"[ "$(cat /etc/resolv.conf)" = "$EXPECTED" ] && \
+               ! { echo scribble >> /etc/resolv.conf; } 2> /dev/null"#,
+        ])
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect("the sandbox launches");
+    assert!(
+        status.success(),
+        "expected the named nameservers, read-only"
+    );
+}
+
+#[test]
+fn a_root_without_a_resolv_conf_is_left_without_one() {
+    let Some(rootfs) = common::scratch_rootfs("nameservers-created") else {
+        return;
+    };
+    let file = rootfs.join("etc/resolv.conf");
+    if file.symlink_metadata().is_ok() {
+        std::fs::remove_file(&file).expect("the fixture's resolv.conf is removed");
+    }
+    let status = Cage::builder()
+        .rootfs(&rootfs)
+        .nameservers(["192.0.2.53".parse().unwrap()])
+        .command("/bin/sh")
+        .args(["-c", "grep -qx 'nameserver 192.0.2.53' /etc/resolv.conf"])
+        .build()
+        .expect("a valid sandbox configuration")
+        .run()
+        .expect("the sandbox launches");
+    assert!(status.success(), "the sandbox reads the named nameserver");
+    assert!(
+        file.symlink_metadata().is_err(),
+        "the file created to mount onto is removed with the sandbox",
+    );
+}
+
+#[test]
 fn a_builder_reads_back_what_it_was_given() {
     // The inspection path a profile-driven consumer takes before launching
     // configuration it did not write.
