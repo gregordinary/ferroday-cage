@@ -549,6 +549,9 @@ consumer upgrading can skip it.
   none of those formats does. A Gentoo container's `BUILD_TIME` is read as the
   binhost index's reader reads it, so a value the two read differently is no
   longer a mismatch between them.
+- `fcage` prints a line for each Gentoo package a resolution refuses because
+  its slot is already taken, as it does for an unsatisfiable atom and a
+  blocker. The refusal went unprinted until the run failed.
 
 ### Internal
 

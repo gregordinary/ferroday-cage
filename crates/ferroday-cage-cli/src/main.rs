@@ -7199,6 +7199,24 @@ impl<W: std::io::Write> Progress<W> {
                     "this same resolution would install"
                 },
             )),
+            GentooEvent::Occupied {
+                package,
+                slot,
+                held,
+                second,
+                installed,
+                atom,
+                wanted_by,
+                ..
+            } => self.line(format_args!(
+                "fcage: {wanted_by} requires {atom}, and {second} would occupy slot {slot:?} of \
+                 {package}, which {held} already takes {}",
+                if *installed {
+                    "in the root"
+                } else {
+                    "in this same resolution"
+                },
+            )),
             _ => Ok(()),
         }
     }
