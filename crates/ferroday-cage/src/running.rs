@@ -834,12 +834,17 @@ impl<'obs> Running<'obs> {
     /// # Lifetime
     ///
     /// The returned handle governs the further command and not the sandbox: its
-    /// [`terminate`](Self::terminate) and [`kill`](Self::kill) signal that
-    /// command alone, as a launch without a PID namespace does, and what the
-    /// command started runs on until the sandbox ends. Its
-    /// [`stop_with_caller`](Exec::stop_with_caller) ends the command, not the
-    /// sandbox. A further command's handle runs further commands in the same
-    /// sandbox.
+    /// [`terminate`](Self::terminate) signals that command, and its
+    /// [`kill`](Self::kill) ends it. Where the sandbox has a cgroup, from
+    /// [`cgroup_parent`](crate::CageBuilder::cgroup_parent), the command runs in
+    /// a cgroup of its own beneath the sandbox's, still held to the sandbox's
+    /// limits, and the kill ends everything the command started through that
+    /// cgroup, as a sandbox's own kill ends its tree. Without a cgroup it
+    /// signals the command alone, as a launch without a PID namespace does, and
+    /// what the command started runs on until the sandbox ends. Its
+    /// [`stop_with_caller`](Exec::stop_with_caller) ends the command, and its
+    /// cgroup's tree, not the sandbox. A further command's handle runs further
+    /// commands in the same sandbox.
     ///
     /// The sandbox ends as it always does, with its first command. With a PID
     /// namespace that ends every further command too, which reports `SIGKILL`.
@@ -849,8 +854,9 @@ impl<'obs> Running<'obs> {
     /// Inside the sandbox the command's parent is outside its PID namespace, so
     /// `getppid` answers 0, and a process it leaves behind is reparented to the
     /// sandbox's init. Its [`usage`](Self::usage) is what the command and the
-    /// descendants it waited for used, without the cgroup's figures, which are
-    /// the sandbox's and stay on its own handle.
+    /// descendants it waited for used, and with a cgroup of its own the
+    /// processor time its whole tree used there. The sandbox's memory and
+    /// process figures are the sandbox's cgroup's and stay on its own handle.
     ///
     /// # Errors
     ///
@@ -956,11 +962,19 @@ impl<'obs> Running<'obs> {
             check_terminal_composes(&plan)?;
         }
         let ready = Readiness::new()?;
+        // Where the sandbox has a cgroup, the command gets one of its own
+        // beneath it, which this handle kills and removes as a sandbox's own
+        // handle does the sandbox's.
+        let cgroup = joinable
+            .cgroup
+            .as_deref()
+            .map(|sandbox| sandbox.beneath(plan.stop_with_caller))
+            .transpose()?;
         let spawned = mechanism::spawn(
             &plan,
             observe,
             terminal,
-            joinable.cgroup.as_deref().map(Cgroup::procs),
+            cgroup.as_ref().map(Cgroup::procs),
             Some(joinable.holder.as_fd()),
             &mut |event| {
                 if let Some(observer) = observer.as_deref_mut() {
@@ -977,7 +991,7 @@ impl<'obs> Running<'obs> {
             observer,
             PlaceholderGuard::default(),
             ready,
-            None,
+            cgroup.map(Arc::new),
             Some(Sandbox::Joined(joinable)),
         );
         Ok((running, primary))

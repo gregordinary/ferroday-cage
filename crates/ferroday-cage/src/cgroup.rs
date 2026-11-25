@@ -738,7 +738,8 @@ const LEAF: &str = "sandbox";
 const EMPTYING_BOUND: Duration = Duration::from_secs(5);
 
 /// The sandbox's cgroup and its [`LEAF`], from their creation before the
-/// launch until their removal.
+/// launch until their removal, or a further command's own beneath the leaf;
+/// see [`beneath`](Self::beneath).
 ///
 /// The running handle and each of its kill handles share it. The handle reads
 /// what the tree used once the outcome is known, and removes the cgroup then
@@ -761,9 +762,11 @@ pub(crate) struct Cgroup {
     parent_path: PathBuf,
     /// The cgroup's name beneath the parent.
     name: CString,
-    /// The cgroup's own directory, which holds the limits and the leaf.
+    /// The cgroup's own directory, which holds the limits and the leaf, or a
+    /// further command's processes.
     dir: OwnedFd,
-    /// The leaf's `cgroup.procs`, which the launch stage writes itself into.
+    /// The `cgroup.procs` the launch's processes join through; see
+    /// [`procs`](Self::procs).
     procs: OwnedFd,
     /// Its `cgroup.kill`, where the kernel has one (Linux 5.14).
     kill: Option<OwnedFd>,
@@ -994,8 +997,103 @@ impl Cgroup {
         }
     }
 
-    /// The leaf's `cgroup.procs`, which the launch stage writes `0` to, moving
-    /// itself in.
+    /// A cgroup of a further command's own beneath this sandbox's [`LEAF`],
+    /// which the further command joins in place of the leaf:
+    /// `<parent>/fcage-<unique>/sandbox/exec-<unique>`.
+    ///
+    /// It holds no limit and enables no controller, as the leaf does not, so
+    /// what runs in it is charged to the sandbox's cgroup and held to the
+    /// sandbox's limits. What it adds is the further command's tree as one
+    /// unit: its own `cgroup.kill` ends that tree and nothing else of the
+    /// sandbox's, and its own `cpu.stat` accounts it. The command's processes
+    /// go into it directly, with no leaf beneath it: it is below the root of
+    /// the sandbox's cgroup namespace already. A process can still leave it for
+    /// the leaf, through a cgroup filesystem it mounts, as one can leave a
+    /// process group, and stays the sandbox's then.
+    ///
+    /// The sandbox's leaf cannot be removed while one of these is beneath it,
+    /// so each is removed by its own command's handles, which share it as a
+    /// sandbox's share its own; `tied` is the further command's tie to them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cgroup`] where a step fails: the sandbox's cgroup exists and
+    /// is the caller's, so nothing here is a refusal of the parent's.
+    pub(crate) fn beneath(&self, tied: bool) -> Result<Cgroup, Error> {
+        let leaf_path = self
+            .parent_path
+            .join(std::ffi::OsStr::from_bytes(self.name.as_bytes()))
+            .join(LEAF);
+        let io_error = |op: &'static str, path: &Path| {
+            let path = path.to_path_buf();
+            move |errno: Errno| Error::Cgroup {
+                op,
+                path,
+                source: errno.into(),
+            }
+        };
+        let kept = |mut fd: OwnedFd| crate::mechanism::above_stdio(&mut fd).map(|()| fd);
+        let leaf = rustix::fs::openat(
+            &self.dir,
+            LEAF,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .and_then(kept)
+        .map_err(io_error("opening the sandbox's leaf cgroup", &leaf_path))?;
+        let name = CString::new(format!("exec-{}", crate::host::unique_hex()))
+            .expect("a hex name holds no NUL");
+        let path = leaf_path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        rustix::fs::mkdirat(&leaf, name.as_c_str(), Mode::from_raw_mode(0o755)).map_err(
+            io_error("creating a further command's cgroup beneath", &leaf_path),
+        )?;
+        // From here on a failure removes what was created.
+        let created = (|| {
+            let dir = rustix::fs::openat(
+                &leaf,
+                name.as_c_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .and_then(kept)
+            .map_err(io_error("opening a further command's cgroup", &path))?;
+            let procs = open_write(&dir, "cgroup.procs")
+                .and_then(kept)
+                .map_err(io_error("opening a further command's cgroup.procs", &path))?;
+            // Absent before Linux 5.14, as the sandbox's own.
+            let kill = match open_write(&dir, "cgroup.kill").and_then(kept) {
+                Ok(kill) => Some(kill),
+                Err(Errno::NOENT) => None,
+                Err(errno) => {
+                    return Err(io_error("opening a further command's cgroup.kill", &path)(
+                        errno,
+                    ));
+                }
+            };
+            Ok((dir, procs, kill))
+        })();
+        match created {
+            Ok((dir, procs, kill)) => Ok(Cgroup {
+                parent: leaf,
+                parent_path: leaf_path,
+                name,
+                dir,
+                procs,
+                kill,
+                killed: AtomicBool::new(false),
+                tied,
+                removed: AtomicBool::new(false),
+            }),
+            Err(err) => {
+                let _ = rustix::fs::unlinkat(&leaf, name.as_c_str(), AtFlags::REMOVEDIR);
+                Err(err)
+            }
+        }
+    }
+
+    /// The `cgroup.procs` the launch's processes join through: the leaf's,
+    /// which the launch stage writes `0` to, moving itself in, or a further
+    /// command's own, which its command writes `0` to.
     pub(crate) fn procs(&self) -> BorrowedFd<'_> {
         self.procs.as_fd()
     }

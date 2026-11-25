@@ -116,10 +116,13 @@ consumer upgrading can skip it.
   through the pidfd the handle holds, at the new `SetupStep::JoinSandbox`, and
   enters a nested user and mount namespace of its own, copied from the
   sandbox's setup, under the launch's identity, limits and hardening. Its
-  handle signals that command alone, and runs further commands in the same
-  sandbox. A sandbox that has ended answers `Error::SandboxEnded`, and a
-  restriction's handle `ConfigError::ExecIntoRestriction`. Library only:
-  `fcage` runs one command per invocation.
+  handle ends that command alone, and runs further commands in the same
+  sandbox. Where the sandbox has a cgroup, the command runs in a cgroup of its
+  own beneath the sandbox's, held to the sandbox's limits, whose `cgroup.kill`
+  its handle's kill writes and whose processor time its usage reports. A
+  sandbox that has ended answers `Error::SandboxEnded`, and a restriction's
+  handle `ConfigError::ExecIntoRestriction`. Library only: `fcage` runs one
+  command per invocation.
 - A sandbox or a restriction can report each call its seccomp filter refuses
   the command: `seccomp_reports(true)` on `CageBuilder` and
   `RestrictionBuilder`, `seccomp-reports` in a profile's `[hardening]` table.

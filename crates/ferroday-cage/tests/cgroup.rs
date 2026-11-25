@@ -473,17 +473,57 @@ fn remove_once_empty(cgroup: &Path, within: Duration) {
     }
 }
 
+/// The cgroup `pid` runs in, as a path beneath the cgroup v2 mount.
+fn cgroup_of(pid: u32) -> PathBuf {
+    let line =
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("the process's cgroup reads");
+    let path = line
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .expect("a cgroup v2 membership");
+    PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'))
+}
+
+/// The further commands' cgroups beneath the sandbox cgroup `cgroup`'s leaf.
+fn further_cgroups(cgroup: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(cgroup.join(LEAF))
+        .expect("the leaf lists")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("exec-"))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Runs `script` as a further command of `sandbox`, its output discarded, and
+/// returns its outcome.
+fn exec_quietly(sandbox: &ferroday_cage::Running<'_>, script: &str) -> ferroday_cage::ExitStatus {
+    let mut further = sandbox
+        .exec(
+            &Exec::new("/bin/sh")
+                .args(["-c", script])
+                .stop_with_caller(true)
+                .stdout(Stdio::Null)
+                .stderr(Stdio::Null),
+        )
+        .expect("the further command launches");
+    further
+        .wait_timeout(Duration::from_secs(30))
+        .expect("the wait completes")
+        .expect("the further command ends")
+}
+
 #[test]
-fn a_further_command_runs_in_the_sandboxs_cgroup_and_ends_with_its_kill() {
+fn a_further_command_runs_in_a_cgroup_of_its_own_beneath_the_sandboxs() {
     if !common::require::userns() {
         return;
     }
     let Some(parent) = delegated() else {
         return;
     };
-    // The further command is charged to the sandbox's cgroup, and its stage,
-    // which supervises it from outside, is not: a kill of the sandbox's tree
-    // ends the command and leaves the stage to report it, as `SIGKILL`.
+    // The further command is charged to the sandbox's cgroup, in a cgroup of
+    // its own beneath the leaf, and its stage, which supervises it from
+    // outside, is not: a kill of the sandbox's tree ends the command and leaves
+    // the stage to report it, as `SIGKILL`.
     for pid_namespace in [true, false] {
         let own = own_parent(parent, &format!("exec-{pid_namespace}"));
         let mut sandbox = sh_in(&own, "exec sleep 30")
@@ -501,15 +541,18 @@ fn a_further_command_runs_in_the_sandboxs_cgroup_and_ends_with_its_kill() {
                     .stdout(Stdio::Null),
             )
             .expect("the further command launches");
-        let (_, members) = sole_sandbox_cgroup(&own);
-        assert!(
-            members.contains(&further.pid()),
-            "pid namespace {pid_namespace}: the further command is in the leaf: {members:?}"
+        let (cgroup, _) = sole_sandbox_cgroup(&own);
+        let theirs = further_cgroups(&cgroup);
+        assert_eq!(theirs.len(), 1, "{theirs:?}");
+        assert_eq!(
+            cgroup_of(further.pid()),
+            theirs[0],
+            "pid namespace {pid_namespace}"
         );
         let stage = common::process_parent(further.pid()).expect("the command has a parent");
         assert!(
-            !members.contains(&stage),
-            "pid namespace {pid_namespace}: its stage is not: {members:?}"
+            !cgroup_of(stage).starts_with(&cgroup),
+            "pid namespace {pid_namespace}: its stage is outside the sandbox's cgroup"
         );
         sandbox.kill().expect("the kill is delivered");
         sandbox.wait().expect("the outcome is collected");
@@ -521,6 +564,107 @@ fn a_further_command_runs_in_the_sandboxs_cgroup_and_ends_with_its_kill() {
         drop(sandbox);
         remove_once_empty(&own, Duration::from_secs(10));
     }
+}
+
+#[test]
+fn a_further_commands_kill_ends_what_it_started_and_nothing_else() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let own = own_parent(parent, "exec-kill");
+    let mut sandbox = sh_in(&own, "exec sleep 30")
+        .stop_with_caller(true)
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn()
+        .expect("the sandbox launches");
+    // A background sleep the further command starts outlives the command's own
+    // process, and leaves its process group; its cgroup is what reaches it.
+    let mut further = sandbox
+        .exec(
+            &Exec::new("/bin/sh")
+                .args(["-c", "setsid sleep 30 & echo $! > /tmp/left; exec sleep 30"])
+                .stop_with_caller(true)
+                .stdout(Stdio::Null),
+        )
+        .expect("the further command launches");
+    let status = exec_quietly(&sandbox, "while [ ! -s /tmp/left ]; do sleep 0.01; done");
+    assert!(status.success());
+    further.kill().expect("the kill is delivered");
+    let status = further.wait().expect("the outcome is collected");
+    assert_eq!(status.signal(), Some(9));
+    let status = exec_quietly(&sandbox, "! kill -0 $(cat /tmp/left) 2>/dev/null");
+    assert!(status.success(), "what the further command started is gone");
+    assert_eq!(
+        sandbox.try_wait().expect("the handle polls"),
+        None,
+        "the sandbox runs on"
+    );
+    drop(further);
+    let (cgroup, _) = sole_sandbox_cgroup(&own);
+    assert_eq!(
+        further_cgroups(&cgroup),
+        Vec::<PathBuf>::new(),
+        "removed with its handle"
+    );
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+    drop(sandbox);
+    remove_once_empty(&own, Duration::from_secs(10));
+}
+
+#[test]
+fn a_further_command_is_held_to_the_sandboxs_limits_and_accounted() {
+    if !common::require::userns() {
+        return;
+    }
+    let Some(parent) = delegated() else {
+        return;
+    };
+    let own = own_parent(parent, "exec-limits");
+    let mut sandbox = sh_in(&own, "exec sleep 30")
+        .cgroup_limit(CgroupLimit::PidsMax(8))
+        .stop_with_caller(true)
+        .build()
+        .expect("a valid sandbox configuration")
+        .spawn()
+        .expect("the sandbox launches");
+    // The shell starts more sleeps than the sandbox's limit allows; the forks
+    // past it are refused, which is how the shell ends.
+    let mut further = sandbox
+        .exec(
+            &Exec::new("/bin/sh")
+                .args([
+                    "-c",
+                    "i=0; while [ $i -lt 20 ]; do sleep 5 & i=$((i+1)); done",
+                ])
+                .stop_with_caller(true)
+                .stdout(Stdio::Null)
+                .stderr(Stdio::Null),
+        )
+        .expect("the further command launches");
+    further
+        .wait_timeout(Duration::from_secs(60))
+        .expect("the wait completes")
+        .expect("the further command ends");
+    let (cgroup, _) = sole_sandbox_cgroup(&own);
+    let events = std::fs::read_to_string(cgroup.join("pids.events")).expect("pids.events reads");
+    let refused: u64 = events
+        .lines()
+        .find_map(|line| line.strip_prefix("max "))
+        .and_then(|count| count.parse().ok())
+        .expect("a max count");
+    assert!(refused > 0, "the sandbox's process limit held it: {events}");
+    let usage = further.usage().expect("the further command reports usage");
+    assert!(usage.cgroup_user_time.is_some(), "{usage:?}");
+    sandbox.kill().expect("the kill is delivered");
+    sandbox.wait().expect("the outcome is collected");
+    drop(further);
+    drop(sandbox);
+    remove_once_empty(&own, Duration::from_secs(10));
 }
 
 #[test]
