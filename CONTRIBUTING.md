@@ -569,7 +569,7 @@ report name a package and its version bare.
 | Name a filesystem entry no concurrent caller can collide with | `host::unique_hex` |
 | Fill a buffer from the kernel's randomness | `host::fill_random` |
 | Fork, exec, exit, change signal state, or read signals from a descriptor, without libc | `mechanism::sys` |
-| Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::exits_within` for a bounded wait, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
+| Has a process exited, or wait until it has, through its pidfd | `mechanism::has_exited`, `mechanism::is_running` where only a process known to run counts, `mechanism::exits_within` for a bounded wait, `mechanism::await_exit`, and `reap_via_pidfd` to collect a child of the caller's own |
 | Fork a helper child and signal or reap it whatever else in the caller reaps | `mechanism::sys::fork_with_pidfd`, which hands back a `mechanism::Forked`, or `mechanism::sys::probe` for a probe whose exit code is its answer |
 | Write a forked child's own identity map, or take the child into a mapped user namespace of its own | `mechanism::child::establish_map`, and `child::enter_mapped_namespace` for the whole entry, other namespaces beside it included |
 | Keep a descriptor the launch creates off the standard streams' numbers | `mechanism::above_stdio` in the caller, and in the sandbox's processes the launch stage's `child::hold_closed_streams`, which holds each number the caller left closed before any stage creates a descriptor |
@@ -596,6 +596,7 @@ report name a package and its version bare.
 | Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork with the limits on it and a leaf beneath it, which the launch stage joins through the leaf's `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |
 | Would a launch beneath this parent be refused its cgroup, and why? | `host::cgroup_blocker`, which carries out `cgroup::Cgroup::create` and a join through `mechanism::probe_cgroup_join`, with every errno read by `cgroup::refusal` as the launch's own are |
 | Which cgroup does this process run in? | `host::own_cgroup`, over `host::MountEntry::parse` |
+| Does the process at the other end of a unix socket run in this process's own user namespace, as no sandbox's process does? | `host::peer_in_own_user_namespace`, over `mechanism::peer::of_peer`, which reads the peer the newest way the kernel offers |
 | Which ids does the kernel report an owner as to a namespace whose map does not hold it? | `host::overflow_ids` |
 | Stop a provisioning run on `SIGINT`, removing what it staged | `provision::Interrupt`, which an observer answers `ProvisionObserver::cancelled` from |
 | Which cgroup limit does `NAME=VALUE` spell? | `CgroupLimit`'s `FromStr`, whose names are the keys of a profile's `[cgroup]` table |

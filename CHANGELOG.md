@@ -107,6 +107,13 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `host::peer_in_own_user_namespace` answers whether the process that
+  connected the other end of a unix socket runs in the caller's own user
+  namespace. No sandbox's process does, though its credentials are the
+  caller's, so a program serving a socket on a sandbox's behalf refuses the
+  sandbox's processes with it. The peer is read through `SO_PEERPIDFD` and
+  `PIDFD_GET_USER_NAMESPACE` from Linux 6.11, through `/proc` by the pidfd's
+  pid from 6.5, and by `SO_PEERCRED`'s pid before.
 - `fcage --events PATH` writes everything `fcage` says of its own to `PATH` as
   events, one JSON object per line, and nothing of its own on standard error,
   which then carries the command's output alone. The stream begins with

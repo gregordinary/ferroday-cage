@@ -1,6 +1,8 @@
 //! The process-level system calls the launch path makes itself: fork, exec,
 //! exit, a signal's disposition, the signal mask, a descriptor signals are
-//! read from, and what reaped children used.
+//! read from, and what reaped children used. Beside them, the two that name a
+//! unix socket's peer process, which rustix does not wrap, and the request
+//! that reads a pidfd's user namespace.
 //!
 //! rustix keeps these in a module reserved for libc-like runtimes, whose name
 //! it does not hold stable for anyone else, so they are issued here through the
@@ -16,7 +18,7 @@
 //! applies. An architecture outside the gate does not build.
 
 use std::ffi::{CStr, c_long, c_ulong};
-use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
 use rustix::fs::OFlags;
 use rustix::io::Errno;
@@ -495,6 +497,105 @@ pub(crate) fn signalfd(signals: &SigSet) -> Result<OwnedFd, Errno> {
             std::ptr::from_ref(signals),
             size_of::<SigSet>(),
             SFD_CLOEXEC | SFD_NONBLOCK
+        )
+    }
+    .map_err(errno)?;
+    // SAFETY: the call returned a fresh descriptor this process owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// `SOL_SOCKET`, the level of the options every socket has, on every
+/// architecture the build admits.
+const SOL_SOCKET: usize = 1;
+
+/// `SO_PEERCRED`: the credentials of the process that connected a unix
+/// socket's other end, as of the connection.
+const SO_PEERCRED: usize = 17;
+
+/// `SO_PEERPIDFD` (Linux 6.5): a pidfd for the process that connected a unix
+/// socket's other end.
+const SO_PEERPIDFD: usize = 77;
+
+/// `PIDFD_GET_USER_NAMESPACE` (Linux 6.11), `_IO(0xFF, 9)`: a descriptor of
+/// the user namespace of the process a pidfd refers to. An `_IO` request
+/// carries no direction bits on the architectures the build admits.
+const PIDFD_GET_USER_NAMESPACE: usize = 0xFF09;
+
+/// The kernel's `struct ucred`, as `SO_PEERCRED` writes it: a pid and two ids,
+/// each 32 bits on every architecture.
+#[repr(C)]
+#[derive(Default)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+/// Reads the socket option `option` of `socket` into `value`, returning how
+/// many bytes the kernel wrote.
+///
+/// # Safety
+///
+/// `T` is the type the kernel writes for `option`, with no invalid bit
+/// patterns, since the kernel may write fewer bytes than it holds.
+unsafe fn getsockopt<T>(socket: BorrowedFd<'_>, option: usize, value: &mut T) -> Result<(), Errno> {
+    let mut len = size_of::<T>() as u32;
+    // SAFETY: `value` is a live, writable `T` and `len` its size, which bounds
+    // what the kernel writes; that `T` is the option's type is the caller's
+    // contract. The descriptor is borrowed for the call.
+    unsafe {
+        syscalls::syscall!(
+            Sysno::getsockopt,
+            socket.as_raw_fd(),
+            SOL_SOCKET,
+            option,
+            std::ptr::from_mut(value),
+            &raw mut len
+        )
+    }
+    .map(drop)
+    .map_err(errno)
+}
+
+/// The pid `SO_PEERCRED` gives the process that connected `socket`'s other
+/// end, as the caller's PID namespace numbers it, or `None` where the process
+/// has no pid there.
+///
+/// Issued here rather than through rustix, whose `UCred` holds the pid as a
+/// `Pid`, a type with no value for the 0 the kernel reports for a process the
+/// caller's PID namespace cannot see.
+pub(crate) fn socket_peer_pid(socket: BorrowedFd<'_>) -> Result<Option<Pid>, Errno> {
+    let mut cred = Ucred::default();
+    // SAFETY: `SO_PEERCRED` writes a `struct ucred`, which `Ucred` is, and any
+    // bits are valid for its three integers.
+    unsafe { getsockopt(socket, SO_PEERCRED, &mut cred) }?;
+    Ok(Pid::from_raw(cred.pid))
+}
+
+/// A pidfd for the process that connected `socket`'s other end, through
+/// `SO_PEERPIDFD`, close-on-exec as every pidfd is. `ENOPROTOOPT` before Linux
+/// 6.5.
+pub(crate) fn socket_peer_pidfd(socket: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
+    let mut fd: i32 = -1;
+    // SAFETY: `SO_PEERPIDFD` writes an `int`, which `fd` is.
+    unsafe { getsockopt(socket, SO_PEERPIDFD, &mut fd) }?;
+    // SAFETY: the call succeeded, so the kernel installed a fresh descriptor
+    // this process owns at `fd`.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A descriptor of the user namespace of the process `pidfd` refers to,
+/// through `PIDFD_GET_USER_NAMESPACE`, close-on-exec. `ENOTTY` before Linux
+/// 6.11, where a pidfd answers no request.
+pub(crate) fn pidfd_user_namespace(pidfd: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
+    // SAFETY: the request takes no argument and writes no memory; the
+    // descriptor is borrowed for the call.
+    let fd = unsafe {
+        syscalls::syscall!(
+            Sysno::ioctl,
+            pidfd.as_raw_fd(),
+            PIDFD_GET_USER_NAMESPACE,
+            0usize
         )
     }
     .map_err(errno)?;

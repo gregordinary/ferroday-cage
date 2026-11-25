@@ -81,6 +81,7 @@ pub fn ferroday_cage::host::landlock_enforces_net(ferroday_cage::NetAccess) -> b
 pub fn ferroday_cage::host::landlock_enforces_scope(ferroday_cage::LandlockScope) -> bool
 pub fn ferroday_cage::host::overlay_blocker(impl core::convert::AsRef<std::path::Path>) -> core::option::Option<ferroday_cage::host::OverlayBlocker>
 pub fn ferroday_cage::host::own_cgroup() -> core::option::Option<std::path::PathBuf>
+pub fn ferroday_cage::host::peer_in_own_user_namespace(impl std::os::fd::owned::AsFd) -> core::io::error::Result<bool>
 pub fn ferroday_cage::host::procfs_blocker() -> core::option::Option<ferroday_cage::host::ProcfsBlocker>
 pub fn ferroday_cage::host::range_map_blocker() -> core::option::Option<ferroday_cage::host::RangeMapBlocker>
 pub fn ferroday_cage::host::seccomp_available() -> bool

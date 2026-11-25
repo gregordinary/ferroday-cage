@@ -7,10 +7,13 @@
 //! hosts that cannot run them. [`range_map_blocker`] does the same for
 //! uid/gid range maps, whose availability depends on the caller's privilege
 //! and, for the delegated tier, on the shadow suite's helpers.
+//! [`peer_in_own_user_namespace`] asks of the process at the other end of a
+//! unix socket whether it runs in the caller's own user namespace, which no
+//! sandbox's process does.
 
 use std::ffi::CString;
 use std::fmt;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
@@ -488,6 +491,41 @@ fn cgroup_directory(membership: &str, mountinfo: &str) -> Option<PathBuf> {
             false => entry.mount_point.join(beneath),
         })
     })
+}
+
+/// Whether the process that connected the other end of `socket`, a connected
+/// unix socket, runs in this process's own user namespace.
+///
+/// For a program that serves a socket on behalf of a sandbox, such as one that
+/// runs further commands in it through [`Running::exec`], and must refuse what
+/// the sandbox's own processes send it. Their credentials do not set them
+/// apart: a sandbox maps its identities onto the caller's, so `SO_PEERCRED`
+/// reports a sandboxed process with the caller's own uid and gid, and a check
+/// of the uid admits it. Its user namespace does: every sandbox's process runs
+/// in a namespace nested below the caller's. A
+/// [`Restriction`](crate::Restriction)'s command runs in the caller's own, so
+/// it is not told apart here, and a socket it can reach is one it can use.
+///
+/// The peer is the process that called `connect`. The kernel names it most
+/// exactly from Linux 6.11, by a pidfd and the namespace the pidfd's process
+/// runs in. From Linux 6.5 the namespace is read through `/proc` by the pid
+/// that pidfd's process holds, and counts only where that process still runs
+/// once it has been read. Before 6.5 the pid is `SO_PEERCRED`'s, opened as a
+/// pidfd and read the same way, which leaves a window between the connection
+/// and the check: a peer that exited in it can have its pid taken by another
+/// process, which is then the one asked about.
+///
+/// # Errors
+///
+/// The OS error where the peer cannot be read: it has exited, has no pid in
+/// this process's PID namespace, or runs where this process may not read its
+/// namespace, or `/proc` is not mounted. A caller refusing what it cannot
+/// place refuses such a peer.
+///
+/// [`Running::exec`]: crate::Running::exec
+pub fn peer_in_own_user_namespace(socket: impl AsFd) -> std::io::Result<bool> {
+    let own = crate::mechanism::peer::UserNamespace::own()?;
+    Ok(crate::mechanism::peer::of_peer(socket.as_fd())? == own)
 }
 
 /// The procfs entries the kernel keeps as permanently empty directories for

@@ -4,7 +4,9 @@
 //! This module is one of the crate's homes of `unsafe`. The unsafe
 //! surface here is the process-creation and exec boundary — `fork`,
 //! `unshare_unsafe`, `execve`, the signal-state calls, and the descriptor
-//! sweep — each with its invariant documented at the call site, and
+//! sweep — and the two socket options and the pidfd request that name a unix
+//! socket's peer process ([`peer`]), each with its invariant documented at the
+//! call site, and
 //! everything after the fork runs in a child process under the constraints
 //! documented in [`child`].
 //! Every syscall the stages make themselves is issued with inline assembly,
@@ -103,6 +105,7 @@ mod harden;
 mod listener;
 pub(crate) mod netns;
 mod overlay;
+pub(crate) mod peer;
 mod procfs;
 mod remove;
 pub(crate) mod resolve;
@@ -2255,6 +2258,21 @@ pub(crate) fn exits_within(pidfd: BorrowedFd<'_>, patience: Duration) -> bool {
     matches!(
         rustix::event::poll(&mut fds, Some(&crate::poll::timeout(patience))),
         Ok(ready) if ready > 0
+    )
+}
+
+/// Whether the process a pidfd refers to is known to be running: a poll asked
+/// now answers that it has not exited.
+///
+/// [`has_exited`] read from the other side. Both answer `false` where the poll
+/// fails, since each caller acts only on what it knows: [`peer`] trusts a
+/// reading of a process's namespace by its pid only while the process is known
+/// to hold that pid.
+pub(crate) fn is_running(pidfd: BorrowedFd<'_>) -> bool {
+    let mut fds = [PollFd::from_borrowed_fd(pidfd, PollFlags::IN)];
+    matches!(
+        rustix::event::poll(&mut fds, Some(&crate::poll::timeout(Duration::ZERO))),
+        Ok(0)
     )
 }
 
