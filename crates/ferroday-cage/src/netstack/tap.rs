@@ -29,7 +29,7 @@
 
 use std::ffi::{CStr, CString, c_int};
 use std::net::Ipv4Addr;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, OwnedFd};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
@@ -37,7 +37,7 @@ use rustix::ioctl;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
 use super::{GUEST_MAC, NetStackError, Plan, PlanV4, PlanV6};
-use crate::mechanism::netns::{self, HelperFailure, JoinSteps, Namespaces};
+use crate::mechanism::netns::{self, HelperFailure, IfreqFlags, JoinSteps, Namespaces, RaiseStep};
 use crate::wire::wire_enum;
 
 /// `TUNSETIFF`: create or attach to a tun/tap interface, `_IOW('T', 202,
@@ -53,14 +53,8 @@ const IFF_NO_PI: i16 = 0x1000;
 /// the high bit is its sign.
 const IFF_TUN_EXCL: i16 = 0x8000_u16.cast_signed();
 
-/// `IFF_UP` from the interface flags.
-const IFF_UP: i16 = 0x1;
 /// `SIOCADDRT`: add a route.
 const SIOCADDRT: ioctl::Opcode = 0x890B;
-/// `SIOCGIFFLAGS`: read an interface's flags.
-const SIOCGIFFLAGS: ioctl::Opcode = 0x8913;
-/// `SIOCSIFFLAGS`: set an interface's flags.
-const SIOCSIFFLAGS: ioctl::Opcode = 0x8914;
 /// `SIOCSIFADDR`: set an interface's address (v4 on an `AF_INET` socket,
 /// v6 — with a different request struct — on an `AF_INET6` socket).
 const SIOCSIFADDR: ioctl::Opcode = 0x8916;
@@ -135,20 +129,15 @@ wire_enum! {
     }
 }
 
-/// The interface-request views below mirror `struct ifreq`: the 16-byte
-/// interface name, then one member of the request union, padded to a fixed
-/// 40 bytes. That is the kernel's own size on 64-bit targets; on 32-bit ones
-/// `struct ifreq` is 32 bytes and the trailing padding simply goes unread,
-/// since each ioctl copies its own size and every member used here lies within
-/// the first 32. What must not drift is a member's offset, which the size
-/// assertions pin along with the overall layout: a mismatch has to fail the
-/// build rather than misissue the ioctl.
-#[repr(C)]
-struct IfreqFlags {
-    name: [u8; 16],
-    flags: i16,
-    _pad: [u8; 22],
-}
+// The interface-request views below mirror `struct ifreq`: the 16-byte
+// interface name, then one member of the request union, padded to a fixed 40
+// bytes. That is the kernel's own size on 64-bit targets; on 32-bit ones
+// `struct ifreq` is 32 bytes and the trailing padding simply goes unread, since
+// each ioctl copies its own size and every member used here lies within the
+// first 32. What must not drift is a member's offset, which the size assertions
+// pin along with the overall layout: a mismatch has to fail the build rather
+// than misissue the ioctl. The flags view, which a launch's loopback shares,
+// is `netns::IfreqFlags`.
 
 /// The MTU view of `struct ifreq`.
 #[repr(C)]
@@ -184,7 +173,6 @@ struct IfreqAddrV4 {
     _pad: [u8; 8],
 }
 
-const _: () = assert!(size_of::<IfreqFlags>() == 40);
 const _: () = assert!(size_of::<IfreqMtu>() == 40);
 const _: () = assert!(size_of::<IfreqIndex>() == 40);
 const _: () = assert!(size_of::<IfreqHwaddr>() == 40);
@@ -376,7 +364,10 @@ fn build_tap(context: &HelperContext<'_>) -> Result<OwnedFd, (Step, Errno)> {
         let mask = Ipv4Addr::from(super::prefix::mask_v4(v4.prefix_len));
         set_v4_netmask(&inet, context.name, mask).map_err(|errno| (Step::SetV4Mask, errno))?;
     }
-    bring_up(&inet, context.name)?;
+    netns::raise_interface(inet.as_fd(), context.name).map_err(|(step, errno)| match step {
+        RaiseStep::ReadFlags => (Step::ReadFlags, errno),
+        RaiseStep::SetFlags => (Step::RaiseFlags, errno),
+    })?;
     if let Some(v4) = &context.plan.v4 {
         add_v4_default_route(&inet, v4).map_err(|errno| (Step::AddV4Route, errno))?;
     }
@@ -527,34 +518,6 @@ fn set_v4_netmask(inet: &OwnedFd, name: [u8; 16], mask: Ipv4Addr) -> Result<(), 
             ioctl::Setter::<SIOCSIFNETMASK, IfreqAddrV4>::new(request),
         )
     }
-}
-
-/// Brings the interface up, preserving its other flags.
-fn bring_up(inet: &OwnedFd, name: [u8; 16]) -> Result<(), (Step, Errno)> {
-    let mut request = IfreqFlags {
-        name,
-        flags: 0,
-        _pad: [0; 22],
-    };
-    // SAFETY: SIOCGIFFLAGS reads and writes a `struct ifreq` with the flags
-    // at the start of the union; `IfreqFlags` lays that out at the kernel's
-    // offsets, in 40 bytes, no less than the kernel's size.
-    unsafe {
-        ioctl::ioctl(
-            inet,
-            ioctl::Updater::<SIOCGIFFLAGS, IfreqFlags>::new(&mut request),
-        )
-    }
-    .map_err(|errno| (Step::ReadFlags, errno))?;
-    request.flags |= IFF_UP;
-    // SAFETY: SIOCSIFFLAGS reads the same `struct ifreq` layout.
-    unsafe {
-        ioctl::ioctl(
-            inet,
-            ioctl::Setter::<SIOCSIFFLAGS, IfreqFlags>::new(request),
-        )
-    }
-    .map_err(|errno| (Step::RaiseFlags, errno))
 }
 
 /// Installs the IPv4 default route via the gateway.

@@ -34,6 +34,7 @@ use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
+use rustix::ioctl;
 use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 use rustix::thread::LinkNameSpaceType;
 
@@ -353,6 +354,82 @@ pub(crate) fn socket_for(
         SocketAddr::V6(_) => AddressFamily::INET6,
     };
     rustix::net::socket_with(family, kind, flags, None)
+}
+
+/// The flags view of `struct ifreq`, as the interface-flags ioctls expect it:
+/// the 16-byte interface name, then the flags opening the request union,
+/// padded to 40 bytes. That is the kernel's size on 64-bit targets; on 32-bit
+/// ones `struct ifreq` is 32 bytes, and the padding past it goes unread, since
+/// each ioctl copies the kernel's own size.
+///
+/// The one flags view: [`raise_interface`] sets an interface's flags through
+/// it, and the network stack's tap passes its tun flags through it to
+/// `TUNSETIFF`.
+#[repr(C)]
+pub(crate) struct IfreqFlags {
+    /// The interface name, NUL-padded.
+    pub(crate) name: [u8; 16],
+    /// The flags: the interface's, or a tun device's.
+    pub(crate) flags: i16,
+    /// Padding to the 40 bytes above.
+    pub(crate) _pad: [u8; 22],
+}
+
+/// A layout that drifts from the kernel's must fail the build, not misissue
+/// the ioctl.
+const _: () = assert!(size_of::<IfreqFlags>() == 40);
+
+/// `IFF_UP` from the kernel's interface flags.
+const IFF_UP: i16 = 0x1;
+/// `SIOCGIFFLAGS`: read an interface's flags.
+const SIOCGIFFLAGS: ioctl::Opcode = 0x8913;
+/// `SIOCSIFFLAGS`: set an interface's flags.
+const SIOCSIFFLAGS: ioctl::Opcode = 0x8914;
+
+/// Which half of [`raise_interface`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaiseStep {
+    /// Reading the interface's flags (`SIOCGIFFLAGS`).
+    ReadFlags,
+    /// Setting them with `IFF_UP` added (`SIOCSIFFLAGS`).
+    SetFlags,
+}
+
+/// Brings the interface `name`, NUL-padded, up in the network namespace
+/// `socket` was created in, keeping its other flags.
+///
+/// Through the interface-flags ioctls, which any socket of the namespace
+/// takes, rather than netlink machinery for a single flag. It allocates
+/// nothing, so a forked child may call it: a launch's child raises its
+/// loopback with it, and the network stack's helper its tap.
+pub(crate) fn raise_interface(
+    socket: BorrowedFd<'_>,
+    name: [u8; 16],
+) -> Result<(), (RaiseStep, Errno)> {
+    let mut request = IfreqFlags {
+        name,
+        flags: 0,
+        _pad: [0; 22],
+    };
+    // SAFETY: SIOCGIFFLAGS reads and writes a `struct ifreq` with the flags at
+    // the start of the union; `IfreqFlags` lays that out at the kernel's
+    // offsets, in no fewer bytes than the kernel copies.
+    unsafe {
+        ioctl::ioctl(
+            socket,
+            ioctl::Updater::<SIOCGIFFLAGS, IfreqFlags>::new(&mut request),
+        )
+    }
+    .map_err(|errno| (RaiseStep::ReadFlags, errno))?;
+    request.flags |= IFF_UP;
+    // SAFETY: SIOCSIFFLAGS reads the same `struct ifreq` layout.
+    unsafe {
+        ioctl::ioctl(
+            socket,
+            ioctl::Setter::<SIOCSIFFLAGS, IfreqFlags>::new(request),
+        )
+    }
+    .map_err(|errno| (RaiseStep::SetFlags, errno))
 }
 
 #[cfg(test)]

@@ -87,7 +87,6 @@ use rustix::fs::{
     StatxFlags,
 };
 use rustix::io::Errno;
-use rustix::ioctl;
 use rustix::mount::{self, MountFlags, MountPropagationFlags, UnmountFlags};
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 use rustix::process::Pid;
@@ -105,8 +104,8 @@ use super::seccomp;
 use super::sys::{self, Disposition, How, SigSet};
 use super::{
     FreshFs, FsParam, IdentityPlan, JoinTarget, LaunchPlan, MountAction, MountOp, OverlayPlan,
-    RootPlan,
-    STATUS_DUMPED, STATUS_EXITED, STATUS_SIGNALED, STDERR_FILENO, StdioPlan, encode_status,
+    RootPlan, STATUS_DUMPED, STATUS_EXITED, STATUS_SIGNALED, STDERR_FILENO, StdioPlan,
+    encode_status,
 };
 use crate::error::SetupStep;
 use crate::spec::covers;
@@ -4315,32 +4314,8 @@ fn map_file_path(pid: u32, file: &[u8]) -> StackPath {
     path
 }
 
-/// The flags half of `struct ifreq`, as the kernel's interface ioctls
-/// expect it: the interface name and the flags opening the request union,
-/// padded to 40 bytes. That is the kernel's size on 64-bit targets; on 32-bit
-/// ones `struct ifreq` is 32 bytes, and the padding past it goes unread.
-#[repr(C)]
-struct IfreqFlags {
-    name: [u8; 16],
-    flags: i16,
-    _pad: [u8; 22],
-}
-
-/// The ioctls copy the kernel's own `struct ifreq`, which the view must be no
-/// smaller than; a layout that drifts from it must fail the build, not
-/// misissue the ioctl.
-const _: () = assert!(size_of::<IfreqFlags>() == 40);
-
-/// `IFF_UP` from the kernel's interface flags.
-const IFF_UP: i16 = 0x1;
-/// `SIOCGIFFLAGS`: read an interface's flags.
-const SIOCGIFFLAGS: ioctl::Opcode = 0x8913;
-/// `SIOCSIFFLAGS`: set an interface's flags.
-const SIOCSIFFLAGS: ioctl::Opcode = 0x8914;
-
 /// Brings up the loopback interface in this process's network namespace,
-/// via the interface-flags ioctls on a throwaway datagram socket — no
-/// netlink machinery for a single flag flip.
+/// through a throwaway datagram socket of it.
 fn bring_up_loopback() -> Result<(), Errno> {
     let socket = rustix::net::socket_with(
         AddressFamily::INET,
@@ -4348,29 +4323,8 @@ fn bring_up_loopback() -> Result<(), Errno> {
         SocketFlags::CLOEXEC,
         None,
     )?;
-    let mut request = IfreqFlags {
-        name: *b"lo\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
-        flags: 0,
-        _pad: [0; 22],
-    };
-    // SAFETY: SIOCGIFFLAGS reads and writes a `struct ifreq`, which
-    // `IfreqFlags` lays out: the 16-byte name, then the flags at the start
-    // of the union, padded to 40 bytes, no less than the kernel's size.
-    unsafe {
-        ioctl::ioctl(
-            &socket,
-            ioctl::Updater::<SIOCGIFFLAGS, IfreqFlags>::new(&mut request),
-        )
-    }?;
-    request.flags |= IFF_UP;
-    // SAFETY: SIOCSIFFLAGS reads the same `struct ifreq` layout.
-    unsafe {
-        ioctl::ioctl(
-            &socket,
-            ioctl::Setter::<SIOCSIFFLAGS, IfreqFlags>::new(request),
-        )
-    }?;
-    Ok(())
+    super::netns::raise_interface(socket.as_fd(), *b"lo\0\0\0\0\0\0\0\0\0\0\0\0\0\0")
+        .map_err(|(_, errno)| errno)
 }
 
 /// Writes the failure record: the step discriminant, the errno, and the detail

@@ -976,6 +976,11 @@ consumer upgrading can skip it.
   such as `/etc/passwd`, as it walks them for `etc/passwd`. It asked the upper
   about `/` itself, and failed with `EINVAL`. No current caller spells a path
   that way.
+- A launch's loopback and the network stack's tap are raised through one
+  helper, `mechanism::netns::raise_interface`, over one flags view of
+  `struct ifreq`, which the tap's `TUNSETIFF` request uses too. Each kept its
+  own copy of the view and the two ioctls before. `tools/idioms.toml` records
+  the shape.
 
 ## [0.6.0] - 2026-11-13
 
