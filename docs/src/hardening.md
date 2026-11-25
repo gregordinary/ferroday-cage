@@ -483,8 +483,16 @@ Two carry kernel semantics worth knowing before relying on them:
   5.13 the kernel counts per host user id across the whole system. A command
   running as the calling user's host id then shares the cap with the caller's
   other processes. A [range identity map](identity-maps.md) with a non-root
-  run-as identity gives it a host id of its own. `pending-signals` counts queued
-  signals the same way.
+  run-as identity gives it a host id of its own. A restriction's command runs in
+  no user namespace of its own, so on every kernel its count is every process of
+  the calling user's on the host. `pending-signals` counts queued signals the
+  same way.
+
+  The kernel exempts a process whose real user is the host's root from the
+  count, in whatever user namespace it runs. A root caller's command runs as
+  that user under the single-identity map and under a restriction, so `build`
+  refuses a finite `processes` limit there with `ConfigError::RlimitRootExempt`.
+  A cgroup's `pids-max` bounds the process count in its place.
 - **`AddressSpace`** counts mapped address space, not resident memory. A
   runtime that maps far more than it touches — many do — hits the limit well
   before its real memory use approaches the value.

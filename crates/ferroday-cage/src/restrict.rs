@@ -400,7 +400,11 @@ impl RestrictionBuilder {
     /// all — the only thing bounding what the command consumes is what the
     /// caller sets, this and a cgroup's limits. Each process is held to it
     /// alone, so a command that starts more processes uses more in all;
-    /// [`cgroup_limit`](Self::cgroup_limit) bounds the tree together.
+    /// [`cgroup_limit`](Self::cgroup_limit) bounds the tree together. The
+    /// exception is [`Resource::Processes`], which the kernel counts per user:
+    /// with no user namespace, the count is every process of the calling
+    /// user's on the host, and a root caller's command is exempt from it, so
+    /// [`build`](Self::build) refuses one for a root caller.
     pub fn rlimit(
         mut self,
         resource: Resource,
@@ -843,6 +847,9 @@ impl RestrictionBuilder {
         let command = spec::validate_command(self.command, None)?;
         let exec_label = spec::exec_label(&command.path, &[]);
         let (rlimits, rlimit_labels) = spec::lower_rlimits(&self.rlimits)?;
+        // A restriction switches no identity: the command's host user is the
+        // caller's real one.
+        spec::ensure_rlimits_hold(&self.rlimits, rustix::process::getuid().as_raw())?;
         let cgroup = self.cgroup.plan()?;
         let cgroup_unapplied = self.cgroup.unapplied();
         let args = self

@@ -393,6 +393,14 @@ consumer upgrading can skip it.
   spelling could take `0755` after an entry stated it `0700` through the other,
   and two entries under two spellings ended in whichever order a hash map
   chose.
+- A cage or a restriction whose command would run as the host's root user
+  refuses a finite `Processes` limit with the new
+  `ConfigError::RlimitRootExempt`, since the kernel lets such a process fork
+  past `RLIMIT_NPROC` in any user namespace and the limit held nothing. A root
+  caller's command runs as that user under the single-identity map and under a
+  restriction. The documentation of `Resource::Processes` also said a
+  restriction's count was the sandbox's processes, where it is every process of
+  the calling user's on the host.
 
 ### Internal
 

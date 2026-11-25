@@ -196,7 +196,17 @@ roster_enum! {
     ///   shares the cap with every other process of the caller's. Root of the
     ///   single-identity map is that id, and so is root of the subordinate map.
     ///   A non-root [`run_as`](crate::CageBuilder::run_as) identity under a
-    ///   range map is a host id of its own, whose count is the sandbox's.
+    ///   range map is a host id of its own, whose count is the sandbox's. The
+    ///   hardening layer's `Restriction` runs its command in no user
+    ///   namespace of its own, so on every kernel its count is every process
+    ///   the calling user runs on the host: a limit below how many the caller
+    ///   already runs refuses the command every fork. The kernel exempts a
+    ///   process whose real user is the host's root altogether, in whatever
+    ///   user namespace it runs, so a build whose command would run as the
+    ///   host's root refuses a limit here with
+    ///   [`ConfigError::RlimitRootExempt`](crate::ConfigError::RlimitRootExempt).
+    ///   A root caller's command does, under the single-identity map and under
+    ///   a restriction. A cgroup's `pids-max` bounds the tree in either.
     /// - [`PendingSignals`](Self::PendingSignals) is `RLIMIT_SIGPENDING`, which
     ///   counts queued signals per user in the same way, on the same kernels.
     /// - [`AddressSpace`](Self::AddressSpace) counts mapped address space, not

@@ -287,7 +287,9 @@ environment, standard streams, terminal, timeout, resource limits, and cgroup,
 behave as they do for a sandbox, and `fcage --help` lists every flag
 `--restrict` takes. Resource limits matter more here than in a cage: without
 namespaces, the [`rlimit`]s and a cgroup's limits are the only things bounding
-what the command consumes.
+what the command consumes. The `processes` limit counts every process of the
+calling user's on the host, the caller's own among them, and holds nothing for
+a root caller, whose build refuses one.
 
 [`Restriction`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Restriction.html
 [`landlock_fs`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.RestrictionBuilder.html#method.landlock_fs

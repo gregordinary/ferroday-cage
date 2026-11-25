@@ -1817,6 +1817,8 @@ pub ferroday_cage::ConfigError::RevealUnhidden::path: std::path::PathBuf
 pub ferroday_cage::ConfigError::RlimitInvalid::hard: ferroday_cage::limits::Limit
 pub ferroday_cage::ConfigError::RlimitInvalid::resource: ferroday_cage::limits::Resource
 pub ferroday_cage::ConfigError::RlimitInvalid::soft: ferroday_cage::limits::Limit
+#[non_exhaustive] pub ferroday_cage::ConfigError::RlimitRootExempt
+pub ferroday_cage::ConfigError::RlimitRootExempt::resource: ferroday_cage::limits::Resource
 pub ferroday_cage::ConfigError::RootContradiction
 pub ferroday_cage::ConfigError::RootfsIsHostRoot
 pub ferroday_cage::ConfigError::RootfsMissing

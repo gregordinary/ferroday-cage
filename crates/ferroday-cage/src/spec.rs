@@ -3199,6 +3199,15 @@ impl CageBuilder {
             .as_ref()
             .map(|identity_request| validate_run_as(identity_request, &identity, present_as))
             .transpose()?;
+        let inside_uid = self
+            .run_as
+            .as_ref()
+            .map(|identity| identity.uid)
+            .or(present_as.map(|presented| presented.uid))
+            .unwrap_or(0);
+        if let Some(host_uid) = command_host_uid(&identity, inside_uid) {
+            ensure_rlimits_hold(&self.rlimits, host_uid)?;
+        }
 
         // The nested user namespace the command enters before it hardens, which
         // is what locks the flags of every mount the sandbox established. Its
@@ -5711,6 +5720,37 @@ fn embedded_nul(value: Vec<u8>) -> ConfigError {
 ///
 /// The map's iteration order is the resource's own, so the applied order does
 /// not depend on the order the caller configured them in.
+/// Refuses a process-count limit on a command whose host user, `host_uid`, is
+/// root: the kernel lets such a process fork past `RLIMIT_NPROC` in whatever
+/// user namespace it runs, and a limit that holds nothing is refused rather
+/// than set. An unlimited one asks for nothing and passes.
+pub(crate) fn ensure_rlimits_hold(
+    rlimits: &BTreeMap<Resource, (Limit, Limit)>,
+    host_uid: u32,
+) -> Result<(), ConfigError> {
+    match rlimits.get(&Resource::Processes) {
+        Some((soft, hard))
+            if host_uid == 0 && (soft.amount().is_some() || hard.amount().is_some()) =>
+        {
+            Err(ConfigError::RlimitRootExempt {
+                resource: Resource::Processes,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The host uid the command of a cage whose identity plan is `identity` runs
+/// as, where `inside` is its uid inside: the caller's effective uid, which the
+/// single-identity map maps its one id to, or the host id a range map's extent
+/// gives it.
+fn command_host_uid(identity: &IdentityPlan, inside: u32) -> Option<u32> {
+    match identity {
+        IdentityPlan::Single => Some(rustix::process::geteuid().as_raw()),
+        IdentityPlan::Ranged { map, .. } => idmap::outside_id(map.uid(), inside),
+    }
+}
+
 pub(crate) fn lower_rlimits(
     rlimits: &BTreeMap<Resource, (Limit, Limit)>,
 ) -> Result<(Vec<RlimitPlan>, Vec<String>), Error> {
@@ -9730,6 +9770,26 @@ read-only = true
         let serialized = toml::to_string(&original).unwrap();
         let restored: CageBuilder = toml::from_str(&serialized).unwrap();
         assert_eq!(format!("{original:?}"), format!("{restored:?}"));
+    }
+
+    #[test]
+    fn a_process_count_limit_on_the_host_s_root_user_is_refused() {
+        // The kernel lets a process whose real user is the host's root fork
+        // past `RLIMIT_NPROC`, so a limit there would hold nothing.
+        let limited = BTreeMap::from([(Resource::Processes, (Limit::of(64), Limit::of(64)))]);
+        assert!(matches!(
+            ensure_rlimits_hold(&limited, 0),
+            Err(ConfigError::RlimitRootExempt {
+                resource: Resource::Processes
+            })
+        ));
+        assert!(ensure_rlimits_hold(&limited, 1000).is_ok());
+        // An unlimited one asks for nothing, and other limits hold for root.
+        let unlimited =
+            BTreeMap::from([(Resource::Processes, (Limit::UNLIMITED, Limit::UNLIMITED))]);
+        assert!(ensure_rlimits_hold(&unlimited, 0).is_ok());
+        let files = BTreeMap::from([(Resource::OpenFiles, (Limit::of(64), Limit::of(64)))]);
+        assert!(ensure_rlimits_hold(&files, 0).is_ok());
     }
 
     #[test]

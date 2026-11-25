@@ -976,6 +976,19 @@ rendered as text.
         /// The error encountered while resolving it.
         source: io::Error,
     },
+    /// A process-count limit was set on a command whose host user is root,
+    /// which the kernel exempts from it.
+    ///
+    /// The kernel lets a process whose real user is the host's root fork past
+    /// [`Resource::Processes`](crate::Resource::Processes) in whatever user
+    /// namespace it runs, so the limit would hold nothing. A root caller's
+    /// command runs as that user under the single-identity map, and under a
+    /// restriction. A cgroup's `pids-max` bounds the process count instead.
+    #[non_exhaustive]
+    RlimitRootExempt {
+        /// The limit the kernel would not apply.
+        resource: crate::Resource,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -1039,6 +1052,12 @@ impl fmt::Display for ConfigError {
             ConfigError::LandlockGrantUnresolved { path, .. } => {
                 write!(f, "cannot resolve the Landlock grant path {path:?}")
             }
+            ConfigError::RlimitRootExempt { resource } => write!(
+                f,
+                "the command would run as the host's root user, whom the kernel exempts from \
+                 {resource}, so the limit would hold nothing; a cgroup's pids-max bounds the \
+                 process count instead",
+            ),
             ConfigError::MountTargetInvalid { path } => write!(
                 f,
                 "the mount target {path:?} is not a normal absolute path inside the rootfs",

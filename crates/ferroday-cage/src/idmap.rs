@@ -670,9 +670,16 @@ impl std::error::Error for IdMapError {
 
 /// Whether `id` falls inside one of the extents' inside ranges.
 pub(crate) fn maps_inside_id(ranges: &[IdRange], id: u32) -> bool {
-    ranges
-        .iter()
-        .any(|range| id >= range.inside && id - range.inside < range.count)
+    outside_id(ranges, id).is_some()
+}
+
+/// The host id the extents map the inside id `id` to, from the first extent
+/// whose inside range holds it, or `None` where none does.
+pub(crate) fn outside_id(ranges: &[IdRange], id: u32) -> Option<u32> {
+    ranges.iter().find_map(|range| {
+        let offset = id.checked_sub(range.inside)?;
+        (offset < range.count).then(|| range.outside.checked_add(offset))?
+    })
 }
 
 /// Whether a gid map is the caller's own gid alone: one extent, of one id,
@@ -2134,6 +2141,17 @@ mod tests {
             err,
             ConfigError::IdentityMapInvalid { reason } if reason.contains("340")
         ));
+    }
+
+    #[test]
+    fn an_inside_id_maps_to_the_host_id_its_extent_gives_it() {
+        let ranges = [range(0, 1000, 1), range(1, 100000, 65536)];
+        assert_eq!(outside_id(&ranges, 0), Some(1000));
+        assert_eq!(outside_id(&ranges, 1), Some(100000));
+        assert_eq!(outside_id(&ranges, 65536), Some(165535));
+        assert_eq!(outside_id(&ranges, 65537), None);
+        // An extent running past the host's id space maps nothing there.
+        assert_eq!(outside_id(&[range(0, u32::MAX, 2)], 1), None);
     }
 
     #[test]
