@@ -34,99 +34,27 @@ struct Entry {
     xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-/// A minimal ustar/pax reader for the archives the exporter writes: enough to
-/// verify them without reaching into the crate's own (crate-private) reader.
+/// Each member of an archive the export wrote, read as a `Tarball` reads one:
+/// by ferrotape, at its compatible level.
 fn parse_tar(data: &[u8]) -> Vec<Entry> {
-    let field = |b: &[u8]| {
-        let end = b.iter().position(|c| *c == 0).unwrap_or(b.len());
-        b[..end].to_vec()
-    };
-    let octal = ferroday_cage_testkit::tar::read_octal;
-
+    let mut reader = ferrotape::Reader::new(data).with_level(ferrotape::Level::Compatible);
     let mut entries = Vec::new();
-    let mut pos = 0;
-    let mut pax_path: Option<Vec<u8>> = None;
-    let mut pax_link: Option<Vec<u8>> = None;
-    let mut pax_xattrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-    while pos + 512 <= data.len() {
-        let block = &data[pos..pos + 512];
-        if block.iter().all(|b| *b == 0) {
-            break;
-        }
-        pos += 512;
-        let name = field(&block[0..100]);
-        let prefix = field(&block[345..500]);
-        let mut path = if prefix.is_empty() {
-            name
-        } else {
-            let mut p = prefix;
-            p.push(b'/');
-            p.extend_from_slice(&name);
-            p
-        };
-        let mode = octal(&block[100..108]) as u32;
-        let uid = octal(&block[108..116]);
-        let gid = octal(&block[116..124]);
-        let size = octal(&block[124..136]) as usize;
-        let typeflag = block[156];
-        let mut linkname = field(&block[157..257]);
-        let body = &data[pos..pos + size];
-        pos += size.div_ceil(512) * 512;
-
-        if typeflag == b'x' {
-            parse_pax(body, &mut pax_path, &mut pax_link, &mut pax_xattrs);
-            continue;
-        }
-        if let Some(p) = pax_path.take() {
-            path = p;
-        }
-        if let Some(l) = pax_link.take() {
-            linkname = l;
-        }
-        let xattrs = std::mem::take(&mut pax_xattrs);
+    while let Some(member) = reader.next_entry().expect("the export reads back") {
         entries.push(Entry {
-            path,
-            typeflag,
-            uid,
-            gid,
-            mode,
-            linkname,
-            xattrs,
+            path: member.path().to_vec(),
+            typeflag: member.typeflag(),
+            uid: u64::from(member.uid()),
+            gid: u64::from(member.gid()),
+            mode: member.mode(),
+            linkname: member.link_target().to_vec(),
+            xattrs: member
+                .pax_records()
+                .xattrs()
+                .map(|(name, value)| (name.to_vec(), value.to_vec()))
+                .collect(),
         });
     }
     entries
-}
-
-/// Parses the pax records this exporter emits: `path`, `linkpath`, and
-/// `SCHILY.xattr.*`.
-fn parse_pax(
-    mut data: &[u8],
-    path: &mut Option<Vec<u8>>,
-    link: &mut Option<Vec<u8>>,
-    xattrs: &mut Vec<(Vec<u8>, Vec<u8>)>,
-) {
-    while !data.is_empty() {
-        let space = data.iter().position(|b| *b == b' ').unwrap();
-        let len: usize = std::str::from_utf8(&data[..space])
-            .unwrap()
-            .parse()
-            .unwrap();
-        let record = &data[space + 1..len];
-        data = &data[len..];
-        let record = &record[..record.len() - 1]; // trailing newline
-        let eq = record.iter().position(|b| *b == b'=').unwrap();
-        let (key, value) = (&record[..eq], &record[eq + 1..]);
-        match key {
-            b"path" => *path = Some(value.to_vec()),
-            b"linkpath" => *link = Some(value.to_vec()),
-            _ => {
-                if let Some(name) = key.strip_prefix(b"SCHILY.xattr.") {
-                    xattrs.push((name.to_vec(), value.to_vec()));
-                }
-            }
-        }
-    }
 }
 
 /// Indexes entries by path for order-independent assertions.

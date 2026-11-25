@@ -355,19 +355,3 @@ pub fn octal(field: &mut [u8], value: u64) {
     let text = format!("{value:0width$o}", width = field.len() - 1);
     field[..text.len()].copy_from_slice(text.as_bytes());
 }
-
-/// Reads a space- or NUL-terminated octal tar field.
-///
-/// The decoder side of [`octal`], for a test that reads back what a writer
-/// produced.
-pub fn read_octal(field: &[u8]) -> u64 {
-    let text = field
-        .split(|byte| *byte == 0 || *byte == b' ')
-        .next()
-        .unwrap_or(b"");
-    let text = std::str::from_utf8(text).expect("an octal field is ASCII");
-    if text.is_empty() {
-        return 0;
-    }
-    u64::from_str_radix(text, 8).expect("an octal field parses")
-}
