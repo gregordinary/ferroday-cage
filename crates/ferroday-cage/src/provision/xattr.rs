@@ -1437,12 +1437,16 @@ mod tests {
                 (ACL_OTHER, 4, ACL_UNDEFINED_ID),
             ]),
         );
-        // The same holds for a name the root does not answer.
-        let text = stated(b"u::rw-,u:alice:---,u:ghost:rw-,g::r--,m::rw-,o::r--");
-        assert_eq!(
-            text.resolve(|name| (name == b"alice").then_some(1001), |_| None),
-            Ok(mapped.list),
-        );
+        // The same holds for a name the root does not answer, where an
+        // archive's text form of the list is read at all.
+        #[cfg(feature = "tarball")]
+        {
+            let text = stated(b"u::rw-,u:alice:---,u:ghost:rw-,g::r--,m::rw-,o::r--");
+            assert_eq!(
+                text.resolve(|name| (name == b"alice").then_some(1001), |_| None),
+                Ok(mapped.list),
+            );
+        }
     }
 
     #[test]
