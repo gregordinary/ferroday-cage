@@ -304,6 +304,17 @@ The function's own documentation says why that is a different question from \
 the one `path::is_ordinary_component` answers."""
 
 [[idiom.site]]
+path = "crates/ferroday-cage/src/provision/tar.rs"
+count = 1
+why = """\
+The answer's refusal, made where a pax `path` or `linkpath` record is read \
+rather than where a path is resolved. A record's length ends its value, so a \
+NUL is inside the name, and other readers decode it three ways: GNU tar and \
+bsdtar cut the name there, Python keeps the byte, Go refuses. Members are also \
+found by name without being extracted (a package's control or metadata \
+member), so the refusal cannot wait for resolution."""
+
+[[idiom.site]]
 path = "crates/ferroday-cage/examples/orchestrator.rs"
 count = 1
 why = """\

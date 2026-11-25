@@ -3,7 +3,7 @@
 //!
 //! The parser yields entry metadata and streams entry data; it interprets
 //! GNU long-name (`L`)/long-link (`K`) entries and pax extended headers
-//! (`x` per-entry, and `g` global, whose per-file keywords are read past)
+//! (`x` per-entry, and `g` global, refused unless it holds only a `comment`)
 //! internally, so a consumer only ever sees
 //! concrete file entries with their effective path, link target, size, and
 //! times. Header checksums are verified.
@@ -128,16 +128,6 @@ pub(crate) struct AclRecords {
     pub text: Option<Vec<u8>>,
 }
 
-impl AclRecords {
-    /// `other` over `self`, each form taken from `other` where it states one.
-    fn overlaid(&self, other: &AclRecords) -> AclRecords {
-        AclRecords {
-            value: other.value.clone().or_else(|| self.value.clone()),
-            text: other.text.clone().or_else(|| self.text.clone()),
-        }
-    }
-}
-
 /// Whether entries of type `typeflag` carry a data stream.
 ///
 /// Hardlinks, symlinks, devices, directories, and FIFOs have none;
@@ -147,7 +137,7 @@ fn has_data(typeflag: u8) -> bool {
     !matches!(typeflag, b'1' | b'2' | b'3' | b'4' | b'5' | b'6')
 }
 
-/// Pax keys collected from an `x` or `g` header.
+/// Pax keys collected from an `x` header.
 #[derive(Debug, Default, Clone)]
 struct PaxRecords {
     path: Option<Vec<u8>>,
@@ -164,31 +154,6 @@ struct PaxRecords {
     /// Whether any `GNU.sparse.*` record was present, which makes the entry a
     /// GNU sparse member in one of the pax formats.
     gnu_sparse: bool,
-}
-
-impl PaxRecords {
-    /// Overlays `other` on top of `self`, `other` winning where both are set:
-    /// a pax header may be split across several `x` entries, and the later one
-    /// states the attribute.
-    fn overlaid(&self, other: &PaxRecords) -> PaxRecords {
-        PaxRecords {
-            path: other.path.clone().or_else(|| self.path.clone()),
-            link_target: other
-                .link_target
-                .clone()
-                .or_else(|| self.link_target.clone()),
-            size: other.size.or(self.size),
-            mtime: other.mtime.or(self.mtime),
-            uid: other.uid.or(self.uid),
-            gid: other.gid.or(self.gid),
-            uname: other.uname.clone().or_else(|| self.uname.clone()),
-            gname: other.gname.clone().or_else(|| self.gname.clone()),
-            checksum_sha1: other.checksum_sha1.or(self.checksum_sha1),
-            acl_access: self.acl_access.overlaid(&other.acl_access),
-            acl_default: self.acl_default.overlaid(&other.acl_default),
-            gnu_sparse: other.gnu_sparse || self.gnu_sparse,
-        }
-    }
 }
 
 /// Reasons a header block is rejected.
@@ -306,7 +271,8 @@ impl<R: Read> TarReader<R> {
     ///
     /// Any unread data of the previous entry is drained first. Metadata
     /// entries (GNU long names, pax headers) are consumed internally and
-    /// folded into the entry they describe.
+    /// folded into the entry they describe, which takes at most one of each
+    /// kind: a second is refused.
     ///
     /// A GNU sparse member is refused, with
     /// [`ProvisionError::EntryUnsupported`] and the type `S`, whichever of
@@ -333,8 +299,12 @@ impl<R: Read> TarReader<R> {
         let mut gnu_longname: Option<Vec<u8>> = None;
         let mut gnu_longlink: Option<Vec<u8>> = None;
         let mut pax_entry: Option<PaxRecords> = None;
+        // Whether a global extended header has arrived since the last entry.
+        let mut after_global = false;
 
         loop {
+            // Whether metadata read so far waits for an entry to describe.
+            let waiting = gnu_longname.is_some() || gnu_longlink.is_some() || pax_entry.is_some();
             let header_offset = self.offset;
             let mut block = [0u8; BLOCK as usize];
             if !self.read_block(&mut block)? {
@@ -351,7 +321,7 @@ impl<R: Read> TarReader<R> {
                 // EOF at a later header boundary. GNU tar tolerates a missing
                 // two-block terminator, and so do we — unless metadata was
                 // left dangling.
-                if gnu_longname.is_some() || gnu_longlink.is_some() || pax_entry.is_some() {
+                if waiting {
                     return Err(
                         self.malformed(header_offset, "the archive ends after a metadata entry")
                     );
@@ -365,7 +335,7 @@ impl<R: Read> TarReader<R> {
                 // Metadata waiting for an entry it never got is refused here as
                 // it is at the end of the stream: the two are one archive
                 // ending in one place, spelled with and without its marker.
-                if gnu_longname.is_some() || gnu_longlink.is_some() || pax_entry.is_some() {
+                if waiting {
                     return Err(
                         self.malformed(header_offset, "the archive ends after a metadata entry")
                     );
@@ -383,44 +353,80 @@ impl<R: Read> TarReader<R> {
             };
             self.set_current(&entry);
 
+            // One metadata entry of each kind describes the entry after it. No
+            // writer emits a second, and readers part ways over one: GNU tar and
+            // Go take the last, Python the first `L` and a merge of the `x`
+            // records, bsdtar refuses. Whichever this reader took, some other
+            // reader would name the member differently, so a second is refused.
             match entry.typeflag {
-                // GNU long name / long link: the data names the next entry.
-                b'L' => {
-                    gnu_longname = Some(self.read_metadata()?);
-                    trim_trailing_nuls(gnu_longname.as_mut().expect("just set"));
-                }
-                b'K' => {
-                    gnu_longlink = Some(self.read_metadata()?);
-                    trim_trailing_nuls(gnu_longlink.as_mut().expect("just set"));
+                // GNU long name / long link: the data names the next entry, as
+                // the C string GNU writes, so it ends at its first NUL.
+                b'L' | b'K' => {
+                    let (slot, second) = if entry.typeflag == b'L' {
+                        (&mut gnu_longname, "two GNU long names describe one entry")
+                    } else {
+                        (&mut gnu_longlink, "two GNU long links describe one entry")
+                    };
+                    if slot.is_some() {
+                        return Err(self.malformed(header_offset, second));
+                    }
+                    *slot = Some(field_bytes(&self.read_metadata()?).to_vec());
                 }
                 // Pax extended headers.
                 b'x' => {
+                    if pax_entry.is_some() {
+                        return Err(self.malformed(
+                            header_offset,
+                            "two pax extended headers describe one entry",
+                        ));
+                    }
                     let data = self.read_metadata()?;
                     let records =
                         parse_pax(&data).map_err(|reason| self.malformed(header_offset, reason))?;
-                    pax_entry = Some(match pax_entry {
-                        Some(prior) => prior.overlaid(&records),
-                        None => records,
-                    });
+                    pax_entry = Some(records);
                 }
                 b'g' => {
-                    // A global extended header states attributes for every
-                    // entry after it, and every keyword this reader
-                    // understands is a per-file one: a path, a size, an
-                    // owner, a digest. Taking them from here would let one
-                    // record at the head of an archive rename every member —
-                    // or, with a `size` the entry's own header contradicts,
-                    // split one member into two, since the bytes past the
-                    // declared size are read as the next header. That is a
-                    // member set no other reader agrees with, which is the
-                    // shape a tar parser differential takes. GNU tar decodes
-                    // no per-file keyword from a global header either.
+                    // A global extended header states defaults for every entry
+                    // after it, and readers part ways over what to do with
+                    // them. GNU tar and Python apply them, and differ from each
+                    // other over a second header, an empty value, a vendor
+                    // keyword, and a `size`, which GNU tar frames the next
+                    // member by. bsdtar and Go apply none. Under a global
+                    // `linkpath`, GNU tar and Python point every symbolic link
+                    // somewhere bsdtar and Go do not. So whichever reading this
+                    // reader took, some other reader would see different
+                    // members, and a record that could change one is refused.
+                    // `comment` changes none; it is the record `git archive`
+                    // writes, carrying the commit an archive was made from.
                     //
-                    // The records are still parsed, so a malformed global
-                    // header is a malformed archive rather than a block read
-                    // past without looking.
+                    // Where one falls is held as well. bsdtar refuses two with
+                    // no entry between them, and Go lets one consume metadata
+                    // already waiting for its entry, which the others apply to
+                    // that entry.
+                    if waiting {
+                        return Err(self.malformed(
+                            header_offset,
+                            "a global extended header separates an entry from its metadata",
+                        ));
+                    }
+                    if after_global {
+                        return Err(self.malformed(
+                            header_offset,
+                            "two global extended headers precede one entry",
+                        ));
+                    }
                     let data = self.read_metadata()?;
-                    parse_pax(&data).map_err(|reason| self.malformed(header_offset, reason))?;
+                    for field in pax_fields(&data) {
+                        let (key, _) =
+                            field.map_err(|reason| self.malformed(header_offset, reason))?;
+                        if key != b"comment" {
+                            return Err(self.malformed(
+                                header_offset,
+                                "a global extended header sets a record other than `comment`",
+                            ));
+                        }
+                    }
+                    after_global = true;
                 }
                 _ => {
                     // A concrete file entry: fold in the accumulated
@@ -762,13 +768,6 @@ impl std::error::Error for Carried {
 /// real ones in one allocation, and a larger one grows past it as it is read.
 const RESERVE: usize = 64 * 1024;
 
-/// Removes trailing NUL bytes (long-name data is NUL-terminated).
-fn trim_trailing_nuls(bytes: &mut Vec<u8>) {
-    while bytes.last() == Some(&0) {
-        bytes.pop();
-    }
-}
-
 /// Parses a 512-byte header block into an [`Entry`].
 fn parse_header(block: &[u8; BLOCK as usize]) -> Result<Entry, HeaderFlaw> {
     // Magic: POSIX writes "ustar\0" + version "00"; GNU writes "ustar " +
@@ -873,7 +872,12 @@ fn verify_checksum(block: &[u8; BLOCK as usize]) -> Result<(), HeaderFlaw> {
     }
 }
 
-/// A header text field: the bytes up to the first NUL.
+/// A text field: the bytes up to the first NUL.
+///
+/// A header's own name fields are NUL-padded, and a GNU long name or long link
+/// is a C string, so in either a NUL ends the text. GNU tar, bsdtar, Python and
+/// Go all read a long name holding one this way; a reader that kept the bytes
+/// after it would name a member none of them does.
 fn field_bytes(field: &[u8]) -> &[u8] {
     let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
     &field[..end]
@@ -933,35 +937,73 @@ fn base256_field(field: &[u8]) -> Result<i64, Numeric> {
     Ok(value)
 }
 
-/// Parses a pax header body: a sequence of `"%d key=value\n"` records,
-/// where the decimal length counts the whole record. Unknown keys are
-/// ignored.
+/// One pax record's keyword and value.
+type PaxField<'a> = (&'a [u8], &'a [u8]);
+
+/// The keyword and value of each record in a pax header body, a sequence of
+/// `"%d key=value\n"` records whose decimal length counts the whole record.
+///
+/// A record that does not frame is the last item, its reason in place of a
+/// field: past it there is no boundary to read on from.
+fn pax_fields(data: &[u8]) -> impl Iterator<Item = Result<PaxField<'_>, &'static str>> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let next = pax_field(rest);
+        rest = match next {
+            Ok((_, after)) => after,
+            Err(_) => &[],
+        };
+        Some(next.map(|(field, _)| field))
+    })
+}
+
+/// The first record of the non-empty pax header body `rest`, and the bytes
+/// after it.
+fn pax_field(rest: &[u8]) -> Result<(PaxField<'_>, &[u8]), &'static str> {
+    let space = rest
+        .iter()
+        .position(|b| *b == b' ')
+        .ok_or("a pax record has no length delimiter")?;
+    let length: usize =
+        super::number::digits(&rest[..space]).ok_or("a pax record length is not decimal")?;
+    if length <= space + 1 || length > rest.len() {
+        return Err("a pax record length is out of bounds");
+    }
+    let record = rest[space + 1..length]
+        .strip_suffix(b"\n")
+        .ok_or("a pax record does not end in a newline")?;
+    let eq = record
+        .iter()
+        .position(|b| *b == b'=')
+        .ok_or("a pax record has no '='")?;
+    Ok(((&record[..eq], &record[eq + 1..]), &rest[length..]))
+}
+
+/// Parses a per-entry pax header body ([`pax_fields`]) into the records this
+/// reader applies to the entry it describes. Unknown keys are ignored.
 fn parse_pax(data: &[u8]) -> Result<PaxRecords, &'static str> {
     let mut records = PaxRecords::default();
-    let mut rest = data;
-    while !rest.is_empty() {
-        let space = rest
-            .iter()
-            .position(|b| *b == b' ')
-            .ok_or("a pax record has no length delimiter")?;
-        let length: usize =
-            super::number::digits(&rest[..space]).ok_or("a pax record length is not decimal")?;
-        if length <= space + 1 || length > rest.len() {
-            return Err("a pax record length is out of bounds");
-        }
-        let record = &rest[space + 1..length];
-        rest = &rest[length..];
-        let record = record
-            .strip_suffix(b"\n")
-            .ok_or("a pax record does not end in a newline")?;
-        let eq = record
-            .iter()
-            .position(|b| *b == b'=')
-            .ok_or("a pax record has no '='")?;
-        let (key, value) = (&record[..eq], &record[eq + 1..]);
+    for field in pax_fields(data) {
+        let (key, value) = field?;
         match key {
-            b"path" => records.path = Some(value.to_vec()),
-            b"linkpath" => records.link_target = Some(value.to_vec()),
+            // A record's length delimits its value, so a NUL in a name is part
+            // of it rather than its end, and no file has such a name. Readers
+            // part ways over one: GNU tar and bsdtar cut the name there, Python
+            // keeps the byte, Go refuses. Refusing is the one reading that names
+            // no member differently from any of them.
+            b"path" | b"linkpath" => {
+                if value.contains(&0) {
+                    return Err("a pax path or link target holds a NUL byte");
+                }
+                if key == b"path" {
+                    records.path = Some(value.to_vec());
+                } else {
+                    records.link_target = Some(value.to_vec());
+                }
+            }
             b"size" => {
                 let size: u64 =
                     super::number::digits(value).ok_or("a pax size record is not decimal")?;
@@ -1689,6 +1731,91 @@ mod tests {
         assert!(reader.next_entry().unwrap().is_none(), "the archive ends");
     }
 
+    /// A GNU long name (`L`) or long link (`K`) entry whose data is `value`.
+    fn long_link_entry(typeflag: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = sized_header(b"././@LongLink", value.len() as u64, typeflag).to_vec();
+        out.extend_from_slice(value);
+        pad(&mut out, value.len() as u64).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_second_metadata_entry_of_one_kind_is_refused() {
+        // GNU tar and Go take the last of two, Python the first long name and
+        // a merge of the pax records, so a member described twice has no one
+        // name across readers.
+        let cases = [
+            (
+                [
+                    pax_block(b'x', &pax_record(b"path", b"first")),
+                    pax_block(b'x', &pax_record(b"mtime", b"100")),
+                ],
+                "two pax extended headers describe one entry",
+            ),
+            (
+                [
+                    long_link_entry(b'L', b"first-long\0"),
+                    long_link_entry(b'L', b"second-long\0"),
+                ],
+                "two GNU long names describe one entry",
+            ),
+            (
+                [
+                    long_link_entry(b'K', b"first-target\0"),
+                    long_link_entry(b'K', b"second-target\0"),
+                ],
+                "two GNU long links describe one entry",
+            ),
+        ];
+        for (metadata, reason) in cases {
+            let mut archive = metadata.concat();
+            archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
+            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+            let err = TarReader::in_memory(&archive[..])
+                .next_entry()
+                .expect_err("one entry described twice");
+            assert!(err.to_string().contains(reason), "{err}");
+        }
+
+        // One of each kind is the ordinary shape, the pax path winning.
+        let mut archive = long_link_entry(b'L', b"gnu-long-name\0");
+        archive.extend(pax_block(b'x', &pax_record(b"path", b"pax-path")));
+        archive.extend_from_slice(&sized_header(b"short", 0, b'0'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let entry = TarReader::in_memory(&archive[..])
+            .next_entry()
+            .unwrap()
+            .expect("the entry");
+        assert_eq!(entry.path, &b"pax-path"[..]);
+    }
+
+    #[test]
+    fn a_long_name_ends_at_its_first_nul() {
+        // The bytes after the NUL are not part of the name to any of GNU tar,
+        // bsdtar, Python or Go.
+        let mut archive = long_link_entry(b'L', b"abc\0def\0");
+        archive.extend(long_link_entry(b'K', b"target\0rest\0"));
+        archive.extend_from_slice(&sized_header(b"short", 0, b'2'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let entry = TarReader::in_memory(&archive[..])
+            .next_entry()
+            .unwrap()
+            .expect("the entry");
+        assert_eq!(entry.path, &b"abc"[..]);
+        assert_eq!(entry.link_target, &b"target"[..]);
+    }
+
+    #[test]
+    fn a_pax_name_holding_a_nul_is_refused() {
+        // A record's length, not a NUL, ends its value, so the byte is part of
+        // a name no file can have, and readers disagree about what it names.
+        for key in [&b"path"[..], b"linkpath"] {
+            let err = parse_pax(&pax_record(key, b"abc\0def")).expect_err("a NUL in a name");
+            assert_eq!(err, "a pax path or link target holds a NUL byte");
+        }
+        assert!(parse_pax(&pax_record(b"comment", b"abc\0def")).is_ok());
+    }
+
     #[test]
     fn an_entry_that_names_a_directory_and_declares_data_is_refused() {
         // The other side of the rule above. An entry whose resolved name ends
@@ -1965,42 +2092,105 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_global_header_states_nothing_about_a_later_entry() {
-        // A `g` header applies to every entry after it, and every keyword this
-        // reader understands is a per-file one. Taking a `size` from one splits
-        // a member in two: the bytes past the declared size are read as the
-        // next header, so this reader's member set differs from that of every
-        // reader that ignores it -- a tar parser differential of exactly the
-        // kind the rest of this module refuses. A `path` from one renames every
-        // member of the archive at once.
-        let payload = b"0123456789abcdef";
-        let mut archive = pax_block(b'g', b"9 size=0\n16 path=renamed\n");
-        archive.extend_from_slice(&sized_header(b"real.txt", payload.len() as u64, b'0'));
-        let mut data = [0u8; BLOCK as usize];
-        data[..payload.len()].copy_from_slice(payload);
-        archive.extend_from_slice(&data);
-        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+    /// The paths of every entry in `archive`, or the first refusal.
+    fn entry_paths(archive: &[u8]) -> Result<Vec<Vec<u8>>, ProvisionError> {
+        let mut reader = TarReader::in_memory(archive);
+        let mut paths = Vec::new();
+        while let Some(entry) = reader.next_entry()? {
+            paths.push(entry.path);
+        }
+        Ok(paths)
+    }
 
-        let mut reader = TarReader::in_memory(&archive[..]);
-        let entry = reader.next_entry().unwrap().expect("the file entry");
-        assert_eq!(
-            entry.path,
-            &b"real.txt"[..],
-            "the global path is not the entry's",
-        );
-        assert_eq!(
-            entry.size,
-            payload.len() as u64,
-            "the global size is not the entry's",
-        );
-        let mut body = vec![0u8; payload.len()];
-        let got = reader.read_data(&mut body).expect("the body reads");
-        assert_eq!(&body[..got], payload);
-        assert!(
-            reader.next_entry().unwrap().is_none(),
-            "the archive holds one member, not two",
-        );
+    #[test]
+    fn a_global_header_holding_only_a_comment_is_passed_over() {
+        // The record `git archive` writes at the head of every archive, and
+        // one between entries, which no reader applies to either.
+        let commit = pax_record(b"comment", b"0123456789abcdef0123456789abcdef01234567");
+        let mut archive = pax_block(b'g', &commit);
+        archive.extend_from_slice(&sized_header(b"first", 0, b'0'));
+        archive.extend(pax_block(b'g', &pax_record(b"comment", b"another")));
+        archive.extend(pax_block(b'x', &pax_record(b"path", b"pax-path")));
+        archive.extend_from_slice(&sized_header(b"second", 0, b'0'));
+        archive.extend(pax_block(b'g', b""));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        assert_eq!(entry_paths(&archive).unwrap(), [&b"first"[..], b"pax-path"]);
+    }
+
+    #[test]
+    fn a_global_header_setting_any_other_record_is_refused() {
+        // GNU tar and Python apply these to every later member, and bsdtar and
+        // Go apply none; a `size` is also where GNU tar looks for the next
+        // header. A vendor keyword is refused with the rest: GNU tar does not
+        // apply a global extended attribute that Python reports on each member.
+        let records = [
+            pax_record(b"size", b"0"),
+            pax_record(b"path", b"renamed"),
+            pax_record(b"linkpath", b"elsewhere"),
+            pax_record(b"uid", b"1234"),
+            pax_record(b"mtime", b"1000000"),
+            pax_record(b"SCHILY.xattr.user.k", b"v"),
+            [
+                pax_record(b"comment", b"c"),
+                pax_record(b"uname", b"someone"),
+            ]
+            .concat(),
+        ];
+        for records in records {
+            let mut archive = pax_block(b'g', &records);
+            archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
+            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+            let err = entry_paths(&archive).expect_err("a global record that sets a member");
+            assert!(
+                matches!(err, ProvisionError::Archive { offset: 0, .. }),
+                "{err:?}",
+            );
+            assert!(
+                err.to_string().contains("a record other than `comment`"),
+                "{err}",
+            );
+        }
+
+        // One whose records do not frame is malformed as an `x` header is.
+        let mut archive = pax_block(b'g', b"99 comment=x\n");
+        archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
+        archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+        let err = entry_paths(&archive).expect_err("an unframed record");
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+    }
+
+    #[test]
+    fn a_global_header_does_not_fall_between_metadata_and_its_entry() {
+        // Go lets the global header consume an `x` or a long name waiting for
+        // its entry, which GNU tar, bsdtar and Python apply to that entry; and
+        // bsdtar refuses two global headers in a row, whatever they hold.
+        let comment = pax_block(b'g', &pax_record(b"comment", b"c"));
+        let cases = [
+            (
+                pax_block(b'x', &pax_record(b"path", b"xname")),
+                "separates an entry from its metadata",
+            ),
+            (
+                long_link_entry(b'L', b"long-name\0"),
+                "separates an entry from its metadata",
+            ),
+            (
+                long_link_entry(b'K', b"long-target\0"),
+                "separates an entry from its metadata",
+            ),
+            (
+                comment.clone(),
+                "two global extended headers precede one entry",
+            ),
+        ];
+        for (before, reason) in cases {
+            let mut archive = before;
+            archive.extend(comment.clone());
+            archive.extend_from_slice(&sized_header(b"plain", 0, b'0'));
+            archive.extend_from_slice(&[0u8; 2 * BLOCK as usize]);
+            let err = entry_paths(&archive).expect_err("a global header out of place");
+            assert!(err.to_string().contains(reason), "{err}");
+        }
     }
 
     #[test]

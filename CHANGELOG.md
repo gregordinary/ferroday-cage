@@ -45,6 +45,17 @@ consumer upgrading can skip it.
   than failing to set it with an I/O error. A list naming one user or group twice,
   which the kernel stores and libacl's checker refuses, is refused too; named
   entries are written in ascending order.
+- A tar archive is refused as malformed where two pax extended headers, two GNU
+  long names, or two GNU long links describe one entry. The reader merged the
+  pax headers and took the last long name or link.
+- A GNU long name or long link ends at its first NUL, as GNU `tar` reads it. The
+  reader kept the bytes after it.
+- A tar archive is refused as malformed where a pax `path` or `linkpath` record
+  holds a NUL byte.
+- A tar archive is refused as malformed where a pax global header sets any
+  record but `comment`, follows another global header with no entry between
+  them, or falls between an entry and its metadata. The reader ignored a global
+  header's records.
 
 ## [0.6.0] - 2026-11-13
 

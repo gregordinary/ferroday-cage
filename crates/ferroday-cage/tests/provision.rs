@@ -647,14 +647,15 @@ fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
     let err = provision_err("malformed-empty-symlink", &empty_target.finish());
     assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
 
-    // A hard link naming no entry, and a symbolic link whose target no
-    // filesystem can store, are malformed in the same way: neither names
-    // anything outside the root.
+    // A hard link naming no entry is malformed in the same way: it names
+    // nothing outside the root.
     let mut empty_hardlink = archive();
     empty_hardlink.hardlink("link", "");
     let err = provision_err("malformed-empty-hardlink", &empty_hardlink.finish());
     assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
 
+    // A symbolic link whose target no filesystem can store is refused before
+    // extraction, by the reader, as the malformed archive it is.
     let record = ferroday_cage_testkit::tar::pax_record("linkpath", "a\0b");
     let mut nul_target = archive();
     nul_target
@@ -662,7 +663,8 @@ fn a_malformed_archive_is_not_reported_as_an_escape_attempt() {
         .body(record.as_bytes())
         .symlink("link", "placeholder");
     let err = provision_err("malformed-nul-symlink", &nul_target.finish());
-    assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+    assert!(matches!(err, ProvisionError::Archive { .. }), "{err}");
+    assert!(err.to_string().contains("holds a NUL byte"), "{err}");
 }
 
 #[test]

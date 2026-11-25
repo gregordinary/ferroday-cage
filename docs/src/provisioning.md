@@ -754,7 +754,7 @@ filesystem:
   `ProvisionError::EntryUnsafe` before anything is written. That error
   means an escape attempt and nothing else. Any other refusal is a
   `ProvisionError::EntryRefused`, such as a path through a file or a link
-  whose target is empty or holds a NUL.
+  whose target is empty.
 - **Ownership maps to the calling user.** Every extracted entry belongs to the
   calling user, which the sandbox's identity map gives uid 0, so extracted
   files appear root-owned inside the sandbox. A command with a presented
@@ -772,6 +772,12 @@ filesystem:
   whichever GNU format wrote them. That is the old `S` type, and the pax
   formats 0.0, 0.1 and 1.0, whose headers claim a regular file. Multi-volume
   members fail the same way.
+- **An archive that tar readers read differently fails** with
+  `ProvisionError::Archive`. One such archive describes an entry with two pax
+  headers, two long names, or two long links. Another holds a NUL inside a pax
+  `path` or `linkpath`. A third has a pax global header that sets a record
+  other than `comment`. A global header also fails where it follows another
+  with no entry between them, or separates an entry from its metadata.
 
 An archive records an access control list in either of two forms, or both. One
 is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in
