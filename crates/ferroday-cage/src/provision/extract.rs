@@ -231,7 +231,9 @@ impl ListIds<'_> {
         let Some(text) = &records.text else {
             return Ok(Stated::Nothing);
         };
-        let text = AclText::parse(text).map_err(refused)?;
+        let Some(text) = AclText::parse(text).map_err(refused)? else {
+            return Ok(Stated::Nothing);
+        };
         let resolved = if text.names_anyone() {
             let (users, groups) = self.accounts()?;
             text.resolve(
@@ -2414,6 +2416,56 @@ mod list_tests {
             0o4600,
             "the owning group was given its own entry rather than the mask",
         );
+    }
+
+    #[test]
+    fn a_directorys_empty_default_list_text_states_no_list() {
+        // GNU tar 1.35 writes an empty `SCHILY.acl.default` for a directory
+        // with an access list and no default list, with `--acls` alone and
+        // beside the attribute's value with `--acls --xattrs`.
+        let root = Scratch::for_test("extract", "empty-default-text");
+        if !xattr::holds_acls(&root) {
+            ferroday_cage_testkit::require::FILESYSTEM
+                .skip("this filesystem holds no POSIX access control lists");
+            return;
+        }
+        let caller = rustix::process::geteuid().as_raw();
+        let text: &[u8] = b"user::rwx\nuser:0:rwx\ngroup::---\nmask::rwx\nother::---\n";
+        let mut tar = Tar::new();
+        pax(
+            &mut tar,
+            &[
+                pax_record(b"SCHILY.acl.access", text),
+                pax_record(b"SCHILY.acl.default", b""),
+            ]
+            .concat(),
+        );
+        tar.dir("text-only", 0o770);
+        pax(
+            &mut tar,
+            &[
+                pax_record(b"SCHILY.acl.access", text),
+                pax_record(b"SCHILY.acl.default", b""),
+                pax_record(b"SCHILY.xattr.system.posix_acl_access", &masked_dir(0)),
+            ]
+            .concat(),
+        );
+        tar.dir("text-and-value", 0o770);
+        extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| Ok(Placement::Write),
+        )
+        .expect("the archive extracts");
+        for name in ["text-only", "text-and-value"] {
+            let dir = root.join(name);
+            assert_eq!(
+                xattr::get(&dir, "system.posix_acl_access"),
+                Some(masked_dir(caller)),
+                "{name}",
+            );
+            assert_eq!(xattr::get(&dir, "system.posix_acl_default"), None, "{name}");
+        }
     }
 
     #[test]

@@ -778,7 +778,9 @@ is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in
 `SCHILY.xattr.system.posix_acl_default` for a directory's default list. The
 other is the list's text, in `SCHILY.acl.access` and `SCHILY.acl.default`, as
 GNU `tar --acls` writes it. Where both are present, the value is applied and the
-text is not read. GNU `tar` reads them the other way round.
+text is not read. GNU `tar` reads them the other way round. Text holding no
+entry states no list, as the empty `SCHILY.acl.default` GNU `tar` writes for a
+directory without a default list does.
 
 A list is applied after the entry's mode, and a directory's once its contents
 are written. Its named users and groups are the ids the tree means, as an export

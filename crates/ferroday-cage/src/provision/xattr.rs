@@ -525,12 +525,17 @@ enum Who {
 impl AclText {
     /// Reads a list's text, or says why it is none.
     ///
+    /// `Ok(None)` is a text holding no entry, as an attribute's value holding
+    /// none is no list ([`Acl::parse`]). GNU tar writes an empty
+    /// `SCHILY.acl.default` for a directory with an access list and no default
+    /// list.
+    ///
     /// Whatever the entries name, the text must hold exactly one owner, one
     /// owning group and one entry for everyone else, at most one mask, and a
     /// mask wherever it names a user or group, as a list does
     /// ([`AclFlaw::Shape`]); whether it names anyone twice waits for its names
     /// ([`resolve`](Self::resolve)).
-    pub(super) fn parse(text: &[u8]) -> Result<AclText, &'static str> {
+    pub(super) fn parse(text: &[u8]) -> Result<Option<AclText>, &'static str> {
         let mut entries = Vec::new();
         for line in text.split(|byte| *byte == b'\n') {
             let line = line
@@ -548,6 +553,9 @@ impl AclText {
                 entries.push(text_entry(entry)?);
             }
         }
+        if entries.is_empty() {
+            return Ok(None);
+        }
         let count = |tag: u16| entries.iter().filter(|entry| entry.tag == tag).count();
         let named = count(ACL_USER) + count(ACL_GROUP);
         let masks = count(ACL_MASK);
@@ -559,7 +567,7 @@ impl AclText {
         {
             return Err(AclFlaw::Shape.reason());
         }
-        Ok(AclText { entries })
+        Ok(Some(AclText { entries }))
     }
 
     /// Whether any entry names a user or group by name, which only the root
@@ -800,6 +808,14 @@ mod tests {
         value
     }
 
+    /// The list `text` states, for a text the test holds to be one.
+    #[cfg(feature = "tarball")]
+    fn stated(text: &[u8]) -> AclText {
+        AclText::parse(text)
+            .expect("the text reads")
+            .expect("the text states a list")
+    }
+
     const NONE: u32 = ACL_UNDEFINED_ID;
 
     #[test]
@@ -1004,7 +1020,7 @@ mod tests {
             text,
             b"user::rw-\nuser:0:r--\nuser:4242:r-x\ngroup::r--\ngroup:4243:rw-\nmask::rwx\nother::---\n",
         );
-        let read = AclText::parse(&text).expect("the text reads back");
+        let read = stated(&text);
         assert_eq!(read.resolve(|_| None, |_| None), Ok(Some(acl)));
     }
 
@@ -1012,10 +1028,9 @@ mod tests {
     #[test]
     fn a_lists_text_names_are_the_roots_to_answer() {
         // As GNU tar writes it, naming each user the writing host could name.
-        let text = AclText::parse(
+        let text = stated(
             b"user::rw-\nuser:root:r--\nuser:4242:r-x\ngroup::r--\ngroup:wheel:rw-\nmask::rwx\nother::---\n",
-        )
-        .expect("the text reads");
+        );
         assert!(text.names_anyone());
         let users = |name: &[u8]| (name == b"root").then_some(0);
         let groups = |name: &[u8]| (name == b"wheel").then_some(10);
@@ -1044,8 +1059,7 @@ mod tests {
         );
         // star's fourth field answers where the root does not, and gives way
         // where it does.
-        let starred =
-            AclText::parse(b"u::rw-,u:lisa:rw-:502,g::r--,m::rw-,o::---").expect("the text reads");
+        let starred = stated(b"u::rw-,u:lisa:rw-:502,g::r--,m::rw-,o::---");
         assert_eq!(
             starred.resolve(|_| None, |_| None),
             Ok(Some(list(&[
@@ -1061,7 +1075,7 @@ mod tests {
             Ok(Some(acl)) if acl.entries[1].id == 1000,
         ));
         // Two names the root reads as one id are one user named twice.
-        let twice = AclText::parse(b"u::rw-,u:a:r--,u:b:r--,g::r--,m::r--,o::---").unwrap();
+        let twice = stated(b"u::rw-,u:a:r--,u:b:r--,g::r--,m::r--,o::---");
         assert_eq!(
             twice.resolve(|_| Some(7), |_| None),
             Err(AclFlaw::Duplicate)
@@ -1083,7 +1097,7 @@ mod tests {
             b"u::rw-,u:4242:r-- #effective:r--\ng::r--,m::r--,o::---",
         ] {
             assert!(
-                AclText::parse(text).is_ok(),
+                matches!(AclText::parse(text), Ok(Some(_))),
                 "{}",
                 String::from_utf8_lossy(text)
             );
@@ -1097,10 +1111,19 @@ mod tests {
             b"u::rw-,g::r--,o::---,d:u::rwx",
             b"u::rw-,u:4242:r--,g::r--,o::---",
             b"u::rw-,g::r--",
-            b"",
         ] {
             assert!(
                 AclText::parse(text).is_err(),
+                "{}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        // A text holding no entry is no list, as GNU tar writes a directory's
+        // default list when it has none.
+        for text in [&b""[..], b"\n", b" , ", b"# nothing\n"] {
+            assert_eq!(
+                AclText::parse(text),
+                Ok(None),
                 "{}",
                 String::from_utf8_lossy(text)
             );
@@ -1119,14 +1142,17 @@ mod tests {
         }
         for name in ["-1", "0x10", "+5"] {
             let text = format!("u::rw-,u:{name}:r--,g::r--,m::r--,o::---");
-            let read = AclText::parse(text.as_bytes()).expect("a name reads");
+            let read = stated(text.as_bytes());
             assert_eq!(read.resolve(|_| None, |_| None), Ok(None), "{name}");
         }
         // A name's recorded id must be an id, and a numeric qualifier's must
         // be the same one.
         assert!(AclText::parse(b"u::rw-,u:lisa:rw-:x,g::r--,m::rw-,o::---").is_err());
         assert!(AclText::parse(b"u::rw-,u:5:rw-:6,g::r--,m::rw-,o::---").is_err());
-        assert!(AclText::parse(b"u::rw-,u:5:rw-:5,g::r--,m::rw-,o::---").is_ok());
+        assert!(matches!(
+            AclText::parse(b"u::rw-,u:5:rw-:5,g::r--,m::rw-,o::---"),
+            Ok(Some(_))
+        ));
     }
 
     #[test]
