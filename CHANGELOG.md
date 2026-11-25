@@ -840,6 +840,9 @@ consumer upgrading can skip it.
   reader, the decompressors, the Debian `Release` and `Packages` readers, the
   `.deb` container, the Alpine index and `.PKGINFO` readers, the `.apk` reader,
   and the gpkg container reader.
+- The launch resolves a mount target refusing a magic link by name, as every
+  other scoped lookup in the crate does. `RESOLVE_IN_ROOT` refuses one too on
+  every kernel so far.
 
 ## [0.6.0] - 2026-11-13
 

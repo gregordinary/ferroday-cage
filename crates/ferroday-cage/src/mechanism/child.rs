@@ -3740,14 +3740,23 @@ fn open_in_root(root: BorrowedFd<'_>, path: &CStr, oflags: OFlags) -> Result<Own
 /// to, so the `O_DIRECTORY` that helper folds in would refuse half of them. The
 /// lookup goes through [`resolve::openat2`] all the same, so a rename or a mount
 /// elsewhere on the host racing a `..` step of the walk is retried rather than
-/// failing the launch.
+/// failing the launch. It refuses a magic link by name, as that helper does: a
+/// `/proc/*/fd/*` entry reopens whatever it names, from anywhere on the host,
+/// and no mount target has a use for one. `RESOLVE_IN_ROOT` refuses one too on
+/// every kernel so far, and the kernel documents that as subject to change.
 fn open_in_root_with(
     root: BorrowedFd<'_>,
     path: &CStr,
     oflags: OFlags,
     mode: Mode,
 ) -> Result<OwnedFd, Errno> {
-    resolve::openat2(root, path, oflags, mode, ResolveFlags::IN_ROOT)
+    resolve::openat2(
+        root,
+        path,
+        oflags,
+        mode,
+        ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
+    )
 }
 
 /// Bytes assembled into a stack buffer of `N`, for the post-fork stages that
@@ -4157,6 +4166,24 @@ mod tests {
         assert!(
             !dir.join("absent").exists(),
             "a file was created through the link",
+        );
+    }
+
+    #[test]
+    fn a_mount_target_through_a_magic_link_is_refused_by_name() {
+        // A procfs inside the root holds magic links, and a target named
+        // through one is refused. `RESOLVE_IN_ROOT` alone refuses the jump with
+        // `EXDEV`, a refusal the kernel reserves the right to lift; refused by
+        // name, it is `ELOOP`.
+        let root = open_root(std::path::Path::new("/"));
+        let held =
+            fs::open(c"/", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).expect("the root opens");
+        let path = std::ffi::CString::new(format!("proc/self/fd/{}", held.as_raw_fd()))
+            .expect("the path holds no NUL");
+
+        assert_eq!(
+            open_in_root(root.as_fd(), &path, OFlags::PATH).map(drop),
+            Err(Errno::LOOP),
         );
     }
 
