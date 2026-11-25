@@ -455,6 +455,44 @@ fn requests_the_session_cannot_serve_are_answered_with_errors() {
 }
 
 #[test]
+fn a_signal_reaches_the_connections_exec() {
+    let Some(server) = Server::start("fcage-session-exec-signal", &[]) else {
+        return;
+    };
+    let mut client = server.connect();
+    let (read_end, write_end) = pipe();
+    let request = json!({"id": 1, "method": "exec", "params": {
+        "command": "/bin/sh",
+        "args": ["-c", "trap 'kill $!; exit 3' INT; echo ready; sleep 30 & wait $!"],
+        "stdout": "passed",
+    }});
+    client.send_with(&request, &[write_end.as_fd()]);
+    drop(write_end);
+    // Once the shell has said so, its trap is set.
+    assert!(
+        common::readable_by(&read_end, std::time::Instant::now() + PATIENCE),
+        "the command never said it was ready"
+    );
+
+    // A signal names the exec it is for, by the request that started it, and
+    // a signal by a number the kernel names.
+    let signal = |id: u64, exec: u64, number: i32| json!({"id": id, "method": "signal", "params": {"exec": exec, "signal": number}});
+    let (_, other) = client.call(&signal(2, 7, 2));
+    assert_eq!(other["error"]["code"], "no-such-exec", "{other}");
+    let (_, unnamed) = client.call(&signal(3, 1, 40));
+    assert_eq!(unnamed["error"]["code"], "invalid-params", "{unnamed}");
+    let (_, sent) = client.call(&signal(4, 1, 2));
+    assert_eq!(sent["result"], json!({}), "{sent}");
+    let (_, ended) = client.response(1);
+    assert_eq!(ended["result"]["code"], 3, "{ended}");
+    assert_eq!(read_all(read_end), b"ready\n");
+
+    // Once it has ended, the exec is no longer the connection's.
+    let (_, late) = client.call(&signal(5, 1, 2));
+    assert_eq!(late["error"]["code"], "no-such-exec", "{late}");
+}
+
+#[test]
 fn two_connections_run_their_execs_at_once() {
     let Some(server) = Server::start("fcage-session-concurrent", &[]) else {
         return;

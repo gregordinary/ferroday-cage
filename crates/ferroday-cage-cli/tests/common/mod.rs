@@ -11,6 +11,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub use ferroday_cage_testkit::dns;
+pub use ferroday_cage_testkit::fd::readable_by;
 pub use ferroday_cage_testkit::process::{
     cpu_ticks, finish_bounded, process_state, rerun, rerun_args, run_bounded, spawn_grouped,
 };

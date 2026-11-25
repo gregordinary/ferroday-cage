@@ -36,9 +36,10 @@
 //!   member naming the request that started it.
 //!
 //! The methods are `hello`, answered with the protocol version; `exec`, which
-//! runs a command and answers with how it ended once it has; and `stop`, which
-//! ends the session and answers once the sandbox has ended. A connection runs
-//! one exec at a time, and its close ends the exec it is running.
+//! runs a command and answers with how it ended once it has; `signal`, which
+//! delivers a signal to the connection's exec; and `stop`, which ends the
+//! session and answers once the sandbox has ended. A connection runs one exec
+//! at a time, and its close ends the exec it is running.
 //!
 //! Descriptors travel with a message's first byte, as sd-varlink's rule has
 //! them: an `exec` that passes its streams sends them attached to the first
@@ -787,6 +788,7 @@ impl<'a> Session<'a> {
                 Ok(()) => return,
                 Err(refusal) => Err(refusal),
             },
+            "signal" => self.signal(index, &request),
             "stop" => match request.no_params() {
                 Ok(()) => {
                     self.connections[index].stops.push(request.id.clone());
@@ -797,7 +799,9 @@ impl<'a> Session<'a> {
             },
             other => Err(Refusal::new(
                 "method-not-found",
-                format!("no method is named {other:?}; the methods are hello, exec and stop"),
+                format!(
+                    "no method is named {other:?}; the methods are hello, exec, signal and stop"
+                ),
             )),
         };
         let line = answer.unwrap_or_else(|refusal| refusal.response(&request.id));
@@ -857,6 +861,45 @@ impl<'a> Session<'a> {
         });
         self.collect(index);
         Ok(())
+    }
+
+    /// Delivers the signal `request` names to the exec it names, which must be
+    /// the one connection `index` runs, and answers once it is sent.
+    ///
+    /// An exec that has ended is no longer the connection's, so a signal that
+    /// crosses its end is refused as one naming no exec, which a client takes
+    /// as the exec's end it is about to read.
+    fn signal(&mut self, index: usize, request: &Request) -> Result<Vec<u8>, Refusal> {
+        let params: SignalParams = request.params_as()?;
+        let flight = self.connections[index]
+            .flight
+            .as_mut()
+            .filter(|flight| flight.id == params.exec)
+            .ok_or_else(|| {
+                Refusal::new(
+                    "no-such-exec",
+                    format!(
+                        "the connection runs no exec that request {} started",
+                        params.exec
+                    ),
+                )
+            })?;
+        match flight.running.signal(params.signal) {
+            Ok(()) => Ok(result(&request.id, json!({}))),
+            Err(ferroday_cage::Error::Signal { source, .. })
+                if source.raw_os_error() == Some(Errno::INVAL.raw_os_error()) =>
+            {
+                Err(Refusal::new(
+                    "invalid-params",
+                    format!(
+                        "signal {} names none of the signals the kernel names, and a \
+                         real-time signal is refused",
+                        params.signal
+                    ),
+                ))
+            }
+            Err(error) => Err(Refusal::of_fault(Fault::of_cage(&error))),
+        }
     }
 
     /// Collects the outcome of connection `index`'s exec, where it has one,
@@ -1227,6 +1270,16 @@ struct ExecParams {
     /// Seconds from that until it is killed, as `--kill-after` counts them.
     #[serde(default)]
     kill_after: Option<f64>,
+}
+
+/// A `signal` request's parameters.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct SignalParams {
+    /// The id of the request that started the exec.
+    exec: Value,
+    /// The signal, by its number, as an `exited` event writes one.
+    signal: i32,
 }
 
 /// Where one of an exec's standard streams goes.
@@ -1836,6 +1889,22 @@ mod tests {
             ),
         ] {
             assert_eq!(id(message), Err((answered_id, json!(code))), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_signal_names_its_exec_and_the_signals_number() {
+        let read = |value: Value| serde_json::from_value::<SignalParams>(value).is_ok();
+        assert!(read(json!({"exec": 1, "signal": 2})));
+        assert!(read(json!({"exec": "a", "signal": 15})));
+        for refused in [
+            json!({"signal": 2}),
+            json!({"exec": 1}),
+            json!({"exec": 1, "signal": "INT"}),
+            json!({"exec": 1, "signal": 2.5}),
+            json!({"exec": 1, "signal": 2, "group": true}),
+        ] {
+            assert!(!read(refused.clone()), "{refused}");
         }
     }
 

@@ -121,7 +121,8 @@ consumer upgrading can skip it.
   command with its arguments, environment, working directory, path lookup,
   timeout and standard streams, `null` or passed as descriptors attached to the
   request's first byte, answered with how it ended, after a `started` event and
-  the exec's seccomp reports; and `stop`. A connection runs one exec at a time,
+  the exec's seccomp reports; `signal`, which delivers a signal by its number
+  to the connection's exec; and `stop`. A connection runs one exec at a time,
   and its close ends its exec. A peer outside the server's user namespace, as
   every sandbox's process is, is refused before its request is read, and so is
   a passed file, which the command could reopen with more access than the
