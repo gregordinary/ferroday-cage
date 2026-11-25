@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use super::extract::{Placement, extract_archive};
 use super::tar::{self, TarReader};
 use super::{ProvisionError, ProvisionEvent, ProvisionRequest, Provisioner, compress};
+use ferrotape::Level;
 
 /// How often the byte counter reports progress: once per mebibyte consumed.
 ///
@@ -142,7 +143,9 @@ enum Source {
 ///   one kind of member those readers extract differently, setuid, setgid or
 ///   sticky beside an access control list, as GNU tar extracts it, the bits
 ///   kept and the list applied, which is how an export of a shared setgid
-///   directory provisions again.
+///   directory provisions again. The packages and stage3s the userland layers
+///   verify are read at the strict level, which counts the Rust tar crates
+///   among those readers too.
 ///
 /// Extraction imposes no size or entry-count quota, so a caller extracting
 /// untrusted archives should bound disk usage externally. Decoder memory is
@@ -153,6 +156,8 @@ enum Source {
 /// name a large memory cost anywhere in it.
 pub struct Tarball {
     source: Source,
+    /// The level the archive is read at.
+    level: Level,
 }
 
 impl Tarball {
@@ -163,6 +168,7 @@ impl Tarball {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Tarball {
             source: Source::Path(path.as_ref().to_path_buf()),
+            level: Level::Compatible,
         }
     }
 
@@ -195,6 +201,7 @@ impl Tarball {
     pub fn from_reader(reader: impl Read + Send + 'static) -> Self {
         Tarball {
             source: Source::Reader(Some(Box::new(reader))),
+            level: Level::Compatible,
         }
     }
 
@@ -208,10 +215,14 @@ impl Tarball {
     ///
     /// Byte progress carries the file's length as its total, as a path source's
     /// does. The file is consumed by the first run, as a reader is.
+    ///
+    /// The archive is read at the strict level, as every distribution artifact
+    /// the userland layers verify is.
     #[cfg_attr(not(feature = "gentoo"), allow(dead_code))]
     pub(crate) fn from_file(file: File, path: impl Into<PathBuf>) -> Self {
         Tarball {
             source: Source::File(Some(file), path.into()),
+            level: Level::Strict,
         }
     }
 }
@@ -281,7 +292,8 @@ impl Provisioner for Tarball {
         let (codec, decoded) =
             compress::decoder(source).map_err(|err| tar::read_failure(&subject, 0, err))?;
 
-        let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded), &subject);
+        let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded), &subject)
+            .with_level(self.level);
         // A cancellation stops the extraction part way through an entry as
         // well as between two, and `ensure` discards the staging tree
         // wholesale, so stopping leaves nothing half-extracted behind.

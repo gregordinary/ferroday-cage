@@ -4,10 +4,13 @@
 //! ferrotape reads POSIX ustar and pax, GNU, and pre-POSIX v7 archives, folds
 //! long names and pax records into the member they describe, and refuses an
 //! archive that GNU tar, bsdtar, Go's `archive/tar` and Python's `tarfile`
-//! read differently from one another. A reader here reads at its
-//! [`Level::Compatible`], which holds an archive to those four readers, and
-//! with its default for a global extended header, which refuses one that would
-//! change a member.
+//! read differently from one another. A reader here starts at its
+//! [`Level::Strict`], which also counts the Rust tar crates among those
+//! readers, and is read with its default for a global extended header, which
+//! refuses one that would change a member. The packages and stage3s the
+//! userland layers verify are read at Strict; a caller's own archive, through
+//! [`Tarball`](super::Tarball), at [`Level::Compatible`]
+//! ([`with_level`](TarReader::with_level)).
 //!
 //! [`TarReader`] is that reader with the archive's name beside it, so a
 //! failure is reported as a [`ProvisionError`] naming the archive it belongs
@@ -65,16 +68,24 @@ impl<'a> TarReader<&'a [u8]> {
 
 impl<R: Read> TarReader<R> {
     /// A reader over `inner`, which holds the archive at `path`, at
-    /// [`Level::Compatible`].
+    /// [`Level::Strict`].
     ///
     /// `path` is what a failure to read `inner` names: the file, or, for a
     /// stream that has none, what the caller calls it.
     pub(crate) fn new(inner: R, path: impl Into<PathBuf>) -> Self {
         TarReader {
-            inner: Reader::new(inner).with_level(Level::Compatible),
+            inner: Reader::new(inner).with_level(Level::Strict),
             path: path.into(),
             not_a_tar: false,
             data_at: 0,
+        }
+    }
+
+    /// The reader, reading at `level`, before anything is read.
+    pub(crate) fn with_level(self, level: Level) -> Self {
+        TarReader {
+            inner: self.inner.with_level(level),
+            ..self
         }
     }
 

@@ -821,7 +821,9 @@ filesystem:
   setuid, setgid or sticky beside a `SCHILY.acl.access` list, which `bsdtar`
   extracts without the bits and GNU `tar` with them. It is extracted as GNU
   `tar` extracts it, which is how an export of a shared setgid directory
-  provisions again.
+  provisions again. The packages and stage3s the Debian, Alpine and Gentoo
+  layers verify are read at the strict level, which counts the Rust tar
+  crates among the readers too and refuses that member.
 
 An archive records an access control list in either of two forms, or both. One
 is the attribute's own value, in `SCHILY.xattr.system.posix_acl_access`, and in

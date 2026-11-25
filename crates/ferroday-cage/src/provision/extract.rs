@@ -2623,6 +2623,7 @@ mod list_tests {
     use crate::scratch::Scratch;
     use ferroday_cage_testkit::tar::Tar;
     use ferroday_cage_testkit::tar::pax_record;
+    use ferrotape::Level;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -2831,8 +2832,10 @@ mod list_tests {
             ),
         );
         tar.file("escaped", 0o660, b"x");
+        // Read as a `Tarball` reads a caller's archive, which keeps setuid
+        // beside a list, as GNU tar extracts it.
         extract_archive(
-            &mut TarReader::in_memory(&tar.finish()[..]),
+            &mut TarReader::in_memory(&tar.finish()[..]).with_level(Level::Compatible),
             &root,
             &mut |_, _| Ok(Placement::Write),
             &mut || false,
@@ -2908,6 +2911,35 @@ mod list_tests {
             xattr::get(&root.join("after"), "system.posix_acl_access"),
             Some(masked(caller)),
         );
+    }
+
+    #[test]
+    fn a_special_bit_beside_a_list_refuses_the_archive_at_the_strict_level() {
+        // GNU tar extracts setuid, setgid and sticky beside an access list,
+        // and bsdtar drops all three, so the two extract such an archive with
+        // different modes. The strict level, which a distribution artifact is
+        // read at, refuses it before anything is written.
+        let root = Scratch::for_test("extract", "special-bits-beside-a-list");
+        for mode in [0o4755, 0o2775, 0o1777] {
+            let mut tar = Tar::new();
+            pax(
+                &mut tar,
+                &pax_record(b"SCHILY.acl.access", b"user::rwx,group::r-x,other::r-x"),
+            );
+            tar.file("special", mode, b"x");
+            let err = extract_archive(
+                &mut TarReader::in_memory(&tar.finish()[..]),
+                &root,
+                &mut |_, _| Ok(Placement::Write),
+                &mut || false,
+            )
+            .expect_err("the archive is refused");
+            assert!(
+                matches!(&err, ProvisionError::Archive { reason, .. } if *reason == ferrotape::ErrorKind::SpecialBitsWithAcl.to_string()),
+                "{mode:o}: {err:?}"
+            );
+            assert!(!root.join("special").exists(), "{mode:o}");
+        }
     }
 
     #[test]

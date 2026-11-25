@@ -2000,6 +2000,64 @@ fn an_exported_access_control_list_is_applied_where_the_archive_is_extracted() {
     );
 }
 
+/// A shared setgid directory with an access control list is recorded with its
+/// setgid bit beside the list, as GNU tar records one, and provisions again
+/// through `Tarball` with both: the bit kept, as GNU tar extracts it, and the
+/// list applied.
+#[test]
+fn an_exported_shared_setgid_directory_with_a_list_provisions_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("acl-setgid-round-trip");
+    let root = dir.join("root");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("notes"), b"for the group\n").unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let list = xattr::acl(&[
+        (0x01, 7, xattr::NO_ID),
+        (0x02, 7, uid),
+        (0x04, 5, xattr::NO_ID),
+        (0x10, 7, xattr::NO_ID),
+        (0x20, 5, xattr::NO_ID),
+    ]);
+    if !xattr::set(&shared, xattr::ACCESS_ACL, &list) {
+        common::require::FILESYSTEM.skip("this filesystem holds no POSIX access control lists");
+        return;
+    }
+    assert!(xattr::set(&shared, xattr::DEFAULT_ACL, &list));
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2775)).unwrap();
+    assert_eq!(xattr::get(&shared, xattr::ACCESS_ACL), Some(list.clone()));
+
+    let mut out = Vec::new();
+    provision::export_tar(&root, &mut out, IdentityMap::Single).expect("the export succeeds");
+    let dest = dir.join("provisioned");
+    provision::ensure(
+        &dest,
+        &mut provision::Tarball::from_reader(std::io::Cursor::new(out)),
+    )
+    .expect("the archive provisions");
+
+    let landed = dest.join("shared");
+    assert_eq!(xattr::get(&landed, xattr::ACCESS_ACL), Some(list.clone()));
+    assert_eq!(xattr::get(&landed, xattr::DEFAULT_ACL), Some(list));
+    assert_eq!(
+        std::fs::symlink_metadata(&landed)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o2775,
+    );
+    assert_eq!(
+        std::fs::read(landed.join("notes")).unwrap(),
+        b"for the group\n"
+    );
+}
+
 /// Read through a map that does not hold a user an access control list names,
 /// the list names the id that stands for no one in that user's place, which no
 /// extraction could set. The export refuses the entry rather than record it.

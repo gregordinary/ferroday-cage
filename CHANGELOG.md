@@ -714,6 +714,13 @@ consumer upgrading can skip it.
   `APK-TOOLS.checksum.SHA1` record is not a SHA-1 in lowercase hex fails with
   `ProvisionError::EntryRefused` naming the entry, where it was
   `ProvisionError::Archive`.
+- **Breaking.** The packages and stage3s the Debian, Alpine and Gentoo layers
+  verify are read at ferrotape's strict level, which counts the Rust tar
+  crates among the readers an archive is held to, and refuses setuid, setgid
+  or sticky beside a `SCHILY.acl.access` list. A `Tarball`'s archive is read
+  at the compatible level, which reads such a member as GNU tar extracts it,
+  the bits kept and the list applied, so an export of a shared setgid
+  directory provisions again.
 
 ### Fixed
 
