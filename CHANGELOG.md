@@ -534,6 +534,9 @@ consumer upgrading can skip it.
   tar header's name field under a pax `path` record, which `apk` reads. It
   refused the bootstrap instead, so a package whose name and version ran past
   about 44 bytes could not be installed with its scripts.
+- A Debian `Release` that lists one index twice in a digest section, with two
+  digests at one size, leaves the index out, as it does one listed at two
+  sizes. The later line silently replaced the earlier.
 
 ### Internal
 

@@ -86,6 +86,13 @@ pub(crate) struct Release {
 impl Release {
     /// Parses a release body (the verified `InRelease` text, or a trusted
     /// `Release`).
+    ///
+    /// The `SHA256` and `SHA512` sections are read alike, and an index listed
+    /// in both carries both digests. An index the lists state two sizes for,
+    /// or two digests of one algorithm for, whether across the sections or
+    /// twice in one, is left out: one of the two is wrong, and nothing says
+    /// which. A line naming an index again with the same size and digest is
+    /// the same line.
     pub(crate) fn parse(body: &str) -> Result<Release, Refusal> {
         let stanza = document::parse(body)
             .next()
@@ -105,9 +112,8 @@ impl Release {
         // mirror root there, and for a repository trusted unsigned nothing has
         // vouched for the text at all.
         //
-        // The `SHA256` and `SHA512` sections are read alike, and an index
-        // listed in both carries both digests. One whose two sections state two
-        // sizes is dropped: one of them is wrong, and nothing says which.
+        // An index stated two ways is dropped, as the function's documentation
+        // sets out.
         let mut listed: HashMap<String, (u64, [Option<String>; 2])> = HashMap::new();
         let mut conflicting = Vec::new();
         for (at, (algorithm, section)) in RECORDED.into_iter().enumerate() {
@@ -124,7 +130,10 @@ impl Release {
                     let entry = listed
                         .entry(path.to_string())
                         .or_insert_with(|| (size, [None, None]));
-                    if entry.0 != size {
+                    let differs = entry.1[at]
+                        .as_deref()
+                        .is_some_and(|stated| stated != digest);
+                    if entry.0 != size || differs {
                         conflicting.push(path.to_string());
                     }
                     entry.1[at] = Some(digest.to_string());
@@ -695,6 +704,25 @@ SHA512:
         assert_eq!(listed("main/binary-amd64/Packages.gz"), None);
         // A SHA-256 is not a SHA-512 because it sits in that section.
         assert_eq!(listed("main/binary-arm64/Packages"), None);
+    }
+
+    #[test]
+    fn an_index_listed_twice_in_one_section_is_kept_only_where_the_lines_agree() {
+        let (first, second) = ("a".repeat(64), "c".repeat(64));
+        let release = Release::parse(&format!(
+            "\
+Suite: tenacious
+SHA256:
+ {first} 111 main/binary-amd64/Packages
+ {first} 111 main/binary-amd64/Packages
+ {first} 222 main/binary-amd64/Packages.xz
+ {second} 222 main/binary-amd64/Packages.xz
+",
+        ))
+        .unwrap();
+        assert!(release.digest("main/binary-amd64/Packages").is_some());
+        // Two digests at one size are two claims, one of them wrong.
+        assert!(release.digest("main/binary-amd64/Packages.xz").is_none());
     }
 
     #[test]
