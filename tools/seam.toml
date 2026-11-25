@@ -674,7 +674,7 @@ tests = 1
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/tar.rs"
-code = 4
+code = 5
 
 [[gate]]
 path = "crates/ferroday-cage/src/provision/tarball.rs"

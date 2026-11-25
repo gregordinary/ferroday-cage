@@ -133,7 +133,13 @@ impl<R: Read> TarReader<R> {
     /// reader that sizes a read from the entry, as one hashing or holding a
     /// member does, must never meet one. Only the extractor reads sparse
     /// members, through
-    /// [`next_entry_with_sparse`](Self::next_entry_with_sparse).
+    /// [`next_entry_with_sparse`](Self::next_entry_with_sparse). The Debian,
+    /// Alpine and Gentoo layers are this method's callers, so a build with
+    /// none of them has none.
+    #[cfg_attr(
+        not(any(feature = "debian", feature = "alpine", feature = "gentoo")),
+        allow(dead_code)
+    )]
     pub fn next_entry(&mut self) -> Result<Option<Entry>, ProvisionError> {
         let entry = self.next_entry_with_sparse()?;
         if let Some(entry) = &entry
