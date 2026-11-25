@@ -301,7 +301,10 @@ fallback](restriction-fallback.md) the same interactive story, by the same
 mechanism. A restriction has no `/dev` of its own, so the `/dev/ptmx` its
 command sees is the host's. Its terminal therefore comes from the host's
 `devpts`, and a path for it resolves against the host's `/dev/pts`, which the
-command also sees.
+command also sees. So does the caller's own terminal, `/dev/pts/N` there, and
+the calling user owns it. The terminal the command is given is its controlling
+terminal and the one its streams are on, but only a Landlock domain that grants
+nothing beneath `/dev/pts` keeps it from opening the caller's by its path.
 
 ## At a shell prompt
 

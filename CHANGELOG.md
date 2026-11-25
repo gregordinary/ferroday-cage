@@ -447,6 +447,10 @@ consumer upgrading can skip it.
   with a carriage return and a line feed where standard error is a terminal.
   Raw mode turns off the processing that adds the return, so each line began
   where the last one ended.
+- `fcage --terminal`'s help, and the terminal chapter, say that under
+  `--restrict` the command sees the host's `/dev/pts`, so only Landlock grants
+  that leave it out keep it from opening the caller's terminal by its path. The
+  help said the command reached nothing of that terminal.
 
 ### Internal
 
