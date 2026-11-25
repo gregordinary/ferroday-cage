@@ -33,6 +33,11 @@ rustix = { version = "1.1.4", features = ["mount", "process", "fs", "pipe", "thr
 # the relevant uapi structs and issues the syscalls directly, so no `landlock`
 # crate is needed.
 syscalls = { version = "0.8", default-features = false }
+# POSIX access control lists as data (safe Rust, no dependencies): the binary
+# attribute value the kernel stores, the text a tar archive's `SCHILY.acl.*`
+# records hold, and the rules that judge a list. Not optional, since a copy into
+# a root carries lists in every build.
+file-acl = "0.1.0"
 serde = { version = "1.0", features = ["derive"], optional = true }
 # gzip. The backend is named rather than left to flate2's default so that it
 # cannot move without this line moving: `miniz_oxide` carries

@@ -32,7 +32,6 @@ jobs:
           - client_hello
           - http_head
           - tar_archive
-          - acl
           - gentoo_dependencies
           - stanza_document
           - decompress

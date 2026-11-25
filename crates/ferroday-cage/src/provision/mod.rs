@@ -89,13 +89,6 @@ pub(crate) mod fuzzing {
         super::tar::exercise(archive);
     }
 
-    /// Reads `bytes` as an access control list's attribute value and as a
-    /// `SCHILY.acl.*` record's text.
-    #[cfg(feature = "tarball")]
-    pub fn acl(bytes: &[u8]) {
-        super::xattr::exercise(bytes);
-    }
-
     /// Reads `text` as a Gentoo runtime dependency class.
     #[cfg(feature = "gentoo")]
     pub fn gentoo_dependencies(text: &[u8]) {

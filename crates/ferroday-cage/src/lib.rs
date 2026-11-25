@@ -293,12 +293,12 @@ pub mod fuzzing {
     pub use crate::netstack::fuzzing::{client_hello, dns_query, http_head};
     #[cfg(any(feature = "debian", feature = "alpine", feature = "gentoo"))]
     pub use crate::provision::fuzzing::stanza_document;
-    #[cfg(feature = "tarball")]
-    pub use crate::provision::fuzzing::{acl, decompress, tar_archive};
     #[cfg(feature = "alpine")]
     pub use crate::provision::fuzzing::{apk_metadata, apk_package};
     #[cfg(feature = "debian")]
     pub use crate::provision::fuzzing::{deb, debian_indexes};
+    #[cfg(feature = "tarball")]
+    pub use crate::provision::fuzzing::{decompress, tar_archive};
     #[cfg(feature = "gentoo")]
     pub use crate::provision::fuzzing::{gentoo_dependencies, gpkg};
 }

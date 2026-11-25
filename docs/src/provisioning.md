@@ -834,8 +834,11 @@ The text may name users and groups by name, as GNU `tar` does for every one the
 writing host could name. A name means what the root's own `/etc/passwd` and
 `/etc/group` give it, as the root stands when the list is applied, not what the
 host's do. The text is read as libacl reads it. A three-digit escape such as
-`\040` is the byte it spells, and a `#` inside a name is part of the name. A
-list the kernel would not store, in either form, refuses its entry with
+`\040` is the byte it spells, and a `#` inside a name is part of the name.
+Where libacl is loose, the text is refused. That covers a qualifier libacl reads
+as a number in another form than decimal digits, such as `010`, which it reads
+as 8, and a text holding blanks or a comment but no entry. A list the kernel
+would not store, in either form, refuses its entry with
 `ProvisionError::EntryRefused`.
 
 An entry naming an id the map has no host id for is left out of its list. So is

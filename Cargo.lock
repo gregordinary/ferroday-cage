@@ -689,6 +689,7 @@ version = "0.6.0"
 dependencies = [
  "ferrata",
  "ferroday-cage-testkit",
+ "file-acl",
  "flate2",
  "irongall",
  "libc",
@@ -748,6 +749,12 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "file-acl"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6321c3a1166288a4e0d5205f84f2059dd302b8e944c90e4eaf58936e5e0ab43"
 
 [[package]]
 name = "flate2"

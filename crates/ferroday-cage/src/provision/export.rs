@@ -33,6 +33,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use file_acl::text::{self, Spelling};
+use file_acl::xattr::DecodeError;
+
 use super::containment;
 use super::copyin::Translation;
 use super::identity::compose_child_map;
@@ -40,7 +43,7 @@ use super::tar::{
     BLOCK, MAX_USTAR_ID, MAX_USTAR_MTIME, MAX_USTAR_NAME, MAX_USTAR_PREFIX, MAX_USTAR_SIZE, pad,
     pax_header_block, pax_record, ustar_block, xattr_keyword,
 };
-use super::xattr::{ACCESS_ACL, Acl, AclFlaw, DEFAULT_ACL};
+use super::xattr::{ACCESS_ACL, DEFAULT_ACL};
 use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
 use crate::mechanism::{
@@ -801,7 +804,7 @@ impl<'f, W: Write> TarWriter<'f, W> {
     ///
     /// The kernel reports an id a list names that the map does not hold
     /// differently from an owner: the entry, with the id that stands for no
-    /// one in place of its own ([`AclFlaw::UnmappedId`]). No list the kernel
+    /// one in place of its own ([`DecodeError::UnmappedId`]). No list the kernel
     /// stores holds that id, so such a list is refused wherever it appears,
     /// whatever the map holds. A list read through the kernel cannot be flawed
     /// in any other way, and one that somehow were is refused too: the archive
@@ -821,9 +824,9 @@ impl<'f, W: Write> TarWriter<'f, W> {
             {
                 continue;
             }
-            match Acl::parse(value) {
+            match file_acl::xattr::decode(value) {
                 Ok(_) => {}
-                Err(AclFlaw::UnmappedId) => {
+                Err(DecodeError::UnmappedId { .. }) => {
                     return Err(EncodeError::Refused(format!(
                         "its {} names an id the identity map the export reads through does not \
                          hold, which the kernel reports as the id that stands for no one: the \
@@ -833,9 +836,8 @@ impl<'f, W: Write> TarWriter<'f, W> {
                 }
                 Err(flaw) => {
                     return Err(EncodeError::Refused(format!(
-                        "its {} is not a list an extraction could apply: {}",
+                        "its {} is not a list an extraction could apply: {flaw}",
                         String::from_utf8_lossy(name),
-                        flaw.reason(),
                     )));
                 }
             }
@@ -1072,9 +1074,9 @@ impl<'f, W: Write> TarWriter<'f, W> {
                 .iter()
                 .find(|(name, _)| name.as_slice() == attribute.to_bytes());
             if let Some((_, value)) = list
-                && let Ok(Some(acl)) = Acl::parse(value)
+                && let Ok(Some(acl)) = file_acl::xattr::decode(value)
             {
-                pax.extend_from_slice(&pax_record(keyword, &acl.text()));
+                pax.extend_from_slice(&pax_record(keyword, &text::write(&acl, Spelling::GNU_TAR)));
             }
         }
 

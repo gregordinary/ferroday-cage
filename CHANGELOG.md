@@ -675,6 +675,13 @@ consumer upgrading can skip it.
   earlier launch that renamed the directory it is in, is under a name the hide
   does not reach. A path with nothing at it when the sandbox is built still
   hides nothing.
+- A list's text is refused where libacl reads it otherwise or more loosely than
+  its own rules: a qualifier spelling a number in another form than decimal
+  digits, such as `010`, which libacl reads as 8, `0x10` or `-1`; a comment
+  followed by nothing but a line end; an empty entry between two commas; and a
+  text holding blanks or line ends and no entry, which was read as no list. A
+  mask's or everyone else's entry with its empty qualifier left out
+  (`mask:rwx`) is read.
 
 ### Fixed
 
@@ -1058,6 +1065,11 @@ consumer upgrading can skip it.
   `struct ifreq`, which the tap's `TUNSETIFF` request uses too. Each kept its
   own copy of the view and the two ioctls before. `tools/idioms.toml` records
   the shape.
+- Access control lists are read, judged, restated across an identity map and
+  written by the `file-acl` crate, which the library depends on in every build.
+  `provision::xattr` keeps reading an entry's attributes, the narrowing given
+  as a mode, and a capability's restatement. The `acl` fuzz target is retired:
+  the readers it drove are the crate's, which fuzzes them.
 
 ## [0.6.0] - 2026-11-13
 

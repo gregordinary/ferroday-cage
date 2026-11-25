@@ -151,7 +151,7 @@ struct FileLines {
 ///
 /// What `apk` calls an entry's acl, on its `a:` and `M:` lines, and named for
 /// what it holds instead: it is no access control list, which is what
-/// `provision::xattr::Acl` is.
+/// `file_acl::Acl` is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OwnerMode {
     uid: u32,

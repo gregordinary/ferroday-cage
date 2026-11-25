@@ -32,7 +32,7 @@ use rustix::fs::{self, AtFlags, OFlags};
 
 use super::containment;
 use super::identity::{Ownership, compose_child_map};
-use super::xattr::{self, Acl, Holder, Mapped, Named, Restated};
+use super::xattr::{self, Holder, Named, Restated};
 use super::{Delegate, ProvisionError};
 use crate::IdentityMap;
 use crate::failure::ErrorChain;
@@ -925,8 +925,8 @@ struct Attributes {
 /// leaves it out ([`containment::host_assigned_xattr`]). Everything else is
 /// [`AttributeSkip::Unsettable`]. A list or a capability naming an id the map
 /// has no inside id for is [`AttributeSkip::UnmappedId`]. Such a list is given
-/// without the entries naming one ([`Acl::mapped`]), so nothing lands more open
-/// than the source. A capability is left off.
+/// without the entries naming one (`Acl::map_ids_partial`), so nothing lands
+/// more open than the source. A capability is left off.
 fn judge(
     read: Named,
     kind: fs::FileType,
@@ -951,35 +951,36 @@ fn judge(
         } else if name.starts_with(b"user.") {
             Ok(value)
         } else if is(xattr::ACCESS_ACL) || is(xattr::DEFAULT_ACL) {
-            match Acl::parse(&value) {
+            match file_acl::xattr::decode(&value) {
                 Err(_) => Err(AttributeSkip::Unsettable),
                 // No entries, which the kernel never reports and takes as no
                 // list: carried as it was read, it sets none.
                 Ok(None) => Ok(value),
-                Ok(Some(acl)) => match acl.mapped(|id| ids.maps_uid(id), |id| ids.maps_gid(id)) {
-                    Some(Mapped {
-                        list,
-                        left_out: false,
-                    }) => Ok(list.encode()),
-                    Some(Mapped {
-                        list,
-                        left_out: true,
-                    }) => {
-                        attributes.carried.push((name.clone(), list.encode()));
-                        Err(AttributeSkip::UnmappedId)
-                    }
-                    // Answers that read two ids as one, which a map's never
-                    // do: no list the kernel would store, so its narrowing.
-                    None => {
-                        let narrowed = acl.narrowed();
-                        if is(xattr::ACCESS_ACL) {
-                            attributes.mode = Some(narrowed.mode_of(mode));
-                        } else {
-                            attributes.carried.push((name.clone(), narrowed.encode()));
+                Ok(Some(acl)) => {
+                    match acl.map_ids_partial(|id| ids.maps_uid(id), |id| ids.maps_gid(id)) {
+                        Ok(partial) if partial.left_out == 0 => {
+                            Ok(file_acl::xattr::encode(&partial.list))
                         }
-                        Err(AttributeSkip::UnmappedId)
+                        Ok(partial) => {
+                            attributes
+                                .carried
+                                .push((name.clone(), file_acl::xattr::encode(&partial.list)));
+                            Err(AttributeSkip::UnmappedId)
+                        }
+                        // Answers that read two ids as one, which a map's never
+                        // do: no list the kernel would store, so its narrowing.
+                        Err(_) => {
+                            if is(xattr::ACCESS_ACL) {
+                                attributes.mode = Some(xattr::narrowed(&acl, mode));
+                            } else {
+                                attributes
+                                    .carried
+                                    .push((name.clone(), file_acl::xattr::encode(&acl.narrowed())));
+                            }
+                            Err(AttributeSkip::UnmappedId)
+                        }
                     }
-                },
+                }
             }
         } else if is(xattr::CAPABILITY) {
             match xattr::capability_mapped(&value, |id| ids.maps_uid(id)) {

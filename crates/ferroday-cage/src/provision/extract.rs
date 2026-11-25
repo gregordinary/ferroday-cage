@@ -46,6 +46,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use file_acl::Acl;
+use file_acl::text::{self, Prefer};
 use rustix::fs::Timespec;
 use rustix::fs::{
     AtFlags, FileType, Mode, OFlags, ResolveFlags, Timestamps, UTIME_OMIT, XattrFlags,
@@ -63,7 +65,7 @@ use super::copyin::{Owed, Translation, reown};
 use super::identity::Ownership;
 use super::rooted::Rooted;
 use super::tar::{AclRecords, Entry, TarReader};
-use super::xattr::{self, Acl, AclText};
+use super::xattr;
 
 /// How every path an extraction writes through is resolved: inside the root,
 /// with an absolute link re-anchored there, as the root filesystem resolves it
@@ -225,13 +227,13 @@ impl DirMeta {
 /// map is the one [`Extraction::owned_through`] names, the single-identity map
 /// unless one is named, under which only root inside has a host id.
 ///
-/// A list recorded only as text may name its users and groups by name
-/// ([`AclText`]). A name means what the root's own `/etc/passwd` and
-/// `/etc/group` say it means, not what the host's do, so it is looked up there
-/// ([`accounts::ids`]), as the root stands when the list is applied: the merged
-/// view over the base, in a layered build. An archive that carries the
-/// accounts files after an entry whose list names an account they define
-/// leaves that name nothing to answer it, and its entry is left out.
+/// A list recorded only as text may name its users and groups by name. A name
+/// means what the root's own `/etc/passwd` and `/etc/group` say it means, not
+/// what the host's do, so it is looked up there ([`accounts::ids`]), as the
+/// root stands when the list is applied: the merged view over the base, in a
+/// layered build. An archive that carries the accounts files after an entry
+/// whose list names an account they define leaves that name nothing to answer
+/// it, and its entry is left out.
 struct ListIds<'a> {
     ownership: &'a Ownership,
     resolved: OnceCell<Option<Translation>>,
@@ -257,7 +259,7 @@ enum Stated {
     /// Neither form states a list.
     Nothing,
     /// A list, its named entries in the root's ids, without any naming someone
-    /// the root has no account for ([`AclText::resolve`]).
+    /// the root has no account for (`Parsed::resolve_partial`).
     List(Acl),
 }
 
@@ -273,15 +275,17 @@ impl ListIds<'_> {
     }
 
     /// The list `acl` with its named ids read across the map, without the
-    /// entries naming an id the map has no host id for ([`Acl::mapped`]), or
-    /// `None` where the map cannot be resolved at all.
+    /// entries naming an id the map has no host id for
+    /// (`Acl::map_ids_partial`), or `None` where the map cannot be resolved at
+    /// all.
     fn on_host(&self, acl: &Acl) -> Option<Acl> {
         let ids = self
             .resolved
             .get_or_init(|| Translation::of_ownership(self.ownership).ok())
             .as_ref()?;
-        acl.mapped(|id| ids.host_uid(id), |id| ids.host_gid(id))
-            .map(|mapped| mapped.list)
+        acl.map_ids_partial(|id| ids.host_uid(id), |id| ids.host_gid(id))
+            .ok()
+            .map(|partial| partial.list)
     }
 
     /// The list `records` state for the entry at `path`.
@@ -291,43 +295,51 @@ impl ListIds<'_> {
     /// that is not the root's. GNU tar reads the two the other way round, and
     /// applies only the text. The text is read only where the value is absent,
     /// so text that would not read beside a value is no reason to refuse the
-    /// entry.
+    /// entry. A text alone is given without the entries naming someone the
+    /// root has no account for, where GNU tar gives no list at all.
     ///
     /// A list the kernel would not store, in either form, refuses the entry,
     /// since nothing about the entry's access could then be relied on.
     fn stated(&self, records: &AclRecords, path: &Path) -> Result<Stated, ProvisionError> {
-        let refused = |reason: &str| ProvisionError::EntryRefused {
+        let refused = |reason: String| ProvisionError::EntryRefused {
             path: path.to_path_buf(),
-            reason: format!(
-                "the access control list it records is not one the kernel stores: {reason}"
-            ),
+            reason,
         };
         if let Some(value) = &records.value {
-            return match Acl::parse(value) {
+            return match file_acl::xattr::decode(value) {
                 Ok(Some(acl)) => Ok(Stated::List(acl)),
                 Ok(None) => Ok(Stated::Nothing),
-                Err(flaw) => Err(refused(flaw.reason())),
+                Err(flaw) => Err(refused(format!(
+                    "the access control list it records is not one the kernel stores: {flaw}"
+                ))),
             };
         }
         let Some(text) = &records.text else {
             return Ok(Stated::Nothing);
         };
-        let Some(text) = AclText::parse(text).map_err(refused)? else {
+        let unreadable = |reason: &dyn std::fmt::Display| {
+            refused(format!(
+                "the text of the access control list it records states no list the kernel \
+                 stores: {reason}"
+            ))
+        };
+        let Some(parsed) = text::parse(text).map_err(|flaw| unreadable(&flaw))? else {
             return Ok(Stated::Nothing);
         };
-        let resolved = if text.names_anyone() {
-            let accounts = self.accounts()?;
-            let (users, groups) = &*accounts;
-            text.resolve(
+        let accounts = if parsed.holds_names() {
+            self.accounts()?
+        } else {
+            Rc::new((AccountIds::new(), AccountIds::new()))
+        };
+        let (users, groups) = &*accounts;
+        parsed
+            .resolve_partial(
                 |name| users.get(name).copied(),
                 |name| groups.get(name).copied(),
+                Prefer::Name,
             )
-        } else {
-            text.resolve(|_| None, |_| None)
-        };
-        resolved
-            .map(Stated::List)
-            .map_err(|flaw| refused(flaw.reason()))
+            .map(|partial| Stated::List(partial.list))
+            .map_err(|flaw| unreadable(&flaw))
     }
 
     /// The id each name in the root's `/etc/passwd`, and each in its
@@ -1476,7 +1488,7 @@ fn apply_meta_fd(
 ///
 /// A list the filesystem holds no lists for cannot be given at all, nor can
 /// one whose map cannot be resolved. The access list is then given as its
-/// narrowing ([`Acl::narrowed`]), which is a mode: where a list has a mask,
+/// narrowing ([`xattr::narrowed`]), which is a mode: where a list has a mask,
 /// the mode's group bits are the mask, and the mode alone would give the
 /// owning group what the mask allows rather than what the list gave it. A
 /// default list is given as its narrowing where the map cannot be resolved, so
@@ -1492,8 +1504,8 @@ fn apply_lists(
 ) -> Result<(), ProvisionError> {
     let setting =
         |errno: Errno| ProvisionError::io("setting the access control list of", path, errno.into());
-    let narrow = |narrowed: &Acl| {
-        rustix::fs::fchmod(fd, Mode::from_raw_mode(narrowed.mode_of(mode))).map_err(setting)
+    let narrow = |acl: &Acl| {
+        rustix::fs::fchmod(fd, Mode::from_raw_mode(xattr::narrowed(acl, mode))).map_err(setting)
     };
     match lists.stated(access, path)? {
         Stated::Nothing => {}
@@ -1503,7 +1515,7 @@ fn apply_lists(
                     match rustix::fs::fsetxattr(
                         fd,
                         xattr::ACCESS_ACL,
-                        &on_host.encode(),
+                        &file_acl::xattr::encode(&on_host),
                         XattrFlags::empty(),
                     ) {
                         Ok(()) => true,
@@ -1514,7 +1526,7 @@ fn apply_lists(
                 None => false,
             };
             if !given {
-                narrow(&acl.narrowed())?;
+                narrow(&acl)?;
             }
         }
     }
@@ -1525,7 +1537,8 @@ fn apply_lists(
         Stated::Nothing => return Ok(()),
         Stated::List(acl) => lists.on_host(&acl).unwrap_or_else(|| acl.narrowed()),
     };
-    match rustix::fs::fsetxattr(fd, xattr::DEFAULT_ACL, &list.encode(), XattrFlags::empty()) {
+    let list = file_acl::xattr::encode(&list);
+    match rustix::fs::fsetxattr(fd, xattr::DEFAULT_ACL, &list, XattrFlags::empty()) {
         Ok(()) | Err(Errno::NOTSUP) => Ok(()),
         Err(errno) => Err(setting(errno)),
     }
@@ -2888,6 +2901,29 @@ mod list_tests {
         }
     }
 
+    /// Why extracting a file carrying `records` refuses it, into a root
+    /// whose accounts name `admin` user and group 0.
+    fn refusal(test: &str, records: &[u8]) -> String {
+        let mut tar = Tar::new();
+        tar.dir("etc", 0o755)
+            .file("etc/passwd", 0o644, b"admin:x:0:0::/root:/bin/sh\n")
+            .file("etc/group", 0o644, b"admin:x:0:\n");
+        pax(&mut tar, records);
+        tar.file("file", 0o640, b"x");
+        match extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &Scratch::for_test("extract", test),
+            &mut |_, _| Ok(Placement::Write),
+            &mut || false,
+        ) {
+            Err(ProvisionError::EntryRefused { path, reason }) => {
+                assert_eq!(path, Path::new("file"), "{test}");
+                reason
+            }
+            other => panic!("{test}: expected the entry refused, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_lists_value_is_applied_over_its_text_and_text_beside_one_is_not_read() {
         let root = Scratch::for_test("extract", "value-over-text");
@@ -2935,22 +2971,33 @@ mod list_tests {
                 "{name}",
             );
         }
+    }
 
+    #[test]
+    fn a_lists_text_libacl_reads_otherwise_refuses_its_entry() {
+        let access = |text: &[u8]| pax_record(b"SCHILY.acl.access", text);
         // Alone, text that is not a list refuses its entry as a value does.
-        let mut tar = Tar::new();
-        pax(
-            &mut tar,
-            &pax_record(b"SCHILY.acl.access", b"user::rw-,group::r--"),
-        );
-        tar.file("file", 0o640, b"x");
-        let err = extract_archive(
-            &mut TarReader::in_memory(&tar.finish()[..]),
-            &Scratch::for_test("extract", "malformed-text"),
-            &mut |_, _| Ok(Placement::Write),
-            &mut || false,
-        )
-        .expect_err("a list missing an entry is refused");
-        assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
+        let reason = refusal("incomplete-text", &access(b"user::rw-,group::r--"));
+        assert!(reason.contains("everyone else"), "{reason}");
+        // libacl reads `010` as group 8, and a comment followed by nothing
+        // but a line end refuses the text.
+        for (test, text) in [
+            (
+                "leading-zero",
+                &b"user::rw-\ngroup::r--\ngroup:010:r--\nmask::r--\nother::---\n"[..],
+            ),
+            (
+                "trailing-comment",
+                b"user::rw-\ngroup::r--\nother::--- #c\n",
+            ),
+            ("blank-text", b"\n"),
+        ] {
+            let reason = refusal(test, &access(text));
+            assert!(
+                reason.contains("text of the access control list"),
+                "{test}: {reason}"
+            );
+        }
     }
 }
 
