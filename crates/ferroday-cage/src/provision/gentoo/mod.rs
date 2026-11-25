@@ -1634,8 +1634,7 @@ impl Gentoo {
         // half-gigabyte download beside a root that was never published is not
         // something a later run would find and clear.
         let cache =
-            PackageCache::beside(request.staging(), self.cache_dir.as_deref(), STAGE3_CACHE);
-        cache::create(cache.path())?;
+            PackageCache::beside(request.staging(), self.cache_dir.as_deref(), STAGE3_CACHE)?;
         let tarball = cache.path().join(stage3.file_name());
         // The digest document beside the tarball it vouches for, so a later
         // resolution of this build reads it back rather than asking an archive
@@ -1801,7 +1800,7 @@ impl Gentoo {
             return Ok(());
         }
 
-        let cache = PackageCache::beside(root, self.cache_dir.as_deref(), PACKAGE_CACHE);
+        let cache = PackageCache::beside(root, self.cache_dir.as_deref(), PACKAGE_CACHE)?;
         let directory = index::directory(&self.architecture, &plan.binhost);
         // A layered build's database entries are written into the upper over
         // the base, so a directory one creates never hides a link the base

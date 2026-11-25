@@ -715,7 +715,7 @@ impl Debian {
 
         // The archives cache: the caller's shared one, or a sibling of the
         // upper, which goes with this frame however it ends.
-        let archives = PackageCache::beside(upper, self.cache_dir.as_deref(), DEB_CACHE);
+        let archives = PackageCache::beside(upper, self.cache_dir.as_deref(), DEB_CACHE)?;
 
         // Resolve the increment against the base's installed set, download it,
         // extract it into the upper, and configure it through the overlay.
@@ -1763,7 +1763,7 @@ fn bootstrap_suite(
 
     // The cache disposes of itself when this frame ends, on the failure paths
     // below as on the success path, and so does a private copy taken from it.
-    let archives = PackageCache::beside(staging, cache_dir, DEB_CACHE);
+    let archives = PackageCache::beside(staging, cache_dir, DEB_CACHE)?;
     let installables = acquire_debs(fetcher, repositories, &packages, archives.path(), observer)?;
     let private = private_copy(staging, cache_dir, &installables)?;
     let installing = private.as_ref().unwrap_or(&archives).path();
@@ -2385,8 +2385,6 @@ fn acquire_debs(
     archives_host: &Path,
     observer: &mut dyn DebianObserver,
 ) -> Result<Vec<Installable>, ProvisionError> {
-    cache::create(archives_host)?;
-
     let entries: Vec<PathBuf> = packages
         .iter()
         .map(|package| archives_host.join(cache_name(&package.digests)))
@@ -2490,8 +2488,7 @@ fn private_copy(
     if PackageCache::is_derived(tree, DEB_CACHE, cache_dir) {
         return Ok(None);
     }
-    let private = PackageCache::beside(tree, None, DEB_CACHE);
-    cache::create(private.path())?;
+    let private = PackageCache::beside(tree, None, DEB_CACHE)?;
     for installable in installables {
         let name = cache_name(&installable.digests);
         let from = cache_dir.join(&name);

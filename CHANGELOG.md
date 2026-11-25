@@ -87,6 +87,15 @@ consumer upgrading can skip it.
   record of any version below `0x1000` as TLS and serves the name its
   ClientHello carries, so a guest could reach a site the name rules refuse
   through a Go front end at an admitted address.
+- A provisioning run that names no cache directory makes the directory it
+  downloads into afresh, readable by the calling user alone, in place of
+  whatever held its name. It created it with `create_dir_all`, which took a
+  directory already at that predictable name beside the tree, whoever owned it
+  and whatever its mode, and the link a directory there might be. Another user
+  who made one where the tree's parent let them could replace a verified
+  `.deb` before dpkg read it, and dpkg then installed theirs and ran its
+  scripts into the root. Under a group-writable umask the run's own directory
+  was group-writable too.
 
 ### Added
 

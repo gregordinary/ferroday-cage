@@ -126,7 +126,10 @@ which is what makes it a cache.
 Without one, packages are downloaded into a directory beside the tree being
 built and discarded when the run ends. That holds whether the run succeeded or
 failed, so a bootstrap that fails partway leaves nothing beside the tree it did
-not publish.
+not publish. The run makes that directory itself, readable by the calling user
+alone, after removing whatever held its name. Its name is predictable, so a
+directory already there could be another user's, made where the tree's parent
+lets anyone make one.
 
 With one, the packages a run installs are first copied from the cache into that
 same run-owned directory. Extraction verifies the copy, and every dpkg wave

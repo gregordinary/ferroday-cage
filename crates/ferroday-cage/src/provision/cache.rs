@@ -42,7 +42,7 @@
 //! mirror could not serve it, the check refused what arrived, the run was
 //! cancelled, or a host operation on the cache failed. Only the first advances
 //! a walk over mirrors. The last is [`ProvisionError::Io`] whichever layer asked,
-//! as is a cache directory that cannot be created ([`create`]): neither is about
+//! as is a cache directory that cannot be created ([`PackageCache::beside`]): neither is about
 //! a format, so neither is a layer's error.
 
 use std::fs::{self, File};
@@ -60,7 +60,9 @@ use super::{
 ///
 /// A caller that names a cache directory owns it: it survives the run, which is
 /// the whole point of naming one. A run that names none downloads into a derived
-/// sibling of the tree it is building, and that directory is the run's own.
+/// sibling of the tree it is building, and that directory is the run's own: made
+/// by the run, in place of whatever held its name, and readable by the calling
+/// user alone.
 ///
 /// A derived cache is removed when the value is dropped rather than at the end
 /// of the successful path, so a failure disposes of it exactly as a success
@@ -75,8 +77,8 @@ pub(crate) struct PackageCache {
 }
 
 impl PackageCache {
-    /// The cache for a run building `tree`: the caller's, or a sibling of the
-    /// tree named after it with `suffix`.
+    /// The cache for a run building `tree`, created: the caller's, or a
+    /// sibling of the tree named after it with `suffix`.
     ///
     /// A sibling, not a child: an extracted package's entries land under the
     /// tree, so a cache beneath it could be overwritten before it is read, but a
@@ -84,16 +86,39 @@ impl PackageCache {
     ///
     /// The suffix is the layer's, so two provisioners building one destination
     /// do not each dispose of the other's downloads.
-    pub(crate) fn beside(tree: &Path, cache_dir: Option<&Path>, suffix: &str) -> PackageCache {
+    ///
+    /// The caller's cache is created where it is missing, as [`create`] does.
+    /// The run's own is made afresh: whatever holds its name is removed
+    /// without following it, and a directory is made in its place with
+    /// `create_dir`, which refuses a name taken again meanwhile, at
+    /// [`OWN_MODE`]. The name is a predictable one beside the tree, so a
+    /// directory already there could be anyone's: another user's, made where
+    /// the tree's parent lets anyone make one, and writable by them, would
+    /// otherwise hold the run's verified packages between their check and the
+    /// package manager's read. A leftover the calling user cannot remove,
+    /// such as another user's in a sticky directory, fails the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvisionError::Io`] naming the directory.
+    pub(crate) fn beside(
+        tree: &Path,
+        cache_dir: Option<&Path>,
+        suffix: &str,
+    ) -> Result<PackageCache, ProvisionError> {
         match cache_dir {
-            Some(dir) => PackageCache {
-                path: dir.to_path_buf(),
-                owned: false,
-            },
-            None => PackageCache {
-                path: PackageCache::derived(tree, suffix),
-                owned: true,
-            },
+            Some(dir) => {
+                create(dir)?;
+                Ok(PackageCache {
+                    path: dir.to_path_buf(),
+                    owned: false,
+                })
+            }
+            None => {
+                let path = PackageCache::derived(tree, suffix);
+                create_own(&path)?;
+                Ok(PackageCache { path, owned: true })
+            }
         }
     }
 
@@ -166,8 +191,36 @@ impl Drop for PackageCache {
     }
 }
 
+/// The mode the run's own cache is made at: the calling user's alone, whatever
+/// the umask or a set-group-ID parent would give a directory made without one.
+const OWN_MODE: u32 = 0o700;
+
+/// Makes the run's own cache at `path`, in place of whatever holds the name;
+/// see [`PackageCache::beside`].
+fn create_own(path: &Path) -> Result<(), ProvisionError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    match fs::symlink_metadata(path) {
+        // Removed as what it is: a link is removed as a link, never followed.
+        Ok(_) => remove_tree(path, &crate::IdentityMap::Single, None)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(ProvisionError::io(
+                "inspecting the package cache",
+                path,
+                err,
+            ));
+        }
+    }
+    fs::DirBuilder::new()
+        .mode(OWN_MODE)
+        .create(path)
+        .map_err(|err| ProvisionError::io("creating the package cache", path, err))
+}
+
 /// Creates the cache directory `path`, and any directory above it that is
-/// missing, and sweeps it of the staging files nothing is writing.
+/// missing, and sweeps it of the staging files nothing is writing: a cache
+/// the caller named, which the caller keeps.
 ///
 /// A run killed outright leaves the download it was writing as a hidden
 /// staging file beside the entry, and the next run to use the cache is the one
@@ -177,7 +230,7 @@ impl Drop for PackageCache {
 ///
 /// Returns [`ProvisionError::Io`] naming the directory. A cache that cannot be
 /// created is a host failure whichever layer's cache it is.
-pub(crate) fn create(path: &Path) -> Result<(), ProvisionError> {
+fn create(path: &Path) -> Result<(), ProvisionError> {
     fs::create_dir_all(path)
         .map_err(|err| ProvisionError::io("creating the package cache", path, err))?;
     Staged::sweep(path);
@@ -1351,6 +1404,53 @@ mod tests {
             .expect("the open returned rather than waiting on the pipe");
         let err = outcome.expect_err("a pipe is not an entry");
         assert!(err.to_string().contains("is not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn the_run_s_own_cache_is_made_afresh_and_the_caller_s_is_kept() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = Scratch::new("cache-own");
+        let tree = dir.join("tree");
+        let own = PackageCache::derived(&tree, ".cache");
+        // Another user's directory at the predictable name, open to anyone,
+        // holding a package of theirs.
+        fs::create_dir(&own).unwrap();
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::write(own.join("planted.deb"), b"theirs").unwrap();
+        {
+            let cache = PackageCache::beside(&tree, None, ".cache").expect("the cache is made");
+            assert_eq!(cache.path(), own);
+            let made = fs::symlink_metadata(&own).unwrap();
+            assert!(made.is_dir());
+            assert_eq!(made.mode() & 0o777, OWN_MODE);
+            assert_eq!(fs::read_dir(&own).unwrap().count(), 0);
+        }
+        assert!(!own.exists(), "the run's own cache goes with it");
+
+        // A link at the name is removed as a link, never followed.
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("kept"), b"kept").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &own).unwrap();
+        let cache = PackageCache::beside(&tree, None, ".cache").expect("the cache is made");
+        assert!(fs::symlink_metadata(cache.path()).unwrap().is_dir());
+        assert_eq!(fs::read(elsewhere.join("kept")).unwrap(), b"kept");
+        drop(cache);
+
+        // A cache the caller names is created where it is missing, and its
+        // contents are the caller's to keep, as is the directory.
+        let named = dir.join("named/cache");
+        let cache = PackageCache::beside(&tree, Some(&named), ".cache").expect("it is created");
+        fs::write(named.join("kept.deb"), b"kept").unwrap();
+        drop(cache);
+        let cache = PackageCache::beside(&tree, Some(&named), ".cache").expect("it is kept");
+        drop(cache);
+        assert_eq!(fs::read(named.join("kept.deb")).unwrap(), b"kept");
+        assert_eq!(
+            fs::metadata(&named).unwrap().uid(),
+            rustix::process::geteuid().as_raw()
+        );
     }
 
     #[test]

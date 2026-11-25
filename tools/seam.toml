@@ -520,7 +520,7 @@ why = "As above."
 
 [[reach]]
 item = "scratch::Scratch::new"
-tests = 70
+tests = 71
 cost = "test"
 why = "As above."
 

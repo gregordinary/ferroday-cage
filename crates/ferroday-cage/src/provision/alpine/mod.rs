@@ -1817,7 +1817,7 @@ fn install(
 
     // The cache disposes of itself when this frame ends, on the failure paths
     // below as on the success path.
-    let cache = PackageCache::beside(into, alpine.cache_dir.as_deref(), APK_CACHE);
+    let cache = PackageCache::beside(into, alpine.cache_dir.as_deref(), APK_CACHE)?;
     let acquired = acquire(
         &mut *alpine.fetcher,
         &plan,
@@ -1925,8 +1925,6 @@ fn acquire(
     cache: &Path,
     observer: &mut dyn AlpineObserver,
 ) -> Result<Vec<Acquired>, ProvisionError> {
-    cache::create(cache)?;
-
     // Positional, and `validate_plan` has already held the plan to it, so a slot
     // a package names is one this resolves.
     let slots = index_slots(repositories, architecture);
