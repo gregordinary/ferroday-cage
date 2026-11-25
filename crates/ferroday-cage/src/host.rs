@@ -311,6 +311,80 @@ pub(crate) fn procfs_refusal() -> ProcfsBlocker {
         })
 }
 
+/// A security module's policy confining this process, in a mode that refuses
+/// what the policy does not allow.
+///
+/// A launch names one where it has met a refusal only a security module can
+/// have made, as [`Error::MountRefused`](crate::Error::MountRefused).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Confinement {
+    /// An AppArmor profile, or a stack of profiles.
+    ///
+    /// Read from `/proc/self/attr/apparmor/current`, which the kernel offers
+    /// from Linux 5.8, and named only in a mode that refuses. A profile in
+    /// complain mode logs what it would refuse, and one in unconfined mode,
+    /// such as a profile that exists to grant a program user namespaces,
+    /// refuses nothing.
+    #[non_exhaustive]
+    AppArmor {
+        /// The profile's name, or a stack's names joined by `//&`, as the
+        /// kernel writes them.
+        profile: String,
+        /// The mode, as the kernel writes it: `enforce` or `kill`, or `mixed`
+        /// for a stack whose profiles' modes differ.
+        mode: String,
+    },
+}
+
+impl Confinement {
+    /// The confinement an AppArmor label states, as the kernel writes one for
+    /// a process: the profile's name, or a stack's, then its mode in
+    /// parentheses, or `unconfined` alone for a process no profile confines.
+    /// `None` for that, and for a mode that refuses nothing.
+    ///
+    /// A profile's name can hold ` (`, so the mode is what follows the last
+    /// one, which the kernel writes after the name.
+    fn of_apparmor_label(label: &str) -> Option<Confinement> {
+        let label = label.trim_end_matches(['\n', '\0']);
+        let (profile, mode) = label.strip_suffix(')')?.rsplit_once(" (")?;
+        if profile.is_empty() || matches!(mode, "complain" | "unconfined") {
+            return None;
+        }
+        Some(Confinement::AppArmor {
+            profile: profile.to_string(),
+            mode: mode.to_string(),
+        })
+    }
+}
+
+impl fmt::Display for Confinement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // The name is the policy author's, not the kernel's, and an
+            // Ubuntu-derived kernel lets root in a user namespace load policy
+            // (`kernel.unprivileged_userns_apparmor_policy`), so it is escaped
+            // as any string another party supplied is.
+            Confinement::AppArmor { profile, mode } => {
+                write!(f, "the AppArmor profile {profile:?} in {mode} mode")
+            }
+        }
+    }
+}
+
+/// The security module's policy confining this process, where one confines it
+/// in a mode that refuses: the AppArmor profile
+/// `/proc/self/attr/apparmor/current` names.
+///
+/// `None` where AppArmor is not active, where no profile, or one that refuses
+/// nothing, confines this process, and below Linux 5.8, which has no such
+/// file. A launch's setup stage runs under the profile this process does, since
+/// nothing between the fork and a mount executes a program.
+pub(crate) fn confinement() -> Option<Confinement> {
+    let label = std::fs::read_to_string("/proc/self/attr/apparmor/current").ok()?;
+    Confinement::of_apparmor_label(&label)
+}
+
 /// Probes whether a launch with a cgroup of its own beneath `parent`, holding
 /// the tree to `limits`, would be refused its cgroup, returning why where it
 /// would.
@@ -1198,6 +1272,7 @@ mod tests {
         // to call.
         let _ = userns_blocker();
         let _ = procfs_blocker();
+        let _ = confinement();
     }
 
     /// The procfs and its masks as a container runtime with its defaults lays
@@ -1285,6 +1360,56 @@ mod tests {
         );
         assert!(rendered.contains("systempaths=unconfined"), "{rendered}");
         assert!(rendered.contains("pid_namespace(false)"), "{rendered}");
+    }
+
+    #[test]
+    fn an_apparmor_label_names_a_profile_only_in_a_mode_that_refuses() {
+        let named = |label: &str| {
+            Confinement::of_apparmor_label(label)
+                .map(|Confinement::AppArmor { profile, mode }| (profile, mode))
+        };
+        let pair = |profile: &str, mode: &str| Some((profile.to_string(), mode.to_string()));
+        assert_eq!(
+            named("docker-default (enforce)\n"),
+            pair("docker-default", "enforce")
+        );
+        assert_eq!(
+            named("/usr/bin/man (enforce)\n"),
+            pair("/usr/bin/man", "enforce")
+        );
+        assert_eq!(named("a//&b (mixed)\n"), pair("a//&b", "mixed"));
+        assert_eq!(named("strict (kill)"), pair("strict", "kill"));
+        // A name holding the separator keeps it: the mode is what follows the
+        // last one.
+        assert_eq!(named("x (y) (enforce)\n"), pair("x (y)", "enforce"));
+
+        // No profile, or one that refuses nothing.
+        assert_eq!(named("unconfined\n"), None);
+        assert_eq!(named("vscode (unconfined)\n"), None);
+        assert_eq!(named("learning (complain)\n"), None);
+        // Not a label the kernel writes.
+        assert_eq!(named(""), None);
+        assert_eq!(named(" (enforce)"), None);
+        assert_eq!(named("docker-default"), None);
+    }
+
+    #[test]
+    fn a_confinement_names_its_profile_escaped() {
+        let rendered = Confinement::AppArmor {
+            profile: "docker-default".to_string(),
+            mode: "enforce".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            rendered,
+            "the AppArmor profile \"docker-default\" in enforce mode"
+        );
+        let rendered = Confinement::AppArmor {
+            profile: "evil\x1b[2J".to_string(),
+            mode: "enforce".to_string(),
+        }
+        .to_string();
+        assert!(!rendered.contains('\x1b'), "{rendered}");
     }
 
     /// A `security.capability` attribute of the second revision: the magic

@@ -1,0 +1,14 @@
+# An AppArmor profile that allows everything but mounting, as a container
+# runtime's default profile refuses a sandbox's mounts. tests/apparmor.rs runs
+# a launch under it, named by FERRODAY_CAGE_APPARMOR_PROFILE:
+#
+#   sudo apparmor_parser --replace crates/ferroday-cage/tests/fixtures/apparmor/refuses-mounts
+#   FERRODAY_CAGE_APPARMOR_PROFILE=ferroday-cage-refuses-mounts \
+#       cargo test -p ferroday-cage --test apparmor
+
+abi <abi/4.0>,
+
+profile ferroday-cage-refuses-mounts {
+  allow all,
+  deny mount,
+}

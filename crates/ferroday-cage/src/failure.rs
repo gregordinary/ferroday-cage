@@ -313,6 +313,15 @@ mod tests {
                 },
                 source: os_error(),
             }),
+            Box::new(Error::MountRefused {
+                step: SetupStep::MountTmpfs,
+                confinement: crate::host::Confinement::AppArmor {
+                    profile: "docker-default".to_string(),
+                    mode: "enforce".to_string(),
+                },
+                detail: Some("tmpfs at /tmp".to_string()),
+                source: os_error(),
+            }),
             Box::new(ProvisionError::io("opening", "/srv/rootfs.tar", os_error())),
             Box::new(ProvisionError::other(ProvisionError::io(
                 "opening",

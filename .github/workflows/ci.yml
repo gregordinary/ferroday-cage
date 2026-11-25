@@ -94,6 +94,9 @@ jobs:
           user="$(id -un)"
           printf '%s:500000:65536\n' "$user" | sudo tee /etc/subuid > /dev/null
           printf '%s:500000:65536\n' "$user" | sudo tee /etc/subgid > /dev/null
+          # The AppArmor profile tests/apparmor.rs runs a launch under, which
+          # allows everything but mounting.
+          sudo apparmor_parser --replace crates/ferroday-cage/tests/fixtures/apparmor/refuses-mounts
       - name: Test
         # Each REQUIRE turns a test's explicit skip into a failure, so a run
         # where a security-property suite silently skipped must not pass. They
@@ -110,6 +113,8 @@ jobs:
           # The runner's filesystem holds named pipes, access control lists,
           # user attributes and holes, and /dev/shm is a tmpfs of its own.
           FERRODAY_CAGE_REQUIRE_FILESYSTEM: '1'
+          FERRODAY_CAGE_APPARMOR_PROFILE: ferroday-cage-refuses-mounts
+          FERRODAY_CAGE_REQUIRE_APPARMOR: '1'
           # The scope tests need Landlock ABI 6 (Linux 6.12). The hosted image
           # behind `ubuntu-latest` runs a 6.17 kernel on Ubuntu 24.04 and 7.0 on
           # 26.04, which the label is moving to, so a skip here is a regression
@@ -542,10 +547,9 @@ jobs:
           launch 125 "user namespace" -- "${unconfined[@]}" -- --share-pid
           echo "::endgroup::"
 
-          echo "::group::The runtime's own AppArmor profile, with the generated seccomp profile"
-          # docker-default denies mount; what a launch reports under it is
-          # recorded here rather than asserted beyond its failing.
-          launch 125 "" -- "${seccomp[@]}" --security-opt systempaths=unconfined --
+          echo "::group::The runtime's own AppArmor profile refuses the mounts, and is named"
+          launch 125 'the AppArmor profile "docker-default" in enforce mode' \
+            -- "${seccomp[@]}" --security-opt systempaths=unconfined --
           echo "::endgroup::"
 
           echo "::group::The container's cgroup filesystem"

@@ -38,7 +38,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::cgroup::{CgroupReach, CgroupRefusal};
-use crate::host::{ProcfsBlocker, UsernsBlocker};
+use crate::host::{Confinement, ProcfsBlocker, UsernsBlocker};
 use crate::spec::{HOST_ROOT_HIDDEN, is_command_name};
 use crate::wire::wire_enum;
 
@@ -1614,6 +1614,33 @@ pub enum Error {
     /// every process of the launch has exited by then; with one, the
     /// namespace is ending.
     SupervisorUnreceived,
+    /// The security module's policy confining this process refused a setup
+    /// step that mounts, remounts, unmounts or pivots the root.
+    ///
+    /// AppArmor mediates each of these. A profile in enforce mode refuses
+    /// with `EACCES` every one its rules do not allow, and a container
+    /// runtime's default profile, Docker's `docker-default` among them, allows
+    /// no mount, so inside a container started with its defaults a sandbox
+    /// fails at its first. [`Confinement`] names the profile.
+    ///
+    /// Reported in place of [`Setup`](Self::Setup) for a step that met `EACCES`
+    /// where no file's permissions are weighed, while a profile that refuses
+    /// confines this process, from Linux 5.8. A step that also opens a path
+    /// the caller named stays [`Setup`](Self::Setup), since a directory the
+    /// caller cannot search answers `EACCES` too: binding the rootfs or a
+    /// host path, mounting an overlay root, and a raw mount.
+    #[non_exhaustive]
+    MountRefused {
+        /// The step that was refused.
+        step: SetupStep,
+        /// The policy that refused it.
+        confinement: Confinement,
+        /// What the step was operating on, where it has a subject, as for
+        /// [`Setup`](Self::Setup).
+        detail: Option<String>,
+        /// The error the kernel returned, `EACCES`.
+        source: io::Error,
+    },
 }
 
 /// Why [`Pending::listen`](crate::Pending::listen) makes no listener at an
@@ -1794,6 +1821,22 @@ impl fmt::Display for Error {
                  naming the sandbox's supervisor (no descriptor number was free under \
                  RLIMIT_NOFILE, or a security module refused it)",
             ),
+            Error::MountRefused {
+                step,
+                confinement,
+                detail,
+                ..
+            } => {
+                write!(f, "sandbox setup failed while {step}")?;
+                if let Some(detail) = detail {
+                    write!(f, " ({detail})")?;
+                }
+                write!(
+                    f,
+                    ", refused by {confinement}, which confines this process (a sandbox needs \
+                     a profile that allows mount, remount, umount and pivot_root, or none)"
+                )
+            }
         }
     }
 }
@@ -1825,7 +1868,8 @@ impl std::error::Error for Error {
             | Error::Terminal { source }
             | Error::TerminalsExhausted { source }
             | Error::ProcfsRefused { source, .. }
-            | Error::Cgroup { source, .. } => Some(source),
+            | Error::Cgroup { source, .. }
+            | Error::MountRefused { source, .. } => Some(source),
             Error::Listen { source, .. } => source
                 .as_ref()
                 .map(|source| source as &(dyn std::error::Error + 'static)),

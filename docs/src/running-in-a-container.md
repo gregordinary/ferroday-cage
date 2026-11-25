@@ -44,8 +44,10 @@ library that creates a thread with `clone3` falls back to `clone` on `ENOSYS`.
 
 Docker's `docker-default` profile denies `mount`, and so does containerd's
 `cri-containerd.apparmor.d`, which is built from the same template. Under either
-profile, the sandbox's first mount is refused. Run the container unconfined, or
-under an AppArmor profile of your own that allows `mount`.
+profile, the sandbox's first mount is refused. The launch reports
+`Error::MountRefused`, which names the profile and its mode. Run the container
+unconfined, or under an AppArmor profile of your own that allows `mount`,
+`remount`, `umount` and `pivot_root`.
 
 ## The masked procfs
 
@@ -170,6 +172,7 @@ what this chapter says:
 - Sharing the PID namespace launches, as root and as another user.
 - An unmasked procfs launches.
 - Docker's own seccomp profile refuses the sandbox's namespaces.
-- Docker's own AppArmor profile refuses the sandbox's mounts.
+- Docker's own AppArmor profile refuses the sandbox's mounts, and the launch
+  names it.
 
 It also records how the container's cgroup filesystem is mounted.

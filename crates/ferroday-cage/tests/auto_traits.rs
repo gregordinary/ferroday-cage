@@ -99,6 +99,7 @@ const _: () = assert_send_sync::<ferroday_cage::host::UsernsBlocker>();
 const _: () = assert_send_sync::<ferroday_cage::host::RangeMapBlocker>();
 const _: () = assert_send_sync::<ferroday_cage::host::OverlayBlocker>();
 const _: () = assert_send_sync::<ferroday_cage::host::ProcfsBlocker>();
+const _: () = assert_send_sync::<ferroday_cage::host::Confinement>();
 
 // ---------------------------------------------------------------------------
 // Provisioning.

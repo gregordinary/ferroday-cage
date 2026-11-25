@@ -124,6 +124,28 @@ access-time flags. It then reads the mount table to name the mounts in the way.
 [Running inside a container](running-in-a-container.md) gives each runtime's
 configuration.
 
+## An AppArmor profile
+
+A process confined by an AppArmor profile in enforce mode can do only what the
+profile's rules allow. A launch creates a user namespace and mounts, remounts,
+unmounts and pivots into its root, so a profile it runs under needs `userns`,
+`capability`, `mount`, `remount`, `umount` and `pivot_root` rules, or the
+process needs no confinement. A container runtime's default profile is the
+common case; [Running inside a
+container](running-in-a-container.md#the-apparmor-profile) gives its remedies.
+
+A profile refuses a mount with `EACCES`. The launch reports
+`Error::MountRefused`, which names the profile and its mode, read from
+`/proc/self/attr/apparmor/current`. Two refusals are reported as the setup
+step's own `EACCES` instead:
+
+- one below Linux 5.8, which has no such file;
+- one at a step that also opens a path the caller named, such as a bind's
+  source, since a directory the caller cannot search answers `EACCES` there too.
+
+A profile that refuses the user namespace, or the capabilities a namespace
+needs, refuses the launch earlier, as `Error::UsernsUnavailable`.
+
 ## Where the rootfs lives
 
 The rootfs must sit under a directory the calling user controls — not a

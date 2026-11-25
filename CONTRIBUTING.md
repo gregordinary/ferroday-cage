@@ -69,6 +69,7 @@ CI asserts the security-property suites actually ran:
 | `FERRODAY_CAGE_REQUIRE_SECCOMP` | The kernel offers no seccomp |
 | `FERRODAY_CAGE_REQUIRE_CGROUP` | The cgroup suite runs outside a delegated cgroup v2 directory of its own that can hold its sandboxes' cgroups, or the kernel lacks a limit file the suite sets, as `memory.swap.max` is absent with swap accounting off |
 | `FERRODAY_CAGE_REQUIRE_FILESYSTEM` | The scratch directory's filesystem holds no named pipe, POSIX access control list, `user.` attribute or hole in a sparse file, or no second filesystem is mounted at `/dev/shm` |
+| `FERRODAY_CAGE_REQUIRE_APPARMOR` | `FERRODAY_CAGE_APPARMOR_PROFILE` names no loaded AppArmor profile for `tests/apparmor.rs` to run a launch under, as below |
 | `FERRODAY_CAGE_REQUIRE_NETWORK_TEST` | A network suite was not opted into |
 
 A variable governs every test that needs its facility, including the host tools
@@ -123,6 +124,18 @@ test binary a scope of its own, while cargo itself stays outside it:
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='systemd-run --user --scope --quiet -p Delegate=yes --' \
     cargo test --workspace --all-features --test cgroup
+```
+
+`tests/apparmor.rs` runs a launch under an AppArmor profile that refuses a mount
+the launch makes, which `FERRODAY_CAGE_APPARMOR_PROFILE` names. The repository's
+own profile allows everything but mounting, and loading it needs root. Any other
+loaded profile in enforce mode that allows a user namespace and refuses a mount
+serves as well.
+
+```sh
+sudo apparmor_parser --replace crates/ferroday-cage/tests/fixtures/apparmor/refuses-mounts
+FERRODAY_CAGE_APPARMOR_PROFILE=ferroday-cage-refuses-mounts \
+    cargo test --workspace --all-features --test apparmor
 ```
 
 ### The network suites
@@ -570,6 +583,7 @@ report name a package and its version bare.
 | Build the cage a bootstrap runs a package's command in, and hand its output to the layer's events | `provision::layer::Rooting::script_cage`, `layer::Forward` |
 | Can this process install a seccomp filter? | `host::seccomp_available`, which installs one in a forked child through `mechanism::seccomp::installable` |
 | Can a sandbox with a PID namespace of its own mount its procfs here, and why not? | `host::procfs_blocker`, which mounts one in a forked child through `mechanism::probe_procfs_mount`, and `host::procfs_refusal` for the explanation alone |
+| Which security module's policy confines this process, in a mode that refuses? | `host::confinement`, over `Confinement::of_apparmor_label`, which a launch asks where only a security module answers a step's `EACCES` |
 | Give a launch a cgroup of its own beneath a delegated parent, read what its tree used, end its tree, and remove it | `cgroup::Cgroup`, which a launch creates before the fork with the limits on it and a leaf beneath it, which the launch stage joins through the leaf's `cgroup.procs`, and which the running handle and its kill handles share until the last of them drops |
 | Would a launch beneath this parent be refused its cgroup, and why? | `host::cgroup_blocker`, which carries out `cgroup::Cgroup::create` and a join through `mechanism::probe_cgroup_join`, with every errno read by `cgroup::refusal` as the launch's own are |
 | Which cgroup does this process run in? | `host::own_cgroup`, over `host::MountEntry::parse` |

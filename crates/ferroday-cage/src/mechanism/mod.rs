@@ -2708,11 +2708,58 @@ fn setup_error(step: SetupStep, errno: i32, detail: u32, labels: Labels<'_>) -> 
         SetupStep::LandlockAddRule => index_label(detail, labels.landlock),
         _ => index_label(detail, labels.ops),
     };
+    let source = std::io::Error::from_raw_os_error(errno);
+    // A security module refuses a mount it mediates with `EACCES`, which a
+    // step that weighs no file's permissions has no other source for, so the
+    // error names the policy confining this process where one refuses.
+    if errno == Errno::ACCESS.raw_os_error()
+        && refused_only_by_a_security_module(step)
+        && let Some(confinement) = host::confinement()
+    {
+        return Error::MountRefused {
+            step,
+            confinement,
+            detail,
+            source,
+        };
+    }
     Error::Setup {
         step,
-        source: std::io::Error::from_raw_os_error(errno),
+        source,
         detail,
     }
+}
+
+/// Whether `EACCES` from `step` can only be a security module's answer.
+///
+/// These steps mount, remount, unmount or pivot through descriptors the launch
+/// opened and through paths it chose itself, `/` and the root it pivots into,
+/// so no file's permissions are weighed. AppArmor refuses each of them with
+/// `EACCES` where a profile does not allow it.
+///
+/// The steps that also open a path the caller named are not among them, since
+/// a directory the caller cannot search answers `EACCES` there as well:
+/// binding the rootfs or a host path, which opens the source; the overlay root,
+/// which opens its layers; and a raw mount, whose source the kernel resolves.
+/// Opening a mount target is a step of its own.
+fn refused_only_by_a_security_module(step: SetupStep) -> bool {
+    matches!(
+        step,
+        SetupStep::PrivatizeMounts
+            | SetupStep::NosuidRootfs
+            | SetupStep::MountEmptyRoot
+            | SetupStep::MountHostRoot
+            | SetupStep::MountTmpfs
+            | SetupStep::MountProc
+            | SetupStep::MountDevpts
+            | SetupStep::RemountReadOnly
+            | SetupStep::HidePath
+            | SetupStep::PlaceFile
+            | SetupStep::ReadOnlyPath
+            | SetupStep::ReadOnlyEmptyRoot
+            | SetupStep::PivotRoot
+            | SetupStep::DetachOldRoot
+    )
 }
 
 /// What the launch stage's publication of the supervisor delivered to this
@@ -2943,6 +2990,79 @@ mod tests {
             #[cfg(feature = "hardening")]
             landlock: rules,
         }
+    }
+
+    /// `EACCES` from a mount step that weighs no file's permissions names the
+    /// profile confining this process where one refuses, and from a step that
+    /// opens a path the caller named stays the step's failure either way.
+    ///
+    /// Which of the first two outcomes a run sees is this process's
+    /// confinement; `tests/apparmor.rs` runs a launch under a profile.
+    #[test]
+    fn eacces_names_the_confining_profile_only_where_nothing_else_answers_it() {
+        let confinement = host::confinement();
+        for step in [
+            SetupStep::PrivatizeMounts,
+            SetupStep::MountTmpfs,
+            SetupStep::HidePath,
+            SetupStep::PlaceFile,
+            SetupStep::PivotRoot,
+            SetupStep::DetachOldRoot,
+        ] {
+            match (
+                setup_error(
+                    step,
+                    Errno::ACCESS.raw_os_error(),
+                    0,
+                    labels_with_rules(&[]),
+                ),
+                &confinement,
+            ) {
+                (
+                    Error::MountRefused {
+                        step: named,
+                        confinement: reported,
+                        ..
+                    },
+                    Some(confining),
+                ) => {
+                    assert_eq!(named, step);
+                    assert_eq!(&reported, confining);
+                }
+                (Error::Setup { step: named, .. }, None) => assert_eq!(named, step),
+                (other, _) => panic!("{step:?} under {confinement:?}: {other:?}"),
+            }
+        }
+        for step in [
+            SetupStep::BindRootfs,
+            SetupStep::MountOverlayRoot,
+            SetupStep::BindMount,
+            SetupStep::MountRaw,
+            SetupStep::OpenMountTarget,
+            SetupStep::Exec,
+        ] {
+            assert!(
+                matches!(
+                    setup_error(step, Errno::ACCESS.raw_os_error(), 0, labels_with_rules(&[])),
+                    Error::Setup { step: named, .. } if named == step
+                ),
+                "{step:?}"
+            );
+        }
+        // An errno a security module does not answer a mount with stays the
+        // step's failure.
+        assert!(matches!(
+            setup_error(
+                SetupStep::PivotRoot,
+                Errno::INVAL.raw_os_error(),
+                0,
+                labels_with_rules(&[])
+            ),
+            Error::Setup {
+                step: SetupStep::PivotRoot,
+                ..
+            }
+        ));
     }
 
     #[test]

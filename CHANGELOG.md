@@ -55,6 +55,12 @@ consumer upgrading can skip it.
   new `SetupStep::PlaceFile`, and the resolved inputs report it as the new
   `ResolvedMount::File`. The profile format gains the `nameservers` key, and
   `fcage` the `--nameserver ADDRESS` flag.
+- `Error::MountRefused` reports a launch whose mount, remount, unmount or pivot
+  the AppArmor profile confining the caller refused, naming the profile and its
+  mode as `host::Confinement`, in place of a bare `EACCES` at the setup step. A
+  container runtime's default profile refuses every mount, so inside a container
+  started with its defaults a launch fails this way. The profile is read from
+  `/proc/self/attr/apparmor/current`, from Linux 5.8.
 
 ### Changed
 

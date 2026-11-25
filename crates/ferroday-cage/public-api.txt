@@ -1,5 +1,18 @@
 pub mod ferroday_cage
 pub mod ferroday_cage::host
+#[non_exhaustive] pub enum ferroday_cage::host::Confinement
+#[non_exhaustive] pub ferroday_cage::host::Confinement::AppArmor
+pub ferroday_cage::host::Confinement::AppArmor::mode: alloc::string::String
+pub ferroday_cage::host::Confinement::AppArmor::profile: alloc::string::String
+impl core::fmt::Display for ferroday_cage::host::Confinement
+pub fn ferroday_cage::host::Confinement::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for ferroday_cage::host::Confinement
+impl core::marker::Send for ferroday_cage::host::Confinement
+impl core::marker::Sync for ferroday_cage::host::Confinement
+impl core::marker::Unpin for ferroday_cage::host::Confinement
+impl core::marker::UnsafeUnpin for ferroday_cage::host::Confinement
+impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::host::Confinement
+impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::host::Confinement
 #[non_exhaustive] pub enum ferroday_cage::host::OverlayBlocker
 pub ferroday_cage::host::OverlayBlocker::Unsupported
 pub ferroday_cage::host::OverlayBlocker::UpperUnsupported
@@ -1872,6 +1885,11 @@ pub ferroday_cage::Error::Listen::source: core::option::Option<core::io::error::
 #[non_exhaustive] pub ferroday_cage::Error::ListenRefused
 pub ferroday_cage::Error::ListenRefused::address: core::net::socket_addr::SocketAddr
 pub ferroday_cage::Error::ListenRefused::reason: ferroday_cage::ListenRefusal
+#[non_exhaustive] pub ferroday_cage::Error::MountRefused
+pub ferroday_cage::Error::MountRefused::confinement: ferroday_cage::host::Confinement
+pub ferroday_cage::Error::MountRefused::detail: core::option::Option<alloc::string::String>
+pub ferroday_cage::Error::MountRefused::source: core::io::error::Error
+pub ferroday_cage::Error::MountRefused::step: ferroday_cage::SetupStep
 #[non_exhaustive] pub ferroday_cage::Error::NamespaceLimitReached
 pub ferroday_cage::Error::NamespaceLimitReached::source: core::io::error::Error
 pub ferroday_cage::Error::NamespaceLimitReached::step: ferroday_cage::SetupStep

@@ -74,6 +74,12 @@ pub const CGROUP: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_CGROUP
 /// filesystem, at `/dev/shm`, for a work directory placed apart from its upper.
 pub const FILESYSTEM: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_FILESYSTEM");
 
+/// An AppArmor profile in enforce mode that refuses a mount a launch makes,
+/// loaded beforehand and named by `FERRODAY_CAGE_APPARMOR_PROFILE`, and
+/// `aa-exec` to run a test under it. CI loads the library's
+/// `tests/fixtures/apparmor/refuses-mounts` for it.
+pub const APPARMOR: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_APPARMOR");
+
 /// The network suites, which run only when their own variable opts in; see
 /// [`network_suite`].
 pub const NETWORK_TEST: Requirement = Requirement::named("FERRODAY_CAGE_REQUIRE_NETWORK_TEST");
