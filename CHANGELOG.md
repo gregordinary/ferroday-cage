@@ -244,6 +244,12 @@ consumer upgrading can skip it.
   maintainer script changing ownership to an id the map cannot hold failed. A
   bootstrap now keeps a program that a pre-configure overlay lays over a
   stand-in, where it put back the copy it had set aside.
+- The `agent-tools` example's stand-in service answers at most 16 of the
+  command's connections at once and gives each 10 seconds in all for its
+  request. It started a thread for every connection and held each to a timeout
+  per read, so a command could make it hold any number of threads, each for as
+  long as it kept trickling bytes. `Pending::listen` says what serving a
+  listener costs the caller.
 - The embedding chapter's tokio recipe for cancelling a sandbox kills it when
   the async side is dropped, before the kill handle reaches it or after. As
   written, a future dropped before the handle arrived left the sandbox running

@@ -159,6 +159,12 @@ as a proxy that admits the registries a build needs. What that service carries,
 and where, is the runtime's policy, and the command's network reaches nothing
 else. `--port` moves the port.
 
+The service runs in the caller's process. What it holds for the command, a
+thread, a buffer, and the time each connection takes, is bounded by none of the
+command's limits. The example answers at most 16 connections at once, and gives
+each 10 seconds in all for its request. A connection past that waits in the
+listener's backlog. A runtime's own service needs bounds of the same kind.
+
 Nothing of the caller's runs inside the sandbox, so the command is the sandbox's
 only program, and a request to stop reaches it directly.
 

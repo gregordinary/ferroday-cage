@@ -1421,6 +1421,15 @@ impl<'obs> Pending<'obs> {
     ///   it; rustix spells it `rustix::net::shutdown(&listener,
     ///   rustix::net::Shutdown::Read)`.
     ///
+    /// # What serving costs
+    ///
+    /// A connection the command opens is served in the caller's process. What
+    /// serving it holds, a thread, a buffer, and the time it takes, counts
+    /// against the caller and against none of the sandbox's limits, its cgroup
+    /// and its resource limits included. A service the command can reach
+    /// bounds those itself: how many connections it serves at once, how much
+    /// it reads of each, and how long each may take in all.
+    ///
     /// # Landlock
     ///
     /// A Landlock network grant governs `connect` to every TCP port, loopback

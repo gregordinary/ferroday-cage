@@ -55,6 +55,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -143,8 +145,21 @@ const TIMED_OUT: u8 = 124;
 const REQUEST_HEAD_MAX: usize = 16 << 10;
 
 /// How long the stand-in service waits for a request on a connection the
-/// command opened.
+/// command opened, in all: a command trickling a byte at a time cannot hold a
+/// connection past it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most connections the stand-in service answers at once.
+///
+/// The service runs in this process, so what it holds for the command, a
+/// thread and a request head per connection, is bounded by none of the
+/// command's limits. A connection past this waits in the listener's backlog
+/// until one in hand is answered.
+const MAX_CONNECTIONS: usize = 16;
+
+/// How often a wait whose service is answering all it may checks whether a
+/// connection has been answered since.
+const SATURATED_RECHECK: Duration = Duration::from_millis(50);
 
 const USAGE: &str = "\
 Run a coding agent's tool command in a sandbox of its own.
@@ -752,13 +767,16 @@ fn delegated_cgroup() -> Result<PathBuf, String> {
 ///
 /// One `poll` waits on the handle's readiness descriptor, the listener, and
 /// the escalation's next deadline. An event loop registers the same two
-/// descriptors.
+/// descriptors. Each connection is answered on a thread of its own, at most
+/// [`MAX_CONNECTIONS`] at once: while that many are in hand the listener is
+/// left out of the wait, which looks again every [`SATURATED_RECHECK`].
 fn serve_until_exit(
     running: &mut Running<'_>,
     listener: &TcpListener,
     escalation: &mut Escalation,
 ) -> Result<ExitStatus, Failure> {
     let mut serving = true;
+    let answering = Arc::new(AtomicUsize::new(0));
     loop {
         if let Some(status) = running.try_wait()? {
             return Ok(status);
@@ -767,13 +785,21 @@ fn serve_until_exit(
             escalation.expire(running)?;
             continue;
         }
-        let timeout = escalation
+        // A service answering all it may leaves the listener out of the wait,
+        // and looks again shortly for a connection answered since.
+        let accepting = serving && answering.load(Ordering::Acquire) < MAX_CONNECTIONS;
+        let left = escalation
             .deadline()
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .and_then(|left| Timespec::try_from(left).ok());
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let wait = match (left, serving && !accepting) {
+            (Some(left), true) => Some(left.min(SATURATED_RECHECK)),
+            (None, true) => Some(SATURATED_RECHECK),
+            (left, false) => left,
+        };
+        let timeout = wait.and_then(|wait| Timespec::try_from(wait).ok());
         let connection = {
             let mut fds = vec![PollFd::new(&*running, PollFlags::IN)];
-            if serving {
+            if accepting {
                 fds.push(PollFd::new(listener, PollFlags::IN));
             }
             match rustix::event::poll(&mut fds, timeout.as_ref()) {
@@ -792,9 +818,14 @@ fn serve_until_exit(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                answering.fetch_add(1, Ordering::AcqRel);
+                let answered = Answered(Arc::clone(&answering));
                 if let Err(err) = std::thread::Builder::new()
                     .name("agent-tools-service".to_string())
-                    .spawn(move || answer(stream))
+                    .spawn(move || {
+                        let _answered = answered;
+                        answer(stream);
+                    })
                 {
                     eprintln!("agent-tools: cannot start the service's thread: {err}");
                 }
@@ -813,17 +844,38 @@ fn serve_until_exit(
     }
 }
 
-/// Answers one connection of the command's with a line naming its request.
-///
-/// This stands in for the service a runtime offers its tool commands, such as
-/// a proxy that adds the runtime's credentials to the requests it carries,
-/// which the network stack does not. What the service carries, and where, is
-/// the runtime's policy.
-fn answer(mut connection: TcpStream) {
-    let _ = connection.set_read_timeout(Some(REQUEST_TIMEOUT));
+/// A connection the service has in hand, counted while it is: dropping it,
+/// when the answer is done or its thread could not start, frees its place.
+struct Answered(Arc<AtomicUsize>);
+
+impl Drop for Answered {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Answers one connection: reads its request head, within
+/// [`REQUEST_HEAD_MAX`] bytes and [`REQUEST_TIMEOUT`] in all, and replies with
+/// its request line.
+fn answer(connection: TcpStream) {
+    answer_within(connection, REQUEST_TIMEOUT);
+}
+
+/// [`answer`], with `timeout` for the whole of the request head.
+fn answer_within(mut connection: TcpStream, timeout: Duration) {
+    // A deadline the clock cannot express is no deadline, and each read is
+    // then held to the timeout alone.
+    let deadline = Instant::now().checked_add(timeout);
+    let _ = connection.set_write_timeout(Some(timeout));
     let mut head = Vec::new();
     let mut chunk = [0; 1024];
     while !head.windows(4).any(|window| window == b"\r\n\r\n") && head.len() < REQUEST_HEAD_MAX {
+        let left = deadline.map_or(timeout, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        if left.is_zero() || connection.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
         match connection.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => head.extend_from_slice(&chunk[..read]),
@@ -1159,5 +1211,28 @@ mod tests {
                 attached.is_some()
             );
         }
+    }
+
+    #[test]
+    fn a_request_trickled_a_byte_at_a_time_is_held_to_its_deadline() {
+        // A command can keep a connection's thread only as long as the whole
+        // request head is allowed, however it spaces its bytes.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let trickle = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(address).unwrap();
+            for byte in b"GET / HTTP/1.1\r\nHost: x\r\n".iter().cycle().take(200) {
+                if client.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let (connection, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        answer_within(connection, Duration::from_millis(300));
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(2), "the answer took {took:?}");
+        trickle.join().unwrap();
     }
 }
