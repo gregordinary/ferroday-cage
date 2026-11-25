@@ -321,6 +321,14 @@ name = "agent-tools"
 required-features = ["hardening", "netstack"]
 test = true
 
+# A worked consumer: one sandbox kept for a session, started with no command of
+# its own, running each line it reads as a further command. It needs no
+# feature, since it roots the sandbox on the host's own tree. `test` runs its
+# tests, which hold its command line.
+[[example]]
+name = "session-sandbox"
+test = true
+
 [dev-dependencies]
 # The workspace's shared test fixtures and harnesses: the root filesystem, the
 # scratch directories, the skip rule, the tar, `ar`, and repository builders,

@@ -41,7 +41,8 @@ lifetime: a process the command leaves behind cannot outlive the launch,
 and cannot keep [`run`] from returning. That holds for a process tracing the
 command too. A tracer holds the command's exit until it lets go, so once the
 command has exited, the init ends the namespace's other processes, the tracer
-with them.
+with them. A sandbox started with no command of its own lives until it is
+ended instead; see [Further commands](#further-commands).
 
 With [`pid_namespace(false)`], there is no init: the command process is itself
 the supervisor, and the launch stage remains outside the sandbox as its parent
@@ -131,6 +132,85 @@ Prefer waiting, including after a kill, which also drains any output produced
 before it. A file bind's target that the launch created in
 the root goes once the sandbox is gone. A handle dropped while the sandbox runs
 leaves it, since removing it would unmount the running sandbox's bind.
+
+## Further commands
+
+[`Running::exec`] runs a further command in a sandbox that is running. An
+[`Exec`] states the command, its arguments, variables set over the launch's
+environment, a working directory, and its standard streams. Its identity,
+resource limits and hardening are the launch's.
+
+```text
+caller
+├── launch stage ─ init (PID 1) ─ command (PID 2)
+└── join stage                joins the sandbox's namespaces, forks the
+    (supervises from outside) further command, reports its outcome
+    └── further command       PID 3 or later, its parent shown as 0
+```
+
+The join stage enters the sandbox with one `setns`, through the pidfd the
+handle holds. That is the init's, or the launch stage's without a PID
+namespace. The stage forks the further command into the sandbox and supervises
+it from outside, as a launch stage does without a PID namespace. The command
+then enters a nested user and mount namespace of its own, copied from the
+sandbox's setup, and applies the hardening. It is a Landlock domain and a
+seccomp filter of its own, with the launch's rules.
+
+The commands share the sandbox. Its root and every mount the setup made are
+theirs, and so are its processes, its network and its hostname. So are any
+network stack attached to it, its IPC namespace, and its cgroup and limits. A
+mount one command makes in its own namespace is not seen by another. Each is a
+user namespace of its own, so none can `ptrace` another or read another's
+`/proc/<pid>/environ`, `fd` or `mem`.
+
+Each sees the others in `/proc` and can signal them, unless the hardening sets
+[`LandlockScope::Signal`]. A further command's handle governs that command and
+not the sandbox, and its [`kill`] ends the command. Where the sandbox has a
+cgroup, the command runs in a cgroup of its own beneath it, held to the
+sandbox's limits. The kill then ends everything the command started. Without a
+cgroup, what it started runs on until the sandbox ends.
+
+The sandbox ends as it always does, with its first command. With a PID
+namespace, every further command ends with it. An exec costs a fork, the join,
+the nested namespace and the hardening: about a millisecond, a fraction of a
+launch.
+
+```rust,no_run
+# fn main() -> ferroday_cage::Result<()> {
+use ferroday_cage::{Cage, Exec};
+
+let sandbox = Cage::builder()
+    .host_rootfs()
+    .stop_with_caller(true)
+    .build()?
+    .start()?;
+sandbox.exec(&Exec::new("/bin/sh").args(["-c", "python3 -m http.server 8000 &"]))?
+    .wait()?;
+let status = sandbox
+    .exec(&Exec::new("/usr/bin/curl").arg("http://127.0.0.1:8000/"))?
+    .wait()?;
+# let _ = status;
+# Ok(())
+# }
+```
+
+### A sandbox with no command of its own
+
+[`Cage::start`] starts a sandbox and returns its handle without running a
+command. Its init holds the sandbox for further commands. A session's sandbox
+lives for the session rather than for one command, and needs nothing in its
+root to keep it up. Built without a command, a `Cage` is made for this, and
+refuses the launches that run its command. The init takes none of the caller's
+streams, and needs a PID namespace.
+
+[`terminate`] sends `SIGTERM` to every process of such a sandbox, which ends
+once none is left. Its wait then reports an exit code of 0. A process that
+ignores the request keeps it up until a [`kill`]. [`Cage::start_pending`] holds
+the sandbox at the gate, so a network stack attaches before the handle is given
+out, as it does for a pending launch.
+
+The `session-sandbox` example keeps one sandbox for a session and runs each
+line it reads as a further command in it.
 
 ## Signals and the caller
 
@@ -252,3 +332,7 @@ peak below the caller's own is therefore not one the field can show.
 [`Output`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Output.html
 [`pid_namespace(false)`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.CageBuilder.html#method.pid_namespace
 [`LandlockScope::Signal`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/enum.LandlockScope.html#variant.Signal
+[`Running::exec`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Running.html#method.exec
+[`Exec`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Exec.html
+[`Cage::start`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.start
+[`Cage::start_pending`]: https://docs.rs/ferroday-cage/latest/ferroday_cage/struct.Cage.html#method.start_pending

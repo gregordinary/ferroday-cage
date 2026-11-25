@@ -233,6 +233,18 @@ unprivileged process cannot read them, and the command sees `EACCES`. [Reporting
 the filter's refusals](hardening.md#reporting-the-filters-refusals) sets out
 what reports cost and what they require.
 
+## One sandbox for a session
+
+The example runs each command in a sandbox of its own. That keeps what a command
+writes in the project, and nothing it starts. Some runtimes need a process to
+outlive the command that started it, such as a server the next command tests
+against. Such a runtime keeps one sandbox for the session.
+
+It starts the sandbox with no command of its own. Each command then runs in it as a further command,
+confined as a first command is. [Further
+commands](process-model.md#further-commands) sets out what such commands share
+and what each keeps to itself. The `session-sandbox` example runs one.
+
 ## The service
 
 The sandbox's network namespace has a loopback of its own, which reaches nothing

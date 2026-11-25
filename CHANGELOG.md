@@ -123,6 +123,11 @@ consumer upgrading can skip it.
   sandbox that has ended answers `Error::SandboxEnded`, and a restriction's
   handle `ConfigError::ExecIntoRestriction`. Library only: `fcage` runs one
   command per invocation.
+- The `session-sandbox` example keeps one sandbox for a session, started with
+  no command of its own, and runs each line of its standard input in it as a
+  further command. The guide's process model chapter describes further
+  commands and a sandbox with no command of its own, and the agent chapter
+  points a runtime that needs processes to persist between commands at them.
 - A sandbox can start with no command of its own: `Cage::start` sets the
   sandbox up and returns its handle, its init holding it for further commands
   rather than running one, and `Cage::start_pending` holds it at the gate for
