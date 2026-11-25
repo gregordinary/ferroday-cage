@@ -897,6 +897,34 @@ fn install_in_probe() -> i32 {
     if installed { 0 } else { 1 }
 }
 
+/// Whether this process can install a seccomp filter with a listener, found as
+/// [`installable`] is, by installing one in a forked child that does nothing
+/// else and exits.
+///
+/// A process may be under one filter with a listener at most, so the answer is
+/// `false` where a filter this process runs under holds one, and wherever no
+/// filter can be installed at all.
+#[cfg(feature = "hardening")]
+pub(crate) fn listener_installable() -> bool {
+    // SAFETY: `install_listening_in_probe` makes only raw syscalls over static
+    // data, with no allocation, no lock, no libc and no panic, and leaves every
+    // signal blocked, as the fork hands it.
+    let installed = unsafe { sys::probe(install_listening_in_probe) };
+    installed == Ok(Some(0))
+}
+
+/// The probe child of [`listener_installable`], as [`install_in_probe`] is
+/// [`installable`]'s: installs a filter that allows everything, with a
+/// listener.
+#[cfg(feature = "hardening")]
+fn install_listening_in_probe() -> i32 {
+    const ALLOW_ALL: [SockFilter; 1] = [stmt(bpf::RET_K, RET_ALLOW)];
+    let _ = super::child::sweep_fds_keeping(&[]);
+    let installed = rustix::thread::set_no_new_privs(true).is_ok()
+        && install_with(&ALLOW_ALL, FILTER_FLAG_NEW_LISTENER).is_ok();
+    if installed { 0 } else { 1 }
+}
+
 /// A classic-BPF seccomp program, run the way the kernel runs it.
 ///
 /// Three users: the listener of a filter whose refusals are reported, which

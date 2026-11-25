@@ -88,8 +88,10 @@ namespace.
 TOML, a table for each facility. A facility a launch can be refused says whether
 it is `available`, and gives the probe's `reason` where it is not. The report
 also gives the Landlock ABI, this process's cgroup, and the security module's
-confinement. The procfs and range-map answers fork a child that unshares
-namespaces of its own and leaves nothing behind.
+confinement. `seccomp-listener` says whether a launch whose seccomp filter's
+refusals are reported can hold the listener it needs, which a filter this
+process already runs under can hold instead. The procfs and range-map answers
+fork a child that unshares namespaces of its own and leaves nothing behind.
 
 ```toml
 [landlock]

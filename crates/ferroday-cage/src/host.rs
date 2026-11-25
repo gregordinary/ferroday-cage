@@ -201,6 +201,21 @@ pub fn seccomp_available() -> bool {
     crate::mechanism::seccomp::installable()
 }
 
+/// Whether this process can install a seccomp filter with a listener, which a
+/// launch whose filter's refusals are reported needs; see
+/// [`CageBuilder::seccomp_reports`](crate::CageBuilder::seccomp_reports).
+///
+/// `false` wherever [`seccomp_available`] is, and where a filter this process
+/// already runs under holds a listener, as a runtime that intercepts syscalls
+/// installs: a process may be under one such filter at most, and the launch
+/// fails with [`Error::SeccompListenerHeld`](crate::Error::SeccompListenerHeld).
+/// The probe forks as [`seccomp_available`]'s does, and changes nothing in the
+/// calling process.
+#[cfg(feature = "hardening")]
+pub fn seccomp_listener_available() -> bool {
+    crate::mechanism::seccomp::listener_installable()
+}
+
 /// Why a sandbox with a PID namespace of its own cannot mount the fresh procfs
 /// that namespace needs.
 ///

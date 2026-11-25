@@ -1041,6 +1041,10 @@ fn a_caller_already_under_a_listener_cannot_have_reports() {
             .build()
             .expect("a valid sandbox configuration")
     };
+    assert!(
+        ferroday_cage::host::seccomp_listener_available(),
+        "nothing holds a listener on this process yet"
+    );
     // A thread of its own takes a filter with a listener, as a runtime that
     // intercepts syscalls installs one: a filter binds only the thread that
     // installs it, and this one ends with the thread.
@@ -1069,6 +1073,8 @@ fn a_caller_already_under_a_listener_cannot_have_reports() {
             )
         };
         assert!(listener >= 0, "{}", std::io::Error::last_os_error());
+        // The host's probe says so before a launch does.
+        assert!(!ferroday_cage::host::seccomp_listener_available());
         let held = cage(true).spawn();
         assert!(
             matches!(held, Err(Error::SeccompListenerHeld { .. })),

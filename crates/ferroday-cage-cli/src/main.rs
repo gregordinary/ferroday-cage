@@ -6114,12 +6114,23 @@ fn host_report() -> ExitCode {
         i64::from(host::landlock_abi().unwrap_or(0)).into(),
     );
     report.insert("landlock".to_string(), landlock.into());
+    let seccomp = host::seccomp_available();
     report.insert(
         "seccomp".to_string(),
-        facility(
-            (!host::seccomp_available())
-                .then(|| "this process cannot install a seccomp filter".to_string()),
-        ),
+        facility((!seccomp).then(|| "this process cannot install a seccomp filter".to_string())),
+    );
+    // What `--seccomp-reports` needs beyond a filter: a listener of its own.
+    report.insert(
+        "seccomp-listener".to_string(),
+        facility(match (seccomp, host::seccomp_listener_available()) {
+            (_, true) => None,
+            (false, false) => Some("this process cannot install a seccomp filter".to_string()),
+            (true, false) => Some(
+                "a seccomp filter this process runs under holds the one listener a process \
+                 may have"
+                    .to_string(),
+            ),
+        }),
     );
     report.insert(
         "procfs".to_string(),

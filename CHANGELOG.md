@@ -125,6 +125,8 @@ consumer upgrading can skip it.
   `Error::SeccompListenerHeld`. The resolved inputs record
   `seccomp-reports`. `fcage --seccomp-reports` writes each refusal on standard
   error, and `--no-seccomp-reports` overrides a profile.
+  `host::seccomp_listener_available` reports whether a launch can hold the
+  listener, and `fcage --host-report` prints it as `seccomp-listener`.
 - `SeccompRules::relax` leaves the curated roster's entries for a syscall
   out, its argument conditions and errno answers with them, so a command that
   needs what the roster refuses runs with the rest of it in force. A profile's

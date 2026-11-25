@@ -84,6 +84,7 @@ pub fn ferroday_cage::host::own_cgroup() -> core::option::Option<std::path::Path
 pub fn ferroday_cage::host::procfs_blocker() -> core::option::Option<ferroday_cage::host::ProcfsBlocker>
 pub fn ferroday_cage::host::range_map_blocker() -> core::option::Option<ferroday_cage::host::RangeMapBlocker>
 pub fn ferroday_cage::host::seccomp_available() -> bool
+pub fn ferroday_cage::host::seccomp_listener_available() -> bool
 pub fn ferroday_cage::host::userns_blocker() -> core::option::Option<ferroday_cage::host::UsernsBlocker>
 pub mod ferroday_cage::limits
 #[non_exhaustive] pub enum ferroday_cage::limits::Resource
