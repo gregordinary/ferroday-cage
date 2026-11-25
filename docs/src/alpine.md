@@ -282,6 +282,11 @@ verified, exactly as for a fresh download (see [Trust](#trust)). An entry that
 does not read back as the package the plan names is downloaded again rather
 than refused.
 
+An entry that another user could write, by owning it or through its mode, is
+downloaded again rather than read. The layer reads an entry twice, to check it
+and then to lay it down, and a write between the two would go unchecked. A
+download is published writable by its owner alone.
+
 It has to work that way, and the reason is a real difference from the Debian
 pool: an apk index publishes no digest of the whole `.apk` file, so there is no
 content address to name a cache entry by. An entry is named for the package's

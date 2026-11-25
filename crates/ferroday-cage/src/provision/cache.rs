@@ -322,6 +322,57 @@ pub(crate) fn open_entry(path: &Path) -> io::Result<File> {
     Rooted::open(crate::path::parent_of(path))?.reader(name)
 }
 
+/// Opens the cache entry at `path` as [`open_entry`] does, and refuses one
+/// that anyone but the calling user, or root, could rewrite in place.
+///
+/// For an entry read twice through one descriptor: once to verify it, and
+/// once to lay its files down or to hand it on. The descriptor holds the file
+/// against a rename over its name, which is how a download is published, but
+/// not against a write into it. The file's owner, and anyone its mode lets
+/// write it, could change its bytes between the two passes, after the check
+/// and before the read that trusts it. A cache the caller names may be shared,
+/// so an entry there is read only where its owner is the calling user or root
+/// and its mode lets neither its group nor others write it. One refused here
+/// is downloaded again by the cache pass, and published as a file of the run's
+/// own, which [`Staged`] never makes writable by others.
+///
+/// # Errors
+///
+/// What [`open_entry`] answers, and [`io::ErrorKind::PermissionDenied`] for an
+/// entry another user could write.
+pub(crate) fn open_own_entry(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let file = open_entry(path)?;
+    let meta = file.metadata()?;
+    let owner = meta.uid();
+    let own = owner == rustix::process::geteuid().as_raw() || owner == 0;
+    if !own || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} can be written by a user other than this one, so it is not read as a \
+                 cache entry",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// Writes `bytes` to the cache entry at `path` as a run publishes one, at a
+/// mode that lets no other user write it, for a test that seeds a cache:
+/// [`open_own_entry`] refuses an entry written at a mode a group-writable umask
+/// leaves.
+#[cfg(test)]
+pub(crate) fn seed(path: &Path, bytes: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::write(path, bytes).expect("the cache entry is writable");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+        .expect("the cache entry's mode is settable");
+}
+
 /// A cache entry a download fills: where it is published, and the most its body
 /// may hold.
 #[derive(Debug, Clone, Copy)]
@@ -549,7 +600,9 @@ impl<S: Write, W: Watch + ?Sized> Write for Stoppable<'_, S, W> {
 /// start, with the URL it came from and the watch. What it returns is what the
 /// call returns once the entry is published: the descriptor it read through,
 /// typically, so the caller reads on from the bytes that were checked rather
-/// than opening the name again.
+/// than opening the name again. That holds against another download renaming
+/// a file over the name; the staging file is the run's own, made at a mode
+/// that lets nobody else write it, so nothing else writes into it.
 ///
 /// # Errors
 ///
@@ -853,7 +906,7 @@ pub(crate) fn acquire<T, E, W: Watch + ?Sized>(
             return Err(Failure::Cancelled);
         }
         let path = package.entry.path;
-        let cached = open_entry(path)
+        let cached = open_own_entry(path)
             .ok()
             .and_then(|file| check(at, file, &path.display().to_string()).ok());
         if cached.is_none() {
@@ -1361,6 +1414,64 @@ mod tests {
         assert!(matches!(outcome, Err(Failure::Cancelled)));
         assert!(fetcher.asked().is_empty(), "nothing was fetched");
         assert!(ferroday_cage_testkit::scratch::entries(&dir).is_empty());
+    }
+
+    #[test]
+    fn an_entry_read_twice_is_one_no_other_user_could_rewrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = Scratch::new("cache-own-entry");
+        let file = dir.join("entry");
+        fs::write(&file, b"cached").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        open_own_entry(&file).expect("the calling user's own entry opens");
+        // Writable by its group, or by anyone, it could change between the
+        // check and the read that trusts it.
+        for mode in [0o664, 0o646] {
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+            let err = open_own_entry(&file).expect_err("another user could write it");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{mode:o}");
+        }
+        // The plain open, for a file read once, does not ask.
+        open_entry(&file).expect("a regular file opens");
+    }
+
+    /// Set in the child [`a_staged_file_is_writable_by_its_owner_alone`]
+    /// starts, naming the directory it stages a file in: the umask is the
+    /// process's, so the child changes its own.
+    const UMASK_LOOSENED: &str = "FERRODAY_CAGE_TEST_UMASK_LOOSENED";
+
+    #[test]
+    fn a_staged_file_is_writable_by_its_owner_alone() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if let Some(dir) = std::env::var_os(UMASK_LOOSENED) {
+            // A group-writable umask, as a shared directory's users set.
+            rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o002));
+            let dest = Path::new(&dir).join("entry");
+            let (staged, mut file) = Staged::beside(&dest).expect("a staging file is made");
+            file.write_all(b"verified").unwrap();
+            staged.publish().expect("it is published");
+            return;
+        }
+        let dir = Scratch::new("cache-staged-mode");
+        let child = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun(
+                "provision::cache::tests::a_staged_file_is_writable_by_its_owner_alone",
+            )
+            .env(UMASK_LOOSENED, dir.path()),
+            std::time::Duration::from_secs(60),
+        );
+        assert!(
+            child.status.success(),
+            "the child process failed: {}\n{}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        // Neither the group nor others write it, whatever the umask let through.
+        let published = fs::metadata(dir.join("entry")).expect("the child ran the test");
+        assert_eq!(published.mode() & 0o777, 0o644);
     }
 
     #[test]

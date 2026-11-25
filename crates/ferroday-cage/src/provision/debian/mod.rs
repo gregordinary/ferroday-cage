@@ -2648,7 +2648,7 @@ fn extract_packages(
             .next()
             .expect("the deb path has a file name");
         let path = archives_host.join(filename);
-        let mut file = cache::open_entry(&path)
+        let mut file = cache::open_own_entry(&path)
             .map_err(|err| ProvisionError::io("reading the package", &path, err))?;
         // Re-verify against the digest the package was acquired under, rather
         // than trust the bytes on disk: the download and this read are separate
@@ -3581,8 +3581,7 @@ mod tests {
         let two = b"the second package".to_vec();
         let packages = vec![wanted("one", &one), wanted("two", &two)];
         // The first is cached already, the everyday state of a second run.
-        std::fs::write(scratch.join(cache_name(&packages[0].digests)), &one)
-            .expect("the cached package is writable");
+        cache::seed(&scratch.join(cache_name(&packages[0].digests)), &one);
         let repositories = vec![
             Repository::builder("trixie")
                 .mirror("https://mirror.example/debian")
@@ -4751,8 +4750,7 @@ mod tests {
         debs.iter()
             .map(|(name, bytes)| {
                 let sha256 = Algorithm::Sha256.hex_of(bytes);
-                std::fs::write(archives.join(format!("{sha256}.deb")), bytes)
-                    .expect("the package is writable");
+                cache::seed(&archives.join(format!("{sha256}.deb")), bytes);
                 Installable {
                     name: (*name).to_string(),
                     deb_path: format!("{}/{sha256}.deb", bootstrap::ARCHIVES),
@@ -5101,7 +5099,7 @@ mod tests {
                 // Another writer to the shared cache, replacing the entry by
                 // a rename, as anything publishing into a cache does.
                 let planted = cache.join("planted");
-                std::fs::write(&planted, b"not the package").unwrap();
+                cache::seed(&planted, b"not the package");
                 std::fs::rename(&planted, &entry).unwrap();
             }
         };

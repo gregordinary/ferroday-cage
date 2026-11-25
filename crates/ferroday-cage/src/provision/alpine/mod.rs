@@ -2209,7 +2209,7 @@ fn lay_down(
             return Err(ProvisionError::Cancelled);
         }
         let found = &acquired[*at];
-        let (held, mut file) = cache::open_entry(&found.path)
+        let (held, mut file) = cache::open_own_entry(&found.path)
             .map_err(AlpineError::at("reading a package", &found.path))
             .and_then(|file| read_acquired(file, &found.path, &found.planned, architecture))
             .map_err(ProvisionError::from)?;
@@ -3535,7 +3535,7 @@ mod tests {
             .find(|package| package.name == "postmarketos-baselayout")
             .expect("it was asked for");
         let path = scratch.join(planned.file_name());
-        std::fs::write(&path, fixtures::POSTMARKETOS_BASELAYOUT).expect("the package is writable");
+        cache::seed(&path, fixtures::POSTMARKETOS_BASELAYOUT);
         let (held, _) = read_acquired(
             File::open(&path).expect("the package opens"),
             &path,
@@ -3853,7 +3853,7 @@ mod tests {
         for container in [fixtures::ALPINE_BASELAYOUT, fixtures::MUSL] {
             let planned = planned_from(container, "x86_64");
             let path = cache.join(planned.file_name());
-            std::fs::write(&path, container).expect("the package is writable");
+            cache::seed(&path, container);
             acquired.push(acquired_at(&path, &planned));
         }
 
@@ -3927,7 +3927,7 @@ mod tests {
     fn acquired_from(cache: &Path, container: &[u8]) -> Acquired {
         let planned = planned_from(container, "x86_64");
         let path = cache.join(planned.file_name());
-        std::fs::write(&path, container).expect("the package is writable");
+        cache::seed(&path, container);
         acquired_at(&path, &planned)
     }
 
@@ -4007,7 +4007,7 @@ mod tests {
         );
         let planned = planned_from(&container, "x86_64");
         let path = cache.join(planned.file_name());
-        std::fs::write(&path, &container).expect("the package is writable");
+        cache::seed(&path, &container);
         let acquired = [acquired_at(&path, &planned)];
         let (database, subjects) = lay_down(
             &staging,
@@ -4077,10 +4077,10 @@ mod tests {
         std::fs::create_dir_all(&staging).expect("the staging tree is creatable");
         let planned = planned_from(fixtures::MUSL, "x86_64");
         let path = scratch.join(planned.file_name());
-        std::fs::write(&path, fixtures::MUSL).expect("the package is writable");
+        cache::seed(&path, fixtures::MUSL);
         let acquired = [acquired_at(&path, &planned)];
 
-        std::fs::write(&path, fixtures::ALPINE_BASELAYOUT).expect("the entry is replaceable");
+        cache::seed(&path, fixtures::ALPINE_BASELAYOUT);
         let err = lay_down(
             &staging,
             None,
@@ -4234,7 +4234,7 @@ mod tests {
         // repository publishes, and it is still not the one that was asked for.
         let scratch = Scratch::new("alpine-binding");
         let path = scratch.join("musl-1.2.5-r23.apk");
-        std::fs::write(&path, fixtures::MUSL).expect("the package is writable");
+        cache::seed(&path, fixtures::MUSL);
 
         let mut planned = planned_from(fixtures::ALPINE_BASELAYOUT, "x86_64");
         planned.name = "musl".to_string();
@@ -4268,7 +4268,7 @@ mod tests {
     fn a_package_from_an_unpublished_architecture_is_refused() {
         let scratch = Scratch::new("alpine-architecture");
         let path = scratch.join("musl-1.2.5-r23.apk");
-        std::fs::write(&path, fixtures::MUSL).expect("the package is writable");
+        cache::seed(&path, fixtures::MUSL);
         let planned = planned_from(fixtures::MUSL, "aarch64");
         let err = read_acquired(
             File::open(&path).expect("the package opens"),
@@ -4695,11 +4695,10 @@ mod tests {
         std::fs::create_dir_all(&cache).expect("the cache is creatable");
         // One of the two already in the cache, which is the everyday state of a
         // second run, under the name its control identity gives it.
-        std::fs::write(
-            cache.join("musl-1.2.5-r23.1b6c50426d3c0656e9c5a567a5a59601c7f4307a.apk"),
+        cache::seed(
+            &cache.join("musl-1.2.5-r23.1b6c50426d3c0656e9c5a567a5a59601c7f4307a.apk"),
             fixtures::MUSL,
-        )
-        .expect("the cached package is writable");
+        );
 
         #[derive(Default)]
         struct Counting(Vec<(String, usize, usize)>);

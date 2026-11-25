@@ -133,7 +133,7 @@ why = "Publication beside a destination, which `ensure` and the export use too: 
 [[reach]]
 item = "provision::Staged::beside"
 code = 4
-tests = 1
+tests = 2
 cost = "share"
 why = "As above."
 
@@ -520,7 +520,7 @@ why = "As above."
 
 [[reach]]
 item = "scratch::Scratch::new"
-tests = 71
+tests = 73
 cost = "test"
 why = "As above."
 

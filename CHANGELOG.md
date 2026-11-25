@@ -96,6 +96,14 @@ consumer upgrading can skip it.
   `.deb` before dpkg read it, and dpkg then installed theirs and ran its
   scripts into the root. Under a group-writable umask the run's own directory
   was group-writable too.
+- The Alpine and Gentoo layers, and Debian's cache pass, read a cache entry
+  only where no user but the calling one, or root, could write it, and
+  download it again otherwise. Each reads an entry twice through one
+  descriptor, to check it and then to lay it down, and the descriptor held the
+  file against a rename over its name but not against a write into it: in a
+  shared cache, the entry's owner, or a member of its group where its mode let
+  one write, could change the bytes between the two passes. A download is now
+  published at mode 0644, which the umask can only narrow.
 
 ### Added
 

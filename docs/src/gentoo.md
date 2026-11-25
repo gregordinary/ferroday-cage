@@ -852,6 +852,11 @@ megabytes, so a caller provisioning more than one root from the same build wants
 one. Without it the downloads land beside the tree being built and are removed
 with it.
 
+An entry that another user could write, by owning it or through its mode, is
+downloaded again rather than read. The layer reads an entry twice, to check it
+and then to extract or merge it, and a write between the two would go
+unchecked. A download is published writable by its owner alone.
+
 The tarball is kept under its file name, which names the variant and the build.
 Its digest document sits beside it under the same name with `.DIGESTS` added. A
 resolution reads that copy rather than fetching the document again, which is

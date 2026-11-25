@@ -119,9 +119,11 @@ for a tree that goes on to be exported.
 that resolves the same version then reuses the file instead of fetching it
 again. Entries are content-addressed by digest, and every reuse verifies the
 file against that digest. A truncated or altered entry is therefore downloaded
-again rather than trusted, from every mirror the package's repository lists. A
-cache directory is the caller's: it is created if absent and never removed,
-which is what makes it a cache.
+again rather than trusted, from every mirror the package's repository lists. So
+is an entry that another user could write, by owning it or through its mode. A
+download is published writable by its owner alone. A cache directory is the
+caller's: it is created if absent and never removed, which is what makes it a
+cache.
 
 Without one, packages are downloaded into a directory beside the tree being
 built and discarded when the run ends. That holds whether the run succeeded or

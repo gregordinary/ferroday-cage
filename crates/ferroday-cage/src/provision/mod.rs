@@ -1778,6 +1778,13 @@ pub(crate) struct Staged {
 #[cfg(feature = "tarball")]
 const PARTIAL: &str = ".partial";
 
+/// The mode a staging file is created at, which the umask can only narrow: no
+/// user but its owner can write it, so bytes read back from it after a check
+/// are the bytes the check read, whatever the umask or a shared cache's
+/// directory would otherwise allow. A published file keeps it.
+#[cfg(feature = "tarball")]
+const STAGED_MODE: u32 = 0o644;
+
 /// How many staging names [`Staged::beside`] tries before giving up, each one
 /// lost to a [`Staged::sweep`] that took the file in the moment between its
 /// creation and its lock.
@@ -1801,6 +1808,8 @@ impl Staged {
     /// moment before the lock may have taken it, and a name it removed is
     /// given up for a fresh one.
     pub(crate) fn beside(dest: &Path) -> io::Result<(Staged, fs::File)> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         let dir = crate::path::parent_of(dest);
         let name = dest.file_name().unwrap_or(dest.as_os_str());
         for _ in 0..STAGE_ATTEMPTS {
@@ -1812,6 +1821,7 @@ impl Staged {
                 .read(true)
                 .write(true)
                 .create_new(true)
+                .mode(STAGED_MODE)
                 .open(&path)?;
             let held = match try_lock(&file) {
                 Ok(Locked::Held | Locked::Unsupported) => {

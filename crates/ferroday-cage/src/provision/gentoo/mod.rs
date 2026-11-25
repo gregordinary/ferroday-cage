@@ -2051,7 +2051,7 @@ fn cached_or_fetched<T>(
 ) -> Result<T, ProvisionError> {
     // Anything at the name that is not a regular file, a link or a pipe, is not
     // the archive's file either, and the download publishes over it by renaming.
-    if let Ok(file) = cache::open_entry(entry.path) {
+    if let Ok(file) = cache::open_own_entry(entry.path) {
         // Verifying is a long read of a complete file in a cache that outlives
         // the run, so stopping ahead of it costs nothing.
         stop_if_cancelled(to)?;
@@ -4198,7 +4198,7 @@ mod tests {
         let cache = scratch.join("cache");
         std::fs::create_dir_all(&cache).unwrap();
         let planted = cache.join(format!("stage3-amd64-openrc-{BUILD}.tar.xz"));
-        std::fs::write(&planted, b"planted in the cache by something else").unwrap();
+        cache::seed(&planted, b"planted in the cache by something else");
         gentoo.cache_dir = Some(cache);
 
         let mut seen: Vec<&str> = Vec::new();
@@ -4514,7 +4514,7 @@ mod tests {
             .expect("the provisioner installs a plan");
         let entry = cache_entry(&cache, &index::directory(ARCH, BINHOST), &plan.packages[0]);
         std::fs::create_dir_all(entry.parent().expect("a parent")).unwrap();
-        std::fs::write(&entry, b"a container cut short").unwrap();
+        cache::seed(&entry, b"a container cut short");
 
         let root = supplied_root(&scratch, "root");
         gentoo
