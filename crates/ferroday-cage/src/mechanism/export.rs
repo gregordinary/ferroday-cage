@@ -46,6 +46,21 @@
 //! Character and block devices, FIFOs, and sockets are skipped: a deployed OS
 //! image carries none that a runtime does not provide, and the tar reader on
 //! the other end drops them regardless.
+//!
+//! # Replies
+//!
+//! The parent answers some frames on a second pipe, one byte each:
+//! [`REPLY_SEND`] or [`REPLY_SKIP`]. A file's data, and a directory's
+//! contents, cross the stream only where the parent writes them into the
+//! archive. A filtered export is asked of every directory and every file, and
+//! an unfiltered one of every file with more than one link, whose later names
+//! the archive records as hard links rather than as their data. The child
+//! waits for the answer after the entry's metadata. On [`REPLY_SKIP`] a file
+//! frame ends there, without data or a status byte, and a directory frame is
+//! followed by its [`FRAME_LEAVE`] alone. Without this, every name of a file
+//! and every file of an excluded subtree crossed the stream in full and was
+//! discarded, which nothing the archive was written to could bound: a sparse
+//! file of terabytes, linked a thousand times, cost its writer nothing.
 
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
@@ -76,6 +91,21 @@ pub(crate) const FRAME_SYMLINK: u8 = 4;
 pub(crate) const FRAME_END: u8 = 5;
 /// Frame tag: a syscall failed; a step discriminant and errno follow.
 pub(crate) const FRAME_ERROR: u8 = 6;
+
+/// Reply: the parent writes this entry into the archive, so the child streams
+/// its data, or walks its contents.
+pub(crate) const REPLY_SEND: u8 = 1;
+/// Reply: the parent writes nothing of this entry's data or contents, so the
+/// child sends none.
+pub(crate) const REPLY_SKIP: u8 = 0;
+
+/// Whether the child asks the parent before streaming a file's data: always
+/// where the export is `filtered`, and otherwise for a file with more than
+/// `nlink` one. Both ends ask this, so they agree on which frames are
+/// answered.
+pub(crate) fn asks_for_file(filtered: bool, nlink: u64) -> bool {
+    filtered || nlink > 1
+}
 
 wire_enum! {
     /// What the export child was doing when a syscall failed, carried in a
@@ -145,12 +175,19 @@ pub(crate) struct ExportChild {
     child: Forked,
     /// The read end of the frame stream.
     stream: OwnedFd,
+    /// The write end of the replies.
+    replies: OwnedFd,
 }
 
 impl ExportChild {
     /// The frame stream to read to [`FRAME_END`] or [`FRAME_ERROR`].
     pub(crate) fn stream(&self) -> BorrowedFd<'_> {
         self.stream.as_fd()
+    }
+
+    /// Where the parent writes its [replies](self#replies).
+    pub(crate) fn replies(&self) -> BorrowedFd<'_> {
+        self.replies.as_fd()
     }
 
     /// Reaps the child once its stream is drained, reporting only whether the
@@ -166,6 +203,7 @@ impl ExportChild {
     /// reader that ran into the end of it.
     pub(crate) fn finish(self) -> Result<(), Errno> {
         drop(self.stream);
+        drop(self.replies);
         self.child.reap().map(|_| ())
     }
 }
@@ -173,12 +211,20 @@ impl ExportChild {
 /// Forks the export child and establishes its identity map.
 ///
 /// On return the child is walking `rootfs` and streaming frames; the caller
-/// reads [`ExportChild::stream`] to [`FRAME_END`] or [`FRAME_ERROR`], then
-/// calls [`ExportChild::finish`]. A child-side walk failure surfaces in the
-/// stream as [`FRAME_ERROR`], not here; this returns only spawn failures and, for
-/// a delegated map, the delegate's own apply failure.
-pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChild, StartError> {
+/// reads [`ExportChild::stream`] to [`FRAME_END`] or [`FRAME_ERROR`], answering
+/// on [`ExportChild::replies`] what the [replies](self#replies) say it is asked
+/// where the export is `filtered`, then calls [`ExportChild::finish`]. A
+/// child-side walk failure surfaces in the stream as [`FRAME_ERROR`], not here;
+/// this returns only spawn failures and, for a delegated map, the delegate's own
+/// apply failure.
+pub(crate) fn start_export(
+    rootfs: &CStr,
+    map: ChildMap<'_>,
+    filtered: bool,
+) -> Result<ExportChild, StartError> {
     let (stream_read, stream_write) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(StartError::Spawn)?;
+    let (replies_read, replies_write) =
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(StartError::Spawn)?;
 
     // The arenas the child sorts each directory's names in, allocated here
@@ -218,6 +264,7 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
             // permits; everything else the caller had open is closed by the
             // sweep inside `export_child`.
             drop(stream_read);
+            drop(replies_write);
             let gate_child = gate.map(|(caller, child)| {
                 drop(caller);
                 child
@@ -226,10 +273,16 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
                 names: &mut names,
                 order: &mut order,
             };
-            export_child(stream_write.as_fd(), gate_child, rootfs, &map, arena)
+            let ends = Ends {
+                stream: stream_write.as_fd(),
+                replies: replies_read.as_fd(),
+                filtered,
+            };
+            export_child(ends, gate_child, rootfs, &map, arena)
         }
         Ok(PidfdFork::ParentOf(child)) => {
             drop(stream_write);
+            drop(replies_read);
             // The child has its own copy of the arenas; this side's is unused.
             drop((names, order));
             if let (Some((caller, child_end)), ChildMap::Delegated { mapper, map }) = (gate, &map) {
@@ -264,9 +317,17 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
             Ok(ExportChild {
                 child,
                 stream: stream_read,
+                replies: replies_write,
             })
         }
     }
+}
+
+/// The child's ends of its two pipes, and whether the export is filtered.
+struct Ends<'a> {
+    stream: BorrowedFd<'a>,
+    replies: BorrowedFd<'a>,
+    filtered: bool,
 }
 
 /// The child: unshare, establish the map, walk, and stream. Never returns.
@@ -274,12 +335,13 @@ pub(crate) fn start_export(rootfs: &CStr, map: ChildMap<'_>) -> Result<ExportChi
 /// Takes the gate by value so the handshake can close it: past the go byte the
 /// gate has nothing left to say, and the walk that follows is long.
 fn export_child(
-    stream: BorrowedFd<'_>,
+    ends: Ends<'_>,
     gate: Option<OwnedFd>,
     rootfs: &CStr,
     map: &ChildMap<'_>,
     arena: Arena<'_>,
 ) -> ! {
+    let stream = ends.stream;
     let fail = |step: ExportStep, errno: Errno| -> ! {
         emit_error(stream, step, errno);
         sys::exit_group(1)
@@ -287,6 +349,7 @@ fn export_child(
 
     let keep = [
         stream.as_raw_fd(),
+        ends.replies.as_raw_fd(),
         gate.as_ref().map_or(-1 as RawFd, |gate| gate.as_raw_fd()),
     ];
     if let Err(failure) = super::child::enter_mapped_namespace(
@@ -316,7 +379,11 @@ fn export_child(
         Err(errno) => fail(ExportStep::Open, errno),
     };
 
-    let walker = Walker { stream };
+    let walker = Walker {
+        stream,
+        replies: ends.replies,
+        filtered: ends.filtered,
+    };
     match walker.walk_root(root.as_fd(), arena) {
         Ok(()) => {
             emit_tag(stream, FRAME_END);
@@ -363,6 +430,10 @@ struct Arena<'a> {
 /// live in the leaf helpers so they never span a recursive call.
 struct Walker<'a> {
     stream: BorrowedFd<'a>,
+    /// Where the parent's [replies](self#replies) arrive.
+    replies: BorrowedFd<'a>,
+    /// Whether the export is filtered, so every entry is asked of.
+    filtered: bool,
 }
 
 impl Walker<'_> {
@@ -379,7 +450,9 @@ impl Walker<'_> {
     fn walk_root(&self, root: BorrowedFd<'_>, arena: Arena<'_>) -> Result<(), (ExportStep, Errno)> {
         let stat = fs::fstat(root).map_err(|e| (ExportStep::Stat, e))?;
         self.emit_meta(FRAME_DIR, c".", &stat, Some(root))?;
-        self.walk_dir(root, 0, arena)?;
+        if !self.filtered || self.sent()? {
+            self.walk_dir(root, 0, arena)?;
+        }
         emit_tag_checked(self.stream, FRAME_LEAVE)
     }
 
@@ -491,7 +564,9 @@ impl Walker<'_> {
                 // 64 KiB xattr buffers are freed on return, so they never
                 // overlap the recursion's stack.
                 self.emit_meta(FRAME_DIR, name, &stat, Some(child.as_fd()))?;
-                self.walk_dir(child.as_fd(), depth + 1, arena)?;
+                if !self.filtered || self.sent()? {
+                    self.walk_dir(child.as_fd(), depth + 1, arena)?;
+                }
                 emit_tag_checked(self.stream, FRAME_LEAVE)
             }
             FileType::RegularFile => {
@@ -502,6 +577,12 @@ impl Walker<'_> {
                     },
                 )?;
                 self.emit_meta(FRAME_FILE, name, &stat, Some(file.as_fd()))?;
+                // Widened as `emit_meta` widens it; see there.
+                #[allow(clippy::useless_conversion)]
+                let nlink = u64::from(stat.st_nlink);
+                if asks_for_file(self.filtered, nlink) && !self.sent()? {
+                    return Ok(());
+                }
                 self.stream_data(file.as_fd(), stat.st_size as u64)
             }
             FileType::Symlink => self.emit_symlink(dir, name, &stat),
@@ -638,6 +719,21 @@ impl Walker<'_> {
         put_bytes_u16(stream, &target[..len])
     }
 
+    /// Waits for the parent's [reply](self#replies) to the entry just emitted:
+    /// whether it writes the entry's data or contents into the archive.
+    ///
+    /// A parent gone, or a byte that is neither reply, ends the walk as a
+    /// failed stream.
+    fn sent(&self) -> Result<bool, (ExportStep, Errno)> {
+        let mut reply = [0u8; 1];
+        frame::read_full(self.replies, &mut reply).map_err(|e| (ExportStep::Stream, e))?;
+        match reply[0] {
+            REPLY_SEND => Ok(true),
+            REPLY_SKIP => Ok(false),
+            _ => Err((ExportStep::Stream, Errno::PROTO)),
+        }
+    }
+
     /// Streams exactly `size` bytes of a file's data, then the status byte
     /// saying whether the file still held exactly that many.
     ///
@@ -649,7 +745,9 @@ impl Walker<'_> {
     ///
     /// A sparse file's holes read as zeros and are streamed as data. Nothing
     /// here bounds a file's length, so the bound on an archive is its sink's,
-    /// as the `Export` documentation says.
+    /// as the `Export` documentation says: a file's data is streamed only
+    /// where the parent writes it there, which its [reply](self#replies) says
+    /// where it might not.
     fn stream_data(&self, fd: BorrowedFd<'_>, size: u64) -> Result<(), (ExportStep, Errno)> {
         let changed =
             frame::stream_exact(fd, self.stream, size, Holes::Zeros).map_err(|failure| {
@@ -790,6 +888,61 @@ mod tests {
         std::fs::read(dir.join("stream")).expect("the stream file reads")
     }
 
+    /// A file or a directory the parent skips crosses the stream as its
+    /// metadata alone, and one it keeps with its data or its contents.
+    #[test]
+    fn what_the_parent_skips_does_not_cross_the_stream() {
+        let dir = Scratch::new("export-replies");
+        std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
+        std::fs::write(dir.join("tree/file"), b"data").unwrap();
+        std::fs::write(dir.join("tree/sub/inner"), b"inner").unwrap();
+        let tree = fs::open(
+            dir.join("tree"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let visited = |name: &CStr, replies: &[u8]| {
+            let stream = stream_into(&dir);
+            let (read, write) = rustix::pipe::pipe().unwrap();
+            frame::write_full(write.as_fd(), replies).unwrap();
+            let walker = Walker {
+                stream: stream.as_fd(),
+                replies: read.as_fd(),
+                filtered: true,
+            };
+            let (mut names, mut order) = (vec![0u8; 4096], vec![0u32; 16]);
+            let arena = Arena {
+                names: &mut names,
+                order: &mut order,
+            };
+            walker
+                .visit_entry(tree.as_fd(), name, 0, arena)
+                .expect("the entry is visited");
+            written(&dir)
+        };
+        let ends_with = |stream: &[u8], tail: &[u8]| stream.ends_with(tail);
+
+        let sent = visited(c"file", &[REPLY_SEND]);
+        assert!(ends_with(&sent, b"data\0"), "{sent:?}");
+        let skipped = visited(c"file", &[REPLY_SKIP]);
+        assert_eq!(skipped.len(), sent.len() - b"data\0".len());
+        assert_eq!(skipped, sent[..skipped.len()]);
+
+        // A directory kept is walked, its file asked of in turn.
+        let walked = visited(c"sub", &[REPLY_SEND, REPLY_SEND]);
+        assert!(ends_with(
+            &walked,
+            &[b'i', b'n', b'n', b'e', b'r', 0, FRAME_LEAVE]
+        ));
+        // One skipped is its own frame and its leave, with nothing between.
+        let pruned = visited(c"sub", &[REPLY_SKIP]);
+        let (leave, meta) = pruned.split_last().expect("the directory is emitted");
+        assert_eq!(*leave, FRAME_LEAVE);
+        assert_eq!(meta, &walked[..meta.len()]);
+        assert_eq!(walked[meta.len()], FRAME_FILE);
+    }
+
     /// A file streams exactly its declared size whatever it holds, and the
     /// status byte after the data says whether that was all of it.
     #[test]
@@ -808,8 +961,11 @@ mod tests {
                 Mode::empty(),
             )
             .unwrap();
+            let (replies, _) = rustix::pipe::pipe().unwrap();
             Walker {
                 stream: stream.as_fd(),
+                replies: replies.as_fd(),
+                filtered: false,
             }
             .stream_data(file.as_fd(), declared)
             .expect("the data streams");
@@ -837,8 +993,11 @@ mod tests {
         )
         .unwrap();
         let stream = stream_into(&dir);
+        let (replies, _) = rustix::pipe::pipe().unwrap();
         let walker = Walker {
             stream: stream.as_fd(),
+            replies: replies.as_fd(),
+            filtered: false,
         };
 
         let (mut names, mut order) = (vec![0u8; 4096], vec![0u32; 4]);
@@ -923,6 +1082,7 @@ mod tests {
                 uid_line: &uid_line,
                 gid_line: &gid_line,
             },
+            false,
         )
         .unwrap_or_else(|_| panic!("the export child starts"));
 

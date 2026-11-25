@@ -119,7 +119,7 @@ pub(crate) use copyin::{
 #[cfg(feature = "tarball")]
 pub(crate) use export::{
     ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
-    StartError, kill_export, start_export,
+    REPLY_SEND, REPLY_SKIP, StartError, asks_for_file, kill_export, start_export,
 };
 pub(crate) use overlay::{MAX_LOWERS, OverlayProbe, probe_overlay_mount, xattr_unsupported};
 pub(crate) use procfs::{ProcfsProbe, probe_procfs_mount};

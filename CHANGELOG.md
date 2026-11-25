@@ -401,6 +401,13 @@ consumer upgrading can skip it.
   restriction. The documentation of `Resource::Processes` also said a
   restriction's count was the sandbox's processes, where it is every process of
   the calling user's on the host.
+- An export reads no data the archive leaves out. The walk streamed every
+  file in full, under a subtree the filter excluded and under every later name
+  of a file with several links, and the archive's encoder discarded it, so a
+  ceiling on the sink never saw it: a sparse file of terabytes, which costs its
+  writer nothing, linked a few thousand times, kept an export streaming zeros
+  for a day. The encoder now tells the walk to skip such an entry, and the
+  sink's ceiling bounds the export as the documentation says.
 
 ### Internal
 

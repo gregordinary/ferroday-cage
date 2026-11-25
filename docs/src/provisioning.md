@@ -436,7 +436,10 @@ read as. A file can cost the command that wrote it nothing: `truncate -s 16T`
 writes no data and takes no space, yet its member holds sixteen tebibytes. The
 export sets no ceiling of its own, as extraction sets no quota. Where untrusted
 code wrote the tree, bound the sink. `write_to` takes any `Write`, and one that
-refuses past a ceiling fails the export at that point.
+refuses past a ceiling fails the export at that point. What the archive leaves
+out is never read: not a subtree the filter excludes, and not the later names of
+a file with several, which the archive records as hard links. So the sink's
+ceiling bounds the export's reading as well as its writing.
 
 As with removal, a tree built under a `CageBuilder::id_mapper` delegate is
 exported through `Export::id_mapper`. That re-enters the map using the same

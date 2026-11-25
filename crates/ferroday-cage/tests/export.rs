@@ -247,8 +247,9 @@ fn exports_a_single_mapped_tree() {
 #[test]
 fn a_filter_narrows_what_the_archive_holds() {
     // The filter runs on this side of the frame stream, so this is the test
-    // that the exclusion survives the real walk: the child reads and streams
-    // everything, and what reaches the archive is what the predicate kept.
+    // that the exclusion survives the real walk: the child streams what the
+    // encoder tells it the archive keeps, and what reaches the archive is what
+    // the predicate kept.
     if !common::require::userns() {
         return;
     }
@@ -314,6 +315,71 @@ fn a_filter_narrows_what_the_archive_holds() {
             b"./var/",
         ]
         .map(<[u8]>::to_vec)
+    );
+
+    let _ = provision::remove(&dir);
+}
+
+#[test]
+fn what_an_archive_leaves_out_does_not_cross_to_the_encoder() {
+    // A terabyte that costs its writer nothing to make, under a directory the
+    // filter drops, and a gigabyte linked under sixty-four names, whose later
+    // names the archive records as links. Streamed whole and discarded, they
+    // take minutes and no sink's ceiling sees them; the encoder tells the
+    // walk to skip them, so the export takes the gigabyte the archive holds.
+    if !common::require::userns() {
+        return;
+    }
+    let dir = scratch("unsent");
+    let root = dir.join("root");
+    std::fs::create_dir_all(root.join("dropped")).unwrap();
+    std::fs::create_dir_all(root.join("linked")).unwrap();
+    std::fs::File::create(root.join("dropped/vast"))
+        .and_then(|file| file.set_len(1 << 40))
+        .expect("a sparse terabyte is made");
+    std::fs::File::create(root.join("linked/name-00"))
+        .and_then(|file| file.set_len(1 << 30))
+        .expect("a sparse gigabyte is made");
+    for link in 1..64 {
+        std::fs::hard_link(
+            root.join("linked/name-00"),
+            root.join(format!("linked/name-{link:02}")),
+        )
+        .unwrap();
+    }
+
+    /// Counts what the archive holds without keeping it.
+    struct Counted(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl std::io::Write for Counted {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (done, finished) = std::sync::mpsc::channel();
+    let sink = Counted(std::sync::Arc::clone(&written));
+    let exported = root.clone();
+    std::thread::spawn(move || {
+        let dropped = Path::new("/dropped");
+        let outcome = provision::Export::new(&exported)
+            .filter(move |entry| !entry.path().starts_with(dropped))
+            .write_to(sink)
+            .map_err(|error| error.to_string());
+        let _ = done.send(outcome);
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("the export finishes without streaming what it leaves out")
+        .expect("the export succeeds");
+    let written = written.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        ((1 << 30)..(1 << 30) + (1 << 20)).contains(&written),
+        "the archive holds the gigabyte once: {written}"
     );
 
     let _ = provision::remove(&dir);

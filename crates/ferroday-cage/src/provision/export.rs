@@ -17,9 +17,11 @@
 //! archive is encoded — all the heap-bearing work the post-fork child cannot
 //! do. A caller's [`Export::filter`] is consulted here for the same reason:
 //! the child holds no path to offer one and could not call a caller's code
-//! post-fork, so an excluded subtree is walked and dropped on this side. The
-//! encoder is hand-rolled, symmetric with the [reader](super::tar), and adds no
-//! tar dependency.
+//! post-fork. This side answers the child instead, telling it to skip an
+//! excluded subtree and a file whose data the archive does not hold, so
+//! nothing crosses the stream that the archive leaves out. The encoder is
+//! hand-rolled, symmetric with the [reader](super::tar), and adds no tar
+//! dependency.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
@@ -43,7 +45,7 @@ use super::{Delegate, ProvisionError};
 use crate::failure::ErrorChain;
 use crate::mechanism::{
     ExportStep, FRAME_DIR, FRAME_END, FRAME_ERROR, FRAME_FILE, FRAME_LEAVE, FRAME_SYMLINK,
-    StartError, kill_export, start_export,
+    REPLY_SEND, REPLY_SKIP, StartError, asks_for_file, kill_export, start_export,
 };
 use crate::{IdMapper, IdentityMap};
 
@@ -108,7 +110,10 @@ use crate::{IdMapper, IdentityMap};
 /// code wrote can hold a file that cost it nothing to make long: `truncate -s
 /// 16T` writes no data. An export of such a tree bounds its sink, which
 /// [`write_to`](Self::write_to) takes as any `Write`: one that refuses past a
-/// ceiling fails the export there.
+/// ceiling fails the export there. What the archive leaves out is never read:
+/// the walk skips a subtree the filter excludes, and a file's later names,
+/// which the archive records as hard links, so a ceiling on the sink bounds
+/// what the export reads as well as what it writes.
 ///
 /// [`write_to_path`](Self::write_to_path) names a file, which the archive is
 /// staged beside and renamed over, so the destination appears complete or not
@@ -470,7 +475,7 @@ fn export_inner<W: Write>(
         })?;
 
     let overflow = Overflow::of(&Translation::of(&source.child_map()));
-    let child = match start_export(&rootfs_c, source.child_map()) {
+    let child = match start_export(&rootfs_c, source.child_map(), filter.is_some()) {
         Ok(child) => child,
         Err(StartError::Spawn(errno)) => {
             return Err(ProvisionError::io("exporting", rootfs, errno.into()));
@@ -490,6 +495,7 @@ fn export_inner<W: Write>(
 
     let result = drive(
         child.stream(),
+        child.replies(),
         writer,
         rootfs,
         clamp_mtime,
@@ -506,9 +512,12 @@ fn export_inner<W: Write>(
     result
 }
 
-/// Reads the child's frame stream and encodes the archive into `writer`.
+/// Reads the child's frame stream and encodes the archive into `writer`,
+/// answering the child on `replies` where it asks whether an entry's data or
+/// contents go into the archive.
 fn drive<W: Write>(
     stream: BorrowedFd<'_>,
+    replies: BorrowedFd<'_>,
     writer: W,
     rootfs: &Path,
     clamp_mtime: Option<i64>,
@@ -522,9 +531,18 @@ fn drive<W: Write>(
     let dup = rustix::io::fcntl_dupfd_cloexec(stream, 0)
         .map_err(|errno| ProvisionError::io("exporting", rootfs, errno.into()))?;
     let mut reader = BufReader::new(std::fs::File::from(dup));
+    let filtered = filter.is_some();
     let mut tar = TarWriter::new(BufWriter::new(writer), clamp_mtime, filter).overflow(overflow);
 
     let read_err = |e: io::Error| ProvisionError::io("reading the exported tree", rootfs, e);
+    // A reply the child cannot take is a child that is gone, which the stream
+    // reports in its own words where it can.
+    let reply = |send: bool| {
+        let reply = if send { REPLY_SEND } else { REPLY_SKIP };
+        crate::mechanism::frame::write_full(replies, &[reply]).map_err(|errno| {
+            ProvisionError::io("answering the export process", rootfs, errno.into())
+        })
+    };
     let write_err = |e: io::Error| ProvisionError::io("writing the archive", rootfs, e);
     // A failure of an entry's own names the entry, as the tree holds it.
     let failed = |e: EncodeError, tar: &TarWriter<'_, _>, meta: &Meta| match e {
@@ -545,22 +563,39 @@ fn drive<W: Write>(
             FRAME_DIR => {
                 let meta = read_meta(&mut reader, false).map_err(read_err)?;
                 tar.enter_dir(&meta).map_err(|e| failed(e, &tar, &meta))?;
+                if filtered {
+                    reply(!tar.pruning())?;
+                }
             }
             FRAME_FILE => {
                 let meta = read_meta(&mut reader, true).map_err(read_err)?;
-                let written = tar
-                    .file(&meta, &mut reader)
-                    .map_err(|e| failed(e, &tar, &meta))?;
-                // The child's word on whether the file held what it recorded.
-                // It matters only for data that went into the archive: an
-                // excluded file, or a later name of one already written, adds
-                // none of what was read.
-                let changed = read_u8(&mut reader).map_err(read_err)? != 0;
-                if changed && written {
-                    return Err(ProvisionError::SourceChanged {
-                        path: tar.host_path(rootfs, &meta.name),
-                        recorded: meta.size,
-                    });
+                let written = tar.place_file(&meta).map_err(|e| failed(e, &tar, &meta))?;
+                // Asked, the child streams the data only where it goes into the
+                // archive. Unasked, it streams it whatever this side does with
+                // it, which is to write it: nothing excludes an entry from an
+                // unfiltered export, and a file of one link has no other name
+                // to be recorded under.
+                let asked = asks_for_file(filtered, meta.nlink);
+                if asked {
+                    reply(written)?;
+                }
+                if written || !asked {
+                    if written {
+                        tar.file_data(&meta, &mut reader)
+                            .map_err(|e| failed(e, &tar, &meta))?;
+                    } else {
+                        discard(&mut reader, meta.size).map_err(|e| failed(e, &tar, &meta))?;
+                    }
+                    // The child's word on whether the file held what it
+                    // recorded. It matters only for data that went into the
+                    // archive.
+                    let changed = read_u8(&mut reader).map_err(read_err)? != 0;
+                    if changed && written {
+                        return Err(ProvisionError::SourceChanged {
+                            path: tar.host_path(rootfs, &meta.name),
+                            recorded: meta.size,
+                        });
+                    }
                 }
             }
             FRAME_SYMLINK => {
@@ -904,17 +939,20 @@ impl<'f, W: Write> TarWriter<'f, W> {
         }
     }
 
-    /// Emits a file entry: a full regular file the first time its inode is
-    /// seen, a hardlink onto the first path afterward. The `size` bytes of data
-    /// the child streams are copied to the archive for a regular file and
-    /// discarded for a coalesced hardlink, so the stream stays in step either
-    /// way.
+    /// Whether the walk is inside a directory the filter excluded.
+    fn pruning(&self) -> bool {
+        self.pruned > 0
+    }
+
+    /// Places a file entry: a full regular file's header the first time its
+    /// inode is seen, a hardlink onto the first path afterward, and nothing
+    /// for a file the filter excludes.
     ///
-    /// Reports whether the data went into the archive, which is when a change
-    /// to the file while it was read matters.
-    fn file(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<bool, EncodeError> {
+    /// Reports whether the file's data goes into the archive, which
+    /// [`file_data`](Self::file_data) then writes. The child streams it only
+    /// where it does, wherever it is asked.
+    fn place_file(&mut self, meta: &Meta) -> Result<bool, EncodeError> {
         if self.pruned > 0 || !self.keeps(&meta.name, ExportKind::File, meta) {
-            discard(reader, meta.size)?;
             return Ok(false);
         }
         self.check_mapped(meta)?;
@@ -924,16 +962,22 @@ impl<'f, W: Write> TarWriter<'f, W> {
                 let first = first.clone();
                 self.write_entry(&path, b'1', meta, 0, &first, &meta.xattrs)
                     .map_err(EncodeError::Write)?;
-                discard(reader, meta.size)?;
                 return Ok(false);
             }
             self.hardlinks.insert((meta.dev, meta.ino), path.clone());
         }
         self.write_entry(&path, b'0', meta, meta.size, &[], &meta.xattrs)
             .map_err(EncodeError::Write)?;
-        copy_data(reader, &mut self.out, meta.size)?;
-        pad(&mut self.out, meta.size).map_err(EncodeError::Write)?;
         Ok(true)
+    }
+
+    /// Writes the `size` bytes of data of the file [`place_file`] placed, and
+    /// the padding after them.
+    ///
+    /// [`place_file`]: Self::place_file
+    fn file_data(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<(), EncodeError> {
+        copy_data(reader, &mut self.out, meta.size)?;
+        pad(&mut self.out, meta.size).map_err(EncodeError::Write)
     }
 
     /// The host path of a child named `name` in the current directory, for an
@@ -1303,6 +1347,18 @@ fn read_error(reader: &mut impl Read) -> io::Result<(u32, i32)> {
 mod tests {
     use super::super::tar::TarReader;
     use super::*;
+
+    impl<W: Write> TarWriter<'_, W> {
+        /// Places a file and writes its data from `reader` where it goes into
+        /// the archive, as the export does on hearing the child stream it.
+        fn file(&mut self, meta: &Meta, reader: &mut impl Read) -> Result<bool, EncodeError> {
+            let written = self.place_file(meta)?;
+            if written {
+                self.file_data(meta, reader)?;
+            }
+            Ok(written)
+        }
+    }
 
     /// Encodes one entry through a `TarWriter` and parses it back with the
     /// crate's own reader, so the writer is checked against the reader it is
@@ -1828,13 +1884,32 @@ mod tests {
         owned_file_frame(name, (0, 0), &[], data, status)
     }
 
+    /// A file frame of `size` bytes of data as a child streams it on being
+    /// told the file is skipped: its metadata, and neither the data nor the
+    /// status byte.
+    fn skipped(frame: &[u8], size: usize) -> Vec<u8> {
+        frame[..frame.len() - size - 1].to_vec()
+    }
+
     /// [`file_frame`], owned by `owner` and carrying `xattrs`.
     fn owned_file_frame(
+        name: &[u8],
+        owner: (u32, u32),
+        xattrs: &[(&[u8], Vec<u8>)],
+        data: &[u8],
+        status: u8,
+    ) -> Vec<u8> {
+        linked_file_frame(name, owner, xattrs, data, status, 1)
+    }
+
+    /// [`owned_file_frame`], of a file with `nlink` links.
+    fn linked_file_frame(
         name: &[u8],
         (uid, gid): (u32, u32),
         xattrs: &[(&[u8], Vec<u8>)],
         data: &[u8],
         status: u8,
+        nlink: u64,
     ) -> Vec<u8> {
         let mut frame = vec![FRAME_FILE];
         frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -1846,7 +1921,7 @@ mod tests {
         frame.extend_from_slice(&(data.len() as u64).to_le_bytes());
         frame.extend_from_slice(&7u64.to_le_bytes());
         frame.extend_from_slice(&99u64.to_le_bytes());
-        frame.extend_from_slice(&1u64.to_le_bytes());
+        frame.extend_from_slice(&nlink.to_le_bytes());
         frame.extend_from_slice(&(xattrs.len() as u16).to_le_bytes());
         for (name, value) in xattrs {
             frame.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -1874,6 +1949,15 @@ mod tests {
         filter: Option<&EntryPredicate<'_>>,
         overflow: Overflow,
     ) -> Result<(), ProvisionError> {
+        drive_frames_answering(frames, filter, overflow).0
+    }
+
+    /// [`drive_frames_through`], with the replies the encoder gave the child.
+    fn drive_frames_answering(
+        frames: &[u8],
+        filter: Option<&EntryPredicate<'_>>,
+        overflow: Overflow,
+    ) -> (Result<(), ProvisionError>, Vec<u8>) {
         let mut stream = vec![FRAME_DIR];
         stream.extend_from_slice(&1u16.to_le_bytes());
         stream.push(b'.');
@@ -1887,14 +1971,50 @@ mod tests {
         let (read, write) = rustix::pipe::pipe().expect("a pipe is creatable");
         rustix::io::write(&write, &stream).expect("the frames fit the pipe");
         drop(write);
-        drive(
+        // The frames above are already the ones a child streams on hearing the
+        // replies, which are kept to be read back.
+        let (replies_read, replies) = rustix::pipe::pipe().expect("a pipe is creatable");
+        let outcome = drive(
             std::os::fd::AsFd::as_fd(&read),
+            std::os::fd::AsFd::as_fd(&replies),
             io::sink(),
             Path::new("/srv/rootfs"),
             None,
             filter,
             overflow,
-        )
+        );
+        drop(replies);
+        let mut answered = Vec::new();
+        std::fs::File::from(replies_read)
+            .read_to_end(&mut answered)
+            .expect("the replies read back");
+        (outcome, answered)
+    }
+
+    #[test]
+    fn the_child_is_told_to_send_only_data_the_archive_keeps() {
+        // An unfiltered export asks of a file with more than one link alone:
+        // its first name's data goes into the archive, and a later name's is
+        // recorded as a hard link, so the child sends nothing for it.
+        let first = linked_file_frame(b"a", (0, 0), &[], b"abc", 0, 2);
+        let second = skipped(&linked_file_frame(b"b", (0, 0), &[], b"abc", 0, 2), 3);
+        let lone = file_frame(b"c", b"xyz", 0);
+        let frames = [first, second, lone].concat();
+        let (outcome, replies) = drive_frames_answering(&frames, None, Overflow::default());
+        outcome.expect("the export completes");
+        assert_eq!(replies, [REPLY_SEND, REPLY_SKIP]);
+
+        // A filtered one asks of every entry, the root included, and is told
+        // to skip what the filter excludes.
+        let keep = |entry: &ExportEntry<'_>| entry.path() != Path::new("/dropped");
+        let frames = [
+            file_frame(b"kept", b"abc", 0),
+            skipped(&file_frame(b"dropped", b"abc", 0), 3),
+        ]
+        .concat();
+        let (outcome, replies) = drive_frames_answering(&frames, Some(&keep), Overflow::default());
+        outcome.expect("the export completes");
+        assert_eq!(replies, [REPLY_SEND, REPLY_SEND, REPLY_SKIP]);
     }
 
     #[test]
@@ -1967,7 +2087,7 @@ mod tests {
         drive_frames_through(&file((65534, 65534), &[]), None, Overflow::default())
             .expect("an id the map holds exports");
         let keep = |entry: &ExportEntry<'_>| entry.path() != Path::new("/probe");
-        drive_frames_through(&file((65534, 65534), &[]), Some(&keep), single)
+        drive_frames_through(&skipped(&file((65534, 65534), &[]), 1), Some(&keep), single)
             .expect("an excluded entry is not refused");
     }
 
@@ -1987,7 +2107,7 @@ mod tests {
         // An excluded file adds nothing to the archive, so its change does not
         // matter to it.
         let keep = |entry: &ExportEntry<'_>| entry.path() != Path::new("/grew");
-        drive_frames(&file_frame(b"grew", b"abc", 1), Some(&keep))
+        drive_frames(&skipped(&file_frame(b"grew", b"abc", 1), 3), Some(&keep))
             .expect("an excluded file's change is not the archive's");
     }
 
