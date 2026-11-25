@@ -46,6 +46,13 @@ consumer upgrading can skip it.
 
 ### Added
 
+- `fcage --host-report` prints what the host offers a sandbox, as TOML: user
+  namespaces, the Landlock ABI, seccomp, a procfs of the sandbox's own, range
+  maps, this process's cgroup, and a security module's confinement, each a
+  table with `available` and a `reason` where a launch could be refused.
+  `fcage --print-resolved` builds the sandbox or the restriction its flags and
+  profile describe, prints `resolved_inputs` as TOML, and exits without
+  provisioning or starting anything. `host::confinement` is public.
 - `GentooEvent::PhasesNotRun` names each package a Gentoo install merges that
   defines `pkg_setup`, `pkg_preinst` or `pkg_postinst`, which the layer does
   not run, from the package's own `DEFINED_PHASES`. `fcage` prints a line for

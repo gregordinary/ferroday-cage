@@ -74,6 +74,7 @@ impl core::marker::UnsafeUnpin for ferroday_cage::host::UsernsBlocker
 impl core::panic::unwind_safe::RefUnwindSafe for ferroday_cage::host::UsernsBlocker
 impl core::panic::unwind_safe::UnwindSafe for ferroday_cage::host::UsernsBlocker
 pub fn ferroday_cage::host::cgroup_blocker(impl core::convert::AsRef<std::path::Path>, &[ferroday_cage::CgroupLimit]) -> core::option::Option<ferroday_cage::CgroupRefusal>
+pub fn ferroday_cage::host::confinement() -> core::option::Option<ferroday_cage::host::Confinement>
 pub fn ferroday_cage::host::landlock_abi() -> core::option::Option<i32>
 pub fn ferroday_cage::host::landlock_enforces_fs(ferroday_cage::FsAccess) -> bool
 pub fn ferroday_cage::host::landlock_enforces_net(ferroday_cage::NetAccess) -> bool

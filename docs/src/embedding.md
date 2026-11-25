@@ -291,6 +291,9 @@ fn provenance(rootfs: &Path, sources: &Path) -> Result<String, Box<dyn std::erro
 # }
 ```
 
+`fcage --print-resolved` prints the same record as TOML for the sandbox its
+other flags and a profile describe, and starts nothing.
+
 Without the managed mounts, a profile declares its own procfs. Every container
 enters a nested user namespace, which is what locks its mount flags, and that
 namespace's identity map is written through a procfs. A build that declares

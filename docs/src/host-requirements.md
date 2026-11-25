@@ -84,6 +84,25 @@ A host that cannot be unblocked is not entirely without options: with the
 confines a command with Landlock and seccomp alone, which need no user
 namespace.
 
+`fcage --host-report` asks every such probe at once and prints the answers as
+TOML, a table for each facility. A facility a launch can be refused says whether
+it is `available`, and gives the probe's `reason` where it is not. The report
+also gives the Landlock ABI, this process's cgroup, and the security module's
+confinement. The procfs and range-map answers fork a child that unshares
+namespaces of its own and leaves nothing behind.
+
+```toml
+[landlock]
+abi = 6
+
+[procfs]
+available = false
+reason = "..."
+
+[user-namespaces]
+available = true
+```
+
 ## A fresh procfs
 
 A sandbox with a PID namespace of its own, the default, mounts a procfs for

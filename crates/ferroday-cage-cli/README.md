@@ -58,6 +58,10 @@ fcage --remove-overlay-upper ./run-42             # an overlay upper, with its w
 fcage --export-rootfs ./root --export-to root.tar # ownership and xattrs preserved
 ```
 
+`fcage --host-report` prints what the host offers a sandbox, as TOML, and
+`--print-resolved` prints the inputs a launch's flags and profile resolve to,
+without starting it.
+
 ## Confining the command
 
 The default profile is a rootless convenience for code you trust. Untrusted code calls for

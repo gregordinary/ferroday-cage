@@ -180,6 +180,8 @@ enum Mode {
     GentooInstalled,
     /// `--gentoo-keyring-horizon`.
     GentooKeyring,
+    /// `--host-report`.
+    HostReport,
     /// `--help`.
     Help,
     /// `--version`.
@@ -2586,6 +2588,33 @@ const FLAGS: &[Flag] = &[
         take: Take::Refused(Arity::Bare),
         ..Flag::DEFAULTS
     },
+    Flag {
+        long: "--host-report",
+        section: Section::Help,
+        help: &[
+            "Print what this host offers a sandbox, as TOML, and",
+            "exit: user namespaces, Landlock, seccomp, a procfs of",
+            "the sandbox's own, range maps, this process's cgroup,",
+            "and a security module's confinement. Some answers",
+            "fork a child that leaves nothing behind",
+        ],
+        mode: Mode::HostReport,
+        selects: true,
+        take: Take::Refused(Arity::Bare),
+        ..Flag::DEFAULTS
+    },
+    Flag {
+        long: "--print-resolved",
+        section: Section::Help,
+        help: &[
+            "Build the sandbox the flags and the profile describe,",
+            "print the inputs it resolves to as TOML, and exit",
+            "without provisioning the root or starting the command",
+        ],
+        restriction: true,
+        take: Take::Bare(|options| options.print_resolved = true),
+        ..Flag::DEFAULTS
+    },
 ];
 
 /// What `--help` prints above the option sections.
@@ -2697,6 +2726,8 @@ enum Invocation {
     /// Print what each Gentoo release certificate the vendored keyring trusts
     /// can still be trusted to do, and until when.
     GentooKeyring,
+    /// Print what this host offers a sandbox.
+    HostReport,
     /// Write a provisioned rootfs to a tar archive, under the identity map it
     /// was written under.
     Export {
@@ -2837,6 +2868,9 @@ struct Options {
     seccomp_errno: Vec<(i64, u16)>,
     caps: Option<CapsChoice>,
     restrict: bool,
+    /// `--print-resolved`: print what the build resolves to rather than
+    /// launching.
+    print_resolved: bool,
     netstack: bool,
     netstack_cidr: Option<(Ipv4Addr, u8)>,
     netstack_cidr6: Option<(Ipv6Addr, u8)>,
@@ -3239,6 +3273,7 @@ fn main() -> ExitCode {
         }) => gentoo_packages(&architecture, &binhost, mirror.as_deref(), &fallbacks),
         Ok(Invocation::GentooInstalled { root }) => gentoo_installed(&root),
         Ok(Invocation::GentooKeyring) => gentoo_keyring_horizon(),
+        Ok(Invocation::HostReport) => host_report(),
         Ok(Invocation::Export {
             source,
             dest,
@@ -3263,6 +3298,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         Some(Mode::GentooPackages) => return parse_gentoo_packages(args),
         Some(Mode::GentooInstalled) => return parse_gentoo_installed(args),
         Some(Mode::GentooKeyring) => return parse_gentoo_keyring(args),
+        Some(Mode::HostReport) => return parse_host_report(args),
         Some(Mode::Remove) => return parse_removal(args),
         Some(Mode::Export) => return parse_export(args),
         _ => {}
@@ -3375,6 +3411,7 @@ fn parse(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
         seccomp_errno: Vec::new(),
         caps: None,
         restrict: false,
+        print_resolved: false,
         netstack: false,
         netstack_cidr: None,
         netstack_cidr6: None,
@@ -3973,6 +4010,21 @@ fn parse_gentoo_keyring(args: Vec<OsString>) -> Result<Invocation, String> {
         }
     }
     Ok(Invocation::GentooKeyring)
+}
+
+/// Parses a `--host-report` command line, excluding the program name.
+///
+/// The report asks the host and nothing else, so it takes no settings.
+fn parse_host_report(args: Vec<OsString>) -> Result<Invocation, String> {
+    if let Some(answer) = help_or_version(&args) {
+        return Ok(answer);
+    }
+    for arg in args {
+        if arg != "--host-report" {
+            return Err(mode_conflict(&arg, "--host-report", &["--host-report"]));
+        }
+    }
+    Ok(Invocation::HostReport)
 }
 
 /// Parses a `--gentoo-packages` command line, excluding the program name.
@@ -5487,10 +5539,14 @@ fn run(options: Options) -> ExitCode {
         };
     }
 
+    let print_resolved = options.print_resolved;
     let launch = match Launch::prepare(options) {
         Ok(launch) => launch,
         Err(code) => return code,
     };
+    if print_resolved {
+        return print_resolved_inputs(launch.builder);
+    }
     if let Some(provisioner) = provisioner.as_mut() {
         let rootfs = rootfs.as_deref().expect("checked at parse time");
         if let Err(code) = provision(rootfs, provisioner) {
@@ -5840,6 +5896,91 @@ impl Launcher for RestrictionBuilder {
     fn resolved_inputs(built: &Restriction) -> ResolvedInputs {
         built.resolved_inputs()
     }
+}
+
+/// Builds a launch and prints the inputs it resolves to, as TOML, without
+/// starting it: `--print-resolved`.
+fn print_resolved_inputs<B: Launcher>(builder: B) -> ExitCode {
+    let built = match builder.build() {
+        Ok(built) => built,
+        Err(error) => return fail(error),
+    };
+    let text = match toml::to_string(&B::resolved_inputs(&built)) {
+        Ok(text) => text,
+        Err(err) => return fail(format!("cannot render the resolved inputs: {err}")),
+    };
+    output::print_stdout("the resolved inputs", |out| out.write_all(text.as_bytes()))
+}
+
+/// Prints what this host offers a sandbox, as TOML: `--host-report`.
+///
+/// Each facility is a table of its own, so a reader asks for the one it needs
+/// and a facility added later adds a table. A facility a launch can be refused
+/// carries `available`, and a `reason` where it is not; the reason is the
+/// library's own description of the blocker.
+fn host_report() -> ExitCode {
+    use ferroday_cage::host;
+    let facility = |reason: Option<String>| {
+        let mut table = toml::Table::new();
+        table.insert("available".to_string(), reason.is_none().into());
+        if let Some(reason) = reason {
+            table.insert("reason".to_string(), reason.into());
+        }
+        toml::Value::Table(table)
+    };
+    let mut report = toml::Table::new();
+    report.insert(
+        "user-namespaces".to_string(),
+        facility(host::userns_blocker().map(|blocker| blocker.to_string())),
+    );
+    let mut landlock = toml::Table::new();
+    landlock.insert(
+        "abi".to_string(),
+        i64::from(host::landlock_abi().unwrap_or(0)).into(),
+    );
+    report.insert("landlock".to_string(), landlock.into());
+    report.insert(
+        "seccomp".to_string(),
+        facility(
+            (!host::seccomp_available())
+                .then(|| "this process cannot install a seccomp filter".to_string()),
+        ),
+    );
+    report.insert(
+        "procfs".to_string(),
+        facility(host::procfs_blocker().map(|blocker| blocker.to_string())),
+    );
+    report.insert(
+        "range-map".to_string(),
+        facility(host::range_map_blocker().map(|blocker| blocker.to_string())),
+    );
+    let mut cgroup = toml::Table::new();
+    if let Some(own) = host::own_cgroup() {
+        cgroup.insert("own".to_string(), own.display().to_string().into());
+    }
+    report.insert("cgroup".to_string(), cgroup.into());
+    let mut confinement = toml::Table::new();
+    match host::confinement() {
+        None => {
+            confinement.insert("confined".to_string(), false.into());
+        }
+        Some(host::Confinement::AppArmor { profile, mode, .. }) => {
+            confinement.insert("confined".to_string(), true.into());
+            confinement.insert("module".to_string(), "apparmor".into());
+            confinement.insert("profile".to_string(), profile.into());
+            confinement.insert("mode".to_string(), mode.into());
+        }
+        Some(other) => {
+            confinement.insert("confined".to_string(), true.into());
+            confinement.insert("description".to_string(), other.to_string().into());
+        }
+    }
+    report.insert("confinement".to_string(), confinement.into());
+    let text = match toml::to_string(&report) {
+        Ok(text) => text,
+        Err(err) => return fail(format!("cannot render the host report: {err}")),
+    };
+    output::print_stdout("the host report", |out| out.write_all(text.as_bytes()))
 }
 
 /// Builds a launch, says on standard error what the build leaves unapplied,
@@ -6335,6 +6476,9 @@ fn run_restricted(mut options: Options) -> ExitCode {
         Ok(builder) => builder,
         Err(message) => return usage_error(format_args!("{message}")),
     };
+    if options.print_resolved {
+        return print_resolved_inputs(builder);
+    }
 
     if options.terminal {
         // The restriction's terminal comes from the host's own /dev/ptmx, the
@@ -8148,6 +8292,30 @@ mod tests {
         assert!(error.contains("--rootfs"), "{error}");
         let error = parse_error(&["--gentoo-keyring-horizon", "--gentoo-mirror", "http://x"]);
         assert!(error.contains("--gentoo-mirror"), "{error}");
+    }
+
+    #[test]
+    fn the_host_report_takes_nothing_and_print_resolved_rides_a_launch() {
+        assert!(matches!(
+            parse_args(&["--host-report"]).expect("the report parses"),
+            Invocation::HostReport,
+        ));
+        // A launch flag alongside the report is a usage error rather than a
+        // setting with no effect.
+        let error = parse_error(&["--host-report", "--rootfs", "/roots/a"]);
+        assert!(error.contains("--rootfs"), "{error}");
+
+        // --print-resolved is a launch's, plain or restricted.
+        let options = run_options(&["--print-resolved", "--host-rootfs", "/bin/true"]);
+        assert!(options.print_resolved);
+        let options = run_options(&[
+            "--restrict",
+            "--landlock-ro",
+            "/usr",
+            "--print-resolved",
+            "/bin/true",
+        ]);
+        assert!(options.print_resolved && options.restrict);
     }
 
     #[test]
@@ -10930,7 +11098,7 @@ mod tests {
         // flag, given with a value it accepts, changes the restriction the
         // launch builds from the one it builds without it. A flag that states
         // the default changes nothing alone, so it is held to overriding its
-        // `--no-` form instead. The three the launch applies around the
+        // `--no-` form instead. The four the launch applies around the
         // restriction stay in the options for it.
         let built = |flags: &[&str]| {
             let mut args = vec!["--restrict", "--landlock-ro", "/usr"];
@@ -10949,6 +11117,7 @@ mod tests {
             let (with, options) = built(&given(flag));
             let seen = match flag.long {
                 "--terminal" => options.terminal,
+                "--print-resolved" => options.print_resolved,
                 "--timeout" => options.timeout.is_some(),
                 "--kill-after" => options.kill_after == Duration::from_secs(1),
                 _ if with != without => true,

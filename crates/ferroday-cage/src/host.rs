@@ -380,7 +380,7 @@ impl fmt::Display for Confinement {
 /// nothing, confines this process, and below Linux 5.8, which has no such
 /// file. A launch's setup stage runs under the profile this process does, since
 /// nothing between the fork and a mount executes a program.
-pub(crate) fn confinement() -> Option<Confinement> {
+pub fn confinement() -> Option<Confinement> {
     let label = std::fs::read_to_string("/proc/self/attr/apparmor/current").ok()?;
     Confinement::of_apparmor_label(&label)
 }
