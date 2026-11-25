@@ -54,14 +54,9 @@ impl ChangeSet {
     pub fn fork(&self, to: impl AsRef<Path>) -> Result<Overlay, ProvisionError> {
         let to = to.as_ref();
         let made = |errno: Errno| ProvisionError::io("forking into", to, errno.into());
-        let (parent, name) = split(to).map_err(made)?;
-        let parent = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
+        let (_, name) = split(to).map_err(made)?;
         let parent_fd = fs::open(
-            parent,
+            crate::path::parent_of(to),
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
