@@ -793,6 +793,9 @@ consumer upgrading can skip it.
   every thread the library starts: the thread that answers a launch's reported
   seccomp refusals and an `Interrupt`'s were missing, and the embedding chapter
   said a launch starts none.
+- A process the library forks, which by the post-fork discipline never
+  panics, ends with exit code 127 should a panic unwind in it, rather than
+  unwind out of the fork and run the caller's code in the copy.
 - A kill through a `Running` or a `KillHandle` that finds the supervisor
   already exited records nothing, so a supervisor that ended some other way,
   as by the kernel's out-of-memory killer, reads as `Error::SupervisorLost`.

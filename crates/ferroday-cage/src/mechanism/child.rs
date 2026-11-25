@@ -49,6 +49,11 @@
 //! - call into libc or the thread runtime, whose state is stale in the
 //!   copy.
 //!
+//! The launch stage runs inside [`sys::in_child`], and every stage forked from
+//! it carries that in the stack the fork copied, so a panic that broke the
+//! rule would end the process with `exit_group(127)` rather than unwind into
+//! the caller's code.
+//!
 //! Every operation below is a raw syscall, through rustix or [`sys`], over
 //! data frozen by the caller before the fork. The exception is a dropped
 //! [`OwnedFd`], which the standard library closes through libc's `close`, an
@@ -4196,7 +4201,7 @@ mod tests {
         // SAFETY: the child makes raw syscalls only, through rustix, and ends
         // in `exit_group`.
         match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
-            sys::PidfdFork::Child => {
+            sys::PidfdFork::Child => sys::in_child(|| {
                 // SAFETY: the numbers are this child's own copies of the
                 // standard streams, which nothing in it holds or uses again.
                 unsafe {
@@ -4225,7 +4230,7 @@ mod tests {
                     Ok(fd) if fd.as_raw_fd() > STDERR_FILENO => sys::exit_group(0),
                     _ => sys::exit_group(3),
                 }
-            }
+            }),
             sys::PidfdFork::ParentOf(child) => {
                 assert_eq!(
                     child.reap(),
@@ -4258,7 +4263,7 @@ mod tests {
         // SAFETY: the child makes raw syscalls only, through rustix, `sys` and
         // the shared map sequence, and ends in `exit_group`.
         let child = match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
-            sys::PidfdFork::Child => {
+            sys::PidfdFork::Child => sys::in_child(|| {
                 let keep = [ready_end.as_raw_fd(), hold_end.as_raw_fd()];
                 if enter_mapped_namespace(&keep, UnshareFlags::empty(), duty(), None).is_err() {
                     sys::exit_group(1)
@@ -4273,7 +4278,7 @@ mod tests {
                 let mut byte = [0u8; 1];
                 let _ = rustix::io::read(&hold_end, &mut byte);
                 sys::exit_group(0)
-            }
+            }),
             sys::PidfdFork::ParentOf(child) => child,
         };
         drop((ready_end, hold_end));
@@ -4303,7 +4308,7 @@ mod tests {
         // waits for it.
         // SAFETY: as above.
         match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
-            sys::PidfdFork::Child => {
+            sys::PidfdFork::Child => sys::in_child(|| {
                 if withhold_image().is_err() {
                     sys::exit_group(2)
                 }
@@ -4313,7 +4318,7 @@ mod tests {
                     }
                     _ => sys::exit_group(1),
                 }
-            }
+            }),
             sys::PidfdFork::ParentOf(child) => assert_eq!(
                 child.reap(),
                 Ok(Some(0)),
@@ -4333,7 +4338,7 @@ mod tests {
         // SAFETY: the child makes raw syscalls only, through rustix, and ends
         // in `exit_group`.
         match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
-            sys::PidfdFork::Child => {
+            sys::PidfdFork::Child => sys::in_child(|| {
                 let mut entry = SandboxEntry::new(target, namespaces);
                 match entry.open() {
                     Ok(()) => {}
@@ -4349,7 +4354,7 @@ mod tests {
                 } else {
                     3
                 })
-            }
+            }),
             sys::PidfdFork::ParentOf(joiner) => joiner.reap().expect("the joiner is reaped"),
         }
     }
@@ -4364,7 +4369,7 @@ mod tests {
         // SAFETY: the holder makes raw syscalls only, through rustix and the
         // shared map sequence, and ends in `exit_group`.
         let holder = match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
-            sys::PidfdFork::Child => {
+            sys::PidfdFork::Child => sys::in_child(|| {
                 let duty = MapDuty::Write {
                     paths: MapPaths::SELF,
                     uid_line: &uid_line,
@@ -4380,7 +4385,7 @@ mod tests {
                 let mut byte = [0u8; 1];
                 let _ = rustix::io::read(&hold_end, &mut byte);
                 sys::exit_group(0)
-            }
+            }),
             sys::PidfdFork::ParentOf(holder) => holder,
         };
         drop((ready_end, hold_end));

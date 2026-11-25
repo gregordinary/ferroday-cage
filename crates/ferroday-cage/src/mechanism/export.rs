@@ -256,7 +256,7 @@ pub(crate) fn start_export(
     // locking, no panic — and never returns: every path ends in `exit_group`.
     match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(StartError::Spawn(errno)),
-        Ok(PidfdFork::Child) => {
+        Ok(PidfdFork::Child) => sys::in_child(|| {
             // The fork duplicated the caller's ends into this process; close
             // what this child does not use, so it pins nothing of the caller's.
             // The read end of its own frame pipe matters most: holding it would
@@ -282,7 +282,7 @@ pub(crate) fn start_export(
                 filtered,
             };
             export_child(ends, gate_child, rootfs, &map, arena)
-        }
+        }),
         Ok(PidfdFork::ParentOf(child)) => {
             drop(stream_write);
             drop(replies_read);

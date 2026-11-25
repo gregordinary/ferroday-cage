@@ -198,7 +198,7 @@ mod tests {
         // SAFETY: the child runs `child`, which makes system calls and drops a
         // descriptor, and nothing else, then exits without returning here.
         match unsafe { sys::fork_with_pidfd() }.expect("the peer forks") {
-            PidfdFork::Child => sys::exit_group(child()),
+            PidfdFork::Child => sys::in_child(|| sys::exit_group(child())),
             PidfdFork::ParentOf(forked) => forked,
         }
     }
@@ -303,7 +303,7 @@ mod tests {
         let connector = || -> i32 { i32::from(rustix::net::connect(&socket, address).is_err()) };
         // SAFETY: the child connects and exits, making system calls only.
         let forked = match unsafe { sys::fork_with_pidfd() }.expect("the peer forks") {
-            PidfdFork::Child => sys::exit_group(connector()),
+            PidfdFork::Child => sys::in_child(|| sys::exit_group(connector())),
             PidfdFork::ParentOf(forked) => forked,
         };
         assert!(

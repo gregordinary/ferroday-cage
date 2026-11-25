@@ -392,7 +392,7 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
     // locking, no panic — and never returns: every path ends in `exit_group`.
     match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(spawn_failure(errno)),
-        Ok(PidfdFork::Child) => {
+        Ok(PidfdFork::Child) => sys::in_child(|| {
             // The fork duplicated the caller's ends into this process. Closing
             // the write end of its own frame pipe is what lets the child see
             // end of input when the parent is done; holding it would make the
@@ -402,7 +402,7 @@ pub(crate) fn start_copy_in(rootfs: &CStr, map: ChildMap<'_>) -> Result<CopyChil
             drop(stream_write);
             drop(gate_caller);
             copy_child(stream_read.as_fd(), gate_child.as_fd(), rootfs, &map)
-        }
+        }),
         Ok(PidfdFork::ParentOf(child)) => {
             drop(stream_read);
             drop(gate_child);

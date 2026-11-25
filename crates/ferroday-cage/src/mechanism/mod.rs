@@ -2010,7 +2010,7 @@ fn fork_launch(
     // libc — and never returns: every path ends in `execve` or `exit_group`.
     match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(spawn_error(errno)),
-        Ok(PidfdFork::Child) => {
+        Ok(PidfdFork::Child) => sys::in_child(|| {
             let context = child::Context {
                 plan,
                 argv: &argv,
@@ -2041,7 +2041,7 @@ fn fork_launch(
                 join,
             };
             child::stage_a(&context)
-        }
+        }),
         Ok(PidfdFork::ParentOf(mut stage_a)) => {
             // The pidfd the fork opened, kept off a standard number where a
             // number above them is free; see `above_stdio`.

@@ -157,7 +157,9 @@ pub(crate) unsafe fn in_network_namespace(
     // `exit_group` on every path.
     match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(HelperFailure::Spawn(errno)),
-        Ok(PidfdFork::Child) => helper(namespaces, helper_end.as_fd(), steps, work),
+        Ok(PidfdFork::Child) => {
+            sys::in_child(|| helper(namespaces, helper_end.as_fd(), steps, work))
+        }
         Ok(PidfdFork::ParentOf(child)) => {
             // This process's copy of the helper's end closes first, so the
             // helper's exit hangs the socket up for the receive below.
@@ -379,7 +381,7 @@ mod tests {
         // SAFETY: the child makes one raw syscall, `exit_group`, and never
         // returns.
         let child = match unsafe { sys::fork_with_pidfd() }.expect("the fork succeeds") {
-            PidfdFork::Child => sys::exit_group(0),
+            PidfdFork::Child => sys::in_child(|| sys::exit_group(0)),
             PidfdFork::ParentOf(child) => child,
         };
         super::super::await_exit(child.pidfd()).expect("the child exits");

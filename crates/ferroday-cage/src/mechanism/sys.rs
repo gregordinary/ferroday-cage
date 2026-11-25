@@ -121,6 +121,37 @@ pub(crate) unsafe fn fork_with_pidfd() -> Result<PidfdFork, Errno> {
     })
 }
 
+/// Runs `child`, the whole of a forked child process's path, and ends the
+/// process with `exit_group(127)` should that path unwind, or return, instead.
+///
+/// Every child process the crate forks ends in `execve` or `exit_group`, and
+/// none returns. A panic there, which the post-fork discipline rules out,
+/// would unwind out of the fork's frame and on into the caller's code, run by a
+/// copy holding only the forking thread and the locks of threads that do not
+/// exist in it. The guard this holds ends the copy as the unwinding reaches
+/// it, and a stage forked from a process already inside one carries it too, in
+/// the stack the fork copied.
+///
+/// It cannot keep the panic hook from running first, which allocates. A build
+/// with `panic = "abort"` does not unwind: the abort ends the copy, and on musl
+/// it first sends `SIGABRT` to the thread id musl cached, which in a copy is
+/// the caller's forking thread, so the caller ends too.
+pub(crate) fn in_child(child: impl FnOnce()) -> ! {
+    let _unwound = ExitOnUnwind;
+    child();
+    exit_group(127)
+}
+
+/// Ends the process when it is dropped, which past a fork only unwinding does;
+/// see [`in_child`].
+struct ExitOnUnwind;
+
+impl Drop for ExitOnUnwind {
+    fn drop(&mut self) {
+        exit_group(127)
+    }
+}
+
 /// Runs `child` in a forked child process that exits with the code it returns,
 /// and answers that code once the child is reaped: `None` where a signal ended
 /// it.
@@ -141,7 +172,7 @@ pub(crate) unsafe fn probe(child: impl FnOnce() -> i32) -> Result<Option<i32>, E
     // vouches for, and ends in `exit_group` with its answer, so it never
     // returns into the caller's code.
     match unsafe { fork_with_pidfd() }? {
-        PidfdFork::Child => exit_group(child()),
+        PidfdFork::Child => in_child(|| exit_group(child())),
         PidfdFork::ParentOf(forked) => forked.reap(),
     }
 }
@@ -757,7 +788,7 @@ mod tests {
             // SAFETY: the child makes only raw system calls, and every path in
             // it ends in `exit_group` or in the signal it raises.
             match unsafe { fork() }.expect("the fork succeeds") {
-                Fork::Child => {
+                Fork::Child => in_child(|| {
                     // The opposite first, so the case does not pass on what
                     // the child happened to inherit.
                     let opposite = match disposition {
@@ -771,7 +802,7 @@ mod tests {
                     let raised = unsafe { sigprocmask(How::SetMask, Some(&SigSet::empty())) }
                         .and_then(|_| unsafe { tkill(rustix::thread::gettid(), Signal::USR2) });
                     exit_group(if set.is_ok() && raised.is_ok() { 0 } else { 1 })
-                }
+                }),
                 Fork::ParentOf(child) => {
                     let status = rustix::process::waitpid(
                         Some(child),
@@ -807,7 +838,7 @@ mod tests {
             // SAFETY: the child process reads its mask and calls `exit_group`,
             // raw system calls both.
             match unsafe { fork() }.expect("the fork succeeds") {
-                Fork::Child => {
+                Fork::Child => in_child(|| {
                     // SAFETY: reading the mask changes nothing.
                     let blocked = unsafe { sigprocmask(How::Block, None) };
                     let every = blocked.is_ok_and(|mask| {
@@ -825,7 +856,7 @@ mod tests {
                         .all(|signal| mask.contains(signal))
                     });
                     exit_group(if every { 0 } else { 1 })
-                }
+                }),
                 Fork::ParentOf(child) => {
                     let status = rustix::process::waitpid(
                         Some(child),
@@ -880,9 +911,11 @@ mod tests {
         let before = children_usage().expect("the usage is read");
         // SAFETY: the child spins, calling nothing, until it is killed.
         let child = match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
-            PidfdFork::Child => loop {
-                std::hint::spin_loop();
-            },
+            PidfdFork::Child => in_child(|| {
+                loop {
+                    std::hint::spin_loop();
+                }
+            }),
             PidfdFork::ParentOf(child) => child,
         };
         // The work is measured in processor time, not wall time: a preempted
@@ -922,7 +955,7 @@ mod tests {
     fn a_forks_pidfd_names_the_child_after_another_wait_collects_it() {
         // SAFETY: the child calls only `exit_group`.
         match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
-            PidfdFork::Child => exit_group(42),
+            PidfdFork::Child => in_child(|| exit_group(42)),
             PidfdFork::ParentOf(forked) => {
                 // A wait elsewhere in the caller collects the child first, by
                 // pid, as an application-wide reaper would.
@@ -943,13 +976,13 @@ mod tests {
                 // SAFETY: the bystander only sleeps, through one raw syscall,
                 // and exits.
                 let bystander = match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
-                    PidfdFork::Child => {
+                    PidfdFork::Child => in_child(|| {
                         let _ = rustix::thread::nanosleep(&rustix::thread::Timespec {
                             tv_sec: 5,
                             tv_nsec: 0,
                         });
                         exit_group(0)
-                    }
+                    }),
                     PidfdFork::ParentOf(bystander) => bystander,
                 };
                 forked.kill();
@@ -997,11 +1030,51 @@ mod tests {
         .expect("the descriptor thread ran");
     }
 
+    /// Set in the process [`a_forked_child_that_unwinds_exits_with_127`] starts.
+    const UNWIND: &str = "FERRODAY_CAGE_TEST_SYS_UNWIND";
+
+    #[test]
+    fn a_forked_child_that_unwinds_exits_with_127() {
+        // In a process of its own, on one thread: the panic hook the child
+        // runs allocates, and must find no lock that another thread of the
+        // harness held at the fork.
+        let output = ferroday_cage_testkit::process::run_bounded(
+            ferroday_cage_testkit::process::rerun("mechanism::sys::tests::probe_unwinding_child")
+                .env(UNWIND, "1"),
+            std::time::Duration::from_secs(60),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("the child exited with Ok(Some(127))"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// The probe [`a_forked_child_that_unwinds_exits_with_127`] starts: forks
+    /// a child whose path panics, and says how it ended. Without the guard the
+    /// child would return into this test, and the harness in the child would
+    /// report it and run on.
+    #[test]
+    fn probe_unwinding_child() {
+        if std::env::var_os(UNWIND).is_none() {
+            return;
+        }
+        // SAFETY: the child's path panics on purpose, in a process of this
+        // probe's own, and `in_child` ends it.
+        match unsafe { fork_with_pidfd() }.expect("the fork succeeds") {
+            PidfdFork::Child => in_child(|| panic!("a forked child's path panics")),
+            PidfdFork::ParentOf(child) => {
+                println!("the child exited with {:?}", child.reap());
+            }
+        }
+    }
+
     #[test]
     fn a_forked_child_exits_with_the_code_it_was_given() {
         // SAFETY: the child calls only `exit_group`.
         match unsafe { fork() }.expect("the fork succeeds") {
-            Fork::Child => exit_group(42),
+            Fork::Child => in_child(|| exit_group(42)),
             Fork::ParentOf(child) => {
                 let status =
                     rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty())

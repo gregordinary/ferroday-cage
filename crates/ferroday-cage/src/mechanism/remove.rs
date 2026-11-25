@@ -131,14 +131,14 @@ pub(crate) fn remove_tree_mapped(
     // ends in `exit_group`.
     match unsafe { sys::fork_with_pidfd() } {
         Err(errno) => Err(spawn_failure(errno)),
-        Ok(PidfdFork::Child) => {
+        Ok(PidfdFork::Child) => sys::in_child(|| {
             // The fork duplicated the caller's end of the gate into this
             // process; close it, so this child pins nothing it does not use.
             // Closing an owned descriptor is a bare `close`, which the
             // post-fork discipline permits.
             drop(caller);
             removal_child(child_end.as_fd(), parent, leaf, map.duty())
-        }
+        }),
         Ok(PidfdFork::ParentOf(child)) => {
             drop(child_end);
             // `drive_removal` owns the gate, so returning closes the caller's
@@ -451,7 +451,7 @@ mod tests {
             // then exits — no allocation, no locking, no panic — and never
             // returns.
             match unsafe { sys::fork_with_pidfd() } {
-                Ok(PidfdFork::Child) => {
+                Ok(PidfdFork::Child) => sys::in_child(|| {
                     // Outlast the caller's abandonment; the test collects this
                     // process rather than waiting the sleep out.
                     let _ = rustix::thread::nanosleep(&rustix::thread::Timespec {
@@ -459,7 +459,7 @@ mod tests {
                         tv_nsec: 0,
                     });
                     sys::exit_group(0)
-                }
+                }),
                 Ok(PidfdFork::ParentOf(bystander)) => {
                     *self
                         .bystander
