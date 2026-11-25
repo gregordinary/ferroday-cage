@@ -2613,12 +2613,18 @@ fn hold_file_target(
             return Ok(());
         }
         // Reopened through the descriptor rather than the path, so the file
-        // locked is the file found; an `O_PATH` descriptor takes no lock.
-        let file = fs::open(
+        // locked is the file found; an `O_PATH` descriptor takes no lock. A
+        // file this stage cannot open for reading is no placeholder, which a
+        // launch creates readable: it is the root's own, as a root-shipped
+        // `/etc/shadow` is, which no teardown removes, so the bind goes ahead
+        // without a lock, as it does where the lock is refused.
+        let Ok(file) = fs::open(
             fd_path(&found).as_cstr(),
             OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
-        )?;
+        ) else {
+            return Ok(());
+        };
         match share_target(&file) {
             // Granted after a teardown let go of it, the file may be unlinked
             // already, and the name then holds nothing of this lock's.

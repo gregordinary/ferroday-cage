@@ -417,6 +417,12 @@ consumer upgrading can skip it.
   sandbox with a PID namespace it waits for. The kernel reparents the
   sandbox's init to such a caller once the launch stage exits, and nothing
   collected it; the wait now does, once it has exited.
+- A file bind onto a regular file the root ships, which the sandbox's root
+  cannot read, such as a host's `/etc/shadow` under a bound `/etc`, binds. The
+  launch reopened the target for reading to take its shared lock, and failed
+  at `CreateMountTarget` with `EACCES`; a file it cannot read is none a launch
+  created, and it now binds without the lock, as it does where the lock is
+  refused.
 
 ### Internal
 

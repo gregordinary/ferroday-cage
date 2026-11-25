@@ -403,6 +403,36 @@ fn a_read_only_path_keeps_its_name_while_the_directories_above_it_stay_writable(
 }
 
 #[test]
+fn a_file_bound_over_one_the_sandbox_cannot_read_binds() {
+    if !common::require::userns() {
+        return;
+    }
+    // The host's shadow file is its root's, and unreadable to the calling
+    // user, so to the sandbox's root as well.
+    let shadow = Path::new("/etc/shadow");
+    if std::fs::File::open(shadow).is_ok() || !shadow.is_file() {
+        common::require::premise_unmet(
+            "the caller can read /etc/shadow, or the host has none, so no file here is \
+             unreadable to the sandbox's root",
+        );
+        return;
+    }
+    let (ok, printed) = run(
+        common::host_userland()
+            .bind_ro("/etc", "/etc")
+            .bind_ro("/etc/os-release", "/etc/shadow"),
+        "grep -c . /etc/shadow",
+    );
+    assert!(ok, "{printed}");
+    let lines = std::fs::read_to_string("/etc/os-release")
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count();
+    assert_eq!(printed.trim(), lines.to_string());
+}
+
+#[test]
 fn holding_a_read_only_path_s_name_leaves_a_read_only_root_read_only() {
     if !common::require::userns() {
         return;
