@@ -308,6 +308,12 @@ cost = "share"
 why = "The per-entry callback a `.deb`'s extraction decides with."
 
 [[reach]]
+item = "provision::extract::Cancelled"
+code = 3
+cost = "share"
+why = "The run's cancellation check, which each layer's extraction asks through its data."
+
+[[reach]]
 item = "provision::extract::Placement"
 code = 9
 tests = 2

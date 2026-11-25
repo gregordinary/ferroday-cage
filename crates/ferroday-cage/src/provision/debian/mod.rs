@@ -2690,6 +2690,7 @@ fn extract_packages(
                 // records ownership as they go past, so every entry is written.
                 Ok(Placement::Write)
             },
+            &mut || observer.cancelled(),
         )?;
     }
     if let Some((package, components)) = malformed {

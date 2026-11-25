@@ -509,6 +509,10 @@ consumer upgrading can skip it.
   the archive does not name, costs a step per directory. Each directory was
   made after resolving every prefix of the chain from the root again, so a
   chain as deep as a path allows cost the square of its depth.
+- Extraction consults the run's cancellation check before every entry it reads,
+  skipped ones included, and every four mebibytes of an entry's data. It asked
+  only before each entry it extracted, so one large entry, or a run of entries
+  it skips, could not be cancelled until it was read through.
 
 ### Internal
 

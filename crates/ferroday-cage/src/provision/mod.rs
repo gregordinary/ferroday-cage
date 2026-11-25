@@ -278,7 +278,8 @@ pub trait ProvisionObserver {
     /// Whether the run should stop.
     ///
     /// Consulted by a provisioner at the points where stopping is clean — an
-    /// archive entry boundary, a package boundary. Returning `true` aborts the
+    /// archive entry boundary, every few mebibytes of an entry's data, a
+    /// package boundary. Returning `true` aborts the
     /// run with [`ProvisionError::Cancelled`]; [`ensure`] then removes the
     /// staging tree, so a cancelled run leaves no destination behind, exactly
     /// as a failed one does.

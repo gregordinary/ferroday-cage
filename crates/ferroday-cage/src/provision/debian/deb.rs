@@ -21,7 +21,7 @@ use std::path::Path;
 
 use super::super::ProvisionError;
 use super::super::compress;
-use super::super::extract::{Extraction, OnEntry};
+use super::super::extract::{Cancelled, Extraction, OnEntry};
 use super::super::tar::{self, TarReader};
 
 /// The 8-byte `ar` global header.
@@ -52,7 +52,8 @@ const CONTROL_MEMBER_LIMIT: u64 = 16 * 1024 * 1024;
 ///
 /// `path` names the package in a failure and is not opened. `on_entry` is
 /// forwarded to the extractor for every extracted entry, so the caller can
-/// record ownership for the dpkg statoverride. Extraction shares the caller's
+/// record ownership for the dpkg statoverride, and `cancelled` is asked as
+/// [`Extraction::extract`] asks it. Extraction shares the caller's
 /// [`Extraction`], so directory metadata is applied once across every package
 /// rather than per package.
 ///
@@ -65,6 +66,7 @@ pub(crate) fn extract_deb<R: Read + Seek>(
     deb: &mut R,
     extraction: &mut Extraction,
     on_entry: &mut OnEntry<'_>,
+    cancelled: &mut Cancelled<'_>,
 ) -> Result<(), ProvisionError> {
     let (_, size, suffix) = seek_to_member(path, deb, Member::Data, None)?;
     // Bounded by the member's declared size, so the tar stream ends where the
@@ -80,7 +82,7 @@ pub(crate) fn extract_deb<R: Read + Seek>(
             .1
     };
     let mut archive = TarReader::new(decoded, path);
-    extraction.extract(&mut archive, on_entry)
+    extraction.extract(&mut archive, on_entry, cancelled)
 }
 
 /// A member of a `.deb` a caller reads.
@@ -525,6 +527,7 @@ mod tests {
             &mut Cursor::new(&misordered),
             &mut extraction,
             &mut |_, _| Ok(crate::provision::extract::Placement::Write),
+            &mut || false,
         )
         .expect_err("a .deb that does not begin with debian-binary is refused");
         assert!(
@@ -715,6 +718,7 @@ mod tests {
             &mut Cursor::new(archive),
             &mut extraction,
             &mut |_, _| Ok(crate::provision::extract::Placement::Write),
+            &mut || false,
         )
         .map_err(|err| ErrorChain::new(&err).to_string())?;
         Ok(root)

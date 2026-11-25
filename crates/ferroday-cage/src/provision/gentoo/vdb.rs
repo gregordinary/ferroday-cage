@@ -68,7 +68,7 @@ use super::{BINPKGMD5_FILE, COUNTER_FILE, DB_DIR, GentooError, MAX_CONTENTS_ENTR
 use crate::path;
 use crate::provision::ProvisionError;
 use crate::provision::digest;
-use crate::provision::extract::{Extraction, Placement};
+use crate::provision::extract::{Cancelled, Extraction, Placement};
 use crate::provision::rooted::Rooted;
 
 /// Where portage keeps the ordinal it stamped the last merge into a root with:
@@ -134,7 +134,14 @@ enum Laid {
 /// target that is not UTF-8 or that holds a line ending. Returns
 /// [`GentooError::Io`] where the root could not be written or a merged file
 /// could not be read back, and whatever the extractor reports for an image
-/// archive it will not unpack.
+/// archive it will not unpack, [`ProvisionError::Cancelled`] among it where
+/// `cancelled` answers `true` part way through.
+///
+/// The root comes three ways, its path, its base, and the tree held open, and
+/// the package two, its container's path and what was read from it, so the
+/// merge takes one argument more than the lint allows rather than a bundle
+/// gathered for this call alone.
+#[expect(clippy::too_many_arguments)]
 pub(super) fn merge(
     root: &Path,
     over: Option<&Path>,
@@ -143,9 +150,10 @@ pub(super) fn merge(
     package: &Package,
     planned: &PlannedPackage,
     counter: u64,
+    cancelled: &mut Cancelled<'_>,
 ) -> Result<(), ProvisionError> {
     let entry = entry_dir(planned);
-    let laid = extract_image(root, over, container, package)?;
+    let laid = extract_image(root, over, container, package, cancelled)?;
     let contents = render_contents(root, rooted, &laid)?;
 
     // The metadata files first, then the three portage computes. Written after
@@ -226,52 +234,57 @@ fn extract_image(
     over: Option<&Path>,
     container: &Path,
     package: &Package,
+    cancelled: &mut Cancelled<'_>,
 ) -> Result<Vec<Laid>, ProvisionError> {
     let mut image = package.image(container)?;
     let mut laid: Vec<Laid> = Vec::new();
     let mut extraction = Extraction::new(root)?
         .over(over)?
         .under(IMAGE_DIR.as_bytes());
-    extraction.extract(&mut image, &mut |entry, components| {
-        if laid.len() >= MAX_CONTENTS_ENTRIES {
-            // The extraction stops here rather than at the end: a container
-            // that ships more paths than this is not one to keep unpacking
-            // into a root while deciding what to do about it.
-            return Err(GentooError::container(
-                container,
-                format!("ships more than {MAX_CONTENTS_ENTRIES} paths"),
-            )
-            .into());
-        }
-        // A path is bytes and `CONTENTS` is a text file portage reads line by
-        // line, so one it cannot read back as written cannot be recorded --
-        // and a path in the database that does not describe what is on disk is
-        // worse than a refusal. A link's target is recorded on the same line,
-        // so it is held to the same rule.
-        let path = recordable(components.join(&b'/').to_vec()).map_err(|why| {
-            ProvisionError::from(GentooError::container(
-                container,
-                format!("ships a path that {why}"),
-            ))
-        })?;
-        laid.push(match entry.typeflag {
-            b'5' => Laid::Directory(path),
-            b'2' => {
-                let target = recordable(entry.link_target.clone()).map_err(|why| {
-                    ProvisionError::from(GentooError::container(
-                        container,
-                        format!("ships a link at {path:?} whose target {why}"),
-                    ))
-                })?;
-                Laid::Link(path, target, entry.mtime)
+    extraction.extract(
+        &mut image,
+        &mut |entry, components| {
+            if laid.len() >= MAX_CONTENTS_ENTRIES {
+                // The extraction stops here rather than at the end: a container
+                // that ships more paths than this is not one to keep unpacking
+                // into a root while deciding what to do about it.
+                return Err(GentooError::container(
+                    container,
+                    format!("ships more than {MAX_CONTENTS_ENTRIES} paths"),
+                )
+                .into());
             }
-            b'6' => Laid::Fifo(path),
-            // Regular files, and the unknown typeflags POSIX says to treat as
-            // regular files -- which is what the extractor does with them too.
-            _ => Laid::File(path, entry.mtime),
-        });
-        Ok(Placement::Write)
-    })?;
+            // A path is bytes and `CONTENTS` is a text file portage reads line by
+            // line, so one it cannot read back as written cannot be recorded --
+            // and a path in the database that does not describe what is on disk is
+            // worse than a refusal. A link's target is recorded on the same line,
+            // so it is held to the same rule.
+            let path = recordable(components.join(&b'/').to_vec()).map_err(|why| {
+                ProvisionError::from(GentooError::container(
+                    container,
+                    format!("ships a path that {why}"),
+                ))
+            })?;
+            laid.push(match entry.typeflag {
+                b'5' => Laid::Directory(path),
+                b'2' => {
+                    let target = recordable(entry.link_target.clone()).map_err(|why| {
+                        ProvisionError::from(GentooError::container(
+                            container,
+                            format!("ships a link at {path:?} whose target {why}"),
+                        ))
+                    })?;
+                    Laid::Link(path, target, entry.mtime)
+                }
+                b'6' => Laid::Fifo(path),
+                // Regular files, and the unknown typeflags POSIX says to treat as
+                // regular files -- which is what the extractor does with them too.
+                _ => Laid::File(path, entry.mtime),
+            });
+            Ok(Placement::Write)
+        },
+        cancelled,
+    )?;
     extraction.finalize(root)?;
     Ok(laid)
 }
@@ -398,7 +411,14 @@ mod tests {
         )
         .expect("the container opens");
         let merged = merge(
-            &root, None, &rooted, &container, &package, &planned, counter,
+            &root,
+            None,
+            &rooted,
+            &container,
+            &package,
+            &planned,
+            counter,
+            &mut || false,
         );
         (dir, merged)
     }

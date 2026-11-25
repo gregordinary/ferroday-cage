@@ -1958,7 +1958,16 @@ impl Gentoo {
                 package: &planned.name,
                 version: &planned.version,
             });
-            vdb::merge(root, over, &rooted, cached, &package, planned, ordinal)?;
+            vdb::merge(
+                root,
+                over,
+                &rooted,
+                cached,
+                &package,
+                planned,
+                ordinal,
+                &mut || to.cancelled(),
+            )?;
             let defined = package
                 .metadata_files()
                 .find(|(name, _)| *name == DEFINED_PHASES_FILE)

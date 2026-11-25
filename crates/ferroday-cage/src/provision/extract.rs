@@ -89,9 +89,20 @@ const FIFO_CREATION_MODE: u32 = 0o600;
 ///
 /// Receives the entry's header and its validated path components, and answers
 /// whether the entry is written. Its error abandons the extraction at an entry
-/// boundary, which is what a cancellation check needs.
+/// boundary.
 pub(crate) type OnEntry<'f> =
     dyn FnMut(&Entry, &[Vec<u8>]) -> Result<Placement, ProvisionError> + 'f;
+
+/// The run's cancellation check, which the extractor asks before each header
+/// it reads and every [`CANCEL_EVERY`] bytes of an entry's data, whether it
+/// writes the entry or skips it. `true` abandons the extraction with
+/// [`ProvisionError::Cancelled`].
+pub(crate) type Cancelled<'f> = dyn FnMut() -> bool + 'f;
+
+/// How many bytes of one entry's data are written or skipped between two asks
+/// of the cancellation check: a few milliseconds of a disk's writing, so one
+/// entry of many gigabytes, or a run of skipped ones, still stops promptly.
+const CANCEL_EVERY: u64 = 4 * 1024 * 1024;
 
 /// Whether an entry is written, as the per-entry hook decides.
 ///
@@ -538,12 +549,15 @@ impl Extraction {
     /// progress — without a second pass over the archive. It also decides
     /// whether the entry is written at all ([`Placement`]), so a caller that
     /// keeps a record of the tree can hold the tree to it; and its error
-    /// abandons the extraction at an entry boundary, which is what a
-    /// cancellation check needs.
+    /// abandons the extraction at an entry boundary.
+    ///
+    /// `cancelled` is asked before each header and through each entry's data,
+    /// skipped entries included ([`Cancelled`]).
     pub(crate) fn extract<R: Read>(
         &mut self,
         archive: &mut TarReader<R>,
         on_entry: &mut OnEntry<'_>,
+        cancelled: &mut Cancelled<'_>,
     ) -> Result<(), ProvisionError> {
         let lists = ListIds::new(&self.ownership, &self.root, self.lower.as_deref());
         let tree = Tree {
@@ -552,7 +566,17 @@ impl Extraction {
             owed: &self.owed,
             lists: &lists,
         };
-        while let Some(mut entry) = archive.next_entry()? {
+        loop {
+            // Whatever the last entry left unread, a skipped entry's data, is
+            // read past here rather than by the next header's read, so it is
+            // read past in steps the cancellation check is asked between.
+            skip_data(archive, cancelled)?;
+            if cancelled() {
+                return Err(ProvisionError::Cancelled);
+            }
+            let Some(mut entry) = archive.next_entry()? else {
+                break;
+            };
             match entry.typeflag {
                 // Unextractable without privilege; the sandbox provides its
                 // own /dev. GNU volume labels are archive metadata.
@@ -635,7 +659,14 @@ impl Extraction {
                 b'6' => extract_fifo(tree, &entry, &components, &mut self.dir_meta)?,
                 // Regular files, and unknown typeflags, which POSIX says to
                 // treat as regular files.
-                _ => extract_file(tree, archive, &entry, &components, &mut self.dir_meta)?,
+                _ => extract_file(
+                    tree,
+                    archive,
+                    &entry,
+                    &components,
+                    &mut self.dir_meta,
+                    cancelled,
+                )?,
             }
         }
         Ok(())
@@ -662,15 +693,52 @@ impl Extraction {
 }
 
 /// Extracts every entry of `archive` into the directory at `root`, reporting
-/// each entry through `on_entry`.
+/// each entry through `on_entry` and asking `cancelled` as
+/// [`Extraction::extract`] does.
 pub(crate) fn extract_archive<R: Read>(
     archive: &mut TarReader<R>,
     root: &Path,
     on_entry: &mut OnEntry<'_>,
+    cancelled: &mut Cancelled<'_>,
 ) -> Result<(), ProvisionError> {
     let mut extraction = Extraction::new(root)?;
-    extraction.extract(archive, on_entry)?;
+    extraction.extract(archive, on_entry, cancelled)?;
     extraction.finalize(root)
+}
+
+/// Reads past what remains of the current entry's data, asking `cancelled`
+/// every [`CANCEL_EVERY`] bytes.
+fn skip_data<R: Read>(
+    archive: &mut TarReader<R>,
+    cancelled: &mut Cancelled<'_>,
+) -> Result<(), ProvisionError> {
+    let mut buf = [0u8; 65536];
+    let mut unasked = 0;
+    loop {
+        let got = archive.read_data(&mut buf)?;
+        if got == 0 {
+            return Ok(());
+        }
+        paced(&mut unasked, got, cancelled)?;
+    }
+}
+
+/// Counts `got` more bytes of an entry's data into `unasked`, the bytes since
+/// `cancelled` was last asked, and asks it once every [`CANCEL_EVERY`] of
+/// them.
+fn paced(
+    unasked: &mut u64,
+    got: usize,
+    cancelled: &mut Cancelled<'_>,
+) -> Result<(), ProvisionError> {
+    *unasked += got as u64;
+    if *unasked >= CANCEL_EVERY {
+        *unasked = 0;
+        if cancelled() {
+            return Err(ProvisionError::Cancelled);
+        }
+    }
+    Ok(())
 }
 
 /// Opens the directory at `path`, a tree an extraction writes into or reads
@@ -1022,13 +1090,15 @@ fn resolve_error(errno: Errno, entry_path: &[u8]) -> ProvisionError {
     }
 }
 
-/// Extracts a regular file, streaming its data from the archive.
+/// Extracts a regular file, streaming its data from the archive and asking
+/// `cancelled` every [`CANCEL_EVERY`] bytes of it.
 fn extract_file<R: Read>(
     tree: Tree<'_>,
     archive: &mut TarReader<R>,
     entry: &Entry,
     components: &[Vec<u8>],
     dir_meta: &mut DeferredDirs,
+    cancelled: &mut Cancelled<'_>,
 ) -> Result<(), ProvisionError> {
     let parent = open_parent(tree, components, &entry.path, dir_meta)?;
     let leaf = component_cstr(components.last().expect("non-empty"), &entry.path)?;
@@ -1050,6 +1120,7 @@ fn extract_file<R: Read>(
 
     let mut file = File::from(fd);
     let mut buf = [0u8; 65536];
+    let mut unasked = 0;
     loop {
         let got = archive.read_data(&mut buf)?;
         if got == 0 {
@@ -1057,6 +1128,7 @@ fn extract_file<R: Read>(
         }
         file.write_all(&buf[..got])
             .map_err(|err| ProvisionError::io("writing", bytes_to_path(&entry.path), err))?;
+        paced(&mut unasked, got, cancelled)?;
     }
 
     rustix::fs::fchmod(&file, Mode::from_raw_mode(entry.mode)).map_err(|errno| {
@@ -2184,9 +2256,11 @@ mod prefix_tests {
                 .expect("the root opens")
                 .under(b"image");
             extraction
-                .extract(&mut TarReader::in_memory(&archive[..]), &mut |_, _| {
-                    Ok(Placement::Write)
-                })
+                .extract(
+                    &mut TarReader::in_memory(&archive[..]),
+                    &mut |_, _| Ok(Placement::Write),
+                    &mut || false,
+                )
                 .expect("the image extracts");
             extraction
                 .finalize(&root)
@@ -2248,6 +2322,7 @@ mod mode_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect("the pipes extract");
 
@@ -2256,6 +2331,95 @@ mod mode_tests {
             assert!(found.file_type().is_fifo(), "{name}");
             assert_eq!(found.permissions().mode() & 0o7777, mode, "{name}");
         }
+    }
+}
+
+// Where a cancellation is heard.
+#[cfg(test)]
+mod cancel_tests {
+    use super::{CANCEL_EVERY, Placement, TarReader, extract_archive};
+    use crate::provision::ProvisionError;
+    use crate::scratch::Scratch;
+    use ferroday_cage_testkit::tar::Tar;
+
+    /// What one extraction of a `tar` came to, the check cancelling at its
+    /// `cancel_at`th ask.
+    struct Run {
+        root: Scratch,
+        outcome: Result<(), ProvisionError>,
+        /// How many entries the hook was shown.
+        shown: usize,
+        /// How many times the check was asked.
+        asked: usize,
+    }
+
+    /// Extracts `tar` into a fresh root, writing every entry or skipping every
+    /// one.
+    fn extract(tar: Tar, placement: Placement, cancel_at: usize) -> Run {
+        let root = Scratch::for_test("extract", "cancelled");
+        let (mut asked, mut shown) = (0, 0);
+        let outcome = extract_archive(
+            &mut TarReader::in_memory(&tar.finish()[..]),
+            &root,
+            &mut |_, _| {
+                shown += 1;
+                Ok(placement)
+            },
+            &mut || {
+                asked += 1;
+                asked >= cancel_at
+            },
+        );
+        Run {
+            root,
+            outcome,
+            shown,
+            asked,
+        }
+    }
+
+    #[test]
+    fn a_cancellation_is_heard_within_an_entry_written_or_skipped_and_between_entries() {
+        let large = vec![0u8; 3 * CANCEL_EVERY as usize];
+        let one_large = || {
+            let mut tar = Tar::new();
+            tar.file("large", 0o644, &large);
+            tar
+        };
+
+        // Asked before each header, at the end, and a step at a time through
+        // the data, whether it is written or read past.
+        for placement in [Placement::Write, Placement::Skip] {
+            let run = extract(one_large(), placement, usize::MAX);
+            assert!(run.outcome.is_ok(), "{:?}", run.outcome);
+            assert_eq!(run.asked, 1 + 3 + 1, "{placement:?}");
+        }
+
+        // A cancellation a step into the data stops it there.
+        let run = extract(one_large(), Placement::Write, 2);
+        assert!(
+            matches!(run.outcome, Err(ProvisionError::Cancelled)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(
+            std::fs::metadata(run.root.join("large")).unwrap().len(),
+            CANCEL_EVERY,
+        );
+
+        // And one between entries stops before the next.
+        let mut tar = Tar::new();
+        for name in ["a", "b", "c", "d"] {
+            tar.dir(name, 0o755);
+        }
+        let run = extract(tar, Placement::Write, 3);
+        assert!(
+            matches!(run.outcome, Err(ProvisionError::Cancelled)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(run.shown, 2);
+        assert!(run.root.join("b").is_dir() && !run.root.join("c").exists());
     }
 }
 
@@ -2273,6 +2437,7 @@ mod alias_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect("the archive extracts");
         root
@@ -2353,6 +2518,7 @@ mod naming_tests {
                 &mut TarReader::in_memory(&archive.finish()[..]),
                 &root,
                 &mut |_, _| Ok(Placement::Write),
+                &mut || false,
             )
             .expect_err(case);
             hostile::assert_escaped(&ErrorChain::new(&err).to_string());
@@ -2462,6 +2628,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect("the archive extracts");
 
@@ -2504,6 +2671,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect_err("a malformed list is refused");
         assert!(err.to_string().contains("access control list"), "{err}",);
@@ -2526,6 +2694,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         ) {
             Err(ProvisionError::EntryRefused { path, reason }) => {
                 assert_eq!(path, Path::new("file"));
@@ -2577,6 +2746,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect("the archive extracts");
 
@@ -2637,6 +2807,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect("the archive extracts");
 
@@ -2687,6 +2858,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect("the archive extracts");
         for name in ["text-only", "text-and-value"] {
@@ -2737,6 +2909,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &root,
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect("the archive extracts");
         for name in ["disagreeing", "unreadable-text"] {
@@ -2758,6 +2931,7 @@ mod list_tests {
             &mut TarReader::in_memory(&tar.finish()[..]),
             &Scratch::for_test("extract", "malformed-text"),
             &mut |_, _| Ok(Placement::Write),
+            &mut || false,
         )
         .expect_err("a list missing an entry is refused");
         assert!(matches!(err, ProvisionError::EntryRefused { .. }), "{err}");
@@ -2785,10 +2959,14 @@ mod layered_tests {
     ) -> Result<Vec<String>, crate::provision::ProvisionError> {
         let mut seen = Vec::new();
         let mut extraction = Extraction::new(upper)?.over(Some(base))?;
-        extraction.extract(&mut TarReader::in_memory(archive), &mut |_, components| {
-            seen.push(String::from_utf8(components.join(&b'/')).unwrap());
-            Ok(Placement::Write)
-        })?;
+        extraction.extract(
+            &mut TarReader::in_memory(archive),
+            &mut |_, components| {
+                seen.push(String::from_utf8(components.join(&b'/')).unwrap());
+                Ok(Placement::Write)
+            },
+            &mut || false,
+        )?;
         extraction.finalize(upper)?;
         Ok(seen)
     }
@@ -3349,9 +3527,11 @@ mod layered_tests {
             .unwrap()
             .owned_through(ownership.clone());
         extraction
-            .extract(&mut TarReader::in_memory(&tar.finish()[..]), &mut |_, _| {
-                Ok(Placement::Write)
-            })
+            .extract(
+                &mut TarReader::in_memory(&tar.finish()[..]),
+                &mut |_, _| Ok(Placement::Write),
+                &mut || false,
+            )
             .unwrap();
         extraction
             .finalize(&upper)

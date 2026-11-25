@@ -88,7 +88,9 @@ enum Source {
 ///
 /// Extraction reports an [`Entry`](ProvisionEvent::Entry) per extracted entry
 /// and a [`Read`](ProvisionEvent::Read) as it consumes the source, and it
-/// consults the run's cancellation check at each entry boundary. Both reach it
+/// consults the run's cancellation check before each entry and every few
+/// mebibytes of an entry's data, whether it extracts the entry or skips it.
+/// Both reach it
 /// through the [`ProvisionRequest`], so they are configured on the publication
 /// with [`Provision::observe`](super::Provision::observe) rather than on the
 /// provisioner. Byte progress counts the *source* stream, so for a compressed
@@ -271,22 +273,25 @@ impl Provisioner for Tarball {
             compress::decoder(source).map_err(|err| tar::read_failure(&subject, 0, err))?;
 
         let mut archive = TarReader::new(BufReader::with_capacity(64 * 1024, decoded), &subject);
-        let outcome = extract_archive(&mut archive, request.staging(), &mut |_, components| {
-            // An entry boundary: what has been written is complete, and
-            // `ensure` discards the staging tree wholesale, so stopping here
-            // leaves nothing half-extracted behind.
-            if request.cancelled() {
-                return Err(ProvisionError::Cancelled);
-            }
-            let mut path = PathBuf::new();
-            for component in components {
-                path.push(OsStr::from_bytes(component));
-            }
-            request.report(ProvisionEvent::Entry { path: &path });
-            // A tarball provisioner unpacks what the archive holds and keeps no
-            // record to hold it to, so every entry is written.
-            Ok(Placement::Write)
-        });
+        // A cancellation stops the extraction part way through an entry as
+        // well as between two, and `ensure` discards the staging tree
+        // wholesale, so stopping leaves nothing half-extracted behind.
+        let mut cancelled = || request.cancelled();
+        let outcome = extract_archive(
+            &mut archive,
+            request.staging(),
+            &mut |_, components| {
+                let mut path = PathBuf::new();
+                for component in components {
+                    path.push(OsStr::from_bytes(component));
+                }
+                request.report(ProvisionEvent::Entry { path: &path });
+                // A tarball provisioner unpacks what the archive holds and keeps no
+                // record to hold it to, so every entry is written.
+                Ok(Placement::Write)
+            },
+            &mut cancelled,
+        );
         match outcome {
             // The archive is complete, but the stream it came from may still
             // hold the check over its last compressed block. An archive passed

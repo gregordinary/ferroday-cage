@@ -72,7 +72,7 @@ use super::binfmt;
 use super::cache;
 
 use super::digest::{Algorithm, Digest};
-use super::extract::{Extraction, Placement};
+use super::extract::{Cancelled, Extraction, Placement};
 use super::identity::Ownership;
 // `super::layer` is the shared one; this module has a `layer` of its own, which
 // reads a provisioned base rather than describing how a cage is rooted on it.
@@ -2258,6 +2258,7 @@ fn lay_down(
                     None => stated.remove(&path),
                 };
             },
+            &mut || observer.cancelled(),
         )?;
 
         subjects.push(ScriptSubject {
@@ -2333,7 +2334,8 @@ fn stated_owner(at: usize, entry: &crate::provision::tar::Entry, path: &[u8]) ->
 /// recording each entry against the package numbered `at`.
 ///
 /// `written` hears each entry the extraction writes, with its root-relative
-/// path, after the record has it.
+/// path, after the record has it, and `cancelled` is asked as
+/// [`Extraction::extract`] asks it.
 ///
 /// A directory laid where an earlier package's link is
 /// ([`Claim::Through`]) is the one claim the record cannot settle alone,
@@ -2350,15 +2352,20 @@ fn lay_package<R: std::io::Read>(
     at: usize,
     archive: &mut TarReader<R>,
     written: &mut dyn FnMut(&crate::provision::tar::Entry, Vec<u8>),
+    cancelled: &mut Cancelled<'_>,
 ) -> Result<(), ProvisionError> {
     let mut through = Vec::new();
-    extraction.extract(archive, &mut |entry, components| {
-        let placement = record_entry(database, at, entry, components, &mut through)?;
-        if placement == Placement::Write {
-            written(entry, components.join(&b'/'));
-        }
-        Ok(placement)
-    })?;
+    extraction.extract(
+        archive,
+        &mut |entry, components| {
+            let placement = record_entry(database, at, entry, components, &mut through)?;
+            if placement == Placement::Write {
+                written(entry, components.join(&b'/'));
+            }
+            Ok(placement)
+        },
+        cancelled,
+    )?;
     for (path, owner) in through {
         let relative = Path::new(OsStr::from_bytes(&path));
         let stat = tree
@@ -5504,6 +5511,7 @@ mod tests {
                 at,
                 &mut reader,
                 &mut |_, _| {},
+                &mut || false,
             ) {
                 return (scratch, Err(err));
             }
