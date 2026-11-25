@@ -269,6 +269,11 @@ consumer upgrading can skip it.
   credentials. `FlowRefusal::AwsInstanceServices` becomes
   `FlowRefusal::InstanceServices`, whose `cloud` names whose services they
   are.
+- `fcage --print-resolved` prints, after the resolved inputs, an `[fcage]`
+  table of what `fcage` adds around the sandbox: the terminal, the timeout and
+  its grace, the relayed standard streams, each `--forward-loopback`, and the
+  network stack's settings, its rules and publications among them, which may
+  listen beyond the loopback. It printed the sandbox's inputs alone.
 
 ### Fixed
 

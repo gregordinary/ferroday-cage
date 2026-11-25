@@ -239,6 +239,17 @@ impl Judged {
         Ok(Judged { judged })
     }
 
+    /// The streams the launch relays through a pipe of `fcage`'s, named as the
+    /// stream keys a profile spells them: `stdin`, `stdout`, `stderr`.
+    pub fn relayed(&self) -> Vec<&'static str> {
+        ["stdin", "stdout", "stderr"]
+            .into_iter()
+            .zip(&self.judged)
+            .filter(|(_, judged)| matches!(judged, Some(Handling::Relay(_))))
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// Starts a relay for each judged stream that is a file.
     ///
     /// Every stream was judged before anything starts, so a refusal leaves no

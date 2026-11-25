@@ -292,7 +292,11 @@ fn provenance(rootfs: &Path, sources: &Path) -> Result<String, Box<dyn std::erro
 ```
 
 `fcage --print-resolved` prints the same record as TOML for the sandbox its
-other flags and a profile describe, and starts nothing.
+other flags and a profile describe, and starts nothing. An `[fcage]` table
+after it records what `fcage` adds around the sandbox: the terminal, the
+timeout and its grace before the kill, the standard streams it relays through
+a pipe of its own, each `--forward-loopback`, and the network stack's settings
+in a profile's `[netstack]` format, its rules and publications among them.
 
 Without the managed mounts, a profile declares its own procfs. Every container
 enters a nested user namespace, which is what locks its mount flags, and that

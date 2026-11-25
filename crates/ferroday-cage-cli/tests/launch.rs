@@ -86,3 +86,51 @@ fn a_restriction_says_its_limits_are_not_applied_however_it_starts() {
     assert_notice("plain", &restricted);
     assert_notice("terminal", &[&restricted[..], &["--terminal"]].concat());
 }
+
+#[test]
+fn the_resolved_inputs_name_what_fcage_adds_around_the_sandbox() {
+    // The library's resolved inputs record the sandbox; the stack, a forward,
+    // the timeout and the relays are fcage's, printed as a table of its own.
+    let output = common::run_bounded(
+        Command::new(FCAGE)
+            .args([
+                "--print-resolved",
+                "--host-rootfs",
+                "--netstack",
+                "--netstack-allow",
+                "example.com:443",
+                "--forward-loopback",
+                "8080",
+                "127.0.0.1:9",
+                "--timeout",
+                "30",
+                "--",
+                "/bin/true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        PATIENCE,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed: toml::Table = String::from_utf8_lossy(&output.stdout)
+        .parse()
+        .expect("the inputs are TOML");
+    let fcage = printed["fcage"].as_table().expect("an [fcage] table");
+    assert_eq!(fcage["terminal"].as_bool(), Some(false));
+    assert_eq!(fcage["timeout"].as_float(), Some(30.0));
+    let forward = fcage["forwards"][0].as_table().expect("the forward");
+    assert_eq!(forward["listen"].as_str(), Some("127.0.0.1:8080"));
+    assert_eq!(forward["target"].as_str(), Some("127.0.0.1:9"));
+    let allow = fcage["netstack"]["allow"]
+        .as_array()
+        .expect("the stack's rules");
+    assert_eq!(allow[0].as_str(), Some("example.com:443"));
+    // Standard input is null and the other two are pipes, so nothing is
+    // relayed.
+    assert_eq!(fcage["relayed"].as_array().map(Vec::len), Some(0));
+}

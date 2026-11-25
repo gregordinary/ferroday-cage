@@ -2608,7 +2608,8 @@ const FLAGS: &[Flag] = &[
         section: Section::Help,
         help: &[
             "Build the sandbox the flags and the profile describe,",
-            "print the inputs it resolves to as TOML, and exit",
+            "print the inputs it resolves to as TOML, with what",
+            "fcage adds around it in an [fcage] table, and exit",
             "without provisioning the root or starting the command",
         ],
         restriction: true,
@@ -5541,7 +5542,16 @@ fn run(options: Options) -> ExitCode {
         Err(code) => return code,
     };
     if print_resolved {
-        return print_resolved_inputs(launch.builder);
+        let around = Around {
+            terminal: launch.terminal,
+            timeout: launch.timeout,
+            kill_after: launch.kill_after,
+            relayed: launch.streams.as_ref().map(streams::Judged::relayed),
+            forwards: &launch.forwards,
+            stack: launch.stack_settings.as_ref(),
+        };
+        let added = around.table();
+        return print_resolved_inputs(launch.builder, added);
     }
     if let Some(provisioner) = provisioner.as_mut() {
         let rootfs = rootfs.as_deref().expect("checked at parse time");
@@ -5558,6 +5568,9 @@ struct Launch {
     builder: CageBuilder,
     /// The native network stack, for a `--netstack` run.
     stack: Option<NetStack>,
+    /// The settings that stack was built from, which `--print-resolved`
+    /// prints.
+    stack_settings: Option<NetStackBuilder>,
     /// Which of the stack's reports the run writes, where it writes any.
     shown: Option<netstack::Shown>,
     /// The standard streams the launch hands over, judged, or `None` where a
@@ -5602,10 +5615,12 @@ impl Launch {
         // kernel chose, are read from the stack's settings first.
         let mut ruled = false;
         let mut publications = Vec::new();
+        let mut stack_settings = None;
         let stack = if options.netstack {
             let composed = netstack_builder(&options, profile_stack.unwrap_or_default());
             ruled = !composed.get_allow().is_empty() || !composed.get_deny().is_empty();
             publications = composed.get_publications().collect();
+            stack_settings = Some(composed.clone());
             Some(composed.build().map_err(fail)?)
         } else {
             if profile_stack.is_some() {
@@ -5812,6 +5827,7 @@ impl Launch {
         Ok(Launch {
             builder,
             stack,
+            stack_settings,
             shown: netstack::Shown::of(options.netstack_log, ruled),
             streams,
             terminal: options.terminal,
@@ -5827,6 +5843,7 @@ impl Launch {
         let Launch {
             builder,
             stack,
+            stack_settings: _,
             shown,
             streams,
             terminal,
@@ -5900,16 +5917,74 @@ impl Launcher for RestrictionBuilder {
 
 /// Builds a launch and prints the inputs it resolves to, as TOML, without
 /// starting it: `--print-resolved`.
-fn print_resolved_inputs<B: Launcher>(builder: B) -> ExitCode {
+fn print_resolved_inputs<B: Launcher>(builder: B, around: toml::Table) -> ExitCode {
     let built = match builder.build() {
         Ok(built) => built,
         Err(error) => return fail(error),
     };
-    let text = match toml::to_string(&B::resolved_inputs(&built)) {
+    let mut fcage = toml::Table::new();
+    fcage.insert("fcage".to_string(), around.into());
+    let rendered = toml::to_string(&B::resolved_inputs(&built))
+        .and_then(|inputs| Ok(format!("{inputs}\n{}", toml::to_string(&fcage)?)));
+    let text = match rendered {
         Ok(text) => text,
         Err(err) => return fail(format!("cannot render the resolved inputs: {err}")),
     };
     output::print_stdout("the resolved inputs", |out| out.write_all(text.as_bytes()))
+}
+
+/// What `fcage` adds around the sandbox or the restriction a run builds,
+/// which the library's resolved inputs cannot record: `--print-resolved`
+/// prints it as an `[fcage]` table after them.
+struct Around<'a> {
+    terminal: bool,
+    timeout: Option<Duration>,
+    kill_after: Duration,
+    /// The standard streams relayed through a pipe of `fcage`'s, where they
+    /// were judged: a terminal of the sandbox's own replaces all three.
+    relayed: Option<Vec<&'static str>>,
+    forwards: &'a [(SocketAddr, forward::Target)],
+    /// The network stack's settings, in a profile's `[netstack]` format.
+    stack: Option<&'a NetStackBuilder>,
+}
+
+impl Around<'_> {
+    /// The `[fcage]` table: the terminal, the timeout and the grace before
+    /// the kill, the relayed streams, each forward's listener and target, and
+    /// the network stack's settings as a table of their own, its rules and
+    /// publications among them.
+    fn table(&self) -> toml::Table {
+        let mut table = toml::Table::new();
+        table.insert("terminal".to_string(), self.terminal.into());
+        if let Some(timeout) = self.timeout {
+            table.insert("timeout".to_string(), timeout.as_secs_f64().into());
+            table.insert(
+                "kill-after".to_string(),
+                self.kill_after.as_secs_f64().into(),
+            );
+        }
+        if let Some(relayed) = &self.relayed {
+            let relayed: toml::value::Array = relayed.iter().map(|&name| name.into()).collect();
+            table.insert("relayed".to_string(), relayed.into());
+        }
+        let forwards: toml::value::Array = self
+            .forwards
+            .iter()
+            .map(|(listen, target)| {
+                let mut forward = toml::Table::new();
+                forward.insert("listen".to_string(), listen.to_string().into());
+                forward.insert("target".to_string(), target.to_string().into());
+                forward.into()
+            })
+            .collect();
+        table.insert("forwards".to_string(), forwards.into());
+        if let Some(stack) = self.stack
+            && let Ok(toml::Value::Table(stack)) = toml::Value::try_from(stack)
+        {
+            table.insert(NETSTACK_TABLE.to_string(), stack.into());
+        }
+        table
+    }
 }
 
 /// Prints what this host offers a sandbox, as TOML: `--host-report`.
@@ -6477,7 +6552,23 @@ fn run_restricted(mut options: Options) -> ExitCode {
         Err(message) => return usage_error(format_args!("{message}")),
     };
     if options.print_resolved {
-        return print_resolved_inputs(builder);
+        let relayed = if options.terminal {
+            None
+        } else {
+            match judge_streams(&builder, &RESTRICTION_STREAMS, false) {
+                Ok(judged) => Some(judged.relayed()),
+                Err(code) => return code,
+            }
+        };
+        let around = Around {
+            terminal: options.terminal,
+            timeout: options.timeout,
+            kill_after: options.kill_after,
+            relayed,
+            forwards: &[],
+            stack: None,
+        };
+        return print_resolved_inputs(builder, around.table());
     }
 
     if options.terminal {
