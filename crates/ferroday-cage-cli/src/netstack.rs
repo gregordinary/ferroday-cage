@@ -1,13 +1,16 @@
 //! The native network stack's reports, written on standard error.
 //!
 //! The stack reports each flow of the sandbox's that it carries or refuses, and
-//! why. Under destination rules, `--netstack-allow` or `--netstack-deny`,
-//! `fcage` writes every refusal, so the command's caller reads why a connection
-//! failed. `--netstack-log` writes every report, carried flows too, which with
-//! no rules is a log of where the sandbox goes. Each is one line:
+//! each question its nameserver relays or refuses, and why. Under destination
+//! rules, `--netstack-allow` or `--netstack-deny`, `fcage` writes every
+//! refusal, so the command's caller reads why a connection or a lookup failed.
+//! `--netstack-log` writes every report, carried flows and relayed questions
+//! too, which with no rules is a log of where the sandbox goes, by name. Each
+//! is one line:
 //!
 //! ```text
 //! fcage: the network stack refused tcp from 10.0.2.15:41234 to 192.0.2.1:443: no allow rule admits it
+//! fcage: the network stack refused the A question for example.net from 10.0.2.15:53140: no allow rule admits it
 //! ```
 //!
 //! A thread of its own takes the reports from the stack and hands each line to

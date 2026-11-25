@@ -2009,12 +2009,16 @@ const FLAGS: &[Flag] = &[
         placeholder: "RULE",
         help: &[
             "Carry the sandbox's traffic only to what RULE admits",
-            "(repeatable): an ADDRESS or ADDRESS/LEN, with :PORTS",
-            "such as :443, :80,443 or :8000-8999 (an IPv6 one in",
-            "brackets), and tcp: or udp: for one transport. Once",
-            "one is given, everything no allow rule admits is",
-            "refused. Loopback, link-local and the sandbox's own",
-            "network stay refused whatever the rules say",
+            "(repeatable): an ADDRESS or ADDRESS/LEN, or a NAME or",
+            "*.NAME for the names below it, with :PORTS such as",
+            ":443, :80,443 or :8000-8999 (an IPv6 address with",
+            "ports in brackets), and tcp: or udp: for one",
+            "transport. A name is resolved through the stack's",
+            "nameserver, which refuses the names no rule admits,",
+            "and admits TCP alone. Once one is given, everything no",
+            "allow rule admits is refused. Loopback, link-local",
+            "and the sandbox's own network stay refused whatever",
+            "the rules say",
         ],
         take: Take::One(|options, flag, value| {
             options
@@ -2046,7 +2050,8 @@ const FLAGS: &[Flag] = &[
         long: "--netstack-log",
         section: Section::Networking,
         help: &[
-            "Write each flow the network stack carries or refuses",
+            "Write each flow the network stack carries or refuses,",
+            "and each question its nameserver relays or refuses,",
             "on standard error, one line each, naming the rule",
             "that decided it. Under --netstack-allow or",
             "--netstack-deny, refusals are written without it",

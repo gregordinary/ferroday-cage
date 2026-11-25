@@ -148,19 +148,27 @@ fn stderr_of(rootfs: &str, args: &[&str], script: &str) -> String {
 }
 
 /// The lines `fcage` wrote of the network stack's reports, each with the
-/// guest's port, which the guest's kernel chooses, left out.
+/// guest's port, which the guest's kernel chooses, left out. The guest is
+/// `10.0.2.15`, or `fd00::15` where it wrote from its IPv6 address, as musl's
+/// resolver does in asking each nameserver at once.
 fn stack_lines(stderr: &str) -> Vec<String> {
     stderr
         .lines()
         .filter(|line| line.starts_with("fcage: the network stack "))
         .map(|line| {
-            let (before, after) = line
-                .split_once("from 10.0.2.15:")
+            let (before, guest, after) = ["10.0.2.15", "fd00::15"]
+                .into_iter()
+                .find_map(|guest| {
+                    let endpoint = match guest.contains(':') {
+                        true => format!("from [{guest}]:"),
+                        false => format!("from {guest}:"),
+                    };
+                    let (before, after) = line.split_once(&endpoint)?;
+                    Some((before, guest, after))
+                })
                 .unwrap_or_else(|| panic!("a report names the guest: {line}"));
-            let (_, after) = after
-                .split_once(' ')
-                .unwrap_or_else(|| panic!("a port follows the guest: {line}"));
-            format!("{before}from 10.0.2.15 {after}")
+            let after = after.trim_start_matches(|c: char| c.is_ascii_digit());
+            format!("{before}from {guest}{after}")
         })
         .collect()
 }
@@ -202,6 +210,49 @@ fn refusals_are_written_under_destination_rules() {
         ],
         "{stderr}"
     );
+}
+
+/// Under a name rule a lookup the rules refuse is written as the question the
+/// stack's nameserver refused, and the lookup it admits is not.
+#[test]
+fn a_refused_question_is_written_under_name_rules() {
+    let Some(rootfs) = common::fixture_rootfs() else {
+        return;
+    };
+    if !common::require::tun() {
+        return;
+    }
+    let rootfs = rootfs.to_str().expect("a UTF-8 fixture path");
+    let resolver = common::dns::Resolver::new(1);
+    let upstream = resolver.address().to_string();
+    let stderr = stderr_of(
+        rootfs,
+        &[
+            "--netstack-upstream",
+            &upstream,
+            "--netstack-allow",
+            common::dns::KNOWN_NAME,
+        ],
+        &format!(
+            "/usr/bin/getent hosts {} > /dev/null; /usr/bin/getent hosts other.example; true",
+            common::dns::KNOWN_NAME
+        ),
+    );
+    let lines = stack_lines(&stderr);
+    assert!(!lines.is_empty(), "{stderr}");
+    for line in lines {
+        let (start, end) = line
+            .split_once(" question ")
+            .unwrap_or_else(|| panic!("a question: {line}"));
+        assert!(
+            start.starts_with("fcage: the network stack refused the "),
+            "{line}"
+        );
+        let guest = end
+            .strip_prefix("for other.example from ")
+            .and_then(|end| end.strip_suffix(": no allow rule admits it"));
+        assert!(matches!(guest, Some("10.0.2.15" | "fd00::15")), "{stderr}");
+    }
 }
 
 /// Without rules nothing is written, and `--netstack-log` writes every flow,
