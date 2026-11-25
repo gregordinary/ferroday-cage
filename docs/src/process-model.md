@@ -206,8 +206,10 @@ usual.
 
 On the caller's side, a launch never leaks a zombie when it is waited: the
 short-lived launch stage is collected during `spawn` (or by `wait`, without a
-PID namespace), and the in-namespace init is not the caller's child process
-at all.
+PID namespace). The in-namespace init is not the caller's child process, unless
+the caller is a child subreaper (`PR_SET_CHILD_SUBREAPER`), to which the
+kernel reparents it once the launch stage has exited. The wait collects it
+then too, once it has exited.
 
 ## Resource usage
 

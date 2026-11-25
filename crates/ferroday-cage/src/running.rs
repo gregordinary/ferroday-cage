@@ -814,6 +814,13 @@ impl<'obs> Running<'obs> {
         }
         if ready[Watch::Supervisor as usize] {
             self.supervisor_exited = true;
+            // The init is not the caller's child process, except where the
+            // caller is a child subreaper: the launch stage that forked it has
+            // exited, and the kernel reparents an orphan to the nearest
+            // subreaper above it. It is then the caller's zombie, which nothing
+            // else collects. It has exited, so this does not wait, and anywhere
+            // else it answers `ECHILD`.
+            let _ = mechanism::reap_via_pidfd(self.pidfd.as_fd());
         }
         self.sync_readiness()?;
         Ok(match ready[Watch::Wake as usize] {

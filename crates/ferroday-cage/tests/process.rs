@@ -1042,6 +1042,69 @@ fn a_supervisor_whose_pidfd_cannot_be_received_ends_the_launch() {
     }
 }
 
+/// Set in the child [`a_subreaper_caller_is_left_no_zombie_init`] starts.
+const SUBREAPER: &str = "FERRODAY_CAGE_TEST_PROCESS_SUBREAPER";
+
+#[test]
+fn a_subreaper_caller_is_left_no_zombie_init() {
+    // A caller that is a child subreaper is where the kernel reparents the
+    // init once the launch stage that forked it exits, so the init becomes the
+    // caller's child, and a zombie of the caller's once it exits, unless the
+    // wait collects it.
+    if !common::require::userns() {
+        return;
+    }
+    if let Some(blocker) = ferroday_cage::host::procfs_blocker() {
+        common::require::premise_unmet(format!(
+            "this host cannot mount a PID namespace's procfs: {blocker}"
+        ));
+        return;
+    }
+    let output = common::run_bounded(
+        common::rerun("probe_subreaper_caller").env(SUBREAPER, "1"),
+        Duration::from_secs(120),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("no zombie"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// The probe [`a_subreaper_caller_is_left_no_zombie_init`] starts: becomes a
+/// child subreaper, runs three sandboxes to their outcome, and reports
+/// whether any child of its own is left to collect.
+#[test]
+fn probe_subreaper_caller() {
+    if std::env::var_os(SUBREAPER).is_none() {
+        return;
+    }
+    rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+        .expect("the probe becomes a subreaper");
+    for _ in 0..3 {
+        let status = common::host_userland()
+            .command("/bin/true")
+            .resolv_conf(false)
+            .build()
+            .expect("a valid sandbox configuration")
+            .run()
+            .expect("the sandbox runs");
+        assert!(status.success());
+    }
+    // Any exited child is still there to be waited for, left as it is.
+    let left = rustix::process::waitid(
+        rustix::process::WaitId::All,
+        rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOHANG
+            | rustix::process::WaitIdOptions::NOWAIT,
+    );
+    match left {
+        Ok(None) | Err(rustix::io::Errno::CHILD) => println!("no zombie"),
+        other => panic!("the caller is left a child to collect: {other:?}"),
+    }
+}
+
 /// The probe [`a_supervisor_whose_pidfd_cannot_be_received_ends_the_launch`]
 /// starts: launches as [`UNRECEIVED`] says with no descriptor number free at the
 /// receive, holds the error to `SupervisorUnreceived`, and waits for every

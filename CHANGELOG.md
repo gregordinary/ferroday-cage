@@ -413,6 +413,10 @@ consumer upgrading can skip it.
   own user and could stop it, as `kill -STOP $PPID` does, and the stopped
   stage then never collected the command's outcome, so a wait after a kill
   never ended.
+- A caller that is a child subreaper no longer accumulates a zombie for every
+  sandbox with a PID namespace it waits for. The kernel reparents the
+  sandbox's init to such a caller once the launch stage exits, and nothing
+  collected it; the wait now does, once it has exited.
 
 ### Internal
 
